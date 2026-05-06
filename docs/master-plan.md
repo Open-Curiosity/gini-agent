@@ -2522,13 +2522,15 @@ The first implementation target is an installable Mac runtime with CLI and a loc
 
 **v0 target:** A local macOS agent runtime that can be installed/run on a user-controlled Mac, inspected through CLI and local Next.js, execute tasks safely, show traces/audit, run jobs, expose memory/skills/session-search basics, support lane-aware development, and expose contracts that future mobile can consume.
 
-**v1 target:** The same runtime controlled from an Expo/mobile app, with task cards, approval cards, job/memory/skill/trace views, push/relay-backed remote access, paired-device auth, and Hermes feature parity inside Gini's structured task/permission/trace/control-plane architecture. By the end of v1, Gini should have the end-state system structure in place and should match the current Hermes Agent runtime capability set, even when Gini intentionally presents those capabilities through different UX primitives.
+**v1 target:** Finish the full v1 plan as a complete product foundation, not a partial preview. By the end of v1, Gini should have everything Hermes Agent currently has at the runtime-capability level, plus Gini's end-state architecture skeleton: local runtime, CLI, stable API/contracts, local web control plane, Expo/mobile control plane, paired-device auth, remote/push path, tasks, approvals, jobs, memory, skills, session search, traces, audit, permissions, connectors, toolsets, provider abstraction, delegation, MCP, messaging bridge, lanes, import/migration basics, and parity smoke/eval coverage. Gini may present these capabilities through different UX primitives than Hermes, but a Hermes user should not lose a major runtime capability by switching to Gini v1.
 
-**v2 target:** A production-grade personal agent operations layer that improves beyond Hermes rather than catching up: hardened production/sandbox promotion, rollback, stronger adversarial security, richer connector/auth UX, mature runtime self-improvement, eval/harness optimization, long-running reliability, and operational polish.
+**v2 target:** Start from completed v1 parity and improve beyond Hermes rather than catching up: hardened production/sandbox promotion, rollback, stronger adversarial security, richer connector/auth UX, mature runtime self-improvement, eval/harness optimization, long-running reliability, and operational polish.
 
 ### 12.1.1 v1 Hermes-parity requirement
 
-By the end of v1, Gini should have feature parity with the current Hermes Agent runtime feature set. This does not mean copying Hermes' interface shape. It means matching Hermes-class capabilities while expressing them through Gini's more inspectable, permissioned, task-centric, mobile-operable architecture.
+By the end of v1, Gini should have feature parity with the current Hermes Agent runtime feature set and the architecture skeleton needed for the larger Gini vision. v1 is not a teaser, prototype, or "mobile shell only" release. It is the point where the full v1 plan is complete: Hermes-equivalent runtime capabilities are present, Gini's task/permission/trace/control-plane architecture is in place, and future v2 work can improve beyond Hermes instead of finishing parity.
+
+This does not mean copying Hermes' interface shape. It means matching Hermes-class capabilities while expressing them through Gini's more inspectable, permissioned, task-centric, mobile-operable architecture.
 
 Minimum v1 Hermes-parity capabilities:
 - CLI power-user workflow: chat, single-shot task mode, status/doctor/config commands, and scriptable local control.
@@ -2753,6 +2755,8 @@ By the end of v1, a user can:
 9. Use Gini when away from the Mac through the production relay/push architecture once implemented.
 10. Use Hermes-equivalent runtime capabilities inside Gini: CLI workflow, memory, skills, session search, jobs, file/terminal/web/code tools, toolsets/tool gating, provider abstraction, delegation/subagents, MCP, messaging bridge, config/profile equivalent, and import/migration basics.
 11. Confirm through a Hermes-parity smoke/eval suite that switching from Hermes to Gini does not remove a major runtime capability, even if Gini's UX and integration breadth differ.
+12. Confirm that the v1 architecture skeleton is in place for future v2 expansion: stable runtime contracts, mobile/web clients over the same source-of-truth API, event stream, trace/audit substrate, permission enforcement boundary, lane-aware state, connector/plugin abstraction, provider abstraction, job scheduler, memory/skill governance, support/evidence bundles, and documented extension points.
+13. Treat any missing Hermes runtime capability as a v1 blocker unless explicitly documented as an intentional non-goal with an approved expansion path.
 
 ### 12.5 v2 production success criteria
 
@@ -3053,12 +3057,14 @@ Deliverables:
 - full v1 Hermes-parity smoke/eval coverage
 - install/upgrade/reset/uninstall tests for v1 surfaces
 - provider, MCP, delegation, messaging, mobile, relay, job, memory, skill, and session-search regression tests
+- architecture-readiness review for v2 expansion points: runtime API/contracts, event stream, trace/audit substrate, permission enforcement boundary, lane-aware state, connector/plugin abstraction, provider abstraction, job scheduler, memory/skill governance, support/evidence bundles, and extension documentation
 - support/evidence bundle for v1 failures
 - documentation for Hermes-equivalent workflows and where Gini intentionally differs
 
 Verification:
 - v1 release candidate passes the Hermes-parity suite
 - v1 release candidate passes install, launch, exercise, observability, recovery, and review gates
+- v1 release candidate passes architecture-readiness review for v2 expansion
 - no major Hermes runtime capability is missing without an explicit documented exception and expansion path
 - support/evidence bundle can diagnose failures across runtime, mobile, relay, messaging, MCP, and provider boundaries
 
