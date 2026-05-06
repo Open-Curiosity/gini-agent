@@ -12,8 +12,10 @@ import type {
   PairedDevice,
   PairingCode,
   PairingStatus,
+  PromotionProposal,
   RuntimeState,
   SkillRecord,
+  SnapshotRecord,
   Task,
   TraceRecord
 } from "./types";
@@ -55,7 +57,9 @@ export function createEmptyState(lane: Lane): RuntimeState {
     ],
     improvements: [],
     pairingCodes: [],
-    devices: []
+    devices: [],
+    promotions: [],
+    snapshots: []
   };
 }
 
@@ -346,6 +350,70 @@ export function findActiveDeviceByToken(state: RuntimeState, token: string): Pai
   return device;
 }
 
+export function createPromotionProposal(
+  state: RuntimeState,
+  proposal: Omit<PromotionProposal, "id" | "lane" | "status" | "createdAt" | "updatedAt">
+): PromotionProposal {
+  const at = now();
+  const item: PromotionProposal = {
+    id: id("promo"),
+    lane: state.lane,
+    status: "proposed",
+    createdAt: at,
+    updatedAt: at,
+    ...proposal
+  };
+  state.promotions.unshift(item);
+  addAudit(state, {
+    actor: "user",
+    action: "promotion.proposed",
+    target: item.id,
+    risk: "medium",
+    evidence: { candidateRef: item.candidateRef, evidencePath: item.evidencePath }
+  });
+  return item;
+}
+
+export function decidePromotion(state: RuntimeState, promotionId: string, decision: "approve" | "reject"): PromotionProposal {
+  const promotion = state.promotions.find((item) => item.id === promotionId);
+  if (!promotion) throw new Error(`Promotion proposal not found: ${promotionId}`);
+  if (promotion.status !== "proposed") throw new Error(`Promotion proposal is already ${promotion.status}`);
+  promotion.status = decision === "approve" ? "approved" : "rejected";
+  promotion.decidedAt = now();
+  promotion.updatedAt = promotion.decidedAt;
+  addAudit(state, {
+    actor: "user",
+    action: `promotion.${promotion.status}`,
+    target: promotion.id,
+    risk: "medium",
+    evidence: { candidateRef: promotion.candidateRef }
+  });
+  return promotion;
+}
+
+export function createSnapshotRecord(
+  state: RuntimeState,
+  snapshot: Omit<SnapshotRecord, "id" | "lane" | "createdAt" | "taskCount" | "auditCount">
+): SnapshotRecord {
+  const item: SnapshotRecord = {
+    id: id("snap"),
+    lane: state.lane,
+    createdAt: now(),
+    taskCount: state.tasks.length,
+    auditCount: state.audit.length,
+    ...snapshot
+  };
+  state.snapshots.unshift(item);
+  addAudit(state, {
+    actor: "user",
+    action: "snapshot.created",
+    target: item.id,
+    risk: "medium",
+    evidence: { path: item.path, reason: item.reason }
+  });
+  return item;
+}
+
 export function updateConnectorHealth(connector: ConnectorRecord): ConnectorRecord {
   connector.lastHealthAt = now();
   connector.health = connector.status === "configured" ? "healthy" : "unhealthy";
@@ -376,6 +444,8 @@ function normalizeState(lane: Lane, state: RuntimeState): RuntimeState {
   state.jobs ??= [];
   state.pairingCodes ??= [];
   state.devices ??= [];
+  state.promotions ??= [];
+  state.snapshots ??= [];
   expirePairingCodes(state);
   return state;
 }

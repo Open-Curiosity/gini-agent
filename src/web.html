@@ -72,7 +72,7 @@
       let state = null;
       let selectedTask = null;
       let tab = "task";
-      const tabs = ["task", "approvals", "audit", "memory", "skills", "jobs", "connectors", "improvements", "devices"];
+      const tabs = ["task", "approvals", "audit", "memory", "skills", "jobs", "connectors", "improvements", "devices", "promotions"];
       document.getElementById("submitTask").onclick = async () => {
         const input = document.getElementById("taskInput").value.trim();
         if (!input) return;
@@ -122,6 +122,10 @@
           panel.innerHTML = `<button onclick="createPairing()">Create Pairing Code</button><div id="pairingCode" class="muted"></div>${state.devices.map((item) => `<div class="item"><strong>${escapeHtml(item.name)}</strong> <span class="pill">${item.status}</span><p class="muted">${escapeHtml(item.id)} ${escapeHtml(item.lastSeenAt || "")}</p>${item.status === "active" ? `<button class="secondary" onclick="revokeDevice('${item.id}')">Revoke</button>` : ""}</div>`).join("") || "<p>No paired devices.</p>"}`;
           return;
         }
+        if (tab === "promotions") {
+          panel.innerHTML = state.promotions.map((item) => `<div class="item"><strong>${escapeHtml(item.candidateRef)}</strong> <span class="pill">${item.status}</span><p>${escapeHtml(item.summary)}</p><p class="muted">${escapeHtml(item.evidencePath || "")}</p><pre>${escapeHtml(item.rollbackPlan)}</pre>${item.status === "proposed" ? `<button onclick="approvePromotion('${item.id}')">Approve</button> <button class="secondary" onclick="rejectPromotion('${item.id}')">Reject</button>` : ""}</div>`).join("") || "<p>No promotion proposals.</p>";
+          return;
+        }
         const key = tab === "connectors" ? "connectors" : tab;
         panel.innerHTML = `<pre>${escapeHtml(JSON.stringify(state[key], null, 2))}</pre>`;
       }
@@ -134,6 +138,8 @@
         document.getElementById("pairingCode").textContent = `Code ${result.code} expires ${result.expiresAt}`;
       }
       async function revokeDevice(id) { await api(`/api/devices/${id}/revoke`, { method: "POST" }); await load(); }
+      async function approvePromotion(id) { await api(`/api/promotions/${id}/approve`, { method: "POST" }); await load(); }
+      async function rejectPromotion(id) { await api(`/api/promotions/${id}/reject`, { method: "POST" }); await load(); }
       function escapeHtml(value) { return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[char])); }
       load();
       setInterval(load, 2500);

@@ -2969,6 +2969,7 @@ Deliverables:
 - production/sandbox lane hardening
 - promotion proposal artifact
 - rollback plan artifact
+- lane-local snapshot create/list/restore primitives
 - migration/snapshot direction
 - reviewer-agent checklist
 - promotion UI in web/mobile
@@ -2978,6 +2979,7 @@ Verification:
 - failed gates preserve evidence
 - successful run produces promotion proposal
 - production install is not modified without approval
+- snapshot restore refuses cross-lane artifacts
 
 ### Phase 13: optional messaging bridge
 

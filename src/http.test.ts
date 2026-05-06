@@ -83,6 +83,26 @@ describe("runtime api", () => {
 
     expect(response.status).toBe(401);
   });
+
+  test("records promotion proposals without applying upgrades", async () => {
+    const config = testConfig("promotion");
+    const handler = createHandler(config);
+
+    const proposal = await call(handler, config, "/api/promotions", {
+      method: "POST",
+      body: JSON.stringify({
+        candidateRef: "commit-abc",
+        evidencePath: "/tmp/evidence.json",
+        summary: "Candidate passed sandbox smoke.",
+        rollbackPlan: "Restore snapshot snap_abc."
+      })
+    });
+    const rejected = await call(handler, config, `/api/promotions/${proposal.id}/reject`, { method: "POST" });
+
+    expect(rejected.status).toBe("rejected");
+    expect(rejected.candidateRef).toBe("commit-abc");
+    expect(readState(config.lane).audit.some((event) => event.action === "promotion.rejected")).toBe(true);
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

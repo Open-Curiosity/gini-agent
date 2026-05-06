@@ -54,6 +54,7 @@ This repo now includes a Bun TypeScript v0 implementation of the local runtime t
 - trace-backed improvement proposals for memory, skill, and job changes
 - evidence bundles for smoke/reviewer agents
 - paired-device auth and mobile bootstrap contracts for the future Expo app
+- lane-local snapshots and promotion proposal records for v2 promotion/rollback workflows
 - Hermes-inspired memory proposal flow and OpenClaw-inspired connector/skill scaffolding
 
 Run it locally:
@@ -85,6 +86,8 @@ bun run gini evidence
 bun run gini pairing
 bun run gini devices
 bun run gini mobile bootstrap
+bun run gini snapshot create "before trying candidate"
+bun run gini promotion propose HEAD /path/to/evidence.json "tested candidate in sandbox"
 bun run gini provider show
 ```
 

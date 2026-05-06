@@ -22,6 +22,8 @@ export type PairingStatus = "pending" | "claimed" | "expired" | "revoked";
 
 export type DeviceStatus = "active" | "revoked";
 
+export type PromotionStatus = "proposed" | "approved" | "rejected";
+
 export interface ProviderConfig {
   name: ProviderName;
   model: string;
@@ -54,6 +56,8 @@ export interface RuntimeState {
   improvements: ImprovementProposal[];
   pairingCodes: PairingCode[];
   devices: PairedDevice[];
+  promotions: PromotionProposal[];
+  snapshots: SnapshotRecord[];
 }
 
 export interface Task {
@@ -213,6 +217,29 @@ export interface PairedDevice {
   updatedAt: string;
   lastSeenAt?: string;
   revokedAt?: string;
+}
+
+export interface PromotionProposal {
+  id: string;
+  lane: Lane;
+  status: PromotionStatus;
+  candidateRef: string;
+  evidencePath?: string;
+  summary: string;
+  rollbackPlan: string;
+  createdAt: string;
+  updatedAt: string;
+  decidedAt?: string;
+}
+
+export interface SnapshotRecord {
+  id: string;
+  lane: Lane;
+  path: string;
+  reason: string;
+  createdAt: string;
+  taskCount: number;
+  auditCount: number;
 }
 
 export interface RuntimeStatus {

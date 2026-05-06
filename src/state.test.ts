@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createEmptyState, createImprovementProposal, createMemory, createTask, taskCounts } from "./state";
+import { createEmptyState, createImprovementProposal, createMemory, createPromotionProposal, createTask, decidePromotion, taskCounts } from "./state";
 
 describe("state primitives", () => {
   test("creates lane-aware task records", () => {
@@ -36,6 +36,19 @@ describe("state primitives", () => {
     expect(proposal.status).toBe("proposed");
     expect(state.improvements[0]?.id).toBe(proposal.id);
     expect(state.audit[0]?.action).toBe("improvement.proposed");
+  });
+
+  test("promotion proposals are explicit review records", () => {
+    const state = createEmptyState("sandbox");
+    const proposal = createPromotionProposal(state, {
+      candidateRef: "abc123",
+      evidencePath: "/tmp/evidence.json",
+      summary: "Promote tested candidate",
+      rollbackPlan: "Restore snapshot snap_1"
+    });
+    const approved = decidePromotion(state, proposal.id, "approve");
+    expect(approved.status).toBe("approved");
+    expect(state.audit.some((event) => event.action === "promotion.approved")).toBe(true);
   });
 
   test("task counts include all statuses", () => {

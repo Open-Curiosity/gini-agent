@@ -59,6 +59,10 @@ export function skillsDir(lane: Lane): string {
   return join(laneRoot(lane), "skills");
 }
 
+export function snapshotsDir(lane: Lane): string {
+  return join(laneRoot(lane), "snapshots");
+}
+
 export function defaultConfig(lane: Lane): RuntimeConfig {
   const providerName = process.env.GINI_PROVIDER === "openai" || process.env.GINI_PROVIDER === "codex"
     ? process.env.GINI_PROVIDER
@@ -83,6 +87,7 @@ export function loadConfig(lane: Lane): RuntimeConfig {
   ensureDir(traceDir(lane));
   ensureDir(logDir(lane));
   ensureDir(skillsDir(lane));
+  ensureDir(snapshotsDir(lane));
 
   const path = configPath(lane);
   if (!existsSync(path)) {

@@ -3,10 +3,10 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { createServer } from "node:net";
 import { spawn } from "node:child_process";
-import { configPath, loadConfig, parseLane, pidPath } from "./paths";
+import { configPath, loadConfig, parseLane, pidPath, snapshotsDir } from "./paths";
 import { install, resetLane, status } from "./http";
 import { normalizeProvider, providerHealth } from "./provider";
-import { readState, readTrace } from "./state";
+import { addAudit, createSnapshotRecord, mutateState, readState, readTrace, writeState } from "./state";
 import type { RuntimeConfig } from "./types";
 
 const args = Bun.argv.slice(2);
@@ -75,6 +75,14 @@ async function main(): Promise<void> {
       break;
     case "mobile":
       await mobile(config);
+      break;
+    case "promotion":
+    case "promotions":
+      await promotion(config);
+      break;
+    case "snapshot":
+    case "snapshots":
+      snapshot(config);
       break;
     case "provider":
       provider(config);
@@ -310,6 +318,47 @@ async function mobile(config: RuntimeConfig): Promise<void> {
   print(await api(config, "/api/mobile/bootstrap"));
 }
 
+async function promotion(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "propose") {
+    const [candidateRef, evidencePath, ...summaryParts] = restAfter(sub);
+    if (!candidateRef) throw new Error("Usage: gini promotion propose <candidate-ref> [evidence-path] [summary]");
+    print(await api(config, "/api/promotions", {
+      method: "POST",
+      body: JSON.stringify({
+        candidateRef,
+        evidencePath,
+        summary: summaryParts.join(" ") || `Promote candidate ${candidateRef}`,
+        rollbackPlan: "Create a lane snapshot before promotion and restore it if verification fails."
+      })
+    }));
+    return;
+  }
+  if (sub === "approve" || sub === "reject") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error(`Usage: gini promotion ${sub} <promotion-id>`);
+    print(await api(config, `/api/promotions/${id}/${sub}`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/promotions"));
+}
+
+function snapshot(config: RuntimeConfig): void {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "create") {
+    const reason = restAfter(sub).join(" ").trim() || "Manual snapshot";
+    print(createSnapshot(config, reason));
+    return;
+  }
+  if (sub === "restore") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error("Usage: gini snapshot restore <snapshot-id>");
+    print(restoreSnapshot(config, id));
+    return;
+  }
+  print(readState(config.lane).snapshots);
+}
+
 function provider(config: RuntimeConfig): void {
   const sub = cliArgs[1] ?? "show";
   if (sub === "set") {
@@ -364,6 +413,40 @@ function createEvidenceBundle(config: RuntimeConfig) {
   return { ok: true, path: outPath, taskCount: taskIds.length, auditEvents: state.audit.length, improvements: state.improvements.length };
 }
 
+function createSnapshot(config: RuntimeConfig, reason: string) {
+  mkdirSync(snapshotsDir(config.lane), { recursive: true });
+  let snapshotPath = "";
+  const record = mutateState(config.lane, (state) => {
+    snapshotPath = join(snapshotsDir(config.lane), `snapshot-${Date.now()}.json`);
+    return createSnapshotRecord(state, { path: snapshotPath, reason });
+  });
+  const state = readState(config.lane);
+  writeFileSync(snapshotPath, `${JSON.stringify({ createdAt: new Date().toISOString(), lane: config.lane, reason, state }, null, 2)}\n`);
+  return { ok: true, snapshotId: record.id, path: snapshotPath, reason };
+}
+
+function restoreSnapshot(config: RuntimeConfig, snapshotId: string) {
+  const current = readState(config.lane);
+  const record = current.snapshots.find((item) => item.id === snapshotId);
+  if (!record) throw new Error(`Snapshot not found: ${snapshotId}`);
+  if (!existsSync(record.path)) throw new Error(`Snapshot file missing: ${record.path}`);
+  const parsed = JSON.parse(readFileSync(record.path, "utf8")) as { lane: string; state: ReturnType<typeof readState> };
+  if (parsed.lane !== config.lane || parsed.state.lane !== config.lane) {
+    throw new Error(`Snapshot lane mismatch: expected ${config.lane}`);
+  }
+  writeState(config.lane, parsed.state);
+  mutateState(config.lane, (state) => {
+    addAudit(state, {
+      actor: "user",
+      action: "snapshot.restored",
+      target: snapshotId,
+      risk: "high",
+      evidence: { path: record.path }
+    });
+  });
+  return { ok: true, restored: snapshotId, lane: config.lane };
+}
+
 async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
   const started = await start(config);
   try {
@@ -393,6 +476,16 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
       body: JSON.stringify({ code: pairingResult.code, deviceName: "Smoke device" })
     });
     const mobileState = await apiWithToken(config, claimedDevice.token, "/api/mobile/bootstrap");
+    const snapshotResult = createSnapshot(config, "Smoke rollback baseline");
+    const promotionResult = await api(config, "/api/promotions", {
+      method: "POST",
+      body: JSON.stringify({
+        candidateRef: "smoke-candidate",
+        evidencePath: snapshotResult.path,
+        summary: "Smoke validates promotion proposal records.",
+        rollbackPlan: `Restore snapshot ${snapshotResult.snapshotId}`
+      })
+    });
     const finalState = await api(config, "/api/state");
     const bundle = createEvidenceBundle(config);
     print({
@@ -408,6 +501,8 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
       improvementId: proposal.id,
       pairedDeviceId: claimedDevice.device.id,
       mobileTaskCount: mobileState.tasks.length,
+      snapshotId: snapshotResult.snapshotId,
+      promotionId: promotionResult.id,
       connectorHealth: connectorHealth.health,
       traces: finalState.tasks.length,
       auditEvents: finalState.audit.length,
@@ -573,6 +668,8 @@ Usage:
   bun run gini pairing create|claim
   bun run gini devices list|revoke
   bun run gini mobile bootstrap
+  bun run gini promotions list|propose|approve|reject
+  bun run gini snapshots list|create|restore
   bun run gini provider show|set echo|openai|codex [model]
   bun run gini trace <task-id>
   bun run gini audit

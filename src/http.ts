@@ -10,8 +10,10 @@ import {
   createImprovementProposal,
   createMemory,
   createPairingCode,
+  createPromotionProposal,
   createSkill,
   claimPairingCode,
+  decidePromotion,
   findActiveDeviceByToken,
   mutateState,
   now,
@@ -91,7 +93,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/improvements\/([^/]+)\/reject$/, (_request, params) => json(reviewImprovement(config, params[0], "reject"))],
     ["GET", /^\/api\/devices$/, () => json(publicState(config).devices)],
     ["POST", /^\/api\/devices\/([^/]+)\/revoke$/, (_request, params) => json(revokePairedDevice(config, params[0]))],
-    ["POST", /^\/api\/pairing$/, async (request) => json(createPairing(config, await body(request)), 201)]
+    ["POST", /^\/api\/pairing$/, async (request) => json(createPairing(config, await body(request)), 201)],
+    ["GET", /^\/api\/promotions$/, () => json(readState(config.lane).promotions)],
+    ["POST", /^\/api\/promotions$/, async (request) => json(proposePromotion(config, await body(request)), 201)],
+    ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, (_request, params) => json(reviewPromotion(config, params[0], "approve"))],
+    ["POST", /^\/api\/promotions\/([^/]+)\/reject$/, (_request, params) => json(reviewPromotion(config, params[0], "reject"))]
   ];
 
   return async (request: Request) => {
@@ -253,6 +259,21 @@ function claimPairing(config: RuntimeConfig, input: Record<string, unknown>) {
 
 function revokePairedDevice(config: RuntimeConfig, deviceId: string) {
   return redactDevice(mutateState(config.lane, (state) => revokeDevice(state, deviceId)));
+}
+
+function proposePromotion(config: RuntimeConfig, input: Record<string, unknown>) {
+  const candidateRef = String(input.candidateRef ?? "");
+  if (!candidateRef) throw new Error("candidateRef is required.");
+  return mutateState(config.lane, (state) => createPromotionProposal(state, {
+    candidateRef,
+    evidencePath: typeof input.evidencePath === "string" && input.evidencePath ? input.evidencePath : undefined,
+    summary: String(input.summary ?? "Promotion candidate proposed for review."),
+    rollbackPlan: String(input.rollbackPlan ?? "Create a lane snapshot before promotion and restore it if verification fails.")
+  }));
+}
+
+function reviewPromotion(config: RuntimeConfig, promotionId: string, decision: "approve" | "reject") {
+  return mutateState(config.lane, (state) => decidePromotion(state, promotionId, decision));
 }
 
 function proposeImprovement(config: RuntimeConfig, input: Record<string, unknown>) {
