@@ -64,8 +64,9 @@ The ideal product promise:
 **Install an open source agent on your own computer. Control it from an app. Every action has a receipt.**
 
 Release interpretation:
-- v0 proves the local runtime, CLI, and local Next.js control surface.
-- v1 brings the app-based control plane and remote access.
+- v0 proves the durable local runtime trunk: CLI, local Next.js control surface, tasks, traces, audit, permissions, tools, jobs, memory/skills basics, lanes, connectors, and governed self-improvement primitives.
+- v1 completes the end-state system structure and reaches feature parity with the current Hermes Agent runtime feature set: CLI depth, persistent memory, skills, session search, cron/jobs, provider flexibility, toolsets/tool gating, delegation/subagents, MCP, messaging bridges, config/profile equivalents, migration/import basics, and mobile/remote control.
+- v2 is not a catch-up phase. v2 improves beyond Hermes in reliability, security, governance, mobile UX, connector/auth depth, production/sandbox promotion, rollback, evals, harness optimization, and long-running operational maturity.
 - Gini Computer, if pursued, is a separate product and is not part of this open source Gini Agent roadmap.
 
 ---
@@ -155,20 +156,29 @@ Early implementation may run only one dev lane, but config, paths, events, trace
 
 Later milestones should add dev/sandbox/production lanes, separate state paths, separate ports/sockets, separate logs/traces, separate credential namespaces, isolation tests, promotion artifacts, and rollback workflows.
 
-### v0 milestone ladder
+### v0 and v1 milestone ladder
 
-Split v0 into smaller milestones:
+Split v0 into smaller milestones that build the durable runtime trunk:
 
 - v0.1 Runtime skeleton
 - v0.2 Local Next.js control plane
 - v0.3 Tools with safety
 - v0.4 Jobs
-- v0.5 Memory and skills
+- v0.5 Memory, skills, and basic session search
 - v0.6 Lanes and closed-loop development harness
 - v0.7 Connector foundation
-- v1 App-based control plane and remote access
+- v0.8 Runtime self-improvement primitives
 
-Jobs should come before full memory/skills because jobs, traces, approvals, and task visibility prove the reliability layer before deeper agent-learning primitives are added.
+Then use v1 to complete Hermes parity and the end-state control structure:
+
+- v1.0 Mobile contract and Expo app foundation
+- v1.1 Remote relay and notifications
+- v1.2 Hermes-parity runtime completion: provider breadth, toolsets, delegation/subagents, MCP, session search depth, config/profile equivalents, and import/migration basics
+- v1.3 Mobile-first UX expansion across tasks, approvals, memory, skills, jobs, traces, connectors, and runtime health
+- v1.4 Messaging bridge parity for at least the most important channels, without making messaging the source of truth
+- v1.5 v1 parity hardening, smoke/eval coverage, and public-release readiness
+
+Jobs should come before full memory/skills because jobs, traces, approvals, and task visibility prove the reliability layer before deeper agent-learning primitives are added. By the end of v1, Gini should not be less capable than Hermes; it should expose Hermes-class capability through Gini's task/permission/trace/mobile architecture.
 
 ### Phase 0 architecture decisions
 
@@ -2510,11 +2520,33 @@ Build Gini in layers.
 
 The first implementation target is an installable Mac runtime with CLI and a local Next.js control plane. The future app should consume the same runtime/control contracts, but it should not block the first runtime milestones.
 
-**v0 target:** A local macOS agent runtime that can be installed/run on a user-controlled Mac, inspected through CLI and local Next.js, execute tasks safely, show traces/audit, run jobs, and expose contracts that future mobile can consume.
+**v0 target:** A local macOS agent runtime that can be installed/run on a user-controlled Mac, inspected through CLI and local Next.js, execute tasks safely, show traces/audit, run jobs, expose memory/skills/session-search basics, support lane-aware development, and expose contracts that future mobile can consume.
 
-**v1 target:** The same runtime controlled from an Expo/mobile app, with task cards, approval cards, job/memory/trace views, push/relay-backed remote access, and paired-device auth.
+**v1 target:** The same runtime controlled from an Expo/mobile app, with task cards, approval cards, job/memory/skill/trace views, push/relay-backed remote access, paired-device auth, and Hermes feature parity inside Gini's structured task/permission/trace/control-plane architecture. By the end of v1, Gini should have the end-state system structure in place and should match the current Hermes Agent runtime capability set, even when Gini intentionally presents those capabilities through different UX primitives.
 
-**v2 target:** A production-grade personal agent operations layer with hardened production/sandbox promotion, rollback, real connector breadth, optional messaging bridges, mature runtime self-improvement, and reliable remote/mobile operation.
+**v2 target:** A production-grade personal agent operations layer that improves beyond Hermes rather than catching up: hardened production/sandbox promotion, rollback, stronger adversarial security, richer connector/auth UX, mature runtime self-improvement, eval/harness optimization, long-running reliability, and operational polish.
+
+### 12.1.1 v1 Hermes-parity requirement
+
+By the end of v1, Gini should have feature parity with the current Hermes Agent runtime feature set. This does not mean copying Hermes' interface shape. It means matching Hermes-class capabilities while expressing them through Gini's more inspectable, permissioned, task-centric, mobile-operable architecture.
+
+Minimum v1 Hermes-parity capabilities:
+- CLI power-user workflow: chat, single-shot task mode, status/doctor/config commands, and scriptable local control.
+- Persistent memory: user, project, organization, device/environment, preference, and temporary memory scopes with retrieval across sessions.
+- Skills/procedures: load, search, inspect, validate, create proposal, update proposal, test, disable, and rollback/governance where feasible.
+- Session search: searchable prior conversations, task traces, summaries, source links, and transcript/trace citations.
+- Cron/jobs: prompt-based jobs, script-only jobs, create/list/update/pause/resume/remove/run, context injection, delivery targets, logs, missed-run detection, replay, and cost history.
+- Tools: file read/write/search/patch/list, terminal/process management, web search/extraction, code execution/sandboxed Python, browser automation where required for parity, and structured error handling.
+- Toolsets/tool gating: named tool groups, per-task/job/skill availability, visible tool state, and permission mediation.
+- Model/provider abstraction: OpenRouter/OpenAI-compatible provider support, direct providers where practical, local-provider path where practical, provider health, model switching, model capability metadata, and cost tracking.
+- Delegation/subagents: isolated subagent tasks, concurrency/depth limits, tool-scope restrictions, trace linkage, cost attribution, cancellation, and parent verification of side-effect claims.
+- MCP/plugin integration: add/list/remove/test MCP servers, selected exposed tools, plugin health, permission mediation, and failure isolation.
+- Messaging gateway/bridge: at least the most important Hermes-style messaging paths for remote input/notifications, with channel health and links back to Gini's source-of-truth task/control plane.
+- Config/profile equivalent: lane-aware config/profile management that covers the same practical use cases as Hermes profiles while preserving Gini's production/sandbox/dev isolation model.
+- Migration/import basics: at minimum, read-only inspection or guided import for useful Hermes/OpenClaw state such as memories, skills, jobs, profiles, and connector references, without mutating existing installs by default.
+- Runtime self-improvement: memory, skill, job, prompt, or workflow improvement proposals sourced from traces and user feedback, reviewable before application.
+
+v1 release is not complete if a Hermes user loses a major runtime capability by switching to Gini. The acceptable tradeoff is that some capabilities may be narrower in integration breadth, but they must be present in the Gini architecture with clear paths to expand. v2 should begin from parity and move beyond Hermes in reliability, governance, security, UX, and operational maturity.
 
 ### 12.2 v0 milestone ladder
 
@@ -2605,15 +2637,17 @@ Success criteria:
 - missed-run condition is inspectable
 - user can pause/resume/force-run a job
 
-#### v0.5 Memory and skills
+#### v0.5 Memory, skills, and basic session search
 
 Goal:
-Hermes-like agent improvement primitives become visible and governed.
+Hermes-like agent improvement and recall primitives become visible and governed.
 
 Includes:
 - memory store
 - memory proposals
 - memory review/edit/delete
+- basic session transcript/task trace indexing
+- session search with source task/session links
 - basic skill/procedure format
 - skill list/read/validate
 - governed skill updates
@@ -2623,6 +2657,7 @@ Success criteria:
 - agent can propose a memory from a task
 - user can approve/edit/reject it
 - approved memory can be retrieved later
+- user can search prior sessions/tasks and open the cited source trace or transcript
 - skill can be loaded for a toy task
 - skill/memory changes are inspectable and reversible where possible
 

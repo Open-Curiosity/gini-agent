@@ -1,12 +1,12 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { spawn } from "node:child_process";
-import { configPath, loadConfig, parseLane, pidPath, snapshotsDir } from "./paths";
-import { install, resetLane, status } from "./http";
+import { configPath, loadConfig, parseLane, pidPath } from "./paths";
+import { install, resetLane, status } from "./domain/runtime";
 import { normalizeProvider, providerHealth } from "./provider";
-import { addAudit, createSnapshotRecord, mutateState, readState, readTrace, writeState } from "./state";
+import { readState, readTrace } from "./state";
+import { createEvidenceBundle, createSnapshot, restoreSnapshot } from "./domain/harness";
 import type { RuntimeConfig } from "./types";
 
 const args = Bun.argv.slice(2);
@@ -386,65 +386,6 @@ function trace(config: RuntimeConfig): void {
 
 function evidence(config: RuntimeConfig): void {
   print(createEvidenceBundle(config));
-}
-
-function createEvidenceBundle(config: RuntimeConfig) {
-  const state = readState(config.lane);
-  const taskIds = state.tasks.map((task) => task.id);
-  const traces = Object.fromEntries(taskIds.map((taskId) => [taskId, readTrace(config.lane, taskId)]));
-  const bundle = {
-    createdAt: new Date().toISOString(),
-    lane: config.lane,
-    config: {
-      port: config.port,
-      stateRoot: config.stateRoot,
-      logRoot: config.logRoot,
-      workspaceRoot: config.workspaceRoot,
-      provider: providerHealth(config)
-    },
-    status: status(config),
-    state,
-    traces
-  };
-  const outDir = join(config.stateRoot, "evidence");
-  mkdirSync(outDir, { recursive: true });
-  const outPath = join(outDir, `bundle-${Date.now()}.json`);
-  writeFileSync(outPath, `${JSON.stringify(bundle, null, 2)}\n`);
-  return { ok: true, path: outPath, taskCount: taskIds.length, auditEvents: state.audit.length, improvements: state.improvements.length };
-}
-
-function createSnapshot(config: RuntimeConfig, reason: string) {
-  mkdirSync(snapshotsDir(config.lane), { recursive: true });
-  let snapshotPath = "";
-  const record = mutateState(config.lane, (state) => {
-    snapshotPath = join(snapshotsDir(config.lane), `snapshot-${Date.now()}.json`);
-    return createSnapshotRecord(state, { path: snapshotPath, reason });
-  });
-  const state = readState(config.lane);
-  writeFileSync(snapshotPath, `${JSON.stringify({ createdAt: new Date().toISOString(), lane: config.lane, reason, state }, null, 2)}\n`);
-  return { ok: true, snapshotId: record.id, path: snapshotPath, reason };
-}
-
-function restoreSnapshot(config: RuntimeConfig, snapshotId: string) {
-  const current = readState(config.lane);
-  const record = current.snapshots.find((item) => item.id === snapshotId);
-  if (!record) throw new Error(`Snapshot not found: ${snapshotId}`);
-  if (!existsSync(record.path)) throw new Error(`Snapshot file missing: ${record.path}`);
-  const parsed = JSON.parse(readFileSync(record.path, "utf8")) as { lane: string; state: ReturnType<typeof readState> };
-  if (parsed.lane !== config.lane || parsed.state.lane !== config.lane) {
-    throw new Error(`Snapshot lane mismatch: expected ${config.lane}`);
-  }
-  writeState(config.lane, parsed.state);
-  mutateState(config.lane, (state) => {
-    addAudit(state, {
-      actor: "user",
-      action: "snapshot.restored",
-      target: snapshotId,
-      risk: "high",
-      evidence: { path: record.path }
-    });
-  });
-  return { ok: true, restored: snapshotId, lane: config.lane };
 }
 
 async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {

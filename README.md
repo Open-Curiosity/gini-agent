@@ -41,6 +41,10 @@ The master plan lives at:
 
 `docs/master-plan.md`
 
+The current module boundaries are documented at:
+
+`docs/architecture.md`
+
 ## v0 Developer Slice
 
 This repo now includes a Bun TypeScript v0 implementation of the local runtime trunk:

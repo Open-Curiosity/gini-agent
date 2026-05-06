@@ -1,4 +1,6 @@
-import { createHandler, install, runDueJobs, writePid } from "./http";
+import { createHandler, writePid } from "./http";
+import { runDueJobs } from "./domain/jobs";
+import { install } from "./domain/runtime";
 import { loadConfig, parseLane } from "./paths";
 import { appendLog } from "./state";
 

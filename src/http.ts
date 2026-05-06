@@ -1,29 +1,22 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { RuntimeConfig } from "./types";
 import { decideApproval, submitTask } from "./agent";
-import { configPath, pidPath } from "./paths";
+import { pidPath } from "./paths";
 import {
-  addAudit,
-  appendTrace,
-  createJob,
-  createImprovementProposal,
-  createMemory,
-  createPairingCode,
-  createPromotionProposal,
   createSkill,
-  claimPairingCode,
-  decidePromotion,
-  findActiveDeviceByToken,
   mutateState,
-  now,
   readState,
   readTrace,
-  revokeDevice,
-  taskCounts,
-  updateConnectorHealth
 } from "./state";
-import { providerHealth } from "./provider";
+import { mobileBootstrap, publicState } from "./api/views";
+import { checkConnector } from "./domain/connectors";
+import { createScheduledJob, runJobNow, updateJobStatus } from "./domain/jobs";
+import { createMemoryFromInput, updateMemory } from "./domain/memory";
+import { proposeImprovement, reviewImprovement } from "./domain/improvements";
+import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./domain/pairing";
+import { proposePromotion, reviewPromotion } from "./domain/promotions";
+import { status } from "./domain/runtime";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
@@ -46,15 +39,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/audit$/, () => json(readState(config.lane).audit)],
     ["GET", /^\/api\/memory$/, () => json(readState(config.lane).memories)],
     ["POST", /^\/api\/memory$/, async (request) => {
-      const input = await body(request);
-      return json(mutateState(config.lane, (state) => createMemory(state, {
-        content: String(input.content ?? ""),
-        scope: "project",
-        confidence: 1,
-        status: String(input.status ?? "active") === "proposed" ? "proposed" : "active",
-        sensitivity: "normal",
-        provenance: "Created by user"
-      })), 201);
+      return json(createMemoryFromInput(config, await body(request)), 201);
     }],
     ["POST", /^\/api\/memory\/([^/]+)\/approve$/, (_request, params) => json(updateMemory(config, params[0], "active"))],
     ["POST", /^\/api\/memory\/([^/]+)\/reject$/, (_request, params) => json(updateMemory(config, params[0], "rejected"))],
@@ -73,14 +58,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }],
     ["GET", /^\/api\/jobs$/, () => json(readState(config.lane).jobs)],
     ["POST", /^\/api\/jobs$/, async (request) => {
-      const input = await body(request);
-      const intervalSeconds = Math.max(1, Number(input.intervalSeconds ?? 60));
-      return json(mutateState(config.lane, (state) => createJob(state, {
-        name: String(input.name ?? "Untitled job"),
-        prompt: String(input.prompt ?? ""),
-        intervalSeconds,
-        nextRunAt: new Date(Date.now() + intervalSeconds * 1000).toISOString()
-      })), 201);
+      return json(createScheduledJob(config, await body(request)), 201);
     }],
     ["POST", /^\/api\/jobs\/([^/]+)\/run$/, (_request, params) => json(runJobNow(config, params[0]))],
     ["POST", /^\/api\/jobs\/([^/]+)\/pause$/, (_request, params) => json(updateJobStatus(config, params[0], "paused"))],
@@ -127,257 +105,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   };
 }
 
-export function status(config: RuntimeConfig) {
-  const state = readState(config.lane);
-  const missedJobs = state.jobs.filter((job) => job.status === "active" && new Date(job.nextRunAt).getTime() + job.intervalSeconds * 1000 < Date.now()).length;
-  return {
-    ok: true,
-    lane: config.lane,
-    port: config.port,
-    stateRoot: config.stateRoot,
-    pid: process.pid,
-    taskCounts: taskCounts(state.tasks),
-    pendingApprovals: state.approvals.filter((approval) => approval.status === "pending").length,
-    activeJobs: state.jobs.filter((job) => job.status === "active").length,
-    missedJobs,
-    connectors: state.connectors.length,
-    provider: providerHealth(config)
-  };
-}
-
-export function install(config: RuntimeConfig): void {
-  writeFileSync(configPath(config.lane), `${JSON.stringify(config, null, 2)}\n`);
-  readState(config.lane);
-}
-
-export function resetLane(config: RuntimeConfig): void {
-  rmSync(config.stateRoot, { recursive: true, force: true });
-  install(config);
-}
-
-export function runDueJobs(config: RuntimeConfig): void {
-  const due = mutateState(config.lane, (state) => {
-    const dateNow = Date.now();
-    return state.jobs.filter((job) => job.status === "active" && new Date(job.nextRunAt).getTime() <= dateNow);
-  });
-  for (const job of due) runJobNow(config, job.id);
-}
-
-function runJobNow(config: RuntimeConfig, jobId: string) {
-  const job = mutateState(config.lane, (state) => {
-    const item = state.jobs.find((candidate) => candidate.id === jobId);
-    if (!item) throw new Error(`Job not found: ${jobId}`);
-    item.lastRunAt = now();
-    item.runCount += 1;
-    item.nextRunAt = new Date(Date.now() + item.intervalSeconds * 1000).toISOString();
-    item.updatedAt = now();
-    return item;
-  });
-  const task = submitTask(config, job.prompt, job.id);
-  mutateState(config.lane, (state) => {
-    const item = state.jobs.find((candidate) => candidate.id === job.id);
-    if (!item) return;
-    item.taskIds.unshift(task.id);
-    item.lastSuccessAt = now();
-    item.lastError = undefined;
-    item.status = "active";
-  });
-  appendTrace(config.lane, task.id, { type: "job", message: "Job spawned task", data: { jobId } });
-  return { jobId, taskId: task.id };
-}
-
-function updateJobStatus(config: RuntimeConfig, jobId: string, statusValue: "active" | "paused") {
-  return mutateState(config.lane, (state) => {
-    const job = state.jobs.find((candidate) => candidate.id === jobId);
-    if (!job) throw new Error(`Job not found: ${jobId}`);
-    job.status = statusValue;
-    job.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: `job.${statusValue}`,
-      target: jobId,
-      risk: "low"
-    });
-    return job;
-  });
-}
-
-function updateMemory(config: RuntimeConfig, memoryId: string, statusValue: "active" | "rejected") {
-  return mutateState(config.lane, (state) => {
-    const memory = state.memories.find((candidate) => candidate.id === memoryId);
-    if (!memory) throw new Error(`Memory not found: ${memoryId}`);
-    memory.status = statusValue;
-    memory.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: `memory.${statusValue === "active" ? "approved" : "rejected"}`,
-      target: memoryId,
-      risk: "medium",
-      taskId: memory.sourceTaskId
-    });
-    return memory;
-  });
-}
-
-function checkConnector(config: RuntimeConfig, connectorId: string) {
-  return mutateState(config.lane, (state) => {
-    const connector = state.connectors.find((candidate) => candidate.id === connectorId);
-    if (!connector) throw new Error(`Connector not found: ${connectorId}`);
-    updateConnectorHealth(connector);
-    addAudit(state, {
-      actor: "runtime",
-      action: "connector.health",
-      target: connectorId,
-      risk: "low",
-      evidence: { health: connector.health }
-    });
-    return connector;
-  });
-}
-
-function createPairing(config: RuntimeConfig, input: Record<string, unknown>) {
-  const ttlSeconds = Math.min(3600, Math.max(60, Number(input.ttlSeconds ?? 600)));
-  const created = mutateState(config.lane, (state) => createPairingCode(state, ttlSeconds));
-  return {
-    id: created.pairing.id,
-    lane: created.pairing.lane,
-    code: created.code,
-    expiresAt: created.pairing.expiresAt
-  };
-}
-
-function claimPairing(config: RuntimeConfig, input: Record<string, unknown>) {
-  const code = String(input.code ?? "");
-  const deviceName = String(input.deviceName ?? "Mobile device");
-  if (!code) throw new Error("Pairing code is required.");
-  const claimed = mutateState(config.lane, (state) => claimPairingCode(state, code, deviceName));
-  return {
-    device: redactDevice(claimed.device),
-    token: claimed.token
-  };
-}
-
-function revokePairedDevice(config: RuntimeConfig, deviceId: string) {
-  return redactDevice(mutateState(config.lane, (state) => revokeDevice(state, deviceId)));
-}
-
-function proposePromotion(config: RuntimeConfig, input: Record<string, unknown>) {
-  const candidateRef = String(input.candidateRef ?? "");
-  if (!candidateRef) throw new Error("candidateRef is required.");
-  return mutateState(config.lane, (state) => createPromotionProposal(state, {
-    candidateRef,
-    evidencePath: typeof input.evidencePath === "string" && input.evidencePath ? input.evidencePath : undefined,
-    summary: String(input.summary ?? "Promotion candidate proposed for review."),
-    rollbackPlan: String(input.rollbackPlan ?? "Create a lane snapshot before promotion and restore it if verification fails.")
-  }));
-}
-
-function reviewPromotion(config: RuntimeConfig, promotionId: string, decision: "approve" | "reject") {
-  return mutateState(config.lane, (state) => decidePromotion(state, promotionId, decision));
-}
-
-function proposeImprovement(config: RuntimeConfig, input: Record<string, unknown>) {
-  const taskId = typeof input.sourceTaskId === "string" ? input.sourceTaskId : undefined;
-  const trace = taskId ? readTrace(config.lane, taskId) : [];
-  const kind = input.kind === "skill" || input.kind === "job" ? input.kind : "memory";
-  const title = String(input.title ?? `${kind} improvement`);
-  const payload = normalizeImprovementPayload(kind, input.payload);
-
-  return mutateState(config.lane, (state) => createImprovementProposal(state, {
-    kind,
-    title,
-    rationale: String(input.rationale ?? "Proposed from runtime evidence."),
-    sourceTaskId: taskId,
-    sourceTraceIds: Array.isArray(input.sourceTraceIds)
-      ? input.sourceTraceIds.map(String)
-      : trace.slice(-5).map((item) => item.id),
-    payload
-  }));
-}
-
-function reviewImprovement(config: RuntimeConfig, proposalId: string, decision: "approve" | "reject") {
-  return mutateState(config.lane, (state) => {
-    const proposal = state.improvements.find((candidate) => candidate.id === proposalId);
-    if (!proposal) throw new Error(`Improvement proposal not found: ${proposalId}`);
-    if (proposal.status !== "proposed" && proposal.status !== "approved") {
-      throw new Error(`Improvement proposal is already ${proposal.status}`);
-    }
-
-    if (decision === "reject") {
-      proposal.status = "rejected";
-      proposal.updatedAt = now();
-      addAudit(state, {
-        actor: "user",
-        action: "improvement.rejected",
-        target: proposal.id,
-        risk: "medium",
-        taskId: proposal.sourceTaskId
-      });
-      return proposal;
-    }
-
-    proposal.status = "approved";
-    proposal.updatedAt = now();
-    const appliedTargetId = applyImprovement(state, proposal);
-    proposal.appliedTargetId = appliedTargetId;
-    proposal.status = "applied";
-    proposal.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: "improvement.applied",
-      target: proposal.id,
-      risk: "medium",
-      taskId: proposal.sourceTaskId,
-      evidence: { kind: proposal.kind, appliedTargetId }
-    });
-    return proposal;
-  });
-}
-
-function applyImprovement(state: ReturnType<typeof readState>, proposal: ReturnType<typeof proposeImprovement>): string {
-  if (proposal.kind === "memory") {
-    const memory = createMemory(state, {
-      content: String(proposal.payload.content ?? proposal.title),
-      scope: proposal.payload.scope === "user" || proposal.payload.scope === "device" || proposal.payload.scope === "temporary" ? proposal.payload.scope : "project",
-      sourceTaskId: proposal.sourceTaskId,
-      confidence: Number(proposal.payload.confidence ?? 0.75),
-      status: "active",
-      sensitivity: proposal.payload.sensitivity === "sensitive" ? "sensitive" : "normal",
-      provenance: `Applied improvement ${proposal.id}`
-    });
-    return memory.id;
-  }
-
-  if (proposal.kind === "skill") {
-    const skill = createSkill(state, {
-      name: String(proposal.payload.name ?? proposal.title),
-      description: String(proposal.payload.description ?? proposal.rationale),
-      trigger: String(proposal.payload.trigger ?? proposal.payload.name ?? proposal.title),
-      steps: Array.isArray(proposal.payload.steps) ? proposal.payload.steps.map(String) : [proposal.rationale],
-      requiredTools: Array.isArray(proposal.payload.requiredTools) ? proposal.payload.requiredTools.map(String) : [],
-      requiredPermissions: Array.isArray(proposal.payload.requiredPermissions) ? proposal.payload.requiredPermissions.map(String) : [],
-      status: proposal.payload.status === "trusted" ? "trusted" : "draft"
-    });
-    return skill.id;
-  }
-
-  const intervalSeconds = Math.max(1, Number(proposal.payload.intervalSeconds ?? 3600));
-  const job = createJob(state, {
-    name: String(proposal.payload.name ?? proposal.title),
-    prompt: String(proposal.payload.prompt ?? proposal.rationale),
-    intervalSeconds,
-    nextRunAt: new Date(Date.now() + intervalSeconds * 1000).toISOString()
-  });
-  return job.id;
-}
-
-function normalizeImprovementPayload(kind: "memory" | "skill" | "job", payload: unknown): Record<string, unknown> {
-  const value = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-  if (kind === "memory") return { content: String(value.content ?? ""), ...value };
-  if (kind === "skill") return { name: String(value.name ?? "Draft skill"), steps: Array.isArray(value.steps) ? value.steps : [], ...value };
-  return { name: String(value.name ?? "Suggested job"), prompt: String(value.prompt ?? ""), ...value };
-}
-
 async function body(request: Request): Promise<Record<string, unknown>> {
   if (!request.body) return {};
   return (await request.json()) as Record<string, unknown>;
@@ -387,10 +114,7 @@ function authorized(request: Request, config: RuntimeConfig): boolean {
   const header = request.headers.get("authorization") ?? "";
   const queryToken = new URL(request.url).searchParams.get("token");
   const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : queryToken;
-  if (bearer === config.token) return true;
-  if (!bearer) return false;
-  const device = mutateState(config.lane, (state) => findActiveDeviceByToken(state, bearer));
-  return Boolean(device);
+  return authorizedBearer(config, bearer ?? undefined);
 }
 
 function json(value: unknown, statusCode = 200): Response {
@@ -407,51 +131,4 @@ function webApp(config: RuntimeConfig): Response {
 
 export function writePid(config: RuntimeConfig): void {
   writeFileSync(pidPath(config.lane), String(process.pid));
-}
-
-function mobileBootstrap(config: RuntimeConfig) {
-  const state = publicState(config);
-  return {
-    runtime: status(config),
-    lane: config.lane,
-    tasks: state.tasks,
-    approvals: state.approvals,
-    memories: state.memories,
-    skills: state.skills,
-    jobs: state.jobs,
-    connectors: state.connectors,
-    improvements: state.improvements,
-    devices: state.devices
-  };
-}
-
-function publicState(config: RuntimeConfig) {
-  const state = readState(config.lane);
-  return {
-    ...state,
-    pairingCodes: state.pairingCodes.map((pairing) => ({
-      id: pairing.id,
-      lane: pairing.lane,
-      status: pairing.status,
-      createdAt: pairing.createdAt,
-      expiresAt: pairing.expiresAt,
-      claimedAt: pairing.claimedAt,
-      claimedByDeviceId: pairing.claimedByDeviceId
-    })),
-    devices: state.devices.map(redactDevice)
-  };
-}
-
-function redactDevice(device: ReturnType<typeof readState>["devices"][number]) {
-  return {
-    id: device.id,
-    lane: device.lane,
-    name: device.name,
-    status: device.status,
-    scopes: device.scopes,
-    createdAt: device.createdAt,
-    updatedAt: device.updatedAt,
-    lastSeenAt: device.lastSeenAt,
-    revokedAt: device.revokedAt
-  };
 }
