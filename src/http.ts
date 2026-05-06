@@ -1,5 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { writeFileSync } from "node:fs";
 import type { RuntimeConfig } from "./types";
 import { cancelTask, decideApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
@@ -165,7 +164,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       return json({ error: "Not found" }, 404);
     }
-    return webApp(config);
+    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
+      return json({
+        name: "gini-runtime",
+        lane: config.lane,
+        port: config.port,
+        message: "Gini runtime API. The Next.js control plane runs on a separate port; see `gini status`.",
+        ui_url_hint: process.env.GINI_WEB_URL ?? null
+      });
+    }
+    return json({ error: "Not found" }, 404);
   };
 }
 
@@ -216,14 +224,6 @@ function eventStream(config: RuntimeConfig): Response {
       connection: "keep-alive"
     }
   });
-}
-
-function webApp(config: RuntimeConfig): Response {
-  const html = readFileSync(join(import.meta.dir, "web.html"), "utf8")
-    .replaceAll("__GINI_TOKEN__", config.token)
-    .replaceAll("__GINI_LANE__", config.lane)
-    .replaceAll("__GINI_PORT__", String(config.port));
-  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
 export function writePid(config: RuntimeConfig): void {

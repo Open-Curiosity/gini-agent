@@ -11,7 +11,10 @@
     "runtime": "bun run src/runtime.ts",
     "smoke": "bun run src/cli.ts smoke",
     "test": "bun test",
-    "typecheck": "bunx tsc --noEmit"
+    "typecheck": "bunx tsc --noEmit && cd web && bunx tsc --noEmit",
+    "web:dev": "cd web && bun run dev",
+    "web:build": "cd web && bun run build",
+    "web:start": "cd web && bun run start"
   },
   "devDependencies": {
     "@types/bun": "latest",

@@ -1,3 +1,7 @@
 .gini/
 node_modules/
 .DS_Store
+web/.next/
+web/.turbo/
+web/next-env.d.ts
+web/tsconfig.tsbuildinfo

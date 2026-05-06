@@ -2,7 +2,8 @@
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { spawn } from "node:child_process";
-import { configPath, loadConfig, parseLane, pidPath } from "./paths";
+import { join } from "node:path";
+import { configPath, loadConfig, parseLane, pidPath, projectRoot } from "./paths";
 import { install, resetLane, status } from "./domain/runtime";
 import { normalizeProvider, providerHealth } from "./provider";
 import { readState, readTrace } from "./state";
@@ -13,9 +14,11 @@ const args = Bun.argv.slice(2);
 const cliArgs = stripGlobalArgs(args);
 const command = cliArgs[0] ?? "help";
 const ephemeralSmoke = command === "smoke" && !hasFlag(args, "--lane") && !process.env.GINI_LANE;
+const noWeb = hasFlag(args, "--no-web") || ephemeralSmoke;
 applyGlobalEnvOverrides(args, ephemeralSmoke);
 const lane = ephemeralSmoke ? `smoke-${process.pid}-${crypto.randomUUID().slice(0, 6)}` : parseLane(args);
 const config = loadConfig(lane);
+const webPort = Number(process.env.GINI_WEB_PORT ?? flagValue(args, "--web-port") ?? 3000);
 
 async function main(): Promise<void> {
   switch (command) {
@@ -168,13 +171,50 @@ async function start(config: RuntimeConfig): Promise<boolean> {
   child.unref();
   for (let attempt = 0; attempt < 50; attempt += 1) {
     if (await isRunning(config)) {
-      print({ started: true, url: url(config), lane: config.lane });
+      const webStarted = noWeb ? null : await startWeb(config);
+      const banner: Record<string, unknown> = { started: true, url: url(config), lane: config.lane };
+      if (webStarted) banner.webUrl = webStarted.webUrl;
+      print(banner);
       return true;
     }
     await Bun.sleep(100);
   }
   throw new Error("Runtime did not become healthy within 5 seconds.");
 }
+
+async function startWeb(config: RuntimeConfig): Promise<{ webUrl: string } | null> {
+  const webRoot = join(projectRoot(), "web");
+  if (!existsSync(join(webRoot, "package.json"))) return null;
+  const port = await availablePort(webPort);
+  const built = existsSync(join(webRoot, ".next", "BUILD_ID"));
+  const command = built ? ["run", "start", "--", "-p", String(port)] : ["run", "dev", "--", "-p", String(port)];
+  const child = spawn("bun", command, {
+    cwd: webRoot,
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      GINI_RUNTIME_URL: url(config),
+      GINI_TOKEN: config.token,
+      GINI_LANE: config.lane,
+      PORT: String(port)
+    }
+  });
+  child.unref();
+  if (typeof child.pid === "number") {
+    writeFileSync(join(config.stateRoot, "web.pid"), String(child.pid));
+  }
+  const webUrl = `http://127.0.0.1:${port}`;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      const response = await fetch(webUrl, { redirect: "manual" });
+      if (response.status < 500) return { webUrl };
+    } catch { /* keep waiting */ }
+    await Bun.sleep(150);
+  }
+  return { webUrl };
+}
+
 
 async function availablePort(preferred: number): Promise<number> {
   for (let port = preferred; port < preferred + 100; port += 1) {
@@ -198,17 +238,31 @@ function stop(config: RuntimeConfig): void {
 }
 
 function stopRuntime(config: RuntimeConfig) {
+  const webResult = stopWeb(config);
   const path = pidPath(config.lane);
   if (!existsSync(path)) {
-    return { stopped: false, reason: "No pid file", lane: config.lane };
+    return { stopped: false, reason: "No pid file", lane: config.lane, web: webResult };
   }
   const pid = Number(readFileSync(path, "utf8"));
   try {
     process.kill(pid, "SIGTERM");
     rmSync(path, { force: true });
-    return { stopped: true, pid, lane: config.lane };
+    return { stopped: true, pid, lane: config.lane, web: webResult };
   } catch (error) {
-    return { stopped: false, pid, error: error instanceof Error ? error.message : String(error) };
+    return { stopped: false, pid, error: error instanceof Error ? error.message : String(error), web: webResult };
+  }
+}
+
+function stopWeb(config: RuntimeConfig): { stopped: boolean; pid?: number; reason?: string } {
+  const path = join(config.stateRoot, "web.pid");
+  if (!existsSync(path)) return { stopped: false, reason: "No web pid" };
+  const pid = Number(readFileSync(path, "utf8"));
+  try {
+    process.kill(pid, "SIGTERM");
+    rmSync(path, { force: true });
+    return { stopped: true, pid };
+  } catch (error) {
+    return { stopped: false, pid, reason: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -840,6 +894,12 @@ async function waitForTask(config: RuntimeConfig, taskId: string): Promise<void>
 async function doctor(config: RuntimeConfig) {
   const running = await isRunning(config);
   const state = readState(config.lane);
+  const webPidFile = join(config.stateRoot, "web.pid");
+  const webPid = existsSync(webPidFile) ? Number(readFileSync(webPidFile, "utf8")) : undefined;
+  const webRunning = webPid ? processAlive(webPid) : false;
+  const recommendations: string[] = [];
+  if (!running) recommendations.push("Run `bun run gini start` to launch the local runtime.");
+  if (running && !webRunning && !noWeb) recommendations.push("Web pid not found — re-run `gini start` to relaunch the Next.js control plane.");
   return {
     ok: true,
     bun: Bun.version,
@@ -847,12 +907,17 @@ async function doctor(config: RuntimeConfig) {
     running,
     stateRoot: config.stateRoot,
     port: config.port,
+    web: { running: webRunning, pid: webPid ?? null },
     tokenConfigured: Boolean(config.token),
     provider: providerHealth(config),
     tasks: state.tasks.length,
     pendingApprovals: state.approvals.filter((item) => item.status === "pending").length,
-    recommendations: running ? [] : ["Run `bun run gini start` to launch the local runtime."]
+    recommendations
   };
+}
+
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
 async function remoteOrLocalStatus(config: RuntimeConfig) {
@@ -912,10 +977,11 @@ function restAfter(marker: string): string[] {
 function stripGlobalArgs(values: string[]): string[] {
   const stripped: string[] = [];
   for (let index = 0; index < values.length; index += 1) {
-    if (["--lane", "--state-root", "--log-root", "--port"].includes(values[index] ?? "")) {
+    if (["--lane", "--state-root", "--log-root", "--port", "--web-port"].includes(values[index] ?? "")) {
       index += 1;
       continue;
     }
+    if (values[index] === "--no-web") continue;
     stripped.push(values[index]);
   }
   return stripped;
@@ -995,7 +1061,9 @@ Global options:
   --lane <name>        Select a persistent lane. Smoke uses an ephemeral lane when omitted.
   --state-root <path>  Override state root for tests or parallel agents.
   --log-root <path>    Override log root for tests or parallel agents.
-  --port <number>      Preferred localhost port. Start scans upward if busy.
+  --port <number>      Preferred runtime localhost port. Start scans upward if busy.
+  --web-port <number>  Preferred Next.js port (default 3000).
+  --no-web             Don't launch the Next.js control plane (smoke uses this automatically).
 `);
 }
 

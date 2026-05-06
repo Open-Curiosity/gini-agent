@@ -364,6 +364,19 @@ describe("runtime api", () => {
     expect(messages).toHaveLength(2);
   });
 
+  test("returns a JSON pointer at GET / instead of static HTML", async () => {
+    const config = testConfig("root-pointer");
+    const handler = createHandler(config);
+
+    const response = await handler(new Request(`http://127.0.0.1:${config.port}/`));
+    const value = (await response.json()) as { name?: string; lane?: string; message?: string };
+
+    expect(response.headers.get("content-type") ?? "").toContain("application/json");
+    expect(value.name).toBe("gini-runtime");
+    expect(value.lane).toBe(config.lane);
+    expect(String(value.message)).toContain("Next.js");
+  });
+
   test("reports V1 readiness from runtime evidence", async () => {
     const config = testConfig("readiness");
     const handler = createHandler(config);

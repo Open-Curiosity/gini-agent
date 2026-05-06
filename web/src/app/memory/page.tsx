@@ -1,0 +1,115 @@
+"use client";
+
+import { useState } from "react";
+import { useMutation } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { PageHeader, EmptyState } from "@/components/PageHeader";
+import { StatusPill } from "@/components/StatusPill";
+import { api } from "@/lib/api";
+import { useInvalidate, useMemories } from "@/lib/queries";
+import type { MemoryRecord } from "@/lib/types";
+
+const SCOPES = ["all", "user", "project", "device", "temporary"] as const;
+
+export default function MemoryPage() {
+  const memories = useMemories();
+  const [scope, setScope] = useState<typeof SCOPES[number]>("all");
+  const [content, setContent] = useState("");
+  const invalidate = useInvalidate();
+
+  const create = useMutation({
+    mutationFn: (text: string) =>
+      api<MemoryRecord>("/memory", { method: "POST", body: JSON.stringify({ content: text, status: "active" }) }),
+    onSuccess: () => {
+      setContent("");
+      toast.success("Memory added");
+      invalidate(["memory", "state"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  const decide = useMutation({
+    mutationFn: ({ id, op }: { id: string; op: "approve" | "reject" }) =>
+      api<MemoryRecord>(`/memory/${id}/${op}`, { method: "POST" }),
+    onSuccess: () => invalidate(["memory", "state", "audit"])
+  });
+
+  const archive = useMutation({
+    mutationFn: (id: string) => api<MemoryRecord>(`/memory/${id}`, { method: "DELETE" }),
+    onSuccess: () => invalidate(["memory", "state"])
+  });
+
+  const filtered = (memories.data ?? []).filter((m) => scope === "all" || m.scope === scope);
+
+  return (
+    <>
+      <PageHeader title="Memory" description="Approve, reject, archive memories with provenance" />
+      <div className="flex-1 space-y-4 overflow-auto p-6">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Add memory</CardTitle>
+            <CardDescription>Active by default. Use proposals from tasks for governed flow.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            <Textarea value={content} onChange={(event) => setContent(event.target.value)} placeholder="What should Gini remember?" className="min-h-20" />
+            <Button disabled={!content.trim() || create.isPending} onClick={() => create.mutate(content.trim())}>
+              {create.isPending ? "Adding…" : "Add memory"}
+            </Button>
+          </CardContent>
+        </Card>
+
+        <Tabs value={scope} onValueChange={(value) => setScope(value as typeof scope)}>
+          <TabsList>
+            {SCOPES.map((value) => (
+              <TabsTrigger key={value} value={value} className="capitalize text-xs">
+                {value}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+          {SCOPES.map((value) => (
+            <TabsContent key={value} value={value} className="mt-4">
+              {filtered.length === 0 ? (
+                <EmptyState title="No memories" />
+              ) : (
+                <div className="grid gap-3 lg:grid-cols-2">
+                  {filtered.map((memory) => (
+                    <Card key={memory.id}>
+                      <CardHeader>
+                        <div className="flex items-start justify-between gap-2">
+                          <CardTitle className="text-sm font-medium">{memory.scope}</CardTitle>
+                          <StatusPill value={memory.status} />
+                        </div>
+                        <CardDescription className="font-mono text-[11px]">{memory.id}</CardDescription>
+                      </CardHeader>
+                      <CardContent className="space-y-2">
+                        <p className="text-sm">{memory.content}</p>
+                        <p className="font-mono text-[10px] text-muted-foreground">
+                          conf {memory.confidence.toFixed(2)} · {memory.provenance}
+                          {memory.lastUsedAt ? ` · last used ${new Date(memory.lastUsedAt).toLocaleString()}` : ""}
+                          {memory.sourceTaskId ? ` · task ${memory.sourceTaskId}` : ""}
+                        </p>
+                        {memory.status === "proposed" ? (
+                          <div className="flex gap-2">
+                            <Button size="sm" disabled={decide.isPending} onClick={() => decide.mutate({ id: memory.id, op: "approve" })}>Approve</Button>
+                            <Button size="sm" variant="outline" disabled={decide.isPending} onClick={() => decide.mutate({ id: memory.id, op: "reject" })}>Reject</Button>
+                          </div>
+                        ) : null}
+                        {memory.status === "active" ? (
+                          <Button size="sm" variant="outline" disabled={archive.isPending} onClick={() => archive.mutate(memory.id)}>Archive</Button>
+                        ) : null}
+                      </CardContent>
+                    </Card>
+                  ))}
+                </div>
+              )}
+            </TabsContent>
+          ))}
+        </Tabs>
+      </div>
+    </>
+  );
+}
