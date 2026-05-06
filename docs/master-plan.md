@@ -65,7 +65,7 @@ The ideal product promise:
 
 Release interpretation:
 - v0 proves the durable local runtime trunk: CLI, local Next.js control surface, tasks, traces, audit, permissions, tools, jobs, memory/skills basics, lanes, connectors, and governed self-improvement primitives.
-- v1 completes the end-state system structure and reaches feature parity with the current Hermes Agent runtime feature set: CLI depth, persistent memory, skills, session search, cron/jobs, provider flexibility, toolsets/tool gating, delegation/subagents, MCP, messaging bridges, config/profile equivalents, migration/import basics, and mobile/remote control.
+- v1 completes the end-state system structure and reaches feature parity with the current Hermes Agent runtime feature set: CLI depth, persistent memory, skills, session search, cron/jobs, provider flexibility, toolsets/tool gating, delegation/subagents, MCP, messaging bridges, config/profile equivalents, migration/import basics, and the stable architecture/contracts needed for the future app and end-state product.
 - v2 is not a catch-up phase. v2 improves beyond Hermes in reliability, security, governance, mobile UX, connector/auth depth, production/sandbox promotion, rollback, evals, harness optimization, and long-running operational maturity.
 - Gini Computer, if pursued, is a separate product and is not part of this open source Gini Agent roadmap.
 
@@ -171,14 +171,12 @@ Split v0 into smaller milestones that build the durable runtime trunk:
 
 Then use v1 to complete Hermes parity and the end-state control structure:
 
-- v1.0 Mobile contract and Expo app foundation
-- v1.1 Remote relay and notifications
-- v1.2 Hermes-parity runtime completion: provider breadth, toolsets, delegation/subagents, MCP, session search depth, config/profile equivalents, and import/migration basics
-- v1.3 Mobile-first UX expansion across tasks, approvals, memory, skills, jobs, traces, connectors, and runtime health
-- v1.4 Messaging bridge parity for at least the most important channels, without making messaging the source of truth
-- v1.5 v1 parity hardening, smoke/eval coverage, and public-release readiness
+- v1.0 Architecture skeleton and contract hardening for the end-state product, without building the iOS/Expo app
+- v1.1 Hermes-parity runtime completion: provider breadth, toolsets, delegation/subagents, MCP, session search depth, config/profile equivalents, and import/migration basics
+- v1.2 Messaging bridge parity for at least the most important Hermes-style channels, without making messaging the source of truth
+- v1.3 v1 parity hardening, smoke/eval coverage, and public-release readiness
 
-Jobs should come before full memory/skills because jobs, traces, approvals, and task visibility prove the reliability layer before deeper agent-learning primitives are added. By the end of v1, Gini should not be less capable than Hermes; it should expose Hermes-class capability through Gini's task/permission/trace/mobile architecture.
+Jobs should come before full memory/skills because jobs, traces, approvals, and task visibility prove the reliability layer before deeper agent-learning primitives are added. By the end of v1, Gini should not be less capable than Hermes; it should expose Hermes-class capability through Gini's task/permission/trace/control-plane architecture. The iOS/Expo mobile app is explicitly post-v1.
 
 ### Phase 0 architecture decisions
 
@@ -1132,6 +1130,13 @@ v0 primary:
 - local Next.js control plane for task, approval, job, trace, memory, and runtime inspection
 
 v1 primary:
+- Hermes runtime feature parity
+- stable local runtime API/contracts and event stream
+- local Next.js control plane as the primary v1 human/control surface
+- architecture skeleton for future app, pairing, relay, push, mobile cards, and richer remote control
+- no iOS/Expo mobile app implementation in v1
+
+Post-v1 / v2 primary:
 - Expo/mobile companion app
 - paired-device auth
 - remote relay/push path so the phone works wherever the user is
@@ -1158,15 +1163,15 @@ Initial setup:
 6. User runs a first task.
 7. Gini shows task status, trace/log evidence, and any approval requests.
 
-The target experience is that people can install Gini Agent, download/connect the app, and have it work without buying a dedicated device.
+The v1 target experience is that people can install Gini Agent on their own Mac and operate it through CLI and the local Next.js control plane. The future app should connect to the same runtime contracts after v1; it should not be required for v1.
 
 ---
 
 ## 5. Core Product Surfaces
 
-### 5.1 Phone App: Primary Control Plane
+### 5.1 Control Plane Surfaces
 
-In v0, these same product surfaces should first be exposed through the local Next.js control plane so coding agents can test them with browser automation. In v1, the Expo/mobile app becomes the primary human control surface.
+In v0 and v1, these product surfaces should be exposed through the local Next.js control plane so coding agents can test them with browser automation and users can operate Gini without a mobile app. The Expo/mobile app is post-v1 and should consume the same runtime contracts once the v1 architecture is stable.
 
 Tabs:
 1. Home
@@ -1769,10 +1774,10 @@ Flow:
 
 The v0 first-run path may be technical. It is meant to prove the runtime and control contracts before consumer onboarding is built.
 
-### 7.1.1 v1 mobile pairing for BYO Mac
+### 7.1.1 Post-v1 mobile pairing for BYO Mac
 
 Goal:
-Once the mobile app exists, a user can pair the phone with an already running Mac runtime without changing the core runtime architecture.
+After v1 has stabilized the runtime contracts, a later iOS/Expo app can pair with an already running Mac runtime without changing the core runtime architecture. This flow is not required for v1.
 
 Flow:
 1. User starts Gini on their Mac.
@@ -2522,15 +2527,15 @@ The first implementation target is an installable Mac runtime with CLI and a loc
 
 **v0 target:** A local macOS agent runtime that can be installed/run on a user-controlled Mac, inspected through CLI and local Next.js, execute tasks safely, show traces/audit, run jobs, expose memory/skills/session-search basics, support lane-aware development, and expose contracts that future mobile can consume.
 
-**v1 target:** Finish the full v1 plan as a complete product foundation, not a partial preview. By the end of v1, Gini should have everything Hermes Agent currently has at the runtime-capability level, plus Gini's end-state architecture skeleton: local runtime, CLI, stable API/contracts, local web control plane, Expo/mobile control plane, paired-device auth, remote/push path, tasks, approvals, jobs, memory, skills, session search, traces, audit, permissions, connectors, toolsets, provider abstraction, delegation, MCP, messaging bridge, lanes, import/migration basics, and parity smoke/eval coverage. Gini may present these capabilities through different UX primitives than Hermes, but a Hermes user should not lose a major runtime capability by switching to Gini v1.
+**v1 target:** Finish the full v1 plan as a complete product foundation, not a partial preview. By the end of v1, Gini should have everything Hermes Agent currently has at the runtime-capability level, plus Gini's end-state architecture skeleton: local runtime, CLI, stable API/contracts, local web control plane, future app/control-plane contracts, task/event model, tasks, approvals, jobs, memory, skills, session search, traces, audit, permissions, connectors, toolsets, provider abstraction, delegation, MCP, messaging bridge, lanes, import/migration basics, and parity smoke/eval coverage. Gini may present these capabilities through different UX primitives than Hermes, but a Hermes user should not lose a major runtime capability by switching to Gini v1. The iOS/Expo app is not part of v1.
 
-**v2 target:** Start from completed v1 parity and improve beyond Hermes rather than catching up: hardened production/sandbox promotion, rollback, stronger adversarial security, richer connector/auth UX, mature runtime self-improvement, eval/harness optimization, long-running reliability, and operational polish.
+**v2 target:** Start from completed v1 parity and improve beyond Hermes rather than catching up: iOS/Expo app, paired-device auth, remote/push path, hardened production/sandbox promotion, rollback, stronger adversarial security, richer connector/auth UX, mature runtime self-improvement, eval/harness optimization, long-running reliability, and operational polish.
 
 ### 12.1.1 v1 Hermes-parity requirement
 
-By the end of v1, Gini should have feature parity with the current Hermes Agent runtime feature set and the architecture skeleton needed for the larger Gini vision. v1 is not a teaser, prototype, or "mobile shell only" release. It is the point where the full v1 plan is complete: Hermes-equivalent runtime capabilities are present, Gini's task/permission/trace/control-plane architecture is in place, and future v2 work can improve beyond Hermes instead of finishing parity.
+By the end of v1, Gini should have feature parity with the current Hermes Agent runtime feature set and the architecture skeleton needed for the larger Gini vision. v1 is not a teaser, prototype, or "mobile shell only" release. It is the point where the full v1 plan is complete: Hermes-equivalent runtime capabilities are present, Gini's task/permission/trace/control-plane architecture is in place, and future v2 work can improve beyond Hermes instead of finishing parity. The iOS/Expo app is post-v1; v1 should define the contracts that app will later consume, not build the app itself.
 
-This does not mean copying Hermes' interface shape. It means matching Hermes-class capabilities while expressing them through Gini's more inspectable, permissioned, task-centric, mobile-operable architecture.
+This does not mean copying Hermes' interface shape. It means matching Hermes-class capabilities while expressing them through Gini's more inspectable, permissioned, task-centric, control-plane architecture.
 
 Minimum v1 Hermes-parity capabilities:
 - CLI power-user workflow: chat, single-shot task mode, status/doctor/config commands, and scriptable local control.
@@ -2744,31 +2749,36 @@ Avoid initially:
 ### 12.4 v1 success criteria
 
 By the end of v1, a user can:
-1. Pair phone with the Mac runtime.
-2. Chat or speak to Gini from the phone.
-3. See task progress from the phone.
-4. Approve or deny risky actions from structured mobile cards.
+1. Install and run Gini on a user-controlled Mac.
+2. Operate Gini through the CLI and local Next.js control plane.
+3. Submit tasks and see task progress through local control surfaces.
+4. Approve or deny risky actions through structured local web/CLI approval flows.
 5. Browse and edit memory.
 6. Browse, inspect, validate, and approve/reject skill changes.
-7. Browse jobs and receive failure notifications.
+7. Browse jobs and receive visible failure status through local control surfaces and configured messaging channels where available.
 8. Review trace/audit summaries in a readable form.
-9. Use Gini when away from the Mac through the production relay/push architecture once implemented.
-10. Use Hermes-equivalent runtime capabilities inside Gini: CLI workflow, memory, skills, session search, jobs, file/terminal/web/code tools, toolsets/tool gating, provider abstraction, delegation/subagents, MCP, messaging bridge, config/profile equivalent, and import/migration basics.
-11. Confirm through a Hermes-parity smoke/eval suite that switching from Hermes to Gini does not remove a major runtime capability, even if Gini's UX and integration breadth differ.
-12. Confirm that the v1 architecture skeleton is in place for future v2 expansion: stable runtime contracts, mobile/web clients over the same source-of-truth API, event stream, trace/audit substrate, permission enforcement boundary, lane-aware state, connector/plugin abstraction, provider abstraction, job scheduler, memory/skill governance, support/evidence bundles, and documented extension points.
-13. Treat any missing Hermes runtime capability as a v1 blocker unless explicitly documented as an intentional non-goal with an approved expansion path.
+9. Use Hermes-equivalent runtime capabilities inside Gini: CLI workflow, memory, skills, session search, jobs, file/terminal/web/code tools, toolsets/tool gating, provider abstraction, delegation/subagents, MCP, messaging bridge, config/profile equivalent, and import/migration basics.
+10. Confirm through a Hermes-parity smoke/eval suite that switching from Hermes to Gini does not remove a major runtime capability, even if Gini's UX and integration breadth differ.
+11. Confirm that the v1 architecture skeleton is in place for future v2 expansion: stable runtime contracts, future app/control-plane contracts, event stream, trace/audit substrate, permission enforcement boundary, lane-aware state, connector/plugin abstraction, provider abstraction, job scheduler, memory/skill governance, support/evidence bundles, and documented extension points.
+12. Treat any missing Hermes runtime capability as a v1 blocker unless explicitly documented as an intentional non-goal with an approved expansion path.
+
+Explicit v1 non-goal:
+- Do not build the iOS/Expo mobile app in v1. v1 should make the app possible by stabilizing the runtime contracts, event model, local control plane, permission model, and trace/audit substrate.
 
 ### 12.5 v2 production success criteria
 
 v2 starts from v1 Hermes parity. It is not a catch-up milestone. A user can:
-1. Run production Gini as a daily-driver lane while coding agents test sandbox lanes.
-2. Promote a tested candidate with an evidence-backed proposal and rollback plan.
-3. Recover from a failed upgrade without losing state, traces, or audit history.
-4. Use multiple real connectors with scoped credential storage, visible health, revocation, and operational recovery.
-5. Use optional messaging bridges without making them the source of truth.
-6. Inspect, approve, reject, and roll back runtime self-improvement changes across memories, skills, jobs, prompts, workflow templates, and harness material.
-7. Operate remotely with clear degraded/offline behavior.
-8. Benefit from beyond-Hermes reliability, governance, security, mobile UX, eval/harness optimization, data-egress controls, and long-running operational maturity.
+1. Pair an iOS/Expo app with the Mac runtime.
+2. Chat or speak to Gini from the phone.
+3. See task progress and approve/deny risky actions from structured mobile cards.
+4. Use Gini remotely through paired-device auth, relay/push, and clear degraded/offline behavior.
+5. Run production Gini as a daily-driver lane while coding agents test sandbox lanes.
+6. Promote a tested candidate with an evidence-backed proposal and rollback plan.
+7. Recover from a failed upgrade without losing state, traces, or audit history.
+8. Use multiple real connectors with scoped credential storage, visible health, revocation, and operational recovery.
+9. Use optional messaging bridges without making them the source of truth.
+10. Inspect, approve, reject, and roll back runtime self-improvement changes across memories, skills, jobs, prompts, workflow templates, and harness material.
+11. Benefit from beyond-Hermes reliability, governance, security, mobile UX, eval/harness optimization, data-egress controls, and long-running operational maturity.
 
 ---
 
@@ -2788,7 +2798,7 @@ Deliverables:
 - minimal permission/audit/trace substrate design
 - lane identity design
 - Next.js control-plane direction
-- mobile contract direction
+- future app/control-plane contract direction
 
 Required ADRs:
 - Mac process model
@@ -2955,47 +2965,24 @@ Verification:
 - rejected proposal has no side effect
 - approved proposal applies the target change and records audit evidence
 
-### Phase 9: v1.0 mobile contract and Expo app foundation
+### Phase 9: v1.0 architecture skeleton and contract hardening
 
 Deliverables:
-- stable mobile API contract
-- pairing/auth design
-- paired-device token issuance and revocation
-- mobile bootstrap endpoint backed by runtime state
-- Expo app shell
-- task list/detail
-- chat UI skeleton
-- approval card skeleton
-- job/memory/skill/trace summary skeleton
-- remote relay/push architecture design
+- stable runtime API/contracts for CLI, local Next.js, future mobile clients, messaging bridges, and test harnesses
+- event stream contract for tasks, approvals, jobs, memory, skills, connectors, traces, audit, runtime health, and future mobile updates
+- local Next.js control plane completeness for v1 user-facing flows
+- future app contract direction without implementing the iOS/Expo app
+- future pairing/remote/relay contract direction without implementing the production mobile path
+- architecture-readiness checklist for the end-state product
 
 Verification:
-- app or simulator pairs with runtime
-- app can list tasks and task detail
-- app can send basic task request
-- app can approve/deny simulated permission request
-- app can browse job, memory, skill, and trace summaries from runtime state
-- mobile uses runtime contracts rather than separate state
-- revoked device tokens cannot access the mobile contract
+- CLI and local web operate through the same runtime source-of-truth contracts
+- event stream can drive local web and automated smoke tests
+- future mobile/app requirements are represented in contracts, not hardcoded into a mobile-only implementation
+- no iOS/Expo app shell is required or built for v1
+- architecture-readiness checklist has explicit pass/fail evidence
 
-### Phase 10: v1.1 remote relay and notifications
-
-Deliverables:
-- relay threat model implemented enough for product use
-- push notification path
-- remote reachability path
-- E2EE or equivalent sensitive payload protection where feasible
-- relay outage/degraded behavior
-- notification routing for approvals, job failures, connector failures, and runtime health
-
-Verification:
-- user can receive approval/job notifications away from Mac
-- phone can reach Mac runtime remotely through secure channel
-- relay cannot approve actions by itself
-- local mode still works if relay is down
-- notification payloads link back to authoritative runtime state
-
-### Phase 11: v1.2 Hermes-parity runtime completion
+### Phase 10: v1.1 Hermes-parity runtime completion
 
 Deliverables:
 - provider breadth: OpenRouter/OpenAI-compatible, direct providers where practical, and local-provider path where practical
@@ -3014,61 +3001,67 @@ Verification:
 - migration/import never mutates existing Hermes/OpenClaw installs by default
 - parity smoke/eval suite passes before v1 release
 
-### Phase 12: v1.3 mobile-first UX expansion
-
-Deliverables:
-- polished task cards
-- permission cards
-- memory browser/editor
-- skill browser/editor/proposal review
-- job list/detail
-- connector and runtime health views
-- trace/audit summary views
-- notification deep links
-- voice input when ready
-
-Verification:
-- user can operate core Gini flows from phone
-- approval UX is clearer than chat prompts
-- job failure notification links to evidence
-- raw traces are summarized safely for mobile
-- skills and memory are governable from the mobile/control-plane UX
-
-### Phase 13: v1.4 messaging bridge parity
+### Phase 11: v1.2 messaging bridge parity
 
 Deliverables:
 - at least one high-priority Hermes-style messaging bridge, such as Telegram or iMessage
-- notification forwarding
+- notification forwarding through the messaging bridge where practical
 - inbound message/task creation
 - voice message support where the chosen channel makes it practical
-- task links back to mobile app or local web view
+- task links back to local web control plane
 - channel health and failed-send retry/logging
 
 Verification:
 - messaging channel can send/receive simple messages
 - messaging channel can create or update a task without becoming the source of truth
-- rich tasks still open in the native/web control plane
+- rich tasks still open in the local web control plane
 - channel failure is visible
 - messaging is not the source of truth
 
-### Phase 14: v1.5 parity hardening and public-release readiness
+### Phase 12: v1.3 parity hardening and public-release readiness
 
 Deliverables:
 - full v1 Hermes-parity smoke/eval coverage
 - install/upgrade/reset/uninstall tests for v1 surfaces
-- provider, MCP, delegation, messaging, mobile, relay, job, memory, skill, and session-search regression tests
-- architecture-readiness review for v2 expansion points: runtime API/contracts, event stream, trace/audit substrate, permission enforcement boundary, lane-aware state, connector/plugin abstraction, provider abstraction, job scheduler, memory/skill governance, support/evidence bundles, and extension documentation
+- provider, MCP, delegation, messaging, job, memory, skill, session-search, local web, API, event-stream, trace, audit, and permission regression tests
+- architecture-readiness review for v2 expansion points: runtime API/contracts, future app/control-plane contracts, event stream, trace/audit substrate, permission enforcement boundary, lane-aware state, connector/plugin abstraction, provider abstraction, job scheduler, memory/skill governance, support/evidence bundles, and extension documentation
 - support/evidence bundle for v1 failures
-- documentation for Hermes-equivalent workflows and where Gini intentionally differs
+- documentation for Hermes-equivalent workflows, v1 local control surfaces, future app contracts, and where Gini intentionally differs
 
 Verification:
 - v1 release candidate passes the Hermes-parity suite
 - v1 release candidate passes install, launch, exercise, observability, recovery, and review gates
 - v1 release candidate passes architecture-readiness review for v2 expansion
 - no major Hermes runtime capability is missing without an explicit documented exception and expansion path
-- support/evidence bundle can diagnose failures across runtime, mobile, relay, messaging, MCP, and provider boundaries
+- no iOS/Expo app is required for v1 release readiness
+- support/evidence bundle can diagnose failures across runtime, local web, messaging, MCP, provider, job, memory, skill, trace, audit, and permission boundaries
 
-### Phase 15: v2 beyond-Hermes hardening and operations
+### Phase 13: v2 iOS/Expo app, pairing, relay, and mobile UX
+
+Deliverables:
+- Expo app shell backed by v1 runtime contracts
+- paired-device auth implementation
+- paired-device token issuance and revocation
+- mobile bootstrap endpoint backed by runtime state
+- task list/detail
+- chat/voice UI
+- approval cards
+- job/memory/skill/trace summary views
+- remote relay/push implementation
+- notification deep links
+- relay outage/degraded behavior
+
+Verification:
+- app or simulator pairs with runtime
+- app can list tasks and task detail
+- app can send basic task request
+- app can approve/deny permission requests
+- app can browse job, memory, skill, and trace summaries from runtime state
+- mobile uses runtime contracts rather than separate state
+- revoked device tokens cannot access the mobile contract
+- local mode still works if relay is down
+
+### Phase 14: v2 beyond-Hermes hardening and operations
 
 Deliverables:
 - production/sandbox promotion workflow implemented end-to-end
@@ -3177,16 +3170,16 @@ Hermes advantage:
 
 Our advantage:
 - v1 Hermes feature parity inside a more operable system structure
-- mobile-first control plane
+- local Next.js control plane first, with future mobile control plane enabled by stable contracts
 - structured auth/permission UX
 - governed memory and skills
 - task/job observability
 - trace/audit/cost receipts for every important action
 - harness trace/optimization infrastructure
-- app/runtime pairing
+- app/runtime pairing architecture after v1
 
 Message:
-Hermes proves the runtime primitives people want. Gini should match those primitives by v1, then make them visible, governable, mobile-operable, and reliable enough to trust for long-running work.
+Hermes proves the runtime primitives people want. Gini should match those primitives by v1, then make them visible, governable, easier to operate, and reliable enough to trust for long-running work. The iOS/Expo app comes after the v1 parity and architecture foundation are complete.
 
 ### 15.3 Against generic chatbots
 
@@ -3238,7 +3231,7 @@ This section intentionally excludes questions already resolved in Section 0.1.
 
 Resolved defaults:
 - v0 is a BYO Mac developer/power-user runtime.
-- v1 is the app-based control-plane and remote-access product track.
+- v1 is Hermes runtime feature parity plus the end-state architecture skeleton, operated through CLI and local Next.js. The iOS/Expo app, paired-device mobile control, and production remote/push path are post-v1.
 - Gini Computer / appliance packaging is a separate product concept, not part of this roadmap.
 
 Open later:
