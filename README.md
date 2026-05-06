@@ -45,6 +45,10 @@ The current module boundaries are documented at:
 
 `docs/architecture.md`
 
+The V1 local runtime readiness map is documented at:
+
+`docs/v1-readiness.md`
+
 ## v0 Developer Slice
 
 This repo now includes a Bun TypeScript v0 implementation of the local runtime trunk:
@@ -100,6 +104,8 @@ bun run gini import inspect hermes ~/.hermes
 bun run gini snapshot create "before trying candidate"
 bun run gini promotion propose HEAD /path/to/evidence.json "tested candidate in sandbox"
 bun run gini provider show
+bun run gini parity hermes
+bun run gini readiness v1
 ```
 
 Use Codex OAuth as the model provider:
