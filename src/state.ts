@@ -7,6 +7,7 @@ import type {
   DeviceStatus,
   ImportReport,
   ImprovementProposal,
+  JobRunRecord,
   JobRecord,
   Lane,
   MemoryRecord,
@@ -26,7 +27,8 @@ import type {
   ToolRecord,
   ToolsetRecord,
   TraceRecord,
-  NotificationRecord
+  NotificationRecord,
+  RuntimeEvent
 } from "./types";
 import { ensureDir, laneRoot, logDir, statePath, traceDir } from "./paths";
 
@@ -78,7 +80,9 @@ export function createEmptyState(lane: Lane): RuntimeState {
     profiles: [defaultProfile(lane, at)],
     activeProfileId: "profile_default",
     relays: [],
-    notifications: []
+    notifications: [],
+    events: [],
+    jobRuns: []
   };
 }
 
@@ -148,6 +152,18 @@ export function appendLog(lane: Lane, message: string, data?: Record<string, unk
   );
 }
 
+export function appendEvent(state: RuntimeState, event: Omit<RuntimeEvent, "id" | "lane" | "at">): RuntimeEvent {
+  const item: RuntimeEvent = {
+    id: id("event"),
+    lane: state.lane,
+    at: now(),
+    ...event
+  };
+  state.events.unshift(item);
+  state.events = state.events.slice(0, 1000);
+  return item;
+}
+
 export function taskCounts(tasks: Task[]): Record<Task["status"], number> {
   return {
     queued: tasks.filter((task) => task.status === "queued").length,
@@ -167,6 +183,15 @@ export function addAudit(state: RuntimeState, event: Omit<AuditEvent, "id" | "la
     ...event
   };
   state.audit.unshift(audit);
+  appendEvent(state, {
+    kind: "runtime",
+    action: audit.action,
+    target: audit.target,
+    taskId: audit.taskId,
+    risk: audit.risk,
+    summary: audit.action,
+    data: audit.evidence
+  });
   return audit;
 }
 
@@ -235,7 +260,7 @@ export function createMemory(state: RuntimeState, memory: Omit<MemoryRecord, "id
   return item;
 }
 
-export function createSkill(state: RuntimeState, skill: Omit<SkillRecord, "id" | "lane" | "createdAt" | "updatedAt" | "version">): SkillRecord {
+export function createSkill(state: RuntimeState, skill: Omit<SkillRecord, "id" | "lane" | "createdAt" | "updatedAt" | "version" | "tests" | "successCount" | "failureCount" | "previousVersions"> & Partial<Pick<SkillRecord, "tests" | "successCount" | "failureCount" | "previousVersions">>): SkillRecord {
   const at = now();
   const item: SkillRecord = {
     id: id("skill"),
@@ -243,13 +268,17 @@ export function createSkill(state: RuntimeState, skill: Omit<SkillRecord, "id" |
     createdAt: at,
     updatedAt: at,
     version: 1,
+    tests: [],
+    successCount: 0,
+    failureCount: 0,
+    previousVersions: [],
     ...skill
   };
   state.skills.unshift(item);
   return item;
 }
 
-export function createJob(state: RuntimeState, job: Omit<JobRecord, "id" | "lane" | "createdAt" | "updatedAt" | "status" | "lastRunAt" | "lastSuccessAt" | "lastFailureAt" | "lastError" | "runCount" | "missedRuns" | "taskIds">): JobRecord {
+export function createJob(state: RuntimeState, job: Omit<JobRecord, "id" | "lane" | "createdAt" | "updatedAt" | "status" | "lastRunAt" | "lastSuccessAt" | "lastFailureAt" | "lastError" | "runCount" | "missedRuns" | "taskIds" | "runIds" | "deliveryTargets" | "context" | "retryLimit" | "timeoutSeconds"> & Partial<Pick<JobRecord, "runIds" | "deliveryTargets" | "context" | "retryLimit" | "timeoutSeconds">>): JobRecord {
   const at = now();
   const item: JobRecord = {
     id: id("job"),
@@ -257,12 +286,41 @@ export function createJob(state: RuntimeState, job: Omit<JobRecord, "id" | "lane
     createdAt: at,
     updatedAt: at,
     status: "active",
+    deliveryTargets: [],
+    context: [],
+    retryLimit: 0,
+    timeoutSeconds: 30,
     runCount: 0,
     missedRuns: 0,
     taskIds: [],
+    runIds: [],
     ...job
   };
   state.jobs.unshift(item);
+  return item;
+}
+
+export function createJobRun(state: RuntimeState, run: Omit<JobRunRecord, "id" | "lane" | "createdAt" | "updatedAt" | "status" | "attempt">): JobRunRecord {
+  const at = now();
+  const item: JobRunRecord = {
+    id: id("jobrun"),
+    lane: state.lane,
+    status: "running",
+    attempt: state.jobRuns.filter((candidate) => candidate.jobId === run.jobId).length + 1,
+    createdAt: at,
+    updatedAt: at,
+    ...run
+  };
+  state.jobRuns.unshift(item);
+  appendEvent(state, {
+    kind: "job",
+    action: "job.run.started",
+    target: run.jobId,
+    jobId: run.jobId,
+    risk: "low",
+    summary: `Job run started for ${run.jobId}`,
+    data: { runId: item.id, trigger: item.trigger }
+  });
   return item;
 }
 
@@ -651,6 +709,21 @@ function normalizeState(lane: Lane, state: RuntimeState): RuntimeState {
   state.activeProfileId ??= state.profiles.find((item) => item.status === "active")?.id ?? state.profiles[0]?.id;
   state.relays ??= [];
   state.notifications ??= [];
+  state.events ??= [];
+  state.jobRuns ??= [];
+  for (const skill of state.skills) {
+    skill.tests ??= [];
+    skill.successCount ??= 0;
+    skill.failureCount ??= 0;
+    skill.previousVersions ??= [];
+  }
+  for (const job of state.jobs) {
+    job.deliveryTargets ??= [];
+    job.context ??= [];
+    job.retryLimit ??= 0;
+    job.timeoutSeconds ??= 30;
+    job.runIds ??= [];
+  }
   expirePairingCodes(state);
   return state;
 }

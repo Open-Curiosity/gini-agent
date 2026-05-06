@@ -130,6 +130,10 @@ async function main(): Promise<void> {
     case "audit":
       print(readState(config.lane).audit);
       break;
+    case "events":
+    case "event":
+      print(await api(config, "/api/events"));
+      break;
     case "evidence":
       evidence(config);
       break;
@@ -260,8 +264,18 @@ async function skill(config: RuntimeConfig): Promise<void> {
     return;
   }
   if (sub === "validate") {
-    const state = readState(config.lane);
-    print({ valid: state.skills.every((item) => item.name && item.steps.length >= 0), count: state.skills.length });
+    print(await api(config, "/api/skills/validate"));
+    return;
+  }
+  if (sub === "show" || sub === "test" || sub === "trust" || sub === "disable" || sub === "rollback") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error(`Usage: gini skill ${sub} <skill-id-or-name>`);
+    print(await api(config, `/api/skills/${encodeURIComponent(id)}${sub === "show" ? "" : `/${sub}`}`, { method: sub === "show" ? "GET" : "POST" }));
+    return;
+  }
+  if (sub === "search") {
+    const query = restAfter(sub).join(" ").trim();
+    print(await api(config, `/api/skills?q=${encodeURIComponent(query)}`));
     return;
   }
   print(await api(config, "/api/skills"));
@@ -282,6 +296,23 @@ async function job(config: RuntimeConfig): Promise<void> {
     const id = restAfter(sub)[0];
     if (!id) throw new Error(`Usage: gini job ${sub} <job-id>`);
     print(await api(config, `/api/jobs/${id}/${sub}`, { method: "POST" }));
+    return;
+  }
+  if (sub === "remove") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error("Usage: gini job remove <job-id>");
+    print(await api(config, `/api/jobs/${id}`, { method: "DELETE" }));
+    return;
+  }
+  if (sub === "runs") {
+    const id = restAfter(sub)[0];
+    print(await api(config, id ? `/api/jobs/${id}/runs` : "/api/job-runs"));
+    return;
+  }
+  if (sub === "replay") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error("Usage: gini job replay <job-run-id>");
+    print(await api(config, `/api/job-runs/${id}/replay`, { method: "POST" }));
     return;
   }
   print(await api(config, "/api/jobs"));
@@ -401,6 +432,16 @@ async function mcp(config: RuntimeConfig): Promise<void> {
     const id = restAfter(sub)[0];
     if (!id) throw new Error(`Usage: gini mcp ${sub} <server-id-or-name>`);
     print(await api(config, `/api/mcp/${encodeURIComponent(id)}/${sub}`, { method: "POST" }));
+    return;
+  }
+  if (sub === "invoke") {
+    const [id, toolName, ...payloadParts] = restAfter(sub);
+    if (!id || !toolName) throw new Error("Usage: gini mcp invoke <server-id-or-name> <tool-name> [json-input]");
+    const input = payloadParts.length > 0 ? JSON.parse(payloadParts.join(" ")) : {};
+    print(await api(config, `/api/mcp/${encodeURIComponent(id)}/invoke`, {
+      method: "POST",
+      body: JSON.stringify({ toolName, input })
+    }));
     return;
   }
   print(await api(config, "/api/mcp"));
@@ -846,8 +887,8 @@ Usage:
   bun run gini approvals
   bun run gini approval approve|deny <approval-id>
   bun run gini memory list|add|approve|reject
-  bun run gini skills list|add|validate
-  bun run gini jobs list|add|run|pause|resume
+  bun run gini skills list|add|show|search|validate|test|trust|disable|rollback
+  bun run gini jobs list|add|run|pause|resume|remove|runs|replay
   bun run gini connectors list|health
   bun run gini improvements list|propose|approve|reject
   bun run gini pairing create|claim
@@ -856,7 +897,7 @@ Usage:
   bun run gini search <query>
   bun run gini toolsets list|enable|disable
   bun run gini subagents list|spawn
-  bun run gini mcp list|add|health|disable
+  bun run gini mcp list|add|health|invoke|disable
   bun run gini messaging list|add|health|disable
   bun run gini import inspect hermes|openclaw <path>
   bun run gini profiles list|create|use
@@ -867,6 +908,7 @@ Usage:
   bun run gini snapshots list|create|restore
   bun run gini provider show|catalog|set echo|openai|codex|openrouter|local [model]
   bun run gini trace <task-id>
+  bun run gini events
   bun run gini audit
   bun run gini evidence
   bun run gini smoke

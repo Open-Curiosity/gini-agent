@@ -25,7 +25,9 @@ export function mobileBootstrap(config: RuntimeConfig) {
     profiles: state.profiles,
     activeProfileId: state.activeProfileId,
     relays: state.relays,
-    notifications: state.notifications
+    notifications: state.notifications,
+    events: state.events,
+    jobRuns: state.jobRuns
   };
 }
 

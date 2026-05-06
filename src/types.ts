@@ -42,6 +42,21 @@ export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 
 export type NotificationStatus = "queued" | "sent" | "failed" | "acknowledged";
 
+export type RuntimeEventKind =
+  | "task"
+  | "approval"
+  | "job"
+  | "memory"
+  | "skill"
+  | "connector"
+  | "mcp"
+  | "messaging"
+  | "provider"
+  | "runtime"
+  | "notification";
+
+export type JobRunStatus = "running" | "completed" | "failed";
+
 export interface ProviderConfig {
   name: ProviderName;
   model: string;
@@ -86,6 +101,8 @@ export interface RuntimeState {
   activeProfileId?: string;
   relays: RelayRecord[];
   notifications: NotificationRecord[];
+  events: RuntimeEvent[];
+  jobRuns: JobRunRecord[];
 }
 
 export interface Task {
@@ -107,6 +124,21 @@ export interface Task {
   jobId?: string;
   parentTaskId?: string;
   subagentId?: string;
+  cost?: CostRecord;
+}
+
+export interface RuntimeEvent {
+  id: string;
+  lane: Lane;
+  at: string;
+  kind: RuntimeEventKind;
+  action: string;
+  target: string;
+  taskId?: string;
+  jobId?: string;
+  risk: RiskLevel;
+  summary: string;
+  data?: Record<string, unknown>;
 }
 
 export interface TraceRecord {
@@ -331,6 +363,21 @@ export interface SkillRecord {
   createdAt: string;
   updatedAt: string;
   lastUsedAt?: string;
+  sourceTaskId?: string;
+  tests: string[];
+  successCount: number;
+  failureCount: number;
+  previousVersions: SkillVersion[];
+}
+
+export interface SkillVersion {
+  version: number;
+  updatedAt: string;
+  description: string;
+  trigger: string;
+  steps: string[];
+  requiredTools: string[];
+  requiredPermissions: string[];
 }
 
 export interface JobRecord {
@@ -338,8 +385,14 @@ export interface JobRecord {
   lane: Lane;
   name: string;
   prompt: string;
+  script?: string;
   intervalSeconds: number;
   status: JobStatus;
+  deliveryTargets: string[];
+  context: string[];
+  retryLimit: number;
+  timeoutSeconds: number;
+  costBudget?: number;
   createdAt: string;
   updatedAt: string;
   lastRunAt?: string;
@@ -350,6 +403,32 @@ export interface JobRecord {
   runCount: number;
   missedRuns: number;
   taskIds: string[];
+  runIds: string[];
+}
+
+export interface JobRunRecord {
+  id: string;
+  lane: Lane;
+  jobId: string;
+  status: JobRunStatus;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  taskId?: string;
+  attempt: number;
+  trigger: "schedule" | "manual" | "replay";
+  summary?: string;
+  error?: string;
+  cost?: CostRecord;
+}
+
+export interface CostRecord {
+  provider: ProviderName | string;
+  model: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  estimatedUsd?: number;
 }
 
 export interface ConnectorRecord {
@@ -446,4 +525,5 @@ export interface ProviderResult {
   text: string;
   responseId?: string;
   usage?: Record<string, unknown>;
+  cost?: CostRecord;
 }

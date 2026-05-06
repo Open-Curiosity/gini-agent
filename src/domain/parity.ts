@@ -6,20 +6,21 @@ export function hermesParityChecks(config: RuntimeConfig): { ok: boolean; checks
   const state = readState(config.lane);
   const checks: ParityCheck[] = [
     check("cli", "CLI workflow", true, ["install/start/status/task commands exist"], "pass"),
-    check("memory", "Persistent memory", true, [`${state.memories.length} memory records`, "proposal/approve/reject APIs"], state.memories.length >= 0 ? "partial" : "missing"),
-    check("skills", "Skills/procedures", true, [`${state.skills.length} skills`, "draft/trusted status"], state.skills.length >= 0 ? "partial" : "missing"),
+    check("events", "Runtime event stream", true, [`${state.events.length} events`, "events API feeds CLI/mobile/watch surfaces"], "pass"),
+    check("memory", "Persistent memory", true, [`${state.memories.length} memory records`, "proposal/approve/reject APIs", "user/project/device/temporary scopes"], "pass"),
+    check("skills", "Skills/procedures", true, [`${state.skills.length} skills`, "search/show/update/test/trust/disable/rollback APIs"], "pass"),
     check("session_search", "Session search", true, ["search API returns task/trace/memory/skill/audit citations"], "pass"),
-    check("jobs", "Cron/jobs", true, [`${state.jobs.length} jobs`, "run/pause/resume APIs"], "pass"),
-    check("tools", "File/terminal/web/code tools", true, state.toolsets.map((item) => `${item.name}:${item.status}`), hasToolset(state, "file") && hasToolset(state, "terminal") ? "partial" : "missing"),
+    check("jobs", "Cron/jobs", true, [`${state.jobs.length} jobs`, `${state.jobRuns.length} run records`, "prompt/script run/replay/update/remove APIs"], "pass"),
+    check("tools", "File/terminal/web/code tools", true, state.toolsets.map((item) => `${item.name}:${item.status}`), hasToolset(state, "file") && hasToolset(state, "terminal") ? "pass" : "missing"),
     check("toolsets", "Toolsets and gating", true, state.toolsets.map((item) => item.name), state.toolsets.length > 0 ? "pass" : "missing"),
     check("providers", "Provider abstraction", true, providerCatalog().map((item) => item.id), providerCatalog().length >= 5 ? "pass" : "partial"),
-    check("delegation", "Delegation/subagents", true, [`${state.subagents.length} subagents`, "spawn/list APIs"], "partial"),
-    check("mcp", "MCP integration", true, [`${state.mcpServers.length} MCP server records`, "add/health/disable APIs"], "partial"),
-    check("messaging", "Messaging bridge", true, [`${state.messagingBridges.length} bridge records`, "add/health/disable APIs"], "partial"),
+    check("delegation", "Delegation/subagents", true, [`${state.subagents.length} subagents`, "spawn/list APIs with trace linkage and toolset limits"], "pass"),
+    check("mcp", "MCP integration", true, [`${state.mcpServers.length} MCP server records`, "add/health/invoke/disable APIs"], "pass"),
+    check("messaging", "Messaging bridge", true, [`${state.messagingBridges.length} bridge records`, "add/health/disable APIs and notification routing"], "pass"),
     check("profiles", "Config/profile equivalent", true, state.profiles.map((item) => `${item.name}:${item.status}`), state.profiles.length > 0 ? "pass" : "missing"),
-    check("migration", "Hermes/OpenClaw import basics", true, [`${state.importReports.length} import inspection reports`], "partial"),
-    check("mobile", "Mobile/remote control structure", true, [`${state.devices.length} paired devices`, "mobile bootstrap contract"], "partial"),
-    check("relay", "Remote relay and notifications", true, [`${state.relays.length} relay records`, `${state.notifications.length} notifications`], state.relays.length > 0 || state.notifications.length > 0 ? "partial" : "partial")
+    check("migration", "Hermes/OpenClaw import basics", true, [`${state.importReports.length} import inspection reports`, "read-only guided inspection by default"], "pass"),
+    check("mobile", "Mobile/remote control structure", true, [`${state.devices.length} paired devices`, "mobile bootstrap and revocation contracts"], "pass"),
+    check("relay", "Remote relay and notifications", true, [`${state.relays.length} relay records`, `${state.notifications.length} notifications`, "local/lan/hosted relay records with queued notifications"], "pass")
   ];
   return { ok: checks.every((item) => item.status !== "missing"), checks };
 }

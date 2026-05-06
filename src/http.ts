@@ -3,15 +3,10 @@ import { join } from "node:path";
 import type { RuntimeConfig } from "./types";
 import { decideApproval, submitTask } from "./agent";
 import { pidPath } from "./paths";
-import {
-  createSkill,
-  mutateState,
-  readState,
-  readTrace,
-} from "./state";
+import { readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./api/views";
 import { checkConnector } from "./domain/connectors";
-import { createScheduledJob, runJobNow, updateJobStatus } from "./domain/jobs";
+import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./domain/jobs";
 import { createMemoryFromInput, updateMemory } from "./domain/memory";
 import { proposeImprovement, reviewImprovement } from "./domain/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./domain/pairing";
@@ -20,13 +15,14 @@ import { status } from "./domain/runtime";
 import { searchSessions } from "./domain/search";
 import { listToolsets, setToolsetStatus } from "./domain/toolsets";
 import { listSubagents, spawnSubagent } from "./domain/subagents";
-import { addMcpServer, checkMcpServer, removeMcpServer } from "./domain/mcp";
+import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./domain/mcp";
 import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge } from "./domain/messaging";
 import { inspectImportSource } from "./domain/importers";
 import { providerCatalog } from "./provider";
 import { createProfile, listProfiles, useProfile } from "./domain/profiles";
 import { hermesParityChecks } from "./domain/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./domain/relay";
+import { createSkillFromInput, getSkill, listSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./domain/skills";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
@@ -48,30 +44,35 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/approvals\/([^/]+)\/approve$/, async (_request, params) => json(await decideApproval(config, params[0], "approve"))],
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
     ["GET", /^\/api\/audit$/, () => json(readState(config.lane).audit)],
+    ["GET", /^\/api\/events$/, () => json(readState(config.lane).events)],
     ["GET", /^\/api\/memory$/, () => json(readState(config.lane).memories)],
     ["POST", /^\/api\/memory$/, async (request) => {
       return json(createMemoryFromInput(config, await body(request)), 201);
     }],
     ["POST", /^\/api\/memory\/([^/]+)\/approve$/, (_request, params) => json(updateMemory(config, params[0], "active"))],
     ["POST", /^\/api\/memory\/([^/]+)\/reject$/, (_request, params) => json(updateMemory(config, params[0], "rejected"))],
-    ["GET", /^\/api\/skills$/, () => json(readState(config.lane).skills)],
-    ["POST", /^\/api\/skills$/, async (request) => {
-      const input = await body(request);
-      return json(mutateState(config.lane, (state) => createSkill(state, {
-        name: String(input.name ?? "Untitled skill"),
-        description: String(input.description ?? ""),
-        trigger: String(input.trigger ?? ""),
-        steps: Array.isArray(input.steps) ? input.steps.map(String) : [],
-        requiredTools: Array.isArray(input.requiredTools) ? input.requiredTools.map(String) : [],
-        requiredPermissions: Array.isArray(input.requiredPermissions) ? input.requiredPermissions.map(String) : [],
-        status: String(input.status ?? "draft") === "trusted" ? "trusted" : "draft"
-      })), 201);
+    ["GET", /^\/api\/skills$/, (request) => {
+      const query = new URL(request.url).searchParams.get("q");
+      return json(query ? searchSkills(config, query) : listSkills(config));
     }],
+    ["POST", /^\/api\/skills$/, async (request) => json(createSkillFromInput(config, await body(request)), 201)],
+    ["GET", /^\/api\/skills\/validate$/, () => json(validateSkills(config))],
+    ["GET", /^\/api\/skills\/([^/]+)$/, (_request, params) => json(getSkill(config, params[0]))],
+    ["PATCH", /^\/api\/skills\/([^/]+)$/, async (request, params) => json(updateSkill(config, params[0], await body(request)))],
+    ["POST", /^\/api\/skills\/([^/]+)\/test$/, (_request, params) => json(testSkill(config, params[0]))],
+    ["POST", /^\/api\/skills\/([^/]+)\/trust$/, (_request, params) => json(setSkillStatus(config, params[0], "trusted"))],
+    ["POST", /^\/api\/skills\/([^/]+)\/disable$/, (_request, params) => json(setSkillStatus(config, params[0], "disabled"))],
+    ["POST", /^\/api\/skills\/([^/]+)\/rollback$/, (_request, params) => json(rollbackSkill(config, params[0]))],
     ["GET", /^\/api\/jobs$/, () => json(readState(config.lane).jobs)],
     ["POST", /^\/api\/jobs$/, async (request) => {
       return json(createScheduledJob(config, await body(request)), 201);
     }],
-    ["POST", /^\/api\/jobs\/([^/]+)\/run$/, (_request, params) => json(runJobNow(config, params[0]))],
+    ["PATCH", /^\/api\/jobs\/([^/]+)$/, async (request, params) => json(updateJob(config, params[0], await body(request)))],
+    ["DELETE", /^\/api\/jobs\/([^/]+)$/, (_request, params) => json(removeJob(config, params[0]))],
+    ["GET", /^\/api\/job-runs$/, () => json(listJobRuns(config))],
+    ["GET", /^\/api\/jobs\/([^/]+)\/runs$/, (_request, params) => json(listJobRuns(config, params[0]))],
+    ["POST", /^\/api\/jobs\/([^/]+)\/run$/, async (_request, params) => json(await runJobNow(config, params[0]))],
+    ["POST", /^\/api\/job-runs\/([^/]+)\/replay$/, async (_request, params) => json(await replayJobRun(config, params[0]))],
     ["POST", /^\/api\/jobs\/([^/]+)\/pause$/, (_request, params) => json(updateJobStatus(config, params[0], "paused"))],
     ["POST", /^\/api\/jobs\/([^/]+)\/resume$/, (_request, params) => json(updateJobStatus(config, params[0], "active"))],
     ["GET", /^\/api\/connectors$/, () => json(readState(config.lane).connectors)],
@@ -94,7 +95,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/subagents$/, async (request) => json(spawnSubagent(config, await body(request)), 201)],
     ["GET", /^\/api\/mcp$/, () => json(readState(config.lane).mcpServers)],
     ["POST", /^\/api\/mcp$/, async (request) => json(addMcpServer(config, await body(request)), 201)],
-    ["POST", /^\/api\/mcp\/([^/]+)\/health$/, (_request, params) => json(checkMcpServer(config, params[0]))],
+    ["POST", /^\/api\/mcp\/([^/]+)\/health$/, async (_request, params) => json(await checkMcpServer(config, params[0]))],
+    ["POST", /^\/api\/mcp\/([^/]+)\/invoke$/, async (request, params) => {
+      const input = await body(request);
+      return json(await invokeMcpTool(config, params[0], String(input.toolName ?? ""), input.input && typeof input.input === "object" ? input.input as Record<string, unknown> : {}));
+    }],
     ["POST", /^\/api\/mcp\/([^/]+)\/disable$/, (_request, params) => json(removeMcpServer(config, params[0]))],
     ["GET", /^\/api\/messaging$/, () => json(readState(config.lane).messagingBridges)],
     ["POST", /^\/api\/messaging$/, async (request) => json(addMessagingBridge(config, await body(request)), 201)],

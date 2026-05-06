@@ -34,12 +34,12 @@ export function providerHealth(config: RuntimeConfig) {
   }
 
   const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
-  const configured = Boolean(process.env[envName]);
+  const configured = provider.name === "local" || Boolean(process.env[envName]);
   return {
     ok: configured,
     provider,
     configured,
-    message: configured ? "OpenAI provider key is present." : `Set ${envName} to use the OpenAI provider.`
+    message: configured ? `${provider.name} provider is configured.` : `Set ${envName} to use the ${provider.name} provider.`
   };
 }
 
@@ -107,7 +107,10 @@ export async function generateTaskSummary(config: RuntimeConfig, input: string, 
     };
   }
 
-  return callOpenAI(provider, input, memories);
+  if (provider.name === "openrouter" || provider.name === "local") {
+    return callChatCompletions(provider, input, memories);
+  }
+  return callOpenAIResponses(provider, input, memories);
 }
 
 export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
@@ -149,7 +152,7 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   };
 }
 
-async function callOpenAI(provider: ProviderConfig, input: string, memories: MemoryRecord[]): Promise<ProviderResult> {
+async function callOpenAIResponses(provider: ProviderConfig, input: string, memories: MemoryRecord[]): Promise<ProviderResult> {
   const bearer = provider.name === "codex" ? readCodexBearer(provider) : readOpenAIBearer(provider);
   const headers = provider.name === "codex" ? codexHeaders(bearer) : {};
 
@@ -205,7 +208,48 @@ async function callOpenAI(provider: ProviderConfig, input: string, memories: Mem
     provider,
     text: extractOutputText(payload) || "The model returned no text output.",
     responseId: typeof payload.id === "string" ? payload.id : undefined,
-    usage: isRecord(payload.usage) ? payload.usage : undefined
+    usage: isRecord(payload.usage) ? payload.usage : undefined,
+    cost: estimateCost(provider, isRecord(payload.usage) ? payload.usage : undefined)
+  };
+}
+
+async function callChatCompletions(provider: ProviderConfig, input: string, memories: MemoryRecord[]): Promise<ProviderResult> {
+  const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
+  const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
+  const memoryBlock = memories.length > 0
+    ? memories.map((memory) => `- (${memory.scope}) ${memory.content}`).join("\n")
+    : "No active memories.";
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
+  };
+  const response = await fetch(`${provider.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: provider.model,
+      messages: [
+        {
+          role: "system",
+          content: "You are Gini, a local-first personal agent runtime. Return a concise task summary and do not claim side effects."
+        },
+        { role: "user", content: `Active memories:\n${memoryBlock}\n\nTask:\n${input}` }
+      ]
+    })
+  });
+  const rawPayload = await response.text();
+  const payload = parseJsonObject(rawPayload);
+  if (!response.ok) {
+    const fallback = rawPayload.slice(0, 500) || `Chat completions request failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  return {
+    provider,
+    text: extractChatText(payload) || "The model returned no text output.",
+    responseId: typeof payload.id === "string" ? payload.id : undefined,
+    usage: isRecord(payload.usage) ? payload.usage : undefined,
+    cost: estimateCost(provider, isRecord(payload.usage) ? payload.usage : undefined)
   };
 }
 
@@ -245,7 +289,8 @@ async function readCodexStream(response: Response, provider: ProviderConfig): Pr
     provider,
     text,
     responseId,
-    usage
+    usage,
+    cost: estimateCost(provider, usage)
   };
 }
 
@@ -302,6 +347,33 @@ function readOpenAIBearer(provider: ProviderConfig): string {
     throw new Error(`OpenAI provider is configured but ${envName} is not set.`);
   }
   return apiKey;
+}
+
+function extractChatText(payload: Record<string, unknown>): string {
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  const first = choices.find(isRecord);
+  if (!first || !isRecord(first.message)) return "";
+  return typeof first.message.content === "string" ? first.message.content.trim() : "";
+}
+
+function estimateCost(provider: ProviderConfig, usage?: Record<string, unknown>) {
+  const inputTokens = numberField(usage, "input_tokens") ?? numberField(usage, "prompt_tokens");
+  const outputTokens = numberField(usage, "output_tokens") ?? numberField(usage, "completion_tokens");
+  const calculatedTokens = inputTokens || outputTokens ? (inputTokens ?? 0) + (outputTokens ?? 0) : undefined;
+  const totalTokens = numberField(usage, "total_tokens") ?? calculatedTokens;
+  return {
+    provider: provider.name,
+    model: provider.model,
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    estimatedUsd: undefined
+  };
+}
+
+function numberField(record: Record<string, unknown> | undefined, key: string): number | undefined {
+  const value = record?.[key];
+  return typeof value === "number" ? value : undefined;
 }
 
 function readCodexBearer(provider: ProviderConfig): string {

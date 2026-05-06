@@ -112,6 +112,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     item.status = "completed";
     item.currentStep = "Completed";
     item.summary = providerResult.text;
+    item.cost = providerResult.cost;
     item.updatedAt = now();
     upsertTask(state, item);
     return item;

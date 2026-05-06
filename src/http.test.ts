@@ -211,6 +211,61 @@ describe("runtime api", () => {
     expect(notification.status).toBe("queued");
     expect(sent.some((item: { id: string; status: string }) => item.id === notification.id && item.status === "sent")).toBe(true);
   });
+
+  test("supports V1 skill governance and job run history workflows", async () => {
+    const config = testConfig("v1-skill-job");
+    const handler = createHandler(config);
+
+    const skill = await call(handler, config, "/api/skills", {
+      method: "POST",
+      body: JSON.stringify({ name: "triage", steps: ["Read trace"], tests: ["has name"] })
+    });
+    const trusted = await call(handler, config, `/api/skills/${skill.id}/trust`, { method: "POST" });
+    const tested = await call(handler, config, `/api/skills/${skill.id}/test`, { method: "POST" });
+    const updated = await call(handler, config, `/api/skills/${skill.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ description: "Updated skill", steps: ["Read trace", "Summarize"] })
+    });
+    const rolledBack = await call(handler, config, `/api/skills/${skill.id}/rollback`, { method: "POST" });
+
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "script", intervalSeconds: 60, script: "echo script-ok", deliveryTargets: ["local"], timeoutSeconds: 5 })
+    });
+    const run = await call(handler, config, `/api/jobs/${job.id}/run`, { method: "POST" });
+    const runs = await call(handler, config, `/api/jobs/${job.id}/runs`);
+    const replay = await call(handler, config, `/api/job-runs/${runs[0].id}/replay`, { method: "POST" });
+    const events = await call(handler, config, "/api/events");
+
+    expect(trusted.status).toBe("trusted");
+    expect(tested.ok).toBe(true);
+    expect(updated.version).toBe(2);
+    expect(rolledBack.version).toBe(3);
+    expect(run.exitCode).toBe(0);
+    expect(runs[0].summary).toContain("script-ok");
+    expect(replay.exitCode).toBe(0);
+    expect(events.some((event: { action: string }) => event.action === "job.run.completed")).toBe(true);
+  });
+
+  test("probes and invokes configured MCP command records", async () => {
+    const config = testConfig("v1-mcp");
+    const handler = createHandler(config);
+
+    const server = await call(handler, config, "/api/mcp", {
+      method: "POST",
+      body: JSON.stringify({ name: "echo-mcp", command: "echo", args: ["ok"], exposedTools: ["echo.tool"] })
+    });
+    const health = await call(handler, config, `/api/mcp/${server.id}/health`, { method: "POST" });
+    const invoked = await call(handler, config, `/api/mcp/${server.id}/invoke`, {
+      method: "POST",
+      body: JSON.stringify({ toolName: "echo.tool", input: { value: 1 } })
+    });
+
+    expect(health.status).toBe("configured");
+    expect(health.message).toContain("completed");
+    expect(invoked.ok).toBe(true);
+    expect(invoked.stdout).toContain("ok");
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
