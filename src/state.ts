@@ -15,6 +15,7 @@ import type {
   PairedDevice,
   PairingCode,
   PairingStatus,
+  ProfileRecord,
   PromotionProposal,
   RuntimeState,
   SkillRecord,
@@ -71,7 +72,9 @@ export function createEmptyState(lane: Lane): RuntimeState {
     subagents: [],
     mcpServers: [],
     messagingBridges: [],
-    importReports: []
+    importReports: [],
+    profiles: [defaultProfile(lane, at)],
+    activeProfileId: "profile_default"
   };
 }
 
@@ -519,6 +522,46 @@ export function createImportReport(state: RuntimeState, report: Omit<ImportRepor
   return item;
 }
 
+export function createProfileRecord(
+  state: RuntimeState,
+  profile: Omit<ProfileRecord, "id" | "lane" | "status" | "createdAt" | "updatedAt">
+): ProfileRecord {
+  const at = now();
+  const item: ProfileRecord = {
+    id: id("profile"),
+    lane: state.lane,
+    status: "inactive",
+    createdAt: at,
+    updatedAt: at,
+    ...profile
+  };
+  state.profiles.unshift(item);
+  addAudit(state, {
+    actor: "user",
+    action: "profile.created",
+    target: item.id,
+    risk: "low",
+    evidence: { name: item.name, toolsets: item.toolsets }
+  });
+  return item;
+}
+
+export function activateProfile(state: RuntimeState, idOrName: string): ProfileRecord {
+  const profile = state.profiles.find((item) => item.id === idOrName || item.name === idOrName);
+  if (!profile) throw new Error(`Profile not found: ${idOrName}`);
+  for (const item of state.profiles) item.status = item.id === profile.id ? "active" : "inactive";
+  profile.updatedAt = now();
+  state.activeProfileId = profile.id;
+  addAudit(state, {
+    actor: "user",
+    action: "profile.activated",
+    target: profile.id,
+    risk: "low",
+    evidence: { name: profile.name }
+  });
+  return profile;
+}
+
 export function updateConnectorHealth(connector: ConnectorRecord): ConnectorRecord {
   connector.lastHealthAt = now();
   connector.health = connector.status === "configured" ? "healthy" : "unhealthy";
@@ -557,6 +600,8 @@ function normalizeState(lane: Lane, state: RuntimeState): RuntimeState {
   state.mcpServers ??= [];
   state.messagingBridges ??= [];
   state.importReports ??= [];
+  state.profiles ??= [defaultProfile(lane, now())];
+  state.activeProfileId ??= state.profiles.find((item) => item.status === "active")?.id ?? state.profiles[0]?.id;
   expirePairingCodes(state);
   return state;
 }
@@ -677,4 +722,20 @@ function defaultTools(lane: Lane, at: string): ToolRecord[] {
     createdAt: at,
     updatedAt: at
   })));
+}
+
+function defaultProfile(lane: Lane, at: string): ProfileRecord {
+  return {
+    id: "profile_default",
+    lane,
+    name: "default",
+    status: "active",
+    providerName: "echo",
+    model: "gini-echo-v0",
+    toolsets: ["file", "terminal", "memory", "session_search", "delegation"],
+    memoryScopes: ["user", "project", "device", "temporary"],
+    messagingTargets: [],
+    createdAt: at,
+    updatedAt: at
+  };
 }

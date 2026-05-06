@@ -21,7 +21,9 @@ export function mobileBootstrap(config: RuntimeConfig) {
     subagents: state.subagents,
     mcpServers: state.mcpServers,
     messagingBridges: state.messagingBridges,
-    importReports: state.importReports
+    importReports: state.importReports,
+    profiles: state.profiles,
+    activeProfileId: state.activeProfileId
   };
 }
 

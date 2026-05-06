@@ -173,6 +173,24 @@ describe("runtime api", () => {
     expect(state.audit.some((event) => event.action === "file.list")).toBe(true);
     expect(state.audit.some((event) => event.action === "file.search")).toBe(true);
   });
+
+  test("supports profile config equivalents and Hermes parity reporting", async () => {
+    const config = testConfig("profiles-parity");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/profiles", {
+      method: "POST",
+      body: JSON.stringify({ name: "research", toolsets: ["file", "web", "session_search"], memoryScopes: ["user", "project"] })
+    });
+    const active = await call(handler, config, `/api/profiles/${created.id}/use`, { method: "POST" });
+    const profiles = await call(handler, config, "/api/profiles");
+    const parity = await call(handler, config, "/api/parity/hermes");
+
+    expect(active.status).toBe("active");
+    expect(profiles.activeProfileId).toBe(created.id);
+    expect(parity.ok).toBe(true);
+    expect(parity.checks.some((item: { id: string; status: string }) => item.id === "profiles" && item.status === "pass")).toBe(true);
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

@@ -36,6 +36,8 @@ export type MessagingBridgeStatus = "configured" | "disabled" | "error";
 
 export type ImportSource = "hermes" | "openclaw";
 
+export type ProfileStatus = "active" | "inactive";
+
 export interface ProviderConfig {
   name: ProviderName;
   model: string;
@@ -76,6 +78,8 @@ export interface RuntimeState {
   mcpServers: McpServerRecord[];
   messagingBridges: MessagingBridgeRecord[];
   importReports: ImportReport[];
+  profiles: ProfileRecord[];
+  activeProfileId?: string;
 }
 
 export interface Task {
@@ -213,6 +217,28 @@ export interface ProviderCatalogItem {
   models: string[];
   capabilities: string[];
   costHint: "free" | "external" | "unknown";
+}
+
+export interface ProfileRecord {
+  id: string;
+  lane: Lane;
+  name: string;
+  status: ProfileStatus;
+  providerName?: ProviderName | "openrouter" | "local";
+  model?: string;
+  toolsets: string[];
+  memoryScopes: Array<"user" | "project" | "device" | "temporary">;
+  messagingTargets: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ParityCheck {
+  id: string;
+  label: string;
+  status: "pass" | "partial" | "missing";
+  evidence: string[];
+  requiredForV1: boolean;
 }
 
 export interface AuditEvent {

@@ -24,6 +24,8 @@ import { addMcpServer, checkMcpServer, removeMcpServer } from "./domain/mcp";
 import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge } from "./domain/messaging";
 import { inspectImportSource } from "./domain/importers";
 import { providerCatalog } from "./provider";
+import { createProfile, listProfiles, useProfile } from "./domain/profiles";
+import { hermesParityChecks } from "./domain/parity";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
@@ -98,6 +100,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/messaging\/([^/]+)\/health$/, (_request, params) => json(checkMessagingBridge(config, params[0]))],
     ["POST", /^\/api\/messaging\/([^/]+)\/disable$/, (_request, params) => json(disableMessagingBridge(config, params[0]))],
     ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],
+    ["GET", /^\/api\/profiles$/, () => json(listProfiles(config))],
+    ["POST", /^\/api\/profiles$/, async (request) => json(createProfile(config, await body(request)), 201)],
+    ["POST", /^\/api\/profiles\/([^/]+)\/use$/, (_request, params) => json(useProfile(config, params[0]))],
+    ["GET", /^\/api\/parity\/hermes$/, () => json(hermesParityChecks(config))],
     ["GET", /^\/api\/imports$/, () => json(readState(config.lane).importReports)],
     ["POST", /^\/api\/imports\/inspect$/, async (request) => {
       const input = await body(request);

@@ -98,6 +98,13 @@ async function main(): Promise<void> {
     case "imports":
       await importInspect(config);
       break;
+    case "profile":
+    case "profiles":
+      await profile(config);
+      break;
+    case "parity":
+      await parity(config);
+      break;
     case "promotion":
     case "promotions":
       await promotion(config);
@@ -424,6 +431,32 @@ async function importInspect(config: RuntimeConfig): Promise<void> {
   print(await api(config, "/api/imports"));
 }
 
+async function profile(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "create") {
+    const [name, ...toolsets] = restAfter(sub);
+    if (!name) throw new Error("Usage: gini profile create <name> [toolsets...]");
+    print(await api(config, "/api/profiles", {
+      method: "POST",
+      body: JSON.stringify({ name, toolsets: toolsets.length > 0 ? toolsets : undefined })
+    }));
+    return;
+  }
+  if (sub === "use") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error("Usage: gini profile use <profile-id-or-name>");
+    print(await api(config, `/api/profiles/${encodeURIComponent(id)}/use`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/profiles"));
+}
+
+async function parity(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "hermes";
+  if (sub !== "hermes") throw new Error("Usage: gini parity hermes");
+  print(await api(config, "/api/parity/hermes"));
+}
+
 async function promotion(config: RuntimeConfig): Promise<void> {
   const sub = cliArgs[1] ?? "list";
   if (sub === "propose") {
@@ -553,6 +586,12 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
       method: "POST",
       body: JSON.stringify({ source: "hermes", path: process.cwd() })
     });
+    const profileResult = await api(config, "/api/profiles", {
+      method: "POST",
+      body: JSON.stringify({ name: "smoke-profile", toolsets: ["file", "memory", "session_search"] })
+    });
+    await api(config, `/api/profiles/${profileResult.id}/use`, { method: "POST" });
+    const parityResult = await api(config, "/api/parity/hermes");
     const snapshotResult = createSnapshot(config, "Smoke rollback baseline");
     const promotionResult = await api(config, "/api/promotions", {
       method: "POST",
@@ -586,6 +625,8 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
       mcpId: mcpResult.id,
       messagingId: messagingResult.id,
       importReportId: importResult.id,
+      profileId: profileResult.id,
+      parityOk: parityResult.ok,
       snapshotId: snapshotResult.snapshotId,
       promotionId: promotionResult.id,
       connectorHealth: connectorHealth.health,
@@ -759,6 +800,8 @@ Usage:
   bun run gini mcp list|add|health|disable
   bun run gini messaging list|add|health|disable
   bun run gini import inspect hermes|openclaw <path>
+  bun run gini profiles list|create|use
+  bun run gini parity hermes
   bun run gini promotions list|propose|approve|reject
   bun run gini snapshots list|create|restore
   bun run gini provider show|catalog|set echo|openai|codex|openrouter|local [model]
