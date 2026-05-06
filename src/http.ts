@@ -24,6 +24,7 @@ import { hermesParityChecks } from "./domain/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./domain/relay";
 import { createSkillFromInput, getSkill, listSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./domain/skills";
 import { createChat, getChatSession, listChatSessions, submitChatMessage, syncChatTaskResult } from "./domain/chat";
+import { v1Readiness } from "./domain/readiness";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
@@ -125,6 +126,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/profiles$/, async (request) => json(createProfile(config, await body(request)), 201)],
     ["POST", /^\/api\/profiles\/([^/]+)\/use$/, (_request, params) => json(useProfile(config, params[0]))],
     ["GET", /^\/api\/parity\/hermes$/, () => json(hermesParityChecks(config))],
+    ["GET", /^\/api\/readiness\/v1$/, () => json(v1Readiness(config))],
     ["GET", /^\/api\/relays$/, () => json(listRelays(config))],
     ["POST", /^\/api\/relays$/, async (request) => json(configureRelay(config, await body(request)), 201)],
     ["POST", /^\/api\/relays\/([^/]+)\/health$/, (_request, params) => json(checkRelay(config, params[0]))],

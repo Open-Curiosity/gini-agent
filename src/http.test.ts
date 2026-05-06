@@ -363,6 +363,20 @@ describe("runtime api", () => {
     expect(outbound.status).toBe("sent");
     expect(messages).toHaveLength(2);
   });
+
+  test("reports V1 readiness from runtime evidence", async () => {
+    const config = testConfig("readiness");
+    const handler = createHandler(config);
+
+    await call(handler, config, "/api/improvements", {
+      method: "POST",
+      body: JSON.stringify({ kind: "memory", title: "readiness", payload: { content: "readiness evidence" } })
+    });
+    const readiness = await call(handler, config, "/api/readiness/v1");
+
+    expect(readiness.ok).toBe(true);
+    expect(readiness.checks.some((item: { id: string; status: string }) => item.id === "future_app_contracts" && item.status === "pass")).toBe(true);
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

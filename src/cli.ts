@@ -108,6 +108,9 @@ async function main(): Promise<void> {
     case "parity":
       await parity(config);
       break;
+    case "readiness":
+      await readiness(config);
+      break;
     case "relay":
     case "relays":
       await relay(config);
@@ -572,6 +575,12 @@ async function parity(config: RuntimeConfig): Promise<void> {
   print(await api(config, "/api/parity/hermes"));
 }
 
+async function readiness(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "v1";
+  if (sub !== "v1") throw new Error("Usage: gini readiness v1");
+  print(await api(config, "/api/readiness/v1"));
+}
+
 async function relay(config: RuntimeConfig): Promise<void> {
   const sub = cliArgs[1] ?? "list";
   if (sub === "add") {
@@ -746,6 +755,7 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
     });
     await api(config, `/api/profiles/${profileResult.id}/use`, { method: "POST" });
     const parityResult = await api(config, "/api/parity/hermes");
+    const readinessResult = await api(config, "/api/readiness/v1");
     const relayResult = await api(config, "/api/relays", {
       method: "POST",
       body: JSON.stringify({ name: "smoke-relay", endpoint: "local://smoke", mode: "local-only" })
@@ -791,6 +801,7 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
       importReportId: importResult.id,
       profileId: profileResult.id,
       parityOk: parityResult.ok,
+      readinessOk: readinessResult.ok,
       relayId: relayResult.id,
       notificationId: notificationResult.id,
       snapshotId: snapshotResult.snapshotId,
@@ -968,6 +979,7 @@ Usage:
   bun run gini import inspect hermes|openclaw <path>
   bun run gini profiles list|create|use
   bun run gini parity hermes
+  bun run gini readiness v1
   bun run gini relays list|add|health
   bun run gini notifications list|queue|send|ack
   bun run gini promotions list|propose|approve|reject
