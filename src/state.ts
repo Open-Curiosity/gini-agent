@@ -5,10 +5,13 @@ import type {
   AuditEvent,
   ConnectorRecord,
   DeviceStatus,
+  ImportReport,
   ImprovementProposal,
   JobRecord,
   Lane,
   MemoryRecord,
+  McpServerRecord,
+  MessagingBridgeRecord,
   PairedDevice,
   PairingCode,
   PairingStatus,
@@ -16,7 +19,10 @@ import type {
   RuntimeState,
   SkillRecord,
   SnapshotRecord,
+  SubagentRecord,
   Task,
+  ToolRecord,
+  ToolsetRecord,
   TraceRecord
 } from "./types";
 import { ensureDir, laneRoot, logDir, statePath, traceDir } from "./paths";
@@ -59,7 +65,13 @@ export function createEmptyState(lane: Lane): RuntimeState {
     pairingCodes: [],
     devices: [],
     promotions: [],
-    snapshots: []
+    snapshots: [],
+    tools: defaultTools(lane, at),
+    toolsets: defaultToolsets(lane, at),
+    subagents: [],
+    mcpServers: [],
+    messagingBridges: [],
+    importReports: []
   };
 }
 
@@ -158,7 +170,7 @@ export function upsertTask(state: RuntimeState, task: Task): Task {
   return task;
 }
 
-export function createTask(lane: Lane, input: string, jobId?: string): Task {
+export function createTask(lane: Lane, input: string, jobId?: string, parentTaskId?: string, subagentId?: string): Task {
   const at = now();
   const taskId = id("task");
   return {
@@ -174,7 +186,9 @@ export function createTask(lane: Lane, input: string, jobId?: string): Task {
     approvalIds: [],
     memoryIds: [],
     skillIds: [],
-    jobId
+    jobId,
+    parentTaskId,
+    subagentId
   };
 }
 
@@ -414,6 +428,97 @@ export function createSnapshotRecord(
   return item;
 }
 
+export function createSubagentRecord(
+  state: RuntimeState,
+  subagent: Omit<SubagentRecord, "id" | "lane" | "status" | "createdAt" | "updatedAt">
+): SubagentRecord {
+  const at = now();
+  const item: SubagentRecord = {
+    id: id("subagent"),
+    lane: state.lane,
+    status: "queued",
+    createdAt: at,
+    updatedAt: at,
+    ...subagent
+  };
+  state.subagents.unshift(item);
+  addAudit(state, {
+    actor: "agent",
+    action: "subagent.created",
+    target: item.id,
+    risk: "medium",
+    taskId: item.parentTaskId,
+    evidence: { name: item.name, toolsets: item.toolsets }
+  });
+  return item;
+}
+
+export function createMcpServerRecord(
+  state: RuntimeState,
+  server: Omit<McpServerRecord, "id" | "lane" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
+): McpServerRecord {
+  const at = now();
+  const item: McpServerRecord = {
+    id: id("mcp"),
+    lane: state.lane,
+    status: "configured",
+    createdAt: at,
+    updatedAt: at,
+    ...server
+  };
+  state.mcpServers.unshift(item);
+  addAudit(state, {
+    actor: "user",
+    action: "mcp.configured",
+    target: item.id,
+    risk: "medium",
+    evidence: { name: item.name, exposedTools: item.exposedTools }
+  });
+  return item;
+}
+
+export function createMessagingBridgeRecord(
+  state: RuntimeState,
+  bridge: Omit<MessagingBridgeRecord, "id" | "lane" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
+): MessagingBridgeRecord {
+  const at = now();
+  const item: MessagingBridgeRecord = {
+    id: id("bridge"),
+    lane: state.lane,
+    status: "configured",
+    createdAt: at,
+    updatedAt: at,
+    ...bridge
+  };
+  state.messagingBridges.unshift(item);
+  addAudit(state, {
+    actor: "user",
+    action: "messaging.configured",
+    target: item.id,
+    risk: "medium",
+    evidence: { kind: item.kind, deliveryTargets: item.deliveryTargets }
+  });
+  return item;
+}
+
+export function createImportReport(state: RuntimeState, report: Omit<ImportReport, "id" | "lane" | "createdAt">): ImportReport {
+  const item: ImportReport = {
+    id: id("import"),
+    lane: state.lane,
+    createdAt: now(),
+    ...report
+  };
+  state.importReports.unshift(item);
+  addAudit(state, {
+    actor: "user",
+    action: "import.inspected",
+    target: item.id,
+    risk: "low",
+    evidence: { source: item.source, path: item.path, counts: item.counts }
+  });
+  return item;
+}
+
 export function updateConnectorHealth(connector: ConnectorRecord): ConnectorRecord {
   connector.lastHealthAt = now();
   connector.health = connector.status === "configured" ? "healthy" : "unhealthy";
@@ -446,6 +551,12 @@ function normalizeState(lane: Lane, state: RuntimeState): RuntimeState {
   state.devices ??= [];
   state.promotions ??= [];
   state.snapshots ??= [];
+  state.tools ??= defaultTools(lane, now());
+  state.toolsets ??= defaultToolsets(lane, now());
+  state.subagents ??= [];
+  state.mcpServers ??= [];
+  state.messagingBridges ??= [];
+  state.importReports ??= [];
   expirePairingCodes(state);
   return state;
 }
@@ -469,4 +580,101 @@ function randomPairingCode(): string {
     .map((value) => String(value % 10))
     .join("")
     .replace(/^(.{3})(.{3})$/, "$1-$2");
+}
+
+function defaultToolsets(lane: Lane, at: string): ToolsetRecord[] {
+  return [
+    {
+      id: "toolset_file",
+      lane,
+      name: "file",
+      description: "Workspace file read, search, list, and approval-gated write operations.",
+      status: "enabled",
+      toolNames: ["file.read", "file.search", "file.list", "file.write"],
+      scopes: ["task", "job", "skill", "subagent"],
+      createdAt: at,
+      updatedAt: at
+    },
+    {
+      id: "toolset_terminal",
+      lane,
+      name: "terminal",
+      description: "Approval-gated shell execution with timeout and trace evidence.",
+      status: "enabled",
+      toolNames: ["terminal.exec"],
+      scopes: ["task", "job", "skill", "subagent"],
+      createdAt: at,
+      updatedAt: at
+    },
+    {
+      id: "toolset_memory",
+      lane,
+      name: "memory",
+      description: "Inspectable memory proposal, activation, retrieval, and rejection flows.",
+      status: "enabled",
+      toolNames: ["memory.search", "memory.propose", "memory.activate"],
+      scopes: ["task", "job", "skill", "subagent"],
+      createdAt: at,
+      updatedAt: at
+    },
+    {
+      id: "toolset_session_search",
+      lane,
+      name: "session_search",
+      description: "Search prior tasks, traces, memories, skills, and audit events with source links.",
+      status: "enabled",
+      toolNames: ["session.search"],
+      scopes: ["task", "job", "skill", "subagent"],
+      createdAt: at,
+      updatedAt: at
+    },
+    {
+      id: "toolset_delegation",
+      lane,
+      name: "delegation",
+      description: "Spawn isolated subagent tasks with toolset limits and trace linkage.",
+      status: "enabled",
+      toolNames: ["delegate.task"],
+      scopes: ["task", "job", "skill"],
+      createdAt: at,
+      updatedAt: at
+    },
+    {
+      id: "toolset_mcp",
+      lane,
+      name: "mcp",
+      description: "Expose selected external MCP tools through configured server records.",
+      status: "disabled",
+      toolNames: ["mcp.invoke"],
+      scopes: ["task", "job", "skill", "subagent", "mcp"],
+      createdAt: at,
+      updatedAt: at
+    },
+    {
+      id: "toolset_messaging",
+      lane,
+      name: "messaging",
+      description: "Bridge task input and notifications to configured messaging channels.",
+      status: "disabled",
+      toolNames: ["message.send"],
+      scopes: ["job", "messaging"],
+      createdAt: at,
+      updatedAt: at
+    }
+  ];
+}
+
+function defaultTools(lane: Lane, at: string): ToolRecord[] {
+  return defaultToolsets(lane, at).flatMap((toolset) => toolset.toolNames.map((name) => ({
+    id: `tool_${name.replaceAll(".", "_")}`,
+    lane,
+    name,
+    description: `${name} from ${toolset.name} toolset`,
+    toolset: toolset.name,
+    status: toolset.status === "enabled" ? "available" : "disabled",
+    risk: name.includes("write") || name.includes("exec") || name.includes("invoke") || name.includes("send") ? "high" : "low",
+    requiresApproval: name.includes("write") || name.includes("exec") || name.includes("invoke") || name.includes("send"),
+    createdAt: at,
+    updatedAt: at
+  })));
 }

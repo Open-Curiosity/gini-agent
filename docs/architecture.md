@@ -23,6 +23,8 @@ This repo is organized around runtime boundaries rather than feature chronology.
 - `api/` modules must not expose secret hashes or bearer tokens.
 - CLI commands should prefer public runtime APIs when exercising product behavior; direct domain calls are reserved for local harness operations such as snapshots and evidence bundles.
 - New connectors, tools, providers, and mobile surfaces should land in their own modules before adding router or CLI commands.
+- Hermes-parity features should first add durable runtime records and safe inspection flows before adding live external transports.
+- MCP, messaging, and import integrations must fail visibly and must not mutate external installs or credentials by default.
 
 ## Current Intentional Compromises
 

@@ -17,6 +17,13 @@ import { proposeImprovement, reviewImprovement } from "./domain/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./domain/pairing";
 import { proposePromotion, reviewPromotion } from "./domain/promotions";
 import { status } from "./domain/runtime";
+import { searchSessions } from "./domain/search";
+import { listToolsets, setToolsetStatus } from "./domain/toolsets";
+import { listSubagents, spawnSubagent } from "./domain/subagents";
+import { addMcpServer, checkMcpServer, removeMcpServer } from "./domain/mcp";
+import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge } from "./domain/messaging";
+import { inspectImportSource } from "./domain/importers";
+import { providerCatalog } from "./provider";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
@@ -27,6 +34,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/mobile\/bootstrap$/, () => json(mobileBootstrap(config))],
     ["GET", /^\/api\/tasks$/, () => json(readState(config.lane).tasks)],
     ["POST", /^\/api\/tasks$/, async (request) => json(submitTask(config, String((await body(request)).input ?? "")), 201)],
+    ["GET", /^\/api\/search$/, (_request) => json(searchSessions(config, new URL(_request.url).searchParams.get("q") ?? "", Number(new URL(_request.url).searchParams.get("limit") ?? 20)))],
     ["GET", /^\/api\/tasks\/([^/]+)$/, (_request, params) => {
       const state = readState(config.lane);
       const task = state.tasks.find((item) => item.id === params[0]);
@@ -75,7 +83,27 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/promotions$/, () => json(readState(config.lane).promotions)],
     ["POST", /^\/api\/promotions$/, async (request) => json(proposePromotion(config, await body(request)), 201)],
     ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, (_request, params) => json(reviewPromotion(config, params[0], "approve"))],
-    ["POST", /^\/api\/promotions\/([^/]+)\/reject$/, (_request, params) => json(reviewPromotion(config, params[0], "reject"))]
+    ["POST", /^\/api\/promotions\/([^/]+)\/reject$/, (_request, params) => json(reviewPromotion(config, params[0], "reject"))],
+    ["GET", /^\/api\/toolsets$/, () => json(listToolsets(config))],
+    ["POST", /^\/api\/toolsets\/([^/]+)\/enable$/, (_request, params) => json(setToolsetStatus(config, params[0], "enabled"))],
+    ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, (_request, params) => json(setToolsetStatus(config, params[0], "disabled"))],
+    ["GET", /^\/api\/subagents$/, () => json(listSubagents(config))],
+    ["POST", /^\/api\/subagents$/, async (request) => json(spawnSubagent(config, await body(request)), 201)],
+    ["GET", /^\/api\/mcp$/, () => json(readState(config.lane).mcpServers)],
+    ["POST", /^\/api\/mcp$/, async (request) => json(addMcpServer(config, await body(request)), 201)],
+    ["POST", /^\/api\/mcp\/([^/]+)\/health$/, (_request, params) => json(checkMcpServer(config, params[0]))],
+    ["POST", /^\/api\/mcp\/([^/]+)\/disable$/, (_request, params) => json(removeMcpServer(config, params[0]))],
+    ["GET", /^\/api\/messaging$/, () => json(readState(config.lane).messagingBridges)],
+    ["POST", /^\/api\/messaging$/, async (request) => json(addMessagingBridge(config, await body(request)), 201)],
+    ["POST", /^\/api\/messaging\/([^/]+)\/health$/, (_request, params) => json(checkMessagingBridge(config, params[0]))],
+    ["POST", /^\/api\/messaging\/([^/]+)\/disable$/, (_request, params) => json(disableMessagingBridge(config, params[0]))],
+    ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],
+    ["GET", /^\/api\/imports$/, () => json(readState(config.lane).importReports)],
+    ["POST", /^\/api\/imports\/inspect$/, async (request) => {
+      const input = await body(request);
+      const source = input.source === "openclaw" ? "openclaw" : "hermes";
+      return json(inspectImportSource(config, source, String(input.path ?? "")), 201);
+    }]
   ];
 
   return async (request: Request) => {

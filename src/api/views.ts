@@ -15,7 +15,13 @@ export function mobileBootstrap(config: RuntimeConfig) {
     jobs: state.jobs,
     connectors: state.connectors,
     improvements: state.improvements,
-    devices: state.devices
+    devices: state.devices,
+    toolsets: state.toolsets,
+    tools: state.tools,
+    subagents: state.subagents,
+    mcpServers: state.mcpServers,
+    messagingBridges: state.messagingBridges,
+    importReports: state.importReports
   };
 }
 

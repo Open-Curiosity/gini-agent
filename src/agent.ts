@@ -15,8 +15,8 @@ import {
 } from "./state";
 import { generateTaskSummary } from "./provider";
 
-export function submitTask(config: RuntimeConfig, input: string, jobId?: string): Task {
-  const created = createTask(config.lane, input, jobId);
+export function submitTask(config: RuntimeConfig, input: string, jobId?: string, parentTaskId?: string, subagentId?: string): Task {
+  const created = createTask(config.lane, input, jobId, parentTaskId, subagentId);
   mutateState(config.lane, (state) => {
     upsertTask(state, created);
     const audit = addAudit(state, {
@@ -25,7 +25,7 @@ export function submitTask(config: RuntimeConfig, input: string, jobId?: string)
       target: created.id,
       risk: "low",
       taskId: created.id,
-      evidence: { input, jobId }
+      evidence: { input, jobId, parentTaskId, subagentId }
     });
     created.auditIds.push(audit.id);
   });

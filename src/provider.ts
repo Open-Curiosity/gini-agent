@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { MemoryRecord, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
+import type { MemoryRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -43,6 +43,60 @@ export function providerHealth(config: RuntimeConfig) {
   };
 }
 
+export function providerCatalog(): ProviderCatalogItem[] {
+  return [
+    {
+      id: "echo",
+      name: "echo",
+      displayName: "Gini Echo",
+      auth: "none",
+      models: ["gini-echo-v0"],
+      capabilities: ["deterministic", "smoke", "tests"],
+      costHint: "free"
+    },
+    {
+      id: "codex",
+      name: "codex",
+      displayName: "Codex OAuth",
+      baseUrl: DEFAULT_CODEX_BASE_URL,
+      auth: "codex-oauth",
+      models: [DEFAULT_CODEX_MODEL],
+      capabilities: ["responses", "streaming", "oauth"],
+      costHint: "external"
+    },
+    {
+      id: "openai",
+      name: "openai",
+      displayName: "OpenAI Compatible",
+      baseUrl: DEFAULT_OPENAI_BASE_URL,
+      auth: "env",
+      models: ["gpt-5.4-mini", "gpt-5.4"],
+      capabilities: ["responses", "tool-calling"],
+      costHint: "external"
+    },
+    {
+      id: "openrouter",
+      name: "openrouter",
+      displayName: "OpenRouter Compatible",
+      baseUrl: "https://openrouter.ai/api/v1",
+      auth: "env",
+      models: ["openrouter/auto"],
+      capabilities: ["chat-completions", "model-routing"],
+      costHint: "external"
+    },
+    {
+      id: "local",
+      name: "local",
+      displayName: "Local OpenAI-Compatible",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      auth: "env",
+      models: ["local/default"],
+      capabilities: ["chat-completions", "local"],
+      costHint: "unknown"
+    }
+  ];
+}
+
 export async function generateTaskSummary(config: RuntimeConfig, input: string, memories: MemoryRecord[]): Promise<ProviderResult> {
   const provider = normalizeProvider(config.provider);
   if (provider.name === "echo") {
@@ -63,6 +117,22 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || "gpt-5.4-mini",
       baseUrl: provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL,
       apiKeyEnv: provider.apiKeyEnv ?? "OPENAI_API_KEY"
+    };
+  }
+  if (provider.name === "openrouter") {
+    return {
+      name: "openrouter",
+      model: provider.model || "openrouter/auto",
+      baseUrl: provider.baseUrl ?? "https://openrouter.ai/api/v1",
+      apiKeyEnv: provider.apiKeyEnv ?? "OPENROUTER_API_KEY"
+    };
+  }
+  if (provider.name === "local") {
+    return {
+      name: "local",
+      model: provider.model || "local/default",
+      baseUrl: provider.baseUrl ?? "http://127.0.0.1:11434/v1",
+      apiKeyEnv: provider.apiKeyEnv ?? "GINI_LOCAL_API_KEY"
     };
   }
   if (provider.name === "codex") {

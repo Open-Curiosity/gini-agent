@@ -12,7 +12,7 @@ export type SkillStatus = "draft" | "trusted" | "disabled" | "archived";
 
 export type JobStatus = "active" | "paused" | "failed";
 
-export type ProviderName = "echo" | "openai" | "codex";
+export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local";
 
 export type ImprovementStatus = "proposed" | "approved" | "rejected" | "applied";
 
@@ -23,6 +23,18 @@ export type PairingStatus = "pending" | "claimed" | "expired" | "revoked";
 export type DeviceStatus = "active" | "revoked";
 
 export type PromotionStatus = "proposed" | "approved" | "rejected";
+
+export type ToolStatus = "available" | "disabled" | "error";
+
+export type ToolsetStatus = "enabled" | "disabled";
+
+export type SubagentStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+
+export type McpServerStatus = "configured" | "disabled" | "error";
+
+export type MessagingBridgeStatus = "configured" | "disabled" | "error";
+
+export type ImportSource = "hermes" | "openclaw";
 
 export interface ProviderConfig {
   name: ProviderName;
@@ -58,6 +70,12 @@ export interface RuntimeState {
   devices: PairedDevice[];
   promotions: PromotionProposal[];
   snapshots: SnapshotRecord[];
+  tools: ToolRecord[];
+  toolsets: ToolsetRecord[];
+  subagents: SubagentRecord[];
+  mcpServers: McpServerRecord[];
+  messagingBridges: MessagingBridgeRecord[];
+  importReports: ImportReport[];
 }
 
 export interface Task {
@@ -77,6 +95,8 @@ export interface Task {
   memoryIds: string[];
   skillIds: string[];
   jobId?: string;
+  parentTaskId?: string;
+  subagentId?: string;
 }
 
 export interface TraceRecord {
@@ -87,6 +107,112 @@ export interface TraceRecord {
   type: "task" | "model" | "tool" | "approval" | "memory" | "job" | "connector" | "error";
   message: string;
   data?: Record<string, unknown>;
+}
+
+export interface ToolRecord {
+  id: string;
+  lane: Lane;
+  name: string;
+  description: string;
+  toolset: string;
+  status: ToolStatus;
+  risk: RiskLevel;
+  requiresApproval: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ToolsetRecord {
+  id: string;
+  lane: Lane;
+  name: string;
+  description: string;
+  status: ToolsetStatus;
+  toolNames: string[];
+  scopes: Array<"task" | "job" | "skill" | "subagent" | "mcp" | "messaging">;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SubagentRecord {
+  id: string;
+  lane: Lane;
+  name: string;
+  prompt: string;
+  status: SubagentStatus;
+  parentTaskId?: string;
+  taskId?: string;
+  toolsets: string[];
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  error?: string;
+  summary?: string;
+}
+
+export interface McpServerRecord {
+  id: string;
+  lane: Lane;
+  name: string;
+  command: string;
+  args: string[];
+  envKeys: string[];
+  status: McpServerStatus;
+  exposedTools: string[];
+  lastHealthAt?: string;
+  message?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MessagingBridgeRecord {
+  id: string;
+  lane: Lane;
+  name: string;
+  kind: "telegram" | "discord" | "slack" | "email" | "imessage" | "demo" | string;
+  status: MessagingBridgeStatus;
+  deliveryTargets: string[];
+  lastHealthAt?: string;
+  message?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ImportReport {
+  id: string;
+  lane: Lane;
+  source: ImportSource;
+  path: string;
+  mode: "inspect";
+  status: "completed" | "failed";
+  counts: Record<string, number>;
+  findings: string[];
+  createdAt: string;
+  error?: string;
+}
+
+export interface SessionSearchResult {
+  id: string;
+  lane: Lane;
+  kind: "task" | "trace" | "memory" | "skill" | "audit";
+  score: number;
+  title: string;
+  excerpt: string;
+  taskId?: string;
+  traceId?: string;
+  source: string;
+  at: string;
+}
+
+export interface ProviderCatalogItem {
+  id: string;
+  name: ProviderName | "openrouter" | "local" | string;
+  displayName: string;
+  baseUrl?: string;
+  auth: "none" | "env" | "codex-oauth";
+  models: string[];
+  capabilities: string[];
+  costHint: "free" | "external" | "unknown";
 }
 
 export interface AuditEvent {

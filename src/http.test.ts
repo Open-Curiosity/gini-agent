@@ -103,6 +103,45 @@ describe("runtime api", () => {
     expect(rejected.candidateRef).toBe("commit-abc");
     expect(readState(config.lane).audit.some((event) => event.action === "promotion.rejected")).toBe(true);
   });
+
+  test("supports Hermes-parity control records for search, toolsets, subagents, MCP, messaging, and imports", async () => {
+    const config = testConfig("hermes-parity");
+    const handler = createHandler(config);
+
+    const task = await call(handler, config, "/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ input: "remember Hermes parity should be searchable" })
+    });
+    await Bun.sleep(30);
+
+    const search = await call(handler, config, "/api/search?q=Hermes");
+    const toolsets = await call(handler, config, "/api/toolsets");
+    const disabled = await call(handler, config, "/api/toolsets/messaging/disable", { method: "POST" });
+    const subagent = await call(handler, config, "/api/subagents", {
+      method: "POST",
+      body: JSON.stringify({ name: "reviewer", prompt: "review Hermes parity", parentTaskId: task.id, toolsets: ["memory"] })
+    });
+    const mcp = await call(handler, config, "/api/mcp", {
+      method: "POST",
+      body: JSON.stringify({ name: "demo-mcp", command: "echo", args: ["ok"], exposedTools: ["demo.echo"] })
+    });
+    const bridge = await call(handler, config, "/api/messaging", {
+      method: "POST",
+      body: JSON.stringify({ name: "demo-bridge", kind: "demo", deliveryTargets: ["local"] })
+    });
+    const report = await call(handler, config, "/api/imports/inspect", {
+      method: "POST",
+      body: JSON.stringify({ source: "hermes", path: process.cwd() })
+    });
+
+    expect(search.length).toBeGreaterThan(0);
+    expect(toolsets.toolsets.some((item: { name: string }) => item.name === "session_search")).toBe(true);
+    expect(disabled.status).toBe("disabled");
+    expect(subagent.taskId).toBeString();
+    expect(mcp.status).toBe("configured");
+    expect(bridge.status).toBe("configured");
+    expect(report.status).toBe("completed");
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

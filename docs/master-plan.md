@@ -2756,14 +2756,15 @@ By the end of v1, a user can:
 
 ### 12.5 v2 production success criteria
 
-A user can:
+v2 starts from v1 Hermes parity. It is not a catch-up milestone. A user can:
 1. Run production Gini as a daily-driver lane while coding agents test sandbox lanes.
 2. Promote a tested candidate with an evidence-backed proposal and rollback plan.
 3. Recover from a failed upgrade without losing state, traces, or audit history.
-4. Use at least one real connector with scoped credential storage and visible health.
-5. Optionally bridge messaging apps without making them the source of truth.
-6. Inspect, approve, reject, and roll back runtime self-improvement changes.
+4. Use multiple real connectors with scoped credential storage, visible health, revocation, and operational recovery.
+5. Use optional messaging bridges without making them the source of truth.
+6. Inspect, approve, reject, and roll back runtime self-improvement changes across memories, skills, jobs, prompts, workflow templates, and harness material.
 7. Operate remotely with clear degraded/offline behavior.
+8. Benefit from beyond-Hermes reliability, governance, security, mobile UX, eval/harness optimization, data-egress controls, and long-running operational maturity.
 
 ---
 
@@ -2950,7 +2951,7 @@ Verification:
 - rejected proposal has no side effect
 - approved proposal applies the target change and records audit evidence
 
-### Phase 9: mobile contract and Expo app foundation
+### Phase 9: v1.0 mobile contract and Expo app foundation
 
 Deliverables:
 - stable mobile API contract
@@ -2961,7 +2962,7 @@ Deliverables:
 - task list/detail
 - chat UI skeleton
 - approval card skeleton
-- job/memory/trace summary skeleton
+- job/memory/skill/trace summary skeleton
 - remote relay/push architecture design
 
 Verification:
@@ -2969,10 +2970,11 @@ Verification:
 - app can list tasks and task detail
 - app can send basic task request
 - app can approve/deny simulated permission request
+- app can browse job, memory, skill, and trace summaries from runtime state
 - mobile uses runtime contracts rather than separate state
 - revoked device tokens cannot access the mobile contract
 
-### Phase 10: remote relay and notifications
+### Phase 10: v1.1 remote relay and notifications
 
 Deliverables:
 - relay threat model implemented enough for product use
@@ -2980,20 +2982,43 @@ Deliverables:
 - remote reachability path
 - E2EE or equivalent sensitive payload protection where feasible
 - relay outage/degraded behavior
+- notification routing for approvals, job failures, connector failures, and runtime health
 
 Verification:
 - user can receive approval/job notifications away from Mac
 - phone can reach Mac runtime remotely through secure channel
 - relay cannot approve actions by itself
 - local mode still works if relay is down
+- notification payloads link back to authoritative runtime state
 
-### Phase 11: mobile-first UX expansion
+### Phase 11: v1.2 Hermes-parity runtime completion
+
+Deliverables:
+- provider breadth: OpenRouter/OpenAI-compatible, direct providers where practical, and local-provider path where practical
+- toolset/tool-gating model for tasks, jobs, skills, subagents, and MCP tools
+- delegation/subagent runtime with isolated contexts, trace linkage, cost attribution, limits, cancellation, and parent verification rules
+- MCP server add/list/remove/test and selected tool exposure
+- session search depth: prior sessions, task traces, summaries, source links, and transcript/trace citations
+- config/profile equivalent through lane-aware profiles and importable/exportable config
+- Hermes/OpenClaw import basics for memories, skills, jobs, profiles, and connector references, read-only or guided by default
+- parity smoke/eval suite that maps Hermes capabilities to Gini workflows
+
+Verification:
+- a Hermes user can perform equivalent runtime tasks in Gini for memory, skills, session search, jobs, providers, tools, toolsets, delegation, MCP, and config/profile workflows
+- subagent claims about external side effects are trace-backed or verified before surfacing as success
+- MCP/plugin failures are isolated and visible
+- migration/import never mutates existing Hermes/OpenClaw installs by default
+- parity smoke/eval suite passes before v1 release
+
+### Phase 12: v1.3 mobile-first UX expansion
 
 Deliverables:
 - polished task cards
 - permission cards
 - memory browser/editor
+- skill browser/editor/proposal review
 - job list/detail
+- connector and runtime health views
 - trace/audit summary views
 - notification deep links
 - voice input when ready
@@ -3003,40 +3028,41 @@ Verification:
 - approval UX is clearer than chat prompts
 - job failure notification links to evidence
 - raw traces are summarized safely for mobile
+- skills and memory are governable from the mobile/control-plane UX
 
-### Phase 12: production/sandbox promotion and rollback
-
-Deliverables:
-- production/sandbox lane hardening
-- promotion proposal artifact
-- rollback plan artifact
-- lane-local snapshot create/list/restore primitives
-- migration/snapshot direction
-- reviewer-agent checklist
-- promotion UI in web/mobile
-
-Verification:
-- candidate changes can be tested in sandbox lane
-- failed gates preserve evidence
-- successful run produces promotion proposal
-- production install is not modified without approval
-- snapshot restore refuses cross-lane artifacts
-
-### Phase 13: optional messaging bridge
+### Phase 13: v1.4 messaging bridge parity
 
 Deliverables:
-- one optional messaging bridge, such as Telegram or iMessage
+- at least one high-priority Hermes-style messaging bridge, such as Telegram or iMessage
 - notification forwarding
+- inbound message/task creation
+- voice message support where the chosen channel makes it practical
 - task links back to mobile app or local web view
-- channel health
+- channel health and failed-send retry/logging
 
 Verification:
 - messaging channel can send/receive simple messages
+- messaging channel can create or update a task without becoming the source of truth
 - rich tasks still open in the native/web control plane
 - channel failure is visible
 - messaging is not the source of truth
 
-### Phase 14: v2 hardening and operations
+### Phase 14: v1.5 parity hardening and public-release readiness
+
+Deliverables:
+- full v1 Hermes-parity smoke/eval coverage
+- install/upgrade/reset/uninstall tests for v1 surfaces
+- provider, MCP, delegation, messaging, mobile, relay, job, memory, skill, and session-search regression tests
+- support/evidence bundle for v1 failures
+- documentation for Hermes-equivalent workflows and where Gini intentionally differs
+
+Verification:
+- v1 release candidate passes the Hermes-parity suite
+- v1 release candidate passes install, launch, exercise, observability, recovery, and review gates
+- no major Hermes runtime capability is missing without an explicit documented exception and expansion path
+- support/evidence bundle can diagnose failures across runtime, mobile, relay, messaging, MCP, and provider boundaries
+
+### Phase 15: v2 beyond-Hermes hardening and operations
 
 Deliverables:
 - production/sandbox promotion workflow implemented end-to-end
@@ -3044,8 +3070,10 @@ Deliverables:
 - migration tests against redacted or synthetic production-like state
 - real connector credential storage and revocation hardening
 - remote relay degradation tests
-- self-improvement rollback for applied memories, skills, jobs, and harness material
-- long-running reliability tests for jobs, connectors, and approvals
+- self-improvement rollback for applied memories, skills, jobs, prompts, workflows, and harness material
+- adversarial security and model-egress controls
+- richer eval/harness optimization loops
+- long-running reliability tests for jobs, connectors, approvals, messaging, subagents, MCP, and mobile/relay operation
 
 Verification:
 - production lane is not mutated without explicit approval
@@ -3053,6 +3081,7 @@ Verification:
 - connector failures are visible and recoverable
 - remote outage does not break local control
 - applied self-improvement changes can be traced back to evidence and reversed where feasible
+- v2 demonstrably improves beyond Hermes in reliability, governance, security, UX, and operational maturity
 
 ---
 
@@ -3141,15 +3170,17 @@ Hermes advantage:
 - self-improvement loop
 
 Our advantage:
+- v1 Hermes feature parity inside a more operable system structure
 - mobile-first control plane
 - structured auth/permission UX
 - governed memory and skills
 - task/job observability
+- trace/audit/cost receipts for every important action
 - harness trace/optimization infrastructure
 - app/runtime pairing
 
 Message:
-Hermes gives your agent memory and skills. We make those visible, governable, and reliable.
+Hermes proves the runtime primitives people want. Gini should match those primitives by v1, then make them visible, governable, mobile-operable, and reliable enough to trust for long-running work.
 
 ### 15.3 Against generic chatbots
 
@@ -3375,6 +3406,8 @@ When coding agents use this plan:
 8. Use safe defaults.
 9. Make every failure visible.
 10. Prefer fewer integrations that work well over many integrations that fail silently.
+11. Preserve the v1 Hermes-parity requirement: v1 should have the end-state system structure and should not leave major Hermes runtime capabilities missing.
+12. Treat v2 as beyond-Hermes improvement work, not deferred parity catch-up.
 
 ### 19.1 Product invariants vs implementation choices
 

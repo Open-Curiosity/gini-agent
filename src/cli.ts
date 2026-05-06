@@ -76,6 +76,28 @@ async function main(): Promise<void> {
     case "mobile":
       await mobile(config);
       break;
+    case "search":
+      await search(config);
+      break;
+    case "toolset":
+    case "toolsets":
+      await toolset(config);
+      break;
+    case "subagent":
+    case "subagents":
+      await subagent(config);
+      break;
+    case "mcp":
+      await mcp(config);
+      break;
+    case "message":
+    case "messaging":
+      await messaging(config);
+      break;
+    case "import":
+    case "imports":
+      await importInspect(config);
+      break;
     case "promotion":
     case "promotions":
       await promotion(config);
@@ -85,7 +107,7 @@ async function main(): Promise<void> {
       snapshot(config);
       break;
     case "provider":
-      provider(config);
+      await provider(config);
       break;
     case "trace":
       trace(config);
@@ -318,6 +340,90 @@ async function mobile(config: RuntimeConfig): Promise<void> {
   print(await api(config, "/api/mobile/bootstrap"));
 }
 
+async function search(config: RuntimeConfig): Promise<void> {
+  const query = restAfter(command).join(" ").trim();
+  if (!query) throw new Error("Usage: gini search <query>");
+  print(await api(config, `/api/search?q=${encodeURIComponent(query)}`));
+}
+
+async function toolset(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "enable" || sub === "disable") {
+    const name = restAfter(sub)[0];
+    if (!name) throw new Error(`Usage: gini toolset ${sub} <name>`);
+    print(await api(config, `/api/toolsets/${encodeURIComponent(name)}/${sub}`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/toolsets"));
+}
+
+async function subagent(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "spawn") {
+    const [name, ...promptParts] = restAfter(sub);
+    if (!name || promptParts.length === 0) throw new Error("Usage: gini subagent spawn <name> <prompt>");
+    print(await api(config, "/api/subagents", {
+      method: "POST",
+      body: JSON.stringify({ name, prompt: promptParts.join(" ") })
+    }));
+    return;
+  }
+  print(await api(config, "/api/subagents"));
+}
+
+async function mcp(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "add") {
+    const [name, commandValue, ...args] = restAfter(sub);
+    if (!name || !commandValue) throw new Error("Usage: gini mcp add <name> <command> [args...]");
+    print(await api(config, "/api/mcp", {
+      method: "POST",
+      body: JSON.stringify({ name, command: commandValue, args, exposedTools: [] })
+    }));
+    return;
+  }
+  if (sub === "health" || sub === "disable") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error(`Usage: gini mcp ${sub} <server-id-or-name>`);
+    print(await api(config, `/api/mcp/${encodeURIComponent(id)}/${sub}`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/mcp"));
+}
+
+async function messaging(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "add") {
+    const [name, kind = "demo", ...targets] = restAfter(sub);
+    if (!name) throw new Error("Usage: gini messaging add <name> [kind] [delivery-targets...]");
+    print(await api(config, "/api/messaging", {
+      method: "POST",
+      body: JSON.stringify({ name, kind, deliveryTargets: targets })
+    }));
+    return;
+  }
+  if (sub === "health" || sub === "disable") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error(`Usage: gini messaging ${sub} <bridge-id-or-name>`);
+    print(await api(config, `/api/messaging/${encodeURIComponent(id)}/${sub}`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/messaging"));
+}
+
+async function importInspect(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "inspect") {
+    const [source, path] = restAfter(sub);
+    if ((source !== "hermes" && source !== "openclaw") || !path) {
+      throw new Error("Usage: gini import inspect hermes|openclaw <path>");
+    }
+    print(await api(config, "/api/imports/inspect", { method: "POST", body: JSON.stringify({ source, path }) }));
+    return;
+  }
+  print(await api(config, "/api/imports"));
+}
+
 async function promotion(config: RuntimeConfig): Promise<void> {
   const sub = cliArgs[1] ?? "list";
   if (sub === "propose") {
@@ -359,20 +465,24 @@ function snapshot(config: RuntimeConfig): void {
   print(readState(config.lane).snapshots);
 }
 
-function provider(config: RuntimeConfig): void {
+async function provider(config: RuntimeConfig): Promise<void> {
   const sub = cliArgs[1] ?? "show";
   if (sub === "set") {
     const name = restAfter(sub)[0];
     const model = restAfter(sub)[1];
-    if (name !== "echo" && name !== "openai" && name !== "codex") {
-      throw new Error("Usage: gini provider set echo|openai|codex [model]");
+    if (name !== "echo" && name !== "openai" && name !== "codex" && name !== "openrouter" && name !== "local") {
+      throw new Error("Usage: gini provider set echo|openai|codex|openrouter|local [model]");
     }
     config.provider = normalizeProvider({
       name,
-      model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.4" : "gpt-5.4-mini")
+      model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.4" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : "gpt-5.4-mini")
     });
     writeFileSync(configPath(config.lane), `${JSON.stringify(config, null, 2)}\n`);
     print({ updated: true, provider: providerHealth(config), configPath: configPath(config.lane) });
+    return;
+  }
+  if (sub === "catalog") {
+    print(await api(config, "/api/providers/catalog"));
     return;
   }
   print(providerHealth(config));
@@ -417,6 +527,26 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
       body: JSON.stringify({ code: pairingResult.code, deviceName: "Smoke device" })
     });
     const mobileState = await apiWithToken(config, claimedDevice.token, "/api/mobile/bootstrap");
+    const searchResults = await api(config, "/api/search?q=Hermes");
+    await api(config, "/api/toolsets/mcp/enable", { method: "POST" });
+    const subagentResult = await api(config, "/api/subagents", {
+      method: "POST",
+      body: JSON.stringify({ name: "smoke-subagent", prompt: "summarize smoke subagent capability", toolsets: ["memory", "session_search"] })
+    });
+    const mcpResult = await api(config, "/api/mcp", {
+      method: "POST",
+      body: JSON.stringify({ name: "smoke-mcp", command: "echo", args: ["ok"], exposedTools: ["smoke.echo"] })
+    });
+    await api(config, `/api/mcp/${mcpResult.id}/health`, { method: "POST" });
+    const messagingResult = await api(config, "/api/messaging", {
+      method: "POST",
+      body: JSON.stringify({ name: "smoke-messaging", kind: "demo", deliveryTargets: ["local"] })
+    });
+    await api(config, `/api/messaging/${messagingResult.id}/health`, { method: "POST" });
+    const importResult = await api(config, "/api/imports/inspect", {
+      method: "POST",
+      body: JSON.stringify({ source: "hermes", path: process.cwd() })
+    });
     const snapshotResult = createSnapshot(config, "Smoke rollback baseline");
     const promotionResult = await api(config, "/api/promotions", {
       method: "POST",
@@ -442,6 +572,11 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
       improvementId: proposal.id,
       pairedDeviceId: claimedDevice.device.id,
       mobileTaskCount: mobileState.tasks.length,
+      searchResults: searchResults.length,
+      subagentId: subagentResult.id,
+      mcpId: mcpResult.id,
+      messagingId: messagingResult.id,
+      importReportId: importResult.id,
       snapshotId: snapshotResult.snapshotId,
       promotionId: promotionResult.id,
       connectorHealth: connectorHealth.health,
@@ -609,9 +744,15 @@ Usage:
   bun run gini pairing create|claim
   bun run gini devices list|revoke
   bun run gini mobile bootstrap
+  bun run gini search <query>
+  bun run gini toolsets list|enable|disable
+  bun run gini subagents list|spawn
+  bun run gini mcp list|add|health|disable
+  bun run gini messaging list|add|health|disable
+  bun run gini import inspect hermes|openclaw <path>
   bun run gini promotions list|propose|approve|reject
   bun run gini snapshots list|create|restore
-  bun run gini provider show|set echo|openai|codex [model]
+  bun run gini provider show|catalog|set echo|openai|codex|openrouter|local [model]
   bun run gini trace <task-id>
   bun run gini audit
   bun run gini evidence

@@ -59,6 +59,7 @@ This repo now includes a Bun TypeScript v0 implementation of the local runtime t
 - evidence bundles for smoke/reviewer agents
 - paired-device auth and mobile bootstrap contracts for the future Expo app
 - lane-local snapshots and promotion proposal records for v2 promotion/rollback workflows
+- Hermes-parity structure for session search, toolsets, subagents, MCP records, messaging bridge records, provider catalog metadata, and read-only import inspection
 - Hermes-inspired memory proposal flow and OpenClaw-inspired connector/skill scaffolding
 
 Run it locally:
@@ -90,6 +91,12 @@ bun run gini evidence
 bun run gini pairing
 bun run gini devices
 bun run gini mobile bootstrap
+bun run gini search "Hermes parity"
+bun run gini toolsets
+bun run gini subagent spawn reviewer "review recent traces"
+bun run gini mcp add demo echo ok
+bun run gini messaging add local demo local
+bun run gini import inspect hermes ~/.hermes
 bun run gini snapshot create "before trying candidate"
 bun run gini promotion propose HEAD /path/to/evidence.json "tested candidate in sandbox"
 bun run gini provider show
