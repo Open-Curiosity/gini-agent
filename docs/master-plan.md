@@ -2739,17 +2739,20 @@ Avoid initially:
 - full browser automation for arbitrary external websites unless needed
 - bundled provider billing
 
-### 12.4 v1 mobile success criteria
+### 12.4 v1 success criteria
 
-A user can:
+By the end of v1, a user can:
 1. Pair phone with the Mac runtime.
 2. Chat or speak to Gini from the phone.
 3. See task progress from the phone.
 4. Approve or deny risky actions from structured mobile cards.
 5. Browse and edit memory.
-6. Browse jobs and receive failure notifications.
-7. Review trace/audit summaries in a readable form.
-8. Use Gini when away from the Mac through the production relay/push architecture once implemented.
+6. Browse, inspect, validate, and approve/reject skill changes.
+7. Browse jobs and receive failure notifications.
+8. Review trace/audit summaries in a readable form.
+9. Use Gini when away from the Mac through the production relay/push architecture once implemented.
+10. Use Hermes-equivalent runtime capabilities inside Gini: CLI workflow, memory, skills, session search, jobs, file/terminal/web/code tools, toolsets/tool gating, provider abstraction, delegation/subagents, MCP, messaging bridge, config/profile equivalent, and import/migration basics.
+11. Confirm through a Hermes-parity smoke/eval suite that switching from Hermes to Gini does not remove a major runtime capability, even if Gini's UX and integration breadth differ.
 
 ### 12.5 v2 production success criteria
 
@@ -2873,13 +2876,15 @@ Verification:
 - failed job records logs and trace
 - missed-run condition is visible through CLI/API/web
 
-### Phase 5: v0.5 memory and skills
+### Phase 5: v0.5 memory, skills, and basic session search
 
 Deliverables:
 - memory store
 - memory retrieval
 - memory proposal flow
 - memory list/read/edit/delete CLI/API/web
+- basic session transcript/task trace indexing
+- session search with source task/session links
 - basic skill/procedure file format
 - skill list/load/validate CLI/API/web
 - trusted/draft status
@@ -2888,6 +2893,7 @@ Verification:
 - agent proposes memory after a task
 - user can approve/edit/reject through CLI or web
 - approved memory is later retrieved
+- user can search prior sessions/tasks and open cited source trace or transcript
 - skill can be loaded and used in a toy task
 - memory/skill mutations are audited
 
