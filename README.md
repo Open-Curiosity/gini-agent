@@ -53,6 +53,7 @@ This repo now includes a Bun TypeScript v0 implementation of the local runtime t
 - provider support with deterministic `echo`, Codex OAuth, and OpenAI API key modes
 - trace-backed improvement proposals for memory, skill, and job changes
 - evidence bundles for smoke/reviewer agents
+- paired-device auth and mobile bootstrap contracts for the future Expo app
 - Hermes-inspired memory proposal flow and OpenClaw-inspired connector/skill scaffolding
 
 Run it locally:
@@ -81,6 +82,9 @@ bun run gini connectors health
 bun run gini improvement propose skill review-traces "" "Inspect trace evidence before proposing changes"
 bun run gini improvements
 bun run gini evidence
+bun run gini pairing
+bun run gini devices
+bun run gini mobile bootstrap
 bun run gini provider show
 ```
 

@@ -9,11 +9,15 @@ import {
   createJob,
   createImprovementProposal,
   createMemory,
+  createPairingCode,
   createSkill,
+  claimPairingCode,
+  findActiveDeviceByToken,
   mutateState,
   now,
   readState,
   readTrace,
+  revokeDevice,
   taskCounts,
   updateConnectorHealth
 } from "./state";
@@ -24,7 +28,8 @@ type Handler = (request: Request, params: Record<string, string>) => Response | 
 export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
-    ["GET", /^\/api\/state$/, () => json(readState(config.lane))],
+    ["GET", /^\/api\/state$/, () => json(publicState(config))],
+    ["GET", /^\/api\/mobile\/bootstrap$/, () => json(mobileBootstrap(config))],
     ["GET", /^\/api\/tasks$/, () => json(readState(config.lane).tasks)],
     ["POST", /^\/api\/tasks$/, async (request) => json(submitTask(config, String((await body(request)).input ?? "")), 201)],
     ["GET", /^\/api\/tasks\/([^/]+)$/, (_request, params) => {
@@ -83,12 +88,22 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/improvements$/, () => json(readState(config.lane).improvements)],
     ["POST", /^\/api\/improvements$/, async (request) => json(proposeImprovement(config, await body(request)), 201)],
     ["POST", /^\/api\/improvements\/([^/]+)\/approve$/, (_request, params) => json(reviewImprovement(config, params[0], "approve"))],
-    ["POST", /^\/api\/improvements\/([^/]+)\/reject$/, (_request, params) => json(reviewImprovement(config, params[0], "reject"))]
+    ["POST", /^\/api\/improvements\/([^/]+)\/reject$/, (_request, params) => json(reviewImprovement(config, params[0], "reject"))],
+    ["GET", /^\/api\/devices$/, () => json(publicState(config).devices)],
+    ["POST", /^\/api\/devices\/([^/]+)\/revoke$/, (_request, params) => json(revokePairedDevice(config, params[0]))],
+    ["POST", /^\/api\/pairing$/, async (request) => json(createPairing(config, await body(request)), 201)]
   ];
 
   return async (request: Request) => {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/api/")) {
+      if (request.method === "POST" && url.pathname === "/api/pairing/claim") {
+        try {
+          return json(claimPairing(config, await body(request)), 201);
+        } catch (error) {
+          return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+        }
+      }
       if (!authorized(request, config)) return json({ error: "Unauthorized" }, 401);
       for (const [method, pattern, handler] of routes) {
         const match = url.pathname.match(pattern);
@@ -214,6 +229,32 @@ function checkConnector(config: RuntimeConfig, connectorId: string) {
   });
 }
 
+function createPairing(config: RuntimeConfig, input: Record<string, unknown>) {
+  const ttlSeconds = Math.min(3600, Math.max(60, Number(input.ttlSeconds ?? 600)));
+  const created = mutateState(config.lane, (state) => createPairingCode(state, ttlSeconds));
+  return {
+    id: created.pairing.id,
+    lane: created.pairing.lane,
+    code: created.code,
+    expiresAt: created.pairing.expiresAt
+  };
+}
+
+function claimPairing(config: RuntimeConfig, input: Record<string, unknown>) {
+  const code = String(input.code ?? "");
+  const deviceName = String(input.deviceName ?? "Mobile device");
+  if (!code) throw new Error("Pairing code is required.");
+  const claimed = mutateState(config.lane, (state) => claimPairingCode(state, code, deviceName));
+  return {
+    device: redactDevice(claimed.device),
+    token: claimed.token
+  };
+}
+
+function revokePairedDevice(config: RuntimeConfig, deviceId: string) {
+  return redactDevice(mutateState(config.lane, (state) => revokeDevice(state, deviceId)));
+}
+
 function proposeImprovement(config: RuntimeConfig, input: Record<string, unknown>) {
   const taskId = typeof input.sourceTaskId === "string" ? input.sourceTaskId : undefined;
   const trace = taskId ? readTrace(config.lane, taskId) : [];
@@ -324,7 +365,11 @@ async function body(request: Request): Promise<Record<string, unknown>> {
 function authorized(request: Request, config: RuntimeConfig): boolean {
   const header = request.headers.get("authorization") ?? "";
   const queryToken = new URL(request.url).searchParams.get("token");
-  return header === `Bearer ${config.token}` || queryToken === config.token;
+  const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : queryToken;
+  if (bearer === config.token) return true;
+  if (!bearer) return false;
+  const device = mutateState(config.lane, (state) => findActiveDeviceByToken(state, bearer));
+  return Boolean(device);
 }
 
 function json(value: unknown, statusCode = 200): Response {
@@ -341,4 +386,51 @@ function webApp(config: RuntimeConfig): Response {
 
 export function writePid(config: RuntimeConfig): void {
   writeFileSync(pidPath(config.lane), String(process.pid));
+}
+
+function mobileBootstrap(config: RuntimeConfig) {
+  const state = publicState(config);
+  return {
+    runtime: status(config),
+    lane: config.lane,
+    tasks: state.tasks,
+    approvals: state.approvals,
+    memories: state.memories,
+    skills: state.skills,
+    jobs: state.jobs,
+    connectors: state.connectors,
+    improvements: state.improvements,
+    devices: state.devices
+  };
+}
+
+function publicState(config: RuntimeConfig) {
+  const state = readState(config.lane);
+  return {
+    ...state,
+    pairingCodes: state.pairingCodes.map((pairing) => ({
+      id: pairing.id,
+      lane: pairing.lane,
+      status: pairing.status,
+      createdAt: pairing.createdAt,
+      expiresAt: pairing.expiresAt,
+      claimedAt: pairing.claimedAt,
+      claimedByDeviceId: pairing.claimedByDeviceId
+    })),
+    devices: state.devices.map(redactDevice)
+  };
+}
+
+function redactDevice(device: ReturnType<typeof readState>["devices"][number]) {
+  return {
+    id: device.id,
+    lane: device.lane,
+    name: device.name,
+    status: device.status,
+    scopes: device.scopes,
+    createdAt: device.createdAt,
+    updatedAt: device.updatedAt,
+    lastSeenAt: device.lastSeenAt,
+    revokedAt: device.revokedAt
+  };
 }

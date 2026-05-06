@@ -2914,6 +2914,8 @@ Verification:
 Deliverables:
 - stable mobile API contract
 - pairing/auth design
+- paired-device token issuance and revocation
+- mobile bootstrap endpoint backed by runtime state
 - Expo app shell
 - task list/detail
 - chat UI skeleton
@@ -2927,6 +2929,7 @@ Verification:
 - app can send basic task request
 - app can approve/deny simulated permission request
 - mobile uses runtime contracts rather than separate state
+- revoked device tokens cannot access the mobile contract
 
 ### Phase 10: remote relay and notifications
 

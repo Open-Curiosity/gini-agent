@@ -4,10 +4,14 @@ import type {
   Approval,
   AuditEvent,
   ConnectorRecord,
+  DeviceStatus,
   ImprovementProposal,
   JobRecord,
   Lane,
   MemoryRecord,
+  PairedDevice,
+  PairingCode,
+  PairingStatus,
   RuntimeState,
   SkillRecord,
   Task,
@@ -49,7 +53,9 @@ export function createEmptyState(lane: Lane): RuntimeState {
         health: "unknown"
       }
     ],
-    improvements: []
+    improvements: [],
+    pairingCodes: [],
+    devices: []
   };
 }
 
@@ -260,6 +266,86 @@ export function createImprovementProposal(
   return item;
 }
 
+export function createPairingCode(state: RuntimeState, ttlSeconds = 600): { pairing: PairingCode; code: string } {
+  const at = now();
+  const code = randomPairingCode();
+  const pairing: PairingCode = {
+    id: id("pair"),
+    lane: state.lane,
+    codeHash: hashSecret(code),
+    status: "pending",
+    createdAt: at,
+    expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString()
+  };
+  state.pairingCodes.unshift(pairing);
+  addAudit(state, {
+    actor: "user",
+    action: "pairing.created",
+    target: pairing.id,
+    risk: "medium",
+    evidence: { expiresAt: pairing.expiresAt }
+  });
+  return { pairing, code };
+}
+
+export function claimPairingCode(state: RuntimeState, code: string, deviceName: string): { device: PairedDevice; token: string } {
+  expirePairingCodes(state);
+  const codeHash = hashSecret(code);
+  const pairing = state.pairingCodes.find((item) => item.codeHash === codeHash && item.status === "pending");
+  if (!pairing) throw new Error("Pairing code is invalid or expired.");
+
+  const at = now();
+  const token = `gini_device_${crypto.randomUUID().replaceAll("-", "")}`;
+  const device: PairedDevice = {
+    id: id("device"),
+    lane: state.lane,
+    name: deviceName.trim() || "Unnamed device",
+    tokenHash: hashSecret(token),
+    status: "active",
+    scopes: ["tasks:read", "tasks:write", "approvals:write", "state:read"],
+    createdAt: at,
+    updatedAt: at
+  };
+  pairing.status = "claimed";
+  pairing.claimedAt = at;
+  pairing.claimedByDeviceId = device.id;
+  state.devices.unshift(device);
+  addAudit(state, {
+    actor: "user",
+    action: "device.paired",
+    target: device.id,
+    risk: "medium",
+    evidence: { pairingId: pairing.id, name: device.name, scopes: device.scopes }
+  });
+  return { device, token };
+}
+
+export function revokeDevice(state: RuntimeState, deviceId: string): PairedDevice {
+  const device = state.devices.find((item) => item.id === deviceId);
+  if (!device) throw new Error(`Device not found: ${deviceId}`);
+  device.status = "revoked" satisfies DeviceStatus;
+  device.updatedAt = now();
+  device.revokedAt = device.updatedAt;
+  addAudit(state, {
+    actor: "user",
+    action: "device.revoked",
+    target: device.id,
+    risk: "medium",
+    evidence: { name: device.name }
+  });
+  return device;
+}
+
+export function findActiveDeviceByToken(state: RuntimeState, token: string): PairedDevice | undefined {
+  const tokenHash = hashSecret(token);
+  const device = state.devices.find((item) => item.tokenHash === tokenHash && item.status === "active");
+  if (device) {
+    device.lastSeenAt = now();
+    device.updatedAt = device.lastSeenAt;
+  }
+  return device;
+}
+
 export function updateConnectorHealth(connector: ConnectorRecord): ConnectorRecord {
   connector.lastHealthAt = now();
   connector.health = connector.status === "configured" ? "healthy" : "unhealthy";
@@ -288,5 +374,29 @@ function normalizeState(lane: Lane, state: RuntimeState): RuntimeState {
   state.memories ??= [];
   state.skills ??= [];
   state.jobs ??= [];
+  state.pairingCodes ??= [];
+  state.devices ??= [];
+  expirePairingCodes(state);
   return state;
+}
+
+function expirePairingCodes(state: RuntimeState): void {
+  const at = Date.now();
+  for (const pairing of state.pairingCodes) {
+    if (pairing.status === "pending" && new Date(pairing.expiresAt).getTime() <= at) {
+      pairing.status = "expired" satisfies PairingStatus;
+    }
+  }
+}
+
+export function hashSecret(value: string): string {
+  const digest = new Bun.CryptoHasher("sha256").update(value).digest("hex");
+  return `sha256:${digest}`;
+}
+
+function randomPairingCode(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(6)))
+    .map((value) => String(value % 10))
+    .join("")
+    .replace(/^(.{3})(.{3})$/, "$1-$2");
 }

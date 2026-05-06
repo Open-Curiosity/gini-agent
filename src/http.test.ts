@@ -48,16 +48,67 @@ describe("runtime api", () => {
     expect(state.memories).toHaveLength(0);
     expect(state.audit.some((event) => event.action === "improvement.rejected")).toBe(true);
   });
+
+  test("pairs devices with one-time codes and redacts stored secrets", async () => {
+    const config = testConfig("pairing");
+    const handler = createHandler(config);
+
+    const pairing = await call(handler, config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 60 }) });
+    const claimed = await callPublic(handler, config, "/api/pairing/claim", {
+      method: "POST",
+      body: JSON.stringify({ code: pairing.code, deviceName: "Test phone" })
+    });
+    const mobile = await callWithToken(handler, config, claimed.token, "/api/mobile/bootstrap");
+    const devices = await call(handler, config, "/api/devices");
+    const state = await call(handler, config, "/api/state");
+
+    expect(mobile.lane).toBe(config.lane);
+    expect(devices[0].name).toBe("Test phone");
+    expect(JSON.stringify(state)).not.toContain("tokenHash");
+    expect(JSON.stringify(state)).not.toContain("codeHash");
+    expect(JSON.stringify(state)).not.toContain(claimed.token);
+  });
+
+  test("revoked device tokens cannot use mobile contracts", async () => {
+    const config = testConfig("pairing-revoke");
+    const handler = createHandler(config);
+
+    const pairing = await call(handler, config, "/api/pairing", { method: "POST" });
+    const claimed = await callPublic(handler, config, "/api/pairing/claim", {
+      method: "POST",
+      body: JSON.stringify({ code: pairing.code, deviceName: "Revoked phone" })
+    });
+    await call(handler, config, `/api/devices/${claimed.device.id}/revoke`, { method: "POST" });
+    const response = await rawCall(handler, config, "/api/mobile/bootstrap", {}, claimed.token);
+
+    expect(response.status).toBe(401);
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
-  const response = await handler(new Request(`http://127.0.0.1:${config.port}${path}`, {
-    ...init,
-    headers: { "content-type": "application/json", authorization: `Bearer ${config.token}`, ...(init.headers ?? {}) }
-  }));
+  return callWithToken(handler, config, config.token, path, init);
+}
+
+async function callWithToken(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, token: string, path: string, init: RequestInit = {}) {
+  const response = await rawCall(handler, config, path, init, token);
   const value = await response.json();
   if (!response.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
   return value;
+}
+
+async function callPublic(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
+  const response = await rawCall(handler, config, path, init);
+  const value = await response.json();
+  if (!response.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
+  return value;
+}
+
+async function rawCall(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}, token?: string) {
+  const response = await handler(new Request(`http://127.0.0.1:${config.port}${path}`, {
+    ...init,
+    headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}), ...(init.headers ?? {}) }
+  }));
+  return response;
 }
 
 function testConfig(lane: string): RuntimeConfig {

@@ -65,6 +65,17 @@ async function main(): Promise<void> {
     case "improvements":
       await improvement(config);
       break;
+    case "pairing":
+    case "pair":
+      await pairing(config);
+      break;
+    case "device":
+    case "devices":
+      await device(config);
+      break;
+    case "mobile":
+      await mobile(config);
+      break;
     case "provider":
       provider(config);
       break;
@@ -268,6 +279,37 @@ async function improvement(config: RuntimeConfig): Promise<void> {
   print(await api(config, "/api/improvements"));
 }
 
+async function pairing(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "create";
+  if (sub === "claim") {
+    const [code, ...nameParts] = restAfter(sub);
+    if (!code) throw new Error("Usage: gini pairing claim <code> [device-name]");
+    print(await publicApi(config, "/api/pairing/claim", {
+      method: "POST",
+      body: JSON.stringify({ code, deviceName: nameParts.join(" ") || "CLI device" })
+    }));
+    return;
+  }
+  print(await api(config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 600 }) }));
+}
+
+async function device(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "revoke") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error("Usage: gini device revoke <device-id>");
+    print(await api(config, `/api/devices/${id}/revoke`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/devices"));
+}
+
+async function mobile(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "bootstrap";
+  if (sub !== "bootstrap") throw new Error("Usage: gini mobile bootstrap");
+  print(await api(config, "/api/mobile/bootstrap"));
+}
+
 function provider(config: RuntimeConfig): void {
   const sub = cliArgs[1] ?? "show";
   if (sub === "set") {
@@ -345,6 +387,12 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
     });
     await api(config, `/api/improvements/${proposal.id}/approve`, { method: "POST" });
     const connectorHealth = await api(config, "/api/connectors/conn_demo/health", { method: "POST" });
+    const pairingResult = await api(config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 300 }) });
+    const claimedDevice = await publicApi(config, "/api/pairing/claim", {
+      method: "POST",
+      body: JSON.stringify({ code: pairingResult.code, deviceName: "Smoke device" })
+    });
+    const mobileState = await apiWithToken(config, claimedDevice.token, "/api/mobile/bootstrap");
     const finalState = await api(config, "/api/state");
     const bundle = createEvidenceBundle(config);
     print({
@@ -358,6 +406,8 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
       approvedMemoryId: memory.id,
       jobId: job.id,
       improvementId: proposal.id,
+      pairedDeviceId: claimedDevice.device.id,
+      mobileTaskCount: mobileState.tasks.length,
       connectorHealth: connectorHealth.health,
       traces: finalState.tasks.length,
       auditEvents: finalState.audit.length,
@@ -425,9 +475,23 @@ async function isRunning(config: RuntimeConfig): Promise<boolean> {
 }
 
 async function api(config: RuntimeConfig, path: string, options: RequestInit = {}) {
+  return apiWithToken(config, config.token, path, options);
+}
+
+async function apiWithToken(config: RuntimeConfig, token: string, path: string, options: RequestInit = {}) {
   const response = await fetch(`${url(config)}${path}`, {
     ...options,
-    headers: { "content-type": "application/json", ...auth(config), ...(options.headers ?? {}) }
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}`, ...(options.headers ?? {}) }
+  });
+  const value = await response.json();
+  if (!response.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
+  return value;
+}
+
+async function publicApi(config: RuntimeConfig, path: string, options: RequestInit = {}) {
+  const response = await fetch(`${url(config)}${path}`, {
+    ...options,
+    headers: { "content-type": "application/json", ...(options.headers ?? {}) }
   });
   const value = await response.json();
   if (!response.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
@@ -506,6 +570,9 @@ Usage:
   bun run gini jobs list|add|run|pause|resume
   bun run gini connectors list|health
   bun run gini improvements list|propose|approve|reject
+  bun run gini pairing create|claim
+  bun run gini devices list|revoke
+  bun run gini mobile bootstrap
   bun run gini provider show|set echo|openai|codex [model]
   bun run gini trace <task-id>
   bun run gini audit

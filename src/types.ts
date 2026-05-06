@@ -18,6 +18,10 @@ export type ImprovementStatus = "proposed" | "approved" | "rejected" | "applied"
 
 export type ImprovementKind = "memory" | "skill" | "job";
 
+export type PairingStatus = "pending" | "claimed" | "expired" | "revoked";
+
+export type DeviceStatus = "active" | "revoked";
+
 export interface ProviderConfig {
   name: ProviderName;
   model: string;
@@ -48,6 +52,8 @@ export interface RuntimeState {
   jobs: JobRecord[];
   connectors: ConnectorRecord[];
   improvements: ImprovementProposal[];
+  pairingCodes: PairingCode[];
+  devices: PairedDevice[];
 }
 
 export interface Task {
@@ -183,6 +189,30 @@ export interface ImprovementProposal {
   appliedTargetId?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface PairingCode {
+  id: string;
+  lane: Lane;
+  codeHash: string;
+  status: PairingStatus;
+  createdAt: string;
+  expiresAt: string;
+  claimedAt?: string;
+  claimedByDeviceId?: string;
+}
+
+export interface PairedDevice {
+  id: string;
+  lane: Lane;
+  name: string;
+  tokenHash: string;
+  status: DeviceStatus;
+  scopes: string[];
+  createdAt: string;
+  updatedAt: string;
+  lastSeenAt?: string;
+  revokedAt?: string;
 }
 
 export interface RuntimeStatus {
