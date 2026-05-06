@@ -16,7 +16,7 @@ import { searchSessions } from "./domain/search";
 import { listToolsets, setToolsetStatus } from "./domain/toolsets";
 import { listSubagents, spawnSubagent } from "./domain/subagents";
 import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./domain/mcp";
-import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge } from "./domain/messaging";
+import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge, listMessagingMessages, receiveMessagingInput, sendMessagingOutput } from "./domain/messaging";
 import { inspectImportSource } from "./domain/importers";
 import { providerCatalog } from "./provider";
 import { createProfile, listProfiles, useProfile } from "./domain/profiles";
@@ -114,6 +114,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/mcp\/([^/]+)\/disable$/, (_request, params) => json(removeMcpServer(config, params[0]))],
     ["GET", /^\/api\/messaging$/, () => json(readState(config.lane).messagingBridges)],
     ["POST", /^\/api\/messaging$/, async (request) => json(addMessagingBridge(config, await body(request)), 201)],
+    ["GET", /^\/api\/messaging\/messages$/, () => json(listMessagingMessages(config))],
+    ["GET", /^\/api\/messaging\/([^/]+)\/messages$/, (_request, params) => json(listMessagingMessages(config, params[0]))],
+    ["POST", /^\/api\/messaging\/([^/]+)\/receive$/, async (request, params) => json(receiveMessagingInput(config, params[0], await body(request)), 201)],
+    ["POST", /^\/api\/messaging\/([^/]+)\/send$/, async (request, params) => json(sendMessagingOutput(config, params[0], await body(request)), 201)],
     ["POST", /^\/api\/messaging\/([^/]+)\/health$/, (_request, params) => json(checkMessagingBridge(config, params[0]))],
     ["POST", /^\/api\/messaging\/([^/]+)\/disable$/, (_request, params) => json(disableMessagingBridge(config, params[0]))],
     ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],

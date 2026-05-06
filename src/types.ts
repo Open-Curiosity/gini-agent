@@ -41,6 +41,7 @@ export type ProfileStatus = "active" | "inactive";
 export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 
 export type NotificationStatus = "queued" | "sent" | "failed" | "acknowledged";
+export type MessagingMessageStatus = "received" | "queued" | "sent" | "failed";
 
 export type RuntimeEventKind =
   | "task"
@@ -107,6 +108,7 @@ export interface RuntimeState {
   jobRuns: JobRunRecord[];
   chatSessions: ChatSessionRecord[];
   chatMessages: ChatMessageRecord[];
+  messagingMessages: MessagingMessageRecord[];
 }
 
 export interface Task {
@@ -243,6 +245,21 @@ export interface MessagingBridgeRecord {
   message?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface MessagingMessageRecord {
+  id: string;
+  lane: Lane;
+  bridgeId: string;
+  direction: "inbound" | "outbound";
+  status: MessagingMessageStatus;
+  target: string;
+  text: string;
+  createdAt: string;
+  updatedAt: string;
+  taskId?: string;
+  notificationId?: string;
+  error?: string;
 }
 
 export interface ImportReport {

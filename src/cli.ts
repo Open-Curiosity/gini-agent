@@ -516,6 +516,20 @@ async function messaging(config: RuntimeConfig): Promise<void> {
     print(await api(config, `/api/messaging/${encodeURIComponent(id)}/${sub}`, { method: "POST" }));
     return;
   }
+  if (sub === "receive" || sub === "send") {
+    const [id, ...textParts] = restAfter(sub);
+    if (!id || textParts.length === 0) throw new Error(`Usage: gini messaging ${sub} <bridge-id-or-name> <text>`);
+    print(await api(config, `/api/messaging/${encodeURIComponent(id)}/${sub}`, {
+      method: "POST",
+      body: JSON.stringify({ text: textParts.join(" "), target: "local" })
+    }));
+    return;
+  }
+  if (sub === "messages") {
+    const id = restAfter(sub)[0];
+    print(await api(config, id ? `/api/messaging/${encodeURIComponent(id)}/messages` : "/api/messaging/messages"));
+    return;
+  }
   print(await api(config, "/api/messaging"));
 }
 

@@ -29,7 +29,8 @@ export function mobileBootstrap(config: RuntimeConfig) {
     events: state.events,
     jobRuns: state.jobRuns,
     chatSessions: state.chatSessions,
-    chatMessages: state.chatMessages
+    chatMessages: state.chatMessages,
+    messagingMessages: state.messagingMessages
   };
 }
 

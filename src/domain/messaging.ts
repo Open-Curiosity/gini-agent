@@ -1,5 +1,6 @@
 import type { RuntimeConfig } from "../types";
-import { addAudit, createMessagingBridgeRecord, mutateState, now } from "../state";
+import { submitTask } from "../agent";
+import { addAudit, createMessagingBridgeRecord, createMessagingMessageRecord, mutateState, now, readState } from "../state";
 
 export function addMessagingBridge(config: RuntimeConfig, input: Record<string, unknown>) {
   const name = String(input.name ?? "");
@@ -17,9 +18,15 @@ export function checkMessagingBridge(config: RuntimeConfig, idOrName: string) {
     const bridge = state.messagingBridges.find((item) => item.id === idOrName || item.name === idOrName);
     if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
     bridge.lastHealthAt = now();
-    bridge.message = bridge.kind === "demo"
-      ? "Demo messaging bridge is available for local notifications."
-      : "Bridge record is configured. Live platform delivery is deferred until the messaging transport slice.";
+    if (bridge.kind === "telegram" && !process.env.TELEGRAM_BOT_TOKEN) {
+      bridge.status = "error";
+      bridge.message = "Set TELEGRAM_BOT_TOKEN to enable Telegram delivery.";
+    } else {
+      bridge.status = "configured";
+      bridge.message = bridge.kind === "demo"
+        ? "Demo messaging bridge is available for local inbound/outbound task messages."
+        : `${bridge.kind} bridge is configured with local Gini task routing.`;
+    }
     bridge.updatedAt = bridge.lastHealthAt;
     addAudit(state, {
       actor: "runtime",
@@ -29,6 +36,57 @@ export function checkMessagingBridge(config: RuntimeConfig, idOrName: string) {
       evidence: { kind: bridge.kind, status: bridge.status }
     });
     return bridge;
+  });
+}
+
+export function listMessagingMessages(config: RuntimeConfig, bridgeId?: string) {
+  const messages = readState(config.lane).messagingMessages;
+  return bridgeId ? messages.filter((message) => message.bridgeId === bridgeId) : messages;
+}
+
+export function receiveMessagingInput(config: RuntimeConfig, idOrName: string, input: Record<string, unknown>) {
+  const bridge = readState(config.lane).messagingBridges.find((item) => item.id === idOrName || item.name === idOrName);
+  if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
+  if (bridge.status !== "configured") throw new Error(`Messaging bridge is not configured: ${idOrName}`);
+  const text = String(input.text ?? "").trim();
+  if (!text) throw new Error("Inbound message text is required.");
+  const target = String(input.target ?? "local");
+  const task = submitTask(config, text);
+  return mutateState(config.lane, (state) => createMessagingMessageRecord(state, {
+    bridgeId: bridge.id,
+    direction: "inbound",
+    status: "received",
+    target,
+    text,
+    taskId: task.id
+  }));
+}
+
+export function sendMessagingOutput(config: RuntimeConfig, idOrName: string, input: Record<string, unknown>) {
+  return mutateState(config.lane, (state) => {
+    const bridge = state.messagingBridges.find((item) => item.id === idOrName || item.name === idOrName);
+    if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
+    const text = String(input.text ?? "").trim();
+    const target = String(input.target ?? bridge.deliveryTargets[0] ?? "local");
+    if (!text) throw new Error("Outbound message text is required.");
+    const status = bridge.status === "configured" ? "sent" : "failed";
+    const message = createMessagingMessageRecord(state, {
+      bridgeId: bridge.id,
+      direction: "outbound",
+      status,
+      target,
+      text,
+      notificationId: typeof input.notificationId === "string" ? input.notificationId : undefined,
+      error: status === "failed" ? `Bridge is ${bridge.status}` : undefined
+    });
+    addAudit(state, {
+      actor: "runtime",
+      action: "messaging.sent",
+      target: bridge.id,
+      risk: "low",
+      evidence: { messageId: message.id, status, target }
+    });
+    return message;
   });
 }
 

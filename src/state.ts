@@ -15,6 +15,7 @@ import type {
   MemoryRecord,
   McpServerRecord,
   MessagingBridgeRecord,
+  MessagingMessageRecord,
   PairedDevice,
   PairingCode,
   PairingStatus,
@@ -86,7 +87,8 @@ export function createEmptyState(lane: Lane): RuntimeState {
     events: [],
     jobRuns: [],
     chatSessions: [],
-    chatMessages: []
+    chatMessages: [],
+    messagingMessages: []
   };
 }
 
@@ -613,6 +615,31 @@ export function createMessagingBridgeRecord(
   return item;
 }
 
+export function createMessagingMessageRecord(
+  state: RuntimeState,
+  message: Omit<MessagingMessageRecord, "id" | "lane" | "createdAt" | "updatedAt">
+): MessagingMessageRecord {
+  const at = now();
+  const item: MessagingMessageRecord = {
+    id: id("message"),
+    lane: state.lane,
+    createdAt: at,
+    updatedAt: at,
+    ...message
+  };
+  state.messagingMessages.unshift(item);
+  appendEvent(state, {
+    kind: "messaging",
+    action: `messaging.${item.direction}.${item.status}`,
+    target: item.bridgeId,
+    taskId: item.taskId,
+    risk: "low",
+    summary: `${item.direction} message ${item.status}`,
+    data: { messageId: item.id, target: item.target }
+  });
+  return item;
+}
+
 export function createImportReport(state: RuntimeState, report: Omit<ImportReport, "id" | "lane" | "createdAt">): ImportReport {
   const item: ImportReport = {
     id: id("import"),
@@ -751,6 +778,7 @@ function normalizeState(lane: Lane, state: RuntimeState): RuntimeState {
   state.subagents ??= [];
   state.mcpServers ??= [];
   state.messagingBridges ??= [];
+  state.messagingMessages ??= [];
   state.importReports ??= [];
   state.profiles ??= [defaultProfile(lane, now())];
   state.activeProfileId ??= state.profiles.find((item) => item.status === "active")?.id ?? state.profiles[0]?.id;

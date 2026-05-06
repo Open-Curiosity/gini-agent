@@ -338,6 +338,31 @@ describe("runtime api", () => {
     expect(approval?.action).toBe("file.patch");
     expect(String(approval?.payload.diff)).toContain("--- before");
   });
+
+  test("routes messaging bridge input to tasks and records outbound delivery", async () => {
+    const config = testConfig("messaging-routing");
+    const handler = createHandler(config);
+
+    const bridge = await call(handler, config, "/api/messaging", {
+      method: "POST",
+      body: JSON.stringify({ name: "local-messages", kind: "demo", deliveryTargets: ["local"] })
+    });
+    const inbound = await call(handler, config, `/api/messaging/${bridge.id}/receive`, {
+      method: "POST",
+      body: JSON.stringify({ text: "remember message bridge works", target: "local" })
+    });
+    await waitForTask(handler, config, inbound.taskId);
+    const outbound = await call(handler, config, `/api/messaging/${bridge.id}/send`, {
+      method: "POST",
+      body: JSON.stringify({ text: "Task is visible in Gini", target: "local" })
+    });
+    const messages = await call(handler, config, `/api/messaging/${bridge.id}/messages`);
+
+    expect(inbound.direction).toBe("inbound");
+    expect(inbound.status).toBe("received");
+    expect(outbound.status).toBe("sent");
+    expect(messages).toHaveLength(2);
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
