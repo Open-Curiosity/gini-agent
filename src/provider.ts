@@ -113,6 +113,143 @@ export async function generateTaskSummary(config: RuntimeConfig, input: string, 
   return callOpenAIResponses(provider, input, memories);
 }
 
+// Hindsight phase 2 — structured-output helper.
+//
+// Calls the LLM with a JSON-only output contract and parses the result. Two
+// implementations:
+//   - echo: tests register stub responders by tag (or globally by index).
+//           Deterministic by construction.
+//   - openai/codex: uses the Responses API with `text.format = { type:
+//           "json_object" }`. The caller passes a Zod-like validator; if
+//           the model returns invalid JSON we return a structured error
+//           (the retain pipeline retries once with a "Reply with JSON only"
+//           clarifier, then gives up).
+//
+// The Validator interface is intentionally tiny so domain modules don't need
+// to depend on Zod — they pass a parse callback.
+export interface StructuredValidator<T> {
+  parse(value: unknown): T;
+}
+
+export interface StructuredResult<T> {
+  data: T;
+  raw: string;
+  usage?: Record<string, unknown>;
+  provider: ProviderConfig;
+}
+
+export interface StructuredRequest<T> {
+  system: string;
+  user: string;
+  schemaName: string;
+  validator: StructuredValidator<T>;
+  // Echo provider key — tests register stub data keyed by `echoTag`.
+  echoTag?: string;
+}
+
+// Echo stub registry: tests call `setEchoStructuredResponse(tag, data)` to
+// preconfigure the response for a given `echoTag`. If no exact match exists,
+// the resolver falls back to the longest registered prefix (so a stub
+// registered as "observation:" matches every `observation:<entityId>` call).
+// If still no match, an empty object is returned and the validator parses
+// it to whatever the schema's default is.
+const echoStructuredStubs = new Map<string, unknown>();
+
+export function setEchoStructuredResponse(tag: string, data: unknown): void {
+  echoStructuredStubs.set(tag, data);
+}
+
+export function clearEchoStructuredResponses(): void {
+  echoStructuredStubs.clear();
+}
+
+function resolveEchoStub(tag: string): unknown {
+  if (echoStructuredStubs.has(tag)) return echoStructuredStubs.get(tag);
+  // Longest-prefix match. Lets tests register "observation:" once and have
+  // it cover all entity-keyed observation calls in a single retain call.
+  let bestKey: string | null = null;
+  for (const key of echoStructuredStubs.keys()) {
+    if (key.endsWith(":") && tag.startsWith(key)) {
+      if (bestKey === null || key.length > bestKey.length) bestKey = key;
+    }
+  }
+  return bestKey !== null ? echoStructuredStubs.get(bestKey) : undefined;
+}
+
+export async function generateStructured<T>(
+  config: RuntimeConfig,
+  request: StructuredRequest<T>
+): Promise<StructuredResult<T>> {
+  const provider = normalizeProvider(config.provider);
+  if (provider.name === "echo") {
+    const tag = request.echoTag ?? request.schemaName;
+    const stub = resolveEchoStub(tag);
+    const raw = JSON.stringify(stub ?? {});
+    return {
+      data: request.validator.parse(stub ?? {}),
+      raw,
+      usage: { input_tokens: request.system.length + request.user.length, output_tokens: raw.length },
+      provider
+    };
+  }
+
+  // OpenAI / Codex / OpenAI-compatible: use chat-completions with
+  // response_format json_object. We deliberately don't push json_schema
+  // here — many compat providers reject the field. Instead the validator
+  // re-checks shape after parse.
+  if (provider.name === "openrouter" || provider.name === "local" || provider.name === "openai") {
+    return callStructuredChatCompletions(provider, request);
+  }
+  // Codex: same shape via the responses API isn't broadly supported for
+  // json_object; fall back to chat-completions style on the codex base URL.
+  return callStructuredChatCompletions(provider, request);
+}
+
+async function callStructuredChatCompletions<T>(
+  provider: ProviderConfig,
+  request: StructuredRequest<T>
+): Promise<StructuredResult<T>> {
+  const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
+  const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
+  };
+  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: provider.model,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: request.system },
+        { role: "user", content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema.` }
+      ]
+    })
+  });
+  const rawPayload = await response.text();
+  const payload = parseJsonObject(rawPayload);
+  if (!response.ok) {
+    const fallback = rawPayload.slice(0, 500) || `Structured request failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  const text = extractChatText(payload) || "{}";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Structured response was not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return {
+    data: request.validator.parse(parsed),
+    raw: text,
+    usage: isRecord(payload.usage) ? payload.usage : undefined,
+    provider
+  };
+}
+
 export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   if (provider.name === "openai") {
     return {

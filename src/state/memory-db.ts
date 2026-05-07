@@ -406,6 +406,230 @@ export function getMemoryUnit(lane: Lane, unitId: string): MemoryUnit | null {
   return row ? rowToUnit(row) : null;
 }
 
+// Active units in a bank, sorted by mentioned_at DESC. Optional `limit` caps
+// the candidate pool — phases 2-3 use this to bound the brute-force semantic
+// scan to a recent window. Optional `network` filter narrows to a single
+// network (e.g. opinions only, world facts only).
+export interface ListUnitsOptions {
+  network?: Network | Network[];
+  status?: MemoryUnitStatus | MemoryUnitStatus[];
+  limit?: number;
+  excludeIds?: string[];
+}
+
+export function listMemoryUnits(lane: Lane, bankId: string, options: ListUnitsOptions = {}): MemoryUnit[] {
+  const db = getMemoryDb(lane);
+  const where: string[] = ["bank_id = ?"];
+  const params: (string | number | null)[] = [bankId];
+  const status = options.status ?? "active";
+  const statuses = Array.isArray(status) ? status : [status];
+  if (statuses.length > 0) {
+    where.push(`status IN (${statuses.map(() => "?").join(",")})`);
+    params.push(...statuses);
+  }
+  if (options.network) {
+    const networks = Array.isArray(options.network) ? options.network : [options.network];
+    if (networks.length > 0) {
+      where.push(`network IN (${networks.map(() => "?").join(",")})`);
+      params.push(...networks);
+    }
+  }
+  if (options.excludeIds && options.excludeIds.length > 0) {
+    where.push(`id NOT IN (${options.excludeIds.map(() => "?").join(",")})`);
+    params.push(...options.excludeIds);
+  }
+  let sql = `SELECT * FROM memory_units WHERE ${where.join(" AND ")} ORDER BY mentioned_at DESC`;
+  if (typeof options.limit === "number") {
+    sql += ` LIMIT ${Math.max(0, Math.floor(options.limit))}`;
+  }
+  return db.query<MemoryUnitRow, (string | number | null)[]>(sql).all(...params).map(rowToUnit);
+}
+
+export function recentMemoryUnitIds(lane: Lane, bankId: string, limit: number): string[] {
+  const db = getMemoryDb(lane);
+  return db
+    .query<{ id: string }, [string, number]>(
+      "SELECT id FROM memory_units WHERE bank_id = ? AND status = 'active' ORDER BY mentioned_at DESC LIMIT ?"
+    )
+    .all(bankId, limit)
+    .map((row) => row.id);
+}
+
+// Returns memory units that mention a given entity, ordered most-recent
+// first. Used by observation regeneration (phase 2.4) and recall.
+export function unitsForEntity(lane: Lane, entityId: string, limit?: number): MemoryUnit[] {
+  const db = getMemoryDb(lane);
+  const sql = `SELECT mu.* FROM memory_units mu
+               JOIN entity_mentions em ON em.unit_id = mu.id
+               WHERE em.entity_id = ? AND mu.status = 'active'
+               ORDER BY mu.mentioned_at DESC
+               ${typeof limit === "number" ? `LIMIT ${Math.max(0, Math.floor(limit))}` : ""}`;
+  return db.query<MemoryUnitRow, [string]>(sql).all(entityId).map(rowToUnit);
+}
+
+// Used by observation regeneration to upsert a single observation row per
+// (bank, entity) pair. Implementation: archive any prior observation for the
+// entity, insert the new one with metadata.entityId set.
+export function upsertObservationUnit(
+  lane: Lane,
+  bankId: string,
+  entityId: string,
+  text: string,
+  embedding: Float32Array | null,
+  embeddingModel: string | null
+): MemoryUnit {
+  const db = getMemoryDb(lane);
+  // Archive any existing observation rows for this entity in this bank.
+  db.run(
+    `UPDATE memory_units SET status = 'archived', updated_at = ?
+     WHERE bank_id = ? AND network = 'observation' AND status = 'active'
+       AND id IN (
+         SELECT mu.id FROM memory_units mu
+         JOIN entity_mentions em ON em.unit_id = mu.id
+         WHERE em.entity_id = ?
+       )`,
+    [now(), bankId, entityId]
+  );
+  const unit = insertMemoryUnit(lane, {
+    bankId,
+    text,
+    embedding,
+    embeddingModel,
+    network: "observation",
+    metadata: { entityId }
+  });
+  linkUnitToEntity(lane, unit.id, entityId, text.slice(0, 80));
+  return unit;
+}
+
+export function updateMemoryUnitConfidence(
+  lane: Lane,
+  unitId: string,
+  confidence: number | null
+): void {
+  const db = getMemoryDb(lane);
+  db.run(
+    "UPDATE memory_units SET confidence = ?, updated_at = ? WHERE id = ?",
+    [confidence, now(), unitId]
+  );
+}
+
+export interface UpdateUnitStatsOptions {
+  status?: MemoryUnitStatus;
+  lastUsedAt?: string;
+  bumpUsageCount?: boolean;
+}
+
+export function updateMemoryUnitStats(
+  lane: Lane,
+  unitId: string,
+  options: UpdateUnitStatsOptions
+): void {
+  const db = getMemoryDb(lane);
+  const fragments: string[] = [];
+  const params: (string | number | null)[] = [];
+  if (options.status) {
+    fragments.push("status = ?");
+    params.push(options.status);
+  }
+  if (options.lastUsedAt) {
+    fragments.push("last_used_at = ?");
+    params.push(options.lastUsedAt);
+  }
+  if (options.bumpUsageCount) {
+    fragments.push("usage_count = usage_count + 1");
+  }
+  if (fragments.length === 0) return;
+  fragments.push("updated_at = ?");
+  params.push(now());
+  params.push(unitId);
+  db.run(`UPDATE memory_units SET ${fragments.join(", ")} WHERE id = ?`, params);
+}
+
+export function findEntitiesByMentions(lane: Lane, unitId: string): Entity[] {
+  const db = getMemoryDb(lane);
+  return db
+    .query<{ id: string; bank_id: string; canonical_name: string; entity_type: EntityType; created_at: string }, [string]>(
+      `SELECT e.* FROM entities e
+       JOIN entity_mentions em ON em.entity_id = e.id
+       WHERE em.unit_id = ?`
+    )
+    .all(unitId)
+    .map((row) => ({
+      id: row.id,
+      bankId: row.bank_id,
+      canonicalName: row.canonical_name,
+      entityType: row.entity_type,
+      createdAt: row.created_at
+    }));
+}
+
+export function entityMentionsForUnit(lane: Lane, unitId: string): EntityMention[] {
+  const db = getMemoryDb(lane);
+  return db
+    .query<{ unit_id: string; entity_id: string; surface: string }, [string]>(
+      "SELECT * FROM entity_mentions WHERE unit_id = ?"
+    )
+    .all(unitId)
+    .map((row) => ({ unitId: row.unit_id, entityId: row.entity_id, surface: row.surface }));
+}
+
+// Listing memory links from a set of seed unit IDs (used by recall's graph
+// channel). One round-trip per seed keeps the SQL simple and avoids needing
+// a recursive CTE for two-hop expansion.
+export function linksFromMany(lane: Lane, unitIds: string[]): MemoryLink[] {
+  if (unitIds.length === 0) return [];
+  const db = getMemoryDb(lane);
+  const placeholders = unitIds.map(() => "?").join(",");
+  return db
+    .query<MemoryLinkRow, string[]>(
+      `SELECT * FROM memory_links WHERE from_unit IN (${placeholders})`
+    )
+    .all(...unitIds)
+    .map(rowToLink);
+}
+
+export function getBank(lane: Lane, bankId: string): MemoryBank | null {
+  const db = getMemoryDb(lane);
+  const row = db
+    .query<MemoryBankRow, [string]>("SELECT * FROM memory_banks WHERE id = ?")
+    .get(bankId);
+  return row ? rowToBank(row) : null;
+}
+
+export interface UpdateBankInput {
+  name?: string;
+  agentName?: string | null;
+  background?: string | null;
+  skepticism?: number;
+  literalism?: number;
+  empathy?: number;
+  biasStrength?: number;
+}
+
+export function updateBank(lane: Lane, bankId: string, patch: UpdateBankInput): MemoryBank | null {
+  const db = getMemoryDb(lane);
+  const fragments: string[] = [];
+  const params: (string | number | null)[] = [];
+  if (patch.name !== undefined) { fragments.push("name = ?"); params.push(patch.name); }
+  if (patch.agentName !== undefined) { fragments.push("agent_name = ?"); params.push(patch.agentName); }
+  if (patch.background !== undefined) { fragments.push("background = ?"); params.push(patch.background); }
+  if (typeof patch.skepticism === "number") { fragments.push("skepticism = ?"); params.push(clampInt(patch.skepticism, 1, 5)); }
+  if (typeof patch.literalism === "number") { fragments.push("literalism = ?"); params.push(clampInt(patch.literalism, 1, 5)); }
+  if (typeof patch.empathy === "number") { fragments.push("empathy = ?"); params.push(clampInt(patch.empathy, 1, 5)); }
+  if (typeof patch.biasStrength === "number") { fragments.push("bias_strength = ?"); params.push(Math.max(0, Math.min(1, patch.biasStrength))); }
+  if (fragments.length === 0) return getBank(lane, bankId);
+  fragments.push("updated_at = ?");
+  params.push(now());
+  params.push(bankId);
+  db.run(`UPDATE memory_banks SET ${fragments.join(", ")} WHERE id = ?`, params);
+  return getBank(lane, bankId);
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, Math.round(value)));
+}
+
 export function countMemoryUnits(lane: Lane): number {
   const db = getMemoryDb(lane);
   const row = db

@@ -6,7 +6,8 @@ import { readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./domain/views";
 import { checkConnector } from "./domain/connectors";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./domain/jobs";
-import { archiveMemory, createMemoryFromInput, editMemory, updateMemory } from "./domain/memory";
+import { archiveMemory, createMemoryFromInput, editMemory, retain, updateMemory } from "./domain/memory";
+import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./domain/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./domain/pairing";
 import { proposePromotion, reviewPromotion } from "./domain/promotions";
@@ -57,6 +58,63 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/memory$/, () => json(readState(config.lane).memories)],
     ["POST", /^\/api\/memory$/, async (request) => {
       return json(await createMemoryFromInput(config, await body(request)), 201);
+    }],
+    // Hindsight phase 2: retain pipeline. Specific routes come before the
+    // catch-all /api/memory/:id pattern below.
+    ["POST", /^\/api\/memory\/retain$/, async (request) => {
+      const payload = await body(request);
+      const text = String(payload.text ?? "").trim();
+      if (!text) return json({ error: "text is required" }, 400);
+      const result = await retain(config, {
+        text,
+        bankId: typeof payload.bankId === "string" ? payload.bankId : undefined,
+        sourceTaskId: typeof payload.sourceTaskId === "string" ? payload.sourceTaskId : undefined,
+        sourceSessionId: typeof payload.sourceSessionId === "string" ? payload.sourceSessionId : undefined,
+        mentionedAt: typeof payload.mentionedAt === "string" ? payload.mentionedAt : undefined
+      });
+      return json(result, 201);
+    }],
+    ["GET", /^\/api\/memory\/units$/, (request) => {
+      const url = new URL(request.url);
+      const networkParam = url.searchParams.get("network");
+      const bankId = url.searchParams.get("bank") ?? DEFAULT_BANK_ID;
+      ensureDefaultBank(config.lane);
+      const networks = networkParam
+        ? networkParam.split(",").filter((value): value is Network =>
+            value === "world" || value === "experience" || value === "opinion" || value === "observation"
+          )
+        : undefined;
+      const limit = Number(url.searchParams.get("limit") ?? 200);
+      const units = listMemoryUnits(config.lane, bankId, {
+        network: networks && networks.length > 0 ? networks : undefined,
+        limit
+      });
+      return json(units.map((unit) => ({ ...unit, kind: "hindsight" })));
+    }],
+    ["GET", /^\/api\/memory\/banks$/, () => {
+      ensureDefaultBank(config.lane);
+      return json(listBanks(config.lane));
+    }],
+    ["GET", /^\/api\/memory\/banks\/([^/]+)$/, (_request, params) => {
+      ensureDefaultBank(config.lane);
+      const bank = getBank(config.lane, params[0]);
+      if (!bank) return json({ error: "bank not found" }, 404);
+      return json(bank);
+    }],
+    ["PATCH", /^\/api\/memory\/banks\/([^/]+)$/, async (request, params) => {
+      ensureDefaultBank(config.lane);
+      const payload = await body(request);
+      const updated = updateBank(config.lane, params[0], {
+        name: typeof payload.name === "string" ? payload.name : undefined,
+        agentName: typeof payload.agentName === "string" ? payload.agentName : undefined,
+        background: typeof payload.background === "string" ? payload.background : undefined,
+        skepticism: typeof payload.skepticism === "number" ? payload.skepticism : undefined,
+        literalism: typeof payload.literalism === "number" ? payload.literalism : undefined,
+        empathy: typeof payload.empathy === "number" ? payload.empathy : undefined,
+        biasStrength: typeof payload.biasStrength === "number" ? payload.biasStrength : undefined
+      });
+      if (!updated) return json({ error: "bank not found" }, 404);
+      return json(updated);
     }],
     ["PATCH", /^\/api\/memory\/([^/]+)$/, async (request, params) => json(await editMemory(config, params[0], await body(request)))],
     ["DELETE", /^\/api\/memory\/([^/]+)$/, async (_request, params) => json(await archiveMemory(config, params[0]))],

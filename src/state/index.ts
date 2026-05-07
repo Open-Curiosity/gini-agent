@@ -28,7 +28,18 @@ export {
   linkUnitToEntity,
   insertLink,
   linksFrom,
+  linksFromMany,
   listBanks,
+  listMemoryUnits,
+  recentMemoryUnitIds,
+  unitsForEntity,
+  upsertObservationUnit,
+  updateMemoryUnitConfidence,
+  updateMemoryUnitStats,
+  findEntitiesByMentions,
+  entityMentionsForUnit,
+  getBank,
+  updateBank,
   probeMemoryDb,
   serializeEmbedding,
   deserializeEmbedding,
@@ -51,7 +62,10 @@ export type {
   MemoryDbProbe,
   InsertMemoryUnitInput,
   InsertEntityInput,
-  InsertLinkInput
+  InsertLinkInput,
+  ListUnitsOptions,
+  UpdateUnitStatsOptions,
+  UpdateBankInput
 } from "./memory-db";
 export {
   taskCounts,
