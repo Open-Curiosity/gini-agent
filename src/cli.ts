@@ -166,7 +166,7 @@ async function start(config: RuntimeConfig): Promise<boolean> {
     install(config);
     config.port = await availablePort(config.port);
     install(config);
-    const child = spawn(process.execPath, ["run", "src/runtime.ts", "--lane", config.lane], {
+    const child = spawn(process.execPath, ["run", "src/server.ts", "--lane", config.lane], {
       cwd: process.cwd(),
       detached: true,
       stdio: "ignore",

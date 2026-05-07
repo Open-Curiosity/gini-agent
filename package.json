@@ -8,7 +8,7 @@
   },
   "scripts": {
     "gini": "bun run src/cli.ts",
-    "runtime": "bun run src/runtime.ts",
+    "server": "bun run src/server.ts",
     "smoke": "bun run src/cli.ts smoke",
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit && cd web && bunx tsc --noEmit",

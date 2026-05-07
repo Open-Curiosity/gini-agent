@@ -13,7 +13,7 @@ This repo is organized around runtime boundaries rather than feature chronology.
 - `src/agent.ts` owns task execution and approval-gated tool actions.
 - `src/provider.ts` owns model provider normalization, health, and calls.
 - `src/cli.ts` is the command-line adapter over runtime APIs and domain utilities.
-- `src/runtime.ts` is the process entrypoint and scheduler loop.
+- `src/server.ts` is the process entrypoint and scheduler loop.
 
 ## Boundary Rules
 
