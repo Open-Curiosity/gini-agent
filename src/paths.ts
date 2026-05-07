@@ -18,13 +18,13 @@ export function projectRoot(): string {
 export function baseStateRoot(): string {
   return process.env.GINI_STATE_ROOT
     ? resolve(process.env.GINI_STATE_ROOT)
-    : join(homedir(), "Library", "Application Support", "Gini");
+    : join(homedir(), ".gini");
 }
 
 export function baseLogRoot(): string {
   return process.env.GINI_LOG_ROOT
     ? resolve(process.env.GINI_LOG_ROOT)
-    : join(homedir(), "Library", "Logs", "Gini");
+    : join(homedir(), ".gini", "logs");
 }
 
 export function laneRoot(lane: Lane): string {

@@ -210,8 +210,8 @@ Default names:
 - product: Gini
 - CLI: `gini`
 - runtime: `gini-runtime` or `gini-daemon`
-- state root: `~/Library/Application Support/Gini/<lane>` for production-quality macOS installs
-- logs: `~/Library/Logs/Gini/<lane>`
+- state root: `~/.gini/<lane>` (overridable via `GINI_STATE_ROOT`)
+- logs: `~/.gini/logs/<lane>` (overridable via `GINI_LOG_ROOT`)
 
 Development builds may use simpler local paths, but old placeholder product names should be removed.
 
@@ -2035,7 +2035,7 @@ Database stores:
 Filesystem trace store stores full artifacts:
 
 ```
-~/Library/Application Support/Gini/<lane>/
+~/.gini/<lane>/
   config.yaml
   auth/                 # references only; secrets in Keychain
   db.sqlite
