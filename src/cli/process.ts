@@ -18,13 +18,31 @@ import { probeMemoryDb } from "../state/memory-db";
 import { legacyMigrationStatus } from "../domain/memory";
 import { embeddingStatus, listBanksWithModelMismatch } from "../domain/embedding";
 import { rerankerStatus } from "../domain/reranker";
-import { pidPath, projectRoot } from "../paths";
+import { defaultRuntimePort, defaultWebPort, pidPath, projectRoot, runtimePortPath, webPortPath } from "../paths";
 import { api, auth, url } from "./api";
 
 export interface WebOptions {
   webPort: number;
   webPortPinned: boolean;
   noWeb: boolean;
+  // True when the runtime port came from --port or GINI_PORT. Pinned ports
+  // strict-fail on collision (the user asked for that exact port; silently
+  // walking would surprise them). Unpinned uses the lane default and walks.
+  runtimePortPinned?: boolean;
+}
+
+function readRecordedPort(path: string): number | null {
+  if (!existsSync(path)) return null;
+  const value = Number(readFileSync(path, "utf8").trim());
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+export function recordedRuntimePort(config: RuntimeConfig): number | null {
+  return readRecordedPort(runtimePortPath(config.lane));
+}
+
+export function recordedWebPort(config: RuntimeConfig): number | null {
+  return readRecordedPort(webPortPath(config.lane));
 }
 
 export async function start(config: RuntimeConfig, options: WebOptions): Promise<{ runtimeStarted: boolean; banner: Record<string, unknown> }> {
@@ -32,8 +50,15 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
   let runtimeStarted = false;
   if (!alreadyRunning) {
     install(config);
-    config.port = await availablePort(config.port);
+    const requestedRuntimePort = config.port;
+    const claimedPort = await availablePort(requestedRuntimePort);
+    if (claimedPort !== requestedRuntimePort && options.runtimePortPinned) {
+      // User pinned via --port / GINI_PORT; refuse to silently roll forward.
+      throw new Error(`Requested runtime port ${requestedRuntimePort} is busy. Stop the other process or pick a different --port.`);
+    }
+    config.port = claimedPort;
     install(config);
+    writeFileSync(runtimePortPath(config.lane), String(config.port));
     const child = spawn(process.execPath, ["run", "src/server.ts", "--lane", config.lane], {
       cwd: process.cwd(),
       detached: true,
@@ -48,6 +73,13 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
     }
     if (!healthy) throw new Error("Runtime did not become healthy within 5 seconds.");
     runtimeStarted = true;
+  } else {
+    // Even if the runtime was already up, refresh the recorded port so
+    // status/stop/doctor read the live value.
+    const recorded = recordedRuntimePort(config);
+    if (recorded !== config.port) {
+      writeFileSync(runtimePortPath(config.lane), String(config.port));
+    }
   }
   // Web launch runs whether or not the runtime was already up — a user whose
   // web crashed should be able to recover with `gini start` without first stopping.
@@ -86,9 +118,11 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
  * Next.js (via /api/runtime/__healthz). Cleans up stale pidfiles when the
  * process is gone or hung. Returns null when nothing usable is running.
  *
- * We can't reconstruct the URL purely from the pidfile (port isn't recorded),
- * so we probe `webPort` and the next 99 ports. Cheap and covers the common
- * case where the user used the default or an explicit --web-port.
+ * Probe order:
+ *   1. The persisted `web.port` recorded at startup (always correct when present).
+ *   2. The caller-supplied `webPort` and the next 9 candidates (covers the
+ *      case where the port file is missing — e.g. pre-upgrade install — but
+ *      the user is likely on the default or an explicit --web-port).
  */
 export async function existingWebUrl(config: RuntimeConfig, webPort: number): Promise<string | null> {
   const path = join(config.stateRoot, "web.pid");
@@ -96,9 +130,16 @@ export async function existingWebUrl(config: RuntimeConfig, webPort: number): Pr
   const pid = Number(readFileSync(path, "utf8"));
   if (!processAlive(pid)) {
     rmSync(path, { force: true });
+    rmSync(webPortPath(config.lane), { force: true });
     return null;
   }
-  for (let candidate = webPort; candidate < webPort + 100; candidate += 1) {
+  const recorded = recordedWebPort(config);
+  const candidates: number[] = [];
+  if (recorded !== null) candidates.push(recorded);
+  for (let candidate = webPort; candidate < webPort + 10; candidate += 1) {
+    if (!candidates.includes(candidate)) candidates.push(candidate);
+  }
+  for (const candidate of candidates) {
     const candidateUrl = `http://127.0.0.1:${candidate}`;
     try {
       const response = await fetch(`${candidateUrl}/api/runtime/__healthz`, { redirect: "manual" });
@@ -116,6 +157,7 @@ export async function existingWebUrl(config: RuntimeConfig, webPort: number): Pr
   }
   // Pid is alive but nothing healthy on the expected ports — treat as stale.
   rmSync(path, { force: true });
+  rmSync(webPortPath(config.lane), { force: true });
   return null;
 }
 
@@ -146,6 +188,13 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // detached: true puts the child in its own process group so we can SIGTERM
   // the entire group on stop (`bun run dev` re-execs into Next.js, leaving an
   // orphaned grandchild if we only kill the recorded pid).
+  // Each lane gets its own `.next-<lane>` build dir. Without this, two
+  // parallel `next dev` instances in the same web/ refuse to start: Next.js
+  // grabs an exclusive lock at `<distDir>/lock`. The dist dir must stay
+  // inside the project (Next.js rejects `../`-style paths), so we sanitize
+  // and namespace per lane. Standalone `bun run dev` still defaults to
+  // `.next` because that env var is unset.
+  const laneSlug = config.lane.replace(/[^a-zA-Z0-9_-]/g, "_");
   const child = spawn("bun", command, {
     cwd: webRoot,
     detached: true,
@@ -155,6 +204,7 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
       GINI_RUNTIME_URL: url(config),
       GINI_TOKEN: config.token,
       GINI_LANE: config.lane,
+      GINI_DIST_DIR: `.next-${laneSlug}`,
       PORT: String(port)
     }
   });
@@ -162,6 +212,10 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   if (typeof child.pid === "number") {
     writeFileSync(join(config.stateRoot, "web.pid"), String(child.pid));
   }
+  // Persist the actual port so status/stop/doctor and `existingWebUrl` find
+  // it without having to scan a port range. Cleared on stop and on stale-pid
+  // detection above.
+  writeFileSync(webPortPath(config.lane), String(port));
   const webUrl = `http://127.0.0.1:${port}`;
   try {
     await waitForWebHealthz(webUrl, child.pid, config.lane);
@@ -172,6 +226,7 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
       try { process.kill(-child.pid, "SIGTERM"); } catch { /* ignore */ }
     }
     rmSync(join(config.stateRoot, "web.pid"), { force: true });
+    rmSync(webPortPath(config.lane), { force: true });
     throw error;
   }
 }
@@ -229,12 +284,17 @@ export async function availablePort(preferred: number): Promise<number> {
 }
 
 function canListen(port: number): Promise<boolean> {
-  // Probe BOTH "0.0.0.0" (IPv4 wildcard) and "::" (IPv6 wildcard) so we don't
-  // hand out a port that a dual-stack squatter (Bun.serve, Next.js itself)
-  // can't actually claim. macOS specifically: a single-family bind here
-  // succeeds even when the other family is already taken, leading to a false
-  // positive and a confusing "process exited before becoming healthy" later.
-  return Promise.all([probe(port, "0.0.0.0"), probe(port, "::")]).then(([a, b]) => a && b);
+  // Probe every host we (or downstream Next.js) might bind to. Wildcard
+  // probes alone are insufficient on macOS: binding 0.0.0.0:N succeeds even
+  // when 127.0.0.1:N is already taken (different addresses, kernel doesn't
+  // refuse). We probe 127.0.0.1 (where the Bun runtime listens), ::1 (IPv6
+  // loopback), AND 0.0.0.0 (dual-stack squatters like Next.js). If any one
+  // fails, the port is unusable and we walk to the next.
+  return Promise.all([
+    probe(port, "127.0.0.1"),
+    probe(port, "::1"),
+    probe(port, "0.0.0.0")
+  ]).then((results) => results.every(Boolean));
 }
 
 function probe(port: number, host: string): Promise<boolean> {
@@ -250,12 +310,24 @@ export function stopRuntime(config: RuntimeConfig) {
   const webResult = stopWeb(config);
   const path = pidPath(config.lane);
   if (!existsSync(path)) {
+    // Clean up any orphaned port file even when there's no pidfile — keeps
+    // the lane root tidy across upgrades and aborted starts.
+    rmSync(runtimePortPath(config.lane), { force: true });
     return { stopped: false, reason: "No pid file", lane: config.lane, web: webResult };
   }
   const pid = Number(readFileSync(path, "utf8"));
+  // Process already dead → stale pidfile, treat as a successful stop. The
+  // user just wanted "make sure it's not running"; surfacing an error here
+  // makes them re-run stop or rm the pidfile by hand.
+  if (!processAlive(pid)) {
+    rmSync(path, { force: true });
+    rmSync(runtimePortPath(config.lane), { force: true });
+    return { stopped: true, pid, reason: "process already dead", lane: config.lane, web: webResult };
+  }
   try {
     process.kill(pid, "SIGTERM");
     rmSync(path, { force: true });
+    rmSync(runtimePortPath(config.lane), { force: true });
     return { stopped: true, pid, lane: config.lane, web: webResult };
   } catch (error) {
     return { stopped: false, pid, error: error instanceof Error ? error.message : String(error), web: webResult };
@@ -264,8 +336,16 @@ export function stopRuntime(config: RuntimeConfig) {
 
 function stopWeb(config: RuntimeConfig): { stopped: boolean; pid?: number; reason?: string } {
   const path = join(config.stateRoot, "web.pid");
-  if (!existsSync(path)) return { stopped: false, reason: "No web pid" };
+  if (!existsSync(path)) {
+    rmSync(webPortPath(config.lane), { force: true });
+    return { stopped: false, reason: "No web pid" };
+  }
   const pid = Number(readFileSync(path, "utf8"));
+  if (!processAlive(pid)) {
+    rmSync(path, { force: true });
+    rmSync(webPortPath(config.lane), { force: true });
+    return { stopped: true, pid, reason: "process already dead" };
+  }
   let groupKilled = false;
   // The web pid is the group leader (we spawned with detached: true). Killing
   // the group with -pid reaches every descendant: bun run -> next dev -> the
@@ -279,6 +359,7 @@ function stopWeb(config: RuntimeConfig): { stopped: boolean; pid?: number; reaso
   }
   try {
     rmSync(path, { force: true });
+    rmSync(webPortPath(config.lane), { force: true });
     return { stopped: true, pid, ...(groupKilled ? { reason: "group SIGTERM" } : {}) };
   } catch (error) {
     return { stopped: false, pid, reason: error instanceof Error ? error.message : String(error) };
@@ -356,6 +437,21 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
     stateRoot: config.stateRoot,
     workspaceRoot: config.workspaceRoot,
     port: config.port,
+    // Surface lane defaults vs. the actual recorded port so users can see
+    // when a port walk happened (e.g. another lane already grabbed the
+    // default). `recorded` is null when nothing has been started for this lane.
+    ports: {
+      runtime: {
+        default: defaultRuntimePort(config.lane),
+        configured: config.port,
+        recorded: recordedRuntimePort(config)
+      },
+      web: {
+        default: defaultWebPort(config.lane),
+        configured: options.webPort,
+        recorded: recordedWebPort(config)
+      }
+    },
     web: { running: webPidAlive, pid: webPid ?? null, url: webHealthyUrl },
     tokenConfigured: Boolean(config.token),
     provider: providerHealth(config),

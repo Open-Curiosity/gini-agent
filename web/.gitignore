@@ -15,6 +15,9 @@
 
 # next.js
 /.next/
+# Per-lane build dirs (gini start --lane <foo> uses .next-<foo>/ so two
+# `next dev` processes can run in parallel on the same web/ checkout).
+/.next-*/
 /out/
 
 # production

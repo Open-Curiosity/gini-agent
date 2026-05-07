@@ -1,7 +1,7 @@
 // CLI entry point. Parses global flags, resolves the lane and runtime
 // config, builds a CliContext, and dispatches to the right command module.
 
-import { loadConfig, parseLane } from "../paths";
+import { defaultWebPort, loadConfig, parseLane } from "../paths";
 import { applyGlobalEnvOverrides, flagValue, hasFlag, stripGlobalArgs } from "./args";
 import type { CliContext } from "./context";
 import { help } from "./output";
@@ -47,19 +47,25 @@ export async function run(): Promise<void> {
   // Decoupled from the ephemeral-lane decision so `gini smoke --lane <x>` stays headless.
   const smokeImpliesNoWeb = command === "smoke" && !hasFlag(args, "--web");
   const noWeb = hasFlag(args, "--no-web") || smokeImpliesNoWeb;
+  // Snapshot whether the user pinned ports BEFORE applyGlobalEnvOverrides
+  // mutates GINI_PORT/GINI_WEB_PORT. Smoke-generated random ports must NOT
+  // be treated as user pins (strict-fail would defeat smoke's randomization).
+  const userPinnedRuntimePort = Boolean(flagValue(args, "--port")) || Boolean(process.env.GINI_PORT);
+  const userPinnedWebPort = Boolean(flagValue(args, "--web-port")) || Boolean(process.env.GINI_WEB_PORT);
   applyGlobalEnvOverrides(args, ephemeralSmoke);
   const lane = ephemeralSmoke ? `smoke-${process.pid}-${crypto.randomUUID().slice(0, 6)}` : parseLane(args);
   const config = loadConfig(lane);
   const webPortFlag = flagValue(args, "--web-port");
-  const webPortPinned = Boolean(webPortFlag) || Boolean(process.env.GINI_WEB_PORT);
-  const webPort = Number(process.env.GINI_WEB_PORT ?? webPortFlag ?? 3000);
+  const webPortPinned = userPinnedWebPort;
+  const webPort = Number(process.env.GINI_WEB_PORT ?? webPortFlag ?? defaultWebPort(lane));
+  const runtimePortPinned = userPinnedRuntimePort;
 
   const ctx: CliContext = {
     config,
     cliArgs,
     command,
     ephemeralSmoke,
-    web: { webPort, webPortPinned, noWeb }
+    web: { webPort, webPortPinned, noWeb, runtimePortPinned }
   };
 
   switch (command) {
