@@ -286,6 +286,46 @@ describe("runtime api", () => {
     expect(text).toContain("event_");
   });
 
+  test("SSE stream honors Last-Event-ID for reconnect dedup", async () => {
+    // Regression for the Round 2 reconnect storm: every reconnect was
+    // re-replaying the entire event log, which compounded into thousands of
+    // events/sec on the client when the EventSource thrashed. With dedup, a
+    // reconnect that includes the most-recent id should yield zero historical
+    // events on first read.
+    const config = testConfig("events-stream-dedup");
+    const handler = createHandler(config);
+
+    await call(handler, config, "/api/improvements", {
+      method: "POST",
+      body: JSON.stringify({ kind: "memory", title: "first", payload: { content: "first" } })
+    });
+    // Read the full event log once to discover the most-recent id.
+    const events = await call(handler, config, "/api/events");
+    expect(events.length).toBeGreaterThan(0);
+    const lastEventId = events[events.length - 1].id;
+
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/events/stream",
+      { headers: { "last-event-id": lastEventId } },
+      config.token
+    );
+    // First read should yield no historical events (everything up to and
+    // including lastEventId is suppressed). The TextDecoder.decode of an empty
+    // chunk is "".
+    const reader = response.body?.getReader();
+    // Race the read against a short timeout; the heartbeat doesn't fire for
+    // 1s, so an immediate read should observe an empty buffer.
+    const winner = await Promise.race([
+      reader?.read(),
+      new Promise((resolve) => setTimeout(() => resolve({ value: undefined, done: false }), 200))
+    ]) as { value?: Uint8Array; done?: boolean };
+    await reader?.cancel();
+    const text = winner?.value ? new TextDecoder().decode(winner.value) : "";
+    expect(text).toBe("");
+  });
+
   test("supports local chat sessions backed by task execution and retry contracts", async () => {
     const config = testConfig("chat");
     const handler = createHandler(config);

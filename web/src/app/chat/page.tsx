@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -12,7 +12,7 @@ import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useChatSession, useChatSessions, useInvalidate } from "@/lib/queries";
-import type { ChatMessage, ChatSession } from "@/lib/types";
+import type { ChatMessage, ChatSession, Task } from "@/lib/types";
 
 export default function ChatPage() {
   const sessions = useChatSessions();
@@ -56,8 +56,8 @@ export default function ChatPage() {
   return (
     <>
       <PageHeader title="Chat" description="Local chat sessions backed by tasks" />
-      <div className="flex flex-1 gap-4 overflow-hidden p-6">
-        <div className="flex w-80 flex-col gap-3">
+      <div className="flex flex-1 flex-col gap-4 overflow-hidden p-4 md:flex-row md:p-6">
+        <div className="flex w-full shrink-0 flex-col gap-3 md:w-80">
           <Card>
             <CardHeader>
               <CardTitle className="text-sm">New session</CardTitle>
@@ -96,7 +96,7 @@ export default function ChatPage() {
           </ScrollArea>
         </div>
 
-        <Card className="flex flex-1 flex-col overflow-hidden">
+        <Card className="flex min-w-0 flex-1 flex-col overflow-hidden">
           {!selected ? (
             <CardContent className="flex flex-1 items-center justify-center">
               <EmptyState title="No session selected" />
@@ -128,9 +128,7 @@ export default function ChatPage() {
                           ) : null}
                         </div>
                         <p className="whitespace-pre-wrap text-sm">{message.content}</p>
-                        {message.taskId ? (
-                          <p className="mt-1 font-mono text-[10px] text-muted-foreground">task {message.taskId}</p>
-                        ) : null}
+                        {message.taskId ? <InlineTaskCard taskId={message.taskId} /> : null}
                       </li>
                     ))}
                   </ul>
@@ -156,5 +154,37 @@ export default function ChatPage() {
         </Card>
       </div>
     </>
+  );
+}
+
+function InlineTaskCard({ taskId }: { taskId: string }) {
+  // Minimal structured card for chat: surfaces the linked task's status,
+  // summary, and approval/cost hints inline without leaving the conversation.
+  // The runtime returns full task records via /tasks/:id; we render selectively
+  // to keep the chat dense.
+  const detail = useQuery({
+    queryKey: ["chat-task", taskId],
+    queryFn: () => api<{ task: Task }>(`/tasks/${taskId}`),
+    refetchInterval: 4000
+  });
+  if (!detail.data) {
+    return <p className="mt-1 font-mono text-[10px] text-muted-foreground">task {taskId} · loading…</p>;
+  }
+  const task = detail.data.task;
+  return (
+    <div className="mt-2 rounded-md border border-border bg-card/40 p-2 text-xs">
+      <div className="flex flex-wrap items-center gap-2">
+        <StatusPill value={task.status} />
+        <span className="font-mono text-[10px] text-muted-foreground">task {task.id}</span>
+        {task.approvalIds.length > 0 ? (
+          <span className="font-mono text-[10px] text-amber-400">{task.approvalIds.length} approval{task.approvalIds.length === 1 ? "" : "s"}</span>
+        ) : null}
+        {task.cost?.estimatedUsd ? (
+          <span className="font-mono text-[10px] text-muted-foreground">${task.cost.estimatedUsd.toFixed(4)}</span>
+        ) : null}
+      </div>
+      {task.summary ? <p className="mt-1 text-xs">{task.summary}</p> : null}
+      {task.error ? <p className="mt-1 text-xs text-red-400">{task.error}</p> : null}
+    </div>
   );
 }

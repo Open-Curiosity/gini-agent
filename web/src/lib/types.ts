@@ -8,6 +8,15 @@ export type ImprovementStatus = "proposed" | "approved" | "rejected" | "applied"
 export type ImprovementKind = "memory" | "skill" | "job";
 export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local";
 
+export interface CostRecord {
+  provider: string;
+  model: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  estimatedUsd?: number;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -27,6 +36,7 @@ export interface Task {
   jobId?: string;
   parentTaskId?: string;
   subagentId?: string;
+  cost?: CostRecord;
 }
 
 export interface Approval {
@@ -81,6 +91,11 @@ export interface JobRecord {
   script?: string;
   intervalSeconds: number;
   status: JobStatus;
+  deliveryTargets: string[];
+  context: string[];
+  retryLimit: number;
+  timeoutSeconds: number;
+  costBudget?: number;
   createdAt: string;
   updatedAt: string;
   lastRunAt?: string;
@@ -106,6 +121,7 @@ export interface JobRunRecord {
   trigger: "schedule" | "manual" | "replay";
   summary?: string;
   error?: string;
+  cost?: CostRecord;
 }
 
 export interface ConnectorRecord {
@@ -132,10 +148,25 @@ export interface RuntimeStatus {
   connectors: number;
 }
 
+// Mirrors src/types.ts RuntimeEventKind. Kept in sync with useRuntimeStream's
+// EVENT_KINDS list — both are dispatched by the runtime as named SSE events.
+export type RuntimeEventKind =
+  | "task"
+  | "approval"
+  | "job"
+  | "memory"
+  | "skill"
+  | "connector"
+  | "mcp"
+  | "messaging"
+  | "provider"
+  | "runtime"
+  | "notification";
+
 export interface RuntimeEvent {
   id: string;
   at: string;
-  kind: string;
+  kind: RuntimeEventKind | string;
   action: string;
   target: string;
   taskId?: string;

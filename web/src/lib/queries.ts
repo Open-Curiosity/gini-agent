@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useRef } from "react";
 import { useQuery, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import type {
@@ -162,7 +163,43 @@ export function useParity() {
   });
 }
 
+/**
+ * Returns a function that batches invalidate() calls within a tick.
+ *
+ * Why this matters: the SSE stream can fire many events in rapid succession
+ * (e.g. on connection open the runtime replays the recent event log). If every
+ * event triggers a separate invalidateQueries() call, React Query schedules a
+ * refetch + render per call, which re-runs the SSE-subscribing component's
+ * effects, which can re-open the EventSource, which replays again. Coalescing
+ * via queueMicrotask collapses N events in the same tick into a single
+ * invalidate-per-key, breaking the feedback loop.
+ *
+ * The returned function reference is stable across renders so it can be used
+ * directly as a dep without retriggering effects.
+ */
 export function useInvalidate() {
   const qc = useQueryClient();
-  return (keys: string[]) => keys.forEach((k) => qc.invalidateQueries({ queryKey: [k] }));
+  const pendingRef = useRef<Set<string> | null>(null);
+  const flush = useCallback(() => {
+    const set = pendingRef.current;
+    pendingRef.current = null;
+    if (!set) return;
+    for (const key of set) qc.invalidateQueries({ queryKey: [key] });
+  }, [qc]);
+  useEffect(() => {
+    // On unmount, drop any pending batch.
+    return () => {
+      pendingRef.current = null;
+    };
+  }, []);
+  return useCallback(
+    (keys: string[]) => {
+      if (!pendingRef.current) {
+        pendingRef.current = new Set();
+        queueMicrotask(flush);
+      }
+      for (const key of keys) pendingRef.current.add(key);
+    },
+    [flush]
+  );
 }

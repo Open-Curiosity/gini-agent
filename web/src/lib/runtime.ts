@@ -1,4 +1,7 @@
-const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control"]);
+// Headers we forward verbatim from the browser to the runtime. Last-Event-ID
+// is critical for SSE reconnect dedup (see src/http.ts:eventStream) — without
+// it, every reconnect re-replays the entire event log.
+const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control", "last-event-id"]);
 
 export function runtimeUrl(): string {
   return process.env.GINI_RUNTIME_URL ?? "http://127.0.0.1:7337";

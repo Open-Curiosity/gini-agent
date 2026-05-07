@@ -1,11 +1,23 @@
 "use client";
 
-import { useCallback } from "react";
+import Link from "next/link";
+import { useCallback, useMemo } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
-import { useApprovals, useConnectors, useEvents, useInvalidate, useJobs, useStatus, useTasks } from "@/lib/queries";
+import {
+  useApprovals,
+  useConnectors,
+  useEvents,
+  useInvalidate,
+  useJobs,
+  useMemories,
+  useStatus,
+  useTasks
+} from "@/lib/queries";
 import { useRuntimeStream } from "@/lib/useRuntimeStream";
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 export default function HomePage() {
   const status = useStatus();
@@ -14,10 +26,14 @@ export default function HomePage() {
   const jobs = useJobs();
   const connectors = useConnectors();
   const events = useEvents();
+  const memories = useMemories();
   const invalidate = useInvalidate();
 
+  // Pure invalidate — useInvalidate now returns a stable function that batches
+  // microtask-coalesced refetches. Wrapping in useCallback is harmless but no
+  // longer load-bearing.
   useRuntimeStream(useCallback(() => {
-    invalidate(["status", "state", "tasks", "approvals", "jobs", "connectors", "events"]);
+    invalidate(["status", "state", "tasks", "approvals", "jobs", "connectors", "events", "memory"]);
   }, [invalidate]));
 
   const activeTasks = (tasks.data ?? []).filter((t) => ["queued", "running", "waiting_approval"].includes(t.status));
@@ -25,17 +41,70 @@ export default function HomePage() {
   const failedJobs = (jobs.data ?? []).filter((j) => j.status === "failed");
   const connectorIssues = (connectors.data ?? []).filter((c) => c.health === "unhealthy" || c.status === "error");
   const recent = (events.data ?? []).slice().reverse().slice(0, 8);
+  const proposedMemories = (memories.data ?? []).filter((m) => m.status === "proposed");
+
+  // "Today's cost" = sum of estimatedUsd on tasks updated in the last 24h.
+  // The runtime tracks cost on Task and JobRun; we sum across recent tasks
+  // because tasks are the unit users submit, and job runs roll up into tasks
+  // anyway via taskId. Using a 24h rolling cutoff (vs midnight) keeps it
+  // stable across timezones and feels right for a control plane.
+  const todaysCost = useMemo(() => {
+    const cutoff = Date.now() - DAY_MS;
+    let usd = 0;
+    let counted = 0;
+    for (const task of tasks.data ?? []) {
+      if (!task.cost?.estimatedUsd) continue;
+      const at = Date.parse(task.updatedAt);
+      if (Number.isNaN(at) || at < cutoff) continue;
+      usd += task.cost.estimatedUsd;
+      counted += 1;
+    }
+    return { usd, counted };
+  }, [tasks.data]);
 
   return (
     <>
       <PageHeader title="Home" description="Live runtime overview" />
-      <div className="flex-1 space-y-6 overflow-auto p-6">
+      <div className="flex-1 space-y-6 overflow-auto p-4 md:p-6">
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
           <Stat title="Health" value={status.data?.ok ? "Healthy" : status.isLoading ? "…" : "Down"} sub={`port ${status.data?.port ?? "—"}`} />
-          <Stat title="Active tasks" value={String(activeTasks.length)} sub={activeTasks.length > 0 ? `of ${tasks.data?.length ?? 0} lifetime` : "no work in flight"} />
+          <Stat title="Active tasks" value={String(activeTasks.length)} sub={activeTasks.length > 0 ? "in flight" : "no work in flight"} />
           <Stat title="Pending approvals" value={String(pending.length)} sub={pending.length > 0 ? "needs review" : "all clear"} />
           <Stat title="Failed jobs" value={String(failedJobs.length)} sub={`${jobs.data?.length ?? 0} jobs`} />
           <Stat title="Connector issues" value={String(connectorIssues.length)} sub={`${connectors.data?.length ?? 0} configured`} />
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-2">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">Today&apos;s cost</CardTitle>
+              <CardDescription>Estimated USD across tasks updated in the last 24h</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <p className="text-2xl font-semibold">${todaysCost.usd.toFixed(4)}</p>
+              <p className="text-xs text-muted-foreground">{todaysCost.counted} tasks with cost data</p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader>
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <CardTitle className="text-sm">Memory changes needing review</CardTitle>
+                  <CardDescription>Proposed memories awaiting approve / reject</CardDescription>
+                </div>
+                <Link
+                  href="/memory"
+                  className="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium hover:bg-accent"
+                >
+                  Review
+                </Link>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <p className="text-2xl font-semibold">{proposedMemories.length}</p>
+              <p className="text-xs text-muted-foreground">{(memories.data?.length ?? 0)} memories total</p>
+            </CardContent>
+          </Card>
         </div>
 
         <Card>

@@ -53,7 +53,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
     ["GET", /^\/api\/audit$/, () => json(readState(config.lane).audit)],
     ["GET", /^\/api\/events$/, () => json(readState(config.lane).events)],
-    ["GET", /^\/api\/events\/stream$/, () => eventStream(config)],
+    ["GET", /^\/api\/events\/stream$/, (request) => eventStream(config, request)],
     ["GET", /^\/api\/memory$/, () => json(readState(config.lane).memories)],
     ["POST", /^\/api\/memory$/, async (request) => {
       return json(createMemoryFromInput(config, await body(request)), 201);
@@ -193,13 +193,32 @@ function json(value: unknown, statusCode = 200): Response {
   return Response.json(value, { status: statusCode });
 }
 
-function eventStream(config: RuntimeConfig): Response {
+function eventStream(config: RuntimeConfig, request: Request): Response {
   let closed = false;
   let interval: Timer | undefined;
   const encoder = new TextEncoder();
+  // Last-Event-ID is the SSE-native dedup signal. The browser-side EventSource
+  // attaches it automatically on reconnect; honoring it here means a flapping
+  // connection doesn't re-deliver the entire historical event log every time.
+  // Query-string fallback covers proxies/clients that drop the header.
+  const lastEventId =
+    request.headers.get("last-event-id") ??
+    new URL(request.url).searchParams.get("lastEventId") ??
+    undefined;
   const stream = new ReadableStream({
     start(controller) {
       const seen = new Set<string>();
+      // Pre-seed `seen` with everything up to and including the last delivered
+      // id so the first send() after reconnection only emits genuinely new
+      // events. The events list is append-only by id; we walk it in order
+      // (oldest-first, same direction as `send` below) to find the cutoff.
+      if (lastEventId) {
+        const ordered = readState(config.lane).events.slice().reverse();
+        for (const event of ordered) {
+          seen.add(event.id);
+          if (event.id === lastEventId) break;
+        }
+      }
       const send = () => {
         if (closed) return;
         const events = readState(config.lane).events.slice().reverse();

@@ -15,6 +15,7 @@ interface McpRow { id: string; name: string; status: string; command: string; la
 interface MessagingRow { id: string; name: string; status: string; kind: string }
 interface DeviceRow { id: string; name: string; status: string }
 interface PromotionRow { id: string; status: string; candidateRef: string; summary: string }
+interface SnapshotRow { id: string; reason: string; createdAt: string; path?: string }
 
 export default function SettingsPage() {
   const state = useState_();
@@ -50,6 +51,9 @@ export default function SettingsPage() {
     queryKey: ["promotions"],
     queryFn: () => api<PromotionRow[]>("/promotions")
   });
+  // Snapshots are exposed via /api/state but not via a dedicated /snapshots
+  // route, so we read from the state snapshot. (See src/state.ts:readState.)
+  const snapshots = ((state.data?.snapshots ?? []) as SnapshotRow[]).slice().reverse();
 
   const useProfile = useMutation({
     mutationFn: (id: string) => api(`/profiles/${encodeURIComponent(id)}/use`, { method: "POST" }),
@@ -320,6 +324,36 @@ export default function SettingsPage() {
                       <StatusPill value={item.status} />
                     </div>
                     <p className="mt-1 text-xs text-muted-foreground">{item.summary}</p>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Snapshots</CardTitle>
+            <CardDescription>{snapshots.length} on disk · create with `gini snapshot create`</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {snapshots.length === 0 ? (
+              <EmptyState title="No snapshots" description="Run `gini snapshot create <reason>` from the CLI to make one." />
+            ) : (
+              <ul className="divide-y divide-border">
+                {snapshots.map((snap) => (
+                  <li key={snap.id} className="py-2">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm">{snap.reason}</p>
+                        <p className="truncate font-mono text-[10px] text-muted-foreground">
+                          {snap.id} · {new Date(snap.createdAt).toLocaleString()}
+                        </p>
+                        {snap.path ? (
+                          <p className="truncate font-mono text-[10px] text-muted-foreground">{snap.path}</p>
+                        ) : null}
+                      </div>
+                    </div>
                   </li>
                 ))}
               </ul>

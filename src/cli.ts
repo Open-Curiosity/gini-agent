@@ -21,7 +21,9 @@ const noWeb = hasFlag(args, "--no-web") || smokeImpliesNoWeb;
 applyGlobalEnvOverrides(args, ephemeralSmoke);
 const lane = ephemeralSmoke ? `smoke-${process.pid}-${crypto.randomUUID().slice(0, 6)}` : parseLane(args);
 const config = loadConfig(lane);
-const webPort = Number(process.env.GINI_WEB_PORT ?? flagValue(args, "--web-port") ?? 3000);
+const webPortFlag = flagValue(args, "--web-port");
+const webPortPinned = Boolean(webPortFlag) || Boolean(process.env.GINI_WEB_PORT);
+const webPort = Number(process.env.GINI_WEB_PORT ?? webPortFlag ?? 3000);
 
 async function main(): Promise<void> {
   switch (command) {
@@ -181,11 +183,15 @@ async function start(config: RuntimeConfig): Promise<boolean> {
   }
   // Web launch runs whether or not the runtime was already up — a user whose
   // web crashed should be able to recover with `gini start` without first stopping.
-  let webStarted: { webUrl: string } | null = null;
+  let webUrlValue: string | null = null;
   if (!noWeb) {
-    if (!isWebAlreadyAlive(config)) {
+    const existing = await existingWebUrl(config);
+    if (existing) {
+      webUrlValue = existing;
+    } else {
       try {
-        webStarted = await startWeb(config);
+        const result = await startWeb(config);
+        webUrlValue = result.webUrl;
       } catch (error) {
         print({
           started: runtimeStarted,
@@ -201,16 +207,40 @@ async function start(config: RuntimeConfig): Promise<boolean> {
   const banner: Record<string, unknown> = runtimeStarted
     ? { started: true, url: url(config), lane: config.lane }
     : { running: true, url: url(config), lane: config.lane };
-  if (webStarted) banner.webUrl = webStarted.webUrl;
+  if (webUrlValue) banner.webUrl = webUrlValue;
   print(banner);
   return runtimeStarted;
 }
 
-function isWebAlreadyAlive(config: RuntimeConfig): boolean {
+/**
+ * Returns the live web URL if the recorded pid is both alive AND serving
+ * Next.js (via /api/runtime/__healthz). Cleans up stale pidfiles when the
+ * process is gone or hung. Returns null when nothing usable is running.
+ *
+ * We can't reconstruct the URL purely from the pidfile (port isn't recorded),
+ * so we probe `webPort` and the next 99 ports. Cheap and covers the common
+ * case where the user used the default or an explicit --web-port.
+ */
+async function existingWebUrl(config: RuntimeConfig): Promise<string | null> {
   const path = join(config.stateRoot, "web.pid");
-  if (!existsSync(path)) return false;
+  if (!existsSync(path)) return null;
   const pid = Number(readFileSync(path, "utf8"));
-  return processAlive(pid);
+  if (!processAlive(pid)) {
+    rmSync(path, { force: true });
+    return null;
+  }
+  for (let candidate = webPort; candidate < webPort + 100; candidate += 1) {
+    const candidateUrl = `http://127.0.0.1:${candidate}`;
+    try {
+      const response = await fetch(`${candidateUrl}/api/runtime/__healthz`, { redirect: "manual" });
+      if (!response.ok) continue;
+      const body = (await response.json().catch(() => null)) as { ok?: boolean; service?: string } | null;
+      if (body && body.ok === true && body.service === "gini-web") return candidateUrl;
+    } catch { /* try next port */ }
+  }
+  // Pid is alive but nothing healthy on the expected ports — treat as stale.
+  rmSync(path, { force: true });
+  return null;
 }
 
 async function startWeb(config: RuntimeConfig): Promise<{ webUrl: string }> {
@@ -218,9 +248,25 @@ async function startWeb(config: RuntimeConfig): Promise<{ webUrl: string }> {
   if (!existsSync(join(webRoot, "package.json"))) {
     throw new Error("Web app not found at web/. Cannot start the Next.js control plane.");
   }
-  const port = await availablePort(webPort);
-  const built = existsSync(join(webRoot, ".next", "BUILD_ID"));
-  const command = built ? ["run", "start", "--", "-p", String(port)] : ["run", "dev", "--", "-p", String(port)];
+  // We require the chosen port to be claimable BEFORE spawning. If
+  // `availablePort` hands us a free port but a foreign process binds it
+  // between then and now, the child will fail to listen and we'll detect that
+  // via the healthz probe. We do NOT silently roll up to the next port —
+  // foreign-server squatting should fail loudly so the user knows.
+  const requestedPort = webPort;
+  const port = await availablePort(requestedPort);
+  if (port !== requestedPort && webPortPinned) {
+    // User pinned a port (via --web-port or GINI_WEB_PORT); refuse to silently
+    // roll forward to a neighbor. They asked for a specific port, so the right
+    // behavior is to fail loudly so they can stop the squatter or pick another.
+    throw new Error(`Requested web port ${requestedPort} is busy. Stop the other process or pick a different --web-port.`);
+  }
+  // Always use `bun run dev` for the local control plane. Production builds
+  // (`bun run start`) require an explicit prior `bun run build` step, which
+  // is hostile to fresh-clone "gini start" workflows: a stale .next/ from a
+  // previous checkout will silently serve outdated code. Dev mode compiles
+  // on demand and always reflects the current source.
+  const command = ["run", "dev", "--", "-p", String(port)];
   // detached: true puts the child in its own process group so we can SIGTERM
   // the entire group on stop (`bun run dev` re-execs into Next.js, leaving an
   // orphaned grandchild if we only kill the recorded pid).
@@ -241,25 +287,49 @@ async function startWeb(config: RuntimeConfig): Promise<{ webUrl: string }> {
     writeFileSync(join(config.stateRoot, "web.pid"), String(child.pid));
   }
   const webUrl = `http://127.0.0.1:${port}`;
-  // Poll the actual root path (HEAD) so we only return a URL the browser can
-  // reach. Dev mode can take 10–20s to compile the first route, so the timeout
-  // is intentionally generous.
+  try {
+    await waitForWebHealthz(webUrl, child.pid);
+    return { webUrl };
+  } catch (error) {
+    // Kill the child group so we don't leak processes on failure.
+    if (typeof child.pid === "number") {
+      try { process.kill(-child.pid, "SIGTERM"); } catch { /* ignore */ }
+    }
+    rmSync(join(config.stateRoot, "web.pid"), { force: true });
+    throw error;
+  }
+}
+
+/**
+ * Probes /api/runtime/__healthz on the spawned Next.js child.
+ *
+ * Why this is non-trivial:
+ *  - HEAD `/` returns success against ANY HTTP server (Python's http.server, a
+ *    random Bun.serve, etc), so any port-squatter satisfies it. False positive.
+ *  - `availablePort` only checks IPv4 127.0.0.1 binding, but Next.js dual-
+ *    stacks; a port that succeeds on net.createServer can still collide with
+ *    something listening on ::.
+ *
+ * The healthz route returns a marker JSON identifying the runtime+lane. We
+ * verify both that we get the marker AND that the spawned child PID is still
+ * alive — that combination tells us "the server we spawned is the one
+ * answering on this port".
+ */
+async function waitForWebHealthz(webUrl: string, childPid: number | undefined): Promise<void> {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
-    if (!processAlive(child.pid ?? -1)) {
+    if (childPid !== undefined && !processAlive(childPid)) {
       throw new Error(`Next.js process exited before becoming healthy. webUrl=${webUrl}`);
     }
     try {
-      const response = await fetch(webUrl, { method: "HEAD", redirect: "manual" });
-      if (response.status < 500) return { webUrl };
+      const response = await fetch(`${webUrl}/api/runtime/__healthz`, { redirect: "manual" });
+      if (response.ok) {
+        const body = await response.json().catch(() => null) as { ok?: boolean; service?: string } | null;
+        if (body && body.ok === true && body.service === "gini-web") return;
+      }
     } catch { /* keep waiting */ }
     await Bun.sleep(250);
   }
-  // Give up — kill the child and surface the failure rather than printing a dead URL.
-  if (typeof child.pid === "number") {
-    try { process.kill(-child.pid, "SIGTERM"); } catch { /* ignore */ }
-  }
-  rmSync(join(config.stateRoot, "web.pid"), { force: true });
   throw new Error(`Next.js did not become healthy within 30s on ${webUrl}.`);
 }
 
@@ -272,11 +342,20 @@ async function availablePort(preferred: number): Promise<number> {
 }
 
 function canListen(port: number): Promise<boolean> {
+  // Probe BOTH "0.0.0.0" (IPv4 wildcard) and "::" (IPv6 wildcard) so we don't
+  // hand out a port that a dual-stack squatter (Bun.serve, Next.js itself)
+  // can't actually claim. macOS specifically: a single-family bind here
+  // succeeds even when the other family is already taken, leading to a false
+  // positive and a confusing "process exited before becoming healthy" later.
+  return Promise.all([probe(port, "0.0.0.0"), probe(port, "::")]).then(([a, b]) => a && b);
+}
+
+function probe(port: number, host: string): Promise<boolean> {
   return new Promise((resolve) => {
     const server = createServer()
       .once("error", () => resolve(false))
       .once("listening", () => server.close(() => resolve(true)))
-      .listen(port, "127.0.0.1");
+      .listen(port, host);
   });
 }
 
@@ -954,10 +1033,11 @@ async function doctor(config: RuntimeConfig) {
   const state = readState(config.lane);
   const webPidFile = join(config.stateRoot, "web.pid");
   const webPid = existsSync(webPidFile) ? Number(readFileSync(webPidFile, "utf8")) : undefined;
-  const webRunning = webPid ? processAlive(webPid) : false;
+  const webPidAlive = webPid ? processAlive(webPid) : false;
+  const webHealthyUrl = webPidAlive ? await existingWebUrl(config) : null;
   const recommendations: string[] = [];
   if (!running) recommendations.push("Run `bun run gini start` to launch the local runtime.");
-  if (running && !webRunning && !noWeb) recommendations.push("Web pid not found — re-run `gini start` to relaunch the Next.js control plane.");
+  if (running && !webHealthyUrl && !noWeb) recommendations.push("Next.js control plane not healthy — re-run `gini start` to relaunch.");
   return {
     ok: true,
     bun: Bun.version,
@@ -965,7 +1045,7 @@ async function doctor(config: RuntimeConfig) {
     running,
     stateRoot: config.stateRoot,
     port: config.port,
-    web: { running: webRunning, pid: webPid ?? null },
+    web: { running: webPidAlive, pid: webPid ?? null, url: webHealthyUrl },
     tokenConfigured: Boolean(config.token),
     provider: providerHealth(config),
     tasks: state.tasks.length,
@@ -979,10 +1059,16 @@ function processAlive(pid: number): boolean {
 }
 
 async function remoteOrLocalStatus(config: RuntimeConfig) {
+  // R2-m1: include the web URL/health alongside the runtime status so a single
+  // `gini status` invocation tells the user where the UI is. We probe via the
+  // healthz route (rather than just trusting the pidfile) because that's the
+  // only signal that distinguishes "Next.js really running" from "stale pid".
+  const webUrl = await existingWebUrl(config);
   try {
-    return await api(config, "/api/status");
+    const remote = await api(config, "/api/status");
+    return { ...remote, web: { running: Boolean(webUrl), url: webUrl } };
   } catch {
-    return { ...status(config), ok: false, running: false };
+    return { ...status(config), ok: false, running: false, web: { running: Boolean(webUrl), url: webUrl } };
   }
 }
 
