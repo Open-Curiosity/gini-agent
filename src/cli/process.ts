@@ -8,7 +8,7 @@
 
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { join } from "node:path";
 import type { RuntimeConfig } from "../types";
 import { install, status } from "../domain/runtime";
@@ -29,6 +29,16 @@ export interface WebOptions {
   // strict-fail on collision (the user asked for that exact port; silently
   // walking would surprise them). Unpinned uses the lane default and walks.
   runtimePortPinned?: boolean;
+  // Foreground mode: don't detach/unref children, inherit their stdio so the
+  // user sees logs live. Caller (gini run) attaches signal handlers and is
+  // responsible for tearing the children down. start()/startWeb() return the
+  // child handles in this mode so the caller can wait on / signal them.
+  foreground?: boolean;
+}
+
+export interface ForegroundChildren {
+  runtime: ChildProcess | null;
+  web: ChildProcess | null;
 }
 
 function readRecordedPort(path: string): number | null {
@@ -45,7 +55,9 @@ export function recordedWebPort(config: RuntimeConfig): number | null {
   return readRecordedPort(webPortPath(config.lane));
 }
 
-export async function start(config: RuntimeConfig, options: WebOptions): Promise<{ runtimeStarted: boolean; banner: Record<string, unknown> }> {
+export async function start(config: RuntimeConfig, options: WebOptions): Promise<{ runtimeStarted: boolean; banner: Record<string, unknown>; children: ForegroundChildren }> {
+  const foreground = options.foreground === true;
+  const children: ForegroundChildren = { runtime: null, web: null };
   const alreadyRunning = await isRunning(config);
   let runtimeStarted = false;
   if (!alreadyRunning) {
@@ -59,13 +71,17 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
     config.port = claimedPort;
     install(config);
     writeFileSync(runtimePortPath(config.lane), String(config.port));
+    // Foreground mode keeps the child attached to the CLI: no detached process
+    // group, no unref, and stdio inherits so the user sees runtime logs live.
+    // Daemon mode (gini start) preserves the original detach + ignore stdio.
     const child = spawn(process.execPath, ["run", "src/server.ts", "--lane", config.lane], {
       cwd: process.cwd(),
-      detached: true,
-      stdio: "ignore",
+      detached: !foreground,
+      stdio: foreground ? "inherit" : "ignore",
       env: { ...process.env, GINI_LANE: config.lane, GINI_PORT: String(config.port) }
     });
-    child.unref();
+    if (!foreground) child.unref();
+    if (foreground) children.runtime = child;
     let healthy = false;
     for (let attempt = 0; attempt < 50; attempt += 1) {
       if (await isRunning(config)) { healthy = true; break; }
@@ -92,6 +108,7 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
       try {
         const result = await startWeb(config, options);
         webUrlValue = result.webUrl;
+        if (foreground) children.web = result.child ?? null;
       } catch (error) {
         return {
           runtimeStarted,
@@ -101,7 +118,8 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
             url: url(config),
             lane: config.lane,
             webError: error instanceof Error ? error.message : String(error)
-          }
+          },
+          children
         };
       }
     }
@@ -110,7 +128,8 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
     ? { started: true, url: url(config), lane: config.lane }
     : { running: true, url: url(config), lane: config.lane };
   if (webUrlValue) banner.webUrl = webUrlValue;
-  return { runtimeStarted, banner };
+  if (foreground) banner.foreground = true;
+  return { runtimeStarted, banner, children };
 }
 
 /**
@@ -161,7 +180,7 @@ export async function existingWebUrl(config: RuntimeConfig, webPort: number): Pr
   return null;
 }
 
-export async function startWeb(config: RuntimeConfig, options: WebOptions): Promise<{ webUrl: string }> {
+export async function startWeb(config: RuntimeConfig, options: WebOptions): Promise<{ webUrl: string; child?: ChildProcess }> {
   const webRoot = join(projectRoot(), "web");
   if (!existsSync(join(webRoot, "package.json"))) {
     throw new Error("Web app not found at web/. Cannot start the Next.js control plane.");
@@ -195,10 +214,14 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // and namespace per lane. Standalone `bun run dev` still defaults to
   // `.next` because that env var is unset.
   const laneSlug = config.lane.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const foreground = options.foreground === true;
+  // Foreground: keep the web child attached and inherit stdio so dev-server
+  // logs stream to the user. Daemon (gini start) keeps the historic detached
+  // group + ignored stdio so the runtime survives terminal close.
   const child = spawn("bun", command, {
     cwd: webRoot,
-    detached: true,
-    stdio: "ignore",
+    detached: !foreground,
+    stdio: foreground ? "inherit" : "ignore",
     env: {
       ...process.env,
       GINI_RUNTIME_URL: url(config),
@@ -208,7 +231,7 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
       PORT: String(port)
     }
   });
-  child.unref();
+  if (!foreground) child.unref();
   if (typeof child.pid === "number") {
     writeFileSync(join(config.stateRoot, "web.pid"), String(child.pid));
   }
@@ -219,11 +242,16 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   const webUrl = `http://127.0.0.1:${port}`;
   try {
     await waitForWebHealthz(webUrl, child.pid, config.lane);
-    return { webUrl };
+    return foreground ? { webUrl, child } : { webUrl };
   } catch (error) {
-    // Kill the child group so we don't leak processes on failure.
+    // Kill the child group so we don't leak processes on failure. In foreground
+    // mode there is no separate group (we did not pass detached), so signal
+    // the child pid directly.
     if (typeof child.pid === "number") {
-      try { process.kill(-child.pid, "SIGTERM"); } catch { /* ignore */ }
+      try {
+        if (foreground) process.kill(child.pid, "SIGTERM");
+        else process.kill(-child.pid, "SIGTERM");
+      } catch { /* ignore */ }
     }
     rmSync(join(config.stateRoot, "web.pid"), { force: true });
     rmSync(webPortPath(config.lane), { force: true });

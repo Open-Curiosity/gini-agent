@@ -103,4 +103,13 @@ The local web app at `web/` is a separate Next.js 16 process that the CLI launch
 
 `bun run gini start` launches the runtime and the Next.js app, prints both URLs, and uses dev mode unless `web/.next-<lane>/BUILD_ID` is present. `bun run gini stop` kills both. `bun run gini smoke` runs with `--no-web` automatically so smoke remains a runtime-only verification path.
 
+## Process lifecycle: `start` vs `run`
+
+There are two ways to launch a lane:
+
+- **`gini start`** — daemon mode. The CLI spawns the runtime (and Next.js, unless `--no-web`) detached and `unref`s, so the children survive the launching shell. Use this for a persistent personal agent that should keep working after you close the terminal. Stop it explicitly with `gini stop`.
+- **`gini run`** — foreground mode. The CLI stays attached: child stdio is inherited so logs stream live, no `detached`/`unref`, and `SIGINT`/`SIGTERM`/`SIGHUP` to the CLI tear the children down (5s SIGTERM grace, then SIGKILL). When the launching terminal closes (HUP) or Ctrl-C is pressed, the lane dies with it.
+
+Use `gini run` for parallel coding-agent worktrees and CI: each worktree runs its lane in the foreground so the lane is bound to the agent's session — when the agent exits, no orphan runtime is left behind. Both modes share the same port-walking, healthz probing, lane state, and pid/port files; the only differences are stdio + detach + signal handling. `gini stop --lane <X>` still works against a `run`-launched lane if invoked from another terminal.
+
 Ports are auto-allocated per lane so multiple lanes coexist on one machine without manual `--port` wrangling. The default runtime port is `7337 + fnv1a(lane) % 100` and the default web port is `3000 + fnv1a(lane) % 100`; the `dev` lane stays pinned to `7337`/`3000` so existing muscle memory keeps working. If a default is busy (e.g. an unrelated process squats 3000) the CLI walks to the next free port and prints the actual URL it claimed. The chosen ports are persisted in `~/.gini/<lane>/runtime.port` / `web.port` so `gini status`, `gini stop`, and `gini doctor` read them directly without re-probing. Each lane also gets its own `web/.next-<lane>` build dir so two `next dev` instances do not contend on the same Next.js lockfile. Explicit `--port` / `--web-port` (and `GINI_PORT` / `GINI_WEB_PORT`) keep their strict-fail behaviour: a busy pinned port is reported, never silently rolled forward.

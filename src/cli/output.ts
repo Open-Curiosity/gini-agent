@@ -22,6 +22,7 @@ export function help(): void {
 Usage:
   bun run gini install [--lane dev]
   bun run gini start|stop|status|doctor|reset [--lane dev] [--port 7337]
+  bun run gini run [--lane dev] [--no-web]
   bun run gini task submit <prompt>
   bun run gini task list
   bun run gini task show <task-id>
@@ -55,6 +56,12 @@ Usage:
   bun run gini audit
   bun run gini evidence
   bun run gini smoke
+
+Process lifecycle:
+  gini start  - daemon mode; lane keeps running after the terminal closes.
+                Use this for a persistent personal agent on your machine.
+  gini run    - foreground mode; lane dies when this terminal exits or
+                you Ctrl-C. Use this for coding-agent worktrees and CI.
 
 Global options:
   --lane <name>        Select a persistent lane. Smoke uses an ephemeral lane when omitted.
