@@ -1,5 +1,14 @@
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { extname, join, relative } from "node:path";
+// Task orchestrator. Knows how to:
+//   - submit / retry / cancel a task (audit + lifecycle)
+//   - dispatch a queued task to the right tool by sniffing the input prefix
+//   - resolve an approval and run the side-effecting action
+//
+// The actual tool logic (file/web/terminal/code) lives in src/tools/*.
+// Approval lifecycle helpers (completeLowRiskToolTask, executeApprovedAction)
+// remain here because they are part of the orchestrator's contract with
+// the rest of the runtime.
+
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "bun";
 import type { Approval, RuntimeConfig, RuntimeState, Task } from "./types";
 import {
@@ -7,14 +16,17 @@ import {
   appendLog,
   appendTrace,
   assertInsideWorkspace,
-  createApproval,
-  createTask,
   createMemory,
+  createTask,
   mutateState,
   now,
   upsertTask
 } from "./state";
 import { generateTaskSummary } from "./provider";
+import { listFiles, readFile, requestFilePatch, requestFileWrite, searchFiles } from "./tools/file";
+import { fetchWeb } from "./tools/web";
+import { requestShell } from "./tools/terminal";
+import { requestCodeExecution } from "./tools/code";
 
 export function submitTask(config: RuntimeConfig, input: string, jobId?: string, parentTaskId?: string, subagentId?: string): Task {
   const created = createTask(config.lane, input, jobId, parentTaskId, subagentId);
@@ -88,31 +100,18 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   await Bun.sleep(10);
   const lower = task.input.toLowerCase();
 
-  if (lower.startsWith("write ")) {
-    return requestFileWrite(config, task);
-  }
-  if (lower.startsWith("patch ")) {
-    return requestFilePatch(config, task);
-  }
-  if (lower.startsWith("read ")) {
-    return readFile(config, task);
-  }
-  if (lower.startsWith("list ")) {
-    return listFiles(config, task);
-  }
-  if (lower.startsWith("find ")) {
-    return searchFiles(config, task);
-  }
-  if (lower.startsWith("web ")) {
-    return fetchWeb(config, task);
-  }
-  if (lower.startsWith("code ")) {
-    return requestCodeExecution(config, task);
-  }
-  if (lower.startsWith("shell ")) {
-    return requestShell(config, task);
-  }
+  // Dispatch by input prefix. Each tool returns the resulting Task; high-risk
+  // tools may have transitioned the task into waiting_approval.
+  if (lower.startsWith("write ")) return requestFileWrite(config, task);
+  if (lower.startsWith("patch ")) return requestFilePatch(config, task);
+  if (lower.startsWith("read ")) return readFile(config, task);
+  if (lower.startsWith("list ")) return listFiles(config, task);
+  if (lower.startsWith("find ")) return searchFiles(config, task);
+  if (lower.startsWith("web ")) return fetchWeb(config, task);
+  if (lower.startsWith("code ")) return requestCodeExecution(config, task);
+  if (lower.startsWith("shell ")) return requestShell(config, task);
 
+  // No tool matched: fall through to provider summarization.
   const activeMemory = mutateState(config.lane, (state) => state.memories.filter((memory) => memory.status === "active"));
   const providerResult = await generateTaskSummary(config, task.input, activeMemory);
   appendTrace(config.lane, taskId, {
@@ -183,155 +182,17 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
   appendTrace(config.lane, taskId, { type: "error", message, data: {} });
 }
 
-function requestFileWrite(config: RuntimeConfig, task: Task): Task {
-  const match = task.input.match(/^write\s+(.+?)\s*::\s*([\s\S]+)$/i);
-  if (!match) throw new Error("Use: write <relative-path> :: <content>");
-  const [, target, content] = match;
-  assertInsideWorkspace(config.workspaceRoot, target);
-  return mutateState(config.lane, (state) => {
-    const item = findTask(state, task.id);
-    const approval = createApproval(state, {
-      taskId: item.id,
-      action: "file.write",
-      target,
-      risk: "high",
-      reason: "File writes are side effects and require explicit approval.",
-      payload: { path: target, content }
-    });
-    item.status = "waiting_approval";
-    item.currentStep = "Waiting for approval";
-    item.approvalIds.push(approval.id);
-    item.updatedAt = now();
-    appendTrace(config.lane, item.id, { type: "approval", message: "Approval requested for file write", data: { approvalId: approval.id, target } });
-    return item;
-  });
-}
-
-function requestFilePatch(config: RuntimeConfig, task: Task): Task {
-  const match = task.input.match(/^patch\s+(.+?)\s*::\s*([\s\S]+?)\s*=>\s*([\s\S]+)$/i);
-  if (!match) throw new Error("Use: patch <relative-path> :: <old-text> => <new-text>");
-  const [, target, oldText, newText] = match;
-  const path = assertInsideWorkspace(config.workspaceRoot, target);
-  if (!existsSync(path)) throw new Error(`Cannot patch missing file: ${target}`);
-  const before = readFileSync(path, "utf8");
-  if (!before.includes(oldText)) throw new Error(`Patch target text not found in ${target}`);
-  const after = before.replace(oldText, newText);
-  return mutateState(config.lane, (state) => {
-    const item = findTask(state, task.id);
-    const approval = createApproval(state, {
-      taskId: item.id,
-      action: "file.patch",
-      target,
-      risk: "high",
-      reason: "File patches are side effects and require explicit approval.",
-      payload: { path: target, oldText, newText, diff: simpleDiff(oldText, newText), beforeBytes: before.length, afterBytes: after.length }
-    });
-    item.status = "waiting_approval";
-    item.currentStep = "Waiting for approval";
-    item.approvalIds.push(approval.id);
-    item.updatedAt = now();
-    appendTrace(config.lane, item.id, { type: "approval", message: "Approval requested for file patch", data: { approvalId: approval.id, target, diff: approval.payload.diff } });
-    return item;
-  });
-}
-
-function readFile(config: RuntimeConfig, task: Task): Task {
-  const target = task.input.replace(/^read\s+/i, "").trim();
-  if (!target) throw new Error("Use: read <relative-path>");
-  const path = assertInsideWorkspace(config.workspaceRoot, target);
-  const stat = statSync(path);
-  if (!stat.isFile()) throw new Error(`Not a file: ${target}`);
-  const content = readFileSync(path, "utf8").slice(0, 12_000);
-  appendTrace(config.lane, task.id, { type: "tool", message: "File read", data: { path: target, bytes: content.length } });
-  return completeLowRiskToolTask(config, task.id, `Read ${target}\n\n${content}`, "file.read", target, { bytes: content.length });
-}
-
-function listFiles(config: RuntimeConfig, task: Task): Task {
-  const target = task.input.replace(/^list\s+/i, "").trim() || ".";
-  const path = assertInsideWorkspace(config.workspaceRoot, target);
-  const entries = readdirSync(path)
-    .slice(0, 200)
-    .map((entry) => {
-      const full = join(path, entry);
-      const stat = statSync(full);
-      return `${stat.isDirectory() ? "dir " : "file"} ${relative(config.workspaceRoot, full)}`;
-    });
-  appendTrace(config.lane, task.id, { type: "tool", message: "Directory listed", data: { path: target, entries: entries.length } });
-  return completeLowRiskToolTask(config, task.id, entries.join("\n") || "No entries.", "file.list", target, { entries: entries.length });
-}
-
-function searchFiles(config: RuntimeConfig, task: Task): Task {
-  const [, rawPattern = "", rawDir = "."] = task.input.match(/^find\s+(.+?)(?:\s+in\s+(.+))?$/i) ?? [];
-  const pattern = rawPattern.trim();
-  if (!pattern) throw new Error("Use: find <pattern> [in relative-dir]");
-  const root = assertInsideWorkspace(config.workspaceRoot, rawDir.trim() || ".");
-  const matches: string[] = [];
-  for (const file of walkFiles(config.workspaceRoot, root, 300)) {
-    if (matches.length >= 100) break;
-    if (!isTextLike(file)) continue;
-    const content = readFileSync(file, "utf8");
-    const line = content.split(/\r?\n/).findIndex((value) => value.toLowerCase().includes(pattern.toLowerCase()));
-    if (line >= 0) matches.push(`${relative(config.workspaceRoot, file)}:${line + 1}`);
-  }
-  appendTrace(config.lane, task.id, { type: "tool", message: "Files searched", data: { pattern, dir: rawDir, matches: matches.length } });
-  return completeLowRiskToolTask(config, task.id, matches.join("\n") || "No matches.", "file.search", pattern, { matches: matches.length });
-}
-
-async function fetchWeb(config: RuntimeConfig, task: Task): Promise<Task> {
-  const rawUrl = task.input.replace(/^web\s+/i, "").trim();
-  const parsed = new URL(rawUrl);
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("Use: web <http-or-https-url>");
-  const response = await fetch(parsed);
-  const text = (await response.text()).replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 12_000);
-  appendTrace(config.lane, task.id, { type: "tool", message: "Web page fetched", data: { url: parsed.toString(), status: response.status, bytes: text.length } });
-  return completeLowRiskToolTask(config, task.id, text || `Fetched ${parsed.toString()} with HTTP ${response.status}.`, "web.fetch", parsed.toString(), { status: response.status, bytes: text.length });
-}
-
-function requestCodeExecution(config: RuntimeConfig, task: Task): Task {
-  const match = task.input.match(/^code\s+(\w+)\s*::\s*([\s\S]+)$/i);
-  if (!match) throw new Error("Use: code js|python :: <code>");
-  const [, language, code] = match;
-  return mutateState(config.lane, (state) => {
-    const item = findTask(state, task.id);
-    const approval = createApproval(state, {
-      taskId: item.id,
-      action: "terminal.exec",
-      target: `code.${language}`,
-      risk: "high",
-      reason: "Code execution can change the system and requires explicit approval.",
-      payload: { command: codeExecutionCommand(language, code), timeoutMs: 10_000 }
-    });
-    item.status = "waiting_approval";
-    item.currentStep = "Waiting for approval";
-    item.approvalIds.push(approval.id);
-    item.updatedAt = now();
-    appendTrace(config.lane, item.id, { type: "approval", message: "Approval requested for code execution", data: { approvalId: approval.id, language } });
-    return item;
-  });
-}
-
-function requestShell(config: RuntimeConfig, task: Task): Task {
-  const command = task.input.replace(/^shell\s+/i, "").trim();
-  return mutateState(config.lane, (state) => {
-    const item = findTask(state, task.id);
-    const approval = createApproval(state, {
-      taskId: item.id,
-      action: "terminal.exec",
-      target: command,
-      risk: "high",
-      reason: "Terminal execution can change the system and requires explicit approval.",
-      payload: { command, timeoutMs: 10_000 }
-    });
-    item.status = "waiting_approval";
-    item.currentStep = "Waiting for approval";
-    item.approvalIds.push(approval.id);
-    item.updatedAt = now();
-    appendTrace(config.lane, item.id, { type: "approval", message: "Approval requested for terminal command", data: { approvalId: approval.id, command } });
-    return item;
-  });
-}
-
-function completeLowRiskToolTask(config: RuntimeConfig, taskId: string, summary: string, action: string, target: string, evidence: Record<string, unknown>): Task {
+// Shared between agent and tool modules. Tools that complete immediately
+// (file.read, file.list, file.search, web.fetch) call this to record the
+// audit, set the task summary, and mark it completed in one shot.
+export function completeLowRiskToolTask(
+  config: RuntimeConfig,
+  taskId: string,
+  summary: string,
+  action: string,
+  target: string,
+  evidence: Record<string, unknown>
+): Task {
   return mutateState(config.lane, (state) => {
     const task = findTask(state, taskId);
     addAudit(state, {
@@ -349,42 +210,6 @@ function completeLowRiskToolTask(config: RuntimeConfig, taskId: string, summary:
     upsertTask(state, task);
     return task;
   });
-}
-
-function walkFiles(workspaceRoot: string, root: string, limit: number): string[] {
-  const files: string[] = [];
-  const queue = [root];
-  while (queue.length > 0 && files.length < limit) {
-    const current = queue.shift()!;
-    const stat = statSync(current);
-    if (stat.isFile()) {
-      files.push(current);
-      continue;
-    }
-    if (!stat.isDirectory()) continue;
-    for (const entry of readdirSync(current)) {
-      if (entry === "node_modules" || entry === ".git" || entry.startsWith(".gini")) continue;
-      const full = join(current, entry);
-      assertInsideWorkspace(workspaceRoot, relative(workspaceRoot, full));
-      queue.push(full);
-    }
-  }
-  return files;
-}
-
-function isTextLike(path: string): boolean {
-  const ext = extname(path).toLowerCase();
-  return ["", ".ts", ".js", ".json", ".md", ".txt", ".html", ".css", ".yml", ".yaml"].includes(ext);
-}
-
-function codeExecutionCommand(language: string, code: string): string {
-  if (language === "js" || language === "ts") {
-    return `bun -e ${JSON.stringify(code)}`;
-  }
-  if (language === "python" || language === "py") {
-    return `python3 - <<'PY'\n${code}\nPY`;
-  }
-  throw new Error(`Unsupported code language: ${language}`);
 }
 
 export async function decideApproval(config: RuntimeConfig, approvalId: string, decision: "approve" | "deny"): Promise<Approval> {
@@ -490,10 +315,6 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
   }
 }
 
-function simpleDiff(oldText: string, newText: string): string {
-  return [`--- before`, `+++ after`, ...oldText.split(/\r?\n/).map((line) => `-${line}`), ...newText.split(/\r?\n/).map((line) => `+${line}`)].join("\n");
-}
-
 function completeApprovedTask(state: RuntimeState, taskId: string, summary: string, error?: string): void {
   const task = findTask(state, taskId);
   task.status = error ? "failed" : "completed";
@@ -503,7 +324,10 @@ function completeApprovedTask(state: RuntimeState, taskId: string, summary: stri
   task.updatedAt = now();
 }
 
-function findTask(state: RuntimeState, taskId: string): Task {
+// Exported because tool modules call it to look up the task they were
+// dispatched against. Throws if missing — every code path here arrives via
+// runTask which already created the row, so a miss is a real bug.
+export function findTask(state: RuntimeState, taskId: string): Task {
   const task = state.tasks.find((item) => item.id === taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
   return task;
