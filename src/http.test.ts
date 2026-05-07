@@ -247,6 +247,34 @@ describe("runtime api", () => {
     expect(events.some((event: { action: string }) => event.action === "job.run.completed")).toBe(true);
   });
 
+  test("PATCH /api/jobs/:id round-trips costBudget alongside other editable fields", async () => {
+    const config = testConfig("v1-job-cost-budget");
+    const handler = createHandler(config);
+
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "cost-job", intervalSeconds: 120, prompt: "noop" })
+    });
+    expect(job.costBudget).toBeUndefined();
+
+    const patched = await call(handler, config, `/api/jobs/${job.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ costBudget: 2.5, retryLimit: 4, timeoutSeconds: 45 })
+    });
+    expect(patched.costBudget).toBe(2.5);
+    expect(patched.retryLimit).toBe(4);
+    expect(patched.timeoutSeconds).toBe(45);
+
+    const refetched = (await call(handler, config, "/api/jobs")).find((item: { id: string }) => item.id === job.id);
+    expect(refetched.costBudget).toBe(2.5);
+
+    const cleared = await call(handler, config, `/api/jobs/${job.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ costBudget: null })
+    });
+    expect(cleared.costBudget).toBeUndefined();
+  });
+
   test("probes and invokes configured MCP command records", async () => {
     const config = testConfig("v1-mcp");
     const handler = createHandler(config);

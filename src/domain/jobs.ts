@@ -89,6 +89,8 @@ export function updateJob(config: RuntimeConfig, jobId: string, input: Record<st
     if (Array.isArray(input.context)) job.context = input.context.map(String);
     if (typeof input.retryLimit === "number") job.retryLimit = Math.max(0, input.retryLimit);
     if (typeof input.timeoutSeconds === "number") job.timeoutSeconds = Math.max(1, input.timeoutSeconds);
+    if (typeof input.costBudget === "number") job.costBudget = Math.max(0, input.costBudget);
+    else if (input.costBudget === null) job.costBudget = undefined;
     job.updatedAt = now();
     addAudit(state, { actor: "user", action: "job.updated", target: job.id, risk: "low" });
     return job;

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -303,6 +303,19 @@ function EditJobDialog({ job }: { job: JobRecord }) {
   const [timeoutSeconds, setTimeoutSeconds] = useState(String(job.timeoutSeconds));
   const [costBudget, setCostBudget] = useState(typeof job.costBudget === "number" ? String(job.costBudget) : "");
   const [deliveryTargetsRaw, setDeliveryTargetsRaw] = useState((job.deliveryTargets ?? []).join(", "));
+
+  // The selected job can change while this component instance is reused
+  // (parent JobDetail re-renders with a different `job` when the user picks
+  // a different row in the list). Reset form state when the job id changes
+  // OR when the dialog opens — otherwise edits silently overwrite the wrong
+  // record with stale field values from the previous selection.
+  useEffect(() => {
+    setIntervalSeconds(String(job.intervalSeconds));
+    setRetryLimit(String(job.retryLimit));
+    setTimeoutSeconds(String(job.timeoutSeconds));
+    setCostBudget(typeof job.costBudget === "number" ? String(job.costBudget) : "");
+    setDeliveryTargetsRaw((job.deliveryTargets ?? []).join(", "));
+  }, [job.id, job.intervalSeconds, job.retryLimit, job.timeoutSeconds, job.costBudget, job.deliveryTargets, open]);
 
   const update = useMutation({
     mutationFn: (patch: Record<string, unknown>) =>
