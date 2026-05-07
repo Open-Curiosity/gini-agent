@@ -1,4 +1,6 @@
-# Gini Runtime Architecture
+# Gini Runtime Implementation Notes
+
+**Status:** Implementation notes. The canonical product spec is [master-plan.md](./master-plan.md).
 
 This repo is organized around runtime boundaries rather than feature chronology.
 

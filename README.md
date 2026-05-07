@@ -43,7 +43,7 @@ The master plan lives at:
 
 The current module boundaries are documented at:
 
-`docs/architecture.md`
+`docs/implementation-notes.md`
 
 The V1 local runtime readiness map is documented at:
 
