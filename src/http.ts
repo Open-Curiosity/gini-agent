@@ -6,7 +6,7 @@ import { readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./domain/views";
 import { checkConnector } from "./domain/connectors";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./domain/jobs";
-import { archiveMemory, createMemoryFromInput, editMemory, recall, retain, updateMemory } from "./domain/memory";
+import { archiveMemory, createMemoryFromInput, editMemory, recall, reflect, retain, updateMemory } from "./domain/memory";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./domain/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./domain/pairing";
@@ -58,6 +58,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/memory$/, () => json(readState(config.lane).memories)],
     ["POST", /^\/api\/memory$/, async (request) => {
       return json(await createMemoryFromInput(config, await body(request)), 201);
+    }],
+    // Hindsight phase 4: reflect pipeline.
+    ["POST", /^\/api\/memory\/reflect$/, async (request) => {
+      const payload = await body(request);
+      const query = String(payload.query ?? "").trim();
+      if (!query) return json({ error: "query is required" }, 400);
+      const result = await reflect(config, {
+        query,
+        bankId: typeof payload.bankId === "string" ? payload.bankId : undefined,
+        tokenBudget: typeof payload.tokenBudget === "number" ? payload.tokenBudget : undefined,
+        sourceTaskId: typeof payload.sourceTaskId === "string" ? payload.sourceTaskId : undefined
+      });
+      return json(result);
     }],
     // Hindsight phase 3: recall pipeline.
     ["POST", /^\/api\/memory\/recall$/, async (request) => {

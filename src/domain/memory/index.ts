@@ -18,3 +18,8 @@ export type { RetainInput, RetainOutput } from "./retain";
 
 export { recall } from "./recall";
 export type { RecallInput, RecallOutput, RecallScoredUnit, RecallChannel } from "./recall";
+
+export { reflect, verbalizeProfile, buildReflectSystemMessage } from "./reflect";
+export type { ReflectInput, ReflectOutput } from "./reflect";
+
+export { reinforceOpinionsForUnits, applyVerdict } from "./reinforce";
