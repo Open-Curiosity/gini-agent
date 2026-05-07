@@ -26,11 +26,17 @@ beforeAll(() => {
   process.env.GINI_STATE_ROOT = ROOT;
   process.env.GINI_LOG_ROOT = `${ROOT}-logs`;
   process.env.GINI_EMBEDDING_PROVIDER = "echo";
+  // Channel-level recall tests assert ordering against pure RRF. Pin the
+  // reranker to `none` so the cross-encoder pass doesn't reshuffle the head
+  // out from under those assertions. The reranker-specific behavior tests
+  // live in src/reranker.test.ts and a dedicated describe block below.
+  process.env.GINI_RERANKER_PROVIDER = "none";
 });
 
 afterAll(() => {
   closeAllMemoryDbs();
   delete process.env.GINI_EMBEDDING_PROVIDER;
+  delete process.env.GINI_RERANKER_PROVIDER;
   rmSync(ROOT, { recursive: true, force: true });
 });
 
@@ -243,5 +249,67 @@ describe("recall — RRF fusion + token budget", () => {
     const result = await recall(makeConfig(lane), { query: "padding", tokenBudget: 100 });
     expect(result.totalTokens).toBeLessThanOrEqual(100);
     expect(result.units.length).toBeLessThan(10);
+  });
+});
+
+// Cross-encoder reranking behavior, exercised end-to-end via recall(). The
+// reranker provider is set per-test inside the block; we restore the
+// suite-wide `none` pin afterwards so other describe blocks stay stable.
+describe("recall — cross-encoder reranking", () => {
+  test("with reranker=none, recall ordering matches pure RRF", async () => {
+    process.env.GINI_RERANKER_PROVIDER = "none";
+    const lane = "recall-rerank-none";
+    ensureDefaultBank(lane);
+    insertMemoryUnit(lane, {
+      text: "elephant elephant elephant matters here",
+      embedding: echoEmbed("elephant elephant elephant matters here"),
+      embeddingModel: "echo-embed-v0",
+      network: "world"
+    });
+    insertMemoryUnit(lane, {
+      text: "matters here truly",
+      embedding: echoEmbed("matters here truly"),
+      embeddingModel: "echo-embed-v0",
+      network: "world"
+    });
+    const result = await recall(makeConfig(lane), { query: "elephant matters here" });
+    // Multi-channel hit (semantic+bm25) should rank ahead of the
+    // single-channel hit. None reranker is a strict pass-through.
+    expect(result.units[0]!.unit.text).toContain("elephant");
+    // RRF scores are small (1/(k+rank+1)) — none reranker keeps them.
+    expect(result.units[0]!.score).toBeLessThan(1);
+  });
+
+  test("with reranker=echo, head candidates carry echo scores 1/(1+i)", async () => {
+    process.env.GINI_RERANKER_PROVIDER = "echo";
+    const lane = "recall-rerank-echo";
+    ensureDefaultBank(lane);
+    insertMemoryUnit(lane, {
+      text: "first thing about widgets",
+      embedding: echoEmbed("first thing about widgets"),
+      embeddingModel: "echo-embed-v0",
+      network: "world"
+    });
+    insertMemoryUnit(lane, {
+      text: "second thing about widgets",
+      embedding: echoEmbed("second thing about widgets"),
+      embeddingModel: "echo-embed-v0",
+      network: "world"
+    });
+    insertMemoryUnit(lane, {
+      text: "third thing about widgets",
+      embedding: echoEmbed("third thing about widgets"),
+      embeddingModel: "echo-embed-v0",
+      network: "world"
+    });
+    const result = await recall(makeConfig(lane), { query: "thing about widgets" });
+    expect(result.units.length).toBeGreaterThan(0);
+    // Echo reranker assigns 1/(1+i) by input position, then re-sorts by
+    // that score. The top unit must score 1; the second 0.5; etc.
+    expect(result.units[0]!.score).toBeCloseTo(1, 5);
+    if (result.units.length > 1) expect(result.units[1]!.score).toBeCloseTo(0.5, 5);
+    if (result.units.length > 2) expect(result.units[2]!.score).toBeCloseTo(1 / 3, 5);
+    // Restore suite-wide pin for the rest of the file.
+    process.env.GINI_RERANKER_PROVIDER = "none";
   });
 });

@@ -28,6 +28,7 @@ Usage:
   bun run gini approvals
   bun run gini approval approve|deny <approval-id>
   bun run gini memory list|add|approve|reject
+  bun run gini reranker status
   bun run gini skills list|add|show|search|validate|test|trust|disable|rollback
   bun run gini jobs list|add|run|pause|resume|remove|runs|replay
   bun run gini connectors list|health

@@ -10,6 +10,7 @@ import { chat } from "./commands/chat";
 import { approval } from "./commands/approval";
 import { memory } from "./commands/memory";
 import { embedding } from "./commands/embedding";
+import { reranker } from "./commands/reranker";
 import { skill } from "./commands/skills";
 import { job } from "./commands/jobs";
 import { connector } from "./commands/connectors";
@@ -75,6 +76,8 @@ export async function run(): Promise<void> {
     case "memory": await memory(ctx); break;
     case "embedding":
     case "embeddings": await embedding(ctx); break;
+    case "reranker":
+    case "rerankers": await reranker(ctx); break;
     case "skill":
     case "skills": await skill(ctx); break;
     case "job":

@@ -17,6 +17,7 @@ import { readState } from "../state";
 import { probeMemoryDb } from "../state/memory-db";
 import { legacyMigrationStatus } from "../domain/memory";
 import { embeddingStatus, listBanksWithModelMismatch } from "../domain/embedding";
+import { rerankerStatus } from "../domain/reranker";
 import { pidPath, projectRoot } from "../paths";
 import { api, auth, url } from "./api";
 
@@ -343,6 +344,10 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
       `Some banks (${banks}) have units embedded with a different model than the active provider (${embedding.provider.model}). Run \`gini embedding reembed --bank <id>\` to refresh.`
     );
   }
+  // Cross-encoder reranker snapshot. Surfaces the active provider/model and
+  // the top-N. Default is local; smoke pins echo. The reranker shares the
+  // ~/.gini/models cache with embeddings, so size is reported on the same dir.
+  const reranker = rerankerStatus(config);
   return {
     ok: true,
     bun: Bun.version,
@@ -359,6 +364,7 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
     memory,
     legacyMigration,
     embedding,
+    reranker,
     recommendations
   };
 }

@@ -34,6 +34,7 @@ bun run gini evidence
 | Local chat/session history | `gini chat new/send/sync/show/list`, `/api/chat` |
 | Persistent memory | `gini memory list/add/edit/approve/reject/archive`, `/api/memory` |
 | Embeddings | In-process Transformers.js (`Xenova/all-MiniLM-L6-v2`, 384d) by default; OpenAI / echo are opt-in. `gini embedding status`, `gini embedding reembed [--bank ID] [--dry-run]`, `/api/embedding/{status,reembed}`. Cache lives at `~/.gini/models/`. Override via `GINI_EMBEDDING_PROVIDER=local\|openai\|echo` and `GINI_LOCAL_EMBEDDING_MODEL=<hf-id>`. |
+| Reranker | In-process cross-encoder (`Xenova/ms-marco-MiniLM-L-6-v2`, ~22M params, ~100MB) by default; echo / none are opt-in. `gini reranker status`, `/api/reranker/status`. Same `~/.gini/models/` cache. Override via `GINI_RERANKER_PROVIDER=local\|echo\|none`, `GINI_LOCAL_RERANKER_MODEL=<hf-id>`, `GINI_RERANKER_TOP_N=<int>`. |
 | Skills/procedures | `gini skills list/add/show/search/validate/test/trust/disable/rollback`, `/api/skills` |
 | Session search | `gini search <query>`, `/api/search` with task/trace/memory/skill/audit citations |
 | Jobs/cron | `gini jobs list/add/run/pause/resume/remove/runs/replay`, prompt and script jobs |
@@ -63,6 +64,7 @@ V1 intentionally does not build the iOS/Expo app or production remote relay. It 
 - `/api/approvals`
 - `/api/memory`
 - `/api/embedding/status`, `/api/embedding/reembed`
+- `/api/reranker/status`
 - `/api/skills`
 - `/api/jobs`
 - `/api/messaging`
@@ -82,6 +84,18 @@ Hindsight phase 2+ embeds memory units when retaining facts and embeds the query
 Different models live in different vector spaces, so `recall`'s semantic channel filters memory units to those whose `embedding_model` equals the active provider's model. Switching providers leaves prior units in the bank; they remain BM25/graph/temporal-reachable but invisible to semantic recall until you run `gini embedding reembed [--bank ID]`. `gini doctor` and `gini embedding status` surface model mixing.
 
 `gini smoke` pins `GINI_EMBEDDING_PROVIDER=echo` so CI never triggers a model download.
+
+## Recall Pipeline
+
+Recall fuses four channels (semantic, BM25, graph spreading-activation, temporal) with reciprocal rank fusion (RRF, `k=60`), then runs a cross-encoder reranker over the top-N before applying the token-budget pack. Reranker providers:
+
+- `local` (default) — `@huggingface/transformers` running ONNX in-process. Default model `Xenova/ms-marco-MiniLM-L-6-v2` (~22M params, ~100MB). Lazy-loaded the first time recall fires, so users on `echo` or `none` never pay the model-load cost. Override the model via `GINI_LOCAL_RERANKER_MODEL=<hf-id>`. Cache at `~/.gini/models/` (shared with the embedding provider).
+- `echo` — deterministic stub used by tests and by `gini smoke`. Score is `1 / (1 + index)` for predictable assertions.
+- `none` — pass-through. Skips the cross-encoder entirely; RRF order stands.
+
+Top-N defaults to 25 (override via `GINI_RERANKER_TOP_N`). The tail of the RRF list past the top-N keeps RRF order — cross-encoder cost grows with candidates, and tail entries rarely survive the token-budget pack. If the local provider fails to initialise, recall logs a single warning and falls through to `none` so results are always returned.
+
+`gini reranker status` and `gini doctor` surface the active provider/model/top-N. `gini smoke` pins `GINI_RERANKER_PROVIDER=echo` so CI never triggers a cross-encoder download.
 
 ## Next.js Control Plane
 

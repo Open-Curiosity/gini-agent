@@ -8,6 +8,7 @@ import { checkConnector } from "./domain/connectors";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./domain/jobs";
 import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./domain/memory";
 import { embeddingStatus, reembedBank } from "./domain/embedding";
+import { rerankerStatus } from "./domain/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./domain/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./domain/pairing";
@@ -137,6 +138,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       });
       return json(result);
     }],
+    ["GET", /^\/api\/reranker\/status$/, () => json(rerankerStatus(config))],
     ["GET", /^\/api\/memory\/banks$/, () => {
       ensureDefaultBank(config.lane);
       return json(listBanks(config.lane));

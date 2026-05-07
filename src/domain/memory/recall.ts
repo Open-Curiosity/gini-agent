@@ -12,9 +12,12 @@
 //              range (Eqs. 13-14). Channel returns empty if the query has
 //              no temporal expression.
 //
-// Cross-encoder reranking is explicitly out of scope (per the brief); RRF
-// alone produces the final ordering. Token-budget filter packs candidates
-// in RRF order until budget runs out.
+// Cross-encoder reranking runs on the top-N RRF candidates before the
+// token-budget filter (Eq. 16). The reranker provider abstraction lives in
+// src/reranker.ts; default is a local Transformers.js cross-encoder
+// (Xenova/ms-marco-MiniLM-L-6-v2). Tail entries past the top-N keep their
+// RRF order — cross-encoder cost grows with candidates and tail items
+// rarely survive the token-budget pack anyway.
 //
 // Adapted from vectorize-io/hindsight (MIT). Channel-multiplier values and
 // the RRF k=60 default match the upstream reference implementation.
@@ -35,6 +38,7 @@ import {
   updateMemoryUnitStats
 } from "../../state";
 import { cosineSimilarity, getEmbeddingProvider } from "../../embeddings";
+import { getReranker, resolveRerankerChoice } from "../../reranker";
 import { parseTemporal, type TemporalRange } from "./temporal";
 
 export const RRF_K = 60;
@@ -109,17 +113,24 @@ export async function recall(config: RuntimeConfig, input: RecallInput): Promise
     temporal: temporalHits
   });
 
-  // 4. Pack to token budget.
+  // 4. Cross-encoder rerank — only the top-N. The tail keeps RRF order so
+  // a small cross-encoder isn't asked to score 100s of candidates that
+  // would never survive the token-budget pack anyway. Skipped when the
+  // active provider is `none`. If reranking throws (e.g. local model fails
+  // mid-call), fall through to RRF order — recall must always return.
+  const ordered = await applyReranker(config, input.query, fused);
+
+  // 5. Pack to token budget.
   const packed: RecallScoredUnit[] = [];
   let totalTokens = 0;
-  for (const candidate of fused) {
+  for (const candidate of ordered) {
     const cost = approxTokens(candidate.unit.text);
     if (totalTokens + cost > tokenBudget) continue;
     packed.push(candidate);
     totalTokens += cost;
   }
 
-  // 5. Bump usage counters for the units we actually surfaced.
+  // 6. Bump usage counters for the units we actually surfaced.
   const surfaceTime = new Date().toISOString();
   for (const entry of packed) {
     updateMemoryUnitStats(lane, entry.unit.id, { lastUsedAt: surfaceTime, bumpUsageCount: true });
@@ -431,6 +442,36 @@ function fuseRrf(channels: ChannelInput): RecallScoredUnit[] {
   const fused = [...scoreMap.values()];
   fused.sort((a, b) => b.score - a.score);
   return fused;
+}
+
+// --------------------------------------------------------------------------
+// Cross-encoder reranking (Eq. 16)
+// --------------------------------------------------------------------------
+
+async function applyReranker(
+  config: RuntimeConfig,
+  query: string,
+  fused: RecallScoredUnit[]
+): Promise<RecallScoredUnit[]> {
+  if (fused.length === 0) return fused;
+  const choice = resolveRerankerChoice(config);
+  if (choice.name === "none") return fused;
+  const head = fused.slice(0, choice.topN);
+  const tail = fused.slice(choice.topN);
+  const reranker = getReranker(config);
+  let scores: number[];
+  try {
+    scores = await reranker.score(query, head.map((entry) => entry.unit.text));
+  } catch {
+    // Reranker blew up mid-call; recall must always return. Pass through
+    // the existing RRF ordering so callers see a degraded-but-valid result.
+    return fused;
+  }
+  if (scores.length !== head.length) return fused;
+  const reranked = head
+    .map((entry, i) => ({ ...entry, score: scores[i] ?? entry.score }))
+    .sort((a, b) => b.score - a.score);
+  return [...reranked, ...tail];
 }
 
 // --------------------------------------------------------------------------

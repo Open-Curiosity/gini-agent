@@ -28,6 +28,9 @@ export function applyGlobalEnvOverrides(values: string[], ephemeral: boolean): v
     // and offline. The default provider is local; explicit echo keeps smoke
     // contractually unaffected by the default change.
     process.env.GINI_EMBEDDING_PROVIDER ??= "echo";
+    // Same constraint for the cross-encoder reranker. Smoke pins echo so
+    // CI never triggers the ~100MB cross-encoder download.
+    process.env.GINI_RERANKER_PROVIDER ??= "echo";
   }
 }
 
