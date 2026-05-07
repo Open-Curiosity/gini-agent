@@ -12,6 +12,7 @@ export function status(config: RuntimeConfig) {
     lane: config.lane,
     port: config.port,
     stateRoot: config.stateRoot,
+    workspaceRoot: config.workspaceRoot,
     pid: process.pid,
     taskCounts: taskCounts(state.tasks),
     pendingApprovals: state.approvals.filter((approval) => approval.status === "pending").length,

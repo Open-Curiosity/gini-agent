@@ -1063,6 +1063,7 @@ async function doctor(config: RuntimeConfig) {
     lane: config.lane,
     running,
     stateRoot: config.stateRoot,
+    workspaceRoot: config.workspaceRoot,
     port: config.port,
     web: { running: webPidAlive, pid: webPid ?? null, url: webHealthyUrl },
     tokenConfigured: Boolean(config.token),
