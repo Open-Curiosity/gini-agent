@@ -1,6 +1,8 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -11,8 +13,8 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
-import { useInvalidate, useTask, useTasks } from "@/lib/queries";
-import type { Task } from "@/lib/types";
+import { useChatSessions, useInvalidate, useState_, useTask, useTasks } from "@/lib/queries";
+import type { ChatSession, Task, TraceRecord } from "@/lib/types";
 
 const FILTERS = [
   { key: "active", label: "Active", match: (t: Task) => ["queued", "running", "waiting_approval"].includes(t.status) },
@@ -24,12 +26,24 @@ const FILTERS = [
 ] as const;
 
 export default function TasksPage() {
+  const params = useSearchParams();
+  // Honor ?id=<task-id> so other pages (e.g. Jobs "View trace") deep-link
+  // straight into a specific task. Falls back to "all" filter so the task
+  // is visible in the list panel.
+  const initial = params?.get("id") ?? null;
   const [input, setInput] = useState("");
-  const [filter, setFilter] = useState<typeof FILTERS[number]["key"]>("active");
-  const [selected, setSelected] = useState<string | null>(null);
+  const [filter, setFilter] = useState<typeof FILTERS[number]["key"]>(initial ? "all" : "active");
+  const [selected, setSelected] = useState<string | null>(initial);
   const tasks = useTasks();
   const detail = useTask(selected);
   const invalidate = useInvalidate();
+
+  useEffect(() => {
+    if (initial && initial !== selected) {
+      setSelected(initial);
+      setFilter("all");
+    }
+  }, [initial, selected]);
 
   const submit = useMutation({
     mutationFn: (text: string) => api<Task>("/tasks", { method: "POST", body: JSON.stringify({ input: text }) }),
@@ -129,7 +143,7 @@ export default function TasksPage() {
           {!selected ? (
             <EmptyState title="Select a task" description="Pick one from the list to see details and trace." />
           ) : detail.data ? (
-            <TaskDetail
+            <TaskDetailContainer
               data={detail.data}
               actionPending={action.isPending}
               onAction={(op) => action.mutate({ id: detail.data!.task.id, op })}
@@ -152,16 +166,54 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-function TaskDetail({
+function TaskDetailContainer({
   data,
   actionPending,
   onAction
 }: {
-  data: { task: Task; trace: unknown[] };
+  data: { task: Task; trace: TraceRecord[] };
   actionPending: boolean;
   onAction: (op: "retry" | "cancel") => void;
 }) {
+  // We need chatMessages + chatSessions to find the originating conversation.
+  // /state already includes both; we don't need a new endpoint. The query is
+  // already polling so this is cheap.
+  const state = useState_();
+  const chats = useChatSessions();
+  const linkedSession = useMemo<ChatSession | null>(() => {
+    const messages = state.data?.chatMessages ?? [];
+    const taskId = data.task.id;
+    // ChatMessageRecord stores singular taskId per message — find the message
+    // whose taskId matches, then resolve to its session via sessionId.
+    const message = messages.find((m) => m.taskId === taskId);
+    if (!message) return null;
+    return (chats.data ?? []).find((s) => s.id === message.sessionId) ?? null;
+  }, [state.data?.chatMessages, chats.data, data.task.id]);
+  return (
+    <TaskDetail
+      data={data}
+      actionPending={actionPending}
+      onAction={onAction}
+      linkedSession={linkedSession}
+    />
+  );
+}
+
+function TaskDetail({
+  data,
+  actionPending,
+  onAction,
+  linkedSession
+}: {
+  data: { task: Task; trace: TraceRecord[] };
+  actionPending: boolean;
+  onAction: (op: "retry" | "cancel") => void;
+  linkedSession: ChatSession | null;
+}) {
   const task = data.task;
+  const trace = data.trace;
+  const filesChanged = useMemo(() => extractFilesChanged(trace), [trace]);
+  const toolsUsed = useMemo(() => extractToolsUsed(trace), [trace]);
   return (
     <Card className="flex flex-1 flex-col overflow-hidden">
       <CardHeader>
@@ -188,6 +240,8 @@ function TaskDetail({
         <Tabs defaultValue="overview" className="flex h-full flex-col overflow-hidden">
           <TabsList className="self-start">
             <TabsTrigger value="overview">Overview</TabsTrigger>
+            <TabsTrigger value="timeline">Timeline</TabsTrigger>
+            <TabsTrigger value="files">Files</TabsTrigger>
             <TabsTrigger value="related">Related</TabsTrigger>
             <TabsTrigger value="trace">Trace</TabsTrigger>
           </TabsList>
@@ -237,6 +291,83 @@ function TaskDetail({
                     </div>
                   </Section>
                 ) : null}
+                {linkedSession ? (
+                  <Section title="Originated from chat">
+                    <Link
+                      href={`/chat?session=${linkedSession.id}`}
+                      className="inline-flex items-center gap-2 rounded-md border border-border bg-card/50 px-2 py-1 text-xs hover:bg-accent/50"
+                    >
+                      <span className="truncate">{linkedSession.title || "Untitled session"}</span>
+                      <span className="font-mono text-[10px] text-muted-foreground">{linkedSession.id}</span>
+                    </Link>
+                  </Section>
+                ) : null}
+              </div>
+            </ScrollArea>
+          </TabsContent>
+          <TabsContent value="timeline" className="flex-1 overflow-hidden">
+            <ScrollArea className="h-full pr-3">
+              <div className="space-y-2 pb-6">
+                {trace.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">No trace records yet.</p>
+                ) : (
+                  <ol className="space-y-1">
+                    {trace.map((record) => (
+                      <TimelineRow key={record.id} record={record} />
+                    ))}
+                  </ol>
+                )}
+              </div>
+            </ScrollArea>
+          </TabsContent>
+          <TabsContent value="files" className="flex-1 overflow-hidden">
+            <ScrollArea className="h-full pr-3">
+              <div className="space-y-3 pb-6">
+                <Section title={`Files changed (${filesChanged.length})`}>
+                  {filesChanged.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">No file writes or patches recorded.</p>
+                  ) : (
+                    <ul className="space-y-1">
+                      {filesChanged.map((entry, index) => (
+                        <li
+                          key={`${entry.path}-${index}`}
+                          className="flex items-center justify-between gap-2 rounded-md border border-border bg-card/50 px-2 py-1 font-mono text-[11px]"
+                        >
+                          <span className="truncate">{entry.path}</span>
+                          <span className={entry.kind === "patch" ? "text-amber-400" : "text-emerald-400"}>
+                            {entry.kind === "patch" ? "± patch" : "+ write"}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </Section>
+                <Section title={`Tools used (${toolsUsed.length})`}>
+                  {toolsUsed.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">No tools recorded.</p>
+                  ) : (
+                    <ul className="space-y-1">
+                      {toolsUsed.map((entry) => (
+                        <li
+                          key={entry.id}
+                          className="flex items-center justify-between gap-2 rounded-md border border-border bg-card/50 px-2 py-1 text-[11px]"
+                        >
+                          <span className="truncate">{entry.message}</span>
+                          {entry.target ? (
+                            <span className="font-mono text-[10px] text-muted-foreground truncate">{entry.target}</span>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </Section>
+                <Section title="Artifacts produced">
+                  {/* No artifact-typed trace records exist in the current runtime
+                      (TraceRecord.type does not include "artifact"). Surface as
+                      empty-state rather than fake data; v2 can add an artifact
+                      record type and this will populate. */}
+                  <p className="text-xs text-muted-foreground">No artifacts recorded.</p>
+                </Section>
               </div>
             </ScrollArea>
           </TabsContent>
@@ -281,6 +412,83 @@ function Field({ label, value, mono }: { label: string; value: string; mono?: bo
       <p className={`truncate ${mono ? "font-mono" : ""}`}>{value}</p>
     </div>
   );
+}
+
+function TimelineRow({ record }: { record: TraceRecord }) {
+  // Tone the bullet by record type so the timeline is scannable. Tools are
+  // green-ish (work happened), errors red, approvals amber, model/task neutral.
+  const tone =
+    record.type === "error"
+      ? "bg-red-500"
+      : record.type === "tool"
+        ? "bg-emerald-500"
+        : record.type === "approval"
+          ? "bg-amber-500"
+          : record.type === "memory"
+            ? "bg-blue-500"
+            : "bg-zinc-500";
+  const target = traceTarget(record);
+  return (
+    <li className="flex items-start gap-3 rounded-md border border-border bg-card/40 px-2 py-1.5">
+      <span className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${tone}`} aria-hidden />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="text-xs">
+            <span className="text-muted-foreground">[{record.type}]</span> {record.message}
+          </span>
+          <span className="font-mono text-[10px] text-muted-foreground shrink-0">
+            {new Date(record.at).toLocaleTimeString()}
+          </span>
+        </div>
+        {target ? (
+          <p className="truncate font-mono text-[11px] text-muted-foreground">{target}</p>
+        ) : null}
+      </div>
+    </li>
+  );
+}
+
+function traceTarget(record: TraceRecord): string | null {
+  const data = record.data ?? {};
+  // Pull the most-meaningful identifier from the trace data, depending on the
+  // tool that recorded it. Mirrors what src/agent.ts puts in `data`.
+  const candidates: Array<unknown> = [data.path, data.url, data.command, data.target, data.pattern, data.dir];
+  for (const value of candidates) {
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return null;
+}
+
+function extractFilesChanged(trace: TraceRecord[]): Array<{ path: string; kind: "write" | "patch" }> {
+  // The agent emits trace.type === "tool" with messages "File written" / "File
+  // patched" when an approval is granted (see src/agent.ts:438/462). We pick
+  // those out by message rather than tool-name (which isn't in `data`) — the
+  // path lives on `data.path`. De-dupe by path+kind to avoid double counting.
+  const seen = new Set<string>();
+  const out: Array<{ path: string; kind: "write" | "patch" }> = [];
+  for (const record of trace) {
+    if (record.type !== "tool") continue;
+    const path = typeof record.data?.path === "string" ? record.data.path : null;
+    if (!path) continue;
+    let kind: "write" | "patch" | null = null;
+    if (record.message === "File written") kind = "write";
+    else if (record.message === "File patched") kind = "patch";
+    if (!kind) continue;
+    const key = `${kind}:${path}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ path, kind });
+  }
+  return out;
+}
+
+function extractToolsUsed(trace: TraceRecord[]): Array<{ id: string; message: string; target: string | null }> {
+  // All trace records with type "tool" represent tool invocations the agent
+  // made. We surface message + first useful identifier so the user can see
+  // what happened without diving into raw JSON.
+  return trace
+    .filter((record) => record.type === "tool")
+    .map((record) => ({ id: record.id, message: record.message, target: traceTarget(record) }));
 }
 
 function IdList({ ids, hint }: { ids: string[]; hint: string }) {

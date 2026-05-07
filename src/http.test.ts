@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { createHandler } from "./http";
-import { readState } from "./state";
+import { appendEvent, mutateState, readState } from "./state";
 import type { RuntimeConfig } from "./types";
 
 describe("runtime api", () => {
@@ -324,6 +324,54 @@ describe("runtime api", () => {
     await reader?.cancel();
     const text = winner?.value ? new TextDecoder().decode(winner.value) : "";
     expect(text).toBe("");
+  });
+
+  test("SSE Last-Event-ID older than retained buffer still delivers retained events", async () => {
+    // Regression for R3-G1: when the client's Last-Event-ID has rolled out of
+    // the 1000-event ring buffer (long disconnect or burst), we must NOT
+    // silently pre-seed every retained event into `seen` — that would deliver
+    // nothing on reconnect and the client would never recover. Instead, treat
+    // the unknown id as "best effort" and ship the entire retained window.
+    const config = testConfig("events-stream-rollover");
+    const handler = createHandler(config);
+
+    // Generate more events than the ring buffer holds (1000), so a fabricated
+    // earlier id is guaranteed not to be retained.
+    mutateState(config.lane, (state) => {
+      for (let i = 0; i < 1100; i += 1) {
+        appendEvent(state, {
+          kind: "runtime",
+          action: "noop",
+          target: `target-${i}`,
+          risk: "low",
+          summary: `event ${i}`
+        });
+      }
+    });
+
+    // Construct a stale Last-Event-ID that mimics the ID format but isn't in
+    // the buffer. (The buffer holds the last 1000; this id is intentionally
+    // synthetic and won't match any retained event.)
+    const staleId = "event_rolled_out_of_buffer";
+
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/events/stream",
+      { headers: { "last-event-id": staleId } },
+      config.token
+    );
+    const reader = response.body?.getReader();
+    const winner = (await Promise.race([
+      reader?.read(),
+      new Promise((resolve) => setTimeout(() => resolve({ value: undefined, done: false }), 200))
+    ])) as { value?: Uint8Array; done?: boolean };
+    await reader?.cancel();
+    const text = winner?.value ? new TextDecoder().decode(winner.value) : "";
+
+    // Should have received the retained window, not silence.
+    expect(text).toContain("data:");
+    expect(text).toContain("event_");
   });
 
   test("supports local chat sessions backed by task execution and retry contracts", async () => {

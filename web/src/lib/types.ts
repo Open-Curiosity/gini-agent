@@ -8,6 +8,18 @@ export type ImprovementStatus = "proposed" | "approved" | "rejected" | "applied"
 export type ImprovementKind = "memory" | "skill" | "job";
 export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local";
 
+export type TraceType = "task" | "model" | "tool" | "approval" | "memory" | "job" | "connector" | "error";
+
+export interface TraceRecord {
+  id: string;
+  taskId: string;
+  lane: string;
+  at: string;
+  type: TraceType;
+  message: string;
+  data?: Record<string, unknown>;
+}
+
 export interface CostRecord {
   provider: string;
   model: string;

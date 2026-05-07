@@ -1,10 +1,14 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
@@ -128,7 +132,10 @@ function JobDetail({
             <CardTitle className="truncate text-base">{job.name}</CardTitle>
             <CardDescription className="font-mono text-[11px]">{job.id} · every {job.intervalSeconds}s</CardDescription>
           </div>
-          <StatusPill value={job.status} />
+          <div className="flex items-center gap-2">
+            <StatusPill value={job.status} />
+            <EditJobDialog job={job} />
+          </div>
         </div>
       </CardHeader>
       <CardContent className="flex-1 overflow-hidden">
@@ -179,6 +186,14 @@ function JobDetail({
                     <pre className="whitespace-pre-wrap text-xs text-red-400">{job.lastError}</pre>
                   </Section>
                 ) : null}
+                <Section title="Alerts (coming soon)">
+                  {/* Placeholder per master plan §5.7. No alert endpoints exist
+                      in the runtime yet, so we acknowledge the surface rather
+                      than fake controls — see context "R3-M2". */}
+                  <p className="text-xs text-muted-foreground">
+                    Per-job failure alerts will land alongside the notifications surface.
+                  </p>
+                </Section>
               </div>
             </ScrollArea>
           </TabsContent>
@@ -233,6 +248,14 @@ function RunList({
             </div>
             <div className="flex items-center gap-2">
               <StatusPill value={run.status} />
+              {run.taskId ? (
+                <Button asChild size="sm" variant="outline">
+                  {/* Tasks page (after R3-M1) renders a Timeline tab that
+                      surfaces logs/tools/files for each run. We deep-link to
+                      that page so reviewers can trace any run from here. */}
+                  <Link href={`/tasks?id=${run.taskId}`}>View trace</Link>
+                </Button>
+              ) : null}
               <Button size="sm" variant="outline" disabled={replayPending} onClick={() => onReplay(run.id)}>Replay</Button>
             </div>
           </div>
@@ -267,6 +290,127 @@ function RunTaskLink({ taskId }: { taskId: string }) {
       task {taskId}
       {task.data?.task?.status ? ` · ${task.data.task.status}` : ""}
     </p>
+  );
+}
+
+function EditJobDialog({ job }: { job: JobRecord }) {
+  const invalidate = useInvalidate();
+  const [open, setOpen] = useState(false);
+  // Per the brief: editable fields are schedule (intervalSeconds in the
+  // runtime), retryLimit, timeoutSeconds, costBudget, deliveryTargets[].
+  const [intervalSeconds, setIntervalSeconds] = useState(String(job.intervalSeconds));
+  const [retryLimit, setRetryLimit] = useState(String(job.retryLimit));
+  const [timeoutSeconds, setTimeoutSeconds] = useState(String(job.timeoutSeconds));
+  const [costBudget, setCostBudget] = useState(typeof job.costBudget === "number" ? String(job.costBudget) : "");
+  const [deliveryTargetsRaw, setDeliveryTargetsRaw] = useState((job.deliveryTargets ?? []).join(", "));
+
+  const update = useMutation({
+    mutationFn: (patch: Record<string, unknown>) =>
+      api<JobRecord>(`/jobs/${job.id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+    onSuccess: () => {
+      toast.success(`Job updated: ${job.id}`);
+      invalidate(["jobs", "events"]);
+      setOpen(false);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  function submit() {
+    const patch: Record<string, unknown> = {};
+    const interval = Number(intervalSeconds);
+    if (Number.isFinite(interval) && interval > 0) patch.intervalSeconds = interval;
+    const retry = Number(retryLimit);
+    if (Number.isFinite(retry) && retry >= 0) patch.retryLimit = retry;
+    const timeout = Number(timeoutSeconds);
+    if (Number.isFinite(timeout) && timeout > 0) patch.timeoutSeconds = timeout;
+    if (costBudget.trim() === "") {
+      // empty string means "leave unset"; runtime updateJob ignores undefined
+    } else {
+      const budget = Number(costBudget);
+      if (Number.isFinite(budget) && budget >= 0) patch.costBudget = budget;
+    }
+    const targets = deliveryTargetsRaw
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    patch.deliveryTargets = targets;
+    update.mutate(patch);
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button size="sm" variant="outline">Edit</Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Edit job</DialogTitle>
+          <DialogDescription className="font-mono text-[11px]">{job.id}</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-3">
+          <div className="grid gap-1.5">
+            <Label htmlFor="job-interval">Schedule (interval seconds)</Label>
+            <Input
+              id="job-interval"
+              type="number"
+              min={1}
+              value={intervalSeconds}
+              onChange={(event) => setIntervalSeconds(event.target.value)}
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="grid gap-1.5">
+              <Label htmlFor="job-retry">Retry limit</Label>
+              <Input
+                id="job-retry"
+                type="number"
+                min={0}
+                value={retryLimit}
+                onChange={(event) => setRetryLimit(event.target.value)}
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="job-timeout">Timeout (seconds)</Label>
+              <Input
+                id="job-timeout"
+                type="number"
+                min={1}
+                value={timeoutSeconds}
+                onChange={(event) => setTimeoutSeconds(event.target.value)}
+              />
+            </div>
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="job-budget">Cost budget (USD)</Label>
+            <Input
+              id="job-budget"
+              type="number"
+              min={0}
+              step="0.01"
+              placeholder="—"
+              value={costBudget}
+              onChange={(event) => setCostBudget(event.target.value)}
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="job-targets">Delivery targets</Label>
+            <Input
+              id="job-targets"
+              placeholder="local, slack-bridge"
+              value={deliveryTargetsRaw}
+              onChange={(event) => setDeliveryTargetsRaw(event.target.value)}
+            />
+            <p className="text-[10px] text-muted-foreground">Comma-separated.</p>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => setOpen(false)} disabled={update.isPending}>Cancel</Button>
+          <Button onClick={submit} disabled={update.isPending}>
+            {update.isPending ? "Saving…" : "Save"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

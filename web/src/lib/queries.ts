@@ -16,6 +16,7 @@ import type {
   RuntimeStatus,
   SkillRecord,
   Task,
+  TraceRecord,
   AuditEvent
 } from "@/lib/types";
 
@@ -47,9 +48,9 @@ export function useTasks(options?: Partial<UseQueryOptions<Task[]>>) {
 }
 
 export function useTask(id: string | null) {
-  return useQuery<{ task: Task; trace: unknown[] }>({
+  return useQuery<{ task: Task; trace: TraceRecord[] }>({
     queryKey: ["task", id],
-    queryFn: () => api<{ task: Task; trace: unknown[] }>(`/tasks/${id}`),
+    queryFn: () => api<{ task: Task; trace: TraceRecord[] }>(`/tasks/${id}`),
     enabled: Boolean(id),
     refetchInterval: 3000
   });

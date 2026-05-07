@@ -208,16 +208,27 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
   const stream = new ReadableStream({
     start(controller) {
       const seen = new Set<string>();
-      // Pre-seed `seen` with everything up to and including the last delivered
-      // id so the first send() after reconnection only emits genuinely new
-      // events. The events list is append-only by id; we walk it in order
-      // (oldest-first, same direction as `send` below) to find the cutoff.
+      // Pre-seed `seen` with events up to and including the last delivered id
+      // so the first send() after reconnection only emits genuinely new events.
+      // The events list is append-only by id; we walk it in order (oldest-first,
+      // same direction as `send` below) to find the cutoff.
+      //
+      // CRITICAL: only pre-seed if the cutoff id is actually present in the
+      // retained buffer. The buffer is capped at 1000 events; if the client's
+      // Last-Event-ID is older than that (long disconnect or bursty event
+      // generation), naively seeding everything would silently drop the entire
+      // retained window. When the cutoff isn't found, behave as if no
+      // Last-Event-ID was supplied — send everything currently retained.
       if (lastEventId) {
         const ordered = readState(config.lane).events.slice().reverse();
-        for (const event of ordered) {
-          seen.add(event.id);
-          if (event.id === lastEventId) break;
+        const cutoff = ordered.findIndex((event) => event.id === lastEventId);
+        if (cutoff >= 0) {
+          for (let index = 0; index <= cutoff; index += 1) {
+            seen.add(ordered[index]!.id);
+          }
         }
+        // cutoff < 0: id rolled out of the ring buffer; leave `seen` empty so
+        // the client receives the full retained window (best effort recovery).
       }
       const send = () => {
         if (closed) return;

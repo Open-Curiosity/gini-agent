@@ -234,8 +234,15 @@ async function existingWebUrl(config: RuntimeConfig): Promise<string | null> {
     try {
       const response = await fetch(`${candidateUrl}/api/runtime/__healthz`, { redirect: "manual" });
       if (!response.ok) continue;
-      const body = (await response.json().catch(() => null)) as { ok?: boolean; service?: string } | null;
-      if (body && body.ok === true && body.service === "gini-web") return candidateUrl;
+      const body = (await response.json().catch(() => null)) as { ok?: boolean; service?: string; lane?: string } | null;
+      // Lane match is required: the healthz route returns the lane the web
+      // process was spawned for. Without this check, a different lane's web
+      // (or a stray Gini web from a previous session) is treated as healthy
+      // for THIS lane — which leads to "running" banners that point at the
+      // wrong runtime.
+      if (body && body.ok === true && body.service === "gini-web" && body.lane === config.lane) {
+        return candidateUrl;
+      }
     } catch { /* try next port */ }
   }
   // Pid is alive but nothing healthy on the expected ports — treat as stale.
@@ -288,7 +295,7 @@ async function startWeb(config: RuntimeConfig): Promise<{ webUrl: string }> {
   }
   const webUrl = `http://127.0.0.1:${port}`;
   try {
-    await waitForWebHealthz(webUrl, child.pid);
+    await waitForWebHealthz(webUrl, child.pid, config.lane);
     return { webUrl };
   } catch (error) {
     // Kill the child group so we don't leak processes on failure.
@@ -315,8 +322,9 @@ async function startWeb(config: RuntimeConfig): Promise<{ webUrl: string }> {
  * alive — that combination tells us "the server we spawned is the one
  * answering on this port".
  */
-async function waitForWebHealthz(webUrl: string, childPid: number | undefined): Promise<void> {
+async function waitForWebHealthz(webUrl: string, childPid: number | undefined, expectedLane: string): Promise<void> {
   const deadline = Date.now() + 30_000;
+  let sawLaneMismatch = false;
   while (Date.now() < deadline) {
     if (childPid !== undefined && !processAlive(childPid)) {
       throw new Error(`Next.js process exited before becoming healthy. webUrl=${webUrl}`);
@@ -324,11 +332,22 @@ async function waitForWebHealthz(webUrl: string, childPid: number | undefined): 
     try {
       const response = await fetch(`${webUrl}/api/runtime/__healthz`, { redirect: "manual" });
       if (response.ok) {
-        const body = await response.json().catch(() => null) as { ok?: boolean; service?: string } | null;
-        if (body && body.ok === true && body.service === "gini-web") return;
+        const body = await response.json().catch(() => null) as { ok?: boolean; service?: string; lane?: string } | null;
+        if (body && body.ok === true && body.service === "gini-web") {
+          // Lane must match the lane we spawned the child with. Mismatch means
+          // we're talking to a different Gini web (different lane on the same
+          // port — e.g. user has lane A's web running and started lane B that
+          // bound to a port we then probed). Reject and keep waiting in case
+          // the spawned child is still coming up.
+          if (body.lane === expectedLane) return;
+          sawLaneMismatch = true;
+        }
       }
     } catch { /* keep waiting */ }
     await Bun.sleep(250);
+  }
+  if (sawLaneMismatch) {
+    throw new Error(`Next.js healthz on ${webUrl} reports a different lane than expected (${expectedLane}). Another Gini web is using this port.`);
   }
   throw new Error(`Next.js did not become healthy within 30s on ${webUrl}.`);
 }

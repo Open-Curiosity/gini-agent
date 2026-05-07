@@ -1,5 +1,6 @@
 "use client";
 
+import { useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -16,11 +17,20 @@ import type { ChatMessage, ChatSession, Task } from "@/lib/types";
 
 export default function ChatPage() {
   const sessions = useChatSessions();
-  const [selected, setSelected] = useState<string | null>(null);
+  const params = useSearchParams();
+  // Honor ?session=<id> so other pages (e.g. Tasks "Originated from chat")
+  // can deep-link to a specific conversation.
+  const initial = params?.get("session") ?? null;
+  const [selected, setSelected] = useState<string | null>(initial);
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
   const session = useChatSession(selected);
   const invalidate = useInvalidate();
+
+  // If the URL changes to point at a different session, follow it.
+  useEffect(() => {
+    if (initial && initial !== selected) setSelected(initial);
+  }, [initial, selected]);
 
   useEffect(() => {
     if (!selected && sessions.data && sessions.data.length > 0) setSelected(sessions.data[0].id);

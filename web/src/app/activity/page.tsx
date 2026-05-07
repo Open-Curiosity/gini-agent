@@ -220,6 +220,7 @@ function FilterRow({
           <button
             key={option}
             type="button"
+            aria-pressed={active}
             onClick={() => toggle(option)}
             className={cn(
               "rounded-md border px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide transition-colors",
