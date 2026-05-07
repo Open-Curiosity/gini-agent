@@ -6,7 +6,7 @@ import { readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./domain/views";
 import { checkConnector } from "./domain/connectors";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./domain/jobs";
-import { archiveMemory, createMemoryFromInput, editMemory, retain, updateMemory } from "./domain/memory";
+import { archiveMemory, createMemoryFromInput, editMemory, recall, retain, updateMemory } from "./domain/memory";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./domain/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./domain/pairing";
@@ -58,6 +58,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/memory$/, () => json(readState(config.lane).memories)],
     ["POST", /^\/api\/memory$/, async (request) => {
       return json(await createMemoryFromInput(config, await body(request)), 201);
+    }],
+    // Hindsight phase 3: recall pipeline.
+    ["POST", /^\/api\/memory\/recall$/, async (request) => {
+      const payload = await body(request);
+      const query = String(payload.query ?? "").trim();
+      if (!query) return json({ error: "query is required" }, 400);
+      const networkRaw = Array.isArray(payload.network) ? payload.network : undefined;
+      const networks = networkRaw
+        ? networkRaw.filter((value): value is Network => value === "world" || value === "experience" || value === "opinion" || value === "observation")
+        : undefined;
+      const result = await recall(config, {
+        query,
+        bankId: typeof payload.bankId === "string" ? payload.bankId : undefined,
+        tokenBudget: typeof payload.tokenBudget === "number" ? payload.tokenBudget : undefined,
+        network: networks && networks.length > 0 ? networks : undefined,
+        sourceTaskId: typeof payload.sourceTaskId === "string" ? payload.sourceTaskId : undefined
+      });
+      return json(result);
     }],
     // Hindsight phase 2: retain pipeline. Specific routes come before the
     // catch-all /api/memory/:id pattern below.

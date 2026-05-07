@@ -15,3 +15,6 @@ export {
 
 export { retain } from "./retain";
 export type { RetainInput, RetainOutput } from "./retain";
+
+export { recall } from "./recall";
+export type { RecallInput, RecallOutput, RecallScoredUnit, RecallChannel } from "./recall";
