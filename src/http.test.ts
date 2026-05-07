@@ -615,7 +615,12 @@ function testConfig(lane: string): RuntimeConfig {
 }
 
 async function waitForTask(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, taskId: string) {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  // Phase 5 added auto-recall + auto-retain to runTask. The retain side is
+  // fire-and-forget so it can't block, but the inline recall + a few extra
+  // mutateState audits push runTask completion past the original 500ms
+  // budget on slower hosts. A 200-iteration / 10ms loop = 2s ceiling is
+  // still well under any reasonable test timeout.
+  for (let attempt = 0; attempt < 200; attempt += 1) {
     const detail = await call(handler, config, `/api/tasks/${taskId}`);
     if (["completed", "failed", "waiting_approval"].includes(detail.task.status)) return detail;
     await Bun.sleep(10);

@@ -12,6 +12,7 @@ import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useInvalidate, useMemories } from "@/lib/queries";
 import type { MemoryRecord } from "@runtime/types";
+import { HindsightPanel } from "./_components/HindsightPanel";
 
 const SCOPES = ["all", "user", "project", "device", "temporary"] as const;
 
@@ -60,7 +61,16 @@ export default function MemoryPage() {
   return (
     <>
       <PageHeader title="Memory" description="Approve, reject, archive memories with provenance" />
-      <div className="flex-1 space-y-4 overflow-auto p-6">
+      <div className="flex-1 space-y-6 overflow-auto p-6">
+        <HindsightPanel />
+
+        <header>
+          <h2 className="text-lg font-semibold">Legacy memories</h2>
+          <p className="text-xs text-muted-foreground">
+            User-curated MemoryRecord rows. These will be migrated into the Hindsight store in a future release.
+          </p>
+        </header>
+
         <Card>
           <CardHeader>
             <CardTitle className="text-sm">Add memory</CardTitle>

@@ -74,6 +74,28 @@ export function useMemories() {
   });
 }
 
+import type { HindsightUnitView, HindsightBankView } from "@/lib/view-types";
+
+export function useHindsightUnits(network: string = "all") {
+  return useQuery<HindsightUnitView[]>({
+    queryKey: ["memory", "hindsight", network],
+    queryFn: () => {
+      const params = new URLSearchParams({ bank: "bank_default", limit: "200" });
+      if (network !== "all") params.set("network", network);
+      return api<HindsightUnitView[]>(`/memory/units?${params.toString()}`);
+    },
+    refetchInterval: 5000
+  });
+}
+
+export function useHindsightBanks() {
+  return useQuery<HindsightBankView[]>({
+    queryKey: ["memory", "banks"],
+    queryFn: () => api<HindsightBankView[]>("/memory/banks"),
+    refetchInterval: 10_000
+  });
+}
+
 export function useSkills(query?: string) {
   const trimmed = query?.trim() ?? "";
   return useQuery<SkillRecord[]>({

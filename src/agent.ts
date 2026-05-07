@@ -29,6 +29,7 @@ import { listFiles, readFile, requestFilePatch, requestFileWrite, searchFiles } 
 import { fetchWeb } from "./tools/web";
 import { requestShell } from "./tools/terminal";
 import { requestCodeExecution } from "./tools/code";
+import { recall, retain } from "./domain/memory";
 
 export async function submitTask(config: RuntimeConfig, input: string, jobId?: string, parentTaskId?: string, subagentId?: string): Promise<Task> {
   const created = createTask(config.lane, input, jobId, parentTaskId, subagentId);
@@ -115,7 +116,31 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
 
   // No tool matched: fall through to provider summarization.
   const activeMemory = await mutateState(config.lane, (state) => state.memories.filter((memory) => memory.status === "active"));
-  const providerResult = await generateTaskSummary(config, task.input, activeMemory);
+
+  // Hindsight phase 5: auto-recall. Pull relevant facts/opinions from the
+  // four-network store and inject as additional context. Best-effort — if
+  // recall fails (e.g. embedding provider unavailable), continue with the
+  // legacy MemoryRecord injection only.
+  let augmentedInput = task.input;
+  let hindsightUnitsRecalled = 0;
+  try {
+    const recalled = await recall(config, { query: task.input, tokenBudget: 1500, sourceTaskId: taskId });
+    if (recalled.units.length > 0) {
+      hindsightUnitsRecalled = recalled.units.length;
+      const block = recalled.units
+        .map((entry, idx) => `${idx + 1}. (${entry.unit.network}) ${entry.unit.text}`)
+        .join("\n");
+      augmentedInput = `${task.input}\n\nRecalled memory:\n${block}`;
+    }
+  } catch (error) {
+    appendTrace(config.lane, taskId, {
+      type: "memory",
+      message: "auto-recall failed",
+      data: { error: error instanceof Error ? error.message : String(error) }
+    });
+  }
+
+  const providerResult = await generateTaskSummary(config, augmentedInput, activeMemory);
   appendTrace(config.lane, taskId, {
     type: "model",
     message: `${providerResult.provider.name} provider generated response`,
@@ -123,7 +148,8 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
       provider: providerResult.provider,
       responseId: providerResult.responseId,
       usage: providerResult.usage,
-      memoryUsed: activeMemory.map((memory) => memory.id)
+      memoryUsed: activeMemory.map((memory) => memory.id),
+      hindsightUnitsRecalled
     }
   });
 
@@ -161,7 +187,45 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   });
 
   appendTrace(config.lane, taskId, { type: "task", message: "Task completed", data: { summary: task.summary } });
+
+  // Hindsight phase 5: auto-retain. Run async and don't block task
+  // completion. Skip trivial inputs (low information content) to keep cost
+  // sensible. Best-effort: log but don't fail.
+  void scheduleAutoRetain(config, task);
+
   return task;
+}
+
+const AUTO_RETAIN_MIN_INPUT_CHARS = 32;
+
+function shouldAutoRetain(task: Task): boolean {
+  const lower = task.input.toLowerCase();
+  if (task.input.trim().length < AUTO_RETAIN_MIN_INPUT_CHARS) return false;
+  // Read-only / low-risk tool calls don't need to be retained as facts.
+  if (lower.startsWith("read ") || lower.startsWith("list ") || lower.startsWith("find ")) return false;
+  return true;
+}
+
+function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
+  if (!shouldAutoRetain(task)) return;
+  const text = task.summary
+    ? `Task input: ${task.input}\n\nTask summary: ${task.summary}`
+    : `Task input: ${task.input}`;
+  retain(config, { text, sourceTaskId: task.id })
+    .then((result) => {
+      appendTrace(config.lane, task.id, {
+        type: "memory",
+        message: "auto-retain completed",
+        data: { units: result.units.length, links: result.links.length }
+      });
+    })
+    .catch((error) => {
+      appendTrace(config.lane, task.id, {
+        type: "memory",
+        message: "auto-retain failed",
+        data: { error: error instanceof Error ? error.message : String(error) }
+      });
+    });
 }
 
 export async function failTask(config: RuntimeConfig, taskId: string, error: unknown): Promise<void> {
@@ -195,7 +259,7 @@ export async function completeLowRiskToolTask(
   target: string,
   evidence: Record<string, unknown>
 ): Promise<Task> {
-  return mutateState(config.lane, (state) => {
+  const completed = await mutateState(config.lane, (state) => {
     const task = findTask(state, taskId);
     addAudit(state, {
       actor: "runtime",
@@ -212,6 +276,9 @@ export async function completeLowRiskToolTask(
     upsertTask(state, task);
     return task;
   });
+  // Hindsight phase 5: auto-retain. Skip read/list/find — they're noise.
+  void scheduleAutoRetain(config, completed);
+  return completed;
 }
 
 export async function decideApproval(config: RuntimeConfig, approvalId: string, decision: "approve" | "deny"): Promise<Approval> {
