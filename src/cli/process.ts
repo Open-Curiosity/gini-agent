@@ -14,6 +14,7 @@ import type { RuntimeConfig } from "../types";
 import { install, status } from "../domain/runtime";
 import { providerHealth } from "../provider";
 import { readState } from "../state";
+import { probeMemoryDb } from "../state/memory-db";
 import { pidPath, projectRoot } from "../paths";
 import { api, auth, url } from "./api";
 
@@ -318,6 +319,10 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
   const recommendations: string[] = [];
   if (!running) recommendations.push("Run `bun run gini start` to launch the local runtime.");
   if (running && !webHealthyUrl && !options.noWeb) recommendations.push("Next.js control plane not healthy — re-run `gini start` to relaunch.");
+  // Probe the per-lane SQLite memory store. Phase 1 surfaces row counts so a
+  // user (or `gini doctor` consumer) can confirm the schema is in place; phases
+  // 2+ will add retain/recall metrics on top of the same probe.
+  const memory = probeMemoryDb(config.lane);
   return {
     ok: true,
     bun: Bun.version,
@@ -331,6 +336,7 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
     provider: providerHealth(config),
     tasks: state.tasks.length,
     pendingApprovals: state.approvals.filter((item) => item.status === "pending").length,
+    memory,
     recommendations
   };
 }
