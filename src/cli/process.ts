@@ -16,6 +16,7 @@ import { providerHealth } from "../provider";
 import { readState } from "../state";
 import { probeMemoryDb } from "../state/memory-db";
 import { legacyMigrationStatus } from "../domain/memory";
+import { embeddingStatus, listBanksWithModelMismatch } from "../domain/embedding";
 import { pidPath, projectRoot } from "../paths";
 import { api, auth, url } from "./api";
 
@@ -331,6 +332,17 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
   if (legacyMigration.pending > 0) {
     recommendations.push(`${legacyMigration.pending} legacy memory rows are not yet migrated. Run \`gini memory migrate\`.`);
   }
+  // Embedding-provider snapshot. Surfaces the active provider/model + cache
+  // size, and warns if any active unit is embedded with a model other than
+  // the current provider's model (recall's semantic channel skips those).
+  const embedding = embeddingStatus(config);
+  const mismatches = listBanksWithModelMismatch(config);
+  if (mismatches.length > 0) {
+    const banks = [...new Set(mismatches.map((m) => m.bankId))].join(", ");
+    recommendations.push(
+      `Some banks (${banks}) have units embedded with a different model than the active provider (${embedding.provider.model}). Run \`gini embedding reembed --bank <id>\` to refresh.`
+    );
+  }
   return {
     ok: true,
     bun: Bun.version,
@@ -346,6 +358,7 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
     pendingApprovals: state.approvals.filter((item) => item.status === "pending").length,
     memory,
     legacyMigration,
+    embedding,
     recommendations
   };
 }

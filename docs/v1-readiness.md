@@ -33,6 +33,7 @@ bun run gini evidence
 | CLI task workflow | `gini task submit/list/show/retry/cancel` |
 | Local chat/session history | `gini chat new/send/sync/show/list`, `/api/chat` |
 | Persistent memory | `gini memory list/add/edit/approve/reject/archive`, `/api/memory` |
+| Embeddings | In-process Transformers.js (`Xenova/all-MiniLM-L6-v2`, 384d) by default; OpenAI / echo are opt-in. `gini embedding status`, `gini embedding reembed [--bank ID] [--dry-run]`, `/api/embedding/{status,reembed}`. Cache lives at `~/.gini/models/`. Override via `GINI_EMBEDDING_PROVIDER=local\|openai\|echo` and `GINI_LOCAL_EMBEDDING_MODEL=<hf-id>`. |
 | Skills/procedures | `gini skills list/add/show/search/validate/test/trust/disable/rollback`, `/api/skills` |
 | Session search | `gini search <query>`, `/api/search` with task/trace/memory/skill/audit citations |
 | Jobs/cron | `gini jobs list/add/run/pause/resume/remove/runs/replay`, prompt and script jobs |
@@ -61,6 +62,7 @@ V1 intentionally does not build the iOS/Expo app or production remote relay. It 
 - `/api/chat`
 - `/api/approvals`
 - `/api/memory`
+- `/api/embedding/status`, `/api/embedding/reembed`
 - `/api/skills`
 - `/api/jobs`
 - `/api/messaging`
@@ -68,6 +70,18 @@ V1 intentionally does not build the iOS/Expo app or production remote relay. It 
 - `/api/readiness/v1`
 
 V2 starts from this runtime foundation and adds the native mobile app, paired-device auth as product UX, remote relay/push, stronger production/sandbox promotion, and deeper long-running operational hardening.
+
+## Embeddings
+
+Hindsight phase 2+ embeds memory units when retaining facts and embeds the query when recalling. As of `Default to in-process local embeddings`, the runtime ships with three providers:
+
+- `local` (default) — `@huggingface/transformers` running ONNX in-process. Default model `Xenova/all-MiniLM-L6-v2` (~25MB, 384d). Lazy-loaded the first time a retain/recall actually needs an embedding so users on `openai` or `echo` never pay the native-binding cost. Override the model via `GINI_LOCAL_EMBEDDING_MODEL=<hf-id>` (e.g. `Xenova/bge-small-en-v1.5`). Cache at `~/.gini/models/`.
+- `openai` — `text-embedding-3-small` over the same OpenAI bearer / Codex OAuth resolution as the chat provider. Opt-in via `GINI_EMBEDDING_PROVIDER=openai`.
+- `echo` — deterministic 32-d hash, used by tests and by `gini smoke`. Opt-in via `GINI_EMBEDDING_PROVIDER=echo`.
+
+Different models live in different vector spaces, so `recall`'s semantic channel filters memory units to those whose `embedding_model` equals the active provider's model. Switching providers leaves prior units in the bank; they remain BM25/graph/temporal-reachable but invisible to semantic recall until you run `gini embedding reembed [--bank ID]`. `gini doctor` and `gini embedding status` surface model mixing.
+
+`gini smoke` pins `GINI_EMBEDDING_PROVIDER=echo` so CI never triggers a model download.
 
 ## Next.js Control Plane
 

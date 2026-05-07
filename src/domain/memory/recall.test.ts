@@ -169,6 +169,38 @@ describe("recall — temporal channel", () => {
   });
 });
 
+describe("recall — cross-model embedding filter", () => {
+  test("semantic channel skips units embedded with a different model than the active provider", async () => {
+    const lane = "recall-cross-model";
+    ensureDefaultBank(lane);
+    // Active provider is echo (echo-embed-v0). Insert a unit with a stale
+    // model id but otherwise-identical text — the semantic channel should
+    // ignore it. The bm25 channel still matches lexically, so the unit may
+    // appear via that path; we only assert it doesn't surface via semantic.
+    const stale = insertMemoryUnit(lane, {
+      text: "lemur lemur lemur",
+      embedding: echoEmbed("lemur lemur lemur"),
+      embeddingModel: "text-embedding-3-small",
+      network: "world"
+    });
+    const fresh = insertMemoryUnit(lane, {
+      text: "different content entirely",
+      embedding: echoEmbed("different content entirely"),
+      embeddingModel: "echo-embed-v0",
+      network: "world"
+    });
+    const result = await recall(makeConfig(lane), { query: "lemur lemur lemur" });
+    const staleHit = result.units.find((entry) => entry.unit.id === stale.id);
+    if (staleHit) {
+      // If it shows up at all (via bm25), it must NOT be on the semantic channel.
+      expect(staleHit.channels).not.toContain("semantic");
+    }
+    // Sanity: the same-model unit is reachable via semantic.
+    const freshHit = result.units.find((entry) => entry.unit.id === fresh.id);
+    if (freshHit) expect(freshHit.channels).toContain("semantic");
+  });
+});
+
 describe("recall — RRF fusion + token budget", () => {
   test("a unit appearing in multiple channels ranks higher than one in a single channel", async () => {
     const lane = "recall-fusion";

@@ -645,6 +645,64 @@ export interface NetworkCounts {
   observation: number;
 }
 
+// Per-bank histogram of embedding_model -> active unit count. Used by
+// `gini embedding status` and `gini doctor` to surface model mixing — a
+// bank with units across multiple models has stale vectors that semantic
+// recall will skip until reembedded.
+export interface EmbeddingModelCount {
+  bankId: string;
+  embeddingModel: string | null;
+  count: number;
+}
+
+export function countUnitsByEmbeddingModel(lane: Lane, bankId?: string): EmbeddingModelCount[] {
+  const db = getMemoryDb(lane);
+  const rows = bankId
+    ? db
+        .query<{ bank_id: string; embedding_model: string | null; c: number }, [string]>(
+          `SELECT bank_id, embedding_model, COUNT(*) AS c
+           FROM memory_units
+           WHERE status = 'active' AND bank_id = ?
+           GROUP BY bank_id, embedding_model
+           ORDER BY bank_id, c DESC`
+        )
+        .all(bankId)
+    : db
+        .query<{ bank_id: string; embedding_model: string | null; c: number }, []>(
+          `SELECT bank_id, embedding_model, COUNT(*) AS c
+           FROM memory_units
+           WHERE status = 'active'
+           GROUP BY bank_id, embedding_model
+           ORDER BY bank_id, c DESC`
+        )
+        .all();
+  return rows.map((row) => ({ bankId: row.bank_id, embeddingModel: row.embedding_model, count: row.c }));
+}
+
+// Update the embedding/embedding_dim/embedding_model triple for an existing
+// unit. Used by the reembed CLI to swap vectors after a provider change.
+// Pass null/null/null to clear (e.g. for migration). updated_at is bumped.
+export function updateMemoryUnitEmbedding(
+  lane: Lane,
+  unitId: string,
+  embedding: Float32Array | null,
+  embeddingModel: string | null
+): void {
+  const db = getMemoryDb(lane);
+  db.run(
+    `UPDATE memory_units
+     SET embedding = ?, embedding_dim = ?, embedding_model = ?, updated_at = ?
+     WHERE id = ?`,
+    [
+      embedding ? serializeEmbedding(embedding) : null,
+      embedding ? embedding.length : null,
+      embeddingModel,
+      now(),
+      unitId
+    ]
+  );
+}
+
 export function countByNetwork(lane: Lane): NetworkCounts {
   const db = getMemoryDb(lane);
   const counts: NetworkCounts = { world: 0, experience: 0, opinion: 0, observation: 0 };

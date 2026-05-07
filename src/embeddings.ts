@@ -1,21 +1,36 @@
-// Hindsight phase 2 — embedding provider abstraction.
+// Embedding provider abstraction.
 //
-// Two implementations:
+// Three implementations:
+//   - local:  in-process Transformers.js (ONNX), default model
+//             Xenova/all-MiniLM-L6-v2 (384d). Pure JS + native onnxruntime;
+//             no external service. Lazy-imports `@huggingface/transformers`
+//             only on first use so users on openai/echo never pay the
+//             native-binding load cost.
 //   - openai: text-embedding-3-small (dim=1536), batched up to 100 inputs.
 //             Reuses the same bearer-token resolution as src/provider.ts so
 //             both OPENAI_API_KEY and Codex OAuth tokens work.
 //   - echo:   deterministic hash-based 32-dim vector. Identical input always
 //             produces an identical vector — what tests need.
 //
-// Selection: env GINI_EMBEDDING_PROVIDER pins the choice; otherwise default
-// to "openai" when an OpenAI-style key is available, else "echo".
+// Selection priority (per the local-embeddings brief):
+//   1. GINI_EMBEDDING_PROVIDER env (explicit override) — local|openai|echo
+//   2. local (lazy-init; if Transformers.js fails to import or load, fall
+//      through with a one-line stderr warning)
+//   3. openai (if a bearer is reachable)
+//   4. echo
+//
+// Different providers/models live in different vector spaces — cosine across
+// them is meaningless. The `embedding_model` column on memory_units lets
+// recall.ts filter to vectors emitted by the current provider's model. The
+// `gini embedding reembed` CLI walks units and re-embeds them with the
+// active provider so semantic recall picks them up after a provider switch.
 //
 // In-process cache keyed by (model, text) avoids re-embedding the same
 // string twice within a single CLI/runtime process — retain-then-recall in
 // the same process commonly hits the same query, and the cache shaves a
 // network round-trip without persistence concerns.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { RuntimeConfig } from "./types";
@@ -26,6 +41,11 @@ const DEFAULT_OPENAI_EMBEDDING_DIM = 1536;
 const ECHO_DIM = 32;
 const DEFAULT_BATCH_SIZE = 100;
 
+// Default local model — small (~25MB), 384d, fast on M-series. Override with
+// GINI_LOCAL_EMBEDDING_MODEL for a bigger/different SBERT-style encoder.
+export const DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
+export const DEFAULT_LOCAL_EMBEDDING_DIM = 384;
+
 export interface EmbeddingProvider {
   name: string;
   model: string;
@@ -33,16 +53,185 @@ export interface EmbeddingProvider {
   embed(texts: string[]): Promise<Float32Array[]>;
 }
 
-export function getEmbeddingProvider(config: RuntimeConfig): EmbeddingProvider {
-  const choice = (process.env.GINI_EMBEDDING_PROVIDER ?? "").toLowerCase();
-  if (choice === "echo") return echoProvider();
-  if (choice === "openai") return openaiProvider(config);
+export type EmbeddingProviderName = "local" | "openai" | "echo";
 
-  // Auto-select: prefer openai if a key is reachable, otherwise echo.
+// What `gini embedding status` and `gini doctor` need to know without
+// instantiating anything heavyweight. Computed via resolveEmbeddingChoice.
+export interface EmbeddingChoice {
+  name: EmbeddingProviderName;
+  model: string;
+  reason: "explicit" | "default" | "fallback-openai" | "fallback-echo";
+  cacheDir?: string;
+}
+
+export function localCacheDir(): string {
+  return join(homedir(), ".gini", "models");
+}
+
+// Pure-data view of the configured embedding choice. Doesn't trigger a
+// model download; the caller must call `getEmbeddingProvider()` for that.
+export function resolveEmbeddingChoice(config: RuntimeConfig): EmbeddingChoice {
+  const explicit = (process.env.GINI_EMBEDDING_PROVIDER ?? "").toLowerCase();
+  if (explicit === "local") {
+    return {
+      name: "local",
+      model: localModelId(),
+      reason: "explicit",
+      cacheDir: localCacheDir()
+    };
+  }
+  if (explicit === "openai") {
+    return { name: "openai", model: DEFAULT_OPENAI_EMBEDDING_MODEL, reason: "explicit" };
+  }
+  if (explicit === "echo") {
+    return { name: "echo", model: "echo-embed-v0", reason: "explicit" };
+  }
+  // Default is local. The hard-rule from the brief: "default must be local".
+  return {
+    name: "local",
+    model: localModelId(),
+    reason: "default",
+    cacheDir: localCacheDir()
+  };
+}
+
+function localModelId(): string {
+  const override = process.env.GINI_LOCAL_EMBEDDING_MODEL;
+  return override && override.length > 0 ? override : DEFAULT_LOCAL_EMBEDDING_MODEL;
+}
+
+// Track local-provider load failures so we don't spam the same warning per
+// embed call. Once it fails, callers fall back to openai/echo for the rest
+// of the process lifetime.
+let localProviderUnavailable: { reason: string } | null = null;
+
+export function getEmbeddingProvider(config: RuntimeConfig): EmbeddingProvider {
+  const choice = resolveEmbeddingChoice(config);
+  if (choice.name === "echo") return echoProvider();
+  if (choice.name === "openai") return openaiProvider(config);
+
+  // local — try it. If init has previously failed, fall through.
+  if (!localProviderUnavailable) {
+    return localProvider(choice.model);
+  }
+  // Fall-through warned once; pick the next-best option without nagging.
   if (resolveOpenAIBearer(config) || readCodexBearerOrNull(config)) {
     return openaiProvider(config);
   }
   return echoProvider();
+}
+
+// --------------------------------------------------------------------------
+// Local provider — in-process Transformers.js feature-extraction pipeline.
+// --------------------------------------------------------------------------
+
+// Pipeline factories cached per-model so multiple lanes share a single
+// loaded model. Keyed by model id; value is a promise so concurrent callers
+// during cold start don't double-load.
+type FeatureExtractor = (text: string | string[], options: { pooling: "mean"; normalize: boolean }) => Promise<{ data: Float32Array; dims: number[] }>;
+const pipelineCache = new Map<string, Promise<FeatureExtractor>>();
+
+// Test seam — replace the dynamic-import path so unit tests can exercise the
+// local provider without touching the network or the native binding. Setting
+// to null restores the real import.
+type TransformersModule = {
+  pipeline: (task: string, model: string) => Promise<FeatureExtractor>;
+  env: { cacheDir?: string; allowRemoteModels?: boolean };
+};
+let transformersLoader: (() => Promise<TransformersModule>) | null = null;
+export function __setTransformersLoaderForTests(loader: (() => Promise<TransformersModule>) | null): void {
+  transformersLoader = loader;
+  pipelineCache.clear();
+  localProviderUnavailable = null;
+}
+
+async function loadFeatureExtractor(modelId: string): Promise<FeatureExtractor> {
+  const existing = pipelineCache.get(modelId);
+  if (existing) return existing;
+  const promise = (async (): Promise<FeatureExtractor> => {
+    // Cache directory: ~/.gini/models. We set this on env BEFORE the dynamic
+    // import resolves (the module reads env at instantiation time but tolerates
+    // post-import mutation too — we set both env and the module field).
+    const cacheDir = localCacheDir();
+    mkdirSync(cacheDir, { recursive: true });
+    process.env.HF_HOME ??= cacheDir;
+    process.env.TRANSFORMERS_CACHE ??= cacheDir;
+
+    const mod = transformersLoader
+      ? await transformersLoader()
+      : (await import("@huggingface/transformers")) as unknown as TransformersModule;
+    if (mod.env) mod.env.cacheDir = cacheDir;
+
+    // First-use download notice. We can't cheaply tell whether *this* model
+    // is already cached without poking inside the cache layout, so fall back
+    // to "is the cache dir empty" — good enough for the typical first run.
+    const cacheLooksEmpty = (() => {
+      try {
+        // If the directory has no entries (or doesn't exist), this is the
+        // first download. We just created the dir, so check after.
+        const entries = readdirSync(cacheDir);
+        return entries.length === 0;
+      } catch {
+        return true;
+      }
+    })();
+    if (cacheLooksEmpty) {
+      process.stderr.write(`Downloading embedding model ${modelId} (~25MB)... this happens once.\n`);
+    }
+
+    return await mod.pipeline("feature-extraction", modelId);
+  })().catch((error) => {
+    // Surface a one-line warning on first failure so the user knows local
+    // fell through. Subsequent calls quietly use the fallback.
+    pipelineCache.delete(modelId);
+    const message = error instanceof Error ? error.message : String(error);
+    if (!localProviderUnavailable) {
+      process.stderr.write(`Local embedding provider unavailable (${message}); falling back.\n`);
+    }
+    localProviderUnavailable = { reason: message };
+    throw error;
+  });
+  pipelineCache.set(modelId, promise);
+  return promise;
+}
+
+export function localProvider(modelId: string = localModelId()): EmbeddingProvider {
+  // Cache (model, text) -> vector at the provider level. A fact often gets
+  // re-embedded later in the same process (e.g. retain → recall), and local
+  // embedding is fast but not free.
+  const cache = new Map<string, Float32Array>();
+  return {
+    name: "local",
+    model: modelId,
+    // We don't *strictly* know the dim until the model loads, but the default
+    // Xenova/all-MiniLM-L6-v2 is 384d; status surfaces will report this and
+    // the actual dim is captured per-vector at insert time anyway.
+    dim: DEFAULT_LOCAL_EMBEDDING_DIM,
+    async embed(texts: string[]): Promise<Float32Array[]> {
+      if (texts.length === 0) return [];
+      const out: Float32Array[] = new Array(texts.length);
+      const misses: { index: number; text: string }[] = [];
+      for (let i = 0; i < texts.length; i++) {
+        const text = texts[i]!;
+        const cached = cache.get(text);
+        if (cached) out[i] = cached;
+        else misses.push({ index: i, text });
+      }
+      if (misses.length > 0) {
+        const extractor = await loadFeatureExtractor(modelId);
+        for (const slot of misses) {
+          const result = await extractor(slot.text, { pooling: "mean", normalize: true });
+          // Result data is a typed array view onto a shared ArrayBuffer; copy
+          // so subsequent calls don't overwrite earlier results.
+          const copy = new Float32Array(result.data.length);
+          copy.set(result.data);
+          out[slot.index] = copy;
+          cache.set(slot.text, copy);
+        }
+      }
+      return out;
+    }
+  };
 }
 
 // --------------------------------------------------------------------------

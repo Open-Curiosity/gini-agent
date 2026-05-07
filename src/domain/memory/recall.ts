@@ -91,9 +91,11 @@ export async function recall(config: RuntimeConfig, input: RecallInput): Promise
   const embedProvider = getEmbeddingProvider(config);
   const [queryVector] = await embedProvider.embed([input.query]);
 
-  // 2. Run channels in parallel where they're independent.
+  // 2. Run channels in parallel where they're independent. Semantic channel
+  // is scoped to the active provider's model — vectors from other models
+  // live in a different space, so a cross-model cosine is meaningless.
   const [semanticHits, bm25Hits, temporalHits] = await Promise.all([
-    runSemanticChannel(lane, bankId, queryVector ?? null, input.network),
+    runSemanticChannel(lane, bankId, queryVector ?? null, embedProvider.model, input.network),
     Promise.resolve(runBm25Channel(lane, bankId, input.query, input.network)),
     Promise.resolve(runTemporalChannel(lane, bankId, input.query, input.reference, input.network))
   ]);
@@ -156,6 +158,7 @@ async function runSemanticChannel(
   lane: string,
   bankId: string,
   queryVector: Float32Array | null,
+  queryModel: string,
   networks: Network[] | undefined
 ): Promise<ChannelHit[]> {
   if (!queryVector) return [];
@@ -163,14 +166,16 @@ async function runSemanticChannel(
   const networkClause = networks && networks.length > 0
     ? `AND network IN (${networks.map(() => "?").join(",")})`
     : "";
-  const params: (string | number)[] = [bankId];
-  if (networks) params.push(...networks);
+  // Filter by embedding_model: cross-model cosine is meaningless. Units
+  // embedded with a different model become invisible to semantic recall
+  // until a `gini embedding reembed` walks them with the new provider.
   const rows = db
     .query<RawUnitRow, (string | number)[]>(
       `SELECT * FROM memory_units WHERE bank_id = ? AND status = 'active'
-              AND embedding IS NOT NULL AND embedding_dim = ? ${networkClause}`
+              AND embedding IS NOT NULL AND embedding_dim = ?
+              AND embedding_model = ? ${networkClause}`
     )
-    .all(bankId, queryVector.length, ...(networks ?? []));
+    .all(bankId, queryVector.length, queryModel, ...(networks ?? []));
   const hits: ChannelHit[] = [];
   for (const row of rows) {
     const vector = deserializeEmbedding(row.embedding, row.embedding_dim);

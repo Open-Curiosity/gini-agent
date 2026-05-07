@@ -24,6 +24,10 @@ export function applyGlobalEnvOverrides(values: string[], ephemeral: boolean): v
     process.env.GINI_STATE_ROOT ??= `/tmp/gini-smoke-${process.pid}`;
     process.env.GINI_LOG_ROOT ??= `/tmp/gini-smoke-${process.pid}-logs`;
     process.env.GINI_PORT ??= String(7400 + Math.floor(Math.random() * 1000));
+    // Smoke must never pull down the local embedding model — keeps CI fast
+    // and offline. The default provider is local; explicit echo keeps smoke
+    // contractually unaffected by the default change.
+    process.env.GINI_EMBEDDING_PROVIDER ??= "echo";
   }
 }
 

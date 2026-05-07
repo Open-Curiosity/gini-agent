@@ -19,5 +19,12 @@
   "devDependencies": {
     "@types/bun": "latest",
     "typescript": "latest"
-  }
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0"
+  },
+  "trustedDependencies": [
+    "onnxruntime-node",
+    "protobufjs"
+  ]
 }

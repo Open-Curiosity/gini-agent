@@ -7,6 +7,7 @@ import { mobileBootstrap, publicState } from "./domain/views";
 import { checkConnector } from "./domain/connectors";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./domain/jobs";
 import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./domain/memory";
+import { embeddingStatus, reembedBank } from "./domain/embedding";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./domain/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./domain/pairing";
@@ -126,6 +127,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         limit
       });
       return json(units.map((unit) => ({ ...unit, kind: "hindsight" })));
+    }],
+    ["GET", /^\/api\/embedding\/status$/, () => json(embeddingStatus(config))],
+    ["POST", /^\/api\/embedding\/reembed$/, async (request) => {
+      const payload = await body(request);
+      const result = await reembedBank(config, {
+        bankId: typeof payload.bankId === "string" ? payload.bankId : undefined,
+        dryRun: payload.dryRun === true
+      });
+      return json(result);
     }],
     ["GET", /^\/api\/memory\/banks$/, () => {
       ensureDefaultBank(config.lane);
