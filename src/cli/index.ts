@@ -1,0 +1,129 @@
+// CLI entry point. Parses global flags, resolves the lane and runtime
+// config, builds a CliContext, and dispatches to the right command module.
+
+import { loadConfig, parseLane } from "../paths";
+import { applyGlobalEnvOverrides, flagValue, hasFlag, stripGlobalArgs } from "./args";
+import type { CliContext } from "./context";
+import { help } from "./output";
+import { task } from "./commands/task";
+import { chat } from "./commands/chat";
+import { approval } from "./commands/approval";
+import { memory } from "./commands/memory";
+import { skill } from "./commands/skills";
+import { job } from "./commands/jobs";
+import { connector } from "./commands/connectors";
+import { improvement } from "./commands/improvements";
+import { pairing, device } from "./commands/pairing";
+import { mobile } from "./commands/mobile";
+import { search } from "./commands/search";
+import { toolset } from "./commands/toolsets";
+import { subagent } from "./commands/subagents";
+import { mcp } from "./commands/mcp";
+import { messaging } from "./commands/messaging";
+import { importInspect } from "./commands/imports";
+import { profile } from "./commands/profiles";
+import { parity } from "./commands/parity";
+import { readiness } from "./commands/readiness";
+import { relay } from "./commands/relay";
+import { notification } from "./commands/notifications";
+import { promotion } from "./commands/promotions";
+import { snapshot } from "./commands/snapshots";
+import { provider } from "./commands/provider";
+import { trace } from "./commands/trace";
+import { audit } from "./commands/audit";
+import { events } from "./commands/events";
+import { evidence } from "./commands/evidence";
+import { smoke } from "./commands/smoke";
+import { doctorCmd, install_, reset, start, statusCmd, stop } from "./commands/admin";
+
+export async function run(): Promise<void> {
+  const args = Bun.argv.slice(2);
+  const cliArgs = stripGlobalArgs(args);
+  const command = cliArgs[0] ?? "help";
+  const ephemeralSmoke = command === "smoke" && !hasFlag(args, "--lane") && !process.env.GINI_LANE;
+  // Smoke always runs headless unless the user explicitly opts in with --web.
+  // Decoupled from the ephemeral-lane decision so `gini smoke --lane <x>` stays headless.
+  const smokeImpliesNoWeb = command === "smoke" && !hasFlag(args, "--web");
+  const noWeb = hasFlag(args, "--no-web") || smokeImpliesNoWeb;
+  applyGlobalEnvOverrides(args, ephemeralSmoke);
+  const lane = ephemeralSmoke ? `smoke-${process.pid}-${crypto.randomUUID().slice(0, 6)}` : parseLane(args);
+  const config = loadConfig(lane);
+  const webPortFlag = flagValue(args, "--web-port");
+  const webPortPinned = Boolean(webPortFlag) || Boolean(process.env.GINI_WEB_PORT);
+  const webPort = Number(process.env.GINI_WEB_PORT ?? webPortFlag ?? 3000);
+
+  const ctx: CliContext = {
+    config,
+    cliArgs,
+    command,
+    ephemeralSmoke,
+    web: { webPort, webPortPinned, noWeb }
+  };
+
+  switch (command) {
+    case "install": await install_(ctx); break;
+    case "start": await start(ctx); break;
+    case "stop": stop(ctx); break;
+    case "status": await statusCmd(ctx); break;
+    case "doctor": await doctorCmd(ctx); break;
+    case "reset": reset(ctx); break;
+    case "task": await task(ctx); break;
+    case "chat": await chat(ctx); break;
+    case "approval":
+    case "approvals": await approval(ctx); break;
+    case "memory": await memory(ctx); break;
+    case "skill":
+    case "skills": await skill(ctx); break;
+    case "job":
+    case "jobs": await job(ctx); break;
+    case "connector":
+    case "connectors": await connector(ctx); break;
+    case "improvement":
+    case "improvements": await improvement(ctx); break;
+    case "pairing":
+    case "pair": await pairing(ctx); break;
+    case "device":
+    case "devices": await device(ctx); break;
+    case "mobile": await mobile(ctx); break;
+    case "search": await search(ctx); break;
+    case "toolset":
+    case "toolsets": await toolset(ctx); break;
+    case "subagent":
+    case "subagents": await subagent(ctx); break;
+    case "mcp": await mcp(ctx); break;
+    case "message":
+    case "messaging": await messaging(ctx); break;
+    case "import":
+    case "imports": await importInspect(ctx); break;
+    case "profile":
+    case "profiles": await profile(ctx); break;
+    case "parity": await parity(ctx); break;
+    case "readiness": await readiness(ctx); break;
+    case "relay":
+    case "relays": await relay(ctx); break;
+    case "notification":
+    case "notifications": await notification(ctx); break;
+    case "promotion":
+    case "promotions": await promotion(ctx); break;
+    case "snapshot":
+    case "snapshots": snapshot(ctx); break;
+    case "provider": await provider(ctx); break;
+    case "trace": trace(ctx); break;
+    case "audit": audit(ctx); break;
+    case "events":
+    case "event": await events(ctx); break;
+    case "evidence": evidence(ctx); break;
+    case "smoke": await smoke(ctx); break;
+    default: help();
+  }
+}
+
+// Allow `bun run src/cli/index.ts` to execute directly. The conventional
+// entry is via the cli.ts shim (see package.json bin), which keeps the
+// `bun run gini` and the `gini` binary path stable.
+if (import.meta.main) {
+  run().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}
