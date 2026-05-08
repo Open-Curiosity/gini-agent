@@ -16,6 +16,7 @@ import { traceDir } from "./paths";
 import {
   addAudit,
   appendLog,
+  appendTaskPartial,
   appendTrace,
   assertInsideWorkspace,
   createMemory,
@@ -112,15 +113,20 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   const lower = task.input.toLowerCase();
 
   // Dispatch by input prefix. Each tool returns the resulting Task; high-risk
-  // tools may have transitioned the task into waiting_approval.
-  if (lower.startsWith("write ")) return finishTaskTransition(config, await requestFileWrite(config, task));
-  if (lower.startsWith("patch ")) return finishTaskTransition(config, await requestFilePatch(config, task));
-  if (lower.startsWith("read ")) return finishTaskTransition(config, await readFile(config, task));
-  if (lower.startsWith("list ")) return finishTaskTransition(config, await listFiles(config, task));
-  if (lower.startsWith("find ")) return finishTaskTransition(config, await searchFiles(config, task));
-  if (lower.startsWith("web ")) return finishTaskTransition(config, await fetchWeb(config, task));
-  if (lower.startsWith("code ")) return finishTaskTransition(config, await requestCodeExecution(config, task));
-  if (lower.startsWith("shell ")) return finishTaskTransition(config, await requestShell(config, task));
+  // tools may have transitioned the task into waiting_approval. We flip
+  // currentStep to "Working" *before* dispatching so the chat UI can
+  // distinguish text-generation ("Thinking") from tool execution ("Working").
+  // Approval-gated tools will overwrite to "Waiting for approval" inside the
+  // tool itself; synchronous tools (read/list/find/web) keep "Working" until
+  // completion.
+  if (lower.startsWith("write ")) { await markWorking(config, taskId); return finishTaskTransition(config, await requestFileWrite(config, task)); }
+  if (lower.startsWith("patch ")) { await markWorking(config, taskId); return finishTaskTransition(config, await requestFilePatch(config, task)); }
+  if (lower.startsWith("read ")) { await markWorking(config, taskId); return finishTaskTransition(config, await readFile(config, task)); }
+  if (lower.startsWith("list ")) { await markWorking(config, taskId); return finishTaskTransition(config, await listFiles(config, task)); }
+  if (lower.startsWith("find ")) { await markWorking(config, taskId); return finishTaskTransition(config, await searchFiles(config, task)); }
+  if (lower.startsWith("web ")) { await markWorking(config, taskId); return finishTaskTransition(config, await fetchWeb(config, task)); }
+  if (lower.startsWith("code ")) { await markWorking(config, taskId); return finishTaskTransition(config, await requestCodeExecution(config, task)); }
+  if (lower.startsWith("shell ")) { await markWorking(config, taskId); return finishTaskTransition(config, await requestShell(config, task)); }
 
   // No tool matched: fall through to provider summarization.
   const activeMemory = await mutateState(config.instance, (state) => state.memories.filter((memory) => memory.status === "active"));
@@ -150,7 +156,30 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     });
   }
 
-  const providerResult = await generateTaskSummary(config, task.input, activeMemory, recalledContext);
+  // Debounced streaming: codex emits many small SSE deltas. Buffer them and
+  // flush to state at most every ~150ms so we get smooth updates without
+  // thrashing mutateState (each call serializes the full RuntimeState to
+  // disk). A final flush after the stream completes drains any tail.
+  let pending = "";
+  let lastFlush = 0;
+  const flush = async (): Promise<void> => {
+    if (!pending) return;
+    const delta = pending;
+    pending = "";
+    lastFlush = Date.now();
+    await mutateState(config.instance, (state) => {
+      appendTaskPartial(state, taskId, delta);
+    });
+  };
+  const onDelta = (text: string): void => {
+    pending += text;
+    if (Date.now() - lastFlush >= 150) {
+      void flush();
+    }
+  };
+
+  const providerResult = await generateTaskSummary(config, task.input, activeMemory, recalledContext, onDelta);
+  await flush();
   appendTrace(config.instance, taskId, {
     type: "model",
     message: `${providerResult.provider.name} provider generated response`,
@@ -211,6 +240,19 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
 async function finishTaskTransition(config: RuntimeConfig, task: Task): Promise<Task> {
   await updateRunFromTask(config, task);
   return task;
+}
+
+// Sets currentStep to "Working" for a running task. Called immediately
+// before dispatching to a tool so the chat UI's phase indicator can show
+// "Working" (tool execution) instead of "Thinking" (LLM text generation).
+// Tool implementations may later overwrite to "Waiting for approval".
+async function markWorking(config: RuntimeConfig, taskId: string): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    item.currentStep = "Working";
+    item.updatedAt = now();
+    upsertTask(state, item);
+  });
 }
 
 function shouldAutoRetain(task: Task): boolean {

@@ -168,15 +168,21 @@ export default function ChatPage() {
     return userTaskId;
   }, [messages, tasksById]);
 
-  // Determine the pending assistant phase from the in-flight task's status.
+  // Determine the pending assistant phase from the in-flight task. We prefer
+  // `currentStep` (which the runtime flips to "Working" before tool dispatch)
+  // because plain text generation and tool execution both have status
+  // "running"; only currentStep distinguishes them.
   const pendingPhase: PhaseIndicatorPhase | null = useMemo(() => {
     if (!inflightTaskId) return null;
     const task = tasksById.get(inflightTaskId);
-    // No task record yet (just submitted) → "thinking".
     if (!task) return "thinking";
+    if (task.currentStep === "Thinking") return "thinking";
+    if (task.currentStep === "Working") return "working";
+    if (task.currentStep === "Waiting for approval") return "working";
     if (task.status === "queued") return "thinking";
-    if (task.status === "running") return "working";
-    return null;
+    // Any other tool-specific currentStep ("Reading file", "Executing", …)
+    // counts as working.
+    return "working";
   }, [inflightTaskId, tasksById]);
 
   // The assistant message (if any) belonging to the in-flight task — its

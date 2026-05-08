@@ -163,12 +163,29 @@ export function useChatSessions() {
 
 export type ChatSessionDetail = ChatSession & { messages: ChatMessage[]; tasks: Task[] };
 
+// Statuses where a chat task is no longer producing partial text — used to
+// decide polling cadence below.
+const CHAT_TERMINAL_TASK_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "waiting_approval"
+]);
+
 export function useChatSession(id: string | null) {
   return useQuery<ChatSessionDetail>({
     queryKey: ["chat", id],
     queryFn: () => api<ChatSessionDetail>(`/chat/${id}`),
     enabled: Boolean(id),
-    refetchInterval: 3000
+    // While a task is in flight we want the streaming partialSummary to feel
+    // live, so we drop to ~800ms. Once everything is terminal we relax back
+    // to 3s to avoid unnecessary network chatter.
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (!data) return 3000;
+      const hasInflight = data.tasks?.some((t) => !CHAT_TERMINAL_TASK_STATUSES.has(t.status));
+      return hasInflight ? 800 : 3000;
+    }
   });
 }
 

@@ -73,6 +73,7 @@ export type {
 export {
   taskCounts,
   upsertTask,
+  appendTaskPartial,
   createTask,
   createRun,
   createPlanStep,

@@ -51,6 +51,18 @@ export function upsertTask(state: RuntimeState, task: Task): Task {
   return task;
 }
 
+// Appends streamed delta text to a task's `partialSummary`, bumping
+// updatedAt. Used by runTask to expose mid-flight provider output to the
+// chat UI without waiting for the buffered final response. Silently no-ops
+// if the task no longer exists (cancellation race).
+export function appendTaskPartial(state: RuntimeState, taskId: string, delta: string): void {
+  if (!delta) return;
+  const task = state.tasks.find((existing) => existing.id === taskId);
+  if (!task) return;
+  task.partialSummary = (task.partialSummary ?? "") + delta;
+  task.updatedAt = now();
+}
+
 export function createTask(
   instance: Instance,
   input: string,
