@@ -101,7 +101,9 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
   const session = state.chatSessions.find((item) => item.id === sessionId);
   if (!session) throw new Error(`Chat session not found: ${sessionId}`);
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
-  const task = await submitTask(config, content, undefined, undefined, undefined, run.id);
+  // Chat messages run through the tool-calling agent loop. The legacy
+  // prefix-dispatch path stays available for the imperative CLI.
+  const task = await submitTask(config, content, { runId: run.id, mode: "chat" });
   await linkRunToTask(config, run.id, task);
   await mutateState(config.instance, (current) => {
     const message = createChatMessage(current, { sessionId, role: "user", content, taskId: task.id, runId: run.id });

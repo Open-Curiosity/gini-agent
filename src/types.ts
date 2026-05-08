@@ -120,6 +120,38 @@ export interface RuntimeState {
   planSteps: PlanStepRecord[];
 }
 
+export type TaskMode = "chat" | "imperative";
+
+// A pending tool call captured by the chat-task loop while waiting for an
+// approval to resolve. Stored on the task so the loop can resume after the
+// approval completes without re-running the model. `result` is filled in by
+// the approval execution path (e.g. file write succeeded, command output).
+export interface PendingToolCall {
+  toolCallId: string;
+  toolName: string;
+  approvalId: string;
+  result?: string;
+}
+
+// Snapshot of the tool-calling conversation needed to resume the loop after
+// an approval gates a tool. We persist enough context that the runtime can
+// pick up where it left off when the user approves/denies.
+export interface TaskToolCallState {
+  // OpenAI-shaped messages array (system, user, assistant w/ tool_calls,
+  // tool result messages). We keep `unknown[]` to avoid pulling provider
+  // shape into the central type module.
+  messages: unknown[];
+  // Stable identifier for the tool catalog used during this loop. If it
+  // changes between iterations (toolset toggled, skill loaded), we don't
+  // assume the prior catalog still applies.
+  toolsHash: string;
+  // Tool calls awaiting approval. When all of these have results filled in,
+  // the loop resumes.
+  pending: PendingToolCall[];
+  // Iteration counter (capped to prevent runaway loops).
+  iterations: number;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -146,6 +178,14 @@ export interface Task {
   subagentId?: string;
   runId?: string;
   cost?: CostRecord;
+  // Execution mode. "chat" routes through the tool-calling agent loop in
+  // src/execution/chat-task.ts. "imperative" preserves the legacy CLI
+  // prefix-dispatch behavior. Defaults to "imperative" for back-compat.
+  mode?: TaskMode;
+  // Resume state for the chat-task loop while waiting on an approval. Cleared
+  // once the loop finishes (completed/failed) so completed tasks don't retain
+  // long-lived conversation snapshots in state.
+  toolCallState?: TaskToolCallState;
 }
 
 export interface RuntimeEvent {

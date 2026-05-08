@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { MemoryRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
+import type { CostRecord, MemoryRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -118,6 +118,346 @@ export function providerCatalog(): ProviderCatalogItem[] {
       costHint: "unknown"
     }
   ];
+}
+
+// Public so chat-task.ts can build the same authoritative system prompt
+// (instructions + pinned memories + recalled context) the legacy
+// generateTaskSummary path uses.
+export function buildAgentSystemContext(memories: MemoryRecord[], recalledContext?: string): string {
+  return buildSystemContext(memories, recalledContext);
+}
+
+// OpenAI tool-calling shapes. We mirror the chat-completions API surface
+// directly so tool specs can be authored once and shipped to any compat
+// provider (OpenAI, OpenRouter, local) without an intermediate adapter.
+export interface ToolFunctionSpec {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>; // JSON schema
+  };
+}
+
+export interface ToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string; // JSON-encoded args; callers parse
+  };
+}
+
+export type ChatMessageRole = "system" | "user" | "assistant" | "tool";
+
+export interface ToolCallingMessage {
+  role: ChatMessageRole;
+  content: string | null;
+  // tool result messages carry the originating call id; assistant messages
+  // that triggered tool calls carry `tool_calls`.
+  name?: string;
+  tool_call_id?: string;
+  tool_calls?: ToolCall[];
+}
+
+export interface ToolCallingResult {
+  provider: ProviderConfig;
+  text: string;
+  toolCalls: ToolCall[];
+  finishReason: "stop" | "tool_calls" | "length" | "content_filter" | "unknown";
+  responseId?: string;
+  usage?: Record<string, unknown>;
+  cost?: CostRecord;
+}
+
+// Echo provider stub registry for tool-calling. Tests register a sequence
+// of canned responses (each is the next ToolCallingResult to return) keyed
+// by an optional tag — useful for end-to-end chat-task tests where the
+// loop calls the provider multiple times.
+const echoToolCallingStubs: Array<{ tag?: string; result: ToolCallingResult }> = [];
+
+export function setEchoToolCallingResponse(result: ToolCallingResult, tag?: string): void {
+  echoToolCallingStubs.push({ tag, result });
+}
+
+export function clearEchoToolCallingResponses(): void {
+  echoToolCallingStubs.length = 0;
+}
+
+function nextEchoToolCallingResult(provider: ProviderConfig, lastUserText: string): ToolCallingResult {
+  const stub = echoToolCallingStubs.shift();
+  if (stub) return stub.result;
+  // Default: behave like generateTaskSummary's echo branch — finish with a
+  // canned text response so callers that don't pre-register stubs still see
+  // a deterministic shape.
+  return {
+    provider,
+    text: `Gini handled: ${lastUserText}`,
+    toolCalls: [],
+    finishReason: "stop"
+  };
+}
+
+// Native tool-calling entry point. Calls the provider's chat-completions
+// endpoint with a `tools` array. Used by the chat-task agent loop.
+//
+// Codex/responses-API path doesn't support tool-calling here (the responses
+// stream uses a different shape). For codex we log a warning and fall back
+// to a text-only completion: the model can still answer but cannot invoke
+// tools through this loop. The same applies to the echo provider in default
+// mode (tests can override with `setEchoToolCallingResponse`).
+export async function generateToolCallingResponse(
+  config: RuntimeConfig,
+  messages: ToolCallingMessage[],
+  tools: ToolFunctionSpec[],
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  const provider = normalizeProvider(config.provider);
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  const lastUserText = typeof lastUser?.content === "string" ? lastUser.content : "";
+
+  if (provider.name === "echo") {
+    const result = nextEchoToolCallingResult(provider, lastUserText);
+    if (result.text && onDelta) {
+      // Synthesize a single streamed delta so callers exercise their
+      // streaming pipelines in echo-backed tests.
+      try {
+        onDelta(result.text);
+      } catch {
+        // never let onDelta crash the test path.
+      }
+    }
+    return result;
+  }
+
+  // Codex: no tool-calling support yet. Fall back to a text-only completion
+  // through the responses API.
+  if (provider.name === "codex") {
+    const systemContext = stitchSystemFromMessages(messages);
+    const userInput = lastUserText || "";
+    const text = await callOpenAIResponses(provider, userInput, systemContext, onDelta);
+    return {
+      provider: text.provider,
+      text: text.text,
+      toolCalls: [],
+      finishReason: "stop",
+      responseId: text.responseId,
+      usage: text.usage,
+      cost: text.cost
+    };
+  }
+
+  return callToolCallingChatCompletions(provider, messages, tools, onDelta);
+}
+
+// When falling back to the responses API for codex, collapse all `system`
+// messages into one instructions block. tool/assistant messages are dropped
+// since the responses path doesn't model them.
+function stitchSystemFromMessages(messages: ToolCallingMessage[]): string {
+  return messages
+    .filter((m) => m.role === "system" && typeof m.content === "string")
+    .map((m) => m.content as string)
+    .join("\n\n");
+}
+
+async function callToolCallingChatCompletions(
+  provider: ProviderConfig,
+  messages: ToolCallingMessage[],
+  tools: ToolFunctionSpec[],
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
+  const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
+  };
+  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const wantStream = Boolean(onDelta);
+  const body: Record<string, unknown> = {
+    model: provider.model,
+    messages: messages.map(serializeChatMessage),
+    stream: wantStream
+  };
+  if (tools.length > 0) {
+    body.tools = tools;
+    body.tool_choice = "auto";
+  }
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: { ...headers, ...(wantStream ? { accept: "text/event-stream" } : {}) },
+    body: JSON.stringify(body)
+  });
+
+  if (wantStream) {
+    return readToolCallingStream(response, provider, onDelta);
+  }
+
+  const rawPayload = await response.text();
+  const payload = parseJsonObject(rawPayload);
+  if (!response.ok) {
+    const fallback = rawPayload.slice(0, 500) || `Tool-calling request failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  return extractToolCallingResult(payload, provider);
+}
+
+function serializeChatMessage(message: ToolCallingMessage): Record<string, unknown> {
+  // OpenAI chat-completions accepts the wire shape directly. Strip
+  // undefined fields so they don't leak into the JSON body.
+  const out: Record<string, unknown> = { role: message.role, content: message.content };
+  if (message.name !== undefined) out.name = message.name;
+  if (message.tool_call_id !== undefined) out.tool_call_id = message.tool_call_id;
+  if (message.tool_calls !== undefined) out.tool_calls = message.tool_calls;
+  return out;
+}
+
+function extractToolCallingResult(
+  payload: Record<string, unknown>,
+  provider: ProviderConfig
+): ToolCallingResult {
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  const first = choices.find(isRecord);
+  const message = first && isRecord(first.message) ? first.message : undefined;
+  const text = typeof message?.content === "string" ? message.content : "";
+  const toolCalls = extractToolCalls(message);
+  const finishReason = normalizeFinishReason(typeof first?.finish_reason === "string" ? first.finish_reason : undefined);
+  return {
+    provider,
+    text,
+    toolCalls,
+    finishReason,
+    responseId: typeof payload.id === "string" ? payload.id : undefined,
+    usage: isRecord(payload.usage) ? payload.usage : undefined,
+    cost: estimateCost(provider, isRecord(payload.usage) ? payload.usage : undefined)
+  };
+}
+
+function extractToolCalls(message: Record<string, unknown> | undefined): ToolCall[] {
+  if (!message) return [];
+  const raw = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  const out: ToolCall[] = [];
+  for (const call of raw) {
+    if (!isRecord(call)) continue;
+    const id = typeof call.id === "string" ? call.id : "";
+    const fn = isRecord(call.function) ? call.function : undefined;
+    const name = fn && typeof fn.name === "string" ? fn.name : "";
+    const args = fn && typeof fn.arguments === "string" ? fn.arguments : "";
+    if (!id || !name) continue;
+    out.push({ id, type: "function", function: { name, arguments: args } });
+  }
+  return out;
+}
+
+function normalizeFinishReason(value: string | undefined): ToolCallingResult["finishReason"] {
+  if (value === "stop" || value === "tool_calls" || value === "length" || value === "content_filter") return value;
+  return "unknown";
+}
+
+// Streaming tool-calling: many compat providers send tool_call argument
+// chunks across multiple SSE events. We accumulate per-index buffers and
+// emit completed tool calls only when the stream finishes.
+async function readToolCallingStream(
+  response: Response,
+  provider: ProviderConfig,
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  if (!response.ok) {
+    const raw = await response.text();
+    const payload = parseJsonObject(raw);
+    const fallback = raw.slice(0, 500) || `Tool-calling stream failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  const body = response.body;
+  if (!body) throw new Error("Tool-calling stream returned no response body.");
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  const textParts: string[] = [];
+  // Index → in-progress tool call. The chat-completions stream sends
+  // tool_calls as deltas indexed by position. Final id/name arrive in the
+  // first delta for that index; arguments stream in subsequent deltas.
+  const callsByIndex = new Map<number, ToolCall>();
+  let finishReason: ToolCallingResult["finishReason"] = "unknown";
+  let responseId: string | undefined;
+  let usage: Record<string, unknown> | undefined;
+
+  const handleEvent = (block: string): void => {
+    const lines = block.split(/\r?\n/);
+    const dataLines = lines.filter((line) => line.startsWith("data:"));
+    if (dataLines.length === 0) return;
+    const data = dataLines.map((line) => line.slice("data:".length).trim()).join("\n");
+    if (!data || data === "[DONE]") return;
+    const payload = parseJsonObject(data);
+    if (!responseId && typeof payload.id === "string") responseId = payload.id;
+    if (isRecord(payload.usage)) usage = payload.usage;
+    const choices = Array.isArray(payload.choices) ? payload.choices : [];
+    for (const choice of choices) {
+      if (!isRecord(choice)) continue;
+      if (typeof choice.finish_reason === "string") {
+        finishReason = normalizeFinishReason(choice.finish_reason);
+      }
+      const delta = isRecord(choice.delta) ? choice.delta : undefined;
+      if (!delta) continue;
+      if (typeof delta.content === "string" && delta.content.length > 0) {
+        textParts.push(delta.content);
+        if (onDelta) {
+          try {
+            onDelta(delta.content);
+          } catch {
+            // never abort the stream consumer on a UI-side error
+          }
+        }
+      }
+      const tcs = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+      for (const tc of tcs) {
+        if (!isRecord(tc)) continue;
+        const idx = typeof tc.index === "number" ? tc.index : 0;
+        const existing = callsByIndex.get(idx) ?? { id: "", type: "function" as const, function: { name: "", arguments: "" } };
+        if (typeof tc.id === "string" && tc.id.length > 0) existing.id = tc.id;
+        const fn = isRecord(tc.function) ? tc.function : undefined;
+        if (fn) {
+          if (typeof fn.name === "string" && fn.name.length > 0) existing.function.name = fn.name;
+          if (typeof fn.arguments === "string") existing.function.arguments += fn.arguments;
+        }
+        callsByIndex.set(idx, existing);
+      }
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (value) buffer += decoder.decode(value, { stream: true });
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      if (block.trim().length > 0) handleEvent(block);
+      boundary = buffer.indexOf("\n\n");
+    }
+    if (done) break;
+  }
+  buffer += decoder.decode();
+  if (buffer.trim().length > 0) handleEvent(buffer);
+
+  const toolCalls: ToolCall[] = [];
+  // Preserve original index ordering.
+  const sortedIndices = [...callsByIndex.keys()].sort((a, b) => a - b);
+  for (const idx of sortedIndices) {
+    const call = callsByIndex.get(idx)!;
+    if (call.id && call.function.name) toolCalls.push(call);
+  }
+
+  return {
+    provider,
+    text: textParts.join("").trim(),
+    toolCalls,
+    finishReason,
+    responseId,
+    usage,
+    cost: estimateCost(provider, usage)
+  };
 }
 
 export async function generateTaskSummary(

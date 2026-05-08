@@ -32,19 +32,45 @@ import { requestShell } from "./tools/terminal";
 import { requestCodeExecution } from "./tools/code";
 import { recall, retain } from "./memory";
 import { updateRunFromTask } from "./execution/runs";
+import { runChatTask, resumeChatTask } from "./execution/chat-task";
+import { approvalToolCallId } from "./execution/tool-dispatch";
 
-export async function submitTask(config: RuntimeConfig, input: string, jobId?: string, parentTaskId?: string, subagentId?: string, runId?: string): Promise<Task> {
-  const created = createTask(config.instance, input, jobId, parentTaskId, subagentId, runId);
+export interface SubmitTaskOptions {
+  jobId?: string;
+  parentTaskId?: string;
+  subagentId?: string;
+  runId?: string;
+  // Execution mode. "chat" routes through the tool-calling agent loop.
+  // "imperative" preserves the legacy CLI prefix-dispatch behavior. Defaults
+  // to "imperative" for back-compat with the CLI; chat callers pass "chat".
+  mode?: "chat" | "imperative";
+}
+
+export async function submitTask(
+  config: RuntimeConfig,
+  input: string,
+  jobIdOrOptions?: string | SubmitTaskOptions,
+  parentTaskId?: string,
+  subagentId?: string,
+  runId?: string
+): Promise<Task> {
+  // Back-compat shim: callers pass either positional args (legacy) or an
+  // options bag. New chat callers use the bag so they can set mode.
+  const options: SubmitTaskOptions = typeof jobIdOrOptions === "object" && jobIdOrOptions !== null
+    ? jobIdOrOptions
+    : { jobId: jobIdOrOptions, parentTaskId, subagentId, runId };
+  const created = createTask(config.instance, input, options.jobId, options.parentTaskId, options.subagentId, options.runId);
+  if (options.mode) created.mode = options.mode;
   await mutateState(config.instance, (state) => {
     upsertTask(state, created);
     const audit = addAudit(state, {
-      actor: jobId ? "runtime" : "user",
+      actor: options.jobId ? "runtime" : "user",
       action: "task.submitted",
       target: created.id,
       risk: "low",
       taskId: created.id,
-      runId,
-      evidence: { input, jobId, parentTaskId, subagentId, runId }
+      runId: options.runId,
+      evidence: { input, jobId: options.jobId, parentTaskId: options.parentTaskId, subagentId: options.subagentId, runId: options.runId, mode: options.mode }
     });
     created.auditIds.push(audit.id);
   });
@@ -96,6 +122,14 @@ export async function cancelTask(config: RuntimeConfig, taskId: string): Promise
 }
 
 export async function runTask(config: RuntimeConfig, taskId: string): Promise<Task> {
+  // Chat-mode tasks route through the tool-calling agent loop in
+  // src/execution/chat-task.ts. The legacy prefix-dispatch path below is
+  // preserved for imperative CLI commands (`gini task "write foo.txt :: hi"`).
+  const initialTask = await mutateState(config.instance, (state) => findTask(state, taskId));
+  if (initialTask.mode === "chat") {
+    return runChatTask(config, taskId);
+  }
+
   let task = await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     item.status = "running";
@@ -378,6 +412,11 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
 }
 
 async function executeApprovedAction(config: RuntimeConfig, approval: Approval): Promise<void> {
+  // Chat-task approvals carry a `toolCallId` on payload — when present, we
+  // run the side effect, skip task completion (the loop owns the task),
+  // and feed the result back via resumeChatTask.
+  const chatToolCallId = approvalToolCallId(approval.payload);
+
   if (approval.action === "file.write") {
     const target = assertInsideWorkspace(config.workspaceRoot, String(approval.payload.path));
     const before = existsSync(target) ? readFileSync(target, "utf8") : "";
@@ -393,11 +432,14 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
         approvalId: approval.id,
         evidence: { beforeBytes: before.length, afterBytes: String(approval.payload.content).length }
       });
-      if (approval.taskId) completeApprovedTask(state, approval.taskId, "File write completed.");
+      if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, "File write completed.");
       return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
     });
     if (approval.taskId) appendTrace(config.instance, approval.taskId, { type: "tool", message: "File written", data: { path: approval.payload.path } });
     if (task) await updateRunFromTask(config, task);
+    if (chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, `File write completed: ${approval.payload.path}`);
+    }
     return;
   }
 
@@ -420,11 +462,14 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
         approvalId: approval.id,
         evidence: { diff: approval.payload.diff, beforeBytes: before.length, afterBytes: after.length }
       });
-      if (approval.taskId) completeApprovedTask(state, approval.taskId, "File patch completed.");
+      if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, "File patch completed.");
       return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
     });
     if (approval.taskId) appendTrace(config.instance, approval.taskId, { type: "tool", message: "File patched", data: { path: approval.payload.path, diff: approval.payload.diff } });
     if (task) await updateRunFromTask(config, task);
+    if (chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, `File patch completed: ${approval.payload.path}`);
+    }
     return;
   }
 
@@ -468,7 +513,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
           artifactRelPath: artifact?.relPath
         }
       });
-      if (approval.taskId) completeApprovedTask(state, approval.taskId, exitCode === 0 ? "Command completed." : "Command failed.", exitCode === 0 ? undefined : stderr);
+      if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, exitCode === 0 ? "Command completed." : "Command failed.", exitCode === 0 ? undefined : stderr);
       return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
     });
     if (approval.taskId) {
@@ -488,6 +533,16 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
       });
     }
     if (task) await updateRunFromTask(config, task);
+    if (chatToolCallId && approval.taskId) {
+      // Feed the captured stdout/stderr back to the chat-task loop. Truncate
+      // similarly to the audit trail so we don't blow the model's context.
+      const summary = [
+        `exit ${exitCode}`,
+        stdout.length > 0 ? `stdout:\n${stdout.slice(0, 4000)}${stdout.length > 4000 ? "\n…(truncated)" : ""}` : "",
+        stderr.length > 0 ? `stderr:\n${stderr.slice(0, 4000)}${stderr.length > 4000 ? "\n…(truncated)" : ""}` : ""
+      ].filter(Boolean).join("\n\n");
+      await resumeChatTask(config, approval.taskId, chatToolCallId, summary || `Command finished with exit ${exitCode}.`);
+    }
   }
 }
 
