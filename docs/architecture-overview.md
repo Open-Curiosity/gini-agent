@@ -59,7 +59,7 @@ Gini's **runtime is the gateway** — a single Bun process per instance that own
 ### Gateway (the runtime)
 
 - **Single source of truth.** Every byte of agent state lives here: tasks, jobs, memory units, skills, audit events, traces.
-- **One process per instance.** `--instance dev`, `--instance feature-x`, `--instance vienna` are independent gateways with isolated state, ports, and lifecycles. Each writes to `~/.gini/<instance>/`.
+- **One process per instance.** `--instance dev`, `--instance feature-x`, `--instance vienna` are independent gateways with isolated state, ports, and lifecycles. Each writes to `~/.gini/instances/<instance>/`.
 - **Token-authenticated.** Bearer tokens (per-instance and per-paired-device) gate every request. Tokens are minted at install time and stored in the instance's `config.json`.
 - **HTTP + SSE.** Standard REST surface plus an event stream (`/api/events/stream`) for real-time updates.
 - **Self-contained.** No Postgres, no Docker, no Python service. SQLite via `bun:sqlite` for the four-network memory, JSON for everything else.
