@@ -158,19 +158,23 @@ export default function ChatPage() {
     [tasks]
   );
 
-  // The "in-flight task" is the task linked to the latest user message that
-  // has no paired assistant message AND whose status is non-terminal.
+  // The "in-flight task" is the latest user message's task whose status is
+  // non-terminal. It stays set even once a paired assistant message appears,
+  // so streaming/cursor + busy state remain wired until the task is terminal.
   const inflightTaskId: string | null = useMemo(() => {
     if (!messages) return null;
-    const last = messages[messages.length - 1];
-    if (!last || last.role !== "user" || !last.taskId) return null;
-    const hasAssistantForTask = messages.some(
-      (m) => m.role === "assistant" && m.taskId === last.taskId
-    );
-    if (hasAssistantForTask) return null;
-    const task = tasksById.get(last.taskId);
+    let userTaskId: string | undefined;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i]!;
+      if (m.role === "user" && m.taskId) {
+        userTaskId = m.taskId;
+        break;
+      }
+    }
+    if (!userTaskId) return null;
+    const task = tasksById.get(userTaskId);
     if (task && TERMINAL_TASK_STATUSES.has(task.status)) return null;
-    return last.taskId;
+    return userTaskId;
   }, [messages, tasksById]);
 
   // Determine the pending assistant phase from the in-flight task's status.
