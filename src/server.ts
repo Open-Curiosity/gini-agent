@@ -48,5 +48,19 @@ setInterval(() => {
 process.on("SIGTERM", () => {
   appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
   server.stop(true);
-  process.exit(0);
+  // Print a stable shutdown marker so the foreground log capture (and any
+  // human tailing the file) can see that the runtime is going down. Without
+  // this, the SIGTERM path emits no stdio at all and observability of clean
+  // shutdowns rests entirely on the structured runtime.jsonl event stream.
+  // This is also the marker run.test.ts asserts on to guard the
+  // `awaitForegroundLogFlush()` call in admin.ts:runForeground.
+  //
+  // Use process.stdout.write with the exit-in-callback pattern so that when
+  // stdout is a pipe (foreground mode pipes child stdout into the parent for
+  // tee-ing), the write completes before we exit. console.log is async on
+  // pipes and process.exit doesn't wait for pending writes — that race would
+  // drop the shutdown marker.
+  process.stdout.write(`Gini runtime shutting down (SIGTERM) instance=${config.instance}\n`, () => {
+    process.exit(0);
+  });
 });
