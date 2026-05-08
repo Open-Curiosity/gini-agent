@@ -199,16 +199,75 @@ export async function generateStructured<T>(
     };
   }
 
-  // OpenAI / Codex / OpenAI-compatible: use chat-completions with
-  // response_format json_object. We deliberately don't push json_schema
-  // here — many compat providers reject the field. Instead the validator
-  // re-checks shape after parse.
+  // OpenAI / OpenRouter / local OpenAI-compatible: chat-completions with
+  // response_format json_object. We deliberately don't push json_schema —
+  // many compat providers reject the field. Validator re-checks shape.
   if (provider.name === "openrouter" || provider.name === "local" || provider.name === "openai") {
     return callStructuredChatCompletions(provider, request);
   }
-  // Codex: same shape via the responses API isn't broadly supported for
-  // json_object; fall back to chat-completions style on the codex base URL.
-  return callStructuredChatCompletions(provider, request);
+  // Codex doesn't expose /chat/completions and the /responses API doesn't
+  // support response_format=json_object. We prompt for JSON, stream the
+  // /responses endpoint with codex auth, and validate the parsed output.
+  return callStructuredCodex(provider, request);
+}
+
+async function callStructuredCodex<T>(
+  provider: ProviderConfig,
+  request: StructuredRequest<T>
+): Promise<StructuredResult<T>> {
+  const bearer = readCodexBearer(provider);
+  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const response = await fetch(`${baseUrl}/responses`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bearer}`,
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      ...codexHeaders(bearer)
+    },
+    body: JSON.stringify({
+      model: provider.model,
+      store: false,
+      stream: true,
+      instructions: request.system,
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema. No prose, no markdown fences.`
+            }
+          ]
+        }
+      ]
+    })
+  });
+  // readCodexStream already handles non-OK and empty-output as throws.
+  const streamed = await readCodexStream(response, provider);
+  const cleaned = stripJsonFences(streamed.text);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (error) {
+    throw new Error(`Codex structured response was not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return {
+    data: request.validator.parse(parsed),
+    raw: cleaned,
+    usage: streamed.usage,
+    provider
+  };
+}
+
+// Models occasionally wrap JSON in ```json fences despite the prompt. Strip
+// once before parsing so a single rogue fence doesn't fail an otherwise good
+// extraction.
+function stripJsonFences(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("```")) return trimmed;
+  const withoutOpen = trimmed.replace(/^```(?:json)?\s*\n?/, "");
+  return withoutOpen.replace(/\n?```\s*$/, "").trim();
 }
 
 async function callStructuredChatCompletions<T>(
