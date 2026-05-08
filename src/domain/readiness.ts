@@ -6,7 +6,8 @@ export function v1Readiness(config: RuntimeConfig) {
   const state = readState(config.instance);
   const parity = hermesParityChecks(config);
   const checks = [
-    readiness("runtime_contracts", "Stable API contracts", true, ["/api/tasks", "/api/chat", "/api/events", "/api/parity/hermes"]),
+    readiness("runtime_contracts", "Stable API contracts", true, ["/api/tasks", "/api/chat", "/api/runs", "/api/events", "/api/parity/hermes"]),
+    readiness("conversation_runs", "Conversation run model", true, [`${state.runs.length} runs`, `${state.planSteps.length} plan steps`, "runs link conversations, tasks, approvals, and future subtasks"]),
     readiness("local_web", "Local web control plane", true, ["tasks", "approvals", "chat", "events", "memory", "skills", "jobs", "messaging", "parity"]),
     readiness("event_stream", "Event stream", true, [`${state.events.length} recorded events`, "/api/events/stream"]),
     readiness("trace_audit", "Trace/audit substrate", true, [`${state.audit.length} audit events`, "per-task trace files"]),

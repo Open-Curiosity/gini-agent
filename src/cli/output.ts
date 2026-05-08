@@ -26,6 +26,7 @@ Usage:
   bun run gini task submit <prompt>
   bun run gini task list
   bun run gini task show <task-id>
+  bun run gini runs list|show
   bun run gini approvals
   bun run gini approval approve|deny <approval-id>
   bun run gini memory list|add|approve|reject

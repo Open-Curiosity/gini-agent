@@ -44,6 +44,7 @@ export type NotificationStatus = "queued" | "sent" | "failed" | "acknowledged";
 export type MessagingMessageStatus = "received" | "queued" | "sent" | "failed";
 
 export type RuntimeEventKind =
+  | "run"
   | "task"
   | "approval"
   | "job"
@@ -59,6 +60,12 @@ export type RuntimeEventKind =
 export type JobRunStatus = "running" | "completed" | "failed";
 
 export type ChatMessageRole = "user" | "assistant" | "system";
+
+export type RunStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
+
+export type RunKind = "conversation_turn" | "task" | "job" | "subagent" | "direct";
+
+export type PlanStepStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 
 export interface ProviderConfig {
   name: ProviderName;
@@ -109,6 +116,8 @@ export interface RuntimeState {
   chatSessions: ChatSessionRecord[];
   chatMessages: ChatMessageRecord[];
   messagingMessages: MessagingMessageRecord[];
+  runs: RunRecord[];
+  planSteps: PlanStepRecord[];
 }
 
 export interface Task {
@@ -130,6 +139,7 @@ export interface Task {
   jobId?: string;
   parentTaskId?: string;
   subagentId?: string;
+  runId?: string;
   cost?: CostRecord;
 }
 
@@ -142,9 +152,51 @@ export interface RuntimeEvent {
   target: string;
   taskId?: string;
   jobId?: string;
+  runId?: string;
   risk: RiskLevel;
   summary: string;
   data?: Record<string, unknown>;
+}
+
+export interface RunRecord {
+  id: string;
+  instance: Instance;
+  kind: RunKind;
+  status: RunStatus;
+  title: string;
+  input: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  conversationId?: string;
+  userMessageId?: string;
+  assistantMessageId?: string;
+  taskId?: string;
+  jobId?: string;
+  parentRunId?: string;
+  subagentId?: string;
+  planStepIds: string[];
+  childRunIds: string[];
+  approvalIds: string[];
+  summary?: string;
+  error?: string;
+  cost?: CostRecord;
+}
+
+export interface PlanStepRecord {
+  id: string;
+  instance: Instance;
+  runId: string;
+  title: string;
+  status: PlanStepStatus;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  taskId?: string;
+  subagentId?: string;
+  summary?: string;
+  error?: string;
 }
 
 export interface ChatSessionRecord {
@@ -155,6 +207,7 @@ export interface ChatSessionRecord {
   updatedAt: string;
   messageIds: string[];
   taskIds: string[];
+  runIds: string[];
   summary?: string;
 }
 
@@ -166,6 +219,7 @@ export interface ChatMessageRecord {
   content: string;
   createdAt: string;
   taskId?: string;
+  runId?: string;
 }
 
 export interface TraceRecord {
@@ -358,6 +412,7 @@ export interface AuditEvent {
   target: string;
   risk: RiskLevel;
   taskId?: string;
+  runId?: string;
   approvalId?: string;
   evidence?: Record<string, unknown>;
 }

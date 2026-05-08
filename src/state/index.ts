@@ -74,6 +74,8 @@ export {
   taskCounts,
   upsertTask,
   createTask,
+  createRun,
+  createPlanStep,
   createChatSession,
   createChatMessage,
   createApproval,

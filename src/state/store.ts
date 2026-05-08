@@ -49,7 +49,9 @@ export function createEmptyState(instance: Instance): RuntimeState {
     jobRuns: [],
     chatSessions: [],
     chatMessages: [],
-    messagingMessages: []
+    messagingMessages: [],
+    runs: [],
+    planSteps: []
   };
 }
 
@@ -148,7 +150,9 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
     "jobRuns",
     "chatSessions",
     "chatMessages",
-    "messagingMessages"
+    "messagingMessages",
+    "runs",
+    "planSteps"
   ];
   for (const key of collectionKeys) {
     const records = state[key] as unknown;
@@ -194,6 +198,16 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.jobRuns ??= [];
   state.chatSessions ??= [];
   state.chatMessages ??= [];
+  state.runs ??= [];
+  state.planSteps ??= [];
+  for (const session of state.chatSessions) {
+    session.runIds ??= [];
+  }
+  for (const run of state.runs) {
+    run.planStepIds ??= [];
+    run.childRunIds ??= [];
+    run.approvalIds ??= [];
+  }
   for (const skill of state.skills) {
     skill.tests ??= [];
     skill.successCount ??= 0;

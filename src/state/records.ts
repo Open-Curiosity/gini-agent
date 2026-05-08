@@ -19,11 +19,13 @@ import type {
   ProfileRecord,
   PromotionProposal,
   RelayRecord,
+  RunRecord,
   RuntimeState,
   SkillRecord,
   SnapshotRecord,
   SubagentRecord,
-  Task
+  Task,
+  PlanStepRecord
 } from "../types";
 import { id, now } from "./ids";
 import { addAudit, appendEvent } from "./audit";
@@ -54,7 +56,8 @@ export function createTask(
   input: string,
   jobId?: string,
   parentTaskId?: string,
-  subagentId?: string
+  subagentId?: string,
+  runId?: string
 ): Task {
   const at = now();
   const taskId = id("task");
@@ -73,8 +76,77 @@ export function createTask(
     skillIds: [],
     jobId,
     parentTaskId,
-    subagentId
+    subagentId,
+    runId
   };
+}
+
+export function createRun(
+  state: RuntimeState,
+  run: Omit<RunRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt" | "planStepIds" | "childRunIds" | "approvalIds">
+): RunRecord {
+  const at = now();
+  const item: RunRecord = {
+    id: id("run"),
+    instance: state.instance,
+    status: "queued",
+    createdAt: at,
+    updatedAt: at,
+    planStepIds: [],
+    childRunIds: [],
+    approvalIds: [],
+    ...run
+  };
+  state.runs.unshift(item);
+  if (item.parentRunId) {
+    const parent = state.runs.find((candidate) => candidate.id === item.parentRunId);
+    if (parent && !parent.childRunIds.includes(item.id)) parent.childRunIds.push(item.id);
+  }
+  if (item.conversationId) {
+    const session = state.chatSessions.find((candidate) => candidate.id === item.conversationId);
+    if (session && !session.runIds.includes(item.id)) {
+      session.runIds.push(item.id);
+      session.updatedAt = at;
+    }
+  }
+  appendEvent(state, {
+    kind: "run",
+    action: "run.created",
+    target: item.id,
+    runId: item.id,
+    risk: "low",
+    summary: item.title,
+    data: { kind: item.kind, conversationId: item.conversationId, parentRunId: item.parentRunId }
+  });
+  return item;
+}
+
+export function createPlanStep(
+  state: RuntimeState,
+  step: Omit<PlanStepRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt">
+): PlanStepRecord {
+  const at = now();
+  const item: PlanStepRecord = {
+    id: id("step"),
+    instance: state.instance,
+    status: "pending",
+    createdAt: at,
+    updatedAt: at,
+    ...step
+  };
+  state.planSteps.unshift(item);
+  const run = state.runs.find((candidate) => candidate.id === item.runId);
+  if (run && !run.planStepIds.includes(item.id)) run.planStepIds.push(item.id);
+  appendEvent(state, {
+    kind: "run",
+    action: "run.step.created",
+    target: item.runId,
+    runId: item.runId,
+    risk: "low",
+    summary: item.title,
+    data: { stepId: item.id }
+  });
+  return item;
 }
 
 export function createChatSession(state: RuntimeState, title: string): ChatSessionRecord {
@@ -86,7 +158,8 @@ export function createChatSession(state: RuntimeState, title: string): ChatSessi
     createdAt: at,
     updatedAt: at,
     messageIds: [],
-    taskIds: []
+    taskIds: [],
+    runIds: []
   };
   state.chatSessions.unshift(session);
   appendEvent(state, {
@@ -114,6 +187,7 @@ export function createChatMessage(
   if (session) {
     session.messageIds.push(item.id);
     if (item.taskId && !session.taskIds.includes(item.taskId)) session.taskIds.push(item.taskId);
+    if (item.runId && !session.runIds.includes(item.runId)) session.runIds.push(item.runId);
     session.updatedAt = item.createdAt;
     if (item.role === "assistant") session.summary = item.content.slice(0, 240);
   }

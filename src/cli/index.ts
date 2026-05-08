@@ -7,6 +7,7 @@ import type { CliContext } from "./context";
 import { help } from "./output";
 import { task } from "./commands/task";
 import { chat } from "./commands/chat";
+import { runs } from "./commands/runs";
 import { approval } from "./commands/approval";
 import { memory } from "./commands/memory";
 import { embedding } from "./commands/embedding";
@@ -79,6 +80,9 @@ export async function run(): Promise<void> {
     case "reset": reset(ctx); break;
     case "task": await task(ctx); break;
     case "chat": await chat(ctx); break;
+    case "run-record":
+    case "run-records":
+    case "runs": await runs(ctx); break;
     case "approval":
     case "approvals": await approval(ctx); break;
     case "memory": await memory(ctx); break;

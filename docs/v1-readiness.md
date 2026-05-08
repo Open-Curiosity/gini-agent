@@ -32,6 +32,7 @@ bun run gini evidence
 | --- | --- |
 | CLI task workflow | `gini task submit/list/show/retry/cancel` |
 | Local chat/session history | `gini chat new/send/sync/show/list`, `/api/chat` |
+| Execution runs | `gini runs list/show`, `/api/runs`; chat turns create durable runs with plan steps and compatibility task links |
 | Persistent memory | `gini memory list/add/edit/approve/reject/archive`, `/api/memory` |
 | Embeddings | In-process Transformers.js (`Xenova/all-MiniLM-L6-v2`, 384d) by default; OpenAI / echo are opt-in. `gini embedding status`, `gini embedding reembed [--bank ID] [--dry-run]`, `/api/embedding/{status,reembed}`. Cache lives at `~/.gini/models/`. Override via `GINI_EMBEDDING_PROVIDER=local\|openai\|echo` and `GINI_LOCAL_EMBEDDING_MODEL=<hf-id>`. |
 | Reranker | In-process cross-encoder (`Xenova/ms-marco-MiniLM-L-6-v2`, ~22M params, ~100MB) by default; echo / none are opt-in. `gini reranker status`, `/api/reranker/status`. Same `~/.gini/models/` cache. Override via `GINI_RERANKER_PROVIDER=local\|echo\|none`, `GINI_LOCAL_RERANKER_MODEL=<hf-id>`, `GINI_RERANKER_TOP_N=<int>`. |
@@ -61,6 +62,7 @@ V1 intentionally does not build the iOS/Expo app or production remote relay. It 
 - `/api/events/stream`
 - `/api/tasks`
 - `/api/chat`
+- `/api/runs`
 - `/api/approvals`
 - `/api/memory`
 - `/api/embedding/status`, `/api/embedding/reembed`

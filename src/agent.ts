@@ -30,9 +30,10 @@ import { fetchWeb } from "./tools/web";
 import { requestShell } from "./tools/terminal";
 import { requestCodeExecution } from "./tools/code";
 import { recall, retain } from "./domain/memory";
+import { updateRunFromTask } from "./domain/runs";
 
-export async function submitTask(config: RuntimeConfig, input: string, jobId?: string, parentTaskId?: string, subagentId?: string): Promise<Task> {
-  const created = createTask(config.instance, input, jobId, parentTaskId, subagentId);
+export async function submitTask(config: RuntimeConfig, input: string, jobId?: string, parentTaskId?: string, subagentId?: string, runId?: string): Promise<Task> {
+  const created = createTask(config.instance, input, jobId, parentTaskId, subagentId, runId);
   await mutateState(config.instance, (state) => {
     upsertTask(state, created);
     const audit = addAudit(state, {
@@ -41,10 +42,12 @@ export async function submitTask(config: RuntimeConfig, input: string, jobId?: s
       target: created.id,
       risk: "low",
       taskId: created.id,
-      evidence: { input, jobId, parentTaskId, subagentId }
+      runId,
+      evidence: { input, jobId, parentTaskId, subagentId, runId }
     });
     created.auditIds.push(audit.id);
   });
+  await updateRunFromTask(config, created);
   runTask(config, created.id).catch((error) => failTask(config, created.id, error));
   return created;
 }
@@ -52,7 +55,7 @@ export async function submitTask(config: RuntimeConfig, input: string, jobId?: s
 export async function retryTask(config: RuntimeConfig, taskId: string): Promise<Task> {
   const task = await mutateState(config.instance, (state) => {
     const existing = findTask(state, taskId);
-    const retry = createTask(config.instance, existing.input, existing.jobId, existing.parentTaskId, existing.subagentId);
+    const retry = createTask(config.instance, existing.input, existing.jobId, existing.parentTaskId, existing.subagentId, existing.runId);
     upsertTask(state, retry);
     addAudit(state, {
       actor: "user",
@@ -60,6 +63,7 @@ export async function retryTask(config: RuntimeConfig, taskId: string): Promise<
       target: retry.id,
       risk: "low",
       taskId: retry.id,
+      runId: retry.runId,
       evidence: { retriedTaskId: taskId }
     });
     return retry;
@@ -69,7 +73,7 @@ export async function retryTask(config: RuntimeConfig, taskId: string): Promise<
 }
 
 export async function cancelTask(config: RuntimeConfig, taskId: string): Promise<Task> {
-  return mutateState(config.instance, (state) => {
+  const task = await mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
     if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") return task;
     task.status = "cancelled";
@@ -80,11 +84,14 @@ export async function cancelTask(config: RuntimeConfig, taskId: string): Promise
       action: "task.cancelled",
       target: taskId,
       risk: "low",
-      taskId
+      taskId,
+      runId: task.runId
     });
     upsertTask(state, task);
     return task;
   });
+  await updateRunFromTask(config, task);
+  return task;
 }
 
 export async function runTask(config: RuntimeConfig, taskId: string): Promise<Task> {
@@ -96,6 +103,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     upsertTask(state, item);
     return item;
   });
+  await updateRunFromTask(config, task);
 
   appendTrace(config.instance, taskId, { type: "task", message: "Task started", data: { input: task.input } });
   appendLog(config.instance, "task.started", { taskId });
@@ -105,14 +113,14 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
 
   // Dispatch by input prefix. Each tool returns the resulting Task; high-risk
   // tools may have transitioned the task into waiting_approval.
-  if (lower.startsWith("write ")) return requestFileWrite(config, task);
-  if (lower.startsWith("patch ")) return requestFilePatch(config, task);
-  if (lower.startsWith("read ")) return readFile(config, task);
-  if (lower.startsWith("list ")) return listFiles(config, task);
-  if (lower.startsWith("find ")) return searchFiles(config, task);
-  if (lower.startsWith("web ")) return fetchWeb(config, task);
-  if (lower.startsWith("code ")) return requestCodeExecution(config, task);
-  if (lower.startsWith("shell ")) return requestShell(config, task);
+  if (lower.startsWith("write ")) return finishTaskTransition(config, await requestFileWrite(config, task));
+  if (lower.startsWith("patch ")) return finishTaskTransition(config, await requestFilePatch(config, task));
+  if (lower.startsWith("read ")) return finishTaskTransition(config, await readFile(config, task));
+  if (lower.startsWith("list ")) return finishTaskTransition(config, await listFiles(config, task));
+  if (lower.startsWith("find ")) return finishTaskTransition(config, await searchFiles(config, task));
+  if (lower.startsWith("web ")) return finishTaskTransition(config, await fetchWeb(config, task));
+  if (lower.startsWith("code ")) return finishTaskTransition(config, await requestCodeExecution(config, task));
+  if (lower.startsWith("shell ")) return finishTaskTransition(config, await requestShell(config, task));
 
   // No tool matched: fall through to provider summarization.
   const activeMemory = await mutateState(config.instance, (state) => state.memories.filter((memory) => memory.status === "active"));
@@ -187,6 +195,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   });
 
   appendTrace(config.instance, taskId, { type: "task", message: "Task completed", data: { summary: task.summary } });
+  await updateRunFromTask(config, task);
 
   // Hindsight phase 5: auto-retain. Run async and don't block task completion.
   // The extractor decides whether anything factual is in the input — we only
@@ -194,6 +203,11 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   // don't fail.
   void scheduleAutoRetain(config, task);
 
+  return task;
+}
+
+async function finishTaskTransition(config: RuntimeConfig, task: Task): Promise<Task> {
+  await updateRunFromTask(config, task);
   return task;
 }
 
@@ -232,7 +246,7 @@ function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
 
 export async function failTask(config: RuntimeConfig, taskId: string, error: unknown): Promise<void> {
   const message = error instanceof Error ? error.message : String(error);
-  await mutateState(config.instance, (state) => {
+  const task = await mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
     task.status = "failed";
     task.error = message;
@@ -244,10 +258,13 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
       target: taskId,
       risk: "low",
       taskId,
+      runId: task.runId,
       evidence: { error: message }
     });
+    return task;
   });
   appendTrace(config.instance, taskId, { type: "error", message, data: {} });
+  await updateRunFromTask(config, task);
 }
 
 // Shared between agent and tool modules. Tools that complete immediately
@@ -280,6 +297,7 @@ export async function completeLowRiskToolTask(
   });
   // Hindsight phase 5: auto-retain. Skip read/list/find — they're noise.
   void scheduleAutoRetain(config, completed);
+  await updateRunFromTask(config, completed);
   return completed;
 }
 
@@ -296,6 +314,7 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
       target: item.target,
       risk: item.risk,
       taskId: item.taskId,
+      runId: item.taskId ? state.tasks.find((task) => task.id === item.taskId)?.runId : undefined,
       approvalId: item.id
     });
     return item;
@@ -319,19 +338,22 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
     const target = assertInsideWorkspace(config.workspaceRoot, String(approval.payload.path));
     const before = existsSync(target) ? readFileSync(target, "utf8") : "";
     writeFileSync(target, String(approval.payload.content));
-    await mutateState(config.instance, (state) => {
+    const task = await mutateState(config.instance, (state) => {
       addAudit(state, {
         actor: "runtime",
         action: "file.write",
         target: String(approval.payload.path),
         risk: "high",
         taskId: approval.taskId,
+        runId: approval.taskId ? state.tasks.find((task) => task.id === approval.taskId)?.runId : undefined,
         approvalId: approval.id,
         evidence: { beforeBytes: before.length, afterBytes: String(approval.payload.content).length }
       });
       if (approval.taskId) completeApprovedTask(state, approval.taskId, "File write completed.");
+      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
     });
     if (approval.taskId) appendTrace(config.instance, approval.taskId, { type: "tool", message: "File written", data: { path: approval.payload.path } });
+    if (task) await updateRunFromTask(config, task);
     return;
   }
 
@@ -343,19 +365,22 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
     if (!before.includes(oldText)) throw new Error(`Patch target text no longer exists: ${approval.payload.path}`);
     const after = before.replace(oldText, newText);
     writeFileSync(target, after);
-    await mutateState(config.instance, (state) => {
+    const task = await mutateState(config.instance, (state) => {
       addAudit(state, {
         actor: "runtime",
         action: "file.patch",
         target: String(approval.payload.path),
         risk: "high",
         taskId: approval.taskId,
+        runId: approval.taskId ? state.tasks.find((task) => task.id === approval.taskId)?.runId : undefined,
         approvalId: approval.id,
         evidence: { diff: approval.payload.diff, beforeBytes: before.length, afterBytes: after.length }
       });
       if (approval.taskId) completeApprovedTask(state, approval.taskId, "File patch completed.");
+      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
     });
     if (approval.taskId) appendTrace(config.instance, approval.taskId, { type: "tool", message: "File patched", data: { path: approval.payload.path, diff: approval.payload.diff } });
+    if (task) await updateRunFromTask(config, task);
     return;
   }
 
@@ -378,13 +403,14 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
     const artifact = approval.taskId
       ? writeTerminalArtifact(config.instance, approval.taskId, approval.id, { stdout, stderr })
       : undefined;
-    await mutateState(config.instance, (state) => {
+    const task = await mutateState(config.instance, (state) => {
       addAudit(state, {
         actor: "runtime",
         action: "terminal.exec",
         target: command,
         risk: "high",
         taskId: approval.taskId,
+        runId: approval.taskId ? state.tasks.find((task) => task.id === approval.taskId)?.runId : undefined,
         approvalId: approval.id,
         evidence: {
           exitCode,
@@ -399,6 +425,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
         }
       });
       if (approval.taskId) completeApprovedTask(state, approval.taskId, exitCode === 0 ? "Command completed." : "Command failed.", exitCode === 0 ? undefined : stderr);
+      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
     });
     if (approval.taskId) {
       appendTrace(config.instance, approval.taskId, {
@@ -416,6 +443,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
         }
       });
     }
+    if (task) await updateRunFromTask(config, task);
   }
 }
 

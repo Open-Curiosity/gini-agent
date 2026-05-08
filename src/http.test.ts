@@ -570,6 +570,34 @@ describe("runtime api", () => {
     expect(readiness.ok).toBe(true);
     expect(readiness.checks.some((item: { id: string; status: string }) => item.id === "future_app_contracts" && item.status === "pass")).toBe(true);
   });
+
+  test("models chat work as conversation runs with plan steps and compatibility tasks", async () => {
+    const config = testConfig("conversation-runs");
+    const handler = createHandler(config);
+
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "Planful chat" })
+    });
+    const submitted = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "remember conversation runs are the execution layer" })
+    });
+    await waitForTask(handler, config, submitted.taskId);
+    await call(handler, config, `/api/chat/${session.id}/tasks/${submitted.taskId}/sync`, { method: "POST" });
+
+    const run = await call(handler, config, `/api/runs/${submitted.runId}`);
+    const chat = await call(handler, config, `/api/chat/${session.id}`);
+    const runs = await call(handler, config, "/api/runs");
+
+    expect(run.kind).toBe("conversation_turn");
+    expect(run.status).toBe("completed");
+    expect(run.task.id).toBe(submitted.taskId);
+    expect(run.planSteps.length).toBeGreaterThanOrEqual(2);
+    expect(chat.runIds).toContain(submitted.runId);
+    expect(chat.messages.some((message: { role: string; runId?: string }) => message.role === "assistant" && message.runId === submitted.runId)).toBe(true);
+    expect(runs.some((item: { id: string }) => item.id === submitted.runId)).toBe(true);
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

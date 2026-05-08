@@ -32,6 +32,7 @@ export function addAudit(
     action: audit.action,
     target: audit.target,
     taskId: audit.taskId,
+    runId: audit.runId,
     risk: audit.risk,
     summary: audit.action,
     data: audit.evidence
