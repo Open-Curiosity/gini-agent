@@ -116,34 +116,32 @@ export default function ChatPage() {
 
   return (
     <div className="flex flex-1 overflow-hidden">
-      <aside className="flex w-full shrink-0 flex-col border-b border-border bg-card/40 md:w-64 md:border-r md:border-b-0">
-        <div className="p-3">
-          <Button
-            className="w-full justify-start"
-            variant="outline"
+      <aside className="flex w-full shrink-0 flex-col border-b border-border md:w-[260px] md:border-r md:border-b-0">
+        <div className="p-2">
+          <button
+            className="flex h-9 w-full items-center gap-1.5 rounded-[10px] px-2.5 text-sm font-normal hover:bg-accent disabled:opacity-50"
             disabled={create.isPending}
             onClick={() => create.mutate()}
           >
-            <Plus className="size-4" />
-            New chat
-          </Button>
+            <Plus className="size-4" /> New chat
+          </button>
         </div>
         <ScrollArea className="flex-1">
           <div className="px-2 pb-3">
             {sortedSessions.length === 0 ? (
-              <p className="px-2 py-6 text-center text-xs text-muted-foreground">No chats yet</p>
+              <p className="px-2.5 py-3 text-xs text-muted-foreground">No chats yet</p>
             ) : (
-              <ul className="space-y-1">
+              <ul className="space-y-0.5">
                 {sortedSessions.map((s) => {
                   const isActive = selected === s.id;
                   return (
                     <li key={s.id}>
                       <button
                         onClick={() => setSelected(s.id)}
-                        className={`w-full truncate rounded-md px-3 py-2 text-left text-sm transition-colors ${
+                        className={`flex h-9 w-full items-center truncate rounded-[10px] px-2.5 text-sm font-normal transition-colors ${
                           isActive
                             ? "bg-accent text-foreground"
-                            : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+                            : "text-foreground/80 hover:bg-accent/60"
                         }`}
                       >
                         {s.title || "New chat"}
@@ -168,19 +166,18 @@ export default function ChatPage() {
           </div>
         ) : (
           <>
-            <header className="border-b border-border px-6 py-3">
+            <header className="sticky top-0 z-10 bg-background px-4 py-3">
               <h1 className="truncate text-base font-semibold">{session.data.title || "New chat"}</h1>
-              <p className="truncate font-mono text-[10px] text-muted-foreground">{session.data.id}</p>
             </header>
 
             <ScrollArea className="flex-1">
               <div className="mx-auto w-full max-w-3xl px-4 py-6">
                 {!messages || messages.length === 0 ? (
                   <div className="flex min-h-[40vh] items-center justify-center">
-                    <p className="text-sm text-muted-foreground">Send a message to start chatting</p>
+                    <h2 className="text-2xl font-semibold">What can I help with?</h2>
                   </div>
                 ) : (
-                  <ul className="space-y-4">
+                  <ul className="space-y-6">
                     {messages.map((message, index) => {
                       const isUser = message.role === "user";
                       const nextMessage = messages[index + 1];
@@ -195,28 +192,25 @@ export default function ChatPage() {
                         message.taskId &&
                         !hasPairedAssistant &&
                         (!linkedTask || !TERMINAL_TASK_STATUSES.has(linkedTask.status)) &&
-                        // Only show pending bubble if no assistant message immediately follows
                         (!nextMessage || nextMessage.role !== "assistant");
                       return (
                         <li key={message.id} className="space-y-2">
-                          <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-                            <div
-                              className={`max-w-[80%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm leading-relaxed ${
-                                isUser ? "bg-primary/10 text-foreground" : "bg-muted/40 text-foreground"
-                              }`}
-                            >
+                          {isUser ? (
+                            <div className="flex justify-end">
+                              <div className="max-w-[80%] whitespace-pre-wrap rounded-3xl bg-muted px-5 py-2.5 text-base leading-7">
+                                {message.content}
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="whitespace-pre-wrap text-base leading-7 text-foreground">
                               {message.content}
                             </div>
-                          </div>
+                          )}
                           {showPending ? (
-                            <div className="flex justify-start">
-                              <div className="rounded-2xl bg-muted/40 px-4 py-2 text-sm leading-relaxed">
-                                <span className="inline-flex gap-1">
-                                  <span className="size-1.5 animate-pulse rounded-full bg-muted-foreground/60 [animation-delay:0ms]" />
-                                  <span className="size-1.5 animate-pulse rounded-full bg-muted-foreground/60 [animation-delay:150ms]" />
-                                  <span className="size-1.5 animate-pulse rounded-full bg-muted-foreground/60 [animation-delay:300ms]" />
-                                </span>
-                              </div>
+                            <div className="flex items-center gap-1.5 py-2">
+                              <span className="size-2 animate-pulse rounded-full bg-muted-foreground/60 [animation-delay:0ms]" />
+                              <span className="size-2 animate-pulse rounded-full bg-muted-foreground/60 [animation-delay:150ms]" />
+                              <span className="size-2 animate-pulse rounded-full bg-muted-foreground/60 [animation-delay:300ms]" />
                             </div>
                           ) : null}
                         </li>
@@ -228,9 +222,9 @@ export default function ChatPage() {
               </div>
             </ScrollArea>
 
-            <div className="border-t border-border px-4 py-3">
+            <div className="px-4 pb-4 pt-2">
               <div className="mx-auto w-full max-w-3xl">
-                <div className="relative flex items-end rounded-2xl border border-border bg-card focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/40">
+                <div className="relative flex items-end rounded-[28px] bg-background p-2.5 shadow-[0_3px_6px_rgba(0,0,0,0.04),0_4px_80px_8px_rgba(0,0,0,0.04),0_0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_3px_6px_rgba(0,0,0,0.2),0_4px_80px_8px_rgba(0,0,0,0.2),0_0_0_1px_rgba(255,255,255,0.08)]">
                   <textarea
                     ref={textareaRef}
                     value={text}
@@ -238,11 +232,11 @@ export default function ChatPage() {
                     onKeyDown={handleKeyDown}
                     placeholder="Send a message…"
                     rows={1}
-                    className="max-h-[200px] flex-1 resize-none bg-transparent px-4 py-3 text-sm leading-relaxed outline-none placeholder:text-muted-foreground"
+                    className="max-h-[200px] flex-1 resize-none bg-transparent px-3 py-2 text-base leading-7 outline-none placeholder:text-muted-foreground"
                   />
                   <Button
                     size="icon-sm"
-                    className="m-2"
+                    className="m-2 rounded-full"
                     disabled={!text.trim() || send.isPending}
                     onClick={submit}
                     aria-label="Send"
