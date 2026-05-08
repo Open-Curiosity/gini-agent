@@ -73,7 +73,11 @@ describe("phase 5 — auto-retain on task completion", () => {
     expect(after).toBeGreaterThan(before);
   });
 
-  test("trivial inputs (under threshold) do not auto-retain", async () => {
+  test("inputs the extractor finds no facts in do not grow memory unit count", async () => {
+    // No length threshold — the extractor decides. When it returns an empty
+    // fact list, retain is a no-op: zero new memory units. This test was
+    // previously named "under threshold" but the threshold was removed so
+    // short personal-fact disclosures ("my name is X") aren't dropped.
     const instance = "phase5-skip-trivial";
     ensureDefaultBank(instance);
     setEchoStructuredResponse("fact-extraction", { facts: [] });

@@ -188,20 +188,22 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
 
   appendTrace(config.instance, taskId, { type: "task", message: "Task completed", data: { summary: task.summary } });
 
-  // Hindsight phase 5: auto-retain. Run async and don't block task
-  // completion. Skip trivial inputs (low information content) to keep cost
-  // sensible. Best-effort: log but don't fail.
+  // Hindsight phase 5: auto-retain. Run async and don't block task completion.
+  // The extractor decides whether anything factual is in the input — we only
+  // pre-skip obvious tool invocations (read/list/find). Best-effort: log but
+  // don't fail.
   void scheduleAutoRetain(config, task);
 
   return task;
 }
 
-const AUTO_RETAIN_MIN_INPUT_CHARS = 32;
-
 function shouldAutoRetain(task: Task): boolean {
+  // Read-only / low-risk tool calls don't carry retainable facts. Everything
+  // else goes through the extractor — which returns an empty fact list for
+  // non-factual inputs ("hi", "ok", "yes") at the cost of one structured-LLM
+  // call. We accept that cost so short personal-fact disclosures ("my name is
+  // shelden", "I prefer dark mode") aren't filtered out by a length heuristic.
   const lower = task.input.toLowerCase();
-  if (task.input.trim().length < AUTO_RETAIN_MIN_INPUT_CHARS) return false;
-  // Read-only / low-risk tool calls don't need to be retained as facts.
   if (lower.startsWith("read ") || lower.startsWith("list ") || lower.startsWith("find ")) return false;
   return true;
 }
