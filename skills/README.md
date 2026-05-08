@@ -1,0 +1,49 @@
+# Bundled Skills
+
+This directory ships with the runtime. Each subdirectory follows the
+Hermes-compatible shape:
+
+```
+skills/<category>/<skill-name>/SKILL.md
+```
+
+A `SKILL.md` is a markdown file with YAML frontmatter (`name`,
+`description`, `version`, `platforms`, `prerequisites`, …) followed by a
+markdown body that teaches the LLM when to use the skill, when not to use
+it, and which shell commands the skill wraps. The body is loaded on demand
+via the `read_skill` tool so the model only pays the token cost when it
+actually needs the skill.
+
+## Auto-load
+
+`loadSkillsFromDisk` runs at runtime boot and on `POST /api/skills/reload`.
+It walks this directory plus `~/.gini/instances/<instance>/skills/` and
+upserts each `SKILL.md` into runtime state. Skills are matched by `name`;
+re-running the loader bumps the numeric `version` when content changes
+without resetting user-set fields like `status`.
+
+## Auto-trust allowlist
+
+Vendored bundled skills in this directory are reviewed by maintainers, so
+the loader auto-trusts the following on first import (the demo flow can
+exercise them without the user clicking through `/api/skills/<id>/trust`):
+
+- `apple-notes`
+- `apple-reminders`
+
+A skill the user has explicitly disabled stays disabled across reloads.
+
+## Platform gating
+
+Skills with a `platforms:` frontmatter list that doesn't include the host
+platform are skipped at load time. The skipped reason is surfaced in the
+LoadReport returned from `loadSkillsFromDisk` and emitted as a `skill`
+runtime event.
+
+## Adding a new bundled skill
+
+1. Create `skills/<category>/<your-skill>/SKILL.md` with the frontmatter
+   shape used by the existing apple skills.
+2. Restart the runtime (or `curl -X POST /api/skills/reload`).
+3. The skill appears in the `/skills` page; trust it from the UI or via
+   `POST /api/skills/<id>/trust` to expose it to the agent loop.
