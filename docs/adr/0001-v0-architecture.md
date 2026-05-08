@@ -11,7 +11,7 @@ The master plan asks v0 to prove the installable local runtime, CLI, and local c
 ## Required Now
 
 - `gini` CLI commands for install, start, stop, status, doctor, reset, task, approval, memory, skill, job, connector, trace, audit, and smoke.
-- Runtime state is scoped by lane under `~/.gini/<lane>` by default.
+- Runtime state is scoped by lane under `~/.gini/lanes/<lane>` by default.
 - Runtime logs are scoped by lane under `~/.gini/logs/<lane>` by default.
 - Local API requires a bearer token stored in the lane config.
 - Tasks, traces, audit events, approvals, jobs, memories, skills, and demo connector records are persisted.

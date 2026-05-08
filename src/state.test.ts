@@ -71,7 +71,7 @@ describe("state primitives", () => {
     // survives even when N writers fire in parallel.
     const root = "/tmp/gini-state-locking-test";
     const lane = "store-locking" as const;
-    rmSync(`${root}/${lane}`, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
     process.env.GINI_STATE_ROOT = root;
     process.env.GINI_LOG_ROOT = `${root}-logs`;
 

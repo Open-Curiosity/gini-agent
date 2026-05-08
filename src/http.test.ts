@@ -600,16 +600,16 @@ async function rawCall(handler: ReturnType<typeof createHandler>, config: Runtim
 
 function testConfig(lane: string): RuntimeConfig {
   const root = "/tmp/gini-http-tests";
-  rmSync(`${root}/${lane}`, { recursive: true, force: true });
   process.env.GINI_STATE_ROOT = root;
   process.env.GINI_LOG_ROOT = `${root}-logs`;
+  rmSync(`${root}/lanes/${lane}`, { recursive: true, force: true });
   return {
     lane,
     port: 7337,
     token: "test-token",
     provider: { name: "echo", model: "gini-echo-v0" },
     workspaceRoot: "/tmp",
-    stateRoot: `${root}/${lane}`,
+    stateRoot: `${root}/lanes/${lane}`,
     logRoot: `${root}-logs/${lane}`
   };
 }

@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import type { Lane, RuntimeConfig } from "./types";
 
 // Per-lane default ports. Two installs on the same machine (different lanes,
@@ -58,8 +58,39 @@ export function baseLogRoot(): string {
     : join(homedir(), ".gini", "logs");
 }
 
+// All lane state lives under <baseStateRoot>/lanes/<lane>/ so wiping every
+// lane is a single rm -rf without touching the shared model cache or logs.
+export function lanesRoot(): string {
+  return join(baseStateRoot(), "lanes");
+}
+
 export function laneRoot(lane: Lane): string {
-  return join(baseStateRoot(), lane);
+  return join(lanesRoot(), lane);
+}
+
+// One-time migration of pre-`lanes/`-prefix lane directories. Old layout was
+// ~/.gini/<lane>/; new layout is ~/.gini/lanes/<lane>/. We detect a lane by
+// the presence of config.json so reserved children (logs, models, lanes
+// itself) are left alone. Idempotent: skips lanes that already moved.
+export function migrateLegacyLanePaths(): void {
+  const root = baseStateRoot();
+  if (!existsSync(root)) return;
+  const newLanesDir = lanesRoot();
+  let migrated = 0;
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    if (entry.name === "lanes" || entry.name === "logs" || entry.name === "models") continue;
+    const oldDir = join(root, entry.name);
+    if (!existsSync(join(oldDir, "config.json"))) continue;
+    const newDir = join(newLanesDir, entry.name);
+    if (existsSync(newDir)) continue;
+    mkdirSync(newLanesDir, { recursive: true });
+    renameSync(oldDir, newDir);
+    migrated += 1;
+  }
+  if (migrated > 0) {
+    process.stderr.write(`Migrated ${migrated} lane(s) from ~/.gini/<lane>/ to ~/.gini/lanes/<lane>/\n`);
+  }
 }
 
 export function ensureDir(path: string): void {
@@ -133,6 +164,7 @@ export function defaultConfig(lane: Lane): RuntimeConfig {
 }
 
 export function loadConfig(lane: Lane): RuntimeConfig {
+  migrateLegacyLanePaths();
   ensureDir(laneRoot(lane));
   ensureDir(traceDir(lane));
   ensureDir(logDir(lane));
@@ -150,10 +182,15 @@ export function loadConfig(lane: Lane): RuntimeConfig {
   const parsed = JSON.parse(readFileSync(path, "utf8")) as RuntimeConfig;
   const persistedRoot = parsed.workspaceRoot ? resolve(parsed.workspaceRoot) : "";
   const repoRoot = projectRoot();
-  const migratedWorkspaceRoot = persistedRoot && persistedRoot !== repoRoot
-    ? persistedRoot
-    : workspaceDir(lane);
-  const migrated = persistedRoot === repoRoot;
+  // Detect persisted paths from the pre-`lanes/` layout (anything that lives
+  // directly under baseStateRoot but NOT under lanes/). Re-derive to the new
+  // location instead of keeping the stale absolute path. Also rewrites the
+  // old repo-root default from earlier migrations.
+  const oldStyleLanePrefix = join(baseStateRoot(), lane) + "/";
+  const persistedIsOldStyle = persistedRoot.startsWith(oldStyleLanePrefix) || persistedRoot === join(baseStateRoot(), lane);
+  const persistedIsRepoRoot = persistedRoot === repoRoot;
+  const needsRewrite = persistedIsOldStyle || persistedIsRepoRoot || !persistedRoot;
+  const migratedWorkspaceRoot = needsRewrite ? workspaceDir(lane) : persistedRoot;
   const merged: RuntimeConfig = {
     ...defaultConfig(lane),
     ...parsed,
@@ -162,6 +199,6 @@ export function loadConfig(lane: Lane): RuntimeConfig {
     stateRoot: laneRoot(lane),
     logRoot: logDir(lane)
   };
-  if (migrated) writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`);
+  if (needsRewrite) writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`);
   return merged;
 }

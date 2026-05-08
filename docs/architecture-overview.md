@@ -109,23 +109,25 @@ For coding agents in worktrees: use `gini run`. For the personal-agent-on-your-M
 ## Where things live on disk
 
 ```
-~/.gini/<lane>/
-├── config.json         # lane config (port, token, provider, paths)
-├── state.json          # tasks, jobs, skills, approvals, audit, events, ...
-├── memory.db           # SQLite — four-network memory units, entities, links
-├── runtime.pid         # gateway PID (recorded on start)
-├── runtime.port        # gateway port (recorded after walk)
-├── web.pid             # Next.js PID
-├── web.port            # Next.js port
-├── traces/             # per-task trace files (one dir per task)
-├── snapshots/          # lane snapshots for promotion/rollback
-├── skills/             # skill definitions
-└── workspace/          # default workspace for file/terminal tools
-
-~/.gini/logs/<lane>/    # rotated logs
-
-~/.gini/models/         # Transformers.js model cache (shared across lanes)
+~/.gini/
+├── lanes/
+│   └── <lane>/
+│       ├── config.json         # lane config (port, token, provider, paths)
+│       ├── state.json          # tasks, jobs, skills, approvals, audit, events, ...
+│       ├── memory.db           # SQLite — four-network memory units, entities, links
+│       ├── runtime.pid         # gateway PID (recorded on start)
+│       ├── runtime.port        # gateway port (recorded after walk)
+│       ├── web.pid             # Next.js PID
+│       ├── web.port            # Next.js port
+│       ├── traces/             # per-task trace files (one dir per task)
+│       ├── snapshots/          # lane snapshots for promotion/rollback
+│       ├── skills/             # skill definitions
+│       └── workspace/          # default workspace for file/terminal tools
+├── logs/<lane>/                # rotated logs
+└── models/                     # Transformers.js model cache (shared across lanes)
 ```
+
+Cleanup is simple: `rm -rf ~/.gini/lanes/<lane>` removes one lane; `rm -rf ~/.gini/lanes` removes every lane while keeping the (potentially large) model cache and logs.
 
 ## Ports
 

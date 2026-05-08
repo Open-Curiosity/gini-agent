@@ -181,10 +181,12 @@ bun run gini smoke --lane codex-a --state-root /tmp/gini-codex-a --log-root /tmp
 By default, Gini stores per-lane state and logs under `~/.gini/`:
 
 ```text
-~/.gini/<lane>/             # config, state.json, memory.db, traces, snapshots, workspace
+~/.gini/lanes/<lane>/       # config, state.json, memory.db, traces, snapshots, workspace
 ~/.gini/logs/<lane>/         # rotated runtime logs
 ~/.gini/models/              # Transformers.js embedding/reranker model cache (shared across lanes)
 ```
+
+To wipe a single lane: `rm -rf ~/.gini/lanes/<lane>`. To wipe every lane while keeping the model cache and logs: `rm -rf ~/.gini/lanes`.
 
 For disposable development or tests, override those roots:
 

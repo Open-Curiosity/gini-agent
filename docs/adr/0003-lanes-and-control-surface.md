@@ -10,7 +10,7 @@ The master plan requires future dev/sandbox/production separation. v0 does not n
 
 ## Required Now
 
-- State paths are `~/.gini/<lane>/...`.
+- State paths are `~/.gini/lanes/<lane>/...`.
 - Log paths are `~/.gini/logs/<lane>/...`.
 - `GINI_STATE_ROOT` and `GINI_LOG_ROOT` can override paths for disposable tests.
 - `smoke` uses an ephemeral lane/root/port by default when no lane is supplied.

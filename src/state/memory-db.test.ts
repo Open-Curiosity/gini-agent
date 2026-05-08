@@ -22,7 +22,7 @@ import {
   MEMORY_SCHEMA_VERSION
 } from "./memory-db";
 import { resetLane } from "../domain/runtime";
-import { defaultConfig } from "../paths";
+import { defaultConfig, laneRoot } from "../paths";
 
 // All tests share an isolated state root so they don't touch ~/.gini.
 // Each test uses a unique lane name to avoid cross-test interference.
@@ -269,7 +269,7 @@ describe("memory-db schema and storage", () => {
 
   test("resetLane clears the memory DB and probe reports zero units", () => {
     const lane = "mem-reset";
-    const config = { ...defaultConfig(lane), stateRoot: join(ROOT, lane) };
+    const config = { ...defaultConfig(lane), stateRoot: laneRoot(lane) };
     ensureDefaultBank(lane);
     insertMemoryUnit(lane, { text: "to be wiped", network: "world" });
     expect(countMemoryUnits(lane)).toBe(1);
