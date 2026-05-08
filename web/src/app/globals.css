@@ -149,7 +149,7 @@
 .chat-markdown th, .chat-markdown td { border: 1px solid var(--color-border); padding: 0.25rem 0.5rem; }
 
 /* Streaming cursor */
-.streaming-cursor::after {
+.chat-markdown .streaming-cursor::after {
   content: "▉";
   display: inline;
   animation: cursor-blink 1s step-end infinite;

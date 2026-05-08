@@ -111,7 +111,7 @@ export function SessionItem({
               event.stopPropagation();
               onDelete();
             }}
-            className="ml-auto hidden size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive group-hover:flex"
+            className="ml-auto flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground opacity-0 outline-none transition-opacity hover:bg-destructive/10 hover:text-destructive focus-visible:opacity-100 focus-visible:ring-[3px] focus-visible:ring-ring/50 group-hover:opacity-100"
           >
             <X className="size-3" />
           </button>

@@ -1,7 +1,9 @@
+export type PhaseIndicatorPhase = "thinking" | "working" | "receiving";
+
 export function PhaseIndicator({
   phase
 }: {
-  phase: "thinking" | "working" | "receiving";
+  phase: PhaseIndicatorPhase;
 }) {
   const label = phase === "thinking" ? "Thinking" : phase === "working" ? "Working" : "Receiving";
   return (

@@ -1,7 +1,7 @@
 "use client";
 
-import { useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { Plus } from "lucide-react";
 import { toast } from "sonner";
@@ -9,10 +9,11 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Avatar } from "@/components/chat/Avatar";
 import { Composer } from "@/components/chat/Composer";
 import { MessageBubble } from "@/components/chat/MessageBubble";
-import { PhaseIndicator } from "@/components/chat/PhaseIndicator";
+import { PhaseIndicator, type PhaseIndicatorPhase } from "@/components/chat/PhaseIndicator";
 import { SessionItem } from "@/components/chat/SessionItem";
 import { api } from "@/lib/api";
 import {
+  useCancelTask,
   useChatSession,
   useChatSessions,
   useDeleteChatSession,
@@ -21,13 +22,19 @@ import {
 } from "@/lib/queries";
 import type { ChatMessage, ChatSession } from "@/lib/view-types";
 
-const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "waiting_approval"]);
+const TERMINAL_TASK_STATUSES = new Set([
+  "completed",
+  "failed",
+  "waiting_approval",
+  "cancelled"
+]);
 
 export default function ChatPage() {
   const sessions = useChatSessions();
   const params = useSearchParams();
+  const router = useRouter();
   const initial = params?.get("session") ?? null;
-  const [selected, setSelected] = useState<string | null>(initial);
+  const [selected, setSelectedState] = useState<string | null>(initial);
   const [text, setText] = useState("");
   const session = useChatSession(selected);
   const invalidate = useInvalidate();
@@ -36,10 +43,28 @@ export default function ChatPage() {
   // the current session view, so the polling effect doesn't refire sync on
   // every 3s tick once the task hits a terminal state.
   const syncedTaskIdsRef = useRef<Set<string>>(new Set());
+  // Apply the URL ?session= param ONCE on mount (and again only if the URL
+  // itself changes). Using `selected` as a dep would force the user back to
+  // the URL session every time they switch chats.
+  const appliedInitialRef = useRef(false);
+
+  // setSelected wrapper: also syncs ?session= via router.replace so the URL
+  // stays deep-linkable. Use replace (no history entry per click).
+  const setSelected = useCallback(
+    (id: string | null) => {
+      setSelectedState(id);
+      if (id) router.replace(`/chat?session=${id}`);
+      else router.replace("/chat");
+    },
+    [router]
+  );
 
   useEffect(() => {
-    if (initial && initial !== selected) setSelected(initial);
-  }, [initial, selected]);
+    if (!appliedInitialRef.current && initial) {
+      appliedInitialRef.current = true;
+      setSelectedState(initial);
+    }
+  }, [initial]);
 
   const orderedSessions = useMemo<ChatSession[]>(() => {
     const all = sessions.data ?? [];
@@ -57,7 +82,7 @@ export default function ChatPage() {
 
   useEffect(() => {
     if (!selected && orderedSessions.length > 0) setSelected(orderedSessions[0]!.id);
-  }, [selected, orderedSessions]);
+  }, [selected, orderedSessions, setSelected]);
 
   useEffect(() => {
     syncedTaskIdsRef.current = new Set();
@@ -95,6 +120,7 @@ export default function ChatPage() {
 
   const deleteSession = useDeleteChatSession();
   const renameSession = useRenameChatSession();
+  const cancel = useCancelTask();
 
   const messages = session.data?.messages;
   const tasks = session.data?.tasks;
@@ -127,19 +153,47 @@ export default function ChatPage() {
 
   const mainId = orderedSessions[0]?.id;
 
-  // Determine if a pending assistant reply is in-flight for this session.
-  const pendingPhase: "thinking" | null = useMemo(() => {
-    if (!messages || !tasks) return null;
+  const tasksById = useMemo(
+    () => new Map((tasks ?? []).map((t) => [t.id, t])),
+    [tasks]
+  );
+
+  // The "in-flight task" is the task linked to the latest user message that
+  // has no paired assistant message AND whose status is non-terminal.
+  const inflightTaskId: string | null = useMemo(() => {
+    if (!messages) return null;
     const last = messages[messages.length - 1];
     if (!last || last.role !== "user" || !last.taskId) return null;
     const hasAssistantForTask = messages.some(
       (m) => m.role === "assistant" && m.taskId === last.taskId
     );
     if (hasAssistantForTask) return null;
-    const task = tasks.find((t) => t.id === last.taskId);
+    const task = tasksById.get(last.taskId);
     if (task && TERMINAL_TASK_STATUSES.has(task.status)) return null;
-    return "thinking";
-  }, [messages, tasks]);
+    return last.taskId;
+  }, [messages, tasksById]);
+
+  // Determine the pending assistant phase from the in-flight task's status.
+  const pendingPhase: PhaseIndicatorPhase | null = useMemo(() => {
+    if (!inflightTaskId) return null;
+    const task = tasksById.get(inflightTaskId);
+    // No task record yet (just submitted) → "thinking".
+    if (!task) return "thinking";
+    if (task.status === "queued") return "thinking";
+    if (task.status === "running") return "working";
+    return null;
+  }, [inflightTaskId, tasksById]);
+
+  // The assistant message (if any) belonging to the in-flight task — its
+  // bubble shows the streaming cursor.
+  const streamingAssistantMessageId: string | null = useMemo(() => {
+    if (!inflightTaskId || !messages) return null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i]!;
+      if (m.role === "assistant" && m.taskId === inflightTaskId) return m.id;
+    }
+    return null;
+  }, [messages, inflightTaskId]);
 
   const handleDelete = (id: string) => {
     deleteSession.mutate(id, {
@@ -222,10 +276,13 @@ export default function ChatPage() {
                   <ul className="space-y-5">
                     {messages.map((message) => (
                       <li key={message.id}>
-                        <MessageBubble message={message} />
+                        <MessageBubble
+                          message={message}
+                          isStreaming={message.id === streamingAssistantMessageId}
+                        />
                       </li>
                     ))}
-                    {pendingPhase ? (
+                    {pendingPhase && !streamingAssistantMessageId ? (
                       <li>
                         <div className="flex items-start gap-2.5">
                           <Avatar />
@@ -245,7 +302,14 @@ export default function ChatPage() {
                   value={text}
                   onChange={setText}
                   onSubmit={submit}
-                  busy={send.isPending}
+                  busy={Boolean(inflightTaskId) || send.isPending}
+                  onStop={() => {
+                    if (inflightTaskId) {
+                      cancel.mutate(inflightTaskId, {
+                        onError: (error) => toast.error(error.message)
+                      });
+                    }
+                  }}
                   disabled={!selected}
                 />
               </div>

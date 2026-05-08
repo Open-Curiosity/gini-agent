@@ -182,6 +182,17 @@ export function useDeleteChatSession() {
   });
 }
 
+export function useCancelTask() {
+  const qc = useQueryClient();
+  return useMutation<Task, Error, string>({
+    mutationFn: (taskId: string) => api<Task>(`/tasks/${taskId}/cancel`, { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["chat"] });
+      qc.invalidateQueries({ queryKey: ["tasks"] });
+    }
+  });
+}
+
 export function useRenameChatSession() {
   const qc = useQueryClient();
   return useMutation<ChatSession, Error, { id: string; title: string }>({
