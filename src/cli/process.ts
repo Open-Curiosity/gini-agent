@@ -8,7 +8,7 @@
 
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { join } from "node:path";
 import type { RuntimeConfig } from "../types";
 import { install, status } from "../domain/runtime";
@@ -184,6 +184,17 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   const webRoot = join(projectRoot(), "web");
   if (!existsSync(join(webRoot, "package.json"))) {
     throw new Error("Web app not found at web/. Cannot start the Next.js control plane.");
+  }
+  // Worktrees and fresh clones don't have web/node_modules. Auto-install once
+  // so `gini run` / `gini start` works without a separate manual step. Detected
+  // by the presence of next's binary stub; a partial install (lockfile only)
+  // also triggers a re-install.
+  if (!existsSync(join(webRoot, "node_modules", ".bin", "next"))) {
+    process.stderr.write("Installing web dependencies (one-time)... \n");
+    const result = spawnSync("bun", ["install"], { cwd: webRoot, stdio: "inherit" });
+    if (result.status !== 0) {
+      throw new Error("Failed to install web dependencies. Run `cd web && bun install` manually.");
+    }
   }
   // We require the chosen port to be claimable BEFORE spawning. If
   // `availablePort` hands us a free port but a foreign process binds it
