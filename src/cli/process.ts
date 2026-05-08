@@ -9,6 +9,7 @@
 import { createWriteStream, existsSync, openSync, readFileSync, rmSync, writeFileSync, type WriteStream } from "node:fs";
 import { createServer } from "node:net";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { join } from "node:path";
 import type { RuntimeConfig } from "../types";
 import { install, status } from "../domain/runtime";
@@ -55,15 +56,35 @@ interface ChildLogPlumbing {
   onSpawned: (child: ChildProcess) => void;
 }
 
-function setupChildLog(instance: string, fileName: string, foreground: boolean): ChildLogPlumbing {
+// Foreground tee streams registered by setupChildLog so the run command can
+// await their `'finish'` event before `process.exit` — otherwise tail bytes
+// from a crashing child's stderr burst can be lost on signal-driven exits.
+const foregroundLogStreams: Set<WriteStream> = new Set();
+
+export async function awaitForegroundLogFlush(): Promise<void> {
+  // `'finish'` fires after `.end()` has flushed all queued writes. Streams that
+  // are already finished are skipped so we don't hang waiting for an event
+  // that's never coming.
+  await Promise.all(
+    [...foregroundLogStreams].map((stream) =>
+      stream.writableFinished ? Promise.resolve() : once(stream, "finish")
+    )
+  );
+}
+
+export function setupChildLog(instance: string, fileName: string, foreground: boolean): ChildLogPlumbing {
   const dir = logDir(instance);
   ensureDir(dir);
   const logPath = join(dir, fileName);
   if (foreground) {
     // Foreground: open a write stream and tee child.stdout/stderr to both the
-    // user's terminal and the log file. Stream is closed when the child exits
-    // so the tail is flushed and we don't leak FDs across instance restarts.
+    // user's terminal and the log file. Stream is closed when the child's stdio
+    // fully drains (`close` event) so the tail is flushed and we don't leak FDs
+    // across instance restarts. We register on the module-level Set so the run
+    // command can await `'finish'` before process.exit (see awaitForegroundLogFlush).
     const stream: WriteStream = createWriteStream(logPath, { flags: "a" });
+    foregroundLogStreams.add(stream);
+    stream.once("finish", () => { foregroundLogStreams.delete(stream); });
     return {
       stdio: ["inherit", "pipe", "pipe"],
       onSpawned: (child) => {
@@ -76,7 +97,10 @@ function setupChildLog(instance: string, fileName: string, foreground: boolean):
           stream.write(chunk);
         });
         const close = () => { try { stream.end(); } catch { /* ignore */ } };
-        child.once("exit", close);
+        // `close` (not `exit`) fires after stdio has fully drained. Using `exit`
+        // here let late `data` events arrive after the stream had been ended,
+        // which truncates the tail.
+        child.once("close", close);
         child.once("error", close);
       }
     };

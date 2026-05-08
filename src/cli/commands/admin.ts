@@ -3,6 +3,7 @@ import type { ChildProcess } from "node:child_process";
 import type { CliContext } from "../context";
 import { install, resetInstance, uninstallInstance } from "../../domain/runtime";
 import {
+  awaitForegroundLogFlush,
   doctor,
   isRunning,
   remoteOrLocalStatus,
@@ -152,5 +153,10 @@ export async function runForeground(ctx: CliContext): Promise<void> {
   }
 
   await done;
+  // Flush foreground log tee streams before exiting so the tail of a crashing
+  // child's output isn't lost on signal-driven exits (SIGINT/SIGTERM/SIGHUP /
+  // non-zero child exit). `process.exit` does not wait for write streams to
+  // finish, so we explicitly await `'finish'` on each registered stream.
+  await awaitForegroundLogFlush();
   if (exitCode !== 0) process.exit(exitCode);
 }
