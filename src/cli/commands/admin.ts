@@ -1,7 +1,7 @@
 // Lifecycle and instance-admin commands: install, start, stop, status, doctor, reset, run.
 import type { ChildProcess } from "node:child_process";
 import type { CliContext } from "../context";
-import { install, resetInstance } from "../../domain/runtime";
+import { install, resetInstance, uninstallInstance } from "../../domain/runtime";
 import {
   doctor,
   isRunning,
@@ -38,6 +38,15 @@ export async function doctorCmd(ctx: CliContext): Promise<void> {
 export function reset(ctx: CliContext): void {
   resetInstance(ctx.config);
   print({ reset: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot });
+}
+
+export async function uninstall(ctx: CliContext): Promise<void> {
+  // Stop the runtime first if it's running — otherwise removing stateRoot
+  // out from under a live process leaves the daemon writing to a deleted
+  // directory until it crashes.
+  if (await isRunning(ctx.config)) stopRuntime(ctx.config);
+  uninstallInstance(ctx.config);
+  print({ uninstalled: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot, logRoot: ctx.config.logRoot });
 }
 
 // Foreground twin of `start`. Runs the runtime (and optionally Next.js)

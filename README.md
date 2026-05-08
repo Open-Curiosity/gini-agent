@@ -181,12 +181,11 @@ bun run gini smoke --instance codex-a --state-root /tmp/gini-codex-a --log-root 
 By default, Gini stores per-instance state and logs under `~/.gini/`:
 
 ```text
-~/.gini/instances/<instance>/       # config, state.json, memory.db, traces, snapshots, workspace
-~/.gini/logs/<instance>/         # rotated runtime logs
-~/.gini/models/              # Transformers.js embedding/reranker model cache (shared across instances)
+~/.gini/instances/<instance>/       # config, state.json, memory.db, traces, snapshots, workspace, logs
+~/.gini/models/                     # Transformers.js embedding/reranker model cache (shared across instances)
 ```
 
-To wipe a single instance: `rm -rf ~/.gini/instances/<instance>`. To wipe every instance while keeping the model cache and logs: `rm -rf ~/.gini/instances`.
+To wipe a single instance: `bun run gini uninstall --instance <instance>` (or `rm -rf ~/.gini/instances/<instance>`). To wipe every instance while keeping the model cache: `rm -rf ~/.gini/instances`.
 
 For disposable development or tests, override those roots:
 

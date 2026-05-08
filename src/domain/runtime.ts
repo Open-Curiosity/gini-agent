@@ -63,3 +63,9 @@ export function resetInstance(config: RuntimeConfig): void {
   rmSync(config.stateRoot, { recursive: true, force: true });
   install(config);
 }
+
+export function uninstallInstance(config: RuntimeConfig): void {
+  closeMemoryDb(config.instance);
+  rmSync(config.stateRoot, { recursive: true, force: true });
+  rmSync(config.logRoot, { recursive: true, force: true });
+}

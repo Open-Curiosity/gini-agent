@@ -52,10 +52,10 @@ export function baseStateRoot(): string {
     : join(homedir(), ".gini");
 }
 
-export function baseLogRoot(): string {
-  return process.env.GINI_LOG_ROOT
-    ? resolve(process.env.GINI_LOG_ROOT)
-    : join(homedir(), ".gini", "logs");
+// Only honored when GINI_LOG_ROOT is set (tests / non-default deployments). The
+// default layout nests logs inside the instance dir — see logDir().
+export function baseLogRoot(): string | undefined {
+  return process.env.GINI_LOG_ROOT ? resolve(process.env.GINI_LOG_ROOT) : undefined;
 }
 
 // All instance state lives under <baseStateRoot>/instances/<instance>/ so wiping every
@@ -130,6 +130,32 @@ export function migrateLegacyInstancePaths(): void {
   if (migratedFromLanes > 0) {
     process.stderr.write(`Migrated ${migratedFromLanes} instance(s) from ~/.gini/lanes/<name>/ to ~/.gini/instances/<name>/\n`);
   }
+
+  // Layout (3): logs used to live at ~/.gini/logs/<name>/ alongside instances/.
+  // We now nest them inside the instance dir so a single rm -rf cleans up
+  // everything for an instance. Skip if GINI_LOG_ROOT is set (the user opted
+  // into a custom log root and we don't touch it).
+  if (process.env.GINI_LOG_ROOT) return;
+  const oldLogsDir = join(root, "logs");
+  if (!existsSync(oldLogsDir)) return;
+  let migratedLogs = 0;
+  for (const entry of readdirSync(oldLogsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const oldDir = join(oldLogsDir, entry.name);
+    const newDir = join(newInstancesDir, entry.name, "logs");
+    if (existsSync(newDir)) continue;
+    mkdirSync(join(newInstancesDir, entry.name), { recursive: true });
+    renameSync(oldDir, newDir);
+    migratedLogs += 1;
+  }
+  try {
+    if (readdirSync(oldLogsDir).length === 0) rmdirSync(oldLogsDir);
+  } catch {
+    // best-effort cleanup
+  }
+  if (migratedLogs > 0) {
+    process.stderr.write(`Migrated ${migratedLogs} instance log dir(s) from ~/.gini/logs/<name>/ to ~/.gini/instances/<name>/logs/\n`);
+  }
 }
 
 export function ensureDir(path: string): void {
@@ -165,8 +191,12 @@ export function traceDir(instance: Instance): string {
   return join(instanceRoot(instance), "traces");
 }
 
+// Logs nest under the instance dir by default so a single `rm -rf
+// ~/.gini/instances/<name>/` removes everything for that instance. Tests and
+// custom deployments can still pin GINI_LOG_ROOT to keep logs separate.
 export function logDir(instance: Instance): string {
-  return join(baseLogRoot(), instance);
+  const overrideRoot = baseLogRoot();
+  return overrideRoot ? join(overrideRoot, instance) : join(instanceRoot(instance), "logs");
 }
 
 export function skillsDir(instance: Instance): string {

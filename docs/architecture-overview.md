@@ -122,12 +122,12 @@ For coding agents in worktrees: use `gini run`. For the personal-agent-on-your-M
 │       ├── traces/             # per-task trace files (one dir per task)
 │       ├── snapshots/          # instance snapshots for promotion/rollback
 │       ├── skills/             # skill definitions
-│       └── workspace/          # default workspace for file/terminal tools
-├── logs/<instance>/                # rotated logs
+│       ├── workspace/          # default workspace for file/terminal tools
+│       └── logs/               # rotated runtime logs
 └── models/                     # Transformers.js model cache (shared across instances)
 ```
 
-Cleanup is simple: `rm -rf ~/.gini/instances/<instance>` removes one instance; `rm -rf ~/.gini/instances` removes every instance while keeping the (potentially large) model cache and logs.
+Cleanup is simple: `gini uninstall --instance <instance>` (or `rm -rf ~/.gini/instances/<instance>`) removes one instance; `rm -rf ~/.gini/instances` removes every instance while keeping the (potentially large) shared model cache.
 
 ## Ports
 

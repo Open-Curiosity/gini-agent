@@ -36,7 +36,7 @@ import { audit } from "./commands/audit";
 import { events } from "./commands/events";
 import { evidence } from "./commands/evidence";
 import { smoke } from "./commands/smoke";
-import { doctorCmd, install_, reset, runForeground, start, statusCmd, stop } from "./commands/admin";
+import { doctorCmd, install_, reset, runForeground, start, statusCmd, stop, uninstall } from "./commands/admin";
 
 export async function run(): Promise<void> {
   const args = Bun.argv.slice(2);
@@ -70,6 +70,7 @@ export async function run(): Promise<void> {
 
   switch (command) {
     case "install": await install_(ctx); break;
+    case "uninstall": await uninstall(ctx); break;
     case "start": await start(ctx); break;
     case "run": await runForeground(ctx); break;
     case "stop": stop(ctx); break;

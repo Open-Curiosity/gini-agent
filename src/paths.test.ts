@@ -53,13 +53,20 @@ describe("default port helpers", () => {
 describe("legacy on-disk layout migration", () => {
   function withTempStateRoot<T>(fn: (root: string) => T): T {
     const root = mkdtempSync(join(tmpdir(), "gini-paths-"));
-    const previous = process.env.GINI_STATE_ROOT;
+    const previousState = process.env.GINI_STATE_ROOT;
+    const previousLog = process.env.GINI_LOG_ROOT;
     process.env.GINI_STATE_ROOT = root;
+    // Other test files (state.test.ts) set GINI_LOG_ROOT and don't always
+    // unset it; that leak makes the nested-logs migration here a no-op
+    // because the migration step skips when GINI_LOG_ROOT is set.
+    delete process.env.GINI_LOG_ROOT;
     try {
       return fn(root);
     } finally {
-      if (previous === undefined) delete process.env.GINI_STATE_ROOT;
-      else process.env.GINI_STATE_ROOT = previous;
+      if (previousState === undefined) delete process.env.GINI_STATE_ROOT;
+      else process.env.GINI_STATE_ROOT = previousState;
+      if (previousLog === undefined) delete process.env.GINI_LOG_ROOT;
+      else process.env.GINI_LOG_ROOT = previousLog;
       rmSync(root, { recursive: true, force: true });
     }
   }
@@ -131,6 +138,27 @@ describe("legacy on-disk layout migration", () => {
       migrateLegacyInstancePaths();
 
       expect(existsSync(newDir)).toBe(true);
+    });
+  });
+
+  test("moves ~/.gini/logs/<name>/ into instances/<name>/logs/", () => {
+    withTempStateRoot((root) => {
+      // Pre-existing instance dir + an old top-level logs/<name> dir with a
+      // log file inside. Migration should move the contents under instances/.
+      const instanceDir = join(root, "instances", "dev");
+      mkdirSync(instanceDir, { recursive: true });
+      const oldLogs = join(root, "logs", "dev");
+      mkdirSync(oldLogs, { recursive: true });
+      writeFileSync(join(oldLogs, "runtime.log"), "line one\n");
+
+      migrateLegacyInstancePaths();
+
+      const newLogs = join(instanceDir, "logs");
+      expect(existsSync(newLogs)).toBe(true);
+      expect(readFileSync(join(newLogs, "runtime.log"), "utf8")).toBe("line one\n");
+      expect(existsSync(oldLogs)).toBe(false);
+      // Empty top-level logs/ shell is removed.
+      expect(existsSync(join(root, "logs"))).toBe(false);
     });
   });
 
