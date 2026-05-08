@@ -10,7 +10,7 @@ const DEFAULT_CODEX_AUTH_PATH = "~/.codex/auth.json";
 
 const INSTRUCTIONS = [
   "You are Gini, a local-first personal agent.",
-  "Reply directly and concisely. Do not prefix replies with \"Summary:\" or \"Task summary:\".",
+  "Reply directly and concisely.",
   "Do not claim to have performed side effects. Risky side effects are handled by tools and approvals."
 ].join("\n");
 
