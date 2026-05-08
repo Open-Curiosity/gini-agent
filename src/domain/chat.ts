@@ -1,7 +1,24 @@
 import { submitTask } from "../agent";
-import { createChatMessage, createChatSession, mutateState, readState } from "../state";
-import type { RuntimeConfig } from "../types";
+import {
+  createChatMessage,
+  createChatSession,
+  deleteChatSession,
+  mutateState,
+  readState,
+  renameChatSession
+} from "../state";
+import type { ChatMessageRecord, RuntimeConfig, TaskStatus } from "../types";
 import { createConversationRun, linkRunToTask } from "./runs";
+
+// Statuses where a task is no longer producing partial text. Once a task
+// reaches one of these, the synthesized streaming message is dropped in
+// favor of the synced assistant message (or task error).
+const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "waiting_approval"
+]);
 
 export function listChatSessions(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -16,10 +33,46 @@ export function getChatSession(config: RuntimeConfig, id: string) {
   const state = readState(config.instance);
   const session = state.chatSessions.find((item) => item.id === id);
   if (!session) throw new Error(`Chat session not found: ${id}`);
+
+  const stored = state.chatMessages.filter((message) => message.sessionId === id);
+  const tasks = state.tasks.filter((task) => session.taskIds.includes(task.id));
+
+  // Synthesize transient streaming assistant messages: any in-flight task
+  // with partialSummary that doesn't yet have a synced assistant message
+  // gets a virtual ChatMessageRecord so the chat UI sees text mid-flight.
+  // Once the real synced message arrives, this branch is skipped and the
+  // synthesized one disappears — the caller never sees both for the same
+  // task.
+  const syncedAssistantTaskIds = new Set(
+    stored.filter((m) => m.role === "assistant" && m.taskId).map((m) => m.taskId as string)
+  );
+  const synthetic: ChatMessageRecord[] = [];
+  for (const task of tasks) {
+    if (TERMINAL_TASK_STATUSES.has(task.status)) continue;
+    if (!task.partialSummary) continue;
+    if (syncedAssistantTaskIds.has(task.id)) continue;
+    synthetic.push({
+      // Stable id so React's keying stays consistent across polls; switches
+      // to the real msg_* id once the task completes and sync runs.
+      id: `${task.id}-streaming`,
+      instance: state.instance,
+      sessionId: id,
+      role: "assistant",
+      content: task.partialSummary,
+      taskId: task.id,
+      runId: task.runId,
+      createdAt: task.updatedAt
+    });
+  }
+
+  const messages = synthetic.length === 0
+    ? stored
+    : [...stored, ...synthetic].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
   return {
     ...session,
-    messages: state.chatMessages.filter((message) => message.sessionId === id),
-    tasks: state.tasks.filter((task) => session.taskIds.includes(task.id)),
+    messages,
+    tasks,
     runs: state.runs.filter((run) => session.runIds.includes(run.id)).map((run) => ({
       ...run,
       planSteps: state.planSteps.filter((step) => step.runId === run.id)
@@ -29,6 +82,16 @@ export function getChatSession(config: RuntimeConfig, id: string) {
 
 export async function createChat(config: RuntimeConfig, input: Record<string, unknown>) {
   return mutateState(config.instance, (state) => createChatSession(state, String(input.title ?? "New chat")));
+}
+
+export async function deleteChat(config: RuntimeConfig, id: string) {
+  await mutateState(config.instance, (state) => deleteChatSession(state, id));
+  return { ok: true };
+}
+
+export async function renameChat(config: RuntimeConfig, id: string, input: Record<string, unknown>) {
+  const title = String(input.title ?? "");
+  return mutateState(config.instance, (state) => renameChatSession(state, id, title));
 }
 
 export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {

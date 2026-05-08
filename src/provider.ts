@@ -124,7 +124,8 @@ export async function generateTaskSummary(
   config: RuntimeConfig,
   input: string,
   memories: MemoryRecord[],
-  recalledContext?: string
+  recalledContext?: string,
+  onDelta?: (text: string) => void
 ): Promise<ProviderResult> {
   const provider = normalizeProvider(config.provider);
   if (provider.name === "echo") {
@@ -139,7 +140,7 @@ export async function generateTaskSummary(
   if (provider.name === "openrouter" || provider.name === "local") {
     return callChatCompletions(provider, input, systemContext);
   }
-  return callOpenAIResponses(provider, input, systemContext);
+  return callOpenAIResponses(provider, input, systemContext, onDelta);
 }
 
 // Hindsight phase 2 — structured-output helper.
@@ -377,7 +378,12 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   };
 }
 
-async function callOpenAIResponses(provider: ProviderConfig, input: string, systemContext: string): Promise<ProviderResult> {
+async function callOpenAIResponses(
+  provider: ProviderConfig,
+  input: string,
+  systemContext: string,
+  onDelta?: (text: string) => void
+): Promise<ProviderResult> {
   const bearer = provider.name === "codex" ? readCodexBearer(provider) : readOpenAIBearer(provider);
   const headers = provider.name === "codex" ? codexHeaders(bearer) : {};
 
@@ -407,7 +413,7 @@ async function callOpenAIResponses(provider: ProviderConfig, input: string, syst
   });
 
   if (isCodex) {
-    return readCodexStream(response, provider);
+    return readCodexStream(response, provider, onDelta);
   }
 
   const rawPayload = await response.text();
@@ -461,32 +467,82 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
   };
 }
 
-async function readCodexStream(response: Response, provider: ProviderConfig): Promise<ProviderResult> {
-  const raw = await response.text();
+async function readCodexStream(
+  response: Response,
+  provider: ProviderConfig,
+  onDelta?: (text: string) => void
+): Promise<ProviderResult> {
   if (!response.ok) {
+    // Error path: drain the body fully so we can surface the API's error
+    // message. Streaming codex endpoints sometimes return JSON for errors.
+    const raw = await response.text();
     const payload = parseJsonObject(raw);
     const fallback = raw.slice(0, 500) || `Codex API request failed with HTTP ${response.status}`;
     const error = readOpenAIError(payload) ?? fallback;
     throw new Error(error);
   }
 
-  const events = parseSseEvents(raw);
+  const body = response.body;
+  if (!body) {
+    throw new Error("Codex stream returned no response body.");
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
   const deltaTextParts: string[] = [];
   const finalTextParts: string[] = [];
   let responseId: string | undefined;
   let usage: Record<string, unknown> | undefined;
-  for (const event of events) {
-    const payload = parseJsonObject(event.data);
+
+  // Consume the SSE stream incrementally. Each event is delimited by `\n\n`;
+  // we split off complete events from the rolling buffer and push the rest
+  // back. `delta` events fire `onDelta` so callers can surface partial text
+  // to UI. The full response text is still returned at the end so the
+  // existing ProviderResult contract holds.
+  const handleEvent = (block: string): void => {
+    const lines = block.split(/\r?\n/);
+    const dataLines = lines.filter((line) => line.startsWith("data:"));
+    if (dataLines.length === 0) return;
+    const data = dataLines.map((line) => line.slice("data:".length).trim()).join("\n");
+    if (!data || data === "[DONE]") return;
+    const payload = parseJsonObject(data);
     if (!responseId && typeof payload.response_id === "string") responseId = payload.response_id;
     if (!responseId && isRecord(payload.response) && typeof payload.response.id === "string") responseId = payload.response.id;
     if (isRecord(payload.response) && isRecord(payload.response.usage)) usage = payload.response.usage;
-    if (typeof payload.delta === "string") deltaTextParts.push(payload.delta);
+    if (typeof payload.delta === "string") {
+      deltaTextParts.push(payload.delta);
+      if (onDelta) {
+        try {
+          onDelta(payload.delta);
+        } catch {
+          // onDelta is fire-and-forget for UI updates; never let it abort
+          // the stream consumer.
+        }
+      }
+    }
     if (isRecord(payload.item) && Array.isArray(payload.item.content)) {
       for (const content of payload.item.content) {
         if (isRecord(content) && typeof content.text === "string") finalTextParts.push(content.text);
       }
     }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (value) buffer += decoder.decode(value, { stream: true });
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      if (block.trim().length > 0) handleEvent(block);
+      boundary = buffer.indexOf("\n\n");
+    }
+    if (done) break;
   }
+  // Flush any trailing event that wasn't followed by a blank-line terminator.
+  buffer += decoder.decode();
+  if (buffer.trim().length > 0) handleEvent(buffer);
 
   const text = (deltaTextParts.length > 0 ? deltaTextParts.join("") : finalTextParts.join("")).trim();
   if (!text) {
@@ -500,21 +556,6 @@ async function readCodexStream(response: Response, provider: ProviderConfig): Pr
     usage,
     cost: estimateCost(provider, usage)
   };
-}
-
-function parseSseEvents(raw: string): Array<{ event?: string; data: string }> {
-  return raw
-    .split(/\n\n+/)
-    .map((block) => {
-      const lines = block.split(/\r?\n/);
-      const eventLine = lines.find((line) => line.startsWith("event:"));
-      const dataLines = lines.filter((line) => line.startsWith("data:"));
-      return {
-        event: eventLine?.slice("event:".length).trim(),
-        data: dataLines.map((line) => line.slice("data:".length).trim()).join("\n")
-      };
-    })
-    .filter((event) => event.data && event.data !== "[DONE]");
 }
 
 function codexHeaders(accessToken: string): Record<string, string> {

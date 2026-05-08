@@ -130,6 +130,11 @@ export interface Task {
   updatedAt: string;
   currentStep?: string;
   summary?: string;
+  // Live partial assistant text streamed from the provider while the task is
+  // running. Cleared/ignored once `summary` is set on completion. Surfaced to
+  // the chat UI as a synthesized streaming assistant message so the user sees
+  // text mid-flight instead of waiting for the buffered final response.
+  partialSummary?: string;
   error?: string;
   tracePath: string;
   auditIds: string[];
