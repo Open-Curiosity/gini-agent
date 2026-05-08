@@ -68,16 +68,9 @@ export default function ChatPage() {
 
   const orderedSessions = useMemo<ChatSession[]>(() => {
     const all = sessions.data ?? [];
-    if (all.length === 0) return [];
-    const sortedByCreatedAt = [...all].sort((a, b) =>
-      (a.createdAt ?? "").localeCompare(b.createdAt ?? "")
+    return [...all].sort((a, b) =>
+      (b.updatedAt ?? b.createdAt).localeCompare(a.updatedAt ?? a.createdAt)
     );
-    const main = sortedByCreatedAt[0];
-    if (!main) return [];
-    const rest = sortedByCreatedAt
-      .slice(1)
-      .sort((a, b) => (b.updatedAt ?? b.createdAt).localeCompare(a.updatedAt ?? a.createdAt));
-    return [main, ...rest];
   }, [sessions.data]);
 
   useEffect(() => {
@@ -150,8 +143,6 @@ export default function ChatPage() {
     if (!trimmed || send.isPending || !selected) return;
     send.mutate(trimmed);
   };
-
-  const mainId = orderedSessions[0]?.id;
 
   const tasksById = useMemo(
     () => new Map((tasks ?? []).map((t) => [t.id, t])),
@@ -241,7 +232,6 @@ export default function ChatPage() {
                     key={s.id}
                     session={s}
                     isActive={selected === s.id}
-                    isMain={s.id === mainId}
                     onSelect={() => setSelected(s.id)}
                     onDelete={() => handleDelete(s.id)}
                     onRename={(title) => handleRename(s.id, title)}

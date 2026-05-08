@@ -9,7 +9,6 @@ import { formatRelativeTime } from "./relative-time";
 export interface SessionItemProps {
   session: ChatSession;
   isActive: boolean;
-  isMain: boolean;
   onSelect: () => void;
   onDelete: () => void;
   onRename: (title: string) => void;
@@ -18,7 +17,6 @@ export interface SessionItemProps {
 export function SessionItem({
   session,
   isActive,
-  isMain,
   onSelect,
   onDelete,
   onRename
@@ -52,7 +50,7 @@ export function SessionItem({
   };
 
   const label = (() => {
-    const raw = session.title?.trim() || (isMain ? "Main" : "New chat");
+    const raw = session.title?.trim() || "New chat";
     return raw.length <= 50 ? raw : `${raw.slice(0, 50)}...`;
   })();
 
@@ -91,11 +89,6 @@ export function SessionItem({
             className="flex min-w-0 flex-1 items-center gap-2 truncate text-left"
           >
             <span className="truncate">{label}</span>
-            {isMain ? (
-              <span className="rounded bg-muted px-1 py-px text-[9px] font-medium leading-tight text-muted-foreground">
-                Main
-              </span>
-            ) : null}
           </button>
         )}
         {!editing && time ? (
@@ -103,7 +96,7 @@ export function SessionItem({
             {time}
           </span>
         ) : null}
-        {!editing && !isMain ? (
+        {!editing ? (
           <button
             type="button"
             aria-label="Delete chat"
