@@ -213,6 +213,10 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     skill.successCount ??= 0;
     skill.failureCount ??= 0;
     skill.previousVersions ??= [];
+    // Filesystem skill loader (Slice 2) introduced these fields. Records
+    // persisted before the loader landed don't carry them — backfill with
+    // safe defaults so consumers can rely on `body` being a string.
+    skill.body ??= "";
   }
   for (const job of state.jobs) {
     job.deliveryTargets ??= [];

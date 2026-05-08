@@ -514,6 +514,25 @@ export interface SkillRecord {
   successCount: number;
   failureCount: number;
   previousVersions: SkillVersion[];
+  // Filesystem-loaded skills carry their full markdown body (the part of the
+  // SKILL.md file after the YAML frontmatter). Legacy CRUD-created skills
+  // default to "" — present-but-empty so callers can rely on the field being
+  // a string. The body is what gets fed back to the model when it asks to
+  // "read" the skill via the read_skill tool.
+  body: string;
+  // Origin file path (absolute) for skills loaded from disk. Useful for
+  // traceability and re-load detection. Optional because legacy
+  // user-CRUD-authored skills don't have a source file.
+  manifestPath?: string;
+  // Parent directory name for filesystem-loaded skills (e.g. "apple" for
+  // skills/apple/apple-notes/SKILL.md). Used as a UI grouping hint.
+  category?: string;
+  // Frontmatter `platforms` list (e.g. ["macos"]). Skills are skipped at
+  // load time when the host platform isn't in this list.
+  platforms?: string[];
+  // Frontmatter `prerequisites`. We keep `commands` and `env` as strings —
+  // strings the LLM can later inspect or check via terminal_exec.
+  prerequisites?: { commands?: string[]; env?: string[] };
 }
 
 export interface SkillVersion {
