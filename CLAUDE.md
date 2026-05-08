@@ -1,3 +1,5 @@
+@AGENTS.md
+
 # Runtime logs
 
 Gini captures every spawned child's stdio into log files under
