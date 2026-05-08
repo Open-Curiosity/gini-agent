@@ -172,6 +172,38 @@ export function createChatSession(state: RuntimeState, title: string): ChatSessi
   return session;
 }
 
+export function deleteChatSession(state: RuntimeState, id: string): ChatSessionRecord {
+  const index = state.chatSessions.findIndex((item) => item.id === id);
+  if (index < 0) throw new Error(`Chat session not found: ${id}`);
+  const session = state.chatSessions[index]!;
+  state.chatSessions.splice(index, 1);
+  state.chatMessages = state.chatMessages.filter((message) => message.sessionId !== id);
+  appendEvent(state, {
+    kind: "task",
+    action: "chat.session.deleted",
+    target: id,
+    risk: "low",
+    summary: `Chat session deleted: ${session.title}`
+  });
+  return session;
+}
+
+export function renameChatSession(state: RuntimeState, id: string, title: string): ChatSessionRecord {
+  const session = state.chatSessions.find((item) => item.id === id);
+  if (!session) throw new Error(`Chat session not found: ${id}`);
+  const trimmed = title.trim();
+  session.title = (trimmed ? trimmed.slice(0, 80) : "") || "Untitled chat";
+  session.updatedAt = now();
+  appendEvent(state, {
+    kind: "task",
+    action: "chat.session.renamed",
+    target: session.id,
+    risk: "low",
+    summary: `Chat session renamed: ${session.title}`
+  });
+  return session;
+}
+
 export function createChatMessage(
   state: RuntimeState,
   message: Omit<ChatMessageRecord, "id" | "instance" | "createdAt">

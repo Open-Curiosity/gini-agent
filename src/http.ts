@@ -25,7 +25,7 @@ import { createProfile, listProfiles, useProfile } from "./domain/profiles";
 import { hermesParityChecks } from "./domain/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./domain/relay";
 import { createSkillFromInput, getSkill, listSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./domain/skills";
-import { createChat, getChatSession, listChatSessions, submitChatMessage, syncChatTaskResult } from "./domain/chat";
+import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./domain/chat";
 import { v1Readiness } from "./domain/readiness";
 import { getRun, listRuns } from "./domain/runs";
 
@@ -39,6 +39,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/chat$/, () => json(listChatSessions(config))],
     ["POST", /^\/api\/chat$/, async (request) => json(await createChat(config, await body(request)), 201)],
     ["GET", /^\/api\/chat\/([^/]+)$/, (_request, params) => json(getChatSession(config, params[0]))],
+    ["DELETE", /^\/api\/chat\/([^/]+)$/, async (_request, params) => { await deleteChat(config, params[0]); return json({ ok: true }); }],
+    ["PATCH", /^\/api\/chat\/([^/]+)$/, async (request, params) => json(await renameChat(config, params[0], await body(request)))],
     ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],

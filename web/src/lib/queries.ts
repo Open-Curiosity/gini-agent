@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
-import { useQuery, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import type {
   Approval,
@@ -169,6 +169,27 @@ export function useChatSession(id: string | null) {
     queryFn: () => api<ChatSessionDetail>(`/chat/${id}`),
     enabled: Boolean(id),
     refetchInterval: 3000
+  });
+}
+
+export function useDeleteChatSession() {
+  const qc = useQueryClient();
+  return useMutation<{ ok: true }, Error, string>({
+    mutationFn: (id: string) => api<{ ok: true }>(`/chat/${id}`, { method: "DELETE" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["chat"] });
+    }
+  });
+}
+
+export function useRenameChatSession() {
+  const qc = useQueryClient();
+  return useMutation<ChatSession, Error, { id: string; title: string }>({
+    mutationFn: ({ id, title }) =>
+      api<ChatSession>(`/chat/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["chat"] });
+    }
   });
 }
 

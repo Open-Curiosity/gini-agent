@@ -1,5 +1,12 @@
 import { submitTask } from "../agent";
-import { createChatMessage, createChatSession, mutateState, readState } from "../state";
+import {
+  createChatMessage,
+  createChatSession,
+  deleteChatSession,
+  mutateState,
+  readState,
+  renameChatSession
+} from "../state";
 import type { RuntimeConfig } from "../types";
 import { createConversationRun, linkRunToTask } from "./runs";
 
@@ -29,6 +36,16 @@ export function getChatSession(config: RuntimeConfig, id: string) {
 
 export async function createChat(config: RuntimeConfig, input: Record<string, unknown>) {
   return mutateState(config.instance, (state) => createChatSession(state, String(input.title ?? "New chat")));
+}
+
+export async function deleteChat(config: RuntimeConfig, id: string) {
+  await mutateState(config.instance, (state) => deleteChatSession(state, id));
+  return { ok: true };
+}
+
+export async function renameChat(config: RuntimeConfig, id: string, input: Record<string, unknown>) {
+  const title = String(input.title ?? "");
+  return mutateState(config.instance, (state) => renameChatSession(state, id, title));
 }
 
 export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {

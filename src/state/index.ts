@@ -77,6 +77,8 @@ export {
   createRun,
   createPlanStep,
   createChatSession,
+  deleteChatSession,
+  renameChatSession,
   createChatMessage,
   createApproval,
   createMemory,
