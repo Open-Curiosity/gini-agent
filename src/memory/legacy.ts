@@ -1,5 +1,5 @@
-import type { RuntimeConfig } from "../../types";
-import { addAudit, createMemory, mutateState, now } from "../../state";
+import type { RuntimeConfig } from "../types";
+import { addAudit, createMemory, mutateState, now } from "../state";
 
 export async function createMemoryFromInput(config: RuntimeConfig, input: Record<string, unknown>) {
   return mutateState(config.instance, (state) => createMemory(state, {

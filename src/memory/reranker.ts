@@ -1,6 +1,6 @@
 // Reranker-provider domain helpers: status report.
 //
-// Mirrors src/domain/embedding.ts but for the cross-encoder reranker.
+// Mirrors src/memory/embedding.ts but for the cross-encoder reranker.
 // There's no reembed-equivalent — the reranker is stateless and applied at
 // recall time, so changing models doesn't leave a migration trail behind.
 // `gini reranker status` and `gini doctor` consume this.

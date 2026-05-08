@@ -11,8 +11,13 @@ These notes describe the current source layout and boundaries. Product direction
 - `src/agent.ts` owns task execution and approval-gated tool actions.
 - `src/provider.ts` owns provider normalization, health checks, and model calls.
 - `src/state/` contains persistence, JSON state store helpers, audit/trace records, IDs, security helpers, and SQLite memory storage.
-- `src/domain/` contains behavior that mutates or evaluates runtime state.
-- `src/domain/memory/` contains retain, recall, reflect, reinforce, entity, temporal, migration, and schema logic.
+- `src/runtime/` contains install/status, public runtime views, parity/readiness checks, and local harness helpers.
+- `src/execution/` contains chat, runs, and search behavior.
+- `src/memory/` contains retain, recall, reflect, reinforce, embeddings/reranker status, entity, temporal, migration, and schema logic.
+- `src/jobs/` contains scheduler job creation, execution, replay, and run history behavior.
+- `src/governance/` contains approvals-adjacent runtime workflows such as pairing, improvements, and promotions.
+- `src/capabilities/` contains skills, toolsets, profiles, and subagent records.
+- `src/integrations/` contains connectors, MCP, messaging, import inspection, relay, and notification behavior.
 - `src/tools/` contains file, terminal, code, and web tool implementations.
 - `src/cli.ts` is the CLI shim.
 - `src/cli/` contains CLI routing, API helpers, process management, output helpers, and command modules.
@@ -20,12 +25,12 @@ These notes describe the current source layout and boundaries. Product direction
 
 ## Boundary Rules
 
-- API handlers should delegate behavior to `src/domain/*` instead of embedding state mutation logic.
-- Domain services may use `src/state/*`, `src/types.ts`, `src/paths.ts`, and other domain services when needed.
+- API handlers should delegate behavior to bounded runtime modules instead of embedding state mutation logic.
+- Runtime behavior modules may use `src/state/*`, `src/types.ts`, `src/paths.ts`, and neighboring behavior modules when needed.
 - Storage modules should remain persistence-oriented: load/save, record constructors, migrations, traces, logs, security helpers, and low-level state utilities.
 - API responses must not expose bearer tokens, secret hashes, or credential material.
 - CLI commands should prefer public runtime APIs when exercising product behavior.
-- Direct domain calls from CLI are reserved for local harness/process operations such as install, smoke setup, snapshots, and evidence bundles.
+- Direct module calls from CLI are reserved for local harness/process operations such as install, smoke setup, snapshots, and evidence bundles.
 - New connectors, tools, providers, and client surfaces should land in focused modules before adding router or CLI commands.
 - Hermes-parity features should first add durable runtime records and safe inspection flows before adding live external transports.
 - MCP, messaging, and import integrations must fail visibly and must not mutate external installs or credentials by default.

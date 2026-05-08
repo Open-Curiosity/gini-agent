@@ -30,8 +30,8 @@ import { listFiles, readFile, requestFilePatch, requestFileWrite, searchFiles } 
 import { fetchWeb } from "./tools/web";
 import { requestShell } from "./tools/terminal";
 import { requestCodeExecution } from "./tools/code";
-import { recall, retain } from "./domain/memory";
-import { updateRunFromTask } from "./domain/runs";
+import { recall, retain } from "./memory";
+import { updateRunFromTask } from "./execution/runs";
 
 export async function submitTask(config: RuntimeConfig, input: string, jobId?: string, parentTaskId?: string, subagentId?: string, runId?: string): Promise<Task> {
   const created = createTask(config.instance, input, jobId, parentTaskId, subagentId, runId);

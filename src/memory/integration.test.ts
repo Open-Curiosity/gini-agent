@@ -6,11 +6,11 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { closeAllMemoryDbs, countMemoryUnits, ensureDefaultBank, listMemoryUnits, DEFAULT_BANK_ID } from "../../state";
-import { setEchoStructuredResponse, clearEchoStructuredResponses } from "../../provider";
-import { submitTask } from "../../agent";
-import { readState } from "../../state";
-import type { RuntimeConfig } from "../../types";
+import { closeAllMemoryDbs, countMemoryUnits, ensureDefaultBank, listMemoryUnits, DEFAULT_BANK_ID } from "../state";
+import { setEchoStructuredResponse, clearEchoStructuredResponses } from "../provider";
+import { submitTask } from "../agent";
+import { readState } from "../state";
+import type { RuntimeConfig } from "../types";
 
 const ROOT = "/tmp/gini-integration-phase5-test";
 
@@ -110,7 +110,7 @@ describe("phase 5 — auto-recall on task submit", () => {
     await waitForCompletion(config, second.id);
     // Inspect the second task's trace for the auto-recall counter set in
     // src/agent.ts.
-    const { readTrace } = await import("../../state");
+    const { readTrace } = await import("../state");
     const trace = readTrace(instance, second.id);
     const modelEvent = trace.find((entry) => entry.type === "model");
     expect(modelEvent).toBeDefined();

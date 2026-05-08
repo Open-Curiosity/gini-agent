@@ -10,10 +10,10 @@ import {
   mutateState,
   readState,
   DEFAULT_BANK_ID
-} from "../../state";
-import { createMemory } from "../../state";
+} from "../state";
+import { createMemory } from "../state";
 import { migrateLegacyMemories, legacyMigrationStatus } from "./migrate";
-import type { RuntimeConfig } from "../../types";
+import type { RuntimeConfig } from "../types";
 
 const ROOT = "/tmp/gini-migrate-test";
 

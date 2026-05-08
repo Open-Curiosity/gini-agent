@@ -6,16 +6,16 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { closeAllMemoryDbs, getMemoryDb, listMemoryUnits, ensureDefaultBank, DEFAULT_BANK_ID } from "../../state";
+import { closeAllMemoryDbs, getMemoryDb, listMemoryUnits, ensureDefaultBank, DEFAULT_BANK_ID } from "../state";
 import {
   clearEchoStructuredResponses,
   setEchoStructuredResponse
-} from "../../provider";
+} from "../provider";
 import { retain } from "./retain";
 import { lexicalSimilarity, levenshtein } from "./entities";
 import { parseTemporal } from "./temporal";
-import { cosineSimilarity, echoEmbed, echoProvider } from "../../embeddings";
-import type { RuntimeConfig } from "../../types";
+import { cosineSimilarity, echoEmbed, echoProvider } from "../embeddings";
+import type { RuntimeConfig } from "../types";
 
 const ROOT = "/tmp/gini-retain-test";
 
@@ -104,7 +104,7 @@ describe("openai embedding provider (mocked HTTP)", () => {
       }), { status: 200 });
     }) as typeof fetch;
     try {
-      const { openaiProvider } = await import("../../embeddings");
+      const { openaiProvider } = await import("../embeddings");
       process.env.OPENAI_API_KEY = "test-key";
       const provider = openaiProvider({
         instance: "openai-test",
@@ -338,7 +338,7 @@ describe("retain pipeline", () => {
       ]
     });
     await retain(makeConfig(instance), { text: "audited" });
-    const { readState } = await import("../../state");
+    const { readState } = await import("../state");
     const state = readState(instance);
     const audit = state.audit.find((event) => event.action === "memory.retain");
     expect(audit).toBeDefined();

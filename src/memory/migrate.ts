@@ -25,15 +25,15 @@
 // abort the migration. Startup auto-trigger calls this and surfaces the
 // failure in `gini doctor` rather than blocking.
 
-import type { Instance, MemoryRecord, RuntimeConfig } from "../../types";
+import type { Instance, MemoryRecord, RuntimeConfig } from "../types";
 import {
   DEFAULT_BANK_ID,
   ensureDefaultBank,
   insertMemoryUnit,
   mutateState,
   now
-} from "../../state";
-import { getEmbeddingProvider } from "../../embeddings";
+} from "../state";
+import { getEmbeddingProvider } from "../embeddings";
 
 export interface MigrationReport {
   total: number;

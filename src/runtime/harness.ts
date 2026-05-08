@@ -4,7 +4,7 @@ import type { RuntimeConfig } from "../types";
 import { snapshotsDir } from "../paths";
 import { providerHealth } from "../provider";
 import { addAudit, createSnapshotRecord, mutateState, readState, readTrace, writeState } from "../state";
-import { status } from "./runtime";
+import { status } from "./index";
 
 export function createEvidenceBundle(config: RuntimeConfig) {
   const state = readState(config.instance);

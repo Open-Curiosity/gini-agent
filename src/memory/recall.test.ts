@@ -14,10 +14,10 @@ import {
   insertMemoryUnit,
   linkUnitToEntity,
   DEFAULT_BANK_ID
-} from "../../state";
+} from "../state";
 import { recall } from "./recall";
-import { echoEmbed } from "../../embeddings";
-import type { RuntimeConfig } from "../../types";
+import { echoEmbed } from "../embeddings";
+import type { RuntimeConfig } from "../types";
 
 const ROOT = "/tmp/gini-recall-test";
 

@@ -18,19 +18,19 @@
 // Adapted from vectorize-io/hindsight (MIT). The candidate-set heuristic
 // matches upstream; thresholds tuned per the brief.
 
-import type { RuntimeConfig } from "../../types";
+import type { RuntimeConfig } from "../types";
 import type {
   HindsightMemoryUnit as MemoryUnit
-} from "../../state";
+} from "../state";
 import {
   appendTrace,
   entityMentionsForUnit,
   listMemoryUnits,
   unitsForEntity,
   updateMemoryUnitConfidence
-} from "../../state";
-import { generateStructured } from "../../provider";
-import { cosineSimilarity } from "../../embeddings";
+} from "../state";
+import { generateStructured } from "../provider";
+import { cosineSimilarity } from "../embeddings";
 import {
   opinionAssessmentValidator,
   type AssessmentVerdict

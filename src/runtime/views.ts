@@ -1,7 +1,7 @@
 import type { RuntimeConfig } from "../types";
 import { readState } from "../state";
-import { status } from "../domain/runtime";
-import { redactDevice } from "../domain/pairing";
+import { redactDevice } from "../governance/pairing";
+import { status } from "./index";
 
 export function mobileBootstrap(config: RuntimeConfig) {
   const state = publicState(config);

@@ -7,8 +7,8 @@
 //
 // Adapted from vectorize-io/hindsight (MIT) — same field names + literals.
 
-import type { StructuredValidator } from "../../provider";
-import type { EntityType } from "../../state";
+import type { StructuredValidator } from "../provider";
+import type { EntityType } from "../state";
 
 export type FactType = "world" | "experience" | "opinion";
 export type CausalRelationType = "causes" | "caused_by" | "enables" | "prevents";

@@ -16,11 +16,11 @@
 // the upstream phrase bands exactly so behaviour matches the paper's reported
 // distribution.
 
-import type { RuntimeConfig } from "../../types";
+import type { RuntimeConfig } from "../types";
 import type {
   HindsightMemoryUnit as MemoryUnit,
   MemoryBank
-} from "../../state";
+} from "../state";
 import {
   DEFAULT_BANK_ID,
   addAudit,
@@ -29,9 +29,9 @@ import {
   getBank,
   insertMemoryUnit,
   mutateState
-} from "../../state";
-import { generateStructured, generateTaskSummary } from "../../provider";
-import { getEmbeddingProvider } from "../../embeddings";
+} from "../state";
+import { generateStructured, generateTaskSummary } from "../provider";
+import { getEmbeddingProvider } from "../embeddings";
 import { recall } from "./recall";
 import { opinionExtractionValidator, type ExtractedOpinion } from "./schemas";
 

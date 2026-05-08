@@ -1,7 +1,7 @@
 import { createHandler, writePid } from "./http";
-import { runDueJobs } from "./domain/jobs";
-import { install } from "./domain/runtime";
-import { migrateIfNeeded } from "./domain/memory";
+import { runDueJobs } from "./jobs";
+import { install } from "./runtime";
+import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance } from "./paths";
 import { appendLog } from "./state";
 

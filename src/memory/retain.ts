@@ -19,13 +19,13 @@
 // Adapted from vectorize-io/hindsight (MIT). Tuning constants and link math
 // follow the upstream repo where the paper underspecifies.
 
-import type { RuntimeConfig } from "../../types";
+import type { RuntimeConfig } from "../types";
 import type {
   HindsightEntity as Entity,
   HindsightMemoryLink as MemoryLink,
   HindsightMemoryUnit as MemoryUnit,
   Network
-} from "../../state";
+} from "../state";
 import {
   DEFAULT_BANK_ID,
   addAudit,
@@ -40,9 +40,9 @@ import {
   now,
   unitsForEntity,
   upsertObservationUnit
-} from "../../state";
-import { generateStructured } from "../../provider";
-import { cosineSimilarity, getEmbeddingProvider } from "../../embeddings";
+} from "../state";
+import { generateStructured } from "../provider";
+import { cosineSimilarity, getEmbeddingProvider } from "../embeddings";
 import { resolveOrCreateEntity } from "./entities";
 import {
   factExtractionValidator,

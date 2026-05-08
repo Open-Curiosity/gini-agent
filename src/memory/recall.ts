@@ -22,12 +22,12 @@
 // Adapted from vectorize-io/hindsight (MIT). Channel-multiplier values and
 // the RRF k=60 default match the upstream reference implementation.
 
-import type { RuntimeConfig } from "../../types";
+import type { RuntimeConfig } from "../types";
 import type {
   HindsightMemoryLink as MemoryLink,
   HindsightMemoryUnit as MemoryUnit,
   Network
-} from "../../state";
+} from "../state";
 import {
   DEFAULT_BANK_ID,
   appendTrace,
@@ -36,9 +36,9 @@ import {
   getMemoryDb,
   linksFromMany,
   updateMemoryUnitStats
-} from "../../state";
-import { cosineSimilarity, getEmbeddingProvider } from "../../embeddings";
-import { getReranker, resolveRerankerChoice } from "../../reranker";
+} from "../state";
+import { cosineSimilarity, getEmbeddingProvider } from "../embeddings";
+import { getReranker, resolveRerankerChoice } from "../reranker";
 import { parseTemporal, type TemporalRange } from "./temporal";
 
 export const RRF_K = 60;

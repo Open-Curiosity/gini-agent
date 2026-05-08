@@ -9,16 +9,16 @@ import {
   listMemoryUnits,
   updateBank,
   DEFAULT_BANK_ID
-} from "../../state";
+} from "../state";
 import {
   clearEchoStructuredResponses,
   setEchoStructuredResponse
-} from "../../provider";
+} from "../provider";
 import { reflect, verbalizeProfile, buildReflectSystemMessage } from "./reflect";
 import { applyVerdict } from "./reinforce";
 import { retain } from "./retain";
-import { echoEmbed } from "../../embeddings";
-import type { RuntimeConfig } from "../../types";
+import { echoEmbed } from "../embeddings";
+import type { RuntimeConfig } from "../types";
 
 const ROOT = "/tmp/gini-reflect-test";
 
@@ -143,7 +143,7 @@ describe("end-to-end: retain triggers opinion reinforcement", () => {
     // Seed the canonical Alice entity and link an opinion to it. This is the
     // shape the agent gets in production: an earlier reflect formed an opinion
     // about Alice and we already linked it via the bank's entity store.
-    const { insertEntity, linkUnitToEntity } = await import("../../state");
+    const { insertEntity, linkUnitToEntity } = await import("../state");
     const aliceEntity = insertEntity(instance, { canonicalName: "Alice", entityType: "PERSON" });
     const opinion = insertMemoryUnit(instance, {
       text: "I think Alice is reliable.",

@@ -12,10 +12,10 @@
 // Adapted from vectorize-io/hindsight (MIT) — same weights, same merge-on-
 // strong-match policy, same fallback-to-create-new for low-confidence cases.
 
-import type { Instance } from "../../types";
+import type { Instance } from "../types";
 import type { Database } from "bun:sqlite";
-import type { HindsightEntity as Entity, EntityType } from "../../state";
-import { getMemoryDb, insertEntity } from "../../state";
+import type { HindsightEntity as Entity, EntityType } from "../state";
+import { getMemoryDb, insertEntity } from "../state";
 
 // Eq. 2 weighted score must exceed this to count as "same canonical entity".
 // With α/β/γ summing to 1, the score is in [0,1]; the brief's 0.85 threshold
