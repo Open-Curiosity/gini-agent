@@ -295,7 +295,7 @@ async function spawnSubagentTool(
     item.updatedAt = now();
   });
 
-  const final = await waitForSubagentTerminal(config, subagentId, timeoutMs);
+  const final = await waitForSubagentTerminal(config, subagentId, timeoutMs, taskId);
 
   appendTrace(config.instance, taskId, {
     type: "tool",
@@ -325,7 +325,8 @@ async function spawnSubagentTool(
 async function waitForSubagentTerminal(
   config: RuntimeConfig,
   subagentId: string,
-  timeoutMs: number
+  timeoutMs: number,
+  parentTaskId?: string
 ): Promise<{ status: string; summary?: string; error?: string }> {
   const deadline = Date.now() + Math.max(1000, timeoutMs);
   const pollMs = 100;
@@ -339,6 +340,16 @@ async function waitForSubagentTerminal(
         summary: sub.resultSummary ?? sub.summary,
         error: sub.resultError ?? sub.error
       };
+    }
+    // Parent cancellation should short-circuit the wait so the parent
+    // task can exit cleanly. The cascade in cancelTask will eventually
+    // mark the subagent cancelled too, but we shouldn't pin the parent
+    // dispatch loop on that round-trip.
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      if (parent?.status === "cancelled") {
+        return { status: "cancelled", error: "Parent task was cancelled while subagent was running." };
+      }
     }
     await Bun.sleep(pollMs);
   }

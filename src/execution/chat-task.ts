@@ -214,6 +214,24 @@ async function runLoop(
   while (iterations < MAX_LOOP_ITERATIONS) {
     iterations += 1;
 
+    // Cancellation bail-out. If the task was cancelled externally (e.g.
+    // user clicked cancel, or a parent task's cancellation cascaded into
+    // this child via cancelDescendantTasks), stop the loop here so we
+    // don't keep running model calls and dispatching tools against a
+    // task that's already terminal.
+    {
+      const cancelCheck = readState(config.instance).tasks.find((t) => t.id === taskId);
+      if (!cancelCheck || cancelCheck.status === "cancelled") {
+        appendTrace(config.instance, taskId, {
+          type: "task",
+          message: "Chat task loop noticed cancellation",
+          data: { iterations }
+        });
+        await syncSubagentFromTask(config, cancelCheck ?? ({ id: taskId, subagentId: undefined } as unknown as Task));
+        return cancelCheck ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
+      }
+    }
+
     // Stream partial text into task.partialSummary just like the legacy
     // path. Debounced to avoid thrashing mutateState on every SSE delta.
     let pending = "";
