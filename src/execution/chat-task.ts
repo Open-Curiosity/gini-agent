@@ -440,22 +440,35 @@ export async function resumeChatTask(
   toolCallId: string,
   toolResult: string
 ): Promise<Task> {
-  // Stage 1: record the result on the snapshot. Use mutateState so a
-  // concurrent approval-decision can't corrupt the array.
+  // Halt-siblings fix (Review P1 #2): never flip a non-waiting_approval
+  // task back to running. If the task has already failed (e.g. a sibling
+  // approval was denied), been cancelled, or completed, just no-op so we
+  // don't restart a terminal task's loop.
   const stage = await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
+    if (item.status !== "waiting_approval") {
+      return { task: item, ready: false as const, hasState: false as const, terminal: true as const };
+    }
     if (!item.toolCallState) {
       // Nothing to resume against — most likely the snapshot was cleared by
       // a prior failure path. Caller can decide to fail the task.
-      return { task: item, ready: false as const, hasState: false as const };
+      return { task: item, ready: false as const, hasState: false as const, terminal: false as const };
     }
     const pending = item.toolCallState.pending;
     const target = pending.find((p) => p.toolCallId === toolCallId);
     if (target) target.result = toolResult;
     const allResolved = pending.every((p) => typeof p.result === "string");
-    return { task: item, ready: allResolved, hasState: true as const };
+    return { task: item, ready: allResolved, hasState: true as const, terminal: false as const };
   });
 
+  if (stage.terminal) {
+    appendTrace(config.instance, taskId, {
+      type: "approval",
+      message: "Resume request ignored: task is terminal",
+      data: { toolCallId, taskStatus: stage.task.status }
+    });
+    return stage.task;
+  }
   if (!stage.hasState) {
     appendTrace(config.instance, taskId, {
       type: "error",

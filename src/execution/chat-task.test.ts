@@ -7,7 +7,7 @@
 //   - resume after approval → task completes
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -252,6 +252,113 @@ describe("chat-task loop", () => {
 
     expect(finished.status).toBe("completed");
     expect(finished.summary).toBe("Got it — that skill isn't trusted.");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Halt-siblings regression tests (Review P1 #2). When a single LLM turn
+  // emits multiple approval-gated tool calls, denying one must auto-deny
+  // the rest, clear the captured snapshot, and prevent any later approve
+  // from running side effects.
+  test("denying one of multiple sibling approvals auto-denies the rest and prevents side effects", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-sibling-deny");
+    const provider = normalizeProvider(config.provider);
+
+    // First model turn: ask for two file writes in parallel. Both become
+    // pending approvals on the same task (parallel tool_calls).
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_w1", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "a.txt", content: "AAA" }) } },
+        { id: "call_w2", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "b.txt", content: "BBB" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const task = await submitTask(config, "write a and b", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id);
+    expect(paused.status).toBe("waiting_approval");
+    expect(paused.toolCallState).toBeDefined();
+    expect(paused.toolCallState?.pending.length).toBe(2);
+    expect(paused.approvalIds.length).toBe(2);
+
+    // Deny the first sibling. The fix should auto-deny the second.
+    const [firstApprovalId, secondApprovalId] = paused.approvalIds as [string, string];
+    await decideApproval(config, firstApprovalId, "deny");
+
+    // Wait for the task to land in failed (failTask is async).
+    await Bun.sleep(50);
+
+    const stateAfter = readState(config.instance);
+    const failedTask = stateAfter.tasks.find((t) => t.id === task.id)!;
+    expect(failedTask.status).toBe("failed");
+    // Snapshot cleared.
+    expect(failedTask.toolCallState).toBeUndefined();
+
+    // Second approval was auto-denied.
+    const second = stateAfter.approvals.find((a) => a.id === secondApprovalId)!;
+    expect(second.status).toBe("denied");
+
+    // Try to approve the auto-denied sibling — must throw because it's no
+    // longer pending.
+    await expect(decideApproval(config, secondApprovalId, "approve")).rejects.toThrow(/already denied/);
+
+    // Verify no files were written. Even if executeApprovedAction was
+    // somehow called, the terminal-task short-circuit prevents the side
+    // effect.
+    expect(existsSync(join(workspaceRoot, "a.txt"))).toBe(false);
+    expect(existsSync(join(workspaceRoot, "b.txt"))).toBe(false);
+
+    // Audit trail should record the cascade.
+    const cascadeAudits = stateAfter.audit.filter((a) => a.action === "approval.cancelled_sibling_denial");
+    expect(cascadeAudits.length).toBe(1);
+    expect(cascadeAudits[0]?.approvalId).toBe(secondApprovalId);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("resumeChatTask is a no-op for a task that has already failed", async () => {
+    // Standalone test of resumeChatTask's terminal-task guard. We construct
+    // a task in the failed state and call resumeChatTask directly; it must
+    // return without flipping the task back to running and without
+    // re-entering the loop.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-resume-failed");
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_x", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "x.txt", content: "X" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const task = await submitTask(config, "write x", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id);
+    expect(paused.status).toBe("waiting_approval");
+    const approvalId = paused.approvalIds[0]!;
+
+    // Deny — fails the task and clears the snapshot.
+    await decideApproval(config, approvalId, "deny");
+    await Bun.sleep(50);
+
+    const failedBefore = readState(config.instance).tasks.find((t) => t.id === task.id)!;
+    expect(failedBefore.status).toBe("failed");
+
+    // Now call resumeChatTask directly. Must no-op.
+    const { resumeChatTask } = await import("../execution/chat-task");
+    const result = await resumeChatTask(config, task.id, "call_x", "should-not-resume");
+    expect(result.status).toBe("failed");
+
+    // Status / partialSummary unchanged after the no-op resume.
+    const after = readState(config.instance).tasks.find((t) => t.id === task.id)!;
+    expect(after.status).toBe("failed");
+    expect(after.toolCallState).toBeUndefined();
+    expect(existsSync(join(workspaceRoot, "x.txt"))).toBe(false);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

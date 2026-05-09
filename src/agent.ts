@@ -115,6 +115,12 @@ export async function cancelTask(config: RuntimeConfig, taskId: string): Promise
       taskId,
       runId: task.runId
     });
+    // Halt-siblings fix: cancelling a task that's waiting on multiple
+    // pending approvals must also tear down those approvals so a later
+    // approve doesn't run a tool against a cancelled task. Clear the
+    // captured tool-call snapshot in the same write.
+    cancelPendingTaskApprovals(state, taskId, "task.cancelled");
+    task.toolCallState = undefined;
     upsertTask(state, task);
     return task;
   });
@@ -126,6 +132,39 @@ export async function cancelTask(config: RuntimeConfig, taskId: string): Promise
   // this task and is not already terminal, then cancel them.
   await cancelDescendantTasks(config, taskId);
   return task;
+}
+
+// Mark every other pending approval that targets the given task as denied,
+// audited as cancelled-by-sibling-decision. Called from the deny path of
+// decideApproval and from cancelTask. Excludes `excludeApprovalId` (the
+// approval that triggered the cancellation) so we don't double-audit it.
+// Runs inside an existing mutateState call (not its own) so it shares the
+// same write.
+function cancelPendingTaskApprovals(
+  state: RuntimeState,
+  taskId: string,
+  reason: "task.cancelled" | "sibling.denied",
+  excludeApprovalId?: string
+): void {
+  for (const sibling of state.approvals) {
+    if (sibling.taskId !== taskId) continue;
+    if (sibling.status !== "pending") continue;
+    if (excludeApprovalId && sibling.id === excludeApprovalId) continue;
+    sibling.status = "denied";
+    sibling.updatedAt = now();
+    addAudit(state, {
+      actor: "runtime",
+      action: reason === "sibling.denied"
+        ? "approval.cancelled_sibling_denial"
+        : "approval.cancelled_task_cancelled",
+      target: sibling.target,
+      risk: sibling.risk,
+      taskId: sibling.taskId,
+      runId: state.tasks.find((task) => task.id === sibling.taskId)?.runId,
+      approvalId: sibling.id,
+      evidence: { reason, originatingApprovalId: excludeApprovalId }
+    });
+  }
 }
 
 async function cancelDescendantTasks(config: RuntimeConfig, parentTaskId: string): Promise<void> {
@@ -420,6 +459,18 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
       runId: item.taskId ? state.tasks.find((task) => task.id === item.taskId)?.runId : undefined,
       approvalId: item.id
     });
+    // Halt-siblings fix (Review P1 #2): when a single LLM turn emits
+    // multiple approval-gated tool calls, denying one must immediately
+    // tear down the other pending approvals on the same task and clear
+    // the captured tool-call snapshot. Otherwise a sibling approved
+    // *after* the denial would still execute (executeApprovedAction
+    // didn't check task status) and `resumeChatTask` would re-enter the
+    // loop on a failed task.
+    if (decision === "deny" && item.taskId) {
+      cancelPendingTaskApprovals(state, item.taskId, "sibling.denied", item.id);
+      const task = state.tasks.find((t) => t.id === item.taskId);
+      if (task) task.toolCallState = undefined;
+    }
     return item;
   });
 
@@ -441,6 +492,46 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
   // run the side effect, skip task completion (the loop owns the task),
   // and feed the result back via resumeChatTask.
   const chatToolCallId = approvalToolCallId(approval.payload);
+
+  // Halt-siblings fix (Review P1 #2): re-read the owning task and refuse
+  // to execute the side effect if the task has already reached a terminal
+  // state (failed via sibling denial, cancelled, completed). Without this
+  // guard, two approval-gated tool calls in a single LLM turn could both
+  // execute even though the first denial already failed the task.
+  if (approval.taskId) {
+    const taskNow = await mutateState(config.instance, (state) => {
+      return state.tasks.find((t) => t.id === approval.taskId);
+    });
+    if (taskNow && (taskNow.status === "failed" || taskNow.status === "cancelled" || taskNow.status === "completed")) {
+      appendTrace(config.instance, approval.taskId, {
+        type: "approval",
+        message: "Skipping approved action: task already terminal",
+        data: { approvalId: approval.id, taskStatus: taskNow.status }
+      });
+      // Mark the approval as cancelled-after-approval so audit trail and
+      // UI both surface the no-op. Approval status enum only has the
+      // three values; we use "denied" plus a distinct audit action to
+      // record that the cancellation was post-approval.
+      await mutateState(config.instance, (state) => {
+        const item = state.approvals.find((a) => a.id === approval.id);
+        if (item && item.status === "approved") {
+          item.status = "denied";
+          item.updatedAt = now();
+          addAudit(state, {
+            actor: "runtime",
+            action: "approval.cancelled_task_terminal",
+            target: item.target,
+            risk: item.risk,
+            taskId: item.taskId,
+            runId: state.tasks.find((task) => task.id === item.taskId)?.runId,
+            approvalId: item.id,
+            evidence: { taskStatus: taskNow.status }
+          });
+        }
+      });
+      return;
+    }
+  }
 
   if (approval.action === "file.write") {
     const target = assertInsideWorkspace(config.workspaceRoot, String(approval.payload.path));
