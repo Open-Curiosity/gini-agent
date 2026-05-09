@@ -199,13 +199,14 @@ function nextEchoToolCallingResult(provider: ProviderConfig, lastUserText: strin
 }
 
 // Native tool-calling entry point. Calls the provider's chat-completions
-// endpoint with a `tools` array. Used by the chat-task agent loop.
+// endpoint (or codex `/responses`) with a `tools` array. Used by the chat-task
+// agent loop.
 //
-// Codex/responses-API path doesn't support tool-calling here (the responses
-// stream uses a different shape). For codex we log a warning and fall back
-// to a text-only completion: the model can still answer but cannot invoke
-// tools through this loop. The same applies to the echo provider in default
-// mode (tests can override with `setEchoToolCallingResponse`).
+// For codex with no tools (legacy callers), we fall back to the text-only
+// `/responses` path via `callOpenAIResponses` so older code paths still work.
+// With tools present, codex now uses the native function-call surface of the
+// responses API (see `callToolCallingResponses`). The echo provider keeps its
+// stub-driven behavior so unit tests stay deterministic.
 export async function generateToolCallingResponse(
   config: RuntimeConfig,
   messages: ToolCallingMessage[],
@@ -230,9 +231,14 @@ export async function generateToolCallingResponse(
     return result;
   }
 
-  // Codex: no tool-calling support yet. Fall back to a text-only completion
-  // through the responses API.
+  // Codex/responses API. With tools present, route to the native
+  // function-calling responses path. Without tools, fall back to a plain
+  // text completion (preserves legacy callers like `generateTaskSummary`
+  // pathways that still pass through this function).
   if (provider.name === "codex") {
+    if (tools.length > 0) {
+      return callToolCallingResponses(provider, messages, tools, onDelta);
+    }
     const systemContext = stitchSystemFromMessages(messages);
     const userInput = lastUserText || "";
     const text = await callOpenAIResponses(provider, userInput, systemContext, onDelta);
@@ -449,6 +455,345 @@ async function readToolCallingStream(
     if (call.id && call.function.name) toolCalls.push(call);
   }
 
+  return {
+    provider,
+    text: textParts.join("").trim(),
+    toolCalls,
+    finishReason,
+    responseId,
+    usage,
+    cost: estimateCost(provider, usage)
+  };
+}
+
+// Codex/Responses-API tool-calling. Translates the chat-completions message
+// shape used by the rest of the loop into the Responses API input shape:
+//   - All `system` messages → concatenated `instructions` field
+//   - `user` messages → { role: "user", content: [{ type: "input_text", text }] }
+//   - `assistant` text → { role: "assistant", content: [{ type: "output_text", text }] }
+//   - `assistant` tool_calls → { type: "function_call", call_id, name, arguments }
+//   - `tool` results → { type: "function_call_output", call_id, output }
+// Tools are flattened from the chat-completions `{ type, function: {...} }`
+// shape into the Responses API `{ type: "function", name, description,
+// parameters, strict: false }` shape.
+async function callToolCallingResponses(
+  provider: ProviderConfig,
+  messages: ToolCallingMessage[],
+  tools: ToolFunctionSpec[],
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  const bearer = readCodexBearer(provider);
+  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const { instructions, input } = translateMessagesToResponsesInput(messages);
+  const responsesTools = tools.map((tool) => ({
+    type: "function" as const,
+    name: tool.function.name,
+    description: tool.function.description,
+    parameters: tool.function.parameters,
+    strict: false
+  }));
+  const body: Record<string, unknown> = {
+    model: provider.model,
+    store: false,
+    stream: true,
+    instructions,
+    input
+  };
+  if (responsesTools.length > 0) body.tools = responsesTools;
+
+  const response = await fetch(`${baseUrl}/responses`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bearer}`,
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      ...codexHeaders(bearer)
+    },
+    body: JSON.stringify(body)
+  });
+
+  return readResponsesToolCallingStream(response, provider, onDelta);
+}
+
+interface ResponsesInputShape {
+  instructions: string;
+  input: Array<Record<string, unknown>>;
+}
+
+function translateMessagesToResponsesInput(messages: ToolCallingMessage[]): ResponsesInputShape {
+  const systemParts: string[] = [];
+  const input: Array<Record<string, unknown>> = [];
+  for (const message of messages) {
+    if (message.role === "system") {
+      if (typeof message.content === "string" && message.content.length > 0) {
+        systemParts.push(message.content);
+      }
+      continue;
+    }
+    if (message.role === "user") {
+      const text = typeof message.content === "string" ? message.content : "";
+      input.push({
+        role: "user",
+        content: [{ type: "input_text", text }]
+      });
+      continue;
+    }
+    if (message.role === "assistant") {
+      // Emit any tool calls first as discrete function_call items so the
+      // model sees the same item ordering it produced.
+      const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      if (toolCalls.length === 0) {
+        const text = typeof message.content === "string" ? message.content : "";
+        if (text.length > 0) {
+          input.push({
+            role: "assistant",
+            content: [{ type: "output_text", text }]
+          });
+        }
+        continue;
+      }
+      // Some assistants emit text + tool_calls in the same message. Preserve
+      // the text first if present, then the function_call entries.
+      const text = typeof message.content === "string" ? message.content : "";
+      if (text.length > 0) {
+        input.push({
+          role: "assistant",
+          content: [{ type: "output_text", text }]
+        });
+      }
+      for (const call of toolCalls) {
+        input.push({
+          type: "function_call",
+          call_id: call.id,
+          name: call.function.name,
+          arguments: call.function.arguments ?? ""
+        });
+      }
+      continue;
+    }
+    if (message.role === "tool") {
+      const callId = message.tool_call_id ?? "";
+      const output = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+      input.push({
+        type: "function_call_output",
+        call_id: callId,
+        output
+      });
+      continue;
+    }
+  }
+  return { instructions: systemParts.join("\n\n"), input };
+}
+
+// Consume the Responses API SSE stream. Tracks both text deltas
+// (`response.output_text.delta`) and function-call lifecycle events
+// (`response.output_item.added` / `response.function_call_arguments.delta` /
+// `response.output_item.done`). Falls back to the final
+// `response.completed` event's `response.output` array if any tool calls
+// were missed during streaming.
+async function readResponsesToolCallingStream(
+  response: Response,
+  provider: ProviderConfig,
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  if (!response.ok) {
+    const raw = await response.text();
+    const payload = parseJsonObject(raw);
+    const fallback = raw.slice(0, 500) || `Codex tool-calling stream failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  const body = response.body;
+  if (!body) throw new Error("Codex tool-calling stream returned no response body.");
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  const textParts: string[] = [];
+  // item_id → in-progress function call. The Responses API streams
+  // function-call argument deltas keyed by item_id; we accumulate into
+  // these entries and surface the final list when the stream completes.
+  const callsById = new Map<string, { id: string; name: string; arguments: string; order: number }>();
+  let nextOrder = 0;
+  let responseId: string | undefined;
+  let usage: Record<string, unknown> | undefined;
+  let finalOutput: unknown[] | undefined;
+
+  const handleEvent = (block: string): void => {
+    const lines = block.split(/\r?\n/);
+    let eventType: string | undefined;
+    const dataLines: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith("event:")) {
+        eventType = line.slice("event:".length).trim();
+      } else if (line.startsWith("data:")) {
+        dataLines.push(line.slice("data:".length).trim());
+      }
+    }
+    if (dataLines.length === 0) return;
+    const data = dataLines.join("\n");
+    if (!data || data === "[DONE]") return;
+    const payload = parseJsonObject(data);
+    const type = typeof payload.type === "string" ? payload.type : eventType;
+    if (!type) return;
+
+    // Capture top-level metadata when present.
+    if (typeof payload.response_id === "string") responseId = payload.response_id;
+    if (isRecord(payload.response)) {
+      const resp = payload.response;
+      if (!responseId && typeof resp.id === "string") responseId = resp.id;
+      if (isRecord(resp.usage)) usage = resp.usage;
+      if (Array.isArray(resp.output)) finalOutput = resp.output;
+    }
+
+    if (type === "response.output_text.delta") {
+      const delta = typeof payload.delta === "string" ? payload.delta : "";
+      if (delta.length > 0) {
+        textParts.push(delta);
+        if (onDelta) {
+          try {
+            onDelta(delta);
+          } catch {
+            // never abort the stream consumer on a UI-side error
+          }
+        }
+      }
+      return;
+    }
+
+    if (type === "response.output_item.added") {
+      const item = isRecord(payload.item) ? payload.item : undefined;
+      if (item && item.type === "function_call") {
+        const itemId = typeof item.id === "string" ? item.id : (typeof payload.item_id === "string" ? payload.item_id : "");
+        const callId = typeof item.call_id === "string" ? item.call_id : itemId;
+        const name = typeof item.name === "string" ? item.name : "";
+        const args = typeof item.arguments === "string" ? item.arguments : "";
+        const key = itemId || callId;
+        if (key && !callsById.has(key)) {
+          callsById.set(key, { id: callId, name, arguments: args, order: nextOrder++ });
+        }
+      }
+      return;
+    }
+
+    if (type === "response.function_call_arguments.delta") {
+      const delta = typeof payload.delta === "string" ? payload.delta : "";
+      const itemId = typeof payload.item_id === "string" ? payload.item_id : "";
+      if (itemId) {
+        const existing = callsById.get(itemId) ?? { id: itemId, name: "", arguments: "", order: nextOrder++ };
+        existing.arguments += delta;
+        callsById.set(itemId, existing);
+      }
+      return;
+    }
+
+    if (type === "response.function_call_arguments.done") {
+      const itemId = typeof payload.item_id === "string" ? payload.item_id : "";
+      const finalArgs = typeof payload.arguments === "string" ? payload.arguments : undefined;
+      if (itemId && finalArgs !== undefined) {
+        const existing = callsById.get(itemId);
+        if (existing) {
+          existing.arguments = finalArgs;
+          callsById.set(itemId, existing);
+        } else {
+          callsById.set(itemId, { id: itemId, name: "", arguments: finalArgs, order: nextOrder++ });
+        }
+      }
+      return;
+    }
+
+    if (type === "response.output_item.done") {
+      const item = isRecord(payload.item) ? payload.item : undefined;
+      if (item && item.type === "function_call") {
+        const itemId = typeof item.id === "string" ? item.id : (typeof payload.item_id === "string" ? payload.item_id : "");
+        const callId = typeof item.call_id === "string" ? item.call_id : itemId;
+        const name = typeof item.name === "string" ? item.name : "";
+        const args = typeof item.arguments === "string" ? item.arguments : "";
+        const key = itemId || callId;
+        if (key) {
+          const existing = callsById.get(key) ?? { id: callId, name, arguments: args, order: nextOrder++ };
+          if (callId) existing.id = callId;
+          if (name) existing.name = name;
+          if (args.length > 0) existing.arguments = args;
+          callsById.set(key, existing);
+        }
+      }
+      return;
+    }
+
+    if (type === "response.completed") {
+      // Backstop: the final completed event carries the full `response.output`
+      // array. Capture it for fallback reconstruction below.
+      if (isRecord(payload.response) && Array.isArray(payload.response.output)) {
+        finalOutput = payload.response.output;
+      }
+      return;
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (value) buffer += decoder.decode(value, { stream: true });
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      if (block.trim().length > 0) handleEvent(block);
+      boundary = buffer.indexOf("\n\n");
+    }
+    if (done) break;
+  }
+  buffer += decoder.decode();
+  if (buffer.trim().length > 0) handleEvent(buffer);
+
+  // Backstop: if SSE delivery missed function_call items but the final
+  // `response.completed` event carries them, reconstruct from there.
+  if (finalOutput) {
+    let backstopText = "";
+    for (const item of finalOutput) {
+      if (!isRecord(item)) continue;
+      if (item.type === "function_call") {
+        const itemId = typeof item.id === "string" ? item.id : "";
+        const callId = typeof item.call_id === "string" ? item.call_id : itemId;
+        const name = typeof item.name === "string" ? item.name : "";
+        const args = typeof item.arguments === "string" ? item.arguments : "";
+        const key = itemId || callId;
+        if (!key) continue;
+        const existing = callsById.get(key);
+        if (!existing) {
+          callsById.set(key, { id: callId, name, arguments: args, order: nextOrder++ });
+        } else {
+          if (!existing.id && callId) existing.id = callId;
+          if (!existing.name && name) existing.name = name;
+          if (existing.arguments.length === 0 && args.length > 0) existing.arguments = args;
+        }
+      }
+      // Some responses also embed assistant text in output items as
+      // { type: "message", content: [{ type: "output_text", text }] }
+      if (item.type === "message" && Array.isArray(item.content)) {
+        for (const c of item.content) {
+          if (isRecord(c) && c.type === "output_text" && typeof c.text === "string") {
+            backstopText += c.text;
+          }
+        }
+      }
+    }
+    // Only use backstop text if streaming missed all of it.
+    if (textParts.length === 0 && backstopText.length > 0) {
+      textParts.push(backstopText);
+    }
+  }
+
+  const ordered = [...callsById.values()].sort((a, b) => a.order - b.order);
+  const toolCalls: ToolCall[] = [];
+  for (const call of ordered) {
+    if (!call.id || !call.name) continue;
+    toolCalls.push({
+      id: call.id,
+      type: "function",
+      function: { name: call.name, arguments: call.arguments }
+    });
+  }
+
+  const finishReason: ToolCallingResult["finishReason"] = toolCalls.length > 0 ? "tool_calls" : "stop";
   return {
     provider,
     text: textParts.join("").trim(),
