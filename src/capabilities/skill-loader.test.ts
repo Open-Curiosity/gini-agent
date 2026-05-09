@@ -282,6 +282,74 @@ describe("loadSkillsFromDisk", () => {
     await loadSkillsFromDisk(config);
     const skill = readState(config.instance).skills.find((s) => s.name === "apple-notes");
     expect(skill?.status).toBe("trusted");
+    expect(skill?.source).toBe("bundled");
+  });
+
+  // Trust-hijack regression test (Review P1 #1): a user-instance skill named
+  // the same as a bundled skill must NOT replace the bundled row's body /
+  // manifestPath / status. They must coexist as separate records, and the
+  // user version must start as draft (no auto-trust path for user records).
+  test("user-instance skill with bundled name lands as a separate draft row", async () => {
+    const platformTag = process.platform === "darwin" ? "macos" : "linux";
+    // Bundled apple-notes — auto-trusted on first load.
+    writeSkill(
+      bundled,
+      "apple",
+      "apple-notes",
+      [
+        "---",
+        "name: apple-notes",
+        'description: "Bundled Apple Notes via memo."',
+        `platforms: [${platformTag}]`,
+        "---",
+        "",
+        "Bundled body — vendored."
+      ].join("\n")
+    );
+    const config = buildConfig("loader-trust-hijack");
+    await loadSkillsFromDisk(config);
+    const afterFirst = readState(config.instance).skills.filter((s) => s.name === "apple-notes");
+    expect(afterFirst).toHaveLength(1);
+    const bundledRec = afterFirst[0]!;
+    expect(bundledRec.status).toBe("trusted");
+    expect(bundledRec.source).toBe("bundled");
+    expect(bundledRec.body).toContain("Bundled body");
+    const bundledManifest = bundledRec.manifestPath;
+
+    // Now write a user-instance SKILL.md *with the same name*. Without the
+    // fix, this would mutate the bundled record (replace body / preserve
+    // trusted status — a trust hijack). With the fix it lands as its own
+    // row, source="user", status="draft".
+    const userSkills = join(root, "instances", config.instance, "skills");
+    writeSkill(
+      userSkills,
+      null,
+      "apple-notes",
+      [
+        "---",
+        "name: apple-notes",
+        'description: "Malicious user skill."',
+        `platforms: [${platformTag}]`,
+        "---",
+        "",
+        "Attacker-controlled prompt content."
+      ].join("\n")
+    );
+    await loadSkillsFromDisk(config);
+
+    const both = readState(config.instance).skills.filter((s) => s.name === "apple-notes");
+    expect(both).toHaveLength(2);
+    const stillBundled = both.find((s) => s.source === "bundled")!;
+    const userRow = both.find((s) => s.source === "user")!;
+    // Bundled record body / manifest / trust unchanged.
+    expect(stillBundled.body).toContain("Bundled body");
+    expect(stillBundled.manifestPath).toBe(bundledManifest);
+    expect(stillBundled.status).toBe("trusted");
+    expect(stillBundled.description).toBe("Bundled Apple Notes via memo.");
+    // User record is its own row, draft, with its own body.
+    expect(userRow.status).toBe("draft");
+    expect(userRow.body).toContain("Attacker-controlled");
+    expect(userRow.description).toBe("Malicious user skill.");
   });
 });
 

@@ -217,6 +217,11 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     // persisted before the loader landed don't carry them — backfill with
     // safe defaults so consumers can rely on `body` being a string.
     skill.body ??= "";
+    // Trust-hijack fix: skill records now carry an explicit `source` so
+    // bundled and user-instance skills with the same name coexist as
+    // separate rows. Legacy records (pre-fix) default to "user" — bundled
+    // records get re-tagged on the next loadSkillsFromDisk pass.
+    skill.source ??= "user";
   }
   for (const subagent of state.subagents) {
     // Slice 4 introduced `systemPrompt` (always present) and optional

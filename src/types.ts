@@ -551,6 +551,14 @@ export interface SkillRecord {
   // Frontmatter `prerequisites`. We keep `commands` and `env` as strings —
   // strings the LLM can later inspect or check via terminal_exec.
   prerequisites?: { commands?: string[]; env?: string[] };
+  // Origin of the loaded skill: "bundled" for vendored repo skills (under
+  // <repo>/skills/), "user" for skills under ~/.gini/instances/<inst>/skills/.
+  // Used by the loader to keep bundled and user records separate (so a
+  // user-instance SKILL.md named "apple-notes" can't hijack the vendored
+  // trust grant) and by the auto-trust allowlist (only bundled records may
+  // be auto-trusted). Defaults to "user" for legacy records via
+  // normalizeState so older state files keep loading.
+  source?: "bundled" | "user";
 }
 
 export interface SkillVersion {

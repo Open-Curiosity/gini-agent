@@ -259,17 +259,27 @@ export function bundledSkillsRoot(): string {
 }
 
 // Apply parsed file to the runtime state. Matches an existing skill by
-// name. Preserves user-managed fields (`status`, `tests`, success/failure
-// counts, previousVersions, lastUsedAt). On match: only mutate when the
-// content changed, and bump the numeric version. On miss: create a new
-// skill with status="draft" (or "trusted" if it's an auto-trusted bundled
-// skill — see AUTO_TRUSTED_BUNDLED_SKILLS).
+// (name, source) — bundled and user-instance skills with the same name
+// are kept as separate rows so a user-instance SKILL.md cannot hijack the
+// trust grant of a vendored bundled skill (see Review P1 #1). Preserves
+// user-managed fields (`status`, `tests`, success/failure counts,
+// previousVersions, lastUsedAt). On match: only mutate when the content
+// changed, and bump the numeric version. On miss: create a new skill with
+// status="draft" (or "trusted" only when the new record is bundled and is
+// in AUTO_TRUSTED_BUNDLED_SKILLS).
 function upsertSkillFromFile(
   state: RuntimeState,
   parsed: ParsedSkillFile,
   origin: DiscoveredSkill
 ): { record: SkillRecord; kind: "added" | "updated" | "noop" } {
-  const existing = state.skills.find((skill) => skill.name === parsed.name);
+  // Match on (name, source). Legacy records (created before `source` was
+  // added) default to "user" via normalizeState, so bundled re-loads will
+  // create a separate row for the bundled flavor on the first pass —
+  // intentional, because we have no way to retroactively know the original
+  // origin for legacy rows.
+  const existing = state.skills.find(
+    (skill) => skill.name === parsed.name && (skill.source ?? "user") === origin.source
+  );
   const trimmedBody = parsed.body;
   const at = now();
 
@@ -318,7 +328,8 @@ function upsertSkillFromFile(
     manifestPath: origin.manifestPath,
     category: origin.category,
     platforms: parsed.platforms,
-    prerequisites: parsed.prerequisites
+    prerequisites: parsed.prerequisites,
+    source: origin.source
   });
   return { record, kind: "added" };
 }

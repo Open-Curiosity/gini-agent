@@ -172,8 +172,24 @@ function filterSkillsForSubagent(skills: SkillRecord[], subagent: SubagentRecord
 function buildTrustedSkillsBlock(skills: SkillRecord[]): string {
   const trusted = skills.filter((s) => s.status === "trusted");
   if (trusted.length === 0) return "";
-  const lines = trusted
-    .slice()
+  // Dedupe by name, preferring bundled records over user records when both
+  // exist with the same name. Mirrors the read_skill tool's tiebreak so
+  // the advertised skill description matches the body that read_skill will
+  // return.
+  const byName = new Map<string, SkillRecord>();
+  for (const skill of trusted) {
+    const existing = byName.get(skill.name);
+    if (!existing) {
+      byName.set(skill.name, skill);
+      continue;
+    }
+    const existingSource = existing.source ?? "user";
+    const candidateSource = skill.source ?? "user";
+    if (existingSource !== "bundled" && candidateSource === "bundled") {
+      byName.set(skill.name, skill);
+    }
+  }
+  const lines = Array.from(byName.values())
     .sort((a, b) => a.name.localeCompare(b.name))
     .map((s) => {
       const desc = s.description.trim() || "(no description)";

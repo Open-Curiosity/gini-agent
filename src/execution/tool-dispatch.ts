@@ -191,8 +191,13 @@ async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<
 async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
   const name = requireString(args, "name");
   const state = readState(config.instance);
-  const skill = state.skills.find((s) => s.name === name);
-  if (!skill) throw new Error(`No skill named ${name} is registered.`);
+  // Trust-hijack fix: when both a bundled and a user record share a name,
+  // prefer the bundled (vendored) row first since it's the audited source
+  // of truth. A user record with the same name remains independent and
+  // stays draft until the user trusts it.
+  const matches = state.skills.filter((s) => s.name === name);
+  if (matches.length === 0) throw new Error(`No skill named ${name} is registered.`);
+  const skill = matches.find((s) => (s.source ?? "user") === "bundled") ?? matches[0]!;
   if (skill.status !== "trusted") {
     throw new Error(`Skill ${name} is not trusted (current status: ${skill.status}). Ask the user to trust it via /skills before using.`);
   }
