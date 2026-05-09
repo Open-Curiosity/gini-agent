@@ -22,10 +22,16 @@ import {
 } from "@/lib/queries";
 import type { ChatMessage, ChatSession } from "@/lib/view-types";
 
+// Review P1 #3: waiting_approval is intentionally NOT terminal here. It's
+// in-flight from the chat UI's perspective — getChatSession synthesizes
+// an ephemeral assistant placeholder for it, and the runtime only persists
+// a real synced ChatMessageRecord once the task hits completed / failed /
+// cancelled. Triggering auto-sync on waiting_approval would (a) blow up
+// because syncChatTaskResult now rejects that status, and (b) freeze the
+// placeholder text on the previous "Waiting for approval" string.
 const TERMINAL_TASK_STATUSES = new Set([
   "completed",
   "failed",
-  "waiting_approval",
   "cancelled"
 ]);
 
