@@ -57,14 +57,31 @@ const server = Bun.serve({
 appendLog(config.instance, "runtime.started", { port: server.port, pid: process.pid });
 console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=${config.instance}`);
 
-setInterval(() => {
-  runDueJobs(config).catch((error) => {
-    appendLog(config.instance, "scheduler.error", { error: error instanceof Error ? error.message : String(error) });
-  });
-}, 1000);
+// Self-rescheduling scheduler loop. We await runDueJobs(config) before
+// scheduling the next tick so a slow tick (e.g. spawning N script jobs
+// inline) can never overlap with itself. Cadence is the 1000ms gap
+// *between completions*, which means a fast tick still polls roughly
+// once a second; a slow tick just slides the next tick later. Bun.sleep
+// is used in lieu of setTimeout to keep the loop awaitable and to match
+// the project's preference (CLAUDE.md).
+let schedulerStopped = false;
+async function schedulerLoop(): Promise<void> {
+  while (!schedulerStopped) {
+    try {
+      await runDueJobs(config);
+    } catch (error) {
+      appendLog(config.instance, "scheduler.error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+    await Bun.sleep(1000);
+  }
+}
+void schedulerLoop();
 
 process.on("SIGTERM", () => {
   appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
+  schedulerStopped = true;
   server.stop(true);
   // Print a stable shutdown marker so the foreground log capture (and any
   // human tailing the file) can see that the runtime is going down. Without
