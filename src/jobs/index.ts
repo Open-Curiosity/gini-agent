@@ -1,6 +1,6 @@
 import { submitTask } from "../agent";
 import type { JobRecord, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
-import { addAudit, appendEvent, appendTrace, createJob, createJobRun, mutateState, now, readState } from "../state";
+import { addAudit, appendEvent, appendLog, appendTrace, createJob, createJobRun, mutateState, now, readState } from "../state";
 import { spawn } from "bun";
 
 export { finalizeJobRunFromTask } from "./finalize";
@@ -102,13 +102,28 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
   });
 
   for (const { job, run } of claimed) {
-    if (job.script) {
-      // executeScriptJob handles its own try/catch to keep the scheduler
-      // tick from crashing on a script-runtime error.
-      await executeScriptJob(config, job.id, run.id, job.script, job.timeoutSeconds, "schedule");
+    // Regression guard: see review note 2026-05-10. A per-job dispatch
+    // failure must NOT escape and strand the OTHER already-claimed runs
+    // in `running` forever. dispatchPromptRun finalizes its own run as
+    // failed before rethrowing, so the catch here is purely about not
+    // derailing the rest of the loop. Log the iteration error so an
+    // operator can see what happened.
+    try {
+      if (job.script) {
+        // executeScriptJob handles its own try/catch to keep the scheduler
+        // tick from crashing on a script-runtime error.
+        await executeScriptJob(config, job.id, run.id, job.script, job.timeoutSeconds, "schedule");
+        continue;
+      }
+      await dispatchPromptRun(config, job, run, "schedule");
+    } catch (error) {
+      appendLog(config.instance, "scheduler.iteration.error", {
+        jobId: job.id,
+        runId: run.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
       continue;
     }
-    await dispatchPromptRun(config, job, run, "schedule");
   }
 }
 
