@@ -49,3 +49,29 @@ runtime event.
 2. Restart the runtime (or `curl -X POST /api/skills/reload`).
 3. The skill appears in the `/skills` page; trust it from the UI or via
    `POST /api/skills/<id>/trust` to expose it to the agent loop.
+
+## Auto-approving the underlying shell commands
+
+Skills like `apple-notes` and `apple-reminders` invoke trusted CLIs
+(`memo`, `remindctl`) through `terminal_exec`, which is approval-gated by
+default. To skip the approval prompt for those commands, add a glob
+pattern to the per-instance `autoApproveCommands` list in
+`~/.gini/instances/<instance>/config.json`:
+
+```json
+{
+  "autoApproveCommands": ["memo *", "remindctl *"]
+}
+```
+
+Patterns are anchored on both ends (so `memo *` matches `memo notes -a`
+but NOT `rm -rf / && memo notes`). `*` and `?` use the standard shell
+glob semantics; everything else is a literal match. Auto-approved
+commands still write a high-risk `terminal.exec` audit row with
+`evidence.autoApproved=true` and `evidence.autoApprovedReason=<pattern>`
+so the activity trail stays intact.
+
+The list can also be updated at runtime via `PATCH
+/api/settings/auto-approve` with body `{ "patterns": ["memo *", ...] }`;
+the change persists to disk and takes effect immediately for new
+`terminal_exec` calls.

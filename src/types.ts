@@ -82,6 +82,13 @@ export interface RuntimeConfig {
   workspaceRoot: string;
   stateRoot: string;
   logRoot: string;
+  // User-curated allowlist of shell-glob patterns that bypass the approval
+  // gate for terminal_exec. Patterns match the full command string (e.g.
+  // `memo *` matches any command starting with "memo "). Auto-approved
+  // executions still write a `terminal.exec` audit row with
+  // evidence.autoApproved=true plus the matched pattern, so the activity
+  // trail stays intact. Empty / undefined means no auto-approval.
+  autoApproveCommands?: string[];
 }
 
 export interface RuntimeState {

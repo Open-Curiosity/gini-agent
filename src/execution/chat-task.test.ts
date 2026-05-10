@@ -462,6 +462,79 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // Auto-approve allowlist (Fix 2). When the user has added a matching
+  // pattern to RuntimeConfig.autoApproveCommands, terminal_exec should
+  // execute synchronously and write a high-risk audit row with
+  // evidence.autoApproved=true plus the matched pattern. No approval row
+  // should be created — the loop must continue without pausing.
+  test("terminal_exec auto-approves and runs synchronously when the command matches the allowlist", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-auto-approve");
+    config.autoApproveCommands = ["echo *"];
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_auto", type: "function", function: { name: "terminal_exec", arguments: JSON.stringify({ command: "echo hello" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Said hello.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "say hello", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Said hello.");
+
+    const state = readState(config.instance);
+    // No approval row should have been created.
+    const approvalsForTask = state.approvals.filter((a) => a.taskId === task.id);
+    expect(approvalsForTask).toHaveLength(0);
+
+    // The audit row should exist and be flagged as auto-approved.
+    const audit = state.audit.find((a) => a.action === "terminal.exec" && a.taskId === task.id)!;
+    expect(audit).toBeDefined();
+    expect(audit.risk).toBe("high");
+    const evidence = audit.evidence as Record<string, unknown>;
+    expect(evidence.autoApproved).toBe(true);
+    expect(evidence.autoApprovedReason).toBe("echo *");
+    expect(evidence.exitCode).toBe(0);
+    expect(String(evidence.stdout)).toContain("hello");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("terminal_exec falls through to the approval gate when no allowlist pattern matches", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-auto-approve-miss");
+    config.autoApproveCommands = ["memo *"];
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_miss", type: "function", function: { name: "terminal_exec", arguments: JSON.stringify({ command: "rm -rf /tmp/x" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const task = await submitTask(config, "rm something", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id);
+    expect(paused.status).toBe("waiting_approval");
+    expect(paused.approvalIds.length).toBe(1);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("invalid tool args are reported back as tool errors so the model can recover", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-baddargs");

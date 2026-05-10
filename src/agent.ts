@@ -687,7 +687,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
 // command line is parsed by the same shell as a non-PTY invocation. Without
 // this, the model would have to know it's running in a different shell when
 // pty=true.
-function buildPtySpawnArgs(command: string): string[] {
+export function buildPtySpawnArgs(command: string): string[] {
   if (process.platform === "linux") {
     return ["script", "-q", "-c", `zsh -lc ${shellQuote(command)}`, "/dev/null"];
   }
@@ -695,6 +695,87 @@ function buildPtySpawnArgs(command: string): string[] {
   // /dev/null <cmd...>` runs <cmd...> under a PTY and discards the
   // typescript file; the remaining args are the command + its argv.
   return ["script", "-q", "/dev/null", "zsh", "-lc", command];
+}
+
+// Public helper for the auto-approve path. Spawns the command, captures
+// stdout/stderr, writes the artifact + audit + trace, returns the
+// formatted result string the chat-task loop feeds back to the model.
+// Mirrors the executeApprovedAction terminal.exec branch, minus the
+// approval-row handling. `evidenceExtra` lets the caller inject
+// `autoApproved` flags so the audit trail records why the approval gate
+// was skipped.
+export async function runTerminalCommand(
+  config: RuntimeConfig,
+  taskId: string,
+  command: string,
+  options: { timeoutMs?: number; pty?: boolean; evidenceExtra?: Record<string, unknown> } = {}
+): Promise<{ exitCode: number; stdout: string; stderr: string; summary: string }> {
+  const usePty = options.pty === true;
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const spawnArgs = usePty ? buildPtySpawnArgs(command) : ["zsh", "-lc", command];
+  const proc = spawn(spawnArgs, {
+    cwd: config.workspaceRoot,
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+  const timeout = setTimeout(() => proc.kill(), timeoutMs);
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited
+  ]);
+  clearTimeout(timeout);
+  // Synthetic id so the artifact filename collides with neither real
+  // approval ids nor sibling auto-approved runs in the same task.
+  const syntheticId = `auto_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const artifact = writeTerminalArtifact(config.instance, taskId, syntheticId, { stdout, stderr });
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(state, {
+      actor: "runtime",
+      action: "terminal.exec",
+      target: command,
+      risk: "high",
+      taskId,
+      runId: item.runId,
+      evidence: {
+        exitCode,
+        stdout: stdout.slice(0, 4000),
+        stderr: stderr.slice(0, 4000),
+        stdoutBytes: stdout.length,
+        stderrBytes: stderr.length,
+        stdoutTruncated: stdout.length > 4000,
+        stderrTruncated: stderr.length > 4000,
+        artifactPath: artifact.path,
+        artifactRelPath: artifact.relPath,
+        pty: usePty,
+        ...options.evidenceExtra
+      }
+    });
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Command executed",
+    data: {
+      command,
+      exitCode,
+      stdoutBytes: stdout.length,
+      stderrBytes: stderr.length,
+      stdoutTruncated: stdout.length > 4000,
+      stderrTruncated: stderr.length > 4000,
+      artifactPath: artifact.path,
+      artifactRelPath: artifact.relPath,
+      pty: usePty,
+      ...options.evidenceExtra
+    }
+  });
+  const summary = [
+    `exit ${exitCode}`,
+    stdout.length > 0 ? `stdout:\n${stdout.slice(0, 4000)}${stdout.length > 4000 ? "\n…(truncated)" : ""}` : "",
+    stderr.length > 0 ? `stderr:\n${stderr.slice(0, 4000)}${stderr.length > 4000 ? "\n…(truncated)" : ""}` : ""
+  ].filter(Boolean).join("\n\n") || `Command finished with exit ${exitCode}.`;
+  return { exitCode, stdout, stderr, summary };
 }
 
 // POSIX-safe single-quoting for embedding a command as one shell-word

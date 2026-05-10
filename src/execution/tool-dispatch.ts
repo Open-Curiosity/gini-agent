@@ -21,10 +21,11 @@ import {
   now,
   readState
 } from "../state";
-import { findTask } from "../agent";
+import { findTask, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
+import { matchAutoApprove } from "./auto-approve";
 
 export type DispatchResult =
   | { kind: "sync"; result: string }
@@ -65,7 +66,7 @@ export async function dispatchToolCall(
     case "file_patch":
       return { kind: "pending", approvalId: await requestFilePatch(config, taskId, toolCallId, args) };
     case "terminal_exec":
-      return { kind: "pending", approvalId: await requestTerminalExec(config, taskId, toolCallId, args) };
+      return await terminalExecDispatch(config, taskId, toolCallId, args);
     case "code_exec":
       return { kind: "pending", approvalId: await requestCodeExec(config, taskId, toolCallId, args) };
     default:
@@ -469,16 +470,38 @@ async function requestFilePatch(
   });
 }
 
-async function requestTerminalExec(
+// Either auto-approves (if the user added a matching pattern to
+// `RuntimeConfig.autoApproveCommands`) or creates an approval row and
+// pauses the task. Auto-approved commands still produce a high-risk
+// `terminal.exec` audit row so the activity trail is identical from the
+// reviewer's perspective — the only difference is `evidence.autoApproved
+// = true` and `evidence.autoApprovedReason = <matched pattern>`.
+async function terminalExecDispatch(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
   args: Record<string, unknown>
-): Promise<string> {
+): Promise<DispatchResult> {
   const command = requireString(args, "command");
   const timeoutMs = optionalNumber(args, "timeoutMs", 60_000);
   const pty = args.pty === true;
-  return mutateState(config.instance, (state: RuntimeState) => {
+
+  const matchedPattern = matchAutoApprove(config.autoApproveCommands, command);
+  if (matchedPattern) {
+    appendTrace(config.instance, taskId, {
+      type: "approval",
+      message: "Auto-approved terminal command (allowlist match)",
+      data: { command, pty, matchedPattern, toolCallId }
+    });
+    const result = await runTerminalCommand(config, taskId, command, {
+      timeoutMs,
+      pty,
+      evidenceExtra: { autoApproved: true, autoApprovedReason: matchedPattern, toolCallId }
+    });
+    return { kind: "sync", result: result.summary };
+  }
+
+  const approvalId = await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     const approval = createApproval(state, {
       taskId: item.id,
@@ -497,6 +520,7 @@ async function requestTerminalExec(
     });
     return approval.id;
   });
+  return { kind: "pending", approvalId };
 }
 
 async function requestCodeExec(

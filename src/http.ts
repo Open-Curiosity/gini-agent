@@ -13,7 +13,7 @@ import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, DEF
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./governance/pairing";
 import { proposePromotion, reviewPromotion } from "./governance/promotions";
-import { status } from "./runtime";
+import { status, updateAutoApproveCommands } from "./runtime";
 import { searchSessions } from "./execution/search";
 import { listToolsets, setToolsetStatus } from "./capabilities/toolsets";
 import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/subagents";
@@ -35,6 +35,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
+    // Settings: auto-approve allowlist for terminal_exec.
+    ["GET", /^\/api\/settings\/auto-approve$/, () => json({ patterns: config.autoApproveCommands ?? [] })],
+    ["PATCH", /^\/api\/settings\/auto-approve$/, async (request) => {
+      const payload = await body(request);
+      const raw = Array.isArray(payload.patterns) ? payload.patterns : [];
+      const cleaned = updateAutoApproveCommands(config, raw.map(String));
+      return json({ patterns: cleaned });
+    }],
     ["GET", /^\/api\/mobile\/bootstrap$/, () => json(mobileBootstrap(config))],
     ["GET", /^\/api\/chat$/, () => json(listChatSessions(config))],
     ["POST", /^\/api\/chat$/, async (request) => json(await createChat(config, await body(request)), 201)],

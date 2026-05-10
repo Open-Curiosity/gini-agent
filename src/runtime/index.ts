@@ -69,3 +69,17 @@ export function uninstallInstance(config: RuntimeConfig): void {
   rmSync(config.stateRoot, { recursive: true, force: true });
   rmSync(config.logRoot, { recursive: true, force: true });
 }
+
+// Updates the auto-approve command allowlist on the live config object
+// (mutated in place so the HTTP handler closure picks it up immediately)
+// and persists the new list to disk so it survives restarts. Patterns
+// are filtered through trim() to drop accidental whitespace and empties
+// from the UI text input. Returns the updated list so callers can
+// confirm the new state.
+export function updateAutoApproveCommands(config: RuntimeConfig, patterns: string[]): string[] {
+  const cleaned = patterns.map((p) => (typeof p === "string" ? p.trim() : "")).filter((p) => p.length > 0);
+  config.autoApproveCommands = cleaned;
+  ensureDir(instanceRoot(config.instance));
+  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  return cleaned;
+}
