@@ -6,6 +6,7 @@ import { useMutation } from "@tanstack/react-query";
 import { Plus } from "lucide-react";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { ApprovalActions } from "@/components/chat/ApprovalActions";
 import { Avatar } from "@/components/chat/Avatar";
 import { Composer } from "@/components/chat/Composer";
 import { MessageBubble } from "@/components/chat/MessageBubble";
@@ -22,10 +23,16 @@ import {
 } from "@/lib/queries";
 import type { ChatMessage, ChatSession } from "@/lib/view-types";
 
+// Review P1 #3: waiting_approval is intentionally NOT terminal here. It's
+// in-flight from the chat UI's perspective — getChatSession synthesizes
+// an ephemeral assistant placeholder for it, and the runtime only persists
+// a real synced ChatMessageRecord once the task hits completed / failed /
+// cancelled. Triggering auto-sync on waiting_approval would (a) blow up
+// because syncChatTaskResult now rejects that status, and (b) freeze the
+// placeholder text on the previous "Waiting for approval" string.
 const TERMINAL_TASK_STATUSES = new Set([
   "completed",
   "failed",
-  "waiting_approval",
   "cancelled"
 ]);
 
@@ -274,14 +281,31 @@ export default function ChatPage() {
                   </div>
                 ) : (
                   <ul className="space-y-5">
-                    {messages.map((message) => (
-                      <li key={message.id}>
-                        <MessageBubble
-                          message={message}
-                          isStreaming={message.id === streamingAssistantMessageId}
-                        />
-                      </li>
-                    ))}
+                    {messages.map((message) => {
+                      // Render inline Approve / Deny on the synthetic
+                      // "Waiting for approval..." placeholder — when the
+                      // message's task is in waiting_approval state, the user
+                      // can resolve the approval without leaving the chat.
+                      const messageTask = message.taskId
+                        ? tasksById.get(message.taskId)
+                        : undefined;
+                      const showApprovalActions =
+                        message.role === "assistant" &&
+                        messageTask?.status === "waiting_approval";
+                      return (
+                        <li key={message.id}>
+                          <MessageBubble
+                            message={message}
+                            isStreaming={message.id === streamingAssistantMessageId}
+                          />
+                          {showApprovalActions && message.taskId ? (
+                            <div className="ml-[46px] mt-1 max-w-[90%]">
+                              <ApprovalActions taskId={message.taskId} />
+                            </div>
+                          ) : null}
+                        </li>
+                      );
+                    })}
                     {pendingPhase && !streamingAssistantMessageId ? (
                       <li>
                         <div className="flex items-start gap-2.5">

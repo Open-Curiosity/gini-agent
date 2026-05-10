@@ -13,10 +13,10 @@ import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, DEF
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./governance/pairing";
 import { proposePromotion, reviewPromotion } from "./governance/promotions";
-import { status } from "./runtime";
+import { status, updateAutoApproveCommands } from "./runtime";
 import { searchSessions } from "./execution/search";
 import { listToolsets, setToolsetStatus } from "./capabilities/toolsets";
-import { listSubagents, spawnSubagent } from "./capabilities/subagents";
+import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/subagents";
 import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./integrations/mcp";
 import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge, listMessagingMessages, receiveMessagingInput, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
@@ -24,7 +24,7 @@ import { providerCatalog } from "./provider";
 import { createProfile, listProfiles, useProfile } from "./capabilities/profiles";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
-import { createSkillFromInput, getSkill, listSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
+import { createSkillFromInput, getSkill, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
@@ -35,6 +35,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
+    // Settings: auto-approve allowlist for terminal_exec.
+    ["GET", /^\/api\/settings\/auto-approve$/, () => json({ patterns: config.autoApproveCommands ?? [] })],
+    ["PATCH", /^\/api\/settings\/auto-approve$/, async (request) => {
+      const payload = await body(request);
+      const raw = Array.isArray(payload.patterns) ? payload.patterns : [];
+      const cleaned = updateAutoApproveCommands(config, raw.map(String));
+      return json({ patterns: cleaned });
+    }],
     ["GET", /^\/api\/mobile\/bootstrap$/, () => json(mobileBootstrap(config))],
     ["GET", /^\/api\/chat$/, () => json(listChatSessions(config))],
     ["POST", /^\/api\/chat$/, async (request) => json(await createChat(config, await body(request)), 201)],
@@ -179,6 +187,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }],
     ["POST", /^\/api\/skills$/, async (request) => json(await createSkillFromInput(config, await body(request)), 201)],
     ["GET", /^\/api\/skills\/validate$/, () => json(validateSkills(config))],
+    // Manual filesystem skill reload — re-runs loadSkillsFromDisk so a user
+    // can drop a new SKILL.md under <instance>/skills/ without restarting.
+    ["POST", /^\/api\/skills\/reload$/, async () => json(await reloadSkills(config))],
     ["GET", /^\/api\/skills\/([^/]+)$/, (_request, params) => json(getSkill(config, params[0]))],
     ["PATCH", /^\/api\/skills\/([^/]+)$/, async (request, params) => json(await updateSkill(config, params[0], await body(request)))],
     ["POST", /^\/api\/skills\/([^/]+)\/test$/, async (_request, params) => json(await testSkill(config, params[0]))],
@@ -215,6 +226,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "disabled"))],
     ["GET", /^\/api\/subagents$/, async () => json(await listSubagents(config))],
     ["POST", /^\/api\/subagents$/, async (request) => json(await spawnSubagent(config, await body(request)), 201)],
+    ["POST", /^\/api\/subagents\/([^/]+)\/cancel$/, async (_request, params) => json(await cancelSubagent(config, params[0]))],
     ["GET", /^\/api\/mcp$/, () => json(readState(config.instance).mcpServers)],
     ["POST", /^\/api\/mcp$/, async (request) => json(await addMcpServer(config, await body(request)), 201)],
     ["POST", /^\/api\/mcp\/([^/]+)\/health$/, async (_request, params) => json(await checkMcpServer(config, params[0]))],

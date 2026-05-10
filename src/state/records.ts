@@ -282,7 +282,7 @@ export function createMemory(
 
 export function createSkill(
   state: RuntimeState,
-  skill: Omit<SkillRecord, "id" | "instance" | "createdAt" | "updatedAt" | "version" | "tests" | "successCount" | "failureCount" | "previousVersions"> & Partial<Pick<SkillRecord, "tests" | "successCount" | "failureCount" | "previousVersions">>
+  skill: Omit<SkillRecord, "id" | "instance" | "createdAt" | "updatedAt" | "version" | "tests" | "successCount" | "failureCount" | "previousVersions" | "body"> & Partial<Pick<SkillRecord, "tests" | "successCount" | "failureCount" | "previousVersions" | "body" | "manifestPath" | "category" | "platforms" | "prerequisites" | "source">>
 ): SkillRecord {
   const at = now();
   const item: SkillRecord = {
@@ -295,6 +295,7 @@ export function createSkill(
     successCount: 0,
     failureCount: 0,
     previousVersions: [],
+    body: "",
     ...skill
   };
   state.skills.unshift(item);

@@ -13,11 +13,17 @@ import { createConversationRun, linkRunToTask } from "./runs";
 // Statuses where a task is no longer producing partial text. Once a task
 // reaches one of these, the synthesized streaming message is dropped in
 // favor of the synced assistant message (or task error).
+//
+// Note (Review P1 #3): waiting_approval is intentionally NOT in this set.
+// Earlier, we persisted a real ChatMessageRecord for waiting_approval and
+// the syncChatTaskResult short-circuit (`if (existing) return existing`)
+// meant the placeholder text never updated even after the task completed.
+// We now treat waiting_approval as in-flight and synthesize the placeholder
+// ephemerally so it auto-replaces with the real summary on completion.
 const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
   "completed",
   "failed",
-  "cancelled",
-  "waiting_approval"
+  "cancelled"
 ]);
 
 export function listChatSessions(config: RuntimeConfig) {
@@ -38,19 +44,31 @@ export function getChatSession(config: RuntimeConfig, id: string) {
   const tasks = state.tasks.filter((task) => session.taskIds.includes(task.id));
 
   // Synthesize transient streaming assistant messages: any in-flight task
-  // with partialSummary that doesn't yet have a synced assistant message
-  // gets a virtual ChatMessageRecord so the chat UI sees text mid-flight.
+  // with partialSummary or in waiting_approval that doesn't yet have a
+  // synced assistant message gets a virtual ChatMessageRecord so the chat
+  // UI sees text mid-flight (or the "Waiting for approval" placeholder).
   // Once the real synced message arrives, this branch is skipped and the
   // synthesized one disappears — the caller never sees both for the same
   // task.
+  //
+  // Review P1 #3: waiting_approval is included here so the placeholder
+  // updates automatically when approval grants and the task completes;
+  // previously we persisted a real ChatMessageRecord for waiting_approval
+  // and the sync short-circuit froze the UI at "Waiting for approval".
   const syncedAssistantTaskIds = new Set(
     stored.filter((m) => m.role === "assistant" && m.taskId).map((m) => m.taskId as string)
   );
   const synthetic: ChatMessageRecord[] = [];
   for (const task of tasks) {
     if (TERMINAL_TASK_STATUSES.has(task.status)) continue;
-    if (!task.partialSummary) continue;
     if (syncedAssistantTaskIds.has(task.id)) continue;
+    let content: string | undefined;
+    if (task.status === "waiting_approval") {
+      content = task.currentStep || "Waiting for approval...";
+    } else if (task.partialSummary) {
+      content = task.partialSummary;
+    }
+    if (!content) continue;
     synthetic.push({
       // Stable id so React's keying stays consistent across polls; switches
       // to the real msg_* id once the task completes and sync runs.
@@ -58,7 +76,7 @@ export function getChatSession(config: RuntimeConfig, id: string) {
       instance: state.instance,
       sessionId: id,
       role: "assistant",
-      content: task.partialSummary,
+      content,
       taskId: task.id,
       runId: task.runId,
       createdAt: task.updatedAt
@@ -101,7 +119,9 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
   const session = state.chatSessions.find((item) => item.id === sessionId);
   if (!session) throw new Error(`Chat session not found: ${sessionId}`);
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
-  const task = await submitTask(config, content, undefined, undefined, undefined, run.id);
+  // Chat messages run through the tool-calling agent loop. The legacy
+  // prefix-dispatch path stays available for the imperative CLI.
+  const task = await submitTask(config, content, { runId: run.id, mode: "chat" });
   await linkRunToTask(config, run.id, task);
   await mutateState(config.instance, (current) => {
     const message = createChatMessage(current, { sessionId, role: "user", content, taskId: task.id, runId: run.id });
@@ -120,7 +140,11 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
     if (!task) throw new Error(`Task not found: ${taskId}`);
     const existing = state.chatMessages.find((message) => message.taskId === taskId && message.role === "assistant");
     if (existing) return existing;
-    if (task.status !== "completed" && task.status !== "failed" && task.status !== "waiting_approval") {
+    // Review P1 #3: only sync truly terminal task results into a real
+    // ChatMessageRecord. waiting_approval is in-flight — the synthetic
+    // placeholder rendered by getChatSession swaps out automatically once
+    // approval grants and the task finishes.
+    if (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
       throw new Error(`Task is not ready for chat sync: ${task.status}`);
     }
     const content = task.status === "completed"
