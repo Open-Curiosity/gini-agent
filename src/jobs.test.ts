@@ -226,6 +226,82 @@ describe("cron lifecycle", () => {
     expect(response.status).toBe(404);
   });
 
+  test("overdue manual run advances nextRunAt drift-free and bumps missedRuns", async () => {
+    // Setup mirrors the scheduler drift-test, but invokes runJobNow with
+    // trigger="manual" instead of letting runDueJobs claim it. Without the
+    // overdue-advance, runDueJobs would re-claim this job ~1s later and
+    // double-fire it.
+    const config = testConfig("jobs-manual-overdue");
+    const handler = createHandler(config);
+
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "manual overdue", script: "true", intervalSeconds: 10 })
+    });
+    const setupNow = Date.now();
+    const dueAt = setupNow - 25_000;
+    await mutateState(config.instance, (state) => {
+      const item = state.jobs.find((candidate) => candidate.id === job.id);
+      if (!item) throw new Error("setup: job missing");
+      item.nextRunAt = new Date(dueAt).toISOString();
+    });
+
+    const result = await runJobNow(config, job.id, "manual");
+    expect(result).toBeDefined();
+
+    const after = readState(config.instance).jobs.find((candidate) => candidate.id === job.id)!;
+    const newNextMs = new Date(after.nextRunAt).getTime();
+    // The advance must have moved nextRunAt past now so the scheduler
+    // tick won't re-claim immediately.
+    expect(newNextMs).toBeGreaterThan(Date.now());
+    // missedRuns counts only the EXTRA skipped intervals — the first
+    // advance corresponds to "the manual run satisfied the overdue
+    // tick". -25s -> -15s (miss), -15s -> -5s (miss), -5s -> +5s (stop).
+    // Two extra advances => missed = 2.
+    expect(after.missedRuns).toBe(2);
+    // Cadence sanity: new nextRunAt - original due is a multiple of 10s.
+    const stepMs = 10_000;
+    const delta = newNextMs - dueAt;
+    expect(delta % stepMs).toBe(0);
+    expect(delta / stepMs).toBe(3);
+  });
+
+  test("paused manual run does NOT advance nextRunAt", async () => {
+    // The schedule is paused — pretending it kept ticking while paused
+    // would surface a misleading "next run in N seconds" once the user
+    // resumes. Manual run on a paused job must leave nextRunAt alone.
+    const config = testConfig("jobs-manual-paused-noadvance");
+    const handler = createHandler(config);
+
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "paused manual", script: "echo paused", intervalSeconds: 10 })
+    });
+    await call(handler, config, `/api/jobs/${job.id}/pause`, { method: "POST" });
+
+    const setupNow = Date.now();
+    const originalNextRun = new Date(setupNow - 25_000).toISOString();
+    await mutateState(config.instance, (state) => {
+      const item = state.jobs.find((candidate) => candidate.id === job.id);
+      if (!item) throw new Error("setup: job missing");
+      item.nextRunAt = originalNextRun;
+      // missedRuns starts from whatever the previous test path left;
+      // record the baseline so we can assert it's unchanged.
+    });
+    const baseMissedRuns = readState(config.instance).jobs.find((candidate) => candidate.id === job.id)!.missedRuns;
+
+    const result = await runJobNow(config, job.id, "manual");
+    expect(result).toBeDefined();
+
+    const after = readState(config.instance).jobs.find((candidate) => candidate.id === job.id)!;
+    // Paused -> nextRunAt unchanged.
+    expect(after.nextRunAt).toBe(originalNextRun);
+    expect(after.missedRuns).toBe(baseMissedRuns);
+    // And the job stays paused (existing behavior; covered separately
+    // by "manual run does not resume a paused job", but reaffirm).
+    expect(after.status).toBe("paused");
+  });
+
   test("invalid intervalSeconds returns 400", async () => {
     const config = testConfig("jobs-validation");
     const handler = createHandler(config);

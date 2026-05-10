@@ -208,9 +208,27 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
     item.lastRunAt = now();
     item.runCount += 1;
     // For trigger="schedule", advancing nextRunAt is owned by runDueJobs
-    // (drift-free). runJobNow only mutates nextRunAt for manual/replay if
-    // the scheduled time has already passed (we don't want a manual run
-    // to itself be the trigger for the next scheduled run; leave it alone).
+    // (drift-free). For manual/replay we usually leave nextRunAt alone —
+    // a user clicking Run shouldn't itself reschedule the next tick.
+    //
+    // BUT: if the manual run is happening AFTER the scheduled tick was
+    // already overdue, we must advance nextRunAt or the scheduler will
+    // re-fire the same job ~1s later and double-run it. Only do this
+    // for active jobs — advancing on a paused job would imply the
+    // schedule kept ticking while paused, which it didn't.
+    //
+    // The first advance corresponds to "this manual run satisfies the
+    // overdue tick" and is NOT counted as a missed run; only additional
+    // advances (further skipped intervals) bump missedRuns.
+    if (trigger !== "schedule" && item.status === "active") {
+      const dueAt = new Date(item.nextRunAt).getTime();
+      const dateNow = Date.now();
+      if (dueAt <= dateNow) {
+        const { nextRunAtMs, missed } = advanceNextRunAt(dueAt, item.intervalSeconds, dateNow);
+        item.nextRunAt = new Date(nextRunAtMs).toISOString();
+        if (missed > 0) item.missedRuns += missed;
+      }
+    }
     item.updatedAt = now();
     const run = createJobRun(state, { jobId, trigger });
     item.runIds.unshift(run.id);
