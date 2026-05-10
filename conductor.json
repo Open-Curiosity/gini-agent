@@ -2,7 +2,7 @@
     "scripts": {
         "setup": "instance=$(basename \"$PWD\"); bun i && bun run gini install --instance \"$instance\"",
         "remoteSetup": "instance=$(basename \"$PWD\"); bun i && bun run gini install --instance \"$instance\"",
-        "run": "instance=$(basename \"$PWD\"); bun run gini run --instance \"$instance\"",
+        "run": "instance=$(basename \"$PWD\"); session=\"gini-$instance\"; tmux new-session -A -s \"$session\" \"bun run gini run --instance $instance\"",
         "archive": "instance=$(basename \"$PWD\"); bun run gini uninstall --instance \"$instance\" && rm -rf node_modules \"$HOME/.claude/projects/-Users-shelden-conductor-workspaces-gini-agent-$instance\""
     }
 }
