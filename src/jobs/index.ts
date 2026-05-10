@@ -22,9 +22,18 @@ function assertNonNegativeInt(label: string, value: unknown): number {
 }
 
 export async function createScheduledJob(config: RuntimeConfig, input: Record<string, unknown>) {
-  const intervalSeconds = assertPositiveInt("intervalSeconds", input.intervalSeconds ?? 60);
-  const timeoutSeconds = assertPositiveInt("timeoutSeconds", input.timeoutSeconds ?? 30);
-  const retryLimit = assertNonNegativeInt("retryLimit", input.retryLimit ?? 0);
+  // Only fall back to defaults when the field is truly absent. An explicit
+  // NaN-from-JSON arrives as `null`, and `null ?? 60` would silently
+  // promote a bogus payload to a happy path — instead, validate it.
+  const intervalSeconds = input.intervalSeconds === undefined
+    ? 60
+    : assertPositiveInt("intervalSeconds", input.intervalSeconds);
+  const timeoutSeconds = input.timeoutSeconds === undefined
+    ? 30
+    : assertPositiveInt("timeoutSeconds", input.timeoutSeconds);
+  const retryLimit = input.retryLimit === undefined
+    ? 0
+    : assertNonNegativeInt("retryLimit", input.retryLimit);
   return mutateState(config.instance, (state) => createJob(state, {
     name: String(input.name ?? "Untitled job"),
     prompt: String(input.prompt ?? ""),
