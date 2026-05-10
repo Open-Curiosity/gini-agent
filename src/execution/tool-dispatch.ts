@@ -476,7 +476,7 @@ async function requestTerminalExec(
   args: Record<string, unknown>
 ): Promise<string> {
   const command = requireString(args, "command");
-  const timeoutMs = optionalNumber(args, "timeoutMs", 10_000);
+  const timeoutMs = optionalNumber(args, "timeoutMs", 60_000);
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     const approval = createApproval(state, {
