@@ -18,6 +18,7 @@ import { createHandler } from "./http";
 import { runDueJobs, runJobNow } from "./jobs";
 import { createTask, mutateState, readState, upsertTask } from "./state";
 import { dispatchToolCall } from "./execution/tool-dispatch";
+import { syncChatTaskResult } from "./execution/chat";
 import type { RuntimeConfig } from "./types";
 
 describe("cron lifecycle", () => {
@@ -487,6 +488,86 @@ describe("cron lifecycle", () => {
       (event) => event.action === "job.oneshot.completed" && event.target === job.id
     );
     expect(audit).toBeDefined();
+  });
+
+  test("syncChatTaskResult suppresses delivery when the task summary is [SILENT]", async () => {
+    // The cron-execution hint instructs the LLM to emit "[SILENT]" when a
+    // scheduled run has nothing new to report. syncChatTaskResult must
+    // recognize the sentinel, skip creating an assistant ChatMessageRecord,
+    // and audit the suppression.
+    const config = testConfig("jobs-silent-suppress");
+
+    const sessionId = "session_silent_test";
+    const taskId = await mutateState(config.instance, (state) => {
+      state.chatSessions.unshift({
+        id: sessionId,
+        instance: state.instance,
+        title: "Silent test",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messageIds: [],
+        taskIds: [],
+        runIds: []
+      });
+      const task = createTask(state.instance, "watch for change", undefined, undefined, undefined, undefined);
+      task.status = "completed";
+      task.summary = "[SILENT]";
+      task.updatedAt = new Date().toISOString();
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await syncChatTaskResult(config, sessionId, taskId);
+    expect(result).toBeNull();
+
+    const stateAfter = readState(config.instance);
+    const assistantMessages = stateAfter.chatMessages.filter(
+      (m) => m.sessionId === sessionId && m.role === "assistant"
+    );
+    expect(assistantMessages).toHaveLength(0);
+
+    const audit = stateAfter.audit.find(
+      (event) => event.action === "chat.message.suppressed_silent" && event.target === sessionId
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.taskId).toBe(taskId);
+  });
+
+  test("syncChatTaskResult delivers when summary contains [SILENT] alongside other text", async () => {
+    // The sentinel must match exactly. A summary like "[SILENT] but also..."
+    // or a lowercase variant should NOT be suppressed — otherwise a reminder
+    // that happens to mention the word could be silently dropped.
+    const config = testConfig("jobs-silent-not-exact");
+
+    const sessionId = "session_silent_strict";
+    const taskId = await mutateState(config.instance, (state) => {
+      state.chatSessions.unshift({
+        id: sessionId,
+        instance: state.instance,
+        title: "Strict",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messageIds: [],
+        taskIds: [],
+        runIds: []
+      });
+      const task = createTask(state.instance, "watch", undefined, undefined, undefined, undefined);
+      task.status = "completed";
+      task.summary = "[SILENT] with extra";
+      task.updatedAt = new Date().toISOString();
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await syncChatTaskResult(config, sessionId, taskId);
+    expect(result).not.toBeNull();
+
+    const stateAfter = readState(config.instance);
+    const assistantMessages = stateAfter.chatMessages.filter(
+      (m) => m.sessionId === sessionId && m.role === "assistant"
+    );
+    expect(assistantMessages).toHaveLength(1);
+    expect(assistantMessages[0]?.content).toBe("[SILENT] with extra");
   });
 });
 
