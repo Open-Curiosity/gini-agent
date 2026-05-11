@@ -48,6 +48,23 @@ This repo includes a Bun TypeScript local runtime with:
 
 ## Quick Start
 
+Install with one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
+```
+
+The installer drops a `gini` wrapper at `~/.local/bin/gini` that runs against the `home` instance by default. State lives under `~/.gini/instances/home/`. After install, reload your shell PATH and start the runtime:
+
+```bash
+gini start
+gini smoke
+```
+
+`gini start` launches the runtime gateway and the Next.js web control plane and prints the runtime gateway URL and the web URL.
+
+### From source (for developers)
+
 ```bash
 bun install
 bun run gini install
@@ -55,14 +72,7 @@ bun run gini start
 bun run gini smoke
 ```
 
-`start` launches the runtime gateway and the local Next.js web control plane. It prints two URLs:
-
-```text
-url     -> runtime gateway API
-webUrl  -> Next.js control plane
-```
-
-For the `dev` instance those default to:
+When you run the CLI from a repo clone, the default instance is `dev`. The installed `gini` command from `curl | bash` defaults to `home` instead so developer state and end-user state stay separate. For the `dev` instance the URLs default to:
 
 - runtime: `http://127.0.0.1:7337`
 - web: `http://127.0.0.1:3000`
