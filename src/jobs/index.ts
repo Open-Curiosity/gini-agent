@@ -1,6 +1,6 @@
 import { submitTask } from "../agent";
 import type { JobRecord, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
-import { addAudit, appendEvent, appendLog, appendTrace, createJob, createJobRun, mutateState, now, readState } from "../state";
+import { addAudit, appendEvent, appendLog, appendTrace, createJob, createJobRun, createRun, mutateState, now, readState } from "../state";
 import { spawn } from "bun";
 
 export { finalizeJobRunFromTask } from "./finalize";
@@ -150,6 +150,17 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
 // run in `running` — it will be finalized via finalizeJobRunFromTask once
 // the spawned task reaches a terminal state. If submitTask itself throws,
 // finalize the run as failed defensively so it doesn't hang.
+//
+// When the job carries a `chatSessionId` (created via the agent's
+// `create_job` tool), we additionally:
+//   - create a fresh RunRecord linked to that conversation so the chat
+//     UI shows the spawned task in the same thread
+//   - submit the task with mode:"chat" + that runId so the tool-calling
+//     agent loop is used (multi-turn context, structured tool calls)
+//   - push task.id onto session.taskIds so getChatSession picks up the
+//     in-flight task and synthesizes a placeholder
+// Final delivery (assistant message) is wired up in finalizeJobRunFromTask
+// via syncChatTaskResult.
 async function dispatchPromptRun(
   config: RuntimeConfig,
   job: JobRecord,
@@ -157,9 +168,46 @@ async function dispatchPromptRun(
   trigger: "schedule" | "manual" | "replay"
 ): Promise<{ jobId: string; runId: string; taskId: string }> {
   const prompt = [job.context.length > 0 ? `Context:\n${job.context.join("\n")}` : "", job.prompt].filter(Boolean).join("\n\n");
+
+  // Resolve session linkage up-front. If the job points at a session that
+  // no longer exists (deleted by the user), audit the gap and fall through
+  // to the legacy imperative path so the job still produces a result.
+  let chatRunId: string | undefined;
+  if (job.chatSessionId) {
+    const sessionRunId = await mutateState(config.instance, (state) => {
+      const session = state.chatSessions.find((candidate) => candidate.id === job.chatSessionId);
+      if (!session) {
+        addAudit(state, {
+          actor: "runtime",
+          action: "job.session.missing",
+          target: job.id,
+          risk: "low",
+          evidence: { jobId: job.id, runId: run.id, chatSessionId: job.chatSessionId }
+        });
+        return undefined;
+      }
+      const chatRun = createRun(state, {
+        kind: "job",
+        title: job.name,
+        input: prompt,
+        conversationId: job.chatSessionId,
+        jobId: job.id
+      });
+      // createRun pushes the runId onto session.runIds automatically when
+      // conversationId is set. session.taskIds is updated post-submitTask
+      // (we don't have task.id yet).
+      return chatRun.id;
+    });
+    chatRunId = sessionRunId;
+  }
+
   let task;
   try {
-    task = await submitTask(config, prompt, job.id);
+    if (chatRunId) {
+      task = await submitTask(config, prompt, { jobId: job.id, runId: chatRunId, mode: "chat" });
+    } else {
+      task = await submitTask(config, prompt, job.id);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await mutateState(config.instance, (state) => {
@@ -198,11 +246,18 @@ async function dispatchPromptRun(
     runItem.taskId = task.id;
     // Leave runItem.status === "running" so finalizeJobRunFromTask can
     // complete it when the task settles. Do NOT set lastSuccessAt here.
+    if (job.chatSessionId) {
+      const session = state.chatSessions.find((candidate) => candidate.id === job.chatSessionId);
+      if (session && !session.taskIds.includes(task.id)) {
+        session.taskIds.push(task.id);
+        session.updatedAt = now();
+      }
+    }
   });
   appendTrace(config.instance, task.id, {
     type: "job",
     message: "Job spawned task",
-    data: { jobId: job.id, runId: run.id, deliveryTargets: job.deliveryTargets }
+    data: { jobId: job.id, runId: run.id, deliveryTargets: job.deliveryTargets, chatSessionId: job.chatSessionId, chatRunId }
   });
   return { jobId: job.id, runId: run.id, taskId: task.id };
 }
