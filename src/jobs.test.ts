@@ -16,7 +16,8 @@ import { describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { createHandler } from "./http";
 import { runDueJobs, runJobNow } from "./jobs";
-import { mutateState, readState } from "./state";
+import { createTask, mutateState, readState, upsertTask } from "./state";
+import { dispatchToolCall } from "./execution/tool-dispatch";
 import type { RuntimeConfig } from "./types";
 
 describe("cron lifecycle", () => {
@@ -319,6 +320,173 @@ describe("cron lifecycle", () => {
     // JSON.stringify turns NaN into null, which Number(...) rejects via
     // the assertPositiveInt validator. Either way we expect 400.
     expect(nan.status).toBe(400);
+  });
+
+  test("create_job dispatch from a chat-bound task records chatSessionId", async () => {
+    const config = testConfig("jobs-create-tool-chat");
+    // Build a chat session and a task whose runId points at it. This is
+    // the shape submitChatMessage produces — we synthesize it directly so
+    // the dispatch test isn't gated on the full chat-task agent loop.
+    const { taskId, sessionId } = await mutateState(config.instance, (state) => {
+      state.chatSessions.unshift({
+        id: "session_test_chat",
+        instance: state.instance,
+        title: "Test chat",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messageIds: [],
+        taskIds: [],
+        runIds: []
+      });
+      const at = new Date().toISOString();
+      state.runs.unshift({
+        id: "run_test_chat",
+        instance: state.instance,
+        kind: "conversation_turn",
+        status: "running",
+        title: "test",
+        input: "test",
+        createdAt: at,
+        updatedAt: at,
+        conversationId: "session_test_chat",
+        planStepIds: [],
+        childRunIds: [],
+        approvalIds: []
+      });
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, "run_test_chat");
+      upsertTask(state, task);
+      return { taskId: task.id, sessionId: "session_test_chat" };
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "create_job",
+      "call_create_job_1",
+      JSON.stringify({ name: "test-reminder", intervalSeconds: 60, prompt: "Remind me.", oneShot: true })
+    );
+    expect(result.kind).toBe("sync");
+
+    const jobs = readState(config.instance).jobs;
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.chatSessionId).toBe(sessionId);
+    expect(jobs[0]?.oneShot).toBe(true);
+    expect(jobs[0]?.intervalSeconds).toBe(60);
+    expect(jobs[0]?.prompt).toBe("Remind me.");
+
+    // Confirmation string contains the new job id and cadence.
+    if (result.kind === "sync") {
+      expect(result.result).toContain(jobs[0]!.id);
+      expect(result.result).toContain("one-shot");
+    }
+    // Audit row with actor:"agent" action:"job.created".
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.created" && event.target === jobs[0]!.id
+    );
+    expect(audit?.actor).toBe("agent");
+  });
+
+  test("create_job dispatch from an imperative task leaves chatSessionId undefined", async () => {
+    const config = testConfig("jobs-create-tool-cli");
+    // An imperative task — no runId, no conversation — looks like a CLI
+    // task. The job should still get created but without chatSessionId.
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "create_job",
+      "call_create_job_imperative",
+      JSON.stringify({ name: "cli-cron", intervalSeconds: 30, prompt: "Heartbeat." })
+    );
+    expect(result.kind).toBe("sync");
+
+    const jobs = readState(config.instance).jobs;
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.chatSessionId).toBeUndefined();
+    // The dispatcher coerces an omitted `oneShot` to false so the field
+    // has a stable shape for downstream reads. Recurring behavior either
+    // way (oneShot must be strictly === true to trigger the auto-pause).
+    expect(jobs[0]?.oneShot).toBe(false);
+  });
+
+  test("scheduled prompt job with chatSessionId delivers an assistant chat message", async () => {
+    // End-to-end test: create a job linked to a chat session, force its
+    // nextRunAt into the past, let runDueJobs claim + dispatch it, wait
+    // for the task to settle, then assert that finalizeJobRunFromTask
+    // produced a ChatMessageRecord with role="assistant" in that session.
+    const config = testConfig("jobs-chat-delivery");
+    const handler = createHandler(config);
+
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "delivery test" })
+    });
+
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "delivery-job",
+        prompt: "echo ping",
+        intervalSeconds: 60,
+        chatSessionId: session.id,
+        oneShot: true
+      })
+    });
+    expect(job.chatSessionId).toBe(session.id);
+    expect(job.oneShot).toBe(true);
+
+    // Force the job due so runDueJobs claims it on the next tick.
+    await mutateState(config.instance, (state) => {
+      const item = state.jobs.find((candidate) => candidate.id === job.id);
+      if (!item) throw new Error("setup: job missing");
+      item.nextRunAt = new Date(Date.now() - 1_000).toISOString();
+    });
+
+    await runDueJobs(config);
+
+    // Diagnostic: confirm runDueJobs claimed the job and spawned a task.
+    const afterClaim = readState(config.instance);
+    const claimedRun = afterClaim.jobRuns.find((run) => run.jobId === job.id);
+    expect(claimedRun).toBeDefined();
+    expect(claimedRun?.taskId).toBeString();
+    const spawnedTask = afterClaim.tasks.find((t) => t.id === claimedRun?.taskId);
+    expect(spawnedTask?.mode).toBe("chat");
+
+    // Wait for the spawned task to settle, then for the assistant message
+    // to appear in the session (finalize is async).
+    await waitFor(() => {
+      const state = readState(config.instance);
+      const jobRun = state.jobRuns.find((run) => run.jobId === job.id);
+      return jobRun?.status === "completed" || jobRun?.status === "failed";
+    }, 5_000);
+
+    await waitFor(() => {
+      const state = readState(config.instance);
+      return state.chatMessages.some(
+        (m) => m.sessionId === session.id && m.role === "assistant"
+      );
+    }, 5_000);
+
+    const stateAfter = readState(config.instance);
+    const assistantMessages = stateAfter.chatMessages.filter(
+      (m) => m.sessionId === session.id && m.role === "assistant"
+    );
+    expect(assistantMessages.length).toBeGreaterThanOrEqual(1);
+
+    // The job should be paused now because oneShot=true.
+    const finalJob = stateAfter.jobs.find((candidate) => candidate.id === job.id);
+    expect(finalJob?.status).toBe("paused");
+
+    // Audit row for the one-shot completion.
+    const audit = stateAfter.audit.find(
+      (event) => event.action === "job.oneshot.completed" && event.target === job.id
+    );
+    expect(audit).toBeDefined();
   });
 });
 
