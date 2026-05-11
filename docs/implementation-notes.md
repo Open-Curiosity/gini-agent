@@ -1,6 +1,6 @@
 # Gini Runtime Implementation Notes
 
-These notes describe the current source layout and boundaries. Product direction lives in [Master Plan](./master-plan.md). Runtime behavior is documented in [Gateway And Control Plane](./gateway.md), [Conversation And Runs](./conversation-runs.md), and [Memory](./memory.md).
+These notes describe the current source layout and boundaries. Product direction lives in [Whitepaper](./whitepaper.md). Runtime behavior is documented in [Gateway And Control Plane](./gateway.md), [Conversation And Runs](./conversation-runs.md), and [Memory](./memory.md).
 
 ## Source Layout
 

@@ -6,7 +6,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 
 ## Docs
 
-- [Master Plan](docs/master-plan.md): high-level goal, principles, and roadmap
+- [Whitepaper](docs/whitepaper.md): the gaps this project is closing and the bar it's measured against
 - [Architecture Overview](docs/architecture-overview.md): gateway/client map
 - [Gateway And Control Plane](docs/gateway.md): runtime process, BFF, auth, instances, ports, disk layout
 - [Conversation And Runs](docs/conversation-runs.md): chat, runs, tasks, plan steps, traces, and audit handoff

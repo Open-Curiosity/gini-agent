@@ -7,8 +7,8 @@
 //
 // Reembed: walks all active memory units in a bank, re-embeds each with the
 // currently-selected provider, and updates the embedding/embedding_dim/
-// embedding_model triple. Audit-logged via addAudit so the master-plan
-// invariant ("audit events for embedding mutations") holds.
+// embedding_model triple. Audit-logged via addAudit so the
+// invariant "audit events for embedding mutations" holds.
 
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -130,7 +130,7 @@ export async function reembedBank(config: RuntimeConfig, input: ReembedInput): P
   }
 
   // Audit (mutate state so the event hits the audit log + the runtime event
-  // stream, matching the master-plan invariant for embedding mutations).
+  // stream, matching the invariant that embedding mutations are audited).
   await mutateState(config.instance, (state) => {
     addAudit(state, {
       actor: "runtime",

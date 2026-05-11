@@ -84,9 +84,8 @@ export function JobDetail({
                   </Section>
                 ) : null}
                 <Section title="Alerts (coming soon)">
-                  {/* Placeholder per master plan §5.7. No alert endpoints exist
-                      in the runtime yet, so we acknowledge the surface rather
-                      than fake controls — see context "R3-M2". */}
+                  {/* Placeholder. No alert endpoints exist in the runtime yet,
+                      so we acknowledge the surface rather than fake controls. */}
                   <p className="text-xs text-muted-foreground">
                     Per-job failure alerts will land alongside the notifications surface.
                   </p>
