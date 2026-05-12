@@ -1,6 +1,5 @@
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { rmSync } from "node:fs";
-import * as net from "node:net";
 import { __test, connectBrowser, disconnectBrowser, getBrowserConnection } from "./browser-connect";
 import { readState } from "../state";
 import type { RuntimeConfig } from "../types";
@@ -202,67 +201,6 @@ describe("browser-connect round-1 hardening", () => {
     expect(__test.stripUrlCredentials(clean)).toBe(clean);
   });
 
-  test("ensurePortAvailable rejects when port is bound", async () => {
-    // Bind a listener so the helper sees EADDRINUSE. Picking 0 lets the
-    // OS assign a free ephemeral port; we then ask the helper about that
-    // same port and expect rejection.
-    await new Promise<void>(async (resolve, reject) => {
-      const server = net.createServer();
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", async () => {
-        const addr = server.address();
-        if (!addr || typeof addr === "string") {
-          server.close();
-          reject(new Error("no port assigned"));
-          return;
-        }
-        const port = addr.port;
-        try {
-          await expect(__test.ensurePortAvailable(port)).rejects.toThrow(/already in use/);
-          resolve();
-        } catch (error) {
-          reject(error);
-        } finally {
-          server.close();
-        }
-      });
-    });
-  });
-
-  test("ensurePortAvailable succeeds when port is free", async () => {
-    // Take an ephemeral port, close it, then probe — the kernel will
-    // typically hand it back to us. (TIME_WAIT means this can flake, but
-    // SO_REUSEADDR-default net.createServer should be fine on Bun.)
-    const port = await new Promise<number>((resolve, reject) => {
-      const server = net.createServer();
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => {
-        const addr = server.address();
-        if (!addr || typeof addr === "string") {
-          server.close();
-          reject(new Error("no port assigned"));
-          return;
-        }
-        const p = addr.port;
-        server.close(() => resolve(p));
-      });
-    });
-    await expect(__test.ensurePortAvailable(port)).resolves.toBeUndefined();
-  });
-
-  test("isPidStillChrome returns false when ps cmdline doesn't match", () => {
-    // pid 1 (the init process) is guaranteed to exist on macOS/Linux but
-    // its cmdline will never include the magical /Applications/Google
-    // Chrome.app path nor a --user-data-dir flag. The identity check must
-    // refuse to accept it.
-    const matches = __test.isPidStillChrome(
-      1,
-      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      "/tmp/never-was-a-real-data-dir"
-    );
-    expect(matches).toBe(false);
-  });
-
   test("idempotent connect refreshes cdpUrl from the probe response", async () => {
     const config = testConfig("idempotent-refresh");
     // Stand up a tiny HTTP server that pretends to be /json/version. We
@@ -309,19 +247,27 @@ describe("browser-connect round-1 hardening", () => {
 });
 
 describe("browser-connect round-2 hardening", () => {
-  test("mismatch-reconnect tears down the old managed record before fresh attempt", async () => {
+  test("mismatch-reconnect drops the in-process handle before fresh attempt", async () => {
     const config = testConfig("mismatch-teardown");
     const { mutateState } = await import("../state");
-    // Seed a managed record on port 9222 with a fake pid. The caller will
-    // request a different cdpUrl; the mismatch path must run the full
-    // teardown — including killManagedChrome — before attempting the
-    // fresh launch. Use a cdpUrl that we know will fail to probe (port 1
-    // is reserved and refused everywhere) so the test is independent of
-    // whether the host machine has Chrome installed.
+    // Seed a managed record. The caller will request a different cdpUrl;
+    // the mismatch path must run the full teardown (clear state + drop
+    // the in-process Playwright handle via disconnectSharedBrowser) before
+    // attempting the fresh launch. Closing the context terminates the
+    // Chromium child Playwright launched — no separate PID kill needed.
+    // Install a fake context so disconnectSharedBrowser can call close()
+    // on it without spawning a real browser.
+    const browserMod = await import("../tools/browser");
+    let contextCloseCount = 0;
+    browserMod.__test.installFakeManagedContextForTest({
+      close: async () => {
+        contextCloseCount++;
+      }
+    });
     await mutateState(config.instance, (state) => {
       state.browser = {
         mode: "managed",
-        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/OLD",
+        cdpUrl: __test.MANAGED_CDP_SENTINEL,
         pid: 424242,
         dataDir: "/tmp/never-was-real",
         chromePath: "/never/was/real/chrome",
@@ -329,32 +275,17 @@ describe("browser-connect round-2 hardening", () => {
       };
     });
 
-    let killCalled = false;
-    const killCalls: Array<{ pid: number; chromePath: string | null; dataDir: string | null }> = [];
-    __test.setKillManagedChromeForTest(async (pid, chromePath, dataDir) => {
-      killCalled = true;
-      killCalls.push({ pid, chromePath, dataDir });
-    });
-    try {
-      // Ask for a different cdpUrl (different host). The fresh connect
-      // will fail (unreachable port), but the assertion is about the
-      // *teardown order*: killManagedChrome must have been called BEFORE
-      // the launch attempt resolved/rejected, and state must be cleared
-      // on failure.
-      await expect(
-        connectBrowser(config, { cdpUrl: "ws://127.0.0.1:1/devtools/browser/NEW" })
-      ).rejects.toThrow();
-      expect(killCalled).toBe(true);
-      expect(killCalls.length).toBe(1);
-      expect(killCalls[0]!.pid).toBe(424242);
-      expect(killCalls[0]!.dataDir).toBe("/tmp/never-was-real");
-      // State should be cleared (the user is in a clean disconnected
-      // state instead of half-leaked).
-      const persisted = readState(config.instance).browser;
-      expect(persisted ?? null).toBeNull();
-    } finally {
-      __test.restoreKillManagedChromeForTest();
-    }
+    // Ask for a different cdpUrl. The fresh attach will fail (unreachable
+    // port), but the assertion is about the *teardown order*: the managed
+    // context's close() must have run BEFORE the launch attempt rejected,
+    // and state must be cleared on failure.
+    await expect(
+      connectBrowser(config, { cdpUrl: "ws://127.0.0.1:1/devtools/browser/NEW" })
+    ).rejects.toThrow();
+    expect(contextCloseCount).toBe(1);
+    const persisted = readState(config.instance).browser;
+    expect(persisted ?? null).toBeNull();
+    browserMod.__test.uninstallFakeBrowserForTest();
   }, 30_000);
 
   test("concurrent disconnect calls run a single teardown sequence", async () => {
@@ -363,32 +294,34 @@ describe("browser-connect round-2 hardening", () => {
     await mutateState(config.instance, (state) => {
       state.browser = {
         mode: "managed",
-        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/ONE",
+        cdpUrl: __test.MANAGED_CDP_SENTINEL,
         pid: 111111,
         dataDir: "/tmp/coalesced-data-dir",
         chromePath: "/never/real/chrome",
         startedAt: new Date().toISOString()
       };
     });
-    let killCount = 0;
-    __test.setKillManagedChromeForTest(async () => {
-      killCount++;
-      // Simulate a kill that takes a moment so concurrent callers really
-      // do overlap. Without pendingDisconnect, the second caller's
-      // killManagedChrome would run before the first's resolves.
-      await new Promise((resolve) => setTimeout(resolve, 50));
+    const browserMod = await import("../tools/browser");
+    let closeCount = 0;
+    browserMod.__test.installFakeManagedContextForTest({
+      close: async () => {
+        closeCount++;
+        // Simulate a teardown that takes a moment so concurrent callers
+        // really do overlap. Without pendingDisconnect, the second caller
+        // would race the first.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
     });
-    try {
-      const [a, b] = await Promise.all([
-        disconnectBrowser(config),
-        disconnectBrowser(config)
-      ]);
-      expect(a.connected).toBe(false);
-      expect(b.connected).toBe(false);
-      expect(killCount).toBe(1);
-    } finally {
-      __test.restoreKillManagedChromeForTest();
-    }
+    const [a, b] = await Promise.all([
+      disconnectBrowser(config),
+      disconnectBrowser(config)
+    ]);
+    expect(a.connected).toBe(false);
+    expect(b.connected).toBe(false);
+    // Both calls should coalesce onto the same pendingDisconnect: the
+    // managed context's close() runs exactly once.
+    expect(closeCount).toBe(1);
+    browserMod.__test.uninstallFakeBrowserForTest();
   });
 });
 
@@ -396,75 +329,89 @@ describe("browser-connect round-3 hardening", () => {
   test("blocked replacement cdpUrl does NOT tear down existing managed record", async () => {
     const config = testConfig("blocked-keeps-existing");
     const { mutateState } = await import("../state");
-    // Seed a managed record. A bad-input connect must not kill the user's
-    // Chrome before validation fires — the round-3 fix lifts validation
-    // to the top of connectBrowserInner so the SSRF/safety check happens
-    // BEFORE we even read `existing`.
+    // Seed a managed record. A bad-input connect must not tear down the
+    // user's Chrome before validation fires — the round-3 fix lifts
+    // validation to the top of connectBrowserInner so the SSRF/safety
+    // check happens BEFORE we even read `existing`.
+    const browserMod = await import("../tools/browser");
+    let closeCalled = false;
+    browserMod.__test.installFakeManagedContextForTest({
+      close: async () => {
+        closeCalled = true;
+      }
+    });
     await mutateState(config.instance, (state) => {
       state.browser = {
         mode: "managed",
-        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/KEEP",
+        cdpUrl: __test.MANAGED_CDP_SENTINEL,
         pid: 555555,
         dataDir: "/tmp/keep-me",
         chromePath: "/never/real/chrome",
         startedAt: new Date().toISOString()
       };
     });
-    let killCalled = false;
-    __test.setKillManagedChromeForTest(async () => {
-      killCalled = true;
-    });
-    try {
-      // IPv4-mapped IPv6 metadata bypass — safetyCheck rejects with a
-      // "Blocked: ..." message wrapped in "Invalid cdpUrl: ...".
-      await expect(
-        connectBrowser(config, { cdpUrl: "ws://[::ffff:169.254.169.254]:9222/" })
-      ).rejects.toThrow(/Invalid cdpUrl/);
-      expect(killCalled).toBe(false);
-      // Old record is still there — we did not tear anything down.
-      const persisted = readState(config.instance).browser;
-      expect(persisted?.cdpUrl).toContain("KEEP");
-      expect(persisted?.pid).toBe(555555);
-    } finally {
-      __test.restoreKillManagedChromeForTest();
-    }
+    // IPv4-mapped IPv6 metadata bypass — safetyCheck rejects with a
+    // "Blocked: ..." message wrapped in "Invalid cdpUrl: ...".
+    await expect(
+      connectBrowser(config, { cdpUrl: "ws://[::ffff:169.254.169.254]:9222/" })
+    ).rejects.toThrow(/Invalid cdpUrl/);
+    expect(closeCalled).toBe(false);
+    // Old record is still there — we did not tear anything down.
+    const persisted = readState(config.instance).browser;
+    expect(persisted?.pid).toBe(555555);
+    expect(persisted?.dataDir).toBe("/tmp/keep-me");
+    browserMod.__test.uninstallFakeBrowserForTest();
   });
 
   test("malformed replacement cdpUrl does NOT tear down existing managed record", async () => {
     const config = testConfig("malformed-keeps-existing");
     const { mutateState } = await import("../state");
+    const browserMod = await import("../tools/browser");
+    let closeCalled = false;
+    browserMod.__test.installFakeManagedContextForTest({
+      close: async () => {
+        closeCalled = true;
+      }
+    });
     await mutateState(config.instance, (state) => {
       state.browser = {
         mode: "managed",
-        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/KEEP",
+        cdpUrl: __test.MANAGED_CDP_SENTINEL,
         pid: 555556,
         dataDir: "/tmp/keep-me-malformed",
         chromePath: "/never/real/chrome",
         startedAt: new Date().toISOString()
       };
     });
-    let killCalled = false;
-    __test.setKillManagedChromeForTest(async () => {
-      killCalled = true;
-    });
-    try {
-      await expect(connectBrowser(config, { cdpUrl: "not a url" })).rejects.toThrow(/Invalid cdpUrl/);
-      expect(killCalled).toBe(false);
-      const persisted = readState(config.instance).browser;
-      expect(persisted?.cdpUrl).toContain("KEEP");
-      expect(persisted?.pid).toBe(555556);
-    } finally {
-      __test.restoreKillManagedChromeForTest();
-    }
+    await expect(connectBrowser(config, { cdpUrl: "not a url" })).rejects.toThrow(/Invalid cdpUrl/);
+    expect(closeCalled).toBe(false);
+    const persisted = readState(config.instance).browser;
+    expect(persisted?.pid).toBe(555556);
+    expect(persisted?.dataDir).toBe("/tmp/keep-me-malformed");
+    browserMod.__test.uninstallFakeBrowserForTest();
   });
 
-  test("mismatch teardown of a cdp-mode record skips managed kill", async () => {
+  test("mismatch teardown of a cdp-mode record disconnects without close()", async () => {
     const config = testConfig("cdp-mismatch-no-kill");
     const { mutateState } = await import("../state");
     // Seed a cdp-mode record (the user attached to an external Chrome).
     // The caller then passes a *different* cdpUrl — the mismatch path
-    // must run teardown (clear state + disconnectSharedBrowser) but must
-    // NOT call killManagedChrome since we don't own the process.
+    // must run teardown (clear state + disconnect the in-process handle)
+    // but must NOT close() the CDP Browser (close() over CDP terminates
+    // the user's Chrome).
+    const browserMod = await import("../tools/browser");
+    let disconnectCalled = false;
+    let closeCalled = false;
+    browserMod.__test.installFakeCdpBrowserForTest(
+      {
+        disconnect: async () => {
+          disconnectCalled = true;
+        },
+        close: async () => {
+          closeCalled = true;
+        }
+      }
+    );
     await mutateState(config.instance, (state) => {
       state.browser = {
         mode: "cdp",
@@ -475,109 +422,173 @@ describe("browser-connect round-3 hardening", () => {
         startedAt: new Date().toISOString()
       };
     });
-    let killCalled = false;
-    __test.setKillManagedChromeForTest(async () => {
-      killCalled = true;
-    });
-    try {
-      // A different valid cdpUrl. The fresh attach will fail (unreachable
-      // port 1) but the assertion is purely about the teardown order /
-      // selectivity.
-      await expect(
-        connectBrowser(config, { cdpUrl: "ws://127.0.0.1:1/devtools/browser/OTHER" })
-      ).rejects.toThrow();
-      expect(killCalled).toBe(false);
-      // State cleared by the teardown (so the user is in a clean
-      // disconnected state after the failed fresh connect).
-      const persisted = readState(config.instance).browser;
-      expect(persisted ?? null).toBeNull();
-    } finally {
-      __test.restoreKillManagedChromeForTest();
-    }
+    // A different valid cdpUrl. The fresh attach will fail (unreachable
+    // port 1) but the assertion is about teardown selectivity.
+    await expect(
+      connectBrowser(config, { cdpUrl: "ws://127.0.0.1:1/devtools/browser/OTHER" })
+    ).rejects.toThrow();
+    expect(disconnectCalled).toBe(true);
+    expect(closeCalled).toBe(false);
+    // State cleared by the teardown.
+    const persisted = readState(config.instance).browser;
+    expect(persisted ?? null).toBeNull();
+    browserMod.__test.uninstallFakeBrowserForTest();
   }, 30_000);
 
   test("mismatch teardown writes a browser.disconnect audit row", async () => {
     const config = testConfig("mismatch-audit");
     const { mutateState } = await import("../state");
+    const browserMod = await import("../tools/browser");
+    browserMod.__test.installFakeManagedContextForTest({
+      close: async () => undefined
+    });
     await mutateState(config.instance, (state) => {
       state.browser = {
         mode: "managed",
-        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/AUDIT-OLD",
+        cdpUrl: __test.MANAGED_CDP_SENTINEL,
         pid: 777777,
         dataDir: "/tmp/audit-old-dir",
         chromePath: "/never/real/chrome",
         startedAt: new Date().toISOString()
       };
     });
-    __test.setKillManagedChromeForTest(async () => undefined);
-    try {
-      await expect(
-        connectBrowser(config, { cdpUrl: "ws://127.0.0.1:1/devtools/browser/NEW" })
-      ).rejects.toThrow();
-      const state = readState(config.instance);
-      const disconnects = state.audit.filter((row) => row.action === "browser.disconnect");
-      expect(disconnects.length).toBeGreaterThanOrEqual(1);
-      // The latest audit row should reference the old record's data dir
-      // as its target (managed-mode target convention).
-      expect(disconnects[0]!.target).toBe("/tmp/audit-old-dir");
-    } finally {
-      __test.restoreKillManagedChromeForTest();
-    }
+    await expect(
+      connectBrowser(config, { cdpUrl: "ws://127.0.0.1:1/devtools/browser/NEW" })
+    ).rejects.toThrow();
+    const state = readState(config.instance);
+    const disconnects = state.audit.filter((row) => row.action === "browser.disconnect");
+    expect(disconnects.length).toBeGreaterThanOrEqual(1);
+    // The latest audit row should reference the old record's data dir
+    // as its target (managed-mode target convention).
+    expect(disconnects[0]!.target).toBe("/tmp/audit-old-dir");
+    browserMod.__test.uninstallFakeBrowserForTest();
   }, 30_000);
 
-  test("pendingDisconnect rejection propagates and clears", async () => {
-    const config = testConfig("pending-disconnect-rejection");
+  test("pendingDisconnect coalesces concurrent disconnects and clears for the next call", async () => {
+    // With the managed-launchPersistentContext pivot, the session manager
+    // owns the close path and swallows teardown errors so the user is
+    // never left in a half-disconnected state. We can no longer assert
+    // that teardown errors propagate (they don't — by design). Instead
+    // verify the round-2 coalescing invariant: concurrent disconnects
+    // share a single in-flight promise, and the slot clears so a
+    // subsequent disconnect runs independently.
+    const config = testConfig("pending-disconnect-coalesce");
     const { mutateState } = await import("../state");
+    const browserMod = await import("../tools/browser");
+    let closeCount = 0;
+    browserMod.__test.installFakeManagedContextForTest({
+      close: async () => {
+        closeCount++;
+        // Hold long enough that both concurrent callers latch onto the
+        // same pendingDisconnect promise.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    });
     await mutateState(config.instance, (state) => {
       state.browser = {
         mode: "managed",
-        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/REJ",
+        cdpUrl: __test.MANAGED_CDP_SENTINEL,
         pid: 888888,
-        dataDir: "/tmp/rejection-test",
+        dataDir: "/tmp/coalesce-test",
         chromePath: "/never/real/chrome",
         startedAt: new Date().toISOString()
       };
     });
-    const boom = new Error("kill failed");
-    __test.setKillManagedChromeForTest(async () => {
-      // Give both concurrent disconnects time to coalesce onto the same
-      // pendingDisconnect promise before we reject.
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      throw boom;
+    const [a, b] = await Promise.all([
+      disconnectBrowser(config),
+      disconnectBrowser(config)
+    ]);
+    expect(a.connected).toBe(false);
+    expect(b.connected).toBe(false);
+    expect(closeCount).toBe(1);
+
+    // pendingDisconnect cleared — a subsequent disconnect should re-run.
+    browserMod.__test.uninstallFakeBrowserForTest();
+    let secondCloseCount = 0;
+    browserMod.__test.installFakeManagedContextForTest({
+      close: async () => {
+        secondCloseCount++;
+      }
     });
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "managed",
+        cdpUrl: __test.MANAGED_CDP_SENTINEL,
+        pid: 999999,
+        dataDir: "/tmp/coalesce-test-2",
+        chromePath: "/never/real/chrome",
+        startedAt: new Date().toISOString()
+      };
+    });
+    const followup = await disconnectBrowser(config);
+    expect(followup.connected).toBe(false);
+    expect(secondCloseCount).toBe(1);
+    browserMod.__test.uninstallFakeBrowserForTest();
+  });
+});
+
+describe("browser-connect managed launch via playwright", () => {
+  test("launchManaged calls chromium.launchPersistentContext and stores the record", async () => {
+    const config = testConfig("playwright-launch");
+    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
+    // Mock playwright-core so we exercise launchManaged without actually
+    // spawning Chrome. The fake context exposes browser()->process()->pid
+    // and a no-op close so the post-launch PID extraction path works.
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
+          launchCalls.push({ dataDir, options });
+          return {
+            browser: () => ({ process: () => ({ pid: 4242 }) }),
+            close: async () => undefined
+          };
+        }
+      }
+    }));
     try {
-      const results = await Promise.allSettled([
-        disconnectBrowser(config),
-        disconnectBrowser(config)
-      ]);
-      expect(results[0]!.status).toBe("rejected");
-      expect(results[1]!.status).toBe("rejected");
-      if (results[0]!.status === "rejected") {
-        expect((results[0]!.reason as Error).message).toBe("kill failed");
-      }
-      if (results[1]!.status === "rejected") {
-        expect((results[1]!.reason as Error).message).toBe("kill failed");
-      }
-      // The pendingDisconnect slot must have cleared so the next call
-      // is independent (we can't see the slot directly, but we can call
-      // again and expect a fresh attempt). Restore the mock to a
-      // success-returning impl, restate the record, and verify the next
-      // disconnect succeeds rather than re-rejecting the stale promise.
-      __test.setKillManagedChromeForTest(async () => undefined);
-      await mutateState(config.instance, (state) => {
-        state.browser = {
-          mode: "managed",
-          cdpUrl: "ws://127.0.0.1:9222/devtools/browser/REJ2",
-          pid: 999999,
-          dataDir: "/tmp/rejection-test-2",
-          chromePath: "/never/real/chrome",
-          startedAt: new Date().toISOString()
-        };
-      });
-      const followup = await disconnectBrowser(config);
-      expect(followup.connected).toBe(false);
+      const result = await connectBrowser(config, {});
+      expect(result.connected).toBe(true);
+      expect(result.record?.mode).toBe("managed");
+      expect(result.record?.pid).toBe(4242);
+      expect(result.record?.dataDir).toContain("chrome-profile");
+      expect(result.record?.cdpUrl).toBe(__test.MANAGED_CDP_SENTINEL);
+      expect(launchCalls.length).toBe(1);
+      expect(launchCalls[0]!.dataDir).toContain("chrome-profile");
+      expect(launchCalls[0]!.options.headless).toBe(false);
+      expect(Array.isArray(launchCalls[0]!.options.args)).toBe(true);
     } finally {
-      __test.restoreKillManagedChromeForTest();
+      mock.restore();
+      const browserMod = await import("../tools/browser");
+      browserMod.__test.uninstallFakeBrowserForTest();
     }
+  });
+
+  test("disconnect closes the managed context (which terminates Chromium)", async () => {
+    const config = testConfig("playwright-disconnect");
+    const { mutateState } = await import("../state");
+    const browserMod = await import("../tools/browser");
+    let contextClosed = false;
+    browserMod.__test.installFakeManagedContextForTest({
+      close: async () => {
+        contextClosed = true;
+      }
+    });
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "managed",
+        cdpUrl: __test.MANAGED_CDP_SENTINEL,
+        pid: 5252,
+        dataDir: "/tmp/playwright-disconnect-data",
+        chromePath: "/fake/path/to/chromium",
+        startedAt: new Date().toISOString()
+      };
+    });
+    const status = await disconnectBrowser(config);
+    expect(status.connected).toBe(false);
+    expect(contextClosed).toBe(true);
+    const persisted = readState(config.instance).browser;
+    expect(persisted ?? null).toBeNull();
+    browserMod.__test.uninstallFakeBrowserForTest();
   });
 });

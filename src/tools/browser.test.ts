@@ -1,6 +1,5 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import type { Browser } from "playwright-core";
 import {
   __test as browserTest,
   browserNavigate,
@@ -123,7 +122,7 @@ describe("browser disconnect lifecycle", () => {
     browserTest.uninstallFakeBrowserForTest();
     browserTest.clearFakeSessionsForTest();
     browserTest.setInFlightDisconnectsForTest(0);
-    browserTest.clearPendingBrowserForTest();
+    browserTest.clearPendingSharedForTest();
   });
 
   test("in-flight disconnect rejects new browser_navigate admissions", async () => {
@@ -136,17 +135,14 @@ describe("browser disconnect lifecycle", () => {
 
   test("disconnectSharedBrowser does not call close() on a CDP browser missing disconnect()", async () => {
     let closeCalled = false;
-    browserTest.installFakeBrowserForTest(
-      {
-        // Intentionally no disconnect() — exactly the playwright-core
-        // shape that previously triggered the buggy fallback. close()
-        // over CDP terminates the user's Chrome, which we must avoid.
-        close: async () => {
-          closeCalled = true;
-        }
-      },
-      true
-    );
+    browserTest.installFakeCdpBrowserForTest({
+      // Intentionally no disconnect() — exactly the playwright-core
+      // shape that previously triggered the buggy fallback. close()
+      // over CDP terminates the user's Chrome, which we must avoid.
+      close: async () => {
+        closeCalled = true;
+      }
+    });
     await disconnectSharedBrowser();
     expect(closeCalled).toBe(false);
   });
@@ -154,60 +150,62 @@ describe("browser disconnect lifecycle", () => {
   test("disconnectSharedBrowser calls disconnect() when available on CDP browser", async () => {
     let disconnectCalled = false;
     let closeCalled = false;
-    browserTest.installFakeBrowserForTest(
-      {
-        disconnect: async () => {
-          disconnectCalled = true;
-        },
-        close: async () => {
-          closeCalled = true;
-        }
+    browserTest.installFakeCdpBrowserForTest({
+      disconnect: async () => {
+        disconnectCalled = true;
       },
-      true
-    );
+      close: async () => {
+        closeCalled = true;
+      }
+    });
     await disconnectSharedBrowser();
     expect(disconnectCalled).toBe(true);
     expect(closeCalled).toBe(false);
   });
 
-  test("disconnectSharedBrowser closes a non-CDP (headless) browser", async () => {
+  test("disconnectSharedBrowser closes a headless browser", async () => {
     let closeCalled = false;
-    browserTest.installFakeBrowserForTest(
-      {
-        close: async () => {
-          closeCalled = true;
-        }
-      },
-      false
-    );
+    browserTest.installFakeHeadlessBrowserForTest({
+      close: async () => {
+        closeCalled = true;
+      }
+    });
     await disconnectSharedBrowser();
     expect(closeCalled).toBe(true);
   });
 
+  test("disconnectSharedBrowser closes the managed context (which terminates Chromium)", async () => {
+    // New managed mode pivot: closing the BrowserContext is how we
+    // shut down the Chromium process Playwright launched. We assert
+    // that the install/teardown branch hits context.close().
+    let contextCloseCalled = false;
+    browserTest.installFakeManagedContextForTest({
+      close: async () => {
+        contextCloseCalled = true;
+      }
+    });
+    await disconnectSharedBrowser();
+    expect(contextCloseCalled).toBe(true);
+  });
+
   test("closeAll skips close() on a CDP browser missing disconnect()", async () => {
     let closeCalled = false;
-    browserTest.installFakeBrowserForTest(
-      {
-        close: async () => {
-          closeCalled = true;
-        }
-      },
-      true
-    );
+    browserTest.installFakeCdpBrowserForTest({
+      close: async () => {
+        closeCalled = true;
+      }
+    });
     await closeAll();
     expect(closeCalled).toBe(false);
   });
 
   test("disconnectSharedBrowser drains in-flight before tearing down", async () => {
     let closeCalled = false;
-    browserTest.installFakeBrowserForTest(
-      {
-        close: async () => {
-          closeCalled = true;
-        }
-      },
-      false
-    );
+    browserTest.installFakeHeadlessBrowserForTest({
+      close: async () => {
+        closeCalled = true;
+      }
+    });
     // Install a synthetic session reporting an in-flight call.
     browserTest.installFakeSessionForTest("drain-task", 1);
     // Schedule the in-flight to drop to zero after a short delay, well
@@ -234,38 +232,41 @@ describe("browser disconnect lifecycle", () => {
   // getOrCreate's await suspends until we resolve it AFTER bumping the
   // generation.
   test("withSession bails when disconnect generation advances during admission", async () => {
-    // Install a pendingBrowser that we control so ensureBrowser's await
+    // Install a pendingShared that we control so ensureShared's await
     // suspends at our latch instead of hitting playwright-core's real
     // launch (which would fail with "Chromium not found" and obscure
-    // the assertion). The fake browser has the minimal Browser surface
-    // getOrCreate needs after the await resolves — but the test bumps
-    // the generation BEFORE we resolve, so the post-await re-check
-    // bails before getOrCreate ever touches the fake.
-    let resolveBrowser: (browser: unknown) => void = () => undefined;
-    const fakeBrowser = {
-      isConnected: () => true,
-      contexts: () => [],
-      newContext: async () => ({
-        newPage: async () => ({
-          on: () => undefined,
-          close: () => Promise.resolve(),
-          goto: () => Promise.resolve(null),
-          url: () => "about:blank",
-          title: () => Promise.resolve(""),
-          evaluate: () => Promise.resolve([])
+    // the assertion). The fake headless handle is what getOrCreate
+    // would see after the await resolves — but the test bumps the
+    // generation BEFORE we resolve, so the post-await re-check bails
+    // before getOrCreate ever touches it.
+    let resolveShared: (handle: unknown) => void = () => undefined;
+    const fakeHandle = {
+      kind: "headless" as const,
+      browser: {
+        isConnected: () => true,
+        contexts: () => [],
+        newContext: async () => ({
+          newPage: async () => ({
+            on: () => undefined,
+            close: () => Promise.resolve(),
+            goto: () => Promise.resolve(null),
+            url: () => "about:blank",
+            title: () => Promise.resolve(""),
+            evaluate: () => Promise.resolve([])
+          }),
+          close: () => Promise.resolve()
         }),
         close: () => Promise.resolve()
-      }),
-      close: () => Promise.resolve()
+      }
     };
     const pending = new Promise<unknown>((resolve) => {
-      resolveBrowser = resolve;
+      resolveShared = resolve;
     });
-    browserTest.installPendingBrowserForTest(pending as unknown as Promise<Browser>);
+    browserTest.installPendingSharedForTest(pending as Promise<never>);
 
     // Kick off the navigation. withSession captures the generation,
-    // bumps pendingAdmissions, awaits getOrCreate -> ensureBrowser ->
-    // pendingBrowser, and suspends.
+    // bumps pendingAdmissions, awaits getOrCreate -> ensureShared ->
+    // pendingShared, and suspends.
     const navigatePromise = browserNavigate("admission-race", { url: "https://example.com/" });
 
     // Yield a microtask so withSession has actually entered the await
@@ -277,10 +278,10 @@ describe("browser disconnect lifecycle", () => {
     // disconnectSharedBrowser does at its top.
     browserTest.bumpDisconnectGenerationForTest();
 
-    // Now resolve the pendingBrowser so the suspended admission resumes
+    // Now resolve the pendingShared so the suspended admission resumes
     // and runs the post-await re-check. It should observe the
     // generation mismatch and bail.
-    resolveBrowser(fakeBrowser);
+    resolveShared(fakeHandle);
 
     const result = await navigatePromise;
     const parsed = JSON.parse(result) as { success: boolean; error?: string };

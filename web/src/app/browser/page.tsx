@@ -113,16 +113,25 @@ export default function BrowserPage() {
           <CardContent className="space-y-3">
             {record ? (
               <dl className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
-                <Detail label="Mode" value={record.mode} />
+                <Detail
+                  label="Mode"
+                  value={
+                    record.mode === "managed"
+                      ? "Managed (visible Chrome window)"
+                      : "External CDP attach"
+                  }
+                />
                 <Detail label="Started" value={new Date(record.startedAt).toLocaleString()} />
                 {record.pid !== null ? <Detail label="PID" value={String(record.pid)} mono /> : null}
                 {record.chromePath ? <Detail label="Binary" value={record.chromePath} mono wrap /> : null}
                 {record.dataDir ? <Detail label="Profile" value={record.dataDir} mono wrap /> : null}
-                <Detail label="CDP URL" value={record.cdpUrl} mono wrap />
+                {record.mode === "cdp" ? (
+                  <Detail label="CDP URL" value={record.cdpUrl} mono wrap />
+                ) : null}
               </dl>
             ) : (
               <p className="text-xs text-muted-foreground">
-                Click Connect to launch a fresh Chrome with a dedicated profile under{" "}
+                Click Connect to open a fresh Chromium window with a dedicated profile under{" "}
                 <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
                   ~/.gini/instances/&lt;instance&gt;/chrome-profile
                 </code>
@@ -223,26 +232,22 @@ export default function BrowserPage() {
           </CardHeader>
           <CardContent className="space-y-2 text-xs text-muted-foreground">
             <p>
-              The runtime probes the standard install locations (Chrome, Chromium, Microsoft Edge) or
-              honors{" "}
+              Connect launches a real Chromium window via Playwright with a dedicated profile
+              under{" "}
               <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
-                GINI_CHROME_PATH
+                ~/.gini/instances/&lt;instance&gt;/chrome-profile
               </code>
-              , spawns Chrome with{" "}
-              <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
-                --remote-debugging-port
-              </code>{" "}
-              and a dedicated{" "}
-              <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
-                --user-data-dir
-              </code>
-              , and waits up to 15 seconds for the CDP endpoint to come up.
+              . Browser tool calls share that exact window — when you sign into a site, the
+              agent inherits your cookies automatically.
             </p>
             <p>
-              Once connected, browser_* tool calls switch from a fresh headless context to your real
-              Chrome session. Disconnect kills the spawned Chrome (the agent never closes your
-              own browser windows in advanced/CDP mode) but the profile directory stays on disk so
-              your sign-ins persist across reconnects.
+              Disconnect closes the window (Playwright owns its lifecycle), but the profile
+              directory stays on disk so your sign-ins persist across reconnects.
+            </p>
+            <p>
+              Advanced: attach to a Chrome you started yourself by pasting its CDP URL. Note
+              that this path is known-flaky under the current Playwright + Bun stack; managed
+              mode is the recommended option.
             </p>
           </CardContent>
         </Card>
@@ -254,7 +259,7 @@ export default function BrowserPage() {
             <DialogTitle>Disconnect browser?</DialogTitle>
             <DialogDescription>
               {record?.mode === "managed"
-                ? "The runtime will send SIGTERM to the Chrome process it launched."
+                ? "The Chromium window the runtime launched will be closed."
                 : "The runtime will drop its CDP attachment but never touch the Chrome process you started."}
             </DialogDescription>
           </DialogHeader>
