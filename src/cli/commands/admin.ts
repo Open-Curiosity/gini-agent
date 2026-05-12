@@ -18,6 +18,7 @@ import {
   stopRuntime
 } from "../process";
 import { print } from "../output";
+import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
 
 export async function install_(ctx: CliContext): Promise<void> {
   const { config } = ctx;
@@ -93,6 +94,8 @@ export async function update(_ctx: CliContext): Promise<void> {
   }
   const beforeSha = (beforeRes.stdout ?? "").trim();
 
+  header("Updating gini-agent");
+
   const fetchRes = spawnSync("git", ["-C", runtimeDir, "fetch", "origin"], { encoding: "utf8" });
   if (fetchRes.status !== 0) {
     const stderr = (fetchRes.stderr ?? "").trim();
@@ -140,18 +143,14 @@ export async function update(_ctx: CliContext): Promise<void> {
     ? "0"
     : countRes && countRes.status === 0 ? (countRes.stdout ?? "").trim() : "?";
 
-  const summary = [
-    "gini update summary:",
-    upToDate
-      ? `  status:        Already at ${afterSha.slice(0, 7)}`
-      : `  before:        ${beforeSha.slice(0, 7)}`
-  ];
-  if (!upToDate) {
-    summary.push(`  after:         ${afterSha.slice(0, 7)}`);
-    summary.push(`  commits:       ${commitCount}`);
+  footer("gini-agent updated.");
+  if (upToDate) {
+    info(`Already at ${afterSha.slice(0, 7)}`);
+  } else {
+    info(`${beforeSha.slice(0, 7)} → ${afterSha.slice(0, 7)} (${commitCount} commit${commitCount === "1" ? "" : "s"})`);
   }
-  summary.push("  reminder:      if a gini runtime is currently running, restart it (`gini stop && gini start`) to pick up the new code");
-  console.log(summary.join("\n"));
+  info("If a runtime is running, restart it: gini stop && gini start");
+  console.log("");
 }
 
 export async function uninstall(ctx: CliContext): Promise<void> {
@@ -188,17 +187,20 @@ async function fullUninstall(flags: FullUninstallFlags): Promise<void> {
   if (!skipPrompts) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     try {
-      const proceed = await rl.question("This will uninstall gini-agent. Continue? [y/N] ");
+      const proceed = await rl.question(`${COLOR.cyan}?${COLOR.reset} This will uninstall gini-agent. Continue? [y/N] `);
       if (!isYes(proceed, false)) {
         console.log("Aborted.");
         return;
       }
-      const keep = await rl.question("Keep your instance state at ~/.gini/instances/? [Y/n] ");
+      const keep = await rl.question(`${COLOR.cyan}?${COLOR.reset} Keep your instance state at ~/.gini/instances/? [Y/n] `);
       deleteInstances = !isYes(keep, true);
     } finally {
       rl.close();
     }
   }
+
+  console.log("");
+  header("Uninstalling gini-agent");
 
   const result = await uninstallAll({
     deleteInstances,
@@ -231,52 +233,51 @@ async function fullUninstall(flags: FullUninstallFlags): Promise<void> {
     : describeWrapper(wrapperPath);
   const modelsNote = testMode ? undefined : describeModels(modelsDir);
 
-  const stoppedLine = result.stopErrors.length > 0
-    ? `  instances stopped:   ${result.stopped.length}/${result.instances.length} (${result.stopErrors.length} had errors)`
-    : `  instances stopped:   ${result.stopped.length}/${result.instances.length}`;
-
-  const summary = [
-    "gini-agent uninstall summary:",
-    stoppedLine,
-    deleteInstances
-      ? `  instances deleted:   yes (${result.instances.length})`
-      : `  instances kept:      yes (${result.instances.length})`,
-    `  shell rc edits:      ${rcEdits.length === 0 ? "none" : rcEdits.join(", ")}`,
-    `  wrapper:             ${wrapperOutcome.message}`,
-    `  runtime dir:         ${testMode ? "skipped (GINI_STATE_ROOT set)" : existsSync(runtimeDir) ? `will remove ${runtimeDir}` : "absent"}`
-  ];
-  console.log(summary.join("\n"));
-
-  if (result.stopErrors.length > 0) {
-    console.log("  stop failures:");
-    for (const fail of result.stopErrors) {
-      console.log(`    - ${fail.instance}: ${fail.error}`);
+  if (result.instances.length > 0) {
+    const stoppedCount = result.stopped.length;
+    const total = result.instances.length;
+    if (result.stopErrors.length > 0) {
+      warn(`Stopped ${stoppedCount}/${total} instance${total === 1 ? "" : "s"} (${result.stopErrors.length} had errors)`);
+      for (const f of result.stopErrors) console.error(`    - ${f.instance}: ${f.error}`);
+    } else if (stoppedCount > 0) {
+      step(`Stopped ${stoppedCount} instance${stoppedCount === 1 ? "" : "s"}`);
     }
+
     if (deleteInstances) {
-      // User-data preservation default trumps process safety. Warn loudly but
-      // don't refuse — the alternative is leaving stale state behind that the
-      // next install would have to step around.
-      console.warn("Warning: proceeding to delete instance state even though one or more instances did not stop cleanly.");
+      step(`Deleted instance state (${total} instance${total === 1 ? "" : "s"})`);
+      if (result.stopErrors.length > 0) {
+        warn("Deleted state even though one or more instances did not stop cleanly.");
+      }
+    } else {
+      info(`Kept instance state (${total} instance${total === 1 ? "" : "s"})`);
     }
   }
 
-  if (modelsNote) console.log(modelsNote);
+  if (rcEdits.length > 0) {
+    for (const file of rcEdits) step(`Cleaned shell rc (${tildify(file)})`);
+  }
 
   if (wrapperOutcome.shouldRemove) {
+    step(`Removed wrapper (${tildify(wrapperPath)})`);
     try { rmSync(wrapperPath, { force: true }); } catch (error) {
-      console.error(`Failed to remove wrapper at ${wrapperPath}: ${error instanceof Error ? error.message : String(error)}`);
+      warn(`Failed to remove wrapper: ${error instanceof Error ? error.message : String(error)}`);
     }
+  } else if (!testMode && wrapperOutcome.message.startsWith("kept")) {
+    warn(`Wrapper not removed: ${wrapperOutcome.message}`);
   }
 
   if (!testMode && existsSync(runtimeDir)) {
+    step(`Removed runtime (${tildify(runtimeDir)})`);
     // Unix keeps file handles alive on unlinked inodes so this is safe even
     // though we may be executing from runtimeDir right now.
     try { rmSync(runtimeDir, { recursive: true, force: true }); } catch (error) {
-      console.error(`Failed to remove runtime dir at ${runtimeDir}: ${error instanceof Error ? error.message : String(error)}`);
+      warn(`Failed to remove runtime: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  console.log("Done.");
+  footer("gini-agent uninstalled.");
+  if (modelsNote) console.log(modelsNote);
+  console.log("");
 }
 
 function isYes(input: string, defaultYes: boolean): boolean {
@@ -369,7 +370,7 @@ function describeModels(path: string): string | undefined {
   } catch {
     // best-effort
   }
-  return `Note: model cache at ${path} (${size}) was kept. Run \`rm -rf ${path}\` to remove.`;
+  return `${COLOR.dim}•${COLOR.reset} Model cache at ${tildify(path)} (${size}) kept. Remove with: rm -rf ${tildify(path)}`;
 }
 
 // Foreground twin of `start`. Runs the runtime (and optionally Next.js)

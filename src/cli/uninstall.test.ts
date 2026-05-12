@@ -75,11 +75,9 @@ describe("gini uninstall", () => {
       stateRoot
     });
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("gini-agent uninstall summary:");
-    expect(result.stdout).toContain("instances deleted:   yes");
-    expect(result.stdout).toContain("wrapper:             skipped (GINI_STATE_ROOT set)");
-    expect(result.stdout).toContain("runtime dir:         skipped (GINI_STATE_ROOT set)");
-    expect(result.stdout).toContain("Done.");
+    expect(result.stdout).toContain("Uninstalling gini-agent");
+    expect(result.stdout).toContain("Deleted instance state");
+    expect(result.stdout).toContain("gini-agent uninstalled.");
     expect(existsSync(join(stateRoot, "instances"))).toBe(false);
   }, 30_000);
 
@@ -104,7 +102,7 @@ describe("gini uninstall", () => {
       stateRoot
     });
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("instances kept:      yes");
+    expect(result.stdout).toContain("Kept instance state");
     expect(existsSync(join(stateRoot, "instances", "foo"))).toBe(true);
   }, 30_000);
 });
