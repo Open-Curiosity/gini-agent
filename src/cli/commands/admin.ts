@@ -98,7 +98,12 @@ async function fullUninstall(flags: FullUninstallFlags): Promise<void> {
     deleteInstances,
     stopInstance: async (name) => {
       const cfg = loadConfig(name);
-      if (await isRunning(cfg)) stopRuntime(cfg);
+      if (!(await isRunning(cfg))) return;
+      const outcome = stopRuntime(cfg);
+      if (!outcome.stopped) {
+        const reason = outcome.error ?? outcome.reason ?? "unknown error";
+        throw new Error(reason);
+      }
     }
   });
 
@@ -120,9 +125,13 @@ async function fullUninstall(flags: FullUninstallFlags): Promise<void> {
     : describeWrapper(wrapperPath);
   const modelsNote = testMode ? undefined : describeModels(modelsDir);
 
+  const stoppedLine = result.stopErrors.length > 0
+    ? `  instances stopped:   ${result.stopped.length}/${result.instances.length} (${result.stopErrors.length} had errors)`
+    : `  instances stopped:   ${result.stopped.length}/${result.instances.length}`;
+
   const summary = [
     "gini-agent uninstall summary:",
-    `  instances stopped:   ${result.stopped.length}/${result.instances.length}`,
+    stoppedLine,
     deleteInstances
       ? `  instances deleted:   yes (${result.instances.length})`
       : `  instances kept:      yes (${result.instances.length})`,
@@ -131,6 +140,19 @@ async function fullUninstall(flags: FullUninstallFlags): Promise<void> {
     `  runtime dir:         ${testMode ? "skipped (GINI_STATE_ROOT set)" : existsSync(runtimeDir) ? `will remove ${runtimeDir}` : "absent"}`
   ];
   console.log(summary.join("\n"));
+
+  if (result.stopErrors.length > 0) {
+    console.log("  stop failures:");
+    for (const fail of result.stopErrors) {
+      console.log(`    - ${fail.instance}: ${fail.error}`);
+    }
+    if (deleteInstances) {
+      // User-data preservation default trumps process safety. Warn loudly but
+      // don't refuse — the alternative is leaving stale state behind that the
+      // next install would have to step around.
+      console.warn("Warning: proceeding to delete instance state even though one or more instances did not stop cleanly.");
+    }
+  }
 
   if (modelsNote) console.log(modelsNote);
 
