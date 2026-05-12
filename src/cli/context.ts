@@ -12,5 +12,15 @@ export interface CliContext {
   cliArgs: string[];
   command: string;
   ephemeralSmoke: boolean;
+  // True ONLY when `--instance` was passed in raw argv. GINI_INSTANCE env is
+  // intentionally NOT treated as explicit because the installed wrapper at
+  // ~/.local/bin/gini sets GINI_INSTANCE=main on every invocation — if the env
+  // counted, `gini uninstall` from the wrapper would always fall into
+  // single-instance mode and never run a full uninstall.
+  explicitInstance: boolean;
+  // The original argv slice before stripGlobalArgs. Commands that need to peek
+  // at flags consumed by the global parser (e.g. uninstall checking --yes,
+  // --purge) read from here.
+  rawArgs: string[];
   web: WebOptions;
 }

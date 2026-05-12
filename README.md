@@ -48,6 +48,52 @@ This repo includes a Bun TypeScript local runtime with:
 
 ## Quick Start
 
+Install with one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
+```
+
+The installer drops a `gini` wrapper at `~/.local/bin/gini` that runs against the `main` instance by default. State lives under `~/.gini/instances/main/`. If the installer is run in an interactive terminal it walks you through `gini setup` immediately; the curl|bash piped form skips that and asks you to run it yourself. After install, reload your shell PATH if needed, then:
+
+```bash
+gini setup    # configures your LLM provider (asks for an OpenAI API key)
+gini start
+gini smoke
+```
+
+`gini setup` writes your API key to `~/.gini/secrets.env` (mode 0600). The installed wrapper sources that file on every invocation so the key is never written to `config.json` and never leaves your machine except in API calls to the configured provider. `gini start` launches the runtime gateway and the Next.js web control plane and prints the runtime gateway URL and the web URL.
+
+### Update
+
+```bash
+gini update
+```
+
+Pulls the latest source into `~/.gini/runtime`, reinstalls dependencies, and leaves your state under `~/.gini/instances/` and the model cache at `~/.gini/models/` untouched. If a runtime is currently running, restart it (`gini stop && gini start`) to pick up the new code.
+
+If you are working from a repo clone, use `git pull && bun install` instead — `gini update` only operates on the installer-managed runtime at `~/.gini/runtime`.
+
+### Uninstall
+
+Full uninstall (asks two questions):
+
+```bash
+gini uninstall
+```
+
+The first prompt confirms the uninstall. The second asks whether to keep instance state under `~/.gini/instances/` (default yes). The downloaded model cache at `~/.gini/models/` is always preserved with a note showing its size and the manual `rm -rf` to remove it.
+
+Other variants:
+
+```bash
+gini uninstall --instance <name>     # remove a single instance, no prompts
+gini uninstall --yes                 # full uninstall, no prompts, keep instances
+gini uninstall --purge               # full uninstall + delete instances (implies --yes)
+```
+
+### From source (for developers)
+
 ```bash
 bun install
 bun run gini install
@@ -55,14 +101,7 @@ bun run gini start
 bun run gini smoke
 ```
 
-`start` launches the runtime gateway and the local Next.js web control plane. It prints two URLs:
-
-```text
-url     -> runtime gateway API
-webUrl  -> Next.js control plane
-```
-
-For the `dev` instance those default to:
+When you run the CLI from a repo clone, the default instance is `dev`. The installed `gini` command from `curl | bash` defaults to `main` instead so developer state and end-user state stay separate. For the `dev` instance the URLs default to:
 
 - runtime: `http://127.0.0.1:7337`
 - web: `http://127.0.0.1:3000`
@@ -72,6 +111,16 @@ Run a foreground instance for coding-agent worktrees:
 ```bash
 bun run gini run --instance feature-x
 ```
+
+### Local development install (for testing in-progress changes)
+
+If you're working on gini-agent itself and want to test the install/update/uninstall flow against your local checkout (without pushing to GitHub):
+
+```bash
+./scripts/install.sh --local
+```
+
+This is the same as the default install except it clones from your local repo into `~/.gini/runtime`. After you commit changes locally, `gini update` will pull them in. `gini uninstall` works exactly the same as a real install (same marker, same wrapper path).
 
 ## Common Commands
 
@@ -99,6 +148,8 @@ bun run gini readiness v1
 ```
 
 ## Providers
+
+`gini setup` walks an interactive picker for both supported providers (OpenAI Codex and OpenAI API key). On `--yes`/`--non-interactive` runs it auto-picks: it prefers Codex when `CODEX_AUTH_JSON` is set or `~/.codex/auth.json` exists, falls back to OpenAI when `OPENAI_API_KEY` is set, and otherwise fails with a clear message naming all three sources.
 
 Use Codex OAuth:
 
@@ -158,11 +209,13 @@ Remove one instance:
 bun run gini uninstall --instance <instance>
 ```
 
-Remove every instance while keeping the model cache:
+Full uninstall with two prompts (asks before deleting instance state):
 
 ```bash
-rm -rf ~/.gini/instances
+bun run gini uninstall
 ```
+
+See the Uninstall subsection under Quick Start for the `--yes` and `--purge` variants.
 
 For disposable development or tests:
 

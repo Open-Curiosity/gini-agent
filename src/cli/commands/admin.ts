@@ -1,7 +1,14 @@
 // Lifecycle and instance-admin commands: install, start, stop, status, doctor, reset, run.
 import type { ChildProcess } from "node:child_process";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import * as readline from "node:readline/promises";
 import type { CliContext } from "../context";
-import { install, resetInstance, uninstallInstance } from "../../runtime";
+import { hasFlag } from "../args";
+import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
+import { loadConfig } from "../../paths";
 import {
   awaitForegroundLogFlush,
   doctor,
@@ -11,6 +18,7 @@ import {
   stopRuntime
 } from "../process";
 import { print } from "../output";
+import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
 
 export async function install_(ctx: CliContext): Promise<void> {
   const { config } = ctx;
@@ -41,13 +49,328 @@ export function reset(ctx: CliContext): void {
   print({ reset: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot });
 }
 
+export async function update(_ctx: CliContext): Promise<void> {
+  // GINI_STATE_ROOT is the test-mode signal — same convention as `uninstall`.
+  // Skip every step that would touch the real $HOME so the command stays
+  // exercisable from subprocess tests without clobbering the developer's
+  // installed runtime.
+  if (process.env.GINI_STATE_ROOT) {
+    console.log("gini update: skipped (GINI_STATE_ROOT set; not touching ~/.gini/runtime)");
+    return;
+  }
+
+  const home = homedir();
+  const runtimeDir = join(home, ".gini", "runtime");
+
+  if (!existsSync(runtimeDir) || !existsSync(join(runtimeDir, ".git"))) {
+    console.error("gini update operates on the installed runtime at ~/.gini/runtime, which is not present. Reinstall with: curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash");
+    process.exit(1);
+  }
+
+  const expectedOrigin = "https://github.com/Lilac-Labs/gini-agent";
+  const originRes = spawnSync("git", ["-C", runtimeDir, "remote", "get-url", "origin"], { encoding: "utf8" });
+  if (originRes.status !== 0) {
+    const stderr = (originRes.stderr ?? "").trim();
+    console.error(`gini update could not read git origin in ${runtimeDir}${stderr ? `: ${stderr}` : "."}`);
+    process.exit(1);
+  }
+  const actualOrigin = (originRes.stdout ?? "").trim();
+  const normalize = (url: string): string => url.replace(/\.git$/, "");
+  const isExpectedRemote = normalize(actualOrigin) === normalize(expectedOrigin);
+  // Local-test installs (via scripts/install.sh --local) set origin to a
+  // filesystem path. Accept that as a valid origin so the test loop
+  // (edit → commit in local repo → gini update) works end to end.
+  const isLocalCheckout = actualOrigin.startsWith("/") && existsSync(join(actualOrigin, ".git"));
+  if (!isExpectedRemote && !isLocalCheckout) {
+    console.error(`gini update refuses to touch ~/.gini/runtime because its git origin is ${actualOrigin} (expected ${expectedOrigin} or a local repo path). Move that directory aside and reinstall.`);
+    process.exit(1);
+  }
+
+  const beforeRes = spawnSync("git", ["-C", runtimeDir, "rev-parse", "HEAD"], { encoding: "utf8" });
+  if (beforeRes.status !== 0) {
+    const stderr = (beforeRes.stderr ?? "").trim();
+    console.error(`gini update could not read current HEAD${stderr ? `: ${stderr}` : "."}`);
+    process.exit(1);
+  }
+  const beforeSha = (beforeRes.stdout ?? "").trim();
+
+  header("Updating gini-agent");
+
+  const fetchRes = spawnSync("git", ["-C", runtimeDir, "fetch", "origin"], { encoding: "utf8" });
+  if (fetchRes.status !== 0) {
+    const stderr = (fetchRes.stderr ?? "").trim();
+    console.error(`gini update: git fetch origin failed${stderr ? `: ${stderr}` : "."}`);
+    process.exit(1);
+  }
+
+  // origin/HEAD follows the remote's default branch — works for both the
+  // GitHub install (main) and local-test installs that may be on any branch.
+  const resetRes = spawnSync("git", ["-C", runtimeDir, "reset", "--hard", "origin/HEAD"], { encoding: "utf8" });
+  if (resetRes.status !== 0) {
+    const stderr = (resetRes.stderr ?? "").trim();
+    console.error(`gini update: git reset --hard origin/HEAD failed${stderr ? `: ${stderr}` : "."}`);
+    process.exit(1);
+  }
+
+  const afterRes = spawnSync("git", ["-C", runtimeDir, "rev-parse", "HEAD"], { encoding: "utf8" });
+  if (afterRes.status !== 0) {
+    const stderr = (afterRes.stderr ?? "").trim();
+    console.error(`gini update could not read new HEAD${stderr ? `: ${stderr}` : "."}`);
+    process.exit(1);
+  }
+  const afterSha = (afterRes.stdout ?? "").trim();
+
+  const installRes = spawnSync("bun", ["install"], { cwd: runtimeDir, stdio: "inherit" });
+  if (installRes.status !== 0) {
+    console.error(`gini update: bun install failed (exit ${installRes.status ?? "null"}).`);
+    process.exit(1);
+  }
+
+  const webDir = join(runtimeDir, "web");
+  if (existsSync(join(webDir, "package.json"))) {
+    const webResult = spawnSync("bun", ["install"], { cwd: webDir, stdio: "inherit" });
+    if (webResult.status !== 0) {
+      console.error(`gini update: bun install in web/ failed (exit ${webResult.status ?? "null"}).`);
+      process.exit(1);
+    }
+  }
+
+  const upToDate = beforeSha === afterSha;
+  const countRes = upToDate
+    ? null
+    : spawnSync("git", ["-C", runtimeDir, "rev-list", "--count", `${beforeSha}..${afterSha}`], { encoding: "utf8" });
+  const commitCount = upToDate
+    ? "0"
+    : countRes && countRes.status === 0 ? (countRes.stdout ?? "").trim() : "?";
+
+  footer("gini-agent updated.");
+  if (upToDate) {
+    info(`Already at ${afterSha.slice(0, 7)}`);
+  } else {
+    info(`${beforeSha.slice(0, 7)} → ${afterSha.slice(0, 7)} (${commitCount} commit${commitCount === "1" ? "" : "s"})`);
+  }
+  info("If a runtime is running, restart it: gini stop && gini start");
+  console.log("");
+}
+
 export async function uninstall(ctx: CliContext): Promise<void> {
-  // Stop the runtime first if it's running — otherwise removing stateRoot
-  // out from under a live process leaves the daemon writing to a deleted
-  // directory until it crashes.
-  if (await isRunning(ctx.config)) stopRuntime(ctx.config);
-  uninstallInstance(ctx.config);
-  print({ uninstalled: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot, logRoot: ctx.config.logRoot });
+  const yes = hasFlag(ctx.rawArgs, "--yes");
+  const purge = hasFlag(ctx.rawArgs, "--purge");
+
+  if (ctx.explicitInstance) {
+    // Stop the runtime first if it's running — otherwise removing stateRoot
+    // out from under a live process leaves the daemon writing to a deleted
+    // directory until it crashes.
+    if (await isRunning(ctx.config)) stopRuntime(ctx.config);
+    uninstallInstance(ctx.config);
+    print({ uninstalled: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot, logRoot: ctx.config.logRoot });
+    return;
+  }
+
+  await fullUninstall({ yes, purge });
+}
+
+interface FullUninstallFlags {
+  yes: boolean;
+  purge: boolean;
+}
+
+async function fullUninstall(flags: FullUninstallFlags): Promise<void> {
+  const skipPrompts = flags.yes || flags.purge;
+  if (!skipPrompts && !process.stdin.isTTY) {
+    console.error("Refusing to run interactively without a TTY. Pass --yes or --purge to proceed.");
+    process.exit(1);
+  }
+
+  let deleteInstances = flags.purge;
+
+  if (!skipPrompts) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      const proceed = await rl.question(`${COLOR.cyan}?${COLOR.reset} This will uninstall gini-agent. Continue? [y/N] `);
+      if (!isYes(proceed, false)) {
+        console.log("Aborted.");
+        return;
+      }
+      const keep = await rl.question(`${COLOR.cyan}?${COLOR.reset} Keep your instance state at ~/.gini/instances/? [Y/n] `);
+      deleteInstances = !isYes(keep, true);
+    } finally {
+      rl.close();
+    }
+  }
+
+  console.log("");
+  header("Uninstalling gini-agent");
+
+  const result = await uninstallAll({
+    deleteInstances,
+    stopInstance: async (name) => {
+      const cfg = loadConfig(name);
+      if (!(await isRunning(cfg))) return;
+      const outcome = stopRuntime(cfg);
+      if (!outcome.stopped) {
+        const reason = outcome.error ?? outcome.reason ?? "unknown error";
+        throw new Error(reason);
+      }
+    }
+  });
+
+  // GINI_STATE_ROOT is the test-mode signal. When set, the user is not actually
+  // tearing down their real install — they're exercising the code path against
+  // a scratch directory — so we skip everything that touches the real $HOME
+  // (rc files, wrapper, runtime checkout, model cache).
+  const testMode = Boolean(process.env.GINI_STATE_ROOT);
+
+  const rcEdits = testMode ? [] : removePathBlockFromRc();
+
+  const home = homedir();
+  const wrapperPath = join(home, ".local", "bin", "gini");
+  const runtimeDir = join(home, ".gini", "runtime");
+  const modelsDir = join(home, ".gini", "models");
+
+  const wrapperOutcome = testMode
+    ? { message: "skipped (GINI_STATE_ROOT set)", shouldRemove: false }
+    : describeWrapper(wrapperPath);
+  const modelsNote = testMode ? undefined : describeModels(modelsDir);
+
+  if (result.instances.length > 0) {
+    const stoppedCount = result.stopped.length;
+    const total = result.instances.length;
+    if (result.stopErrors.length > 0) {
+      warn(`Stopped ${stoppedCount}/${total} instance${total === 1 ? "" : "s"} (${result.stopErrors.length} had errors)`);
+      for (const f of result.stopErrors) console.error(`    - ${f.instance}: ${f.error}`);
+    } else if (stoppedCount > 0) {
+      step(`Stopped ${stoppedCount} instance${stoppedCount === 1 ? "" : "s"}`);
+    }
+
+    if (deleteInstances) {
+      step(`Deleted instance state (${total} instance${total === 1 ? "" : "s"})`);
+      if (result.stopErrors.length > 0) {
+        warn("Deleted state even though one or more instances did not stop cleanly.");
+      }
+    } else {
+      info(`Kept instance state (${total} instance${total === 1 ? "" : "s"})`);
+    }
+  }
+
+  if (rcEdits.length > 0) {
+    for (const file of rcEdits) step(`Cleaned shell rc (${tildify(file)})`);
+  }
+
+  if (wrapperOutcome.shouldRemove) {
+    step(`Removed wrapper (${tildify(wrapperPath)})`);
+    try { rmSync(wrapperPath, { force: true }); } catch (error) {
+      warn(`Failed to remove wrapper: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  } else if (!testMode && wrapperOutcome.message.startsWith("kept")) {
+    warn(`Wrapper not removed: ${wrapperOutcome.message}`);
+  }
+
+  if (!testMode && existsSync(runtimeDir)) {
+    step(`Removed runtime (${tildify(runtimeDir)})`);
+    // Unix keeps file handles alive on unlinked inodes so this is safe even
+    // though we may be executing from runtimeDir right now.
+    try { rmSync(runtimeDir, { recursive: true, force: true }); } catch (error) {
+      warn(`Failed to remove runtime: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  footer("gini-agent uninstalled.");
+  if (modelsNote) console.log(modelsNote);
+  console.log("");
+}
+
+function isYes(input: string, defaultYes: boolean): boolean {
+  const trimmed = input.trim().toLowerCase();
+  if (trimmed === "") return defaultYes;
+  return trimmed === "y" || trimmed === "yes";
+}
+
+const RC_MARKER = "# Added by gini-agent installer";
+const EXPECTED_PATH_LINES = new Set([
+  'export PATH="$HOME/.local/bin:$PATH"',
+  'fish_add_path "$HOME/.local/bin"'
+]);
+
+function removePathBlockFromRc(): string[] {
+  const home = homedir();
+  const candidates: string[] = [];
+  const zdotdir = process.env.ZDOTDIR;
+  if (zdotdir) candidates.push(join(zdotdir, ".zshrc"));
+  candidates.push(
+    join(home, ".zshrc"),
+    join(home, ".bashrc"),
+    join(home, ".bash_profile"),
+    join(home, ".config", "fish", "config.fish")
+  );
+  const edited: string[] = [];
+  for (const file of candidates) {
+    if (!existsSync(file)) continue;
+    let contents: string;
+    try { contents = readFileSync(file, "utf8"); } catch { continue; }
+    const lines = contents.split("\n");
+    const next: string[] = [];
+    let removed = false;
+    let skippedMismatched = false;
+    for (let i = 0; i < lines.length; i += 1) {
+      if (lines[i]?.trim() === RC_MARKER) {
+        const followup = lines[i + 1]?.trim() ?? "";
+        if (EXPECTED_PATH_LINES.has(followup)) {
+          i += 1;
+          removed = true;
+          continue;
+        }
+        skippedMismatched = true;
+      }
+      next.push(lines[i] ?? "");
+    }
+    if (skippedMismatched) {
+      console.error(`Warning: found installer marker in ${file} but the following line didn't match the expected PATH update. Skipping rc cleanup for ${file}.`);
+    }
+    if (!removed) continue;
+    try {
+      writeFileSync(file, next.join("\n"));
+      edited.push(file);
+    } catch (error) {
+      console.error(`Could not edit ${file}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return edited;
+}
+
+interface WrapperOutcome {
+  message: string;
+  shouldRemove: boolean;
+}
+
+function describeWrapper(path: string): WrapperOutcome {
+  if (!existsSync(path)) return { message: "absent", shouldRemove: false };
+  let contents = "";
+  try { contents = readFileSync(path, "utf8"); } catch { return { message: `unreadable at ${path}`, shouldRemove: false }; }
+  const lines = contents.split("\n");
+  const hasMarker = lines.some((line) => line.trim() === "# gini-agent-installer-managed");
+  if (!hasMarker) {
+    return { message: `kept (not installer-managed at ${path})`, shouldRemove: false };
+  }
+  return { message: `will remove ${path}`, shouldRemove: true };
+}
+
+function describeModels(path: string): string | undefined {
+  if (!existsSync(path)) return undefined;
+  let size = "unknown size";
+  try {
+    // 30s cap so a stuck filesystem can't block the whole uninstall on a
+    // best-effort cosmetic measurement.
+    const result = spawnSync("du", ["-sh", path], { encoding: "utf8", timeout: 30_000 });
+    const out = result.stdout?.trim();
+    if (out) {
+      const first = out.split(/\s+/)[0];
+      if (first) size = first;
+    }
+  } catch {
+    // best-effort
+  }
+  return `${COLOR.dim}•${COLOR.reset} Model cache at ${tildify(path)} (${size}) kept. Remove with: rm -rf ${tildify(path)}`;
 }
 
 // Foreground twin of `start`. Runs the runtime (and optionally Next.js)

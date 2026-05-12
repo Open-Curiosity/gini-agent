@@ -2,6 +2,7 @@
 // config, builds a CliContext, and dispatches to the right command module.
 
 import { defaultWebPort, loadConfig, parseInstance } from "../paths";
+import type { RuntimeConfig } from "../types";
 import { applyGlobalEnvOverrides, flagValue, hasFlag, stripGlobalArgs } from "./args";
 import type { CliContext } from "./context";
 import { help } from "./output";
@@ -37,7 +38,8 @@ import { audit } from "./commands/audit";
 import { events } from "./commands/events";
 import { evidence } from "./commands/evidence";
 import { smoke } from "./commands/smoke";
-import { doctorCmd, install_, reset, runForeground, start, statusCmd, stop, uninstall } from "./commands/admin";
+import { doctorCmd, install_, reset, runForeground, start, statusCmd, stop, uninstall, update } from "./commands/admin";
+import { setup } from "./commands/setup";
 
 export async function run(): Promise<void> {
   const args = Bun.argv.slice(2);
@@ -55,29 +57,47 @@ export async function run(): Promise<void> {
   const userPinnedWebPort = Boolean(flagValue(args, "--web-port")) || Boolean(process.env.GINI_WEB_PORT);
   applyGlobalEnvOverrides(args, ephemeralSmoke);
   const instance = ephemeralSmoke ? `smoke-${process.pid}-${crypto.randomUUID().slice(0, 6)}` : parseInstance(args);
-  const config = loadConfig(instance);
   const webPortFlag = flagValue(args, "--web-port");
   const webPortPinned = userPinnedWebPort;
   const webPort = Number(process.env.GINI_WEB_PORT ?? webPortFlag ?? defaultWebPort(instance));
   const runtimePortPinned = userPinnedRuntimePort;
 
+  // `uninstall` reaches into HOME-level paths (wrapper, rc file, runtime dir) when
+  // the user didn't explicitly target one instance. We must distinguish "user
+  // typed --instance" from "we resolved a default instance" — stripGlobalArgs
+  // erases the flag, so we sniff the raw args here. The installed wrapper sets
+  // GINI_INSTANCE=main on every invocation, so env presence cannot count as
+  // "explicit"; only an explicit --instance flag opts into single-instance mode.
+  const explicitInstance = hasFlag(args, "--instance");
+
+  // Full-uninstall must not create instance scaffolding before prompting the
+  // user. loadConfig has the side effect of ensuring instance/trace/log/skills
+  // dirs, so we defer it via a getter that fires only on first .config access.
+  let _config: RuntimeConfig | null = null;
   const ctx: CliContext = {
-    config,
+    get config() {
+      if (!_config) _config = loadConfig(instance);
+      return _config;
+    },
     cliArgs,
     command,
     ephemeralSmoke,
+    explicitInstance,
+    rawArgs: args,
     web: { webPort, webPortPinned, noWeb, runtimePortPinned }
   };
 
   switch (command) {
     case "install": await install_(ctx); break;
     case "uninstall": await uninstall(ctx); break;
+    case "update": await update(ctx); break;
     case "start": await start(ctx); break;
     case "run": await runForeground(ctx); break;
     case "stop": stop(ctx); break;
     case "status": await statusCmd(ctx); break;
     case "doctor": await doctorCmd(ctx); break;
     case "reset": reset(ctx); break;
+    case "setup": await setup(ctx); break;
     case "task": await task(ctx); break;
     case "chat": await chat(ctx); break;
     case "run-record":

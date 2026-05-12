@@ -80,5 +80,6 @@ The gateway uses per-instance bearer tokens. Paired devices can receive their ow
 | `gini run --instance X` | foreground; runtime and web stop when the process receives Ctrl-C/HUP/TERM |
 | `gini stop --instance X` | stops runtime and web for an instance |
 | `gini uninstall --instance X` | removes one instance's local state |
+| `gini uninstall` | full uninstall: stops every instance, removes installer-managed wrapper/runtime/PATH block, prompts before deleting instance state |
 
 Use `gini run` for coding-agent worktrees and CI. Use `gini start` for a persistent personal runtime.

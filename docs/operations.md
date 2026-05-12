@@ -4,6 +4,18 @@ This document covers local install, runtime lifecycle, parallel smoke testing, a
 
 ## Install
 
+One-line install:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
+```
+
+The installer detects OS and arch, installs Bun if missing, clones the runtime into `~/.gini/runtime`, installs dependencies, drops a `gini` wrapper at `~/.local/bin/gini`, ensures `~/.local/bin` is on `PATH`, and initializes the `main` instance under `~/.gini/instances/main/`. The wrapper defaults `GINI_INSTANCE=main` (override via `--instance` or the `GINI_INSTANCE` env var) so installed users land on `main` while repo-clone developers stay on `dev`.
+
+When run in an interactive terminal the installer also walks through `gini setup` at the end. Setup picks between OpenAI Codex (uses existing `codex --login` credentials at `CODEX_AUTH_JSON` or `~/.codex/auth.json`) and OpenAI (API key). Piped curl|bash installs skip the prompt and ask you to run `gini setup` yourself before `gini start`. For OpenAI, setup writes your API key to `~/.gini/secrets.env` with mode 0600; the wrapper sources that file on every invocation. The key is never written to `config.json` and never leaves your machine except in API calls to the configured provider. For Codex, no token values are stored by gini — the runtime reads `~/.codex/auth.json` on demand.
+
+From source (for developers):
+
 ```sh
 bun install
 bun run gini install
@@ -85,24 +97,49 @@ bun run gini readiness v1
 bun run gini evidence
 ```
 
+## Update
+
+To update an existing install:
+
+```sh
+gini update
+```
+
+Pulls the latest source into `~/.gini/runtime`, reinstalls dependencies, and leaves your state under `~/.gini/instances/` and the model cache at `~/.gini/models/` untouched. If a runtime is currently running, restart it (`gini stop && gini start`) to pick up the new code.
+
+`gini update` only operates on the installer-managed runtime at `~/.gini/runtime`. From a repo clone, use `git pull && bun install` instead.
+
+## Local Development Install
+
+If you're working on gini-agent itself and want to test the install/update/uninstall flow against your local checkout (without pushing to GitHub):
+
+```sh
+./scripts/install.sh --local
+```
+
+This is the same as the default install except it clones from your local repo into `~/.gini/runtime`. After you commit changes locally, `gini update` will pull them in. `gini uninstall` works exactly the same as a real install (same marker, same wrapper path).
+
 ## Cleanup
 
-Remove one instance:
+Remove a single instance:
 
 ```sh
-bun run gini uninstall --instance <instance>
+gini uninstall --instance <instance>
 ```
 
-Remove all instances while keeping model cache:
+Full uninstall (interactive, two prompts):
 
 ```sh
-rm -rf ~/.gini/instances
+gini uninstall
 ```
 
-Remove all local Gini data, including downloaded models:
+The first prompt asks "are you sure" (default no). The second asks whether to keep instance state at `~/.gini/instances/` (default yes). The full uninstall stops every running instance, removes the installer-managed wrapper at `~/.local/bin/gini`, removes the runtime checkout at `~/.gini/runtime/`, and strips the PATH block (marker `# Added by gini-agent installer`) from your shell rc. The model cache at `~/.gini/models/` is never auto-removed — the summary prints its size and the `rm -rf` command to remove it manually.
+
+Non-interactive variants:
 
 ```sh
-rm -rf ~/.gini
+gini uninstall --yes      # full uninstall, no prompts, keep instances
+gini uninstall --purge    # full uninstall + delete instances (implies --yes)
 ```
 
 For disposable development and tests, override roots:
