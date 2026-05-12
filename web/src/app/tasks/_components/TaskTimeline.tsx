@@ -8,14 +8,19 @@ export function TaskTimeline({ trace }: { trace: TraceRecord[] }) {
   }
   return (
     <ol className="space-y-1">
-      {trace.map((record) => (
-        <TimelineRow key={record.id} record={record} />
-      ))}
+      {trace.map((record, index) => {
+        // Δ since the previous entry — helps spot long gaps (model latency,
+        // approval waits) without doing the math yourself. First row has no
+        // predecessor so we render an em-dash placeholder for alignment.
+        const prev = index > 0 ? trace[index - 1] : null;
+        const deltaMs = prev ? new Date(record.at).getTime() - new Date(prev.at).getTime() : null;
+        return <TimelineRow key={record.id} record={record} deltaMs={deltaMs} />;
+      })}
     </ol>
   );
 }
 
-function TimelineRow({ record }: { record: TraceRecord }) {
+function TimelineRow({ record, deltaMs }: { record: TraceRecord; deltaMs: number | null }) {
   // Tone the bullet by record type so the timeline is scannable. Tools are
   // green-ish (work happened), errors red, approvals amber, model/task neutral.
   const tone =
@@ -44,8 +49,9 @@ function TimelineRow({ record }: { record: TraceRecord }) {
           <span className="text-xs">
             <span className="text-muted-foreground">[{record.type}]</span> {record.message}
           </span>
-          <span className="font-mono text-[10px] text-muted-foreground shrink-0">
-            {new Date(record.at).toLocaleTimeString()}
+          <span className="flex items-baseline gap-2 font-mono text-[10px] text-muted-foreground shrink-0">
+            <span className="tabular-nums">{formatDelta(deltaMs)}</span>
+            <span>{new Date(record.at).toLocaleTimeString()}</span>
           </span>
         </div>
         {target ? (
@@ -60,6 +66,22 @@ function TimelineRow({ record }: { record: TraceRecord }) {
       </div>
     </li>
   );
+}
+
+// Pretty-print a millisecond delta into the most informative unit:
+//   < 1s   → "+120ms"  (sub-second gaps matter for tight tool calls)
+//   < 60s  → "+1.4s"
+//   ≥ 60s  → "+2m 13s"  (long waits — usually model latency or approvals)
+// First-row deltas get "—" so the column still aligns.
+function formatDelta(ms: number | null): string {
+  if (ms === null) return "—";
+  if (!Number.isFinite(ms) || ms < 0) return "+0ms";
+  if (ms < 1000) return `+${ms}ms`;
+  if (ms < 60_000) return `+${(ms / 1000).toFixed(1)}s`;
+  const totalSec = Math.floor(ms / 1000);
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec - min * 60;
+  return `+${min}m ${sec}s`;
 }
 
 export function traceTarget(record: TraceRecord): string | null {
