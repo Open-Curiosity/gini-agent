@@ -15,11 +15,21 @@ interface Session {
   page: Page;
   refs: Map<string, Locator>;
   lastActivity: number;
+  // In-flight call counter. Incremented by withSession around each tool
+  // invocation so the idle sweeper can skip sessions that are mid-call
+  // (e.g. a slow page.goto exceeding the 5-minute idle window).
+  inFlight: number;
 }
 
 let sharedBrowser: Browser | undefined;
 let chromiumImport: Promise<typeof import("playwright-core").chromium> | undefined;
+// In-flight launch promise so concurrent ensureBrowser callers share one
+// chromium.launch() instead of orphaning the loser's Browser.
+let pendingBrowser: Promise<Browser> | null = null;
 const sessions = new Map<string, Session>();
+// Same idea per task — concurrent getOrCreate() calls for the same taskId
+// share one Promise<Session> so we never create two contexts for one task.
+const pendingSessions = new Map<string, Promise<Session>>();
 let sweepTimer: ReturnType<typeof setInterval> | undefined;
 let exitHookRegistered = false;
 
@@ -32,30 +42,39 @@ function loadChromium(): Promise<typeof import("playwright-core").chromium> {
 
 async function ensureBrowser(): Promise<Browser> {
   if (sharedBrowser && sharedBrowser.isConnected()) return sharedBrowser;
+  if (pendingBrowser) return pendingBrowser;
   const chromium = await loadChromium();
-  try {
-    sharedBrowser = await chromium.launch({ headless: true });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `Failed to launch Chromium: ${message}. ` +
-        "Run `bunx playwright install chromium` to install the browser."
-    );
-  }
-  registerExitHook();
-  startSweeper();
-  return sharedBrowser;
+  pendingBrowser = chromium
+    .launch({ headless: true })
+    .then((browser) => {
+      sharedBrowser = browser;
+      registerExitHook();
+      startSweeper();
+      return browser;
+    })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Failed to launch Chromium: ${message}. ` +
+          "Run `bunx playwright install chromium` to install the browser."
+      );
+    })
+    .finally(() => {
+      pendingBrowser = null;
+    });
+  return pendingBrowser;
 }
 
 function registerExitHook(): void {
   if (exitHookRegistered) return;
   exitHookRegistered = true;
-  const handler = () => {
+  // Only beforeExit. The runtime's own SIGTERM handler in src/server.ts
+  // calls closeAll() as part of its drain; intercepting SIGINT/SIGTERM
+  // here would either swallow the signal (no process.exit) or race the
+  // server's drain. beforeExit covers non-server callers (CLI, tests).
+  process.on("beforeExit", () => {
     void closeAll();
-  };
-  process.on("beforeExit", handler);
-  process.on("SIGINT", handler);
-  process.on("SIGTERM", handler);
+  });
 }
 
 function startSweeper(): void {
@@ -63,6 +82,10 @@ function startSweeper(): void {
   sweepTimer = setInterval(() => {
     const cutoff = Date.now() - IDLE_TIMEOUT_MS;
     for (const [taskId, session] of sessions.entries()) {
+      // Skip sessions with in-flight calls so a slow page.goto doesn't
+      // get killed under the agent's feet just because it crossed the
+      // idle threshold mid-await.
+      if (session.inFlight > 0) continue;
       if (session.lastActivity < cutoff) {
         void closeSession(taskId);
       }
@@ -78,23 +101,57 @@ async function getOrCreate(taskId: string): Promise<Session> {
     existing.lastActivity = Date.now();
     return existing;
   }
-  const browser = await ensureBrowser();
-  const context = await browser.newContext();
-  const page = await context.newPage();
-  const session: Session = { context, page, refs: new Map(), lastActivity: Date.now() };
-  sessions.set(taskId, session);
-  return session;
+  const inflight = pendingSessions.get(taskId);
+  if (inflight) return inflight;
+  const promise = (async () => {
+    const browser = await ensureBrowser();
+    const context = await browser.newContext();
+    let page: Page;
+    try {
+      page = await context.newPage();
+    } catch (error) {
+      // Avoid orphaning the context if newPage throws between newContext()
+      // and the sessions.set() below.
+      await context.close().catch(() => undefined);
+      throw error;
+    }
+    const session: Session = {
+      context,
+      page,
+      refs: new Map(),
+      lastActivity: Date.now(),
+      inFlight: 0
+    };
+    sessions.set(taskId, session);
+    // Attach console capture eagerly so page.goto errors before the
+    // agent's first browser_console call are still observable.
+    attachConsole(taskId, page);
+    return session;
+  })().finally(() => {
+    pendingSessions.delete(taskId);
+  });
+  pendingSessions.set(taskId, promise);
+  return promise;
 }
 
-function touch(taskId: string): void {
-  const session = sessions.get(taskId);
-  if (session) session.lastActivity = Date.now();
+// Per-tool wrapper that bumps inFlight while the work is in progress so
+// the idle sweeper never closes a session mid-call.
+async function withSession<T>(taskId: string, fn: (session: Session) => Promise<T>): Promise<T> {
+  const session = await getOrCreate(taskId);
+  session.inFlight++;
+  try {
+    return await fn(session);
+  } finally {
+    session.inFlight--;
+    session.lastActivity = Date.now();
+  }
 }
 
 async function closeSession(taskId: string): Promise<void> {
   const session = sessions.get(taskId);
   if (!session) return;
   sessions.delete(taskId);
+  consoleLogs.delete(taskId);
   try {
     await session.context.close();
   } catch {
@@ -126,6 +183,7 @@ export async function closeAll(): Promise<void> {
       // ignore
     }
   }
+  consoleLogs.clear();
   if (sharedBrowser) {
     try {
       await sharedBrowser.close();
@@ -164,6 +222,38 @@ function isLinkLocal(host: string): boolean {
   return /^169\.254\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
+// Lightweight IPv6 guard. WHATWG URL hands back hostnames in canonical
+// lowercase form, but `[::1]` style brackets are preserved for IPv6
+// literals. Strip the brackets, then close the explicit bypasses we know
+// about (link-local fe80::/10, loopback ::1, IPv4-mapped ::ffff:a.b.c.d).
+// Not a full SSRF sandbox — proportional to the design's "lightweight
+// guard" intent.
+function isBlockedIpv6(host: string): string | undefined {
+  // fe80::/10 — first 10 bits are 1111 1110 10, so the second hex nibble
+  // is in 8..b. Match fe80, fe90, fea0, feb0 prefixes followed by a colon
+  // (so we don't catch e.g. fe8a:: that's outside the range — but the
+  // bypass we care about is the obvious [fe80::1] style).
+  if (/^fe[89ab][0-9a-f]?:/i.test(host)) {
+    return `Blocked: ${host} is an IPv6 link-local address.`;
+  }
+  if (host === "::1") {
+    return `Blocked: ${host} is the IPv6 loopback address.`;
+  }
+  // ::ffff:a.b.c.d — IPv4-mapped IPv6. Re-run the IPv4 link-local /
+  // metadata check against the trailing dotted quad.
+  const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(host);
+  if (mapped) {
+    const ipv4 = mapped[1]!;
+    if (BLOCKED_HOSTNAMES.has(ipv4)) {
+      return `Blocked: ${host} maps to ${ipv4}, a cloud metadata endpoint.`;
+    }
+    if (isLinkLocal(ipv4)) {
+      return `Blocked: ${host} maps to ${ipv4}, a link-local address.`;
+    }
+  }
+  return undefined;
+}
+
 function safetyCheck(rawUrl: string): string | undefined {
   let parsed: URL;
   try {
@@ -174,13 +264,16 @@ function safetyCheck(rawUrl: string): string | undefined {
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     return `Blocked: only http(s) URLs are allowed (got ${parsed.protocol}).`;
   }
-  const host = parsed.hostname.toLowerCase();
+  // Strip IPv6 brackets so the comparisons below see the bare host.
+  const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
   if (BLOCKED_HOSTNAMES.has(host)) {
     return `Blocked: ${host} is a cloud metadata endpoint.`;
   }
   if (isLinkLocal(host)) {
     return `Blocked: ${host} is a link-local address.`;
   }
+  const ipv6Block = isBlockedIpv6(host);
+  if (ipv6Block) return ipv6Block;
   let decoded = rawUrl;
   try {
     decoded = decodeURIComponent(rawUrl);
@@ -424,18 +517,18 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
   const blocked = safetyCheck(url);
   if (blocked) return fail(blocked);
   try {
-    const session = await getOrCreate(taskId);
-    const response = await session.page.goto(url, { waitUntil: "domcontentloaded" });
-    touch(taskId);
-    const snap = await snapshot(session.page, false);
-    session.refs = snap.refs;
-    return ok({
-      url: session.page.url(),
-      status: response?.status() ?? null,
-      title: await session.page.title(),
-      snapshot: snap.text,
-      elementCount: snap.elementCount,
-      truncated: snap.truncated
+    return await withSession(taskId, async (session) => {
+      const response = await session.page.goto(url, { waitUntil: "domcontentloaded" });
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        status: response?.status() ?? null,
+        title: await session.page.title(),
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
+      });
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -445,16 +538,16 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
 export async function browserSnapshot(taskId: string, args: Record<string, unknown>): Promise<string> {
   const full = bool(args.full, false);
   try {
-    const session = await getOrCreate(taskId);
-    const snap = await snapshot(session.page, full);
-    session.refs = snap.refs;
-    touch(taskId);
-    return ok({
-      url: session.page.url(),
-      title: await session.page.title(),
-      snapshot: snap.text,
-      elementCount: snap.elementCount,
-      truncated: snap.truncated
+    return await withSession(taskId, async (session) => {
+      const snap = await snapshot(session.page, full);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        title: await session.page.title(),
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
+      });
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -465,20 +558,20 @@ export async function browserClick(taskId: string, args: Record<string, unknown>
   const ref = str(args.ref);
   if (!ref) return fail("Missing required string argument: ref");
   try {
-    const session = await getOrCreate(taskId);
-    const locator = session.refs.get(ref);
-    if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-    await locator.click({ timeout: 10_000 });
-    await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-    touch(taskId);
-    const snap = await snapshot(session.page, false);
-    session.refs = snap.refs;
-    return ok({
-      url: session.page.url(),
-      title: await session.page.title(),
-      snapshot: snap.text,
-      elementCount: snap.elementCount,
-      truncated: snap.truncated
+    return await withSession(taskId, async (session) => {
+      const locator = session.refs.get(ref);
+      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await locator.click({ timeout: 10_000 });
+      await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        title: await session.page.title(),
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
+      });
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -491,18 +584,18 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
   if (!ref) return fail("Missing required string argument: ref");
   if (text === undefined) return fail("Missing required string argument: text");
   try {
-    const session = await getOrCreate(taskId);
-    const locator = session.refs.get(ref);
-    if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-    await locator.fill(text, { timeout: 10_000 });
-    touch(taskId);
-    const snap = await snapshot(session.page, false);
-    session.refs = snap.refs;
-    return ok({
-      url: session.page.url(),
-      snapshot: snap.text,
-      elementCount: snap.elementCount,
-      truncated: snap.truncated
+    return await withSession(taskId, async (session) => {
+      const locator = session.refs.get(ref);
+      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await locator.fill(text, { timeout: 10_000 });
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
+      });
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -513,17 +606,17 @@ export async function browserPress(taskId: string, args: Record<string, unknown>
   const key = str(args.key);
   if (!key) return fail("Missing required string argument: key");
   try {
-    const session = await getOrCreate(taskId);
-    await session.page.keyboard.press(key);
-    await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-    touch(taskId);
-    const snap = await snapshot(session.page, false);
-    session.refs = snap.refs;
-    return ok({
-      url: session.page.url(),
-      snapshot: snap.text,
-      elementCount: snap.elementCount,
-      truncated: snap.truncated
+    return await withSession(taskId, async (session) => {
+      await session.page.keyboard.press(key);
+      await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
+      });
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -536,17 +629,17 @@ export async function browserScroll(taskId: string, args: Record<string, unknown
     return fail("Argument direction must be 'up' or 'down'.");
   }
   try {
-    const session = await getOrCreate(taskId);
-    const dy = direction === "down" ? 600 : -600;
-    await session.page.evaluate((delta) => window.scrollBy(0, delta), dy);
-    touch(taskId);
-    const snap = await snapshot(session.page, false);
-    session.refs = snap.refs;
-    return ok({
-      url: session.page.url(),
-      snapshot: snap.text,
-      elementCount: snap.elementCount,
-      truncated: snap.truncated
+    return await withSession(taskId, async (session) => {
+      const dy = direction === "down" ? 600 : -600;
+      await session.page.evaluate((delta) => window.scrollBy(0, delta), dy);
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
+      });
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -555,18 +648,18 @@ export async function browserScroll(taskId: string, args: Record<string, unknown
 
 export async function browserBack(taskId: string, _args: Record<string, unknown>): Promise<string> {
   try {
-    const session = await getOrCreate(taskId);
-    const response = await session.page.goBack({ waitUntil: "domcontentloaded" });
-    touch(taskId);
-    const snap = await snapshot(session.page, false);
-    session.refs = snap.refs;
-    return ok({
-      url: session.page.url(),
-      status: response?.status() ?? null,
-      title: await session.page.title(),
-      snapshot: snap.text,
-      elementCount: snap.elementCount,
-      truncated: snap.truncated
+    return await withSession(taskId, async (session) => {
+      const response = await session.page.goBack({ waitUntil: "domcontentloaded" });
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        status: response?.status() ?? null,
+        title: await session.page.title(),
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
+      });
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -591,30 +684,32 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
   const expression = str(args.expression);
   const clear = bool(args.clear, false);
   try {
-    const session = await getOrCreate(taskId);
-    attachConsole(taskId, session.page);
-    if (clear) {
-      consoleLogs.set(taskId, []);
-    }
-    let evalResult: unknown = undefined;
-    let evalError: string | undefined;
-    if (expression) {
-      try {
-        evalResult = await session.page.evaluate((expr) => {
-          // eslint-disable-next-line no-new-func
-          return new Function(`return (${expr});`)();
-        }, expression);
-      } catch (error) {
-        evalError = error instanceof Error ? error.message : String(error);
+    return await withSession(taskId, async (session) => {
+      // attachConsole is now called eagerly in getOrCreate; this is a
+      // belt-and-braces re-attach in case the page was somehow swapped.
+      attachConsole(taskId, session.page);
+      if (clear) {
+        consoleLogs.set(taskId, []);
       }
-    }
-    touch(taskId);
-    const messages = consoleLogs.get(taskId) ?? [];
-    return ok({
-      url: session.page.url(),
-      messages,
-      evalResult: evalResult === undefined ? null : evalResult,
-      evalError: evalError ?? null
+      let evalResult: unknown = undefined;
+      let evalError: string | undefined;
+      if (expression) {
+        try {
+          evalResult = await session.page.evaluate((expr) => {
+            // eslint-disable-next-line no-new-func
+            return new Function(`return (${expr});`)();
+          }, expression);
+        } catch (error) {
+          evalError = error instanceof Error ? error.message : String(error);
+        }
+      }
+      const messages = consoleLogs.get(taskId) ?? [];
+      return ok({
+        url: session.page.url(),
+        messages,
+        evalResult: evalResult === undefined ? null : evalResult,
+        evalError: evalError ?? null
+      });
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
