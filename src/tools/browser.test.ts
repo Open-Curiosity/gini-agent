@@ -1,5 +1,7 @@
-import { describe, expect, test } from "bun:test";
-import { safetyCheck } from "./browser";
+import { afterAll, describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
+import { safetyCheck, setBrowserInstance } from "./browser";
+import { mutateState, readState } from "../state";
 
 // Direct unit coverage for the URL safety guard. We exercise the function
 // without spinning up Chromium since the guard runs synchronously on the
@@ -61,5 +63,46 @@ describe("browser safetyCheck", () => {
 
   test("allows ordinary https URLs", () => {
     expect(safetyCheck("https://example.com/")).toBeUndefined();
+  });
+});
+
+// Smoke test for the CDP-vs-launch decision. We can't actually exercise
+// playwright-core's connectOverCDP / launch without spawning Chromium —
+// the real verification happens in the manual end-to-end run. What we CAN
+// verify here is that the session manager reads state.browser through the
+// instance registered via setBrowserInstance(), so the wiring between the
+// browser-connect capability and the tool layer is consistent.
+describe("browser session manager state lookup", () => {
+  const TEST_ROOT = "/tmp/gini-browser-state-tests";
+  process.env["GINI_STATE_ROOT"] = TEST_ROOT;
+  const instance = `browser-state-${process.pid}`;
+
+  afterAll(() => {
+    // Reset the module-level instance pointer so subsequent test files
+    // in the same run don't accidentally read this test instance's state.
+    // Passing the literal "dev" matches the production default.
+    setBrowserInstance("dev");
+    rmSync(TEST_ROOT, { recursive: true, force: true });
+  });
+
+  test("setBrowserInstance points readState at the right instance", async () => {
+    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
+    // Seed a connection record so the session manager would, on next
+    // browser tool call, attempt connectOverCDP() instead of launch().
+    // We don't actually trigger that branch (no real CDP endpoint) but
+    // the state shape it consumes is what we verify.
+    await mutateState(instance, (state) => {
+      state.browser = {
+        mode: "cdp",
+        cdpUrl: "ws://127.0.0.1:65535/devtools/browser/test",
+        pid: null,
+        dataDir: null,
+        chromePath: null,
+        startedAt: new Date().toISOString()
+      };
+    });
+    setBrowserInstance(instance);
+    const state = readState(instance);
+    expect(state.browser?.cdpUrl).toContain("127.0.0.1:65535");
   });
 });

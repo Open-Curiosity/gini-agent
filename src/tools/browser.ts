@@ -4,7 +4,15 @@
 // taskId and idle-swept after 5 minutes. All tools are sync — they return
 // a JSON string immediately. Side-effecting actions (click/type) skip the
 // approval gate; the snapshot itself is the trace evidence.
+//
+// CDP-attached mode: when the user has connected a real headed Chrome via
+// /api/browser/connect, the session manager swaps the headless launch for
+// chromium.connectOverCDP() and reuses the user's default context instead
+// of creating fresh ones. That's what makes the user's signed-in cookies
+// visible to the agent.
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
+import { readState } from "../state";
+import type { BrowserConnectionRecord, Instance } from "../types";
 
 const SNAPSHOT_CHAR_BUDGET = 32_000;
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -19,14 +27,30 @@ interface Session {
   // invocation so the idle sweeper can skip sessions that are mid-call
   // (e.g. a slow page.goto exceeding the 5-minute idle window).
   inFlight: number;
+  // True when we created the BrowserContext ourselves (headless launch
+  // path, or CDP attach where the remote browser had no default context).
+  // False when we reused the user's default context — closeSession() then
+  // closes only the page so we don't kill the user's tabs.
+  ownsContext: boolean;
 }
 
 let sharedBrowser: Browser | undefined;
+// True when sharedBrowser was acquired via chromium.connectOverCDP rather
+// than chromium.launch. Drives all of the "don't kill the user's Chrome"
+// branches in close paths and the "reuse default context" branch in
+// session creation.
+let sharedBrowserIsCdp = false;
 let chromiumImport: Promise<typeof import("playwright-core").chromium> | undefined;
 // In-flight launch promise so concurrent ensureBrowser callers share one
 // chromium.launch() instead of orphaning the loser's Browser.
 let pendingBrowser: Promise<Browser> | null = null;
 const sessions = new Map<string, Session>();
+// Set at runtime startup via setBrowserInstance(). Lets ensureBrowser()
+// look up state.browser to decide between connectOverCDP() and launch().
+// Stays undefined in standalone test contexts that import the tools
+// directly without going through the runtime — the launch path then
+// behaves exactly as before.
+let runtimeInstance: Instance | undefined;
 // Same idea per task — concurrent getOrCreate() calls for the same taskId
 // share one Promise<Session> so we never create two contexts for one task.
 const pendingSessions = new Map<string, Promise<Session>>();
@@ -40,26 +64,66 @@ function loadChromium(): Promise<typeof import("playwright-core").chromium> {
   return chromiumImport;
 }
 
+// Called by the runtime (src/server.ts) right after loadConfig so the
+// session manager can resolve which instance's state.browser to consult.
+// Safe to call repeatedly — only the last value is used.
+export function setBrowserInstance(instance: Instance): void {
+  runtimeInstance = instance;
+}
+
+// Read the active CDP connection record if one is registered. Returns
+// undefined when no instance is set (tests / direct tool callers) or
+// when the user hasn't connected a browser. The lookup is synchronous
+// and cheap (readState already memoizes the JSON parse via writeState's
+// atomic rename), so we don't memoize here.
+function activeBrowserRecord(): BrowserConnectionRecord | undefined {
+  if (!runtimeInstance) return undefined;
+  try {
+    const state = readState(runtimeInstance);
+    return state.browser ?? undefined;
+  } catch {
+    // readState can throw on a state-file corruption — better to fall
+    // back to the headless launch than to wedge every browser tool call.
+    return undefined;
+  }
+}
+
 async function ensureBrowser(): Promise<Browser> {
   if (sharedBrowser && sharedBrowser.isConnected()) return sharedBrowser;
   if (pendingBrowser) return pendingBrowser;
-  // Assign pendingBrowser synchronously (before any await) so two concurrent
-  // cold-start callers share one launch promise. If we awaited loadChromium()
-  // first, both callers would pass the null check, both would suspend on the
-  // dynamic import, and each would then call chromium.launch() — orphaning
-  // the loser. Mirrors the IIFE pattern already correct in getOrCreate.
+  // Resolve the active connection record *before* the await chain starts so
+  // two concurrent cold-start callers see the same decision (CDP vs launch).
+  // If the record disappears between this read and the actual attach the
+  // attach will fail and the caller will retry through the normal error
+  // path — we don't try to atomically lock state across the dynamic import.
+  const record = activeBrowserRecord();
+  const useCdp = Boolean(record?.cdpUrl);
   pendingBrowser = (async () => {
     const chromium = await loadChromium();
+    if (useCdp && record?.cdpUrl) {
+      // connectOverCDP returns a Browser handle scoped to the remote
+      // process. The remote Chrome's default BrowserContext (the one the
+      // user has been clicking around in) shows up under browser.contexts()
+      // — we'll reuse it in getOrCreate() so signed-in cookies are visible.
+      return chromium.connectOverCDP(record.cdpUrl);
+    }
     return chromium.launch({ headless: true });
   })()
     .then((browser) => {
       sharedBrowser = browser;
+      sharedBrowserIsCdp = useCdp;
       registerExitHook();
       startSweeper();
       return browser;
     })
     .catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
+      if (useCdp) {
+        throw new Error(
+          `Failed to attach over CDP: ${message}. ` +
+            "Disconnect and reconnect via /api/browser/connect, or start a fresh Chrome session."
+        );
+      }
       throw new Error(
         `Failed to launch Chromium: ${message}. ` +
           "Run `bunx playwright install chromium` to install the browser."
@@ -111,14 +175,35 @@ async function getOrCreate(taskId: string): Promise<Session> {
   if (inflight) return inflight;
   const promise = (async () => {
     const browser = await ensureBrowser();
-    const context = await browser.newContext();
+    // CDP-attached: reuse the user's already-open default BrowserContext
+    // so any pages we create live in their authenticated profile. Newer
+    // Chrome builds reject newContext() over CDP outright; even when they
+    // accept it, the new context inherits no cookies, defeating the whole
+    // point of /api/browser/connect. Track whether we owned the creation
+    // so closeSession() knows to leave the user's context alone.
+    let context: BrowserContext;
+    let weCreatedContext = true;
+    if (sharedBrowserIsCdp) {
+      const existing = browser.contexts()[0];
+      if (existing) {
+        context = existing;
+        weCreatedContext = false;
+      } else {
+        context = await browser.newContext();
+      }
+    } else {
+      context = await browser.newContext();
+    }
     let page: Page;
     try {
       page = await context.newPage();
     } catch (error) {
       // Avoid orphaning the context if newPage throws between newContext()
-      // and the sessions.set() below.
-      await context.close().catch(() => undefined);
+      // and the sessions.set() below. Don't close a context we didn't
+      // create (that would close the user's tabs).
+      if (weCreatedContext) {
+        await context.close().catch(() => undefined);
+      }
       throw error;
     }
     const session: Session = {
@@ -126,7 +211,8 @@ async function getOrCreate(taskId: string): Promise<Session> {
       page,
       refs: new Map(),
       lastActivity: Date.now(),
-      inFlight: 0
+      inFlight: 0,
+      ownsContext: weCreatedContext
     };
     sessions.set(taskId, session);
     // Attach console capture eagerly so page.goto errors before the
@@ -159,17 +245,28 @@ async function closeSession(taskId: string): Promise<void> {
   sessions.delete(taskId);
   consoleLogs.delete(taskId);
   try {
-    await session.context.close();
+    if (session.ownsContext) {
+      await session.context.close();
+    } else {
+      // CDP-attached + reused context: close only the page. The user's
+      // existing tabs stay open in their Chrome.
+      await session.page.close().catch(() => undefined);
+    }
   } catch {
     // Already closed or browser disconnected; nothing useful to do.
   }
-  if (sessions.size === 0 && sharedBrowser) {
+  // Don't tear down the shared browser when CDP-attached — that handle
+  // belongs to the user's Chrome. The headless launch path keeps the
+  // original "tear it down once everyone's gone" behavior so we don't
+  // hold a Chromium process open between idle bursts.
+  if (sessions.size === 0 && sharedBrowser && !sharedBrowserIsCdp) {
     try {
       await sharedBrowser.close();
     } catch {
       // ignore
     }
     sharedBrowser = undefined;
+    sharedBrowserIsCdp = false;
     if (sweepTimer) {
       clearInterval(sweepTimer);
       sweepTimer = undefined;
@@ -190,11 +287,14 @@ export async function disconnectSharedBrowser(): Promise<void> {
     sessions.delete(id);
     if (!session) continue;
     try {
-      // For CDP-attached sessions the context belongs to the user's Chrome
-      // and closing it via Playwright would also close the user's tabs.
-      // Drop our page only; if it throws (already closed, browser gone)
-      // there's nothing useful to do.
-      await session.page.close().catch(() => undefined);
+      // For sessions reusing the user's default context, close just the
+      // page so we don't close the user's tabs. For sessions that own
+      // their context, close the context as usual.
+      if (session.ownsContext) {
+        await session.context.close().catch(() => undefined);
+      } else {
+        await session.page.close().catch(() => undefined);
+      }
     } catch {
       // ignore
     }
@@ -202,13 +302,13 @@ export async function disconnectSharedBrowser(): Promise<void> {
   consoleLogs.clear();
   if (sharedBrowser) {
     try {
-      // Use disconnect() rather than close() — close() over CDP also
-      // terminates the remote browser, which the user owns. The Browser
-      // type from playwright-core only exposes disconnect on CDP-attached
-      // instances, so we probe at runtime and fall back to close() for
-      // local launches.
+      // Use disconnect() rather than close() over CDP — close() over CDP
+      // also terminates the remote browser, which the user owns. The
+      // Browser type from playwright-core only exposes disconnect on
+      // CDP-attached instances, so we probe at runtime and fall back to
+      // close() for local launches.
       const candidate = sharedBrowser as unknown as { disconnect?: () => Promise<void> };
-      if (typeof candidate.disconnect === "function") {
+      if (sharedBrowserIsCdp && typeof candidate.disconnect === "function") {
         await candidate.disconnect();
       } else {
         await sharedBrowser.close();
@@ -217,6 +317,7 @@ export async function disconnectSharedBrowser(): Promise<void> {
       // ignore
     }
     sharedBrowser = undefined;
+    sharedBrowserIsCdp = false;
   }
   if (sweepTimer) {
     clearInterval(sweepTimer);
@@ -231,7 +332,11 @@ export async function closeAll(): Promise<void> {
     sessions.delete(id);
     if (!session) continue;
     try {
-      await session.context.close();
+      if (session.ownsContext) {
+        await session.context.close();
+      } else {
+        await session.page.close().catch(() => undefined);
+      }
     } catch {
       // ignore
     }
@@ -239,11 +344,20 @@ export async function closeAll(): Promise<void> {
   consoleLogs.clear();
   if (sharedBrowser) {
     try {
-      await sharedBrowser.close();
+      // Mirror disconnectSharedBrowser's CDP-aware teardown: over CDP we
+      // disconnect the Playwright handle without killing the user's
+      // Chrome; for the headless-launch path we close() as before.
+      const candidate = sharedBrowser as unknown as { disconnect?: () => Promise<void> };
+      if (sharedBrowserIsCdp && typeof candidate.disconnect === "function") {
+        await candidate.disconnect();
+      } else {
+        await sharedBrowser.close();
+      }
     } catch {
       // ignore
     }
     sharedBrowser = undefined;
+    sharedBrowserIsCdp = false;
   }
   if (sweepTimer) {
     clearInterval(sweepTimer);

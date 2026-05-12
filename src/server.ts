@@ -5,12 +5,18 @@ import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance } from "./paths";
 import { appendLog } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
-import { closeAll as closeBrowserSessions } from "./tools/browser";
+import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
 
 const instance = parseInstance();
 const config = loadConfig(instance);
 install(config);
 writePid(config);
+
+// Inform the browser session manager which instance to consult for the
+// optional CDP connection record. Without this the manager falls back to
+// the headless launch path (which is fine for unit tests that import the
+// tools directly).
+setBrowserInstance(config.instance);
 
 // Hindsight phase 6: opportunistic legacy migration. Runs once per server
 // start; subsequent starts are no-ops because each migrated record carries
