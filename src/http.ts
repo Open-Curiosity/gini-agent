@@ -22,6 +22,7 @@ import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge, listM
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createProfile, listProfiles, useProfile } from "./capabilities/profiles";
+import { connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { createSkillFromInput, getSkill, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
@@ -221,6 +222,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],
     ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, async (_request, params) => json(await reviewPromotion(config, params[0], "approve"))],
     ["POST", /^\/api\/promotions\/([^/]+)\/reject$/, async (_request, params) => json(await reviewPromotion(config, params[0], "reject"))],
+    ["GET", /^\/api\/browser$/, () => json(getBrowserConnection(config))],
+    ["POST", /^\/api\/browser\/connect$/, async (request) => {
+      const payload = await body(request);
+      return json(await connectBrowser(config, payload), 201);
+    }],
+    ["POST", /^\/api\/browser\/disconnect$/, async () => json(await disconnectBrowser(config))],
     ["GET", /^\/api\/toolsets$/, () => json(listToolsets(config))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/enable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "enabled"))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "disabled"))],

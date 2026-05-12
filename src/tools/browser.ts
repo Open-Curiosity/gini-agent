@@ -177,6 +177,53 @@ async function closeSession(taskId: string): Promise<void> {
   }
 }
 
+// Drop the in-process Playwright handle without killing the underlying
+// browser process. Used by the browser-connect capability when the user
+// disconnects a CDP-attached Chrome: the next browser tool call should
+// re-read state and either re-attach (if a fresh record is set up) or
+// fall back to the headless launch path. Safe no-op when no shared
+// browser is held.
+export async function disconnectSharedBrowser(): Promise<void> {
+  const ids = Array.from(sessions.keys());
+  for (const id of ids) {
+    const session = sessions.get(id);
+    sessions.delete(id);
+    if (!session) continue;
+    try {
+      // For CDP-attached sessions the context belongs to the user's Chrome
+      // and closing it via Playwright would also close the user's tabs.
+      // Drop our page only; if it throws (already closed, browser gone)
+      // there's nothing useful to do.
+      await session.page.close().catch(() => undefined);
+    } catch {
+      // ignore
+    }
+  }
+  consoleLogs.clear();
+  if (sharedBrowser) {
+    try {
+      // Use disconnect() rather than close() — close() over CDP also
+      // terminates the remote browser, which the user owns. The Browser
+      // type from playwright-core only exposes disconnect on CDP-attached
+      // instances, so we probe at runtime and fall back to close() for
+      // local launches.
+      const candidate = sharedBrowser as unknown as { disconnect?: () => Promise<void> };
+      if (typeof candidate.disconnect === "function") {
+        await candidate.disconnect();
+      } else {
+        await sharedBrowser.close();
+      }
+    } catch {
+      // ignore
+    }
+    sharedBrowser = undefined;
+  }
+  if (sweepTimer) {
+    clearInterval(sweepTimer);
+    sweepTimer = undefined;
+  }
+}
+
 export async function closeAll(): Promise<void> {
   const ids = Array.from(sessions.keys());
   for (const id of ids) {
