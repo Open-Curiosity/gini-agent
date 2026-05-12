@@ -185,6 +185,24 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.snapshots ??= [];
   state.tools ??= defaultTools(instance, now());
   state.toolsets ??= defaultToolsets(instance, now());
+  // Backfill any toolsets/tools that were added to defaults after this
+  // instance was first created. Without this, an existing instance that
+  // already has a `state.toolsets` array silently misses new toolsets
+  // (e.g. browser) and `/api/toolsets/<name>/enable` returns "Toolset
+  // not found". Match by name so user-renamed entries are left alone.
+  const at = now();
+  const desiredToolsets = defaultToolsets(instance, at);
+  for (const ts of desiredToolsets) {
+    if (!state.toolsets!.some((existing) => existing.name === ts.name)) {
+      state.toolsets!.push(ts);
+    }
+  }
+  const desiredTools = defaultTools(instance, at);
+  for (const tool of desiredTools) {
+    if (!state.tools!.some((existing) => existing.name === tool.name)) {
+      state.tools!.push(tool);
+    }
+  }
   state.subagents ??= [];
   state.mcpServers ??= [];
   state.messagingBridges ??= [];
