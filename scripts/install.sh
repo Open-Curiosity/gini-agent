@@ -142,6 +142,10 @@ fetch_runtime() {
 install_deps() {
   log "installing runtime dependencies via bun install"
   (cd "$RUNTIME_DIR" && bun install)
+  if [ -f "$RUNTIME_DIR/web/package.json" ]; then
+    log "installing web dependencies via bun install"
+    (cd "$RUNTIME_DIR/web" && bun install)
+  fi
 }
 
 write_wrapper() {
