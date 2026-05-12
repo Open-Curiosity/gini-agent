@@ -11,6 +11,13 @@ const distDir = process.env.GINI_DIST_DIR ?? ".next";
 
 const nextConfig: NextConfig = {
   distDir,
+  // The CLI advertises the dev server as http://127.0.0.1:<port>, but Next 16
+  // initializes the dev server with `localhost` and blocks cross-origin
+  // requests to internal dev resources (HMR, chunk fetches) from any other
+  // host — including 127.0.0.1. When those requests are blocked, hydration
+  // silently fails: SSR HTML renders but React never wires up event handlers
+  // or fires effects, so buttons go inert.
+  allowedDevOrigins: ["127.0.0.1"],
   turbopack: {
     root: resolve(import.meta.dirname)
   }
