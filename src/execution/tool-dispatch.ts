@@ -217,10 +217,28 @@ async function browserDispatch(
     // Result wasn't JSON — treat as opaque success.
     parsed = { success: true };
   }
+  // When the browser tool's safety check blocks a URL (which may contain a
+  // bearer/api-token pattern), the raw URL would otherwise be persisted to
+  // both trace data and the audit row, where it surfaces in the activity
+  // UI and on disk. Redact the URL and target in that case so secrets
+  // don't leak through the audit trail. Other failures (network, timeout,
+  // unknown ref) keep the URL since it's needed for debugging.
+  const safetyBlocked =
+    parsed.success === false && typeof parsed.error === "string" && parsed.error.startsWith("Blocked:");
+  const safeArgs = safetyBlocked && typeof args.url === "string"
+    ? { ...args, url: "[redacted]" }
+    : args;
+  const safeTarget = safetyBlocked && typeof args.url === "string"
+    ? "[redacted]"
+    : typeof args.url === "string"
+      ? args.url
+      : typeof args.ref === "string"
+        ? args.ref
+        : action;
   appendTrace(config.instance, taskId, {
     type: parsed.success === false ? "error" : "tool",
     message: `Browser tool ${action}`,
-    data: { action, args, success: parsed.success !== false, error: parsed.error ?? null }
+    data: { action, args: safeArgs, success: parsed.success !== false, error: parsed.error ?? null }
   });
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
@@ -230,11 +248,11 @@ async function browserDispatch(
       at: now(),
       actor: "agent",
       action,
-      target: typeof args.url === "string" ? args.url : typeof args.ref === "string" ? args.ref : action,
+      target: safeTarget,
       risk,
       taskId: item.id,
       runId: item.runId,
-      evidence: { args, success: parsed.success !== false, error: parsed.error ?? null }
+      evidence: { args: safeArgs, success: parsed.success !== false, error: parsed.error ?? null }
     });
     item.updatedAt = now();
   });
