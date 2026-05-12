@@ -4,8 +4,14 @@
 // validated by manual smoke through the curl|bash installer.
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import {
+  checkOpenAIKeyStatus,
+  hasKeyInSecretsFile,
+  readKeyFromSecretsFile,
+  writeKeyToSecretsFile
+} from "./commands/setup";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..", "..");
 const CLI_PATH = join(PROJECT_ROOT, "src", "cli.ts");
@@ -50,26 +56,10 @@ function scratch(tag: string): string {
 }
 
 describe("gini setup", () => {
-  test("--non-interactive without provider configured exits 1", async () => {
-    // Seed an openai-named provider in config but provide no OPENAI_API_KEY
-    // anywhere. providerStep.isComplete returns false, the non-interactive
-    // IO refuses the secret prompt, command exits non-zero. This is the
-    // failure path scripted installers would hit if they forgot to export
-    // the key before invoking `gini setup --yes`.
+  test("--non-interactive without provider configured and no OPENAI_API_KEY exits 1", async () => {
     const stateRoot = scratch("no-key");
     const home = scratch("no-key-home");
     const instance = "dev";
-    const instanceDir = join(stateRoot, "instances", instance);
-    mkdirSync(instanceDir, { recursive: true });
-    writeFileSync(join(instanceDir, "config.json"), `${JSON.stringify({
-      instance,
-      port: 7337,
-      token: "test-token",
-      provider: { name: "openai", model: "gpt-5.4-mini", baseUrl: "https://api.openai.com/v1", apiKeyEnv: "OPENAI_API_KEY" },
-      workspaceRoot: join(instanceDir, "workspace"),
-      stateRoot: instanceDir,
-      logRoot: join(instanceDir, "logs")
-    }, null, 2)}\n`);
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       GINI_STATE_ROOT: stateRoot,
@@ -82,18 +72,13 @@ describe("gini setup", () => {
       env
     });
     expect(result.code).not.toBe(0);
-    expect(result.stderr.toLowerCase()).toContain("not allowed");
+    expect(result.stderr).toContain("OPENAI_API_KEY");
   }, 30_000);
 
   test("--non-interactive with OPENAI_API_KEY in env and provider preconfigured exits 0", async () => {
     const stateRoot = scratch("preconfigured");
     const home = scratch("preconfigured-home");
     const instance = "dev";
-    // Seed a config.json with the openai provider so isComplete short-
-    // circuits to true. The instance dir + every adjacent dir loadConfig
-    // creates must already exist, otherwise loadConfig's defaultConfig
-    // would clobber our seed. Simplest path: write the seed, let
-    // loadConfig merge on top.
     const instanceDir = join(stateRoot, "instances", instance);
     mkdirSync(instanceDir, { recursive: true });
     const seedConfig = {
@@ -127,6 +112,89 @@ describe("gini setup", () => {
     expect(result.stdout).toContain("Done.");
   }, 30_000);
 
+  test("--non-interactive with fresh echo config and OPENAI_API_KEY in env auto-configures openai", async () => {
+    const stateRoot = scratch("fresh-yes");
+    const home = scratch("fresh-yes-home");
+    const instance = "dev";
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      GINI_STATE_ROOT: stateRoot,
+      GINI_INSTANCE: instance,
+      HOME: home,
+      OPENAI_API_KEY: "sk-test-fresh-123"
+    };
+    const result = await runCli({
+      args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
+      env
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("Auto-configured");
+    expect(result.stdout).toContain("openai");
+    const configPath = join(stateRoot, "instances", instance, "config.json");
+    expect(existsSync(configPath)).toBe(true);
+    const config = JSON.parse(readFileSync(configPath, "utf8")) as { provider?: { name?: string; model?: string } };
+    expect(config.provider?.name).toBe("openai");
+    expect(config.provider?.model).toBe("gpt-5.4-mini");
+    // The non-interactive flow persists the env key to secrets.env with
+    // mode 0600 so future shells (loading via the wrapper) pick it up.
+    const secretsPath = join(home, ".gini", "secrets.env");
+    expect(existsSync(secretsPath)).toBe(true);
+    const mode = statSync(secretsPath).mode & 0o777;
+    expect(mode).toBe(0o600);
+  }, 30_000);
+
+  test("--non-interactive with fresh echo config and NO OPENAI_API_KEY exits 1 with helpful message", async () => {
+    const stateRoot = scratch("fresh-yes-nokey");
+    const home = scratch("fresh-yes-nokey-home");
+    const instance = "dev";
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      GINI_STATE_ROOT: stateRoot,
+      GINI_INSTANCE: instance,
+      HOME: home
+    };
+    delete env.OPENAI_API_KEY;
+    const result = await runCli({
+      args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
+      env
+    });
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("OPENAI_API_KEY");
+    // No stack trace in user-facing output.
+    expect(result.stderr).not.toContain("    at ");
+    // Config should NOT have been mutated to openai.
+    const configPath = join(stateRoot, "instances", instance, "config.json");
+    if (existsSync(configPath)) {
+      const config = JSON.parse(readFileSync(configPath, "utf8")) as { provider?: { name?: string } };
+      expect(config.provider?.name).not.toBe("openai");
+    }
+  }, 30_000);
+
+  test("--non-interactive chmods a pre-existing 0644 secrets.env to 0600", async () => {
+    const stateRoot = scratch("chmod-fix");
+    const home = scratch("chmod-fix-home");
+    const instance = "dev";
+    const giniDir = join(home, ".gini");
+    mkdirSync(giniDir, { recursive: true });
+    const secretsPath = join(giniDir, "secrets.env");
+    writeFileSync(secretsPath, "");
+    chmodSync(secretsPath, 0o644);
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      GINI_STATE_ROOT: stateRoot,
+      GINI_INSTANCE: instance,
+      HOME: home,
+      OPENAI_API_KEY: "sk-chmod-test"
+    };
+    const result = await runCli({
+      args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
+      env
+    });
+    expect(result.code).toBe(0);
+    const mode = statSync(secretsPath).mode & 0o777;
+    expect(mode).toBe(0o600);
+  }, 30_000);
+
   test("non-TTY without --yes refuses", async () => {
     const stateRoot = scratch("no-tty");
     const home = scratch("no-tty-home");
@@ -144,11 +212,99 @@ describe("gini setup", () => {
     });
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("Refusing to run interactively without a TTY");
-    // We deliberately don't assert "no instance dir created" here — the
-    // command currently triggers loadConfig before the TTY check so the
-    // scaffold gets created. That mirrors the same trade-off update.ts
-    // accepts; if we wanted to defer config loading we'd lift the TTY
-    // check up to the dispatcher.
     void existsSync(stateRoot);
   }, 30_000);
+});
+
+describe("secrets.env helpers (direct)", () => {
+  function withHome<T>(fn: (home: string) => T): T {
+    const home = scratch("secrets-direct-home");
+    const oldHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      return fn(home);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+    }
+  }
+
+  test("key with $, \", backtick characters round-trips identically", () => {
+    withHome((home) => {
+      const original = `sk-test"with$dollar\`and\\backslash`;
+      writeKeyToSecretsFile("OPENAI_API_KEY", original);
+      const readBack = readKeyFromSecretsFile("OPENAI_API_KEY");
+      expect(readBack).toBe(original);
+      // Permissions should be tightened on every touch.
+      const path = join(home, ".gini", "secrets.env");
+      const mode = statSync(path).mode & 0o777;
+      expect(mode).toBe(0o600);
+    });
+  });
+
+  test("key with embedded single quote round-trips identically", () => {
+    withHome(() => {
+      const original = `sk-key'with'singles`;
+      writeKeyToSecretsFile("OPENAI_API_KEY", original);
+      expect(readKeyFromSecretsFile("OPENAI_API_KEY")).toBe(original);
+    });
+  });
+
+  test("empty value: OPENAI_API_KEY=\"\" → hasKeyInSecretsFile returns false", () => {
+    withHome((home) => {
+      const path = join(home, ".gini", "secrets.env");
+      mkdirSync(join(home, ".gini"), { recursive: true });
+      writeFileSync(path, `export OPENAI_API_KEY=""\n`, { mode: 0o600 });
+      expect(hasKeyInSecretsFile("OPENAI_API_KEY")).toBe(false);
+      expect(readKeyFromSecretsFile("OPENAI_API_KEY")).toBeNull();
+    });
+  });
+
+  test("bare form OPENAI_API_KEY=value (no export) is accepted", () => {
+    withHome((home) => {
+      const path = join(home, ".gini", "secrets.env");
+      mkdirSync(join(home, ".gini"), { recursive: true });
+      writeFileSync(path, `OPENAI_API_KEY=sk-bare-form\n`, { mode: 0o600 });
+      expect(hasKeyInSecretsFile("OPENAI_API_KEY")).toBe(true);
+      expect(readKeyFromSecretsFile("OPENAI_API_KEY")).toBe("sk-bare-form");
+    });
+  });
+
+  test("checkOpenAIKeyStatus reports env source when env is set", () => {
+    withHome(() => {
+      const old = process.env.OPENAI_API_KEY;
+      process.env.OPENAI_API_KEY = "sk-from-env";
+      try {
+        const status = checkOpenAIKeyStatus();
+        expect(status.source).toBe("env");
+        expect(status.value).toBe("sk-from-env");
+      } finally {
+        if (old === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = old;
+      }
+    });
+  });
+
+  test("checkOpenAIKeyStatus reports missing when neither env nor file has a value", () => {
+    withHome(() => {
+      const old = process.env.OPENAI_API_KEY;
+      delete process.env.OPENAI_API_KEY;
+      try {
+        expect(checkOpenAIKeyStatus().source).toBe("missing");
+      } finally {
+        if (old !== undefined) process.env.OPENAI_API_KEY = old;
+      }
+    });
+  });
+
+  test("chmods pre-existing 0644 secrets.env to 0600 on read", () => {
+    withHome((home) => {
+      const path = join(home, ".gini", "secrets.env");
+      mkdirSync(join(home, ".gini"), { recursive: true });
+      writeFileSync(path, `export OPENAI_API_KEY='sk-loose'\n`);
+      chmodSync(path, 0o644);
+      // Reading should tighten perms.
+      readKeyFromSecretsFile("OPENAI_API_KEY");
+      const mode = statSync(path).mode & 0o777;
+      expect(mode).toBe(0o600);
+    });
+  });
 });
