@@ -50,6 +50,15 @@ let pendingBrowser: Promise<Browser> | null = null;
 // reattach to the about-to-die remote or race the close-and-launch path.
 // Cleared in the finally of disconnectSharedBrowser.
 let disconnecting = false;
+// Counts admissions that have passed the `disconnecting` check but have
+// not yet bumped their session's `inFlight`. Without this, a tool call
+// could pass the initial check, suspend inside getOrCreate / ensureBrowser
+// (e.g. on the dynamic playwright-core import or a slow CDP attach),
+// disconnectSharedBrowser could observe an empty drain and tear down,
+// and the suspended call would resume against a closed browser. The
+// drain loop in disconnectSharedBrowser waits for this to fall to zero
+// in addition to summing per-session inFlight.
+let pendingAdmissions = 0;
 // How long disconnectSharedBrowser waits for inFlight sessions to drain
 // before forcing teardown. Better to risk tearing down a slow in-flight
 // call than to wedge disconnect forever waiting on a hung page.goto.
@@ -245,8 +254,22 @@ async function withSession<T>(taskId: string, fn: (session: Session) => Promise<
     // catch blocks.
     throw new Error("Browser disconnecting, retry shortly.");
   }
-  const session = await getOrCreate(taskId);
-  session.inFlight++;
+  // Increment the admission counter so disconnectSharedBrowser can wait
+  // for materializing sessions to either finish bumping inFlight or bail
+  // out. Decremented in the outer finally regardless of which path wins.
+  pendingAdmissions++;
+  let session: Session;
+  try {
+    session = await getOrCreate(taskId);
+    if (disconnecting) {
+      // Disconnect started while we were materializing. Bail out without
+      // using the session — the browser is about to be torn down.
+      throw new Error("Browser disconnecting, retry shortly.");
+    }
+    session.inFlight++;
+  } finally {
+    pendingAdmissions--;
+  }
   try {
     return await fn(session);
   } finally {
@@ -304,16 +327,20 @@ export async function disconnectSharedBrowser(): Promise<void> {
   }
   disconnecting = true;
   try {
-    // Wait for in-flight calls to drain. We can't safely close pages /
-    // contexts while tools are mid-await on them — the half-completed
-    // browser call would throw a confusing "Target closed" up the stack.
-    // Bound the wait so a hung page.goto can't wedge disconnect forever;
-    // after the deadline, proceed with teardown anyway.
+    // Wait for in-flight calls AND materializing admissions to drain. We
+    // can't safely close pages / contexts while tools are mid-await on
+    // them — the half-completed browser call would throw a confusing
+    // "Target closed" up the stack. We also have to wait for any
+    // withSession callers that have passed the disconnecting check but
+    // haven't yet bumped inFlight: closing under them would leave a
+    // suspended call holding a soon-to-be-dead session reference. Bound
+    // the wait so a hung page.goto can't wedge disconnect forever; after
+    // the deadline, proceed with teardown anyway.
     const drainDeadline = Date.now() + DISCONNECT_DRAIN_DEADLINE_MS;
     while (Date.now() < drainDeadline) {
       let pending = 0;
       for (const session of sessions.values()) pending += session.inFlight;
-      if (pending === 0) break;
+      if (pending === 0 && pendingAdmissions === 0) break;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
 

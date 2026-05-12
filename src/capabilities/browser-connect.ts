@@ -234,6 +234,14 @@ interface ConnectInput {
 // mirrors `pendingBrowser` in src/tools/browser.ts.
 let pendingConnect: Promise<Status> | null = null;
 
+// Same idea, but for /api/browser/disconnect. Without this, a second
+// concurrent caller reads still-set state, calls disconnectSharedBrowser
+// (which early-returns because the first caller already flipped its
+// teardown flag), then proceeds to killManagedChrome before the first
+// drain finishes. Folding both calls into the same promise keeps the
+// teardown sequence atomic from the caller's perspective.
+let pendingDisconnect: Promise<Status> | null = null;
+
 // Idempotent connect. Mode is decided by whether the caller supplied a
 // cdpUrl. We re-probe an existing record before returning it so a crashed
 // Chrome doesn't appear as still-connected.
@@ -281,16 +289,28 @@ async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): 
       }
     }
     // The previous endpoint is dead (or the caller asked for a different
-    // one) — clear it and fall through to a fresh launch using whatever
-    // the caller asked for. We deliberately don't try to SIGTERM the
-    // recorded pid here: the process is already gone (probe failed) and
-    // we don't want to race a stale pid that's been recycled by the OS
-    // to some unrelated process.
-    await mutateState(config.instance, (state) => {
-      state.browser = null;
-    });
+    // one) — tear it down fully before falling through to a fresh launch.
+    // For a same-endpoint stale record we only need to clear state (the
+    // probe just showed the remote is gone). For a mismatched endpoint
+    // (caller asked for a *different* port / URL) we must also try to
+    // SIGTERM the recorded managed pid: otherwise the old Chrome stays
+    // alive but is no longer addressable through state, leaking until
+    // the user notices.
+    if (!targetsSameEndpoint) {
+      await tearDownExistingConnection(config, existing);
+    } else {
+      await mutateState(config.instance, (state) => {
+        state.browser = null;
+      });
+    }
   }
 
+  // If the fresh connect below throws, state was already cleared above
+  // (either by tearDownExistingConnection on the mismatch path or the
+  // mutateState block on the same-endpoint dead path), so the user is
+  // left in a clean disconnected state rather than half-leaked. The
+  // thrown error propagates up to the HTTP handler, which maps it to the
+  // appropriate status code.
   const result =
     typeof input.cdpUrl === "string" && input.cdpUrl.length > 0
       ? await connectExisting(config, input.cdpUrl)
@@ -304,6 +324,28 @@ async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): 
   await disconnectSharedBrowser();
 
   return result;
+}
+
+// Full teardown of an existing connection record. Sends SIGTERM to the
+// recorded managed Chrome (if any), drops the in-process Playwright handle,
+// and clears state — same sequence disconnectBrowser uses. Pulled out so
+// the mismatch-reconnect path in connectBrowserInner can reuse it without
+// re-entering disconnectBrowser (which would be coalesced through
+// pendingDisconnect from a different call site).
+async function tearDownExistingConnection(
+  config: RuntimeConfig,
+  existing: BrowserConnectionRecord
+): Promise<void> {
+  // Clear state FIRST so any concurrent ensureBrowser() callers that
+  // re-enter during teardown see fresh state and don't reattach to the
+  // soon-to-be-dead endpoint.
+  await mutateState(config.instance, (state) => {
+    state.browser = null;
+  });
+  await disconnectSharedBrowser();
+  if (existing.mode === "managed" && existing.pid !== null) {
+    await killManagedChrome(existing.pid, existing.chromePath, existing.dataDir);
+  }
 }
 
 // Compare the caller's requested endpoint against the existing record.
@@ -393,6 +435,7 @@ async function launchManaged(config: RuntimeConfig, port: number): Promise<Statu
   // proxy, anything that answers /json/version) and we'd happily store a
   // pid pointing at our zombie alongside a cdpUrl pointing at the
   // unrelated server.
+  // Residual race: another process can claim this port between the check and spawn. The post-probe child-alive verification mitigates the impact.
   await ensurePortAvailable(port);
 
   const dataDir = profileDirFor(config);
@@ -466,7 +509,17 @@ async function launchManaged(config: RuntimeConfig, port: number): Promise<Statu
   return { connected: true, record };
 }
 
-export async function disconnectBrowser(config: RuntimeConfig): Promise<Status> {
+export function disconnectBrowser(config: RuntimeConfig): Promise<Status> {
+  if (pendingDisconnect) return pendingDisconnect;
+  pendingDisconnect = (async () => {
+    return await disconnectBrowserInner(config);
+  })().finally(() => {
+    pendingDisconnect = null;
+  });
+  return pendingDisconnect;
+}
+
+async function disconnectBrowserInner(config: RuntimeConfig): Promise<Status> {
   const existing = readState(config.instance).browser ?? null;
   if (!existing) return { connected: false };
 
@@ -496,7 +549,25 @@ export async function disconnectBrowser(config: RuntimeConfig): Promise<Status> 
   return { connected: false };
 }
 
-async function killManagedChrome(
+// Wrapper indirection so tests can swap in a spy via
+// __test.setKillManagedChromeForTest without spawning a real Chrome.
+// Both connectBrowserInner's mismatch path and disconnectBrowserInner
+// funnel through here so a single override covers every call site.
+function killManagedChrome(
+  pid: number,
+  expectedChromePath: string | null,
+  expectedDataDir: string | null
+): Promise<void> {
+  return killManagedChromeImpl(pid, expectedChromePath, expectedDataDir);
+}
+
+let killManagedChromeImpl: (
+  pid: number,
+  expectedChromePath: string | null,
+  expectedDataDir: string | null
+) => Promise<void> = killManagedChromeReal;
+
+async function killManagedChromeReal(
   pid: number,
   expectedChromePath: string | null,
   expectedDataDir: string | null
@@ -562,5 +633,15 @@ export const __test = {
     mkdirSync(dir, { recursive: true });
     return dir;
   },
-  exists: existsSync
+  exists: existsSync,
+  // Swap in a mocked kill so the mismatch-reconnect and re-entrant
+  // disconnect tests can assert call counts without spawning Chrome.
+  setKillManagedChromeForTest(
+    impl: (pid: number, chromePath: string | null, dataDir: string | null) => Promise<void>
+  ): void {
+    killManagedChromeImpl = impl;
+  },
+  restoreKillManagedChromeForTest(): void {
+    killManagedChromeImpl = killManagedChromeReal;
+  }
 };

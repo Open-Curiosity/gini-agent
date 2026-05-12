@@ -233,8 +233,9 @@ export function useRenameChatSession() {
 
 // Browser-connect status. Shape mirrors the gateway response from
 // /api/browser: { connected: boolean, record?: BrowserConnectionRecord }.
-// Polled every 3s so the status card reflects an external `gini browser
-// connect/disconnect` without a manual refresh.
+// Polled every 5s when idle, and every 1s while a connect/disconnect
+// mutation is in flight, so the status card reflects an external `gini
+// browser connect/disconnect` without a manual refresh.
 export interface BrowserConnectionStatus {
   connected: boolean;
   record?: BrowserConnectionRecord;

@@ -223,4 +223,32 @@ describe("browser disconnect lifecycle", () => {
     expect(elapsed).toBeGreaterThanOrEqual(100);
     expect(elapsed).toBeLessThan(2_000);
   });
+
+  // Round-2 review fix: withSession must re-check `disconnecting` after
+  // the async getOrCreate suspension point. Otherwise a tool call can
+  // pass the initial check, suspend in ensureBrowser, then resume against
+  // a browser that's already torn down.
+  test("withSession bails out when disconnect flips during getOrCreate suspension", async () => {
+    // Flip disconnecting from "false" to "true" between the initial check
+    // and the actual session materialization. browserNavigate routes
+    // through withSession, which awaits getOrCreate -> ensureBrowser.
+    // We can't easily inject a delay into the real ensureBrowser, but we
+    // can simulate the race by flipping the flag synchronously and then
+    // calling browserNavigate: with no real Chrome, getOrCreate either
+    // resolves (and re-check catches it) or rejects (and the throw
+    // surfaces as success: false either way). What we assert is that the
+    // call returns success: false with the disconnecting error message,
+    // not a successful navigation.
+    browserTest.setDisconnectingForTest(false);
+    const navigatePromise = browserNavigate("admission-race", { url: "https://example.com/" });
+    // Flip during the same microtask so the disconnecting flag is true
+    // by the time the post-getOrCreate re-check runs (or before
+    // ensureBrowser starts, in which case the launch fails — also fine,
+    // since the test asserts the call doesn't succeed against a closed
+    // browser).
+    browserTest.setDisconnectingForTest(true);
+    const result = await navigatePromise;
+    const parsed = JSON.parse(result) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+  });
 });

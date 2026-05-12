@@ -307,3 +307,87 @@ describe("browser-connect round-1 hardening", () => {
     }
   });
 });
+
+describe("browser-connect round-2 hardening", () => {
+  test("mismatch-reconnect tears down the old managed record before fresh attempt", async () => {
+    const config = testConfig("mismatch-teardown");
+    const { mutateState } = await import("../state");
+    // Seed a managed record on port 9222 with a fake pid. The caller will
+    // request a different cdpUrl; the mismatch path must run the full
+    // teardown — including killManagedChrome — before attempting the
+    // fresh launch. Use a cdpUrl that we know will fail to probe (port 1
+    // is reserved and refused everywhere) so the test is independent of
+    // whether the host machine has Chrome installed.
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "managed",
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/OLD",
+        pid: 424242,
+        dataDir: "/tmp/never-was-real",
+        chromePath: "/never/was/real/chrome",
+        startedAt: new Date().toISOString()
+      };
+    });
+
+    let killCalled = false;
+    const killCalls: Array<{ pid: number; chromePath: string | null; dataDir: string | null }> = [];
+    __test.setKillManagedChromeForTest(async (pid, chromePath, dataDir) => {
+      killCalled = true;
+      killCalls.push({ pid, chromePath, dataDir });
+    });
+    try {
+      // Ask for a different cdpUrl (different host). The fresh connect
+      // will fail (unreachable port), but the assertion is about the
+      // *teardown order*: killManagedChrome must have been called BEFORE
+      // the launch attempt resolved/rejected, and state must be cleared
+      // on failure.
+      await expect(
+        connectBrowser(config, { cdpUrl: "ws://127.0.0.1:1/devtools/browser/NEW" })
+      ).rejects.toThrow();
+      expect(killCalled).toBe(true);
+      expect(killCalls.length).toBe(1);
+      expect(killCalls[0]!.pid).toBe(424242);
+      expect(killCalls[0]!.dataDir).toBe("/tmp/never-was-real");
+      // State should be cleared (the user is in a clean disconnected
+      // state instead of half-leaked).
+      const persisted = readState(config.instance).browser;
+      expect(persisted ?? null).toBeNull();
+    } finally {
+      __test.restoreKillManagedChromeForTest();
+    }
+  }, 30_000);
+
+  test("concurrent disconnect calls run a single teardown sequence", async () => {
+    const config = testConfig("disconnect-coalesced");
+    const { mutateState } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "managed",
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/ONE",
+        pid: 111111,
+        dataDir: "/tmp/coalesced-data-dir",
+        chromePath: "/never/real/chrome",
+        startedAt: new Date().toISOString()
+      };
+    });
+    let killCount = 0;
+    __test.setKillManagedChromeForTest(async () => {
+      killCount++;
+      // Simulate a kill that takes a moment so concurrent callers really
+      // do overlap. Without pendingDisconnect, the second caller's
+      // killManagedChrome would run before the first's resolves.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    try {
+      const [a, b] = await Promise.all([
+        disconnectBrowser(config),
+        disconnectBrowser(config)
+      ]);
+      expect(a.connected).toBe(false);
+      expect(b.connected).toBe(false);
+      expect(killCount).toBe(1);
+    } finally {
+      __test.restoreKillManagedChromeForTest();
+    }
+  });
+});
