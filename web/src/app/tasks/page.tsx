@@ -6,12 +6,13 @@ import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { api } from "@/lib/api";
-import { useChatSessions, useInvalidate, useState_, useTask, useTasks } from "@/lib/queries";
+import { useChatSessions, useInvalidate, useState_, useStatus, useTask, useTasks } from "@/lib/queries";
 import type { Task, TraceRecord } from "@runtime/types";
 import type { ChatSession } from "@/lib/view-types";
 import { SubmitForm } from "./_components/SubmitForm";
 import { TaskList, type TaskFilter } from "./_components/TaskList";
 import { TaskDetail } from "./_components/TaskDetail";
+import { FleetDashboard } from "./_components/FleetDashboard";
 
 const FILTERS: readonly TaskFilter[] = [
   { key: "active", label: "Active", match: (t: Task) => ["queued", "running", "waiting_approval"].includes(t.status) },
@@ -34,6 +35,10 @@ export default function TasksPage() {
   const tasks = useTasks();
   const detail = useTask(selected);
   const invalidate = useInvalidate();
+  // The fleet dashboard reads runtime-aggregated taskCounts from /status
+  // (RuntimeStatus) — useState_() returns RuntimeStateSnapshot, which does
+  // not carry counts. The sparklines aggregate from the polled task list.
+  const status = useStatus();
 
   useEffect(() => {
     if (initial && initial !== selected) {
@@ -66,6 +71,14 @@ export default function TasksPage() {
   return (
     <>
       <PageHeader title="Tasks" description="Submit, monitor, and inspect tasks" />
+      <div className="px-4 pt-4 md:px-6 md:pt-6">
+        <FleetDashboard
+          tasks={tasks.data ?? []}
+          status={status.data}
+          isPending={tasks.isPending}
+          isError={tasks.isError}
+        />
+      </div>
       <div className="flex flex-1 flex-col gap-4 overflow-hidden p-4 md:flex-row md:p-6">
         <div className="flex w-full shrink-0 flex-col gap-4 md:w-[420px]">
           <SubmitForm

@@ -7,9 +7,10 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { StatusPill } from "@/components/StatusPill";
-import type { Task, TraceRecord } from "@runtime/types";
+import type { CostRecord, Task, TraceRecord } from "@runtime/types";
 import type { ChatSession } from "@/lib/view-types";
 import { TaskTimeline, traceTarget } from "./TaskTimeline";
+import { formatDuration, isLive, useNow } from "./observability";
 
 export function TaskDetail({
   data,
@@ -60,6 +61,7 @@ export function TaskDetail({
           <TabsContent value="overview" className="flex-1 overflow-hidden">
             <ScrollArea className="h-full pr-3">
               <div className="space-y-4 pb-6">
+                <DurationBlock task={task} />
                 <div className="grid gap-2 text-xs sm:grid-cols-2">
                   <Field label="Status" value={task.status} mono />
                   <Field label="Instance" value={task.instance} mono />
@@ -85,21 +87,24 @@ export function TaskDetail({
                 ) : null}
                 {task.cost ? (
                   <Section title="Cost">
-                    <div className="grid gap-2 text-xs sm:grid-cols-2">
-                      <Field label="Provider" value={task.cost.provider} mono />
-                      <Field label="Model" value={task.cost.model} mono />
-                      {typeof task.cost.inputTokens === "number" ? (
-                        <Field label="Input tokens" value={task.cost.inputTokens.toLocaleString()} mono />
-                      ) : null}
-                      {typeof task.cost.outputTokens === "number" ? (
-                        <Field label="Output tokens" value={task.cost.outputTokens.toLocaleString()} mono />
-                      ) : null}
-                      {typeof task.cost.totalTokens === "number" ? (
-                        <Field label="Total tokens" value={task.cost.totalTokens.toLocaleString()} mono />
-                      ) : null}
-                      {typeof task.cost.estimatedUsd === "number" ? (
-                        <Field label="Estimated USD" value={`$${task.cost.estimatedUsd.toFixed(4)}`} mono />
-                      ) : null}
+                    <div className="space-y-3">
+                      <TokenBar cost={task.cost} />
+                      <div className="grid gap-2 text-xs sm:grid-cols-2">
+                        <Field label="Provider" value={task.cost.provider} mono />
+                        <Field label="Model" value={task.cost.model} mono />
+                        {typeof task.cost.inputTokens === "number" ? (
+                          <Field label="Input tokens" value={task.cost.inputTokens.toLocaleString()} mono />
+                        ) : null}
+                        {typeof task.cost.outputTokens === "number" ? (
+                          <Field label="Output tokens" value={task.cost.outputTokens.toLocaleString()} mono />
+                        ) : null}
+                        {typeof task.cost.totalTokens === "number" ? (
+                          <Field label="Total tokens" value={task.cost.totalTokens.toLocaleString()} mono />
+                        ) : null}
+                        {typeof task.cost.estimatedUsd === "number" ? (
+                          <Field label="Estimated USD" value={`$${task.cost.estimatedUsd.toFixed(4)}`} mono />
+                        ) : null}
+                      </div>
                     </div>
                   </Section>
                 ) : null}
@@ -264,6 +269,73 @@ function extractFilesChanged(trace: TraceRecord[]): Array<{ path: string; kind: 
     out.push({ path, kind });
   }
   return out;
+}
+
+function DurationBlock({ task }: { task: Task }) {
+  // Tick once per second only while the task is live; for terminal tasks the
+  // duration is frozen at (updatedAt - createdAt), no interval needed.
+  const live = isLive(task.status);
+  const now = useNow(live, 1000);
+  const start = new Date(task.createdAt).getTime();
+  const endRef = live ? now : new Date(task.updatedAt).getTime();
+  const ms = Math.max(0, endRef - start);
+  return (
+    <div className="rounded-md border border-border bg-card/50 px-3 py-2">
+      <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Duration</p>
+      <p className="font-mono text-2xl tabular-nums">{formatDuration(ms)}</p>
+      <p className="text-[10px] text-muted-foreground">
+        {live ? "Running — counter updates every second." : "Frozen at task completion."}
+      </p>
+    </div>
+  );
+}
+
+function TokenBar({ cost }: { cost: CostRecord }) {
+  // We need both input and output token counts to render the split bar. If
+  // only one side is known we skip the viz rather than fabricate a 100/0
+  // split — the numeric grid below still shows whatever fields exist.
+  const input = typeof cost.inputTokens === "number" ? cost.inputTokens : null;
+  const output = typeof cost.outputTokens === "number" ? cost.outputTokens : null;
+  if (input === null || output === null) return null;
+  const total = input + output;
+  if (total === 0) return null;
+  const inputPct = (input / total) * 100;
+  const outputPct = 100 - inputPct;
+  return (
+    <div>
+      <div className="mb-1 flex items-baseline justify-between text-[10px] uppercase tracking-wide text-muted-foreground">
+        <span>Tokens</span>
+        <span className="font-mono tabular-nums normal-case tracking-normal text-foreground">
+          {total.toLocaleString()} total
+          {typeof cost.estimatedUsd === "number" ? (
+            <span className="ml-2 text-muted-foreground">${cost.estimatedUsd.toFixed(4)}</span>
+          ) : null}
+        </span>
+      </div>
+      <div className="flex h-2 w-full overflow-hidden rounded-full border border-border bg-muted">
+        <span
+          className="block h-full bg-blue-500/70 transition-all duration-300"
+          style={{ width: `${inputPct}%` }}
+          aria-label={`Input tokens ${input}`}
+        />
+        <span
+          className="block h-full bg-emerald-500/70 transition-all duration-300"
+          style={{ width: `${outputPct}%` }}
+          aria-label={`Output tokens ${output}`}
+        />
+      </div>
+      <div className="mt-1 flex justify-between text-[10px] text-muted-foreground">
+        <span>
+          <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-blue-500/70 align-middle" />
+          Input · {input.toLocaleString()} ({inputPct.toFixed(0)}%)
+        </span>
+        <span>
+          <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-emerald-500/70 align-middle" />
+          Output · {output.toLocaleString()} ({outputPct.toFixed(0)}%)
+        </span>
+      </div>
+    </div>
+  );
 }
 
 function extractToolsUsed(trace: TraceRecord[]): Array<{ id: string; message: string; target: string | null }> {
