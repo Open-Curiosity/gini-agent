@@ -41,6 +41,17 @@ import { syncSubagentFromTask } from "./capabilities/subagents";
 // jobId settles. Idempotent — safe to call from runTask, failTask, and
 // cancelTask without de-duping.
 import { finalizeJobRunFromTask } from "./jobs/finalize";
+import {
+  matchesShape,
+  shapeCode,
+  shapeFind,
+  shapeList,
+  shapePatch,
+  shapeRead,
+  shapeShell,
+  shapeWeb,
+  shapeWrite
+} from "./dispatch-shape";
 
 export interface SubmitTaskOptions {
   jobId?: string;
@@ -216,21 +227,34 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   await Bun.sleep(10);
   const lower = task.input.toLowerCase();
 
-  // Dispatch by input prefix. Each tool returns the resulting Task; high-risk
-  // tools may have transitioned the task into waiting_approval. We flip
-  // currentStep to "Working" *before* dispatching so the chat UI can
-  // distinguish text-generation ("Thinking") from tool execution ("Working").
-  // Approval-gated tools will overwrite to "Waiting for approval" inside the
-  // tool itself; synchronous tools (read/list/find/web) keep "Working" until
-  // completion.
-  if (lower.startsWith("write ")) { await markWorking(config, taskId); return finishTaskTransition(config, await requestFileWrite(config, task)); }
-  if (lower.startsWith("patch ")) { await markWorking(config, taskId); return finishTaskTransition(config, await requestFilePatch(config, task)); }
-  if (lower.startsWith("read ")) { await markWorking(config, taskId); return finishTaskTransition(config, await readFile(config, task)); }
-  if (lower.startsWith("list ")) { await markWorking(config, taskId); return finishTaskTransition(config, await listFiles(config, task)); }
-  if (lower.startsWith("find ")) { await markWorking(config, taskId); return finishTaskTransition(config, await searchFiles(config, task)); }
-  if (lower.startsWith("web ")) { await markWorking(config, taskId); return finishTaskTransition(config, await fetchWeb(config, task)); }
-  if (lower.startsWith("code ")) { await markWorking(config, taskId); return finishTaskTransition(config, await requestCodeExecution(config, task)); }
-  if (lower.startsWith("shell ")) { await markWorking(config, taskId); return finishTaskTransition(config, await requestShell(config, task)); }
+  // Dispatch by input prefix *and* input shape. A bare prefix match would
+  // hijack natural-language prompts that happen to start with these English
+  // words ("Write a thorough plan...", "find me a restaurant"); each shape
+  // gate checks that the rest of the input matches the real tool syntax
+  // (write/patch require `::`, web requires `http(s)://`, find needs ` in `
+  // or glob chars, etc.) before claiming the dispatch. Anything that doesn't
+  // match falls through to the LLM. We flip currentStep to "Working" *before*
+  // dispatching so the chat UI can distinguish text-generation ("Thinking")
+  // from tool execution ("Working"). Approval-gated tools will overwrite to
+  // "Waiting for approval" inside the tool itself; synchronous tools
+  // (read/list/find/web) keep "Working" until completion.
+  const dispatch = [
+    { prefix: "write ", shape: shapeWrite, tool: requestFileWrite },
+    { prefix: "patch ", shape: shapePatch, tool: requestFilePatch },
+    { prefix: "read ", shape: shapeRead, tool: readFile },
+    { prefix: "list ", shape: shapeList, tool: listFiles },
+    { prefix: "find ", shape: shapeFind, tool: searchFiles },
+    { prefix: "web ", shape: shapeWeb, tool: fetchWeb },
+    { prefix: "code ", shape: shapeCode, tool: requestCodeExecution },
+    { prefix: "shell ", shape: shapeShell, tool: requestShell }
+  ] as const;
+
+  for (const { prefix, shape, tool } of dispatch) {
+    if (matchesShape(task.input, prefix, shape)) {
+      await markWorking(config, taskId);
+      return finishTaskTransition(config, await tool(config, task));
+    }
+  }
 
   // No tool matched: fall through to provider summarization.
   const activeMemory = await mutateState(config.instance, (state) => state.memories.filter((memory) => memory.status === "active"));
@@ -367,8 +391,13 @@ function shouldAutoRetain(task: Task): boolean {
   // non-factual inputs ("hi", "ok", "yes") at the cost of one structured-LLM
   // call. We accept that cost so short personal-fact disclosures ("my name is
   // shelden", "I prefer dark mode") aren't filtered out by a length heuristic.
-  const lower = task.input.toLowerCase();
-  if (lower.startsWith("read ") || lower.startsWith("list ") || lower.startsWith("find ")) return false;
+  //
+  // We apply the same shape gates as the dispatcher so natural-language
+  // prompts ("read this paper carefully", "find me a restaurant") still get
+  // auto-retained even though they share an English prefix with a tool.
+  if (matchesShape(task.input, "read ", shapeRead)) return false;
+  if (matchesShape(task.input, "list ", shapeList)) return false;
+  if (matchesShape(task.input, "find ", shapeFind)) return false;
   return true;
 }
 
