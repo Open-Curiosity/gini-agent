@@ -10,7 +10,7 @@ One-line install:
 curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
 ```
 
-The installer detects OS and arch, installs Bun if missing, clones the runtime into `~/.gini/runtime`, installs dependencies, drops a `gini` wrapper at `~/.local/bin/gini`, ensures `~/.local/bin` is on `PATH`, and initializes the `home` instance under `~/.gini/instances/home/`. The wrapper pins `GINI_INSTANCE=home` so installed users land on `home` while repo-clone developers stay on `dev`.
+The installer detects OS and arch, installs Bun if missing, clones the runtime into `~/.gini/runtime`, installs dependencies, drops a `gini` wrapper at `~/.local/bin/gini`, ensures `~/.local/bin` is on `PATH`, and initializes the `home` instance under `~/.gini/instances/home/`. The wrapper defaults `GINI_INSTANCE=home` (override via `--instance` or the `GINI_INSTANCE` env var) so installed users land on `home` while repo-clone developers stay on `dev`.
 
 From source (for developers):
 
