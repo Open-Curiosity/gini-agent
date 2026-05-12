@@ -1,22 +1,38 @@
 // Browser automation tools. Drives Chromium via playwright-core in one of
-// three modes:
+// two modes:
 //
-//   - "headless" (default): chromium.launch({ headless: true }) — one Browser
-//     shared across tasks, each task gets its own newContext() for isolation.
-//   - "managed": chromium.launchPersistentContext(dataDir, { headless: false })
-//     — visible Chrome window with a persistent profile. The BrowserContext
-//     IS the unit of sharing; every task lives inside the same context so the
-//     user's signed-in cookies are visible across calls.
-//   - "cdp": chromium.connectOverCDP(url) — attach to an external Chrome the
-//     user started. We reuse browser.contexts()[0] for the same reason.
+//   - "persistent" (default): chromium.launchPersistentContext(dataDir, {
+//     headless }) — one BrowserContext backed by the per-instance profile
+//     directory at ~/.gini/instances/<inst>/chrome-profile/. Used for BOTH
+//     the headless default (no state.browser record) and the visible window
+//     (state.browser.mode === "managed") — the only difference is the
+//     `headless` flag at launch. Sign-ins land on disk under the profile dir
+//     and persist across Connect/Disconnect cycles and across runtime
+//     restarts. All tasks share the single context (cookies bleed across
+//     tasks within an instance, per the explicit product decision).
+//   - "cdp": chromium.connectOverCDP(url) — attach to an external Chrome
+//     the user started themselves. We reuse browser.contexts()[0] for the
+//     same shared-cookie reason.
 //
-// Mode is decided by state.browser (set via /api/browser/connect). Tasks are
-// keyed by taskId and idle-swept after 5 minutes. Side-effecting actions
-// (click/type) skip the approval gate; the snapshot itself is the trace
-// evidence.
+// "Connect" and "Disconnect" are visibility toggles. They tear down the
+// current shared handle so the next call relaunches with the right
+// `headless` flag against the same profile dir.
+//
+// Tasks are keyed by taskId and idle-swept after 5 minutes. Side-effecting
+// actions (click/type) skip the approval gate; the snapshot itself is the
+// trace evidence.
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
+import { join } from "node:path";
+import { instanceRoot } from "../paths";
 import { readState } from "../state";
 import type { BrowserConnectionRecord, Instance } from "../types";
+
+// Per-instance Chrome profile directory. The agent persists ALL sign-ins
+// and cookies here; the directory survives Connect/Disconnect cycles and
+// runtime restarts. Wiped only by the explicit wipe-profile action.
+export function chromeProfileDirFor(instance: Instance): string {
+  return join(instanceRoot(instance), "chrome-profile");
+}
 
 const SNAPSHOT_CHAR_BUDGET = 32_000;
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -31,22 +47,21 @@ interface Session {
   // invocation so the idle sweeper can skip sessions that are mid-call
   // (e.g. a slow page.goto exceeding the 5-minute idle window).
   inFlight: number;
-  // True when we created the BrowserContext ourselves (headless launch
-  // path). False when we reused a shared context (managed/cdp) —
-  // closeSession() then closes only the page so we don't kill the user's
-  // tabs or terminate their Chrome.
+  // We never own the BrowserContext anymore — the persistent and CDP modes
+  // both share a single BrowserContext across tasks. closeSession() closes
+  // just the page so we don't kill the user's tabs or the shared context.
+  // The field is retained to keep the test helpers stable; it's always
+  // false in production code paths.
   ownsContext: boolean;
 }
 
 // Discriminated union describing the currently-installed shared handle.
-// Headless mode owns a Browser and per-task contexts; managed/cdp share a
-// single BrowserContext across tasks (each task gets its own page). The
-// shape differs enough that a single nullable Browser plus an isCdp flag
-// (the previous design) made every close path branch awkwardly — the
-// tagged union keeps the mode-specific cleanup local to each arm.
+// Persistent mode is used for BOTH the headless default and the visible
+// window — the only difference is whether `headed` is true. CDP attach
+// keeps its own variant because it carries a Browser handle (returned by
+// connectOverCDP) alongside the borrowed context.
 type SharedHandle =
-  | { kind: "headless"; browser: Browser }
-  | { kind: "managed"; context: BrowserContext }
+  | { kind: "persistent"; context: BrowserContext; headed: boolean }
   | { kind: "cdp"; browser: Browser; context: BrowserContext };
 
 let shared: SharedHandle | null = null;
@@ -132,25 +147,28 @@ function activeBrowserRecord(): BrowserConnectionRecord | undefined {
 // chain starts so two concurrent cold-start callers see the same decision;
 // if the record changes mid-launch the result is a stale handle, but the
 // disconnect-generation re-check below catches that and forces a retry.
-type Mode = "headless" | "managed" | "cdp";
+type Mode = "persistent" | "cdp";
 
 function modeFromRecord(record: BrowserConnectionRecord | undefined): Mode {
-  if (!record) return "headless";
-  return record.mode === "managed" ? "managed" : "cdp";
+  // Both "no record" (headless persistent) and "managed" (visible
+  // persistent) take the persistent branch; only an explicit cdp record
+  // diverges. The headed/headless distinction is decided inside
+  // ensureShared from the record's mode.
+  if (!record) return "persistent";
+  return record.mode === "managed" ? "persistent" : "cdp";
 }
 
 // Cheap "is this handle still alive?" probe used to short-circuit
-// ensureShared when the previously-installed handle survives. For headless
-// and cdp we ask the Browser; for managed we ask the BrowserContext (its
+// ensureShared when the previously-installed handle survives. For cdp we
+// ask the Browser; for persistent we ask the BrowserContext (its
 // underlying Browser may not always be exposed publicly across Playwright
 // versions, but `pages()` throws after close, so a try/catch covers it).
 function isHandleAlive(handle: SharedHandle): boolean {
   try {
     switch (handle.kind) {
-      case "headless":
       case "cdp":
         return handle.browser.isConnected();
-      case "managed":
+      case "persistent":
         // Touch a cheap property — if the context was closed the
         // underlying Playwright object throws on access.
         handle.context.pages();
@@ -166,6 +184,10 @@ async function ensureShared(): Promise<SharedHandle> {
   if (pendingShared) return pendingShared;
   const record = activeBrowserRecord();
   const mode: Mode = modeFromRecord(record);
+  // headed is the only difference between "no record" (default agent
+  // tooling) and "managed" (user clicked Connect). Same profile dir is
+  // used in both, so signed-in cookies survive the toggle.
+  const headed: boolean = record?.mode === "managed";
   // Capture the current disconnect generation at the START of the launch.
   // If a disconnect bumps the counter while chromium.launch /
   // launchPersistentContext / connectOverCDP is in flight, we don't want
@@ -179,33 +201,46 @@ async function ensureShared(): Promise<SharedHandle> {
   pendingShared = (async () => {
     const chromium = await loadChromium();
     let built: SharedHandle;
-    if (mode === "managed") {
-      if (!record?.dataDir) {
+    if (mode === "persistent") {
+      // Persistent mode is used for BOTH the headless default and the
+      // visible "managed" connect. The profile dir is per-instance, so
+      // sign-ins stored during a headed session remain available the next
+      // time the agent relaunches headless against the same dir.
+      //
+      // Determine the data dir:
+      //   - When a managed record exists and supplies dataDir, prefer that
+      //     (covers explicit Connect flows that already materialized a
+      //     specific dir).
+      //   - Otherwise, derive from the active instance — this is the
+      //     normal path the agent takes when no Connect record exists.
+      //   - If no instance has been registered (raw test imports), refuse
+      //     to launch. Tests should install a fake handle via the __test
+      //     helpers; production callers always set the instance via
+      //     setBrowserInstance() during server boot.
+      let dataDir: string | undefined;
+      if (record?.dataDir) {
+        dataDir = record.dataDir;
+      } else if (runtimeInstance) {
+        dataDir = chromeProfileDirFor(runtimeInstance);
+      }
+      if (!dataDir) {
         throw new Error(
-          "Managed browser connection record is missing dataDir; reconnect via /api/browser/connect."
+          "No instance registered for the browser session manager; call setBrowserInstance() before triggering a browser tool."
         );
       }
-      // launchPersistentContext is the right primitive for visible-Chrome
-      // mode: it spawns Chromium, opens a BrowserContext backed by the
-      // given profile directory, and returns that context directly. No
-      // separate CDP attach, no protocol-version mismatch surface. The
-      // BrowserContext is the unit of sharing — all tasks live inside it
-      // so they all see the same cookies.
-      const context = await chromium.launchPersistentContext(record.dataDir, {
-        headless: false,
-        // executablePath only when the discovery override picked a
-        // specific binary; otherwise let Playwright default to its bundled
-        // Chromium (which is exactly what we want for CDP-compat — same
-        // build under the same playwright-core).
-        executablePath: record.chromePath ?? undefined,
+      const chromePath = record?.chromePath ?? undefined;
+      const context = await chromium.launchPersistentContext(dataDir, {
+        headless: !headed,
+        executablePath: chromePath,
         args: [
           "--no-first-run",
           "--no-default-browser-check",
           "--disable-features=ChromeWhatsNewUI,Translate"
         ]
       });
-      built = { kind: "managed", context };
-    } else if (mode === "cdp") {
+      built = { kind: "persistent", context, headed };
+    } else {
+      // cdp
       if (!record?.cdpUrl) {
         throw new Error(
           "CDP browser connection record is missing cdpUrl; reconnect via /api/browser/connect."
@@ -215,9 +250,8 @@ async function ensureShared(): Promise<SharedHandle> {
       // process. The remote Chrome's default BrowserContext shows up
       // under browser.contexts() — we reuse it so signed-in cookies are
       // visible. Note: CDP attach is known-flaky under playwright-core
-      // 1.60 + Bun (see launchManaged for the historical context); we
-      // keep it for users who explicitly attach to their own Chrome but
-      // warn them in the UI.
+      // 1.60 + Bun; we keep it for users who explicitly attach to their
+      // own Chrome but warn them in the UI.
       let browser: Browser;
       try {
         browser = await chromium.connectOverCDP(record.cdpUrl, { timeout: 60_000 });
@@ -235,9 +269,6 @@ async function ensureShared(): Promise<SharedHandle> {
       }
       const ctx = browser.contexts()[0] ?? (await browser.newContext());
       built = { kind: "cdp", browser, context: ctx };
-    } else {
-      const browser = await chromium.launch({ headless: true });
-      built = { kind: "headless", browser };
     }
     if (disconnectGeneration !== launchGeneration) {
       // Disconnect bumped the generation while we were launching. Clean
@@ -276,15 +307,12 @@ async function ensureShared(): Promise<SharedHandle> {
             "Disconnect and reconnect via /api/browser/connect, or start a fresh Chrome session."
         );
       }
-      if (mode === "managed") {
-        throw new Error(
-          `Failed to launch managed Chrome: ${message}. ` +
-            "Confirm Chrome / Chromium is installed (or set GINI_CHROME_PATH) and retry."
-        );
-      }
+      // persistent (headless default or managed visible window)
       throw new Error(
         `Failed to launch Chromium: ${message}. ` +
-          "Run `bunx playwright install chromium` to install the browser."
+          (headed
+            ? "Confirm Chrome / Chromium is installed (or set GINI_CHROME_PATH) and retry."
+            : "Run `bunx playwright install chromium` to install the browser.")
       );
     })
     .finally(() => {
@@ -293,35 +321,34 @@ async function ensureShared(): Promise<SharedHandle> {
   return pendingShared;
 }
 
-// Called by the browser-connect capability after it builds the
-// managed-mode BrowserContext via chromium.launchPersistentContext. We
+// Called by the browser-connect capability after it builds the visible
+// persistent BrowserContext via chromium.launchPersistentContext. We
 // install the context directly into the shared slot so the first browser_*
 // tool call doesn't have to re-launch Chrome (and so the user sees the
 // window open immediately at connect time). Any pre-existing shared handle
-// is torn down first to avoid leaking a previous Chromium process.
+// is torn down first to avoid leaking a previous Chromium process pointing
+// at the same profile dir (Chromium will lock the profile otherwise).
 export async function materializeManagedForConnect(context: BrowserContext): Promise<void> {
   if (shared) {
     await teardownHandle(shared).catch(() => undefined);
     shared = null;
   }
-  shared = { kind: "managed", context };
+  shared = { kind: "persistent", context, headed: true };
   registerExitHook();
   startSweeper();
 }
 
-// Mode-aware teardown of a SharedHandle. Managed: close the context (which
-// also terminates the Chrome process — desired, the user clicked
-// Disconnect). Headless: close the Browser. CDP: disconnect the Playwright
-// handle without closing the remote Chrome (close() over CDP would kill the
-// user's browser; falling back to close() when disconnect() is missing is
-// the lesser of two evils only if the user's process is acceptable
-// collateral — we deliberately leak the in-process handle instead).
+// Mode-aware teardown of a SharedHandle. Persistent: close the
+// BrowserContext, which also terminates the Chromium child Playwright
+// launched. The profile dir on disk stays put (sign-ins persist).
+// CDP: disconnect the Playwright handle without closing the remote Chrome
+// (close() over CDP would kill the user's browser; falling back to close()
+// when disconnect() is missing is the lesser of two evils only if the
+// user's process is acceptable collateral — we deliberately leak the
+// in-process handle instead).
 async function teardownHandle(handle: SharedHandle): Promise<void> {
   switch (handle.kind) {
-    case "headless":
-      await handle.browser.close().catch(() => undefined);
-      return;
-    case "managed":
+    case "persistent":
       await handle.context.close().catch(() => undefined);
       return;
     case "cdp": {
@@ -379,41 +406,21 @@ async function getOrCreate(taskId: string): Promise<Session> {
   if (inflight) return inflight;
   const promise = (async () => {
     const handle = await ensureShared();
-    // Per-mode page strategy:
-    //   - headless: a fresh BrowserContext per task for cookie isolation.
-    //   - managed: reuse the shared persistent context, take its first
-    //     page for the first task and newPage() for subsequent tasks.
-    //     All tasks see the same cookies.
-    //   - cdp: reuse the remote default context (set up by ensureShared).
-    let context: BrowserContext;
-    let weCreatedContext: boolean;
-    let page: Page;
-    if (handle.kind === "headless") {
-      context = await handle.browser.newContext();
-      weCreatedContext = true;
-      try {
-        page = await context.newPage();
-      } catch (error) {
-        // Avoid orphaning the fresh context if newPage throws.
-        await context.close().catch(() => undefined);
-        throw error;
-      }
-    } else {
-      context = handle.context;
-      weCreatedContext = false;
-      // Reuse an existing tab for the first session (managed launch opens
-      // about:blank by default). Subsequent sessions get their own tab so
-      // tasks don't trample each other's pages.
-      const reusable = sessions.size === 0 ? context.pages()[0] : undefined;
-      page = reusable ?? (await context.newPage());
-    }
+    // Both persistent and cdp share a single BrowserContext across tasks
+    // (cookies bleed by design — one profile per instance). The first task
+    // claims any existing page (e.g. the about:blank Playwright opens at
+    // launch); subsequent tasks each get a fresh tab so they don't trample
+    // each other.
+    const context = handle.context;
+    const reusable = sessions.size === 0 ? context.pages()[0] : undefined;
+    const page = reusable ?? (await context.newPage());
     const session: Session = {
       context,
       page,
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownsContext: weCreatedContext
+      ownsContext: false
     };
     sessions.set(taskId, session);
     // Attach console capture eagerly so page.goto errors before the
@@ -470,32 +477,19 @@ async function closeSession(taskId: string): Promise<void> {
   sessions.delete(taskId);
   consoleLogs.delete(taskId);
   try {
-    if (session.ownsContext) {
-      await session.context.close();
-    } else {
-      // Shared context (managed/cdp): close only the page. The user's
-      // existing tabs / Chrome process stay alive.
-      await session.page.close().catch(() => undefined);
-    }
+    // Shared context (persistent/cdp): close only the page. The user's
+    // window, tabs, and the agent's persistent profile stay alive — the
+    // next task lands in the same profile.
+    await session.page.close().catch(() => undefined);
   } catch {
     // Already closed or browser disconnected; nothing useful to do.
   }
-  // When the last session goes away, tear down the shared HEADLESS handle
-  // so we don't hold a Chromium process open between idle bursts. For
-  // managed/cdp the user owns the lifecycle — keep the handle and let
-  // explicit disconnect tear it down.
-  if (sessions.size === 0 && shared && shared.kind === "headless") {
-    try {
-      await shared.browser.close();
-    } catch {
-      // ignore
-    }
-    shared = null;
-    if (sweepTimer) {
-      clearInterval(sweepTimer);
-      sweepTimer = undefined;
-    }
-  }
+  // We deliberately do NOT tear down the shared handle when sessions hit
+  // zero. The persistent context is cheap to keep alive idle (Chromium
+  // sleeps when no pages are active) and re-launching it on the next
+  // tool call would be more disruptive than the idle process is.
+  // Explicit Connect/Disconnect and the wipe-profile action are the only
+  // paths that tear down the shared handle.
 }
 
 // Drop the in-process Playwright handle without killing the underlying
@@ -545,14 +539,9 @@ export async function disconnectSharedBrowser(): Promise<void> {
       sessions.delete(id);
       if (!session) continue;
       try {
-        // For sessions reusing a shared context (managed/cdp), close just
-        // the page so we don't close the user's tabs. For sessions that
-        // own their context (headless), close the context as usual.
-        if (session.ownsContext) {
-          await session.context.close().catch(() => undefined);
-        } else {
-          await session.page.close().catch(() => undefined);
-        }
+        // Persistent and cdp both share a single context — close just the
+        // page; teardownHandle below closes the context once.
+        await session.page.close().catch(() => undefined);
       } catch {
         // ignore
       }
@@ -578,11 +567,7 @@ export async function closeAll(): Promise<void> {
     sessions.delete(id);
     if (!session) continue;
     try {
-      if (session.ownsContext) {
-        await session.context.close();
-      } else {
-        await session.page.close().catch(() => undefined);
-      }
+      await session.page.close().catch(() => undefined);
     } catch {
       // ignore
     }
@@ -1188,16 +1173,19 @@ export const __test = {
     pendingShared = null;
   },
   // Install a fake shared handle so the close-path tests can assert
-  // disconnect()-vs-close() behavior without launching Chromium.
-  installFakeHeadlessBrowserForTest(
-    browser: Pick<Browser, "close"> & Partial<{ isConnected: () => boolean }>
-  ): void {
-    shared = { kind: "headless", browser: browser as Browser };
-  },
+  // teardown behavior without launching Chromium. The `headed` flag
+  // signals whether the test simulates the visible-window (managed) or
+  // the headless-default state — both go through the same persistent
+  // arm of teardownHandle, so the test impact is purely informational.
   installFakeManagedContextForTest(
     context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[] }>
   ): void {
-    shared = { kind: "managed", context: context as BrowserContext };
+    shared = { kind: "persistent", context: context as BrowserContext, headed: true };
+  },
+  installFakeHeadlessPersistentContextForTest(
+    context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[] }>
+  ): void {
+    shared = { kind: "persistent", context: context as BrowserContext, headed: false };
   },
   installFakeCdpBrowserForTest(
     browser: Pick<Browser, "close"> & Partial<{ disconnect: () => Promise<void>; isConnected: () => boolean }>,

@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { rmSync } from "node:fs";
-import { __test, connectBrowser, disconnectBrowser, getBrowserConnection } from "./browser-connect";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { __test, connectBrowser, disconnectBrowser, getBrowserConnection, wipeBrowserProfile } from "./browser-connect";
 import { readState } from "../state";
 import type { RuntimeConfig } from "../types";
 
@@ -589,6 +590,77 @@ describe("browser-connect managed launch via playwright", () => {
     expect(contextClosed).toBe(true);
     const persisted = readState(config.instance).browser;
     expect(persisted ?? null).toBeNull();
+    browserMod.__test.uninstallFakeBrowserForTest();
+  });
+});
+
+describe("wipeBrowserProfile", () => {
+  test("rejects with Invalid input prefix when a record is connected", async () => {
+    const config = testConfig("wipe-while-connected");
+    const { mutateState } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "managed",
+        cdpUrl: __test.MANAGED_CDP_SENTINEL,
+        pid: 1234,
+        dataDir: "/tmp/wipe-while-connected-fake",
+        chromePath: null,
+        startedAt: new Date().toISOString()
+      };
+    });
+    await expect(wipeBrowserProfile(config)).rejects.toThrow(/Invalid input/);
+    // Record is preserved — we did not tear anything down.
+    const persisted = readState(config.instance).browser;
+    expect(persisted?.pid).toBe(1234);
+  });
+
+  test("removes the profile dir when disconnected and emits an audit row", async () => {
+    const config = testConfig("wipe-success");
+    // Materialize a profile dir on disk with a file inside it so the
+    // test can prove the rm actually happened.
+    const dir = __test.profileDirFor(config);
+    mkdirSync(dir, { recursive: true });
+    const sentinel = join(dir, "Cookies");
+    writeFileSync(sentinel, "fake-cookie-data");
+    expect(existsSync(sentinel)).toBe(true);
+
+    const result = await wipeBrowserProfile(config);
+    expect(result.wiped).toBe(true);
+    expect(result.dataDir).toBe(dir);
+    expect(existsSync(dir)).toBe(false);
+
+    // Audit row recorded.
+    const state = readState(config.instance);
+    const wipes = state.audit.filter((row) => row.action === "browser.wipe-profile");
+    expect(wipes.length).toBe(1);
+    expect(wipes[0]!.target).toBe(dir);
+    expect(wipes[0]!.risk).toBe("medium");
+  });
+
+  test("succeeds when the profile dir does not exist", async () => {
+    const config = testConfig("wipe-noop");
+    // No mkdir — the dir doesn't exist. rm with force:true is a no-op.
+    const result = await wipeBrowserProfile(config);
+    expect(result.wiped).toBe(true);
+    expect(existsSync(result.dataDir)).toBe(false);
+  });
+
+  test("tears down any in-process headless persistent handle before rm", async () => {
+    const config = testConfig("wipe-tears-down");
+    const browserMod = await import("../tools/browser");
+    let contextCloseCalled = false;
+    // Install a fake HEADLESS persistent context (same arm the wipe path
+    // must take down before nuking the dir).
+    browserMod.__test.installFakeHeadlessPersistentContextForTest({
+      close: async () => {
+        contextCloseCalled = true;
+      }
+    });
+    const dir = __test.profileDirFor(config);
+    mkdirSync(dir, { recursive: true });
+    await wipeBrowserProfile(config);
+    expect(contextCloseCalled).toBe(true);
+    expect(existsSync(dir)).toBe(false);
     browserMod.__test.uninstallFakeBrowserForTest();
   });
 });

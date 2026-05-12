@@ -114,7 +114,10 @@ describe("browser session manager state lookup", () => {
   });
 });
 
-// Round-1 review fix: disconnect ordering, in-flight drain, CDP-safe close.
+// Persistent-profile pivot: SharedHandle collapsed to { persistent | cdp }.
+// "headless" no longer exists as a separate variant — both the default
+// headless agent path and the visible Connect window share one persistent
+// BrowserContext arm; only the `headed` flag at launch differs.
 describe("browser disconnect lifecycle", () => {
   afterEach(() => {
     // Clean up any synthetic state the previous test installed so
@@ -163,23 +166,28 @@ describe("browser disconnect lifecycle", () => {
     expect(closeCalled).toBe(false);
   });
 
-  test("disconnectSharedBrowser closes a headless browser", async () => {
-    let closeCalled = false;
-    browserTest.installFakeHeadlessBrowserForTest({
+  test("disconnectSharedBrowser closes the visible persistent context (terminating Chromium)", async () => {
+    // Visibility-toggle disconnect path: closing the BrowserContext is how
+    // we shut down the Chromium process Playwright launched. The same arm
+    // handles the next-call relaunch with `headless: true` against the
+    // same profile dir, so sign-ins persist.
+    let contextCloseCalled = false;
+    browserTest.installFakeManagedContextForTest({
       close: async () => {
-        closeCalled = true;
+        contextCloseCalled = true;
       }
     });
     await disconnectSharedBrowser();
-    expect(closeCalled).toBe(true);
+    expect(contextCloseCalled).toBe(true);
   });
 
-  test("disconnectSharedBrowser closes the managed context (which terminates Chromium)", async () => {
-    // New managed mode pivot: closing the BrowserContext is how we
-    // shut down the Chromium process Playwright launched. We assert
-    // that the install/teardown branch hits context.close().
+  test("disconnectSharedBrowser also closes the HEADLESS persistent context", async () => {
+    // Same teardown arm regardless of headed flag — when the user calls
+    // wipe-profile, the headless persistent context must come down too so
+    // the rm -rf isn't fighting an open Chromium handle. Tests the
+    // headed=false variant explicitly so we don't regress that branch.
     let contextCloseCalled = false;
-    browserTest.installFakeManagedContextForTest({
+    browserTest.installFakeHeadlessPersistentContextForTest({
       close: async () => {
         contextCloseCalled = true;
       }
@@ -201,7 +209,7 @@ describe("browser disconnect lifecycle", () => {
 
   test("disconnectSharedBrowser drains in-flight before tearing down", async () => {
     let closeCalled = false;
-    browserTest.installFakeHeadlessBrowserForTest({
+    browserTest.installFakeManagedContextForTest({
       close: async () => {
         closeCalled = true;
       }
@@ -235,29 +243,27 @@ describe("browser disconnect lifecycle", () => {
     // Install a pendingShared that we control so ensureShared's await
     // suspends at our latch instead of hitting playwright-core's real
     // launch (which would fail with "Chromium not found" and obscure
-    // the assertion). The fake headless handle is what getOrCreate
+    // the assertion). The fake persistent handle is what getOrCreate
     // would see after the await resolves — but the test bumps the
     // generation BEFORE we resolve, so the post-await re-check bails
     // before getOrCreate ever touches it.
     let resolveShared: (handle: unknown) => void = () => undefined;
+    const fakeContext = {
+      pages: () => [],
+      newPage: async () => ({
+        on: () => undefined,
+        close: () => Promise.resolve(),
+        goto: () => Promise.resolve(null),
+        url: () => "about:blank",
+        title: () => Promise.resolve(""),
+        evaluate: () => Promise.resolve([])
+      }),
+      close: () => Promise.resolve()
+    };
     const fakeHandle = {
-      kind: "headless" as const,
-      browser: {
-        isConnected: () => true,
-        contexts: () => [],
-        newContext: async () => ({
-          newPage: async () => ({
-            on: () => undefined,
-            close: () => Promise.resolve(),
-            goto: () => Promise.resolve(null),
-            url: () => "about:blank",
-            title: () => Promise.resolve(""),
-            evaluate: () => Promise.resolve([])
-          }),
-          close: () => Promise.resolve()
-        }),
-        close: () => Promise.resolve()
-      }
+      kind: "persistent" as const,
+      context: fakeContext,
+      headed: false
     };
     const pending = new Promise<unknown>((resolve) => {
       resolveShared = resolve;
@@ -287,5 +293,14 @@ describe("browser disconnect lifecycle", () => {
     const parsed = JSON.parse(result) as { success: boolean; error?: string };
     expect(parsed.success).toBe(false);
     expect(parsed.error).toMatch(/disconnecting/i);
+  });
+});
+
+describe("chromeProfileDirFor", () => {
+  test("derives the per-instance profile path from instance name", async () => {
+    const { chromeProfileDirFor } = await import("./browser");
+    const dir = chromeProfileDirFor("dev");
+    expect(dir.endsWith("chrome-profile")).toBe(true);
+    expect(dir.includes("dev")).toBe(true);
   });
 });

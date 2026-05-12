@@ -1,37 +1,52 @@
-// Headed-browser connect/disconnect capability. The runtime exposes three
+// Headed-browser connect/disconnect capability. The runtime exposes four
 // HTTP routes that delegate to the functions in this module:
 //
-//   GET  /api/browser              -> getBrowserConnection
-//   POST /api/browser/connect      -> connectBrowser
-//   POST /api/browser/disconnect   -> disconnectBrowser
+//   GET  /api/browser                 -> getBrowserConnection
+//   POST /api/browser/connect         -> connectBrowser
+//   POST /api/browser/disconnect      -> disconnectBrowser
+//   POST /api/browser/wipe-profile    -> wipeBrowserProfile
 //
-// Two connection modes:
+// Profile persistence shape:
+//
+// The agent ALWAYS drives the same per-instance profile directory at
+// ~/.gini/instances/<inst>/chrome-profile/. Sign-ins land in that dir and
+// survive across:
+//   - Connect/Disconnect cycles (visibility toggle only)
+//   - Runtime restarts
+//   - Idle teardown
+// The only ways to lose them are:
+//   - The user explicitly hits Wipe Profile (or `gini browser wipe-profile`)
+//   - The user manually rm -rf the profile dir
+//
+// Two connection modes (the third "headless" state is "no record"):
 //
 //   - "managed": no body. The runtime calls chromium.launchPersistentContext
-//     with a dedicated user-data-dir; Playwright spawns Chromium for us and
-//     hands back the BrowserContext directly. No separate CDP attach, no
-//     /json/version probe, no port management. The session manager pulls
-//     the live BrowserContext from its own ensureShared() each time it
-//     needs it — state.json only records that "we have a managed
-//     connection" (with the profile dir and PID for UI display).
+//     against the per-instance profile dir with `headless: false` — Chrome
+//     opens visibly so the user can sign in. The session manager pulls the
+//     live BrowserContext from its own ensureShared() each time it needs
+//     it. Disconnecting closes only the visible window; the next tool call
+//     relaunches the same profile dir with `headless: true`.
 //
 //   - "cdp": body carries `{ cdpUrl }`. The runtime probes the supplied
-//     CDP endpoint (replacing ws:// with http:// for the /json/version
-//     probe) and stores the URL verbatim — minus any embedded credentials
-//     in the redaction copy that lands in the audit row. CDP attach is
-//     known-flaky under the current Playwright + Bun stack; the UI warns
-//     users to prefer managed mode.
+//     CDP endpoint and stores the URL verbatim — minus any embedded
+//     credentials in the redaction copy that lands in the audit row.
+//     CDP attach is known-flaky under the current Playwright + Bun
+//     stack; the UI warns users to prefer managed mode.
 //
-// The shape returned by all three handlers is `{ connected: boolean,
-// record?: BrowserConnectionRecord }` so the CLI / webapp can render a
-// uniform status card.
+// The shape returned by all three GET/POST handlers is `{ connected:
+// boolean, record?: BrowserConnectionRecord }` so the CLI / webapp can
+// render a uniform status card.
 
 import { existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { instanceRoot } from "../paths";
+import { rm } from "node:fs/promises";
 import { addAudit, mutateState, now, readState } from "../state";
 import { findChromePath } from "../tools/chrome-discovery";
-import { disconnectSharedBrowser, materializeManagedForConnect, safetyCheck } from "../tools/browser";
+import {
+  chromeProfileDirFor,
+  disconnectSharedBrowser,
+  materializeManagedForConnect,
+  safetyCheck
+} from "../tools/browser";
 import type { BrowserConnectionRecord, RuntimeConfig } from "../types";
 
 const DEFAULT_CDP_PORT = 9222;
@@ -108,8 +123,11 @@ function stripUrlCredentials(url: string): string {
   }
 }
 
+// Thin alias kept for back-compat with the test helpers. Same directory
+// every browser tool call uses — sign-ins persist regardless of whether
+// the user has clicked Connect.
 function profileDirFor(config: RuntimeConfig): string {
-  return join(instanceRoot(config.instance), "chrome-profile");
+  return chromeProfileDirFor(config.instance);
 }
 
 // HTTP probe of a CDP endpoint. The /json/version path returns Chrome's
@@ -425,6 +443,16 @@ async function launchManaged(config: RuntimeConfig): Promise<Status> {
   const dataDir = profileDirFor(config);
   mkdirSync(dataDir, { recursive: true });
 
+  // CRITICAL: tear down any existing shared handle BEFORE we attempt to
+  // launch the visible Chrome. The headless persistent context the agent
+  // may already be using is rooted at the same profile dir, and Chromium
+  // locks the dir while a context is open — a second
+  // launchPersistentContext against the same dir would fail with "user
+  // data directory is already in use". This is the pivot's central
+  // ordering rule: only one Chromium process can have the profile open at
+  // a time, so visibility transitions go teardown-then-launch.
+  await disconnectSharedBrowser();
+
   // Dynamically import playwright-core so tests can mock it via
   // mock.module without forcing every test that imports this module to
   // pull in the full browser SDK at module-init time.
@@ -512,8 +540,9 @@ async function disconnectBrowserInner(config: RuntimeConfig): Promise<Status> {
   if (!existing) return { connected: false };
 
   // Clear state FIRST so any concurrent ensureShared() callers that
-  // re-enter during teardown see fresh state and take the headless-launch
-  // branch rather than reattaching to the soon-to-be-dead endpoint.
+  // re-enter during teardown see fresh state and take the headless
+  // persistent branch (managed -> headless visibility toggle) rather than
+  // reattaching to the soon-to-be-closed visible window.
   await mutateState(config.instance, (state) => {
     state.browser = null;
     addAudit(state, {
@@ -525,12 +554,54 @@ async function disconnectBrowserInner(config: RuntimeConfig): Promise<Status> {
     });
   });
 
-  // The session manager owns process lifecycle: closing the managed
-  // BrowserContext terminates the Chromium child, disconnect()ing the
-  // CDP Browser leaves the user's Chrome alone. No separate kill needed.
+  // For managed (visible) records: closing the BrowserContext terminates
+  // the Chromium child. The next agent tool call relaunches the SAME
+  // profile dir with headless: true, so the user's sign-ins remain
+  // accessible. For cdp records: disconnect()ing leaves the user's
+  // Chrome alone — they own that process.
   await disconnectSharedBrowser();
 
   return { connected: false };
+}
+
+// Wipe the per-instance Chrome profile directory. Permanently removes all
+// cookies, saved logins, and browsing data the agent has accumulated.
+// Two-step UX: the user must disconnect the visible browser first so we
+// don't yank the profile out from under a live Chromium child. Once
+// disconnected, this tears down any lingering headless persistent context
+// (so the next browser tool call relaunches against an empty profile) and
+// rm -rf's the directory. Emits a medium-risk audit row.
+export interface WipeResult {
+  wiped: boolean;
+  dataDir: string;
+}
+
+export async function wipeBrowserProfile(config: RuntimeConfig): Promise<WipeResult> {
+  const existing = readState(config.instance).browser ?? null;
+  if (existing) {
+    // Refuse to wipe while a visible window is connected — the user must
+    // hit Disconnect first. This is the same "Invalid input" prefix the
+    // gateway maps to 400 in statusFromErrorMessage.
+    throw new Error("Invalid input: disconnect before wiping the profile.");
+  }
+  const dataDir = chromeProfileDirFor(config.instance);
+  // Drop any cached headless persistent context BEFORE rm-ing the dir.
+  // Chromium would otherwise hold open file handles inside the dir; on
+  // macOS rm -rf still succeeds (unlink-while-open semantics) but Chromium
+  // would then write to ghost inodes on its way out, which is messier than
+  // necessary. Tearing down first is the clean order.
+  await disconnectSharedBrowser();
+  await rm(dataDir, { recursive: true, force: true });
+  await mutateState(config.instance, (state) => {
+    addAudit(state, {
+      actor: "user",
+      action: "browser.wipe-profile",
+      target: dataDir,
+      risk: "medium",
+      evidence: { dataDir }
+    });
+  });
+  return { wiped: true, dataDir };
 }
 
 // Internal helpers exported only for unit tests.
