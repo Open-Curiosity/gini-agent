@@ -205,8 +205,8 @@ const codexProvider: ProviderModule = {
   id: "codex",
   label: "OpenAI Codex",
   description: "Use existing codex --login auth (~/.codex/auth.json)",
-  defaultModel: "gpt-5.4",
-  suggestedModels: ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"],
+  defaultModel: "gpt-5.5",
+  suggestedModels: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"],
   checkCredentials(): CredentialStatus {
     return checkCodexCredentialsStatus();
   },

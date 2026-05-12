@@ -406,7 +406,7 @@ describe("gini setup --yes codex precedence", () => {
     const cfgPath = join(stateRoot, "instances", instance, "config.json");
     const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as { provider?: { name?: string; model?: string } };
     expect(cfg.provider?.name).toBe("codex");
-    expect(cfg.provider?.model).toBe("gpt-5.4");
+    expect(cfg.provider?.model).toBe("gpt-5.5");
   }, 30_000);
 
   test("CODEX_AUTH_JSON and OPENAI_API_KEY both set → picks codex (precedence)", async () => {
