@@ -1,9 +1,9 @@
-// Subprocess tests for `gini update`. They exercise the command's guardrails
-// without ever touching the developer's real ~/.gini/runtime: the
-// GINI_STATE_ROOT short-circuit covers the happy-path branches, and HOME
-// override covers the "missing runtime" and "wrong origin" error branches.
-// A real fetch+reset+bun-install integration test would be slow, flaky, and
-// network-dependent — these subprocess tests are what locks the guardrails in.
+// Note: we don't have full-flow integration tests for fetch/reset/install
+// because they'd require either a local git server or network access to
+// GitHub. The 3 guardrail tests below cover the safety paths (missing
+// runtime, wrong origin, GINI_STATE_ROOT shortcut). The actual fetch/reset
+// behavior is exercised manually via the curl|bash install script which
+// uses the same shell commands.
 import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";

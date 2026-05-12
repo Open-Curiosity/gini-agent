@@ -110,37 +110,40 @@ export async function update(_ctx: CliContext): Promise<void> {
   }
   const afterSha = (afterRes.stdout ?? "").trim();
 
-  if (beforeSha === afterSha) {
-    console.log(`Already up to date (at ${afterSha.slice(0, 7)}).`);
-    return;
-  }
-
   const installRes = spawnSync("bun", ["install"], { cwd: runtimeDir, stdio: "inherit" });
   if (installRes.status !== 0) {
     console.error(`gini update: bun install failed (exit ${installRes.status ?? "null"}).`);
     process.exit(1);
   }
 
-  const countRes = spawnSync("git", ["-C", runtimeDir, "rev-list", "--count", `${beforeSha}..${afterSha}`], { encoding: "utf8" });
-  const commitCount = countRes.status === 0 ? (countRes.stdout ?? "").trim() : "?";
-
-  let restartNeeded = false;
-  try {
-    restartNeeded = await isRunning(loadConfig("main"));
-  } catch {
-    // best-effort — if we can't read the main config (e.g. before first install),
-    // treat as not-running. The user can always restart manually.
+  const webDir = join(runtimeDir, "web");
+  if (existsSync(join(webDir, "package.json"))) {
+    const webResult = spawnSync("bun", ["install"], { cwd: webDir, stdio: "inherit" });
+    if (webResult.status !== 0) {
+      console.error(`gini update: bun install in web/ failed (exit ${webResult.status ?? "null"}).`);
+      process.exit(1);
+    }
   }
+
+  const upToDate = beforeSha === afterSha;
+  const countRes = upToDate
+    ? null
+    : spawnSync("git", ["-C", runtimeDir, "rev-list", "--count", `${beforeSha}..${afterSha}`], { encoding: "utf8" });
+  const commitCount = upToDate
+    ? "0"
+    : countRes && countRes.status === 0 ? (countRes.stdout ?? "").trim() : "?";
 
   const summary = [
     "gini update summary:",
-    `  before:        ${beforeSha.slice(0, 7)}`,
-    `  after:         ${afterSha.slice(0, 7)}`,
-    `  commits:       ${commitCount}`
+    upToDate
+      ? `  status:        Already at ${afterSha.slice(0, 7)}`
+      : `  before:        ${beforeSha.slice(0, 7)}`
   ];
-  if (restartNeeded) {
-    summary.push("  runtime:       running — restart with `gini stop && gini start` to pick up the new code");
+  if (!upToDate) {
+    summary.push(`  after:         ${afterSha.slice(0, 7)}`);
+    summary.push(`  commits:       ${commitCount}`);
   }
+  summary.push("  reminder:      if a gini runtime is currently running, restart it (`gini stop && gini start`) to pick up the new code");
   console.log(summary.join("\n"));
 }
 
