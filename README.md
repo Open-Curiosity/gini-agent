@@ -48,19 +48,12 @@ This repo includes a Bun TypeScript local runtime with:
 
 ## Quick Start
 
-Install with one command:
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
-```
-
-The installer drops a `gini` wrapper at `~/.local/bin/gini` that runs against the `main` instance by default. State lives under `~/.gini/instances/main/`. The installer walks you through provider configuration interactively (OpenAI API key or existing `codex --login` auth). After install, reload your shell PATH if needed, then:
-
-```bash
 gini start
 ```
 
-`gini start` launches the runtime gateway and the Next.js web control plane and prints the runtime gateway URL and the web URL. API keys are stored at `~/.gini/secrets.env` (mode 0600) and sourced by the wrapper — never written to `config.json`.
+The installer walks you through provider setup (OpenAI API key or existing `codex --login` auth). `gini start` prints the runtime and web URLs.
 
 ### Update
 
