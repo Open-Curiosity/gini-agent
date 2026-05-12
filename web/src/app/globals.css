@@ -161,3 +161,30 @@
   0%, 100% { opacity: 1; }
   50% { opacity: 0; }
 }
+
+/* Live status dot — used on Tasks list rows where status indicates the task
+   is still in flight (queued/running/waiting_approval). The dual-layer pulse
+   gives a soft halo without depending on Tailwind's generic animate-pulse,
+   which fades the whole element rather than emitting a ring. */
+.gini-live-dot {
+  position: relative;
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 9999px;
+  flex-shrink: 0;
+}
+.gini-live-dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background: currentColor;
+  opacity: 0.6;
+  animation: gini-live-pulse 1.6s ease-out infinite;
+}
+@keyframes gini-live-pulse {
+  0% { transform: scale(1); opacity: 0.6; }
+  80% { transform: scale(2.4); opacity: 0; }
+  100% { transform: scale(2.4); opacity: 0; }
+}
