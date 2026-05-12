@@ -75,8 +75,13 @@ export async function update(_ctx: CliContext): Promise<void> {
   }
   const actualOrigin = (originRes.stdout ?? "").trim();
   const normalize = (url: string): string => url.replace(/\.git$/, "");
-  if (normalize(actualOrigin) !== normalize(expectedOrigin)) {
-    console.error(`gini update refuses to touch ~/.gini/runtime because its git origin is ${actualOrigin} (expected ${expectedOrigin}). Move that directory aside and reinstall.`);
+  const isExpectedRemote = normalize(actualOrigin) === normalize(expectedOrigin);
+  // Local-test installs (via scripts/install-local.sh) set origin to a
+  // filesystem path. Accept that as a valid origin so the test loop
+  // (edit → commit in local repo → gini update) works end to end.
+  const isLocalCheckout = actualOrigin.startsWith("/") && existsSync(join(actualOrigin, ".git"));
+  if (!isExpectedRemote && !isLocalCheckout) {
+    console.error(`gini update refuses to touch ~/.gini/runtime because its git origin is ${actualOrigin} (expected ${expectedOrigin} or a local repo path). Move that directory aside and reinstall.`);
     process.exit(1);
   }
 
@@ -95,10 +100,12 @@ export async function update(_ctx: CliContext): Promise<void> {
     process.exit(1);
   }
 
-  const resetRes = spawnSync("git", ["-C", runtimeDir, "reset", "--hard", "origin/main"], { encoding: "utf8" });
+  // origin/HEAD follows the remote's default branch — works for both the
+  // GitHub install (main) and local-test installs that may be on any branch.
+  const resetRes = spawnSync("git", ["-C", runtimeDir, "reset", "--hard", "origin/HEAD"], { encoding: "utf8" });
   if (resetRes.status !== 0) {
     const stderr = (resetRes.stderr ?? "").trim();
-    console.error(`gini update: git reset --hard origin/main failed${stderr ? `: ${stderr}` : "."}`);
+    console.error(`gini update: git reset --hard origin/HEAD failed${stderr ? `: ${stderr}` : "."}`);
     process.exit(1);
   }
 
