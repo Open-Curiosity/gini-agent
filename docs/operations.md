@@ -107,6 +107,16 @@ Pulls the latest source into `~/.gini/runtime`, reinstalls dependencies, and lea
 
 `gini update` only operates on the installer-managed runtime at `~/.gini/runtime`. From a repo clone, use `git pull && bun install` instead.
 
+## Local Development Install
+
+If you're working on gini-agent itself and want to test the install/update/uninstall flow against your local checkout (without pushing to GitHub):
+
+```sh
+./scripts/install-local.sh
+```
+
+This is the same as the curl|bash installer except it clones from your local repo into `~/.gini/runtime`. After you commit changes locally, `gini update` will pull them in. `gini uninstall` works exactly the same as a real install (same marker, same wrapper path).
+
 ## Cleanup
 
 Remove a single instance:
