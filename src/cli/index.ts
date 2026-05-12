@@ -2,6 +2,7 @@
 // config, builds a CliContext, and dispatches to the right command module.
 
 import { defaultWebPort, loadConfig, parseInstance } from "../paths";
+import type { RuntimeConfig } from "../types";
 import { applyGlobalEnvOverrides, flagValue, hasFlag, stripGlobalArgs } from "./args";
 import type { CliContext } from "./context";
 import { help } from "./output";
@@ -55,7 +56,6 @@ export async function run(): Promise<void> {
   const userPinnedWebPort = Boolean(flagValue(args, "--web-port")) || Boolean(process.env.GINI_WEB_PORT);
   applyGlobalEnvOverrides(args, ephemeralSmoke);
   const instance = ephemeralSmoke ? `smoke-${process.pid}-${crypto.randomUUID().slice(0, 6)}` : parseInstance(args);
-  const config = loadConfig(instance);
   const webPortFlag = flagValue(args, "--web-port");
   const webPortPinned = userPinnedWebPort;
   const webPort = Number(process.env.GINI_WEB_PORT ?? webPortFlag ?? defaultWebPort(instance));
@@ -69,8 +69,15 @@ export async function run(): Promise<void> {
   // "explicit"; only an explicit --instance flag opts into single-instance mode.
   const explicitInstance = hasFlag(args, "--instance");
 
+  // Full-uninstall must not create instance scaffolding before prompting the
+  // user. loadConfig has the side effect of ensuring instance/trace/log/skills
+  // dirs, so we defer it via a getter that fires only on first .config access.
+  let _config: RuntimeConfig | null = null;
   const ctx: CliContext = {
-    config,
+    get config() {
+      if (!_config) _config = loadConfig(instance);
+      return _config;
+    },
     cliArgs,
     command,
     ephemeralSmoke,
