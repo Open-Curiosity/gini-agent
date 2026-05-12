@@ -145,7 +145,29 @@ async function ensureBrowser(): Promise<Browser> {
       // process. The remote Chrome's default BrowserContext (the one the
       // user has been clicking around in) shows up under browser.contexts()
       // — we'll reuse it in getOrCreate() so signed-in cookies are visible.
-      browser = await chromium.connectOverCDP(record.cdpUrl);
+      //
+      // Bump the timeout above Playwright's 30s default: the
+      // /devtools/browser/<id> handshake can stall on slower-to-start
+      // Chromes (cold profile load, extensions warming up). Wrap the
+      // call so a timeout / WebSocket failure surfaces as a clearer
+      // error pointing at CDP-protocol-version mismatch — the most
+      // common cause when the user has connected a system Chrome that's
+      // ahead of playwright-core's pinned revision.
+      try {
+        browser = await chromium.connectOverCDP(record.cdpUrl, { timeout: 60_000 });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/timeout|websocket|protocol/i.test(message)) {
+          throw new Error(
+            `Failed to attach over CDP: ${message}. ` +
+              "This is often caused by a CDP protocol version mismatch between " +
+              "playwright-core's pinned Chromium and the remote Chrome. Try " +
+              "`gini browser disconnect` and reconnect; the new managed launch " +
+              "uses Playwright's bundled Chromium, which is guaranteed to match."
+          );
+        }
+        throw error instanceof Error ? error : new Error(message);
+      }
     } else {
       browser = await chromium.launch({ headless: true });
     }

@@ -59,18 +59,44 @@ export function platformCandidates(plat: NodeJS.Platform = platform()): readonly
   return LINUX_CANDIDATES;
 }
 
+// Returns the path to the Chromium binary playwright-core ships with, or
+// null if it isn't on disk (e.g. `bunx playwright install chromium` was
+// never run, or playwright-core isn't installed). We prefer this over the
+// system Chrome because the bundled Chromium is guaranteed to match
+// playwright-core's pinned CDP protocol revision; system Chrome can be
+// arbitrarily ahead and produces silent /devtools/browser/<id> handshake
+// hangs on protocol drift. The import is dynamic so callers (and tests
+// that mock playwright-core) aren't forced to eagerly resolve the module.
+async function playwrightChromiumPath(): Promise<string | null> {
+  try {
+    const mod = (await import("playwright-core")) as {
+      chromium?: { executablePath?: () => string };
+    };
+    const exec = mod.chromium?.executablePath?.();
+    if (typeof exec !== "string" || exec.length === 0) return null;
+    return existsSync(exec) ? exec : null;
+  } catch {
+    // playwright-core not installed, executablePath threw because the
+    // browser wasn't installed, or any other resolution failure.
+    return null;
+  }
+}
+
 // Returns the first existing Chrome-compatible binary path, or null if none
-// of the candidates are present on disk. The env var override wins
-// unconditionally so users can point at a custom build or a flatpak/snap
-// wrapper without us hard-coding it. An override pointing at a missing path
-// still wins (returns null after the override check) so the caller can
-// produce a clear "GINI_CHROME_PATH is set but the file is missing" error
-// rather than silently falling back to a different browser.
-export function findChromePath(): string | null {
+// of the candidates are present on disk. Precedence:
+//   1. GINI_CHROME_PATH env var (user override, wins unconditionally so an
+//      override pointing at a missing path returns null rather than
+//      silently falling back).
+//   2. Playwright's bundled Chromium (CDP protocol guaranteed compatible
+//      with the playwright-core version we depend on).
+//   3. System Chrome / Chromium / Edge candidates by platform.
+export async function findChromePath(): Promise<string | null> {
   const override = process.env[ENV_OVERRIDE];
   if (override !== undefined && override.length > 0) {
     return existsSync(override) ? override : null;
   }
+  const bundled = await playwrightChromiumPath();
+  if (bundled) return bundled;
   for (const candidate of platformCandidates()) {
     if (existsSync(candidate)) return candidate;
   }

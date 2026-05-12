@@ -440,7 +440,7 @@ async function connectExisting(config: RuntimeConfig, validatedUrl: string): Pro
 }
 
 async function launchManaged(config: RuntimeConfig, port: number): Promise<Status> {
-  const chromePath = findChromePath();
+  const chromePath = await findChromePath();
   if (!chromePath) {
     throw new Error(
       "Could not locate a Chrome / Chromium / Edge install. " +
