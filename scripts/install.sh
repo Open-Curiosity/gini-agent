@@ -8,52 +8,99 @@ WRAPPER_PATH="$BIN_DIR/gini"
 DEFAULT_INSTANCE="main"
 PATH_MANUAL=0
 
-log() {
-  printf '[gini-install] %s\n' "$*"
+LOCAL_MODE=0
+LOCAL_REPO=""
+
+usage() {
+  cat <<USAGE
+Usage: install.sh [--local[=PATH]]
+
+  (no flag)         Install from $REPO_URL (default).
+  --local           Install from the local repo containing this script.
+  --local=PATH      Install from PATH (must be a gini-agent git checkout).
+
+USAGE
 }
 
-err() {
-  printf '[gini-install] error: %s\n' "$*" >&2
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --local) LOCAL_MODE=1; LOCAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"; LOCAL_REPO="${LOCAL_REPO%/}" ;;
+    --local=*) LOCAL_MODE=1; LOCAL_REPO="${1#--local=}"; LOCAL_REPO="${LOCAL_REPO%/}" ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'unknown flag: %s\n' "$1" >&2; usage >&2; exit 1 ;;
+  esac
+  shift
+done
+
+if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ -z "${NO_COLOR:-}" ]; then
+  C_GREEN="$(tput setaf 2)"
+  C_RED="$(tput setaf 1)"
+  C_DIM="$(tput dim)"
+  C_BOLD="$(tput bold)"
+  C_RESET="$(tput sgr0)"
+else
+  C_GREEN=""; C_RED=""; C_DIM=""; C_BOLD=""; C_RESET=""
+fi
+
+step() { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+info() { printf '%s•%s %s\n' "$C_DIM" "$C_RESET" "$*"; }
+err()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+
+# Run a command quietly: show only a checkmark on success, dump captured output on failure.
+# Usage: quiet "Step label" cmd args...
+quiet() {
+  local label="$1"
+  shift
+  local logfile
+  logfile="$(mktemp)"
+  if "$@" >"$logfile" 2>&1; then
+    step "$label"
+    rm -f "$logfile"
+  else
+    local rc=$?
+    err "$label failed (exit $rc)"
+    printf '%s\n' "$C_DIM----- output -----$C_RESET" >&2
+    cat "$logfile" >&2
+    printf '%s\n' "$C_DIM------------------$C_RESET" >&2
+    rm -f "$logfile"
+    exit $rc
+  fi
+}
+
+verify_local_repo() {
+  if [ ! -e "$LOCAL_REPO/.git" ] || [ ! -f "$LOCAL_REPO/package.json" ]; then
+    err "$LOCAL_REPO does not look like a gini-agent checkout."
+    exit 1
+  fi
+  if ! grep -q '"name": "gini-agent"' "$LOCAL_REPO/package.json"; then
+    err "$LOCAL_REPO/package.json does not declare name \"gini-agent\"."
+    exit 1
+  fi
 }
 
 detect_os() {
   if [ "$(uname -o 2>/dev/null || true)" = "Android" ]; then
     err "Android / Termux is not supported by gini-agent"
-    err "Bun has limited support on Termux and the runtime is not tested there"
     exit 1
   fi
-  local uname_s
-  uname_s="$(uname -s)"
-  case "$uname_s" in
+  case "$(uname -s)" in
     Darwin) printf 'darwin' ;;
     Linux) printf 'linux' ;;
-    *)
-      err "unsupported OS: $uname_s"
-      err "supported: macOS (darwin), Linux, WSL2"
-      exit 1
-      ;;
+    *) err "unsupported OS: $(uname -s) (supported: macOS, Linux, WSL2)"; exit 1 ;;
   esac
 }
 
 detect_arch() {
-  local uname_m
-  uname_m="$(uname -m)"
-  case "$uname_m" in
+  case "$(uname -m)" in
     arm64|aarch64) printf 'arm64' ;;
     x86_64|amd64) printf 'x86_64' ;;
-    *)
-      err "unsupported architecture: $uname_m"
-      err "supported: arm64, x86_64"
-      exit 1
-      ;;
+    *) err "unsupported architecture: $(uname -m)"; exit 1 ;;
   esac
 }
 
 detect_shell_rc() {
   local shell_name=""
-  if [ -n "${SHELL:-}" ]; then
-    shell_name="$(basename "$SHELL")"
-  fi
+  [ -n "${SHELL:-}" ] && shell_name="$(basename "$SHELL")"
   case "$shell_name" in
     zsh)
       if [ -n "${ZDOTDIR:-}" ] && [ -d "$ZDOTDIR" ] && [ -w "$ZDOTDIR" ]; then
@@ -63,88 +110,75 @@ detect_shell_rc() {
       fi
       ;;
     bash)
-      if [ "$OS" = "darwin" ]; then
-        printf '%s/.bash_profile' "$HOME"
-      else
-        printf '%s/.bashrc' "$HOME"
-      fi
+      if [ "$OS" = "darwin" ]; then printf '%s/.bash_profile' "$HOME"
+      else printf '%s/.bashrc' "$HOME"; fi
       ;;
     fish) printf '%s/.config/fish/config.fish' "$HOME" ;;
     *)
-      if [ "$OS" = "darwin" ]; then
-        printf '%s/.zshrc' "$HOME"
-      else
-        printf '%s/.bashrc' "$HOME"
-      fi
+      if [ "$OS" = "darwin" ]; then printf '%s/.zshrc' "$HOME"
+      else printf '%s/.bashrc' "$HOME"; fi
       ;;
   esac
 }
 
 detect_shell_name() {
   local shell_name=""
-  if [ -n "${SHELL:-}" ]; then
-    shell_name="$(basename "$SHELL")"
-  fi
+  [ -n "${SHELL:-}" ] && shell_name="$(basename "$SHELL")"
   printf '%s' "$shell_name"
 }
 
 ensure_bun() {
   if command -v bun >/dev/null 2>&1; then
-    log "bun already installed: $(bun --version)"
+    step "Bun ready ($(bun --version))"
     return
   fi
-
-  log "bun not found; installing via https://bun.sh/install"
-  curl -fsSL https://bun.sh/install | bash
+  quiet "Bun installed" bash -c "curl -fsSL https://bun.sh/install | bash"
   export PATH="${BUN_INSTALL:-$HOME/.bun}/bin:$PATH"
-
   if ! command -v bun >/dev/null 2>&1; then
-    local bun_install_dir="${BUN_INSTALL:-$HOME/.bun}"
-    if [ -x "$bun_install_dir/bin/bun" ]; then
-      export PATH="$bun_install_dir/bin:$PATH"
-    fi
-  fi
-
-  if ! command -v bun >/dev/null 2>&1; then
-    err "bun installation did not put bun on PATH"
-    err "try opening a new shell and re-running this installer"
+    err "bun did not land on PATH. Open a new shell and re-run the installer."
     exit 1
   fi
-
-  log "bun installed: $(bun --version)"
 }
 
 fetch_runtime() {
   mkdir -p "$HOME/.gini"
+
+  local expected_origin
+  if [ "$LOCAL_MODE" = "1" ]; then
+    expected_origin="$LOCAL_REPO"
+  else
+    expected_origin="$REPO_URL"
+  fi
+
   if [ -d "$RUNTIME_DIR/.git" ]; then
-    local existing_origin existing_normalized expected_normalized
+    local existing_origin
     existing_origin="$(git -C "$RUNTIME_DIR" remote get-url origin 2>/dev/null || true)"
-    existing_normalized="${existing_origin%.git}"
-    expected_normalized="${REPO_URL%.git}"
-    if [ -z "$existing_origin" ] || [ "$existing_normalized" != "$expected_normalized" ]; then
-      err "directory $RUNTIME_DIR has a different origin ($existing_origin); refusing to overwrite."
-      err "Move or remove it and re-run the installer."
+    if [ -z "$existing_origin" ] || [ "${existing_origin%.git}" != "${expected_origin%.git}" ]; then
+      err "$RUNTIME_DIR is already installed from a different source ($existing_origin)."
+      err "Run 'gini uninstall --purge' first, or move that directory aside."
       exit 1
     fi
-    log "updating existing runtime at $RUNTIME_DIR"
-    git -C "$RUNTIME_DIR" fetch origin
-    git -C "$RUNTIME_DIR" reset --hard origin/main
+    if [ "$LOCAL_MODE" = "1" ]; then
+      quiet "Source refreshed" bash -c "git -C '$RUNTIME_DIR' fetch origin && git -C '$RUNTIME_DIR' reset --hard origin/HEAD"
+    else
+      quiet "Source updated" bash -c "git -C '$RUNTIME_DIR' fetch origin && git -C '$RUNTIME_DIR' reset --hard origin/main"
+    fi
   elif [ -d "$RUNTIME_DIR" ] && [ -n "$(ls -A "$RUNTIME_DIR" 2>/dev/null || true)" ]; then
-    err "$RUNTIME_DIR exists but is not a git checkout."
-    err "Remove it (or move it aside) and re-run the installer."
+    err "$RUNTIME_DIR exists but is not a git checkout. Remove or move it aside and re-run."
     exit 1
   else
-    log "cloning $REPO_URL into $RUNTIME_DIR"
-    git clone "$REPO_URL" "$RUNTIME_DIR"
+    if [ "$LOCAL_MODE" = "1" ]; then
+      quiet "Source cloned" git clone --local "$LOCAL_REPO" "$RUNTIME_DIR"
+    else
+      quiet "Source downloaded" git clone "$REPO_URL" "$RUNTIME_DIR"
+    fi
   fi
 }
 
 install_deps() {
-  log "installing runtime dependencies via bun install"
-  (cd "$RUNTIME_DIR" && bun install)
+  quiet "Dependencies installed" bash -c "cd '$RUNTIME_DIR' && bun install"
   if [ -f "$RUNTIME_DIR/web/package.json" ]; then
-    log "installing web dependencies via bun install"
-    (cd "$RUNTIME_DIR/web" && bun install)
+    quiet "Web app installed" bash -c "cd '$RUNTIME_DIR/web' && bun install"
   fi
 }
 
@@ -152,10 +186,9 @@ write_wrapper() {
   mkdir -p "$BIN_DIR"
   if [ -e "$WRAPPER_PATH" ] && ! grep -Fq 'gini-agent-installer-managed' "$WRAPPER_PATH" 2>/dev/null; then
     err "$WRAPPER_PATH already exists and is not managed by this installer."
-    err "Remove or move it (e.g. mv \"$WRAPPER_PATH\" \"$WRAPPER_PATH.bak\") and re-run the installer."
+    err "Remove or rename it (e.g. mv \"$WRAPPER_PATH\" \"$WRAPPER_PATH.bak\") and re-run."
     exit 1
   fi
-  log "writing wrapper $WRAPPER_PATH"
   cat >"$WRAPPER_PATH" <<'WRAPPER'
 #!/usr/bin/env bash
 # gini-agent-installer-managed
@@ -165,6 +198,7 @@ cd "$HOME/.gini/runtime"
 exec bun run gini "$@"
 WRAPPER
   chmod +x "$WRAPPER_PATH"
+  step "Wrapper ready"
 }
 
 update_path() {
@@ -180,12 +214,12 @@ update_path() {
   fi
 
   if [ -f "$rc_file" ] && grep -Eq '^[[:space:]]*[^#].*\.local/bin' "$rc_file"; then
-    log "PATH entry already present in $rc_file"
+    step "PATH already configured"
     return 0
   fi
 
   if [ -e "$rc_file" ] && [ ! -w "$rc_file" ]; then
-    err "$rc_file is not writable; add this line manually to enable the gini command:"
+    err "$rc_file is not writable; add this line manually:"
     err "  $path_line"
     PATH_MANUAL=1
     return 0
@@ -201,58 +235,60 @@ update_path() {
     fi
   fi
 
-  log "appending PATH update to $rc_file"
   {
     printf '\n# Added by gini-agent installer\n'
     printf '%s\n' "$path_line"
   } >>"$rc_file" 2>/dev/null || {
-    err "could not write to $rc_file; add this line manually:"
+    err "could not write $rc_file; add this line manually:"
     err "  $path_line"
     PATH_MANUAL=1
     return 0
   }
+  step "PATH configured"
 }
 
 initialize_instance() {
-  log "initializing '$DEFAULT_INSTANCE' instance"
-  (cd "$RUNTIME_DIR" && GINI_INSTANCE="$DEFAULT_INSTANCE" bun run gini install)
+  quiet "Initialized" bash -c "cd '$RUNTIME_DIR' && GINI_INSTANCE='$DEFAULT_INSTANCE' bun run gini install"
 }
 
 print_done() {
-  local rc_file
-  rc_file="$(detect_shell_rc)"
-  cat <<DONE
+  local path_ready=0
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) path_ready=1 ;;
+  esac
 
-gini-agent installed.
+  if [ "$LOCAL_MODE" = "1" ]; then
+    printf '\n%sgini-agent installed%s %s(local: %s)%s\n\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$LOCAL_REPO" "$C_RESET"
+  else
+    printf '\n%sgini-agent installed.%s\n\n' "$C_BOLD" "$C_RESET"
+  fi
 
-  runtime source: $RUNTIME_DIR
-  wrapper:        $WRAPPER_PATH
-  default state:  $HOME/.gini/instances/$DEFAULT_INSTANCE/
-
-Next steps:
-  1. Reload your shell to pick up PATH:
-       source $rc_file
-  2. Start the runtime and web UI:
-       gini start
-     gini start will print the runtime gateway URL and the web URL.
-  3. Verify with:
-       gini smoke
-
-DONE
   if [ "$PATH_MANUAL" = "1" ]; then
-    cat <<'MANUAL'
-Note: the installer could not update your shell rc automatically.
-Add $HOME/.local/bin to your PATH manually (see message above) so the
-`gini` command is found.
-
-MANUAL
+    info "Add \$HOME/.local/bin to your PATH (see the message above), then run:"
+    printf '    gini\n\n'
+  elif [ "$path_ready" = "0" ]; then
+    info "Open a new terminal, then run:"
+    printf '    gini\n\n'
+  else
+    if [ "$LOCAL_MODE" = "1" ]; then
+      printf 'Run %sgini%s to start. After committing changes in %s, run %sgini update%s to re-sync.\n\n' "$C_BOLD" "$C_RESET" "$LOCAL_REPO" "$C_BOLD" "$C_RESET"
+    else
+      printf 'Run %sgini%s to start.\n\n' "$C_BOLD" "$C_RESET"
+    fi
   fi
 }
 
 main() {
+  if [ "$LOCAL_MODE" = "1" ]; then
+    verify_local_repo
+  fi
   OS="$(detect_os)"
   ARCH="$(detect_arch)"
-  log "detected $OS/$ARCH"
+  if [ "$LOCAL_MODE" = "1" ]; then
+    printf '%sInstalling gini-agent%s %s(%s/%s, local source)%s\n\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$OS" "$ARCH" "$C_RESET"
+  else
+    printf '%sInstalling gini-agent%s %s(%s/%s)%s\n\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$OS" "$ARCH" "$C_RESET"
+  fi
 
   ensure_bun
   fetch_runtime

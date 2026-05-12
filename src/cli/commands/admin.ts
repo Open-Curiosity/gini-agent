@@ -76,7 +76,7 @@ export async function update(_ctx: CliContext): Promise<void> {
   const actualOrigin = (originRes.stdout ?? "").trim();
   const normalize = (url: string): string => url.replace(/\.git$/, "");
   const isExpectedRemote = normalize(actualOrigin) === normalize(expectedOrigin);
-  // Local-test installs (via scripts/install-local.sh) set origin to a
+  // Local-test installs (via scripts/install.sh --local) set origin to a
   // filesystem path. Accept that as a valid origin so the test loop
   // (edit → commit in local repo → gini update) works end to end.
   const isLocalCheckout = actualOrigin.startsWith("/") && existsSync(join(actualOrigin, ".git"));

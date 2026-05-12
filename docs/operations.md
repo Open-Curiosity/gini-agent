@@ -112,10 +112,10 @@ Pulls the latest source into `~/.gini/runtime`, reinstalls dependencies, and lea
 If you're working on gini-agent itself and want to test the install/update/uninstall flow against your local checkout (without pushing to GitHub):
 
 ```sh
-./scripts/install-local.sh
+./scripts/install.sh --local
 ```
 
-This is the same as the curl|bash installer except it clones from your local repo into `~/.gini/runtime`. After you commit changes locally, `gini update` will pull them in. `gini uninstall` works exactly the same as a real install (same marker, same wrapper path).
+This is the same as the default install except it clones from your local repo into `~/.gini/runtime`. After you commit changes locally, `gini update` will pull them in. `gini uninstall` works exactly the same as a real install (same marker, same wrapper path).
 
 ## Cleanup
 
