@@ -1,6 +1,6 @@
-import { existsSync, rmSync, writeFileSync } from "node:fs";
-import type { RuntimeConfig } from "../types";
-import { configPath, ensureDir, instanceRoot } from "../paths";
+import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import type { Instance, RuntimeConfig } from "../types";
+import { configPath, ensureDir, instanceRoot, instancesRoot } from "../paths";
 import { readState, taskCounts } from "../state";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
 import { providerHealth } from "../provider";
@@ -68,6 +68,45 @@ export function uninstallInstance(config: RuntimeConfig): void {
   closeMemoryDb(config.instance);
   rmSync(config.stateRoot, { recursive: true, force: true });
   rmSync(config.logRoot, { recursive: true, force: true });
+}
+
+export interface UninstallAllOptions {
+  deleteInstances: boolean;
+  // Caller-injected stop. Runtime can't import from src/cli/process.ts without
+  // creating a layering loop, so the CLI hands us a closure that wraps
+  // stopRuntime(loadConfig(name)). Best-effort: any thrown error is swallowed
+  // so one stuck instance doesn't block the rest of the uninstall.
+  stopInstance?: (instance: Instance) => Promise<void> | void;
+}
+
+export interface UninstallAllResult {
+  instances: Instance[];
+  stopped: Instance[];
+  stopErrors: Array<{ instance: Instance; error: string }>;
+  deletedInstances: boolean;
+}
+
+export async function uninstallAll(options: UninstallAllOptions): Promise<UninstallAllResult> {
+  const root = instancesRoot();
+  const instances: Instance[] = existsSync(root)
+    ? readdirSync(root, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name)
+    : [];
+  const stopped: Instance[] = [];
+  const stopErrors: Array<{ instance: Instance; error: string }> = [];
+  for (const name of instances) {
+    if (!options.stopInstance) break;
+    try {
+      await options.stopInstance(name);
+      stopped.push(name);
+    } catch (error) {
+      stopErrors.push({ instance: name, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  if (options.deleteInstances) {
+    for (const name of instances) closeMemoryDb(name);
+    rmSync(root, { recursive: true, force: true });
+  }
+  return { instances, stopped, stopErrors, deletedInstances: options.deleteInstances };
 }
 
 // Updates the auto-approve command allowlist on the live config object

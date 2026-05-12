@@ -12,5 +12,14 @@ export interface CliContext {
   cliArgs: string[];
   command: string;
   ephemeralSmoke: boolean;
+  // True when --instance was passed explicitly OR GINI_INSTANCE was set in the
+  // env. Drives the uninstall command's split between full-uninstall (default)
+  // and single-instance mode. stripGlobalArgs erases the flag from cliArgs, so
+  // commands that need the original signal read this instead.
+  explicitInstance: boolean;
+  // The original argv slice before stripGlobalArgs. Commands that need to peek
+  // at flags consumed by the global parser (e.g. uninstall checking --yes,
+  // --purge) read from here.
+  rawArgs: string[];
   web: WebOptions;
 }

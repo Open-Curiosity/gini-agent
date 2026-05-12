@@ -61,11 +61,21 @@ export async function run(): Promise<void> {
   const webPort = Number(process.env.GINI_WEB_PORT ?? webPortFlag ?? defaultWebPort(instance));
   const runtimePortPinned = userPinnedRuntimePort;
 
+  // `uninstall` reaches into HOME-level paths (wrapper, rc file, runtime dir) when
+  // the user didn't explicitly target one instance. We must distinguish "user
+  // typed --instance" from "we resolved a default instance" — stripGlobalArgs
+  // erases the flag, so we sniff the raw args here. The installed wrapper sets
+  // GINI_INSTANCE=main on every invocation, so env presence cannot count as
+  // "explicit"; only an explicit --instance flag opts into single-instance mode.
+  const explicitInstance = hasFlag(args, "--instance");
+
   const ctx: CliContext = {
     config,
     cliArgs,
     command,
     ephemeralSmoke,
+    explicitInstance,
+    rawArgs: args,
     web: { webPort, webPortPinned, noWeb, runtimePortPinned }
   };
 

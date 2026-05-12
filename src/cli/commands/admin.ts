@@ -1,7 +1,14 @@
 // Lifecycle and instance-admin commands: install, start, stop, status, doctor, reset, run.
 import type { ChildProcess } from "node:child_process";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import * as readline from "node:readline/promises";
 import type { CliContext } from "../context";
-import { install, resetInstance, uninstallInstance } from "../../runtime";
+import { hasFlag } from "../args";
+import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
+import { loadConfig } from "../../paths";
 import {
   awaitForegroundLogFlush,
   doctor,
@@ -42,12 +49,183 @@ export function reset(ctx: CliContext): void {
 }
 
 export async function uninstall(ctx: CliContext): Promise<void> {
-  // Stop the runtime first if it's running — otherwise removing stateRoot
-  // out from under a live process leaves the daemon writing to a deleted
-  // directory until it crashes.
-  if (await isRunning(ctx.config)) stopRuntime(ctx.config);
-  uninstallInstance(ctx.config);
-  print({ uninstalled: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot, logRoot: ctx.config.logRoot });
+  const yes = hasFlag(ctx.rawArgs, "--yes");
+  const purge = hasFlag(ctx.rawArgs, "--purge");
+
+  if (ctx.explicitInstance) {
+    // Stop the runtime first if it's running — otherwise removing stateRoot
+    // out from under a live process leaves the daemon writing to a deleted
+    // directory until it crashes.
+    if (await isRunning(ctx.config)) stopRuntime(ctx.config);
+    uninstallInstance(ctx.config);
+    print({ uninstalled: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot, logRoot: ctx.config.logRoot });
+    return;
+  }
+
+  await fullUninstall({ yes, purge });
+}
+
+interface FullUninstallFlags {
+  yes: boolean;
+  purge: boolean;
+}
+
+async function fullUninstall(flags: FullUninstallFlags): Promise<void> {
+  const skipPrompts = flags.yes || flags.purge;
+  if (!skipPrompts && !process.stdin.isTTY) {
+    console.error("Refusing to run interactively without a TTY. Pass --yes or --purge to proceed.");
+    process.exit(1);
+  }
+
+  let deleteInstances = flags.purge;
+
+  if (!skipPrompts) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      const proceed = await rl.question("This will uninstall gini-agent. Continue? [y/N] ");
+      if (!isYes(proceed, false)) {
+        console.log("Aborted.");
+        return;
+      }
+      const keep = await rl.question("Keep your instance state at ~/.gini/instances/? [Y/n] ");
+      deleteInstances = !isYes(keep, true);
+    } finally {
+      rl.close();
+    }
+  }
+
+  const result = await uninstallAll({
+    deleteInstances,
+    stopInstance: async (name) => {
+      const cfg = loadConfig(name);
+      if (await isRunning(cfg)) stopRuntime(cfg);
+    }
+  });
+
+  // GINI_STATE_ROOT is the test-mode signal. When set, the user is not actually
+  // tearing down their real install — they're exercising the code path against
+  // a scratch directory — so we skip everything that touches the real $HOME
+  // (rc files, wrapper, runtime checkout, model cache).
+  const testMode = Boolean(process.env.GINI_STATE_ROOT);
+
+  const rcEdits = testMode ? [] : removePathBlockFromRc();
+
+  const home = homedir();
+  const wrapperPath = join(home, ".local", "bin", "gini");
+  const runtimeDir = join(home, ".gini", "runtime");
+  const modelsDir = join(home, ".gini", "models");
+
+  const wrapperOutcome = testMode
+    ? { message: "skipped (GINI_STATE_ROOT set)", shouldRemove: false }
+    : describeWrapper(wrapperPath);
+  const modelsNote = testMode ? undefined : describeModels(modelsDir);
+
+  const summary = [
+    "gini-agent uninstall summary:",
+    `  instances stopped:   ${result.stopped.length}/${result.instances.length}`,
+    deleteInstances
+      ? `  instances deleted:   yes (${result.instances.length})`
+      : `  instances kept:      yes (${result.instances.length})`,
+    `  shell rc edits:      ${rcEdits.length === 0 ? "none" : rcEdits.join(", ")}`,
+    `  wrapper:             ${wrapperOutcome.message}`,
+    `  runtime dir:         ${testMode ? "skipped (GINI_STATE_ROOT set)" : existsSync(runtimeDir) ? `will remove ${runtimeDir}` : "absent"}`
+  ];
+  console.log(summary.join("\n"));
+
+  if (modelsNote) console.log(modelsNote);
+
+  if (wrapperOutcome.shouldRemove) {
+    try { rmSync(wrapperPath, { force: true }); } catch (error) {
+      console.error(`Failed to remove wrapper at ${wrapperPath}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (!testMode && existsSync(runtimeDir)) {
+    // Unix keeps file handles alive on unlinked inodes so this is safe even
+    // though we may be executing from runtimeDir right now.
+    try { rmSync(runtimeDir, { recursive: true, force: true }); } catch (error) {
+      console.error(`Failed to remove runtime dir at ${runtimeDir}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  console.log("Done.");
+}
+
+function isYes(input: string, defaultYes: boolean): boolean {
+  const trimmed = input.trim().toLowerCase();
+  if (trimmed === "") return defaultYes;
+  return trimmed === "y" || trimmed === "yes";
+}
+
+const RC_MARKER = "# Added by gini-agent installer";
+
+function removePathBlockFromRc(): string[] {
+  const home = homedir();
+  const candidates = [
+    join(home, ".zshrc"),
+    join(home, ".bashrc"),
+    join(home, ".bash_profile"),
+    join(home, ".config", "fish", "config.fish")
+  ];
+  const edited: string[] = [];
+  for (const file of candidates) {
+    if (!existsSync(file)) continue;
+    let contents: string;
+    try { contents = readFileSync(file, "utf8"); } catch { continue; }
+    const lines = contents.split("\n");
+    const next: string[] = [];
+    let removed = false;
+    for (let i = 0; i < lines.length; i += 1) {
+      if (lines[i]?.trim() === RC_MARKER) {
+        // Skip the marker AND the following PATH line that the installer wrote.
+        i += 1;
+        removed = true;
+        continue;
+      }
+      next.push(lines[i] ?? "");
+    }
+    if (!removed) continue;
+    try {
+      writeFileSync(file, next.join("\n"));
+      edited.push(file);
+    } catch (error) {
+      console.error(`Could not edit ${file}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return edited;
+}
+
+interface WrapperOutcome {
+  message: string;
+  shouldRemove: boolean;
+}
+
+function describeWrapper(path: string): WrapperOutcome {
+  if (!existsSync(path)) return { message: "absent", shouldRemove: false };
+  let contents = "";
+  try { contents = readFileSync(path, "utf8"); } catch { return { message: `unreadable at ${path}`, shouldRemove: false }; }
+  if (!contents.includes("gini-agent-installer-managed")) {
+    return { message: `kept (not installer-managed at ${path})`, shouldRemove: false };
+  }
+  return { message: `will remove ${path}`, shouldRemove: true };
+}
+
+function describeModels(path: string): string | undefined {
+  if (!existsSync(path)) return undefined;
+  let size = "unknown size";
+  try {
+    // 30s cap so a stuck filesystem can't block the whole uninstall on a
+    // best-effort cosmetic measurement.
+    const result = spawnSync("du", ["-sh", path], { encoding: "utf8", timeout: 30_000 });
+    const out = result.stdout?.trim();
+    if (out) {
+      const first = out.split(/\s+/)[0];
+      if (first) size = first;
+    }
+  } catch {
+    // best-effort
+  }
+  return `Note: model cache at ${path} (${size}) was kept. Run \`rm -rf ${path}\` to remove.`;
 }
 
 // Foreground twin of `start`. Runs the runtime (and optionally Next.js)
