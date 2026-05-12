@@ -65,11 +65,13 @@ gini smoke
 
 ### Update
 
-Re-run the same install one-liner to update. The script is idempotent — it pulls the latest source, reinstalls deps, and keeps your state under `~/.gini/instances/`.
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
+gini update
 ```
+
+Pulls the latest source into `~/.gini/runtime`, reinstalls dependencies, and leaves your state under `~/.gini/instances/` and the model cache at `~/.gini/models/` untouched. If a runtime is currently running, restart it (`gini stop && gini start`) to pick up the new code.
+
+If you are working from a repo clone, use `git pull && bun install` instead — `gini update` only operates on the installer-managed runtime at `~/.gini/runtime`.
 
 ### Uninstall
 
