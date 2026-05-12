@@ -22,11 +22,11 @@ import {
 import { findTask } from "../agent";
 import { recall } from "../memory";
 import {
-  buildAgentSystemContext,
   generateToolCallingResponse,
   type ToolCallingMessage,
   type ToolCall
 } from "../provider";
+import { buildAgentSystemContext } from "../system-prompt";
 import type {
   PendingToolCall,
   RuntimeConfig,
