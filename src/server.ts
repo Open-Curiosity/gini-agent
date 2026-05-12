@@ -5,6 +5,7 @@ import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance } from "./paths";
 import { appendLog } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
+import { closeAll as closeBrowserSessions } from "./tools/browser";
 
 const instance = parseInstance();
 const config = loadConfig(instance);
@@ -99,7 +100,14 @@ process.on("SIGTERM", () => {
   // forever. After 5s we proceed even if the tick hasn't unwound — the
   // OS will reap the child process tree on exit.
   const drained = Promise.race([
-    schedulerDone.catch(() => {}),
+    Promise.all([
+      schedulerDone.catch(() => {}),
+      // Close any live headless browser contexts so Chromium child
+      // processes exit cleanly with the runtime instead of being reaped
+      // by the OS at the very end. Errors are swallowed — a stuck
+      // close shouldn't block runtime shutdown.
+      closeBrowserSessions().catch(() => {})
+    ]),
     Bun.sleep(5000)
   ]);
   // Print a stable shutdown marker so the foreground log capture (and any
