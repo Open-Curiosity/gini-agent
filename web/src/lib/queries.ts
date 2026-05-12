@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient, type UseQueryOptions } from "@ta
 import { api } from "@/lib/api";
 import type {
   Approval,
+  BrowserConnectionRecord,
   ConnectorRecord,
   ImprovementProposal,
   JobRecord,
@@ -226,6 +227,52 @@ export function useRenameChatSession() {
       api<ChatSession>(`/chat/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["chat"] });
+    }
+  });
+}
+
+// Browser-connect status. Shape mirrors the gateway response from
+// /api/browser: { connected: boolean, record?: BrowserConnectionRecord }.
+// Polled every 3s so the status card reflects an external `gini browser
+// connect/disconnect` without a manual refresh.
+export interface BrowserConnectionStatus {
+  connected: boolean;
+  record?: BrowserConnectionRecord;
+}
+
+export function useBrowserConnection() {
+  return useQuery<BrowserConnectionStatus>({
+    queryKey: ["browser"],
+    queryFn: () => api<BrowserConnectionStatus>("/browser"),
+    refetchInterval: 3000
+  });
+}
+
+export function useConnectBrowser() {
+  const qc = useQueryClient();
+  return useMutation<BrowserConnectionStatus, Error, { cdpUrl?: string; port?: number }>({
+    mutationFn: (input) =>
+      api<BrowserConnectionStatus>("/browser/connect", {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["browser"] });
+      qc.invalidateQueries({ queryKey: ["events"] });
+      qc.invalidateQueries({ queryKey: ["audit"] });
+    }
+  });
+}
+
+export function useDisconnectBrowser() {
+  const qc = useQueryClient();
+  return useMutation<BrowserConnectionStatus, Error, void>({
+    mutationFn: () =>
+      api<BrowserConnectionStatus>("/browser/disconnect", { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["browser"] });
+      qc.invalidateQueries({ queryKey: ["events"] });
+      qc.invalidateQueries({ queryKey: ["audit"] });
     }
   });
 }
