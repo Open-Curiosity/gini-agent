@@ -30,7 +30,7 @@ describe("browser safetyCheck", () => {
     // The previous regex `^fe[89ab][0-9a-f]?:` would over-match; the fix
     // requires the fourth hex digit so this no longer triggers.
     const result = safetyCheck("http://[fe8::1]/");
-    expect(result === undefined || !result.startsWith("Blocked:")).toBe(true);
+    expect(result).toBeUndefined();
   });
 
   test("does not leak secret-bearing input through Invalid URL error", () => {
@@ -43,6 +43,20 @@ describe("browser safetyCheck", () => {
     expect(result!.startsWith("Blocked:")).toBe(true);
     expect(result).not.toContain("sk-ant-");
     expect(result).not.toContain(sneaky);
+  });
+
+  test("catches percent-encoded tokens hidden alongside malformed escapes", () => {
+    // %zz is a malformed escape that would make all-or-nothing
+    // decodeURIComponent throw, falling back to scanning only the raw form.
+    // The percent-decoded `%73%6b-ant-api03-...` segment is `sk-ant-api03-...`
+    // which should be detected by the permissive per-`%HH` decoder.
+    const sneaky = "http://example.com/%zz/%73%6b-ant-api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+    const result = safetyCheck(sneaky);
+    expect(result).toBeDefined();
+    expect(result!.startsWith("Blocked:")).toBe(true);
+    expect(result).not.toContain(sneaky);
+    expect(result).not.toContain("sk-ant-");
+    expect(result).not.toContain("%73%6b");
   });
 
   test("allows ordinary https URLs", () => {

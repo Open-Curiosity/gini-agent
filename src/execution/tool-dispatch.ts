@@ -226,7 +226,11 @@ async function browserDispatch(
   //
   // Match both "Blocked:" (active safety rejection) and "Invalid URL:"
   // (URL parse failure) — defense in depth so any safety-rejection prefix
-  // routed through this dispatcher won't leak the input string.
+  // routed through this dispatcher won't leak the input string. The error
+  // message itself can also echo the raw URL (e.g. `Invalid URL: <raw>`),
+  // so we substitute a generic "[redacted]" string for the persisted error
+  // on the redaction path while still letting the original error reach the
+  // model via the returned tool result.
   const safetyBlocked =
     parsed.success === false &&
     typeof parsed.error === "string" &&
@@ -241,10 +245,11 @@ async function browserDispatch(
       : typeof args.ref === "string"
         ? args.ref
         : action;
+  const safeError = safetyBlocked ? "[redacted]" : parsed.error ?? null;
   appendTrace(config.instance, taskId, {
     type: parsed.success === false ? "error" : "tool",
     message: `Browser tool ${action}`,
-    data: { action, args: safeArgs, success: parsed.success !== false, error: parsed.error ?? null }
+    data: { action, args: safeArgs, success: parsed.success !== false, error: safeError }
   });
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
@@ -258,7 +263,7 @@ async function browserDispatch(
       risk,
       taskId: item.id,
       runId: item.runId,
-      evidence: { args: safeArgs, success: parsed.success !== false, error: parsed.error ?? null }
+      evidence: { args: safeArgs, success: parsed.success !== false, error: safeError }
     });
     item.updatedAt = now();
   });

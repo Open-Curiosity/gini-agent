@@ -289,12 +289,19 @@ export function safetyCheck(rawUrl: string): string | undefined {
   // fall through to the `Invalid URL: ${rawUrl}` branch and leak the token
   // into the trace + audit row. Short-circuiting here keeps the error
   // surface free of the original string.
-  let decoded = rawUrl;
-  try {
-    decoded = decodeURIComponent(rawUrl);
-  } catch {
-    // Malformed escape — fall back to the raw form.
-  }
+  //
+  // decodeURIComponent is all-or-nothing — a single bad escape (e.g. `%zz`)
+  // throws and we'd fall back to scanning only the raw form, missing tokens
+  // that happen to be percent-encoded alongside other malformed escapes
+  // (e.g. `http://example.com/%zz/%73%6b-ant-...`). Decode each `%HH`
+  // independently so a single bad escape doesn't blind the rest of the scan.
+  const decoded = rawUrl.replace(/%([0-9a-f]{2})/gi, (match, hex: string) => {
+    try {
+      return decodeURIComponent(`%${hex}`);
+    } catch {
+      return match;
+    }
+  });
   for (const pattern of SECRET_PATTERNS) {
     if (pattern.test(rawUrl) || pattern.test(decoded)) {
       return "Blocked: URL appears to contain an API key or token.";
