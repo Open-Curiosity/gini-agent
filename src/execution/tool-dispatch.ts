@@ -27,6 +27,17 @@ import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
 import { createScheduledJob } from "../jobs";
+import {
+  browserBack,
+  browserClick,
+  browserClose,
+  browserConsole,
+  browserNavigate,
+  browserPress,
+  browserScroll,
+  browserSnapshot,
+  browserType
+} from "../tools/browser";
 
 export type DispatchResult =
   | { kind: "sync"; result: string }
@@ -64,6 +75,24 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await spawnSubagentTool(config, taskId, args) };
     case "create_job":
       return { kind: "sync", result: await createJobTool(config, taskId, args) };
+    case "browser_navigate":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", browserNavigate, args) };
+    case "browser_snapshot":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.snapshot", browserSnapshot, args) };
+    case "browser_click":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.click", browserClick, args) };
+    case "browser_type":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.type", browserType, args) };
+    case "browser_press":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.press", browserPress, args) };
+    case "browser_scroll":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.scroll", browserScroll, args) };
+    case "browser_back":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.back", browserBack, args) };
+    case "browser_console":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.console", browserConsole, args) };
+    case "browser_close":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.close", browserClose, args) };
     case "file_write":
       return { kind: "pending", approvalId: await requestFileWrite(config, taskId, toolCallId, args) };
     case "file_patch":
@@ -163,6 +192,53 @@ async function fileSearch(config: RuntimeConfig, taskId: string, args: Record<st
   });
   await recordLowRiskAudit(config, taskId, "file.search", pattern, { matches: matches.length });
   return matches.join("\n") || "No matches.";
+}
+
+// Wraps a browser tool function with the trace+audit ceremony every other
+// chat-task tool emits. Browser tools return JSON strings on their own
+// (success or error), so we don't second-guess their result — we just log
+// the dispatch and pass it through. Audit risk is `low` for read-only
+// surface (navigate/snapshot/scroll/back/press/console/close) and `medium`
+// for the two side-effecting calls (click/type) so the activity trail
+// stays consistent with how file/terminal tools are categorized.
+async function browserDispatch(
+  config: RuntimeConfig,
+  taskId: string,
+  action: string,
+  fn: (taskId: string, args: Record<string, unknown>) => Promise<string>,
+  args: Record<string, unknown>
+): Promise<string> {
+  const result = await fn(taskId, args);
+  const risk: "low" | "medium" = action === "browser.click" || action === "browser.type" ? "medium" : "low";
+  let parsed: { success?: boolean; error?: string } = {};
+  try {
+    parsed = JSON.parse(result) as { success?: boolean; error?: string };
+  } catch {
+    // Result wasn't JSON — treat as opaque success.
+    parsed = { success: true };
+  }
+  appendTrace(config.instance, taskId, {
+    type: parsed.success === false ? "error" : "tool",
+    message: `Browser tool ${action}`,
+    data: { action, args, success: parsed.success !== false, error: parsed.error ?? null }
+  });
+  await mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    state.audit.unshift({
+      id: `audit_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`,
+      instance: state.instance,
+      at: now(),
+      actor: "agent",
+      action,
+      target: typeof args.url === "string" ? args.url : typeof args.ref === "string" ? args.ref : action,
+      risk,
+      taskId: item.id,
+      runId: item.runId,
+      evidence: { args, success: parsed.success !== false, error: parsed.error ?? null }
+    });
+    item.updatedAt = now();
+  });
+  return result;
 }
 
 async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {

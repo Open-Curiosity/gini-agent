@@ -188,6 +188,129 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_navigate",
+      description: "Open a URL in a headless browser session and return a compact accessibility snapshot with @eN refs the agent can click or type into.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "Absolute http(s) URL to navigate to." }
+        },
+        required: ["url"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_snapshot",
+      description: "Re-snapshot the current browser page. Default returns interactive elements with @eN refs; pass full=true for a richer tree including landmarks and headings.",
+      parameters: {
+        type: "object",
+        properties: {
+          full: { type: "boolean", description: "If true, include landmark/heading nodes alongside interactive elements.", default: false }
+        }
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_click",
+      description: "Click an element on the current page by its @eN ref from the latest snapshot. Returns a fresh snapshot.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Element ref like '@e3' from the latest snapshot." }
+        },
+        required: ["ref"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_type",
+      description: "Clear and type text into an input element identified by its @eN ref. Returns a fresh snapshot.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Input ref like '@e3' from the latest snapshot." },
+          text: { type: "string", description: "Text to type into the input." }
+        },
+        required: ["ref", "text"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_press",
+      description: "Press a keyboard key on the current page (e.g. 'Enter', 'Tab', 'Escape', 'ArrowDown'). Returns a fresh snapshot.",
+      parameters: {
+        type: "object",
+        properties: {
+          key: { type: "string", description: "Key name as Playwright understands it (e.g. 'Enter', 'ArrowDown', 'Control+A')." }
+        },
+        required: ["key"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_scroll",
+      description: "Scroll the current page up or down by one viewport. Returns a fresh snapshot.",
+      parameters: {
+        type: "object",
+        properties: {
+          direction: { type: "string", enum: ["up", "down"], description: "Scroll direction." }
+        },
+        required: ["direction"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_back",
+      description: "Navigate back one entry in the browser history. Returns a fresh snapshot.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_console",
+      description: "Read recent console messages from the current page. Optionally evaluate a JavaScript expression and return its result.",
+      parameters: {
+        type: "object",
+        properties: {
+          expression: { type: "string", description: "Optional JavaScript expression to evaluate in the page context." },
+          clear: { type: "boolean", description: "If true, clear the captured console buffer before returning.", default: false }
+        }
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_close",
+      description: "Close the browser session for the current task. Frees the underlying BrowserContext immediately instead of waiting for the idle sweeper.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
     // Schedule a real cron/job. The job's output is delivered as an
     // assistant message back into the originating chat session when it
     // fires. Low-risk: no approval gate — the user can pause/delete the

@@ -78,6 +78,27 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
       scopes: ["job", "messaging"],
       createdAt: at,
       updatedAt: at
+    },
+    {
+      id: "toolset_browser",
+      instance,
+      name: "browser",
+      description: "Browser automation: navigate, snapshot, click, type, and inspect web pages.",
+      status: "disabled",
+      toolNames: [
+        "browser.navigate",
+        "browser.snapshot",
+        "browser.click",
+        "browser.type",
+        "browser.press",
+        "browser.scroll",
+        "browser.back",
+        "browser.console",
+        "browser.close"
+      ],
+      scopes: ["task", "job", "skill", "subagent"],
+      createdAt: at,
+      updatedAt: at
     }
   ];
 }
