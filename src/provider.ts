@@ -1,35 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { buildAgentSystemContext } from "./system-prompt";
 import type { CostRecord, MemoryRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CODEX_MODEL = "gpt-5.4";
 const DEFAULT_CODEX_AUTH_PATH = "~/.codex/auth.json";
-
-const INSTRUCTIONS = [
-  "You are Gini, a local-first personal agent.",
-  "Reply directly and concisely.",
-  "Do not claim to have performed side effects. Risky side effects are handled by tools and approvals."
-].join("\n");
-
-// Build the authoritative system-area context: base instructions + pinned
-// memories + long-term recalled memory. By placing memory in the system
-// channel rather than appending to the user message, it inherits the model's
-// default trust for system instructions — we don't have to talk the model
-// into believing it.
-function buildSystemContext(memories: MemoryRecord[], recalledContext?: string): string {
-  const parts = [INSTRUCTIONS];
-  if (memories.length > 0) {
-    const pinned = memories.map((memory) => `- (${memory.scope}) ${memory.content}`).join("\n");
-    parts.push(`Pinned memories about this user (curated, always relevant):\n${pinned}`);
-  }
-  if (recalledContext && recalledContext.trim().length > 0) {
-    parts.push(`Long-term memory of prior conversations with this user (use these facts when answering):\n${recalledContext}`);
-  }
-  return parts.join("\n\n");
-}
 
 export function providerHealth(config: RuntimeConfig) {
   const provider = normalizeProvider(config.provider);
@@ -118,13 +96,6 @@ export function providerCatalog(): ProviderCatalogItem[] {
       costHint: "unknown"
     }
   ];
-}
-
-// Public so chat-task.ts can build the same authoritative system prompt
-// (instructions + pinned memories + recalled context) the legacy
-// generateTaskSummary path uses.
-export function buildAgentSystemContext(memories: MemoryRecord[], recalledContext?: string): string {
-  return buildSystemContext(memories, recalledContext);
 }
 
 // OpenAI tool-calling shapes. We mirror the chat-completions API surface
@@ -821,7 +792,7 @@ export async function generateTaskSummary(
     };
   }
 
-  const systemContext = buildSystemContext(memories, recalledContext);
+  const systemContext = buildAgentSystemContext(memories, recalledContext);
   if (provider.name === "openrouter" || provider.name === "local") {
     return callChatCompletions(provider, input, systemContext);
   }
