@@ -7,6 +7,7 @@ BIN_DIR="$HOME/.local/bin"
 WRAPPER_PATH="$BIN_DIR/gini"
 DEFAULT_INSTANCE="main"
 PATH_MANUAL=0
+SETUP_RAN=0
 
 LOCAL_MODE=0
 LOCAL_REPO=""
@@ -193,6 +194,7 @@ write_wrapper() {
 #!/usr/bin/env bash
 # gini-agent-installer-managed
 set -euo pipefail
+[ -f "$HOME/.gini/secrets.env" ] && set -a && . "$HOME/.gini/secrets.env" && set +a
 export GINI_INSTANCE="${GINI_INSTANCE:-main}"
 cd "$HOME/.gini/runtime"
 exec bun run gini "$@"
@@ -251,6 +253,21 @@ initialize_instance() {
   quiet "Initialized" bash -c "cd '$RUNTIME_DIR' && GINI_INSTANCE='$DEFAULT_INSTANCE' bun run gini install"
 }
 
+run_setup() {
+  # Setup is interactive — needs full stdio for the API-key prompt. Only
+  # run when both stdin and stdout are TTYs; the curl|bash piped path
+  # (stdin not a TTY) skips this and print_done points users at the
+  # `gini setup` command they can run later.
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf '\n'
+    if (cd "$RUNTIME_DIR" && GINI_INSTANCE="$DEFAULT_INSTANCE" bun run gini setup); then
+      SETUP_RAN=1
+    else
+      err "gini setup did not complete. Run 'gini setup' later to finish."
+    fi
+  fi
+}
+
 print_done() {
   local path_ready=0
   case ":$PATH:" in
@@ -263,17 +280,26 @@ print_done() {
     printf '\n%sgini-agent installed.%s\n\n' "$C_BOLD" "$C_RESET"
   fi
 
+  # If setup ran during install, the user is done — just point at start.
+  # Otherwise tell them to run setup first.
+  local next_cmd
+  if [ "$SETUP_RAN" = "1" ]; then
+    next_cmd='gini start'
+  else
+    next_cmd='gini setup, then gini start'
+  fi
+
   if [ "$PATH_MANUAL" = "1" ]; then
     info "Add \$HOME/.local/bin to your PATH (see the message above), then run:"
-    printf '    gini start\n\n'
+    printf '    %s\n\n' "$next_cmd"
   elif [ "$path_ready" = "0" ]; then
     info "Open a new terminal, then run:"
-    printf '    gini start\n\n'
+    printf '    %s\n\n' "$next_cmd"
   else
     if [ "$LOCAL_MODE" = "1" ]; then
-      printf 'Run %sgini start%s to start. After committing changes in %s, run %sgini update%s to re-sync.\n\n' "$C_BOLD" "$C_RESET" "$LOCAL_REPO" "$C_BOLD" "$C_RESET"
+      printf 'Run %s%s%s. After committing changes in %s, run %sgini update%s to re-sync.\n\n' "$C_BOLD" "$next_cmd" "$C_RESET" "$LOCAL_REPO" "$C_BOLD" "$C_RESET"
     else
-      printf 'Run %sgini start%s to start.\n\n' "$C_BOLD" "$C_RESET"
+      printf 'Run %s%s%s.\n\n' "$C_BOLD" "$next_cmd" "$C_RESET"
     fi
   fi
 }
@@ -296,6 +322,7 @@ main() {
   write_wrapper
   update_path
   initialize_instance
+  run_setup
   print_done
 }
 
