@@ -58,7 +58,7 @@ describe("gini update", () => {
 
   test("missing runtime errors clearly", async () => {
     const home = scratch("no-runtime");
-    const env = { ...process.env, HOME: home };
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home };
     delete env.GINI_STATE_ROOT;
     const result = await runCli({ args: ["update"], env });
     expect(result.code).toBe(1);
@@ -74,7 +74,7 @@ describe("gini update", () => {
     // reaches the origin-check branch instead of the missing-runtime branch.
     spawnSync("git", ["-C", runtimeDir, "init", "--quiet"]);
     spawnSync("git", ["-C", runtimeDir, "remote", "add", "origin", "https://example.com/foo"]);
-    const env = { ...process.env, HOME: home };
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home };
     delete env.GINI_STATE_ROOT;
     const result = await runCli({ args: ["update"], env });
     expect(result.code).toBe(1);
