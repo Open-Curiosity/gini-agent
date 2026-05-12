@@ -15,7 +15,7 @@ Multiple coding agents, worktrees, smoke tests, and personal runtimes need to co
 - `GINI_STATE_ROOT` and `GINI_LOG_ROOT` can override paths for disposable tests.
 - `smoke` uses an ephemeral instance/root/port by default when no instance is supplied.
 - `status` and `doctor` report instance identity.
-- `reset` and `uninstall` affect only the selected instance.
+- `reset` and `uninstall --instance <name>` affect only the selected instance; `uninstall` (no flag) performs a full uninstall with prompts that can also clear every instance.
 - Runtime API and web UI expose the instance.
 - Per-instance runtime and web ports are deterministic and collision-aware.
 
