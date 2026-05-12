@@ -54,7 +54,7 @@ Install with one command:
 curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
 ```
 
-The installer drops a `gini` wrapper at `~/.local/bin/gini` that runs against the `home` instance by default. State lives under `~/.gini/instances/home/`. After install, reload your shell PATH and start the runtime:
+The installer drops a `gini` wrapper at `~/.local/bin/gini` that runs against the `main` instance by default. State lives under `~/.gini/instances/main/`. After install, reload your shell PATH and start the runtime:
 
 ```bash
 gini start
@@ -72,7 +72,7 @@ bun run gini start
 bun run gini smoke
 ```
 
-When you run the CLI from a repo clone, the default instance is `dev`. The installed `gini` command from `curl | bash` defaults to `home` instead so developer state and end-user state stay separate. For the `dev` instance the URLs default to:
+When you run the CLI from a repo clone, the default instance is `dev`. The installed `gini` command from `curl | bash` defaults to `main` instead so developer state and end-user state stay separate. For the `dev` instance the URLs default to:
 
 - runtime: `http://127.0.0.1:7337`
 - web: `http://127.0.0.1:3000`

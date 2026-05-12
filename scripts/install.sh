@@ -5,7 +5,7 @@ REPO_URL="https://github.com/Lilac-Labs/gini-agent"
 RUNTIME_DIR="$HOME/.gini/runtime"
 BIN_DIR="$HOME/.local/bin"
 WRAPPER_PATH="$BIN_DIR/gini"
-DEFAULT_INSTANCE="home"
+DEFAULT_INSTANCE="main"
 PATH_MANUAL=0
 
 log() {
@@ -156,7 +156,7 @@ write_wrapper() {
 #!/usr/bin/env bash
 # gini-agent-installer-managed
 set -euo pipefail
-export GINI_INSTANCE="${GINI_INSTANCE:-home}"
+export GINI_INSTANCE="${GINI_INSTANCE:-main}"
 cd "$HOME/.gini/runtime"
 exec bun run gini "$@"
 WRAPPER
