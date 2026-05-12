@@ -21,6 +21,7 @@ import { pairing, device } from "./commands/pairing";
 import { mobile } from "./commands/mobile";
 import { search } from "./commands/search";
 import { toolset } from "./commands/toolsets";
+import { browser } from "./commands/browser";
 import { subagent } from "./commands/subagents";
 import { mcp } from "./commands/mcp";
 import { messaging } from "./commands/messaging";
@@ -126,6 +127,7 @@ export async function run(): Promise<void> {
     case "search": await search(ctx); break;
     case "toolset":
     case "toolsets": await toolset(ctx); break;
+    case "browser": await browser(ctx); break;
     case "subagent":
     case "subagents": await subagent(ctx); break;
     case "mcp": await mcp(ctx); break;
