@@ -26,7 +26,7 @@ Order below matches the README preview. The webapp is the primary interface for 
 
 The current flow makes the user type `gini start` after install. The target experience matches what tools like Paperclip do today: install completes, the runtime is already running, and it stays running across reboots and crashes.
 
-- ✅ **LaunchAgent registration at install time.** The installer writes two per-instance plists under `~/Library/LaunchAgents/` — `ai.lilac.gini.<instance>.gateway` (Bun runtime) and `ai.lilac.gini.<instance>.web` (Next.js dev) — and registers both with `launchctl bootstrap gui/$(id -u)`. Uninstall tears both down and surfaces bootout failures.
+- ✅ **LaunchAgent registration at install time.** The installer writes two per-instance plists under `~/Library/LaunchAgents/` — `ai.lilaclabs.gini.<instance>.gateway` (Bun runtime) and `ai.lilaclabs.gini.<instance>.web` (Next.js dev) — and registers both with `launchctl bootstrap gui/$(id -u)`. Uninstall tears both down and surfaces bootout failures.
 - ✅ **Crash recovery.** `KeepAlive` configured as a dict (`SuccessfulExit: false`) on both plists, so `gini stop` (clean exit 0) is honored but unexpected exits respawn within `ThrottleInterval`. The web plist's shell shim execs `bun run dev` to keep the launchd-tracked PID accurate.
 - ✅ **Opt-out.** `--no-autostart` on the installer for users who want to manage the runtime themselves.
 - ⚠ **macOS 26+ caveat.** launchd often defers auto-respawn after SIGKILL indefinitely (`pended nondemand spawn = inefficient`). RunAtLoad still fires at login; `gini autostart kick` is the manual workaround.

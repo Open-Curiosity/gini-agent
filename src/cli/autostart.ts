@@ -32,9 +32,44 @@ import { dirname, join, resolve } from "node:path";
 import type { Instance } from "../types";
 import { defaultWebPort, projectRoot } from "../paths";
 
-export const LABEL_PREFIX = "ai.lilac.gini";
+export const LABEL_PREFIX = "ai.lilaclabs.gini";
+
+// Older releases shipped under different label prefixes. `enable()` boots
+// out and removes any plists registered under these so an upgrade is clean
+// (no orphan launchd jobs, no plist files left in ~/Library/LaunchAgents/).
+// Add new entries here — never remove — so users who skip releases still
+// migrate correctly. Each prefix is matched for both the round-1
+// single-plist label (`<prefix>.<instance>`) and the round-2 split pair
+// (`<prefix>.<instance>.gateway` / `<prefix>.<instance>.web`).
+export const LEGACY_LABEL_PREFIXES: readonly string[] = ["ai.lilac.gini"];
 
 export type PlistKind = "gateway" | "web";
+
+// Returns every legacy label/plist-path pair that may exist on disk for
+// this instance, across all known prior label prefixes and both the
+// single-plist and split-pair shapes. Used by `enable()` to clean up
+// before bootstrapping under the current LABEL_PREFIX.
+export interface LegacyHandle {
+  label: string;
+  plistPath: string;
+  serviceTarget: string;
+}
+export function legacyHandlesFor(instance: Instance): LegacyHandle[] {
+  const home = process.env.HOME || homedir();
+  const dom = guiDomain();
+  const handles: LegacyHandle[] = [];
+  for (const prefix of LEGACY_LABEL_PREFIXES) {
+    for (const suffix of ["", ".gateway", ".web"]) {
+      const label = `${prefix}.${instance}${suffix}`;
+      handles.push({
+        label,
+        plistPath: join(home, "Library", "LaunchAgents", `${label}.plist`),
+        serviceTarget: `${dom}/${label}`
+      });
+    }
+  }
+  return handles;
+}
 
 // The legacy single-plist label `ai.lilac.gini.<instance>` (round 1).
 // `labelFor()` keeps returning this for callers that still want a single
@@ -562,6 +597,19 @@ export function bootstrap(instance: Instance, plistPath: string): LaunchctlResul
 
 export function bootout(instance: Instance, kind?: PlistKind): LaunchctlResult {
   return runLaunchctl(["bootout", serviceTarget(instance, kind)]);
+}
+
+// Bootout a specific service target string (e.g. a legacy label from a
+// prior LABEL_PREFIX). Lets the upgrade path tear down old registrations
+// without going through serviceTarget(), which builds against the
+// current prefix.
+export function bootoutTarget(target: string): LaunchctlResult {
+  return runLaunchctl(["bootout", target]);
+}
+
+export function isLoadedTarget(target: string): boolean {
+  const res = runLaunchctl(["print", target]);
+  return res.ok;
 }
 
 export function kickstart(instance: Instance, kind?: PlistKind): LaunchctlResult {

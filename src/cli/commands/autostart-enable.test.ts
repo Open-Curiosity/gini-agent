@@ -188,7 +188,7 @@ const isDarwin = process.platform === "darwin";
     let bootstrapCalls = 0;
     const deps = {
       isLoaded: () => false,
-      bootout: () => fail("Could not find service ai.lilac.gini.x.gateway"),
+      bootout: () => fail("Could not find service ai.lilaclabs.gini.x.gateway"),
       bootstrap: () => {
         bootstrapCalls += 1;
         if (bootstrapCalls === 1) return ok();

@@ -389,6 +389,40 @@ const e2eOn = isDarwin && process.env.GINI_AUTOSTART_E2E === "1";
     expect(existsSync(legacyPath)).toBe(false);
   }, 60_000);
 
+  // Prefix-migration: `enable` removes plists left over from a prior
+  // LABEL_PREFIX (`ai.lilac.gini.*` → current `ai.lilaclabs.gini.*`
+  // rename). Covers both the round-1 single-plist shape and the
+  // round-2 split pair under the old prefix.
+  test("enable removes plists from prior LABEL_PREFIX (ai.lilac.gini.*)", async () => {
+    const { mkdirSync: mk, writeFileSync, existsSync } = await import("node:fs");
+    const { dirname, join } = await import("node:path");
+    const { homedir } = await import("node:os");
+    const home = process.env.HOME || homedir();
+    const launchAgents = join(home, "Library", "LaunchAgents");
+    mk(launchAgents, { recursive: true });
+    const oldSingle = join(launchAgents, `ai.lilac.gini.${uniqueInstance}.plist`);
+    const oldGateway = join(launchAgents, `ai.lilac.gini.${uniqueInstance}.gateway.plist`);
+    const oldWeb = join(launchAgents, `ai.lilac.gini.${uniqueInstance}.web.plist`);
+    writeFileSync(oldSingle, "<plist/>");
+    writeFileSync(oldGateway, "<plist/>");
+    writeFileSync(oldWeb, "<plist/>");
+
+    const result = runCli(
+      [
+        "autostart", "enable",
+        "--instance", uniqueInstance,
+        "--state-root", scratch.stateRoot,
+        "--log-root", scratch.logRoot,
+        "--test-root", scratch.stateRoot
+      ],
+      { GINI_AUTOSTART_E2E: "1" }
+    );
+    expect(result.status).toBe(0);
+    expect(existsSync(oldSingle)).toBe(false);
+    expect(existsSync(oldGateway)).toBe(false);
+    expect(existsSync(oldWeb)).toBe(false);
+  }, 60_000);
+
   // MEDIUM-9: `enable --kind gateway` only loads the gateway; the web
   // service stays untouched. This is the path setup-api scheduleAutostartRefresh
   // uses after POST /api/setup/provider to refresh the gateway plist

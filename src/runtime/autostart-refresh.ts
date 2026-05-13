@@ -44,6 +44,7 @@ import { spawn } from "node:child_process";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { plistPathFor } from "../cli/autostart";
 import { logDir, projectRoot } from "../paths";
 import type { Instance } from "../types";
 
@@ -93,8 +94,7 @@ function resetRefreshFlag(): void {
 // SIGTERM (so unit tests don't have to mock self-signaling).
 export function requestAutostartRefresh(instance: Instance): boolean {
   if (process.platform !== "darwin") return false;
-  const home = process.env.HOME || homedir();
-  const gatewayPlist = join(home, "Library", "LaunchAgents", `ai.lilac.gini.${instance}.gateway.plist`);
+  const gatewayPlist = plistPathFor(instance, "gateway");
   if (!existsSync(gatewayPlist)) return false;
 
   const marker = refreshMarkerPath(instance);

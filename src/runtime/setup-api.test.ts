@@ -152,7 +152,7 @@ describe("setup-api", () => {
     const home = s.home;
     const launchAgents = join(home, "Library", "LaunchAgents");
     mkdirSync(launchAgents, { recursive: true });
-    const gatewayPlist = join(launchAgents, `ai.lilac.gini.${config.instance}.gateway.plist`);
+    const gatewayPlist = join(launchAgents, `ai.lilaclabs.gini.${config.instance}.gateway.plist`);
     writeFileSync(gatewayPlist, "<?xml version=\"1.0\"?>\n");
     try {
       const result = await setSetupProvider(config, { kind: "openai", apiKey: "sk-test" });

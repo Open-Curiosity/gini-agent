@@ -88,7 +88,7 @@ describe("autostart-refresh", () => {
     if (process.platform !== "darwin") return;
     const plistDir = join(s.home, "Library", "LaunchAgents");
     mkdirSync(plistDir, { recursive: true });
-    const plistPath = join(plistDir, `ai.lilac.gini.${instance}.gateway.plist`);
+    const plistPath = join(plistDir, `ai.lilaclabs.gini.${instance}.gateway.plist`);
     writeFileSync(plistPath, "<plist/>\n");
 
     expect(requestAutostartRefresh(instance)).toBe(true);
@@ -119,7 +119,7 @@ describe("autostart-refresh", () => {
     // marker AND sets the in-process refreshRequestedInProcess flag.
     const plistDir = join(s.home, "Library", "LaunchAgents");
     mkdirSync(plistDir, { recursive: true });
-    writeFileSync(join(plistDir, `ai.lilac.gini.${instance}.gateway.plist`), "<plist/>\n");
+    writeFileSync(join(plistDir, `ai.lilaclabs.gini.${instance}.gateway.plist`), "<plist/>\n");
     expect(requestAutostartRefresh(instance)).toBe(true);
     const marker = refreshMarkerPath(instance);
     expect(existsSync(marker)).toBe(true);
@@ -159,7 +159,7 @@ describe("autostart-refresh", () => {
     // Set up a marker, as if /api/setup/provider had just been hit.
     const plistDir = join(s.home, "Library", "LaunchAgents");
     mkdirSync(plistDir, { recursive: true });
-    writeFileSync(join(plistDir, `ai.lilac.gini.${instance}.gateway.plist`), "<plist/>\n");
+    writeFileSync(join(plistDir, `ai.lilaclabs.gini.${instance}.gateway.plist`), "<plist/>\n");
     expect(requestAutostartRefresh(instance)).toBe(true);
 
     let respondedAt = 0;
@@ -245,7 +245,7 @@ describe("autostart-refresh", () => {
     // the in-process flag should be set after this.
     const plistDir = join(s.home, "Library", "LaunchAgents");
     mkdirSync(plistDir, { recursive: true });
-    writeFileSync(join(plistDir, `ai.lilac.gini.${instance}.gateway.plist`), "<plist/>\n");
+    writeFileSync(join(plistDir, `ai.lilaclabs.gini.${instance}.gateway.plist`), "<plist/>\n");
     expect(requestAutostartRefresh(instance)).toBe(true);
 
     let spawnCalls = 0;
@@ -287,7 +287,7 @@ describe("autostart-refresh", () => {
     if (process.platform !== "darwin") return;
     const plistDir = join(s.home, "Library", "LaunchAgents");
     mkdirSync(plistDir, { recursive: true });
-    writeFileSync(join(plistDir, `ai.lilac.gini.${instance}.gateway.plist`), "<plist/>\n");
+    writeFileSync(join(plistDir, `ai.lilaclabs.gini.${instance}.gateway.plist`), "<plist/>\n");
     expect(requestAutostartRefresh(instance)).toBe(true);
 
     const fakeSpawn = ((..._args: unknown[]) => {

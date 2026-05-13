@@ -18,11 +18,14 @@ import { print } from "../output";
 import { flagValue } from "../args";
 import {
   bootout,
+  bootoutTarget,
   bootstrap,
   isLoaded,
+  isLoadedTarget,
   kickstart,
   labelFor,
   labelForKind,
+  legacyHandlesFor,
   loadedLastExitStatus,
   loadedPid,
   platformIsSupported,
@@ -267,9 +270,35 @@ export async function enable(
   const results: PerKindEnableResult[] = [];
   let allOk = true;
 
+  // Migrate from any prior LABEL_PREFIX (e.g. the original
+  // `ai.lilac.gini` → `ai.lilaclabs.gini` rename). For each legacy
+  // prefix we ship the single-plist and split-pair shapes, boot out
+  // anything launchd still has registered, and delete the plist file
+  // from disk. Done unconditionally and silently — `bootout` on an
+  // unknown label is a no-op (we ignore "Could not find service").
+  if (kinds.includes("gateway")) {
+    for (const handle of legacyHandlesFor(instance)) {
+      if (isLoadedTarget(handle.serviceTarget)) {
+        const out = bootoutTarget(handle.serviceTarget);
+        if (!out.ok && !out.stderr.includes("Could not find service")) {
+          // Worst case the old service stays loaded and the user has
+          // to clean it up by hand — but the new pair can still
+          // bootstrap, so don't fail the whole enable on a stuck
+          // legacy plist. Surface via stderr so it's visible.
+          process.stderr.write(
+            `autostart: legacy bootout failed for ${handle.label}: ${out.stderr.trim()}\n`
+          );
+        }
+      }
+      if (existsSync(handle.plistPath)) {
+        try { rmSync(handle.plistPath, { force: true }); } catch { /* best-effort */ }
+      }
+    }
+  }
+
   // HIGH-5: clean up the round-1 legacy single-plist
-  // `ai.lilac.gini.<instance>` (no kind suffix) BEFORE bootstrapping the
-  // round-2 split pair. Otherwise an upgrade from round 1 → round 2
+  // `<currentPrefix>.<instance>` (no kind suffix) BEFORE bootstrapping
+  // the round-2 split pair. Otherwise an upgrade from round 1 → round 2
   // leaves the legacy service running alongside the new pair, which
   // either fights for the gateway port or wedges launchd. `bootout` on
   // an unknown label is a no-op (we ignore "Could not find service"),
