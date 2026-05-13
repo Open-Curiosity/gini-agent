@@ -29,6 +29,12 @@ type SetupStatus = {
 
 type SetupResult = {
   ok: boolean;
+  // The gateway uses plistRefreshNeeded internally to coordinate a
+  // detached `gini autostart enable --kind gateway` after a successful
+  // POST so the new env survives the next launchd respawn. The browser
+  // doesn't act on it directly — the running gateway already has the
+  // new key in process.env, so the user's session works immediately —
+  // and the response handler redirects before any hint could paint.
   plistRefreshNeeded: boolean;
   error?: string;
 };
@@ -41,7 +47,6 @@ export default function SetupPage() {
   const [submitting, setSubmitting] = useState(false);
   const [openaiKey, setOpenaiKey] = useState("");
   const [tab, setTab] = useState<"openai" | "codex">("openai");
-  const [plistRefreshHint, setPlistRefreshHint] = useState(false);
 
   const refreshStatus = async (): Promise<SetupStatus | null> => {
     try {
@@ -91,7 +96,9 @@ export default function SetupPage() {
         setError(result.error ?? "Setup failed.");
         return;
       }
-      if (result.plistRefreshNeeded) setPlistRefreshHint(true);
+      // plistRefreshNeeded is informational only on the client; the
+      // gateway handles the actual refresh via the autostart-refresh
+      // marker + SIGTERM flow.
       router.replace("/");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -194,13 +201,6 @@ export default function SetupPage() {
               </div>
             </TabsContent>
           </Tabs>
-
-          {plistRefreshHint ? (
-            <p className="text-xs text-muted-foreground">
-              Note: re-run <code className="rounded bg-muted px-1 py-0.5 text-xs">gini autostart enable</code> in
-              a terminal to refresh the launchd plist with the new key for future restarts.
-            </p>
-          ) : null}
         </CardContent>
       </Card>
     </div>
