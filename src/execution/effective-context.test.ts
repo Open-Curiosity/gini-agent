@@ -2,8 +2,9 @@
 // it takes a RuntimeState + RuntimeConfig and returns an EffectiveContext —
 // so these tests build state in memory without touching disk.
 
-import { describe, expect, test } from "bun:test";
-import { resolveEffectiveContext } from "./effective-context";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { resolveEffectiveContext, providerOverrideForRuntime } from "./effective-context";
 import type {
   AgentRecord,
   MessagingBridgeRecord,
@@ -199,5 +200,71 @@ describe("resolveEffectiveContext", () => {
     const ctx = resolveEffectiveContext(state, buildConfig());
     expect(ctx.warnings).toEqual([]);
     expect(ctx.providerSource).toBe("agent");
+  });
+});
+
+// providerOverrideForRuntime is the helper consumed by memory pipelines
+// (retain/reflect/reinforce) so each pipeline doesn't repeat the state +
+// effective + source dance. We exercise it against on-disk state to mirror
+// the real call shape from those pipelines.
+const OVERRIDE_ROOT = "/tmp/gini-provider-override-test";
+
+beforeAll(() => {
+  rmSync(OVERRIDE_ROOT, { recursive: true, force: true });
+  mkdirSync(OVERRIDE_ROOT, { recursive: true });
+  process.env.GINI_STATE_ROOT = OVERRIDE_ROOT;
+  process.env.GINI_LOG_ROOT = `${OVERRIDE_ROOT}-logs`;
+});
+
+afterAll(() => {
+  rmSync(OVERRIDE_ROOT, { recursive: true, force: true });
+});
+
+function writeStateFile(instance: string, state: RuntimeState): void {
+  const dir = `${OVERRIDE_ROOT}/instances/${instance}`;
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(`${dir}/state.json`, JSON.stringify(state, null, 2));
+}
+
+describe("providerOverrideForRuntime", () => {
+  test("returns the agent's provider when source is agent", () => {
+    const instance = "override-agent";
+    const agent = buildAgent({
+      id: "agent_default",
+      providerName: "codex",
+      model: "gpt-5.5"
+    });
+    writeStateFile(instance, buildState({
+      instance,
+      agents: [agent],
+      activeAgentId: agent.id
+    }));
+    const config = buildConfig({ name: "echo", model: "gini-echo-v0" });
+    config.instance = instance;
+    const override = providerOverrideForRuntime(config);
+    expect(override).toBeDefined();
+    expect(override?.name).toBe("codex");
+    expect(override?.model).toBe("gpt-5.5");
+  });
+
+  test("returns undefined when no active agent (instance source)", () => {
+    const instance = "override-none";
+    writeStateFile(instance, buildState({ instance }));
+    const config = buildConfig({ name: "codex", model: "gpt-5.5" });
+    config.instance = instance;
+    expect(providerOverrideForRuntime(config)).toBeUndefined();
+  });
+
+  test("returns undefined when agent has no providerName/model (instance source)", () => {
+    const instance = "override-partial";
+    const agent = buildAgent({ id: "agent_default", providerName: undefined, model: undefined });
+    writeStateFile(instance, buildState({
+      instance,
+      agents: [agent],
+      activeAgentId: agent.id
+    }));
+    const config = buildConfig({ name: "codex", model: "gpt-5.5" });
+    config.instance = instance;
+    expect(providerOverrideForRuntime(config)).toBeUndefined();
   });
 });

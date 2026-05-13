@@ -34,6 +34,7 @@ import {
 } from "../state";
 import { generateStructured, generateTaskSummary } from "../provider";
 import { getEmbeddingProvider } from "../embeddings";
+import { providerOverrideForRuntime } from "../execution/effective-context";
 import { recall } from "./recall";
 import { opinionExtractionValidator, type ExtractedOpinion } from "./schemas";
 
@@ -61,6 +62,11 @@ export async function reflect(config: RuntimeConfig, input: ReflectInput): Promi
   const bank = getBank(instance, bankId);
   if (!bank) throw new Error(`Bank not found: ${bankId}`);
 
+  // Resolve the active agent's provider override once. Used for the LLM
+  // generation and opinion-extraction calls below. Embeddings/reranker
+  // stay on config.provider (semantic-recall stability — see ADR 0006).
+  const providerOverride = providerOverrideForRuntime(config);
+
   // 1. Recall.
   const recalled = await recall(config, {
     agentId: input.agentId,
@@ -78,7 +84,7 @@ export async function reflect(config: RuntimeConfig, input: ReflectInput): Promi
   // routes to the OpenAI Responses API (or the chat-completions fallback for
   // local/openrouter).
   const userPrompt = `${systemMessage}\n\nQuestion: ${input.query}\n\nProvide your response.`;
-  const generated = await generateTaskSummary(config, userPrompt, []);
+  const generated = await generateTaskSummary(config, userPrompt, [], undefined, undefined, providerOverride);
 
   // 4. Extract opinions.
   const opinionStub = await generateStructured(config, {
@@ -87,7 +93,7 @@ export async function reflect(config: RuntimeConfig, input: ReflectInput): Promi
     schemaName: "OpinionExtractionResponse",
     validator: opinionExtractionValidator,
     echoTag: "opinion-formation"
-  });
+  }, providerOverride);
   const extracted = opinionStub.data.opinions ?? [];
   const insertedOpinions = await persistOpinions(config, bankId, input.agentId, extracted, input.sourceTaskId);
 

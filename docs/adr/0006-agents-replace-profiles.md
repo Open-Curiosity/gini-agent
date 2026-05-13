@@ -64,11 +64,14 @@ label.
   - `memoryNamespace: string` — the agent id; see ADR 0007.
   - `warnings: string[]` — unknown or disabled references; surfaced in
     `/api/status.activeAgent.warnings` but do not block activation.
-- Provider override is scoped strictly to `generateToolCallingResponse`.
-  Embeddings, reranker, summarizer (`generateTaskSummary`), and
-  `generateStructured` continue to read `config.provider`. Semantic
-  recall and post-hoc summarization keep working when an agent changes
-  inference targets.
+- Provider override applies to **all LLM generation** on the active task:
+  `generateToolCallingResponse` (chat-task inference), `generateStructured`
+  (Hindsight extraction in retain/reflect/reinforce — fact extraction,
+  observation regeneration, opinion formation, opinion assessment), and
+  `generateTaskSummary` (used by reflect for response generation, and by
+  legacy task summarization). Embeddings and the reranker continue to read
+  `config.provider` so semantic recall stays stable across agent switches.
+  See **Amendment 2026-05-13** below.
 - `RuntimeConfig.provider` is retained as a bootstrap seed.
   `seedDefaultAgentFromRuntimeConfig` copies `config.provider` onto the
   default agent on first run. `normalizeState` overwrites the default
@@ -161,11 +164,13 @@ silently bypassing the filter.
   `model`).** Rejected — clearer to require both `providerName` and
   `model` together for an override. Half-configured agents fall
   through to instance config.
-- **Allow provider override on embeddings/reranker/summarizer
-  paths.** Rejected — switching agents would invalidate semantic
-  recall against the current memory bank. Embeddings stay on
-  `config.provider` so recall continues to work across agent
-  switches.
+- **Allow provider override on embeddings/reranker paths.**
+  Rejected — switching agents would invalidate semantic recall against
+  the current memory bank. Embeddings and the reranker stay on
+  `config.provider` so recall continues to work across agent switches.
+  The summarizer (`generateTaskSummary`) and structured-generation
+  (`generateStructured`) calls *are* part of the override scope as of
+  the 2026-05-13 amendment — see below.
 
 ## Acceptance Checks
 
@@ -202,3 +207,33 @@ silently bypassing the filter.
   `activeAgent` block.
 - `src/types.ts` — `AgentRecord`, `ActiveAgentSnapshot`,
   `RuntimeStatus.activeAgent`.
+
+## Amendment 2026-05-13: Provider override extends to memory LLM calls
+
+Phase B scoped the provider override to `generateToolCallingResponse`
+only. Live testing on the davao instance found that Hindsight memory
+extraction (`retain`, `reflect`, `reinforce`) went through
+`generateStructured` and `generateTaskSummary`, both of which still
+read `config.provider` directly. The result: an agent configured with
+`codex / gpt-5.5` on an instance whose `config.provider` was
+`echo / gini-echo-v0` silently routed extraction through the echo
+provider, which returned `units: []` for every retain call.
+
+Resolution semantics are now:
+
+- `generateToolCallingResponse` — accepts `providerOverride` (Phase B).
+- `generateStructured` — accepts `providerOverride` (2026-05-13).
+  Callers: `retain` (fact extraction, observation regeneration),
+  `reflect` (opinion formation), `reinforce` (opinion assessment).
+- `generateTaskSummary` — accepts `providerOverride` (2026-05-13).
+  Callers: `reflect` (response generation), legacy task summary paths.
+- `getEmbeddingProvider` and the reranker — **unchanged.** They keep
+  reading `config.provider`. Switching the embedding model would
+  invalidate semantic recall against the current memory bank.
+
+The plumbing helper is
+`providerOverrideForRuntime(config)` in
+`src/execution/effective-context.ts`, which reads state, resolves the
+effective context, and returns the agent's provider when
+`providerSource === "agent"` (else `undefined`). Each memory pipeline
+resolves the override once at function entry and threads it through.

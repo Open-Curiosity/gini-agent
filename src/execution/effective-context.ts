@@ -20,6 +20,7 @@
 
 import type { ProviderConfig, RuntimeConfig, RuntimeState } from "../types";
 import { normalizeProvider } from "../provider";
+import { readState } from "../state";
 
 export interface EffectiveContext {
   agentId?: string;
@@ -111,4 +112,18 @@ export function resolveEffectiveContext(state: RuntimeState, config: RuntimeConf
     messagingTargetFilter,
     warnings
   };
+}
+
+// Convenience: read the current state and return the agent's provider override
+// (only when sourced from the agent). Used by memory pipelines (retain,
+// reflect, reinforce) so a single LLM call follows the agent's provider
+// without those modules each rebuilding the resolve/source check.
+//
+// Embeddings and the reranker do NOT use this — they continue to read
+// config.provider directly so semantic recall stays stable across agent
+// switches (see ADR 0006).
+export function providerOverrideForRuntime(config: RuntimeConfig): ProviderConfig | undefined {
+  const state = readState(config.instance);
+  const effective = resolveEffectiveContext(state, config);
+  return effective.providerSource === "agent" ? effective.provider : undefined;
 }

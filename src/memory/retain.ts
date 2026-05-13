@@ -45,6 +45,7 @@ import {
 } from "../state";
 import { generateStructured } from "../provider";
 import { cosineSimilarity, getEmbeddingProvider } from "../embeddings";
+import { providerOverrideForRuntime } from "../execution/effective-context";
 import { resolveOrCreateEntity } from "./entities";
 import {
   factExtractionValidator,
@@ -91,6 +92,10 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
   const bankId = input.bankId ?? bankIdForAgent(input.agentId);
   const mentionedAt = input.mentionedAt ?? now();
 
+  // Resolve the active agent's provider override once (if any). Embedding
+  // and reranker calls keep reading config.provider — see ADR 0006.
+  const providerOverride = providerOverrideForRuntime(config);
+
   // 1. LLM extraction.
   const extraction = await generateStructured(config, {
     system: FACT_EXTRACTION_SYSTEM,
@@ -98,7 +103,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
     schemaName: "FactExtractionResponse",
     validator: factExtractionValidator,
     echoTag: "fact-extraction"
-  });
+  }, providerOverride);
   const facts = extraction.data.facts ?? [];
 
   // 2. Temporal normalization.
@@ -256,7 +261,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
   let observationsRegenerated = 0;
   for (const entityId of touchedEntityIds) {
     try {
-      await regenerateObservation(config, bankId, entityId, input.agentId);
+      await regenerateObservation(config, bankId, entityId, input.agentId, providerOverride);
       observationsRegenerated += 1;
     } catch (error) {
       // Observation failures are non-fatal — emit a trace and continue.
@@ -343,7 +348,13 @@ async function maybeReinforceOpinions(config: RuntimeConfig, bankId: string, uni
   }
 }
 
-async function regenerateObservation(config: RuntimeConfig, bankId: string, entityId: string, agentId: string): Promise<void> {
+async function regenerateObservation(
+  config: RuntimeConfig,
+  bankId: string,
+  entityId: string,
+  agentId: string,
+  providerOverride?: import("../types").ProviderConfig
+): Promise<void> {
   const instance = config.instance;
   const facts = unitsForEntity(instance, entityId, OBSERVATION_FACT_LIMIT)
     .filter((unit) => unit.network === "world" || unit.network === "experience");
@@ -366,7 +377,7 @@ async function regenerateObservation(config: RuntimeConfig, bankId: string, enti
     schemaName: "ObservationExtractionResponse",
     validator: observationExtractionValidator,
     echoTag: `observation:${entityId}`
-  });
+  }, providerOverride);
   const observations = result.data.observations.map((entry) => entry.observation).filter(Boolean);
   if (observations.length === 0) return;
   const summary = observations.join(" ");
