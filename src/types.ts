@@ -715,17 +715,29 @@ export interface SnapshotRecord {
   auditCount: number;
 }
 
+export interface ProviderHealth {
+  ok: boolean;
+  provider: ProviderConfig;
+  configured: boolean;
+  authPath?: string;
+  credentialType?: string;
+  message?: string;
+}
+
 export interface RuntimeStatus {
   ok: boolean;
   instance: Instance;
   port: number;
   stateRoot: string;
+  workspaceRoot?: string;
   pid?: number;
   taskCounts: Record<TaskStatus, number>;
   pendingApprovals: number;
   activeJobs: number;
   missedJobs: number;
   connectors: number;
+  memoryUnits?: number;
+  provider?: ProviderHealth;
 }
 
 export interface ProviderResult {

@@ -4,7 +4,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { PageHeader } from "@/components/PageHeader";
 import { api } from "@/lib/api";
-import { useInvalidate } from "@/lib/queries";
+import { useInvalidate, useStatus } from "@/lib/queries";
 import { ProviderCard, type ProviderCatalogItem } from "./_components/ProviderCard";
 import { ProfileCard, type ProfileRow } from "./_components/ProfileCard";
 import { ToolsetsCard, type ToolsetRow } from "./_components/ToolsetsCard";
@@ -13,6 +13,7 @@ import { DevicesCard, type DeviceRow } from "./_components/DevicesCard";
 
 export default function SettingsPage() {
   const invalidate = useInvalidate();
+  const status = useStatus();
   const catalog = useQuery({
     queryKey: ["providers"],
     queryFn: () => api<ProviderCatalogItem[]>("/providers/catalog"),
@@ -89,15 +90,16 @@ export default function SettingsPage() {
   });
 
   const activeProfileId = profiles.data?.activeProfileId;
-  const activeProfile = profiles.data?.profiles.find((p) => p.id === activeProfileId);
-  const catalogEntry = catalog.data?.find((c) => c.name === activeProfile?.providerName);
-  const activeProviderDisplayName = catalogEntry?.displayName ?? activeProfile?.providerName;
+  const effectiveProviderName = status.data?.provider?.provider?.name;
+  const effectiveProviderModel = status.data?.provider?.provider?.model;
+  const catalogEntry = catalog.data?.find((c) => c.name === effectiveProviderName);
+  const displayName = catalogEntry?.displayName ?? effectiveProviderName;
 
   return (
     <>
       <PageHeader title="Settings" description="Providers, profiles, toolsets, integrations, devices" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
-        <ProviderCard displayName={activeProviderDisplayName} model={activeProfile?.model} />
+        <ProviderCard displayName={displayName} model={effectiveProviderModel} />
 
         <ProfileCard
           profiles={profiles.data?.profiles ?? []}
