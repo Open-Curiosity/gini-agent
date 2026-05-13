@@ -598,6 +598,37 @@ describe("runtime api", () => {
     expect(chat.messages.some((message: { role: string; runId?: string }) => message.role === "assistant" && message.runId === submitted.runId)).toBe(true);
     expect(runs.some((item: { id: string }) => item.id === submitted.runId)).toBe(true);
   });
+
+  test("identity CRUD round-trips through /api/identities without persisting plaintext secrets", async () => {
+    const config = testConfig("identity-crud");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/identities", {
+      method: "POST",
+      body: JSON.stringify({ kind: "linear", name: "primary linear", scopes: ["read"], secrets: { token: "lin_secret_abc" } })
+    });
+
+    expect(created.kind).toBe("linear");
+    expect(created.secretRefs).toHaveLength(1);
+    expect(created.secretRefs[0].purpose).toBe("token");
+    const raw = readFileSync(`${config.stateRoot}/state.json`, "utf8");
+    expect(raw).not.toContain("lin_secret_abc");
+
+    const listed = await call(handler, config, "/api/identities");
+    expect(listed.some((item: { id: string }) => item.id === created.id)).toBe(true);
+
+    await call(handler, config, `/api/identities/${created.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ secrets: { token: "lin_secret_xyz" } })
+    });
+    const auditAfterRotate = readState(config.instance).audit;
+    expect(auditAfterRotate.some((event) => event.action === "identity.rotate")).toBe(true);
+
+    await call(handler, config, `/api/identities/${created.id}`, { method: "DELETE" });
+    const after = await call(handler, config, "/api/identities");
+    expect(after.some((item: { id: string }) => item.id === created.id)).toBe(false);
+    expect(existsSync(`${config.stateRoot}/secrets/${created.id}.token.json`)).toBe(false);
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
