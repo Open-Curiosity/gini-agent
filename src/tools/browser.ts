@@ -24,8 +24,9 @@
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import { join } from "node:path";
 import { instanceRoot } from "../paths";
+import { generateVisionAnalysis } from "../provider";
 import { readState } from "../state";
-import type { BrowserConnectionRecord, Instance } from "../types";
+import type { BrowserConnectionRecord, Instance, RuntimeConfig } from "../types";
 
 // Per-instance Chrome profile directory. The agent persists ALL sign-ins
 // and cookies here; the directory survives Connect/Disconnect cycles and
@@ -1217,6 +1218,42 @@ export async function browserClose(taskId: string, _args: Record<string, unknown
   }
 }
 
+// Screenshot the current page and ask the configured vision model a question
+// about it. Returns the model's text answer. The agent never sees the
+// screenshot bytes — vision is a side call mediated by the provider layer so
+// pixels stay out of the agent loop's transcript. One image per invocation;
+// `full` toggles fullPage vs viewport. Cost is bounded by the provider's
+// default 512-token response budget.
+export async function browserVision(
+  taskId: string,
+  args: Record<string, unknown>,
+  config: RuntimeConfig
+): Promise<string> {
+  const question = str(args.question);
+  if (!question) return fail("Missing required string argument: question");
+  const full = bool(args.full, false);
+  try {
+    return await withSession(taskId, async (session) => {
+      const buf = await session.page.screenshot({ type: "png", fullPage: full });
+      const imageBase64 = Buffer.from(buf).toString("base64");
+      const result = await generateVisionAnalysis(config, {
+        prompt: question,
+        imageBase64,
+        mimeType: "image/png",
+        maxTokens: 512
+      });
+      return ok({
+        url: session.page.url(),
+        answer: result.text,
+        bytes: buf.length,
+        full
+      });
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
 // Internal hooks exported for unit tests. The session manager keeps its
 // state module-local so production callers don't accidentally poke at the
 // shared browser; tests need controlled access to verify the
@@ -1288,6 +1325,19 @@ export const __test = {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight,
+      ownsContext: false
+    });
+  },
+  // Install a synthetic session with a caller-provided `page` so tool
+  // entry points (browserVision, etc.) can be exercised against a
+  // hand-built page without spawning Chromium.
+  installFakeSessionWithPageForTest(taskId: string, page: Pick<Page, "screenshot" | "url">): void {
+    sessions.set(taskId, {
+      context: {} as BrowserContext,
+      page: page as unknown as Page,
+      refs: new Map(),
+      lastActivity: Date.now(),
+      inFlight: 0,
       ownsContext: false
     });
   },

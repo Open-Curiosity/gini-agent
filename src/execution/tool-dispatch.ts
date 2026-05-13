@@ -36,7 +36,8 @@ import {
   browserPress,
   browserScroll,
   browserSnapshot,
-  browserType
+  browserType,
+  browserVision
 } from "../tools/browser";
 
 export type DispatchResult =
@@ -93,6 +94,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.console", browserConsole, args) };
     case "browser_close":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.close", browserClose, args) };
+    case "browser_vision":
+      return { kind: "sync", result: await browserDispatchWithConfig(config, taskId, "browser.vision", browserVision, args) };
     case "file_write":
       return { kind: "pending", approvalId: await requestFileWrite(config, taskId, toolCallId, args) };
     case "file_patch":
@@ -208,7 +211,31 @@ async function browserDispatch(
   fn: (taskId: string, args: Record<string, unknown>) => Promise<string>,
   args: Record<string, unknown>
 ): Promise<string> {
-  const result = await fn(taskId, args);
+  return runBrowserDispatch(config, taskId, action, () => fn(taskId, args), args);
+}
+
+// Variant for browser tools that need the runtime config (e.g. browser_vision,
+// which threads the configured provider through to generateVisionAnalysis).
+// Kept separate from browserDispatch so the 9 existing tools keep their
+// stable `(taskId, args)` signature.
+async function browserDispatchWithConfig(
+  config: RuntimeConfig,
+  taskId: string,
+  action: string,
+  fn: (taskId: string, args: Record<string, unknown>, config: RuntimeConfig) => Promise<string>,
+  args: Record<string, unknown>
+): Promise<string> {
+  return runBrowserDispatch(config, taskId, action, () => fn(taskId, args, config), args);
+}
+
+async function runBrowserDispatch(
+  config: RuntimeConfig,
+  taskId: string,
+  action: string,
+  exec: () => Promise<string>,
+  args: Record<string, unknown>
+): Promise<string> {
+  const result = await exec();
   const risk: "low" | "medium" = action === "browser.click" || action === "browser.type" ? "medium" : "low";
   let parsed: { success?: boolean; error?: string } = {};
   try {

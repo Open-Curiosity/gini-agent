@@ -311,6 +311,22 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_vision",
+      description: "Screenshot the current page and ask the configured vision model a question about what's visible. Returns the model's text answer. Use when the accessibility snapshot can't capture what you need (charts, image-only content, visual layout, captchas-by-description). One image per call.",
+      parameters: {
+        type: "object",
+        properties: {
+          question: { type: "string", description: "Question to ask about the page screenshot." },
+          full: { type: "boolean", default: false, description: "If true, capture the full scrollable page; otherwise just the viewport." }
+        },
+        required: ["question"]
+      }
+    }
+  },
+  {
     // Schedule a real cron/job. The job's output is delivered as an
     // assistant message back into the originating chat session when it
     // fires. Low-risk: no approval gate — the user can pause/delete the

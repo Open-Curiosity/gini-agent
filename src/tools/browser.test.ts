@@ -3,13 +3,16 @@ import { rmSync } from "node:fs";
 import {
   __test as browserTest,
   browserNavigate,
+  browserVision,
   closeAll,
   disconnectSharedBrowser,
   safetyCheck,
   setBrowserInstance,
   withTeardownLock
 } from "./browser";
+import { clearEchoVisionResponses, setEchoVisionResponse } from "../provider";
 import { mutateState, readState } from "../state";
+import type { RuntimeConfig } from "../types";
 
 // Direct unit coverage for the URL safety guard. We exercise the function
 // without spinning up Chromium since the guard runs synchronously on the
@@ -633,5 +636,78 @@ describe("ensureShared default headless persistent launch", () => {
     expect(call.options.headless).toBe(true);
     expect(call.dataDir).toContain("chrome-profile");
     expect(call.dataDir).toContain(instance);
+  });
+});
+
+// browser_vision: screenshots the current page and asks the configured vision
+// model a question. We install a fake session with a stub `page.screenshot`
+// so we don't need a real Chromium, and route the provider through the echo
+// stub so the model response is deterministic.
+describe("browserVision", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    clearEchoVisionResponses();
+  });
+
+  test("screenshots the current page and threads the question through generateVisionAnalysis", async () => {
+    let screenshotCalls = 0;
+    const fakePage = {
+      screenshot: async (_opts: { type: "png"; fullPage?: boolean }) => {
+        screenshotCalls++;
+        // Tiny PNG header bytes — any non-empty Buffer is sufficient since
+        // the provider call is stubbed.
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      },
+      url: () => "https://example.com/dashboard"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-task", fakePage);
+
+    setEchoVisionResponse({ text: "There is a login form in the center of the page." });
+
+    const config: RuntimeConfig = {
+      instance: "test",
+      port: 7337,
+      token: "test",
+      provider: { name: "echo", model: "gini-echo-v0" },
+      workspaceRoot: "/tmp",
+      stateRoot: "/tmp/gini-vision-test",
+      logRoot: "/tmp/gini-vision-test-logs"
+    };
+    const raw = await browserVision("vision-task", { question: "What is on this page?" }, config);
+    const parsed = JSON.parse(raw) as {
+      success: boolean;
+      answer?: string;
+      bytes?: number;
+      url?: string;
+      full?: boolean;
+    };
+    expect(parsed.success).toBe(true);
+    expect(parsed.answer).toContain("login form");
+    expect(parsed.bytes).toBeGreaterThan(0);
+    expect(parsed.url).toBe("https://example.com/dashboard");
+    expect(parsed.full).toBe(false);
+    expect(screenshotCalls).toBe(1);
+  });
+
+  test("rejects calls missing the required question argument", async () => {
+    const fakePage = {
+      screenshot: async () => Buffer.from([0x89]),
+      url: () => "https://example.com/"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-missing-q", fakePage);
+    const config: RuntimeConfig = {
+      instance: "test",
+      port: 7337,
+      token: "test",
+      provider: { name: "echo", model: "gini-echo-v0" },
+      workspaceRoot: "/tmp",
+      stateRoot: "/tmp/gini-vision-test",
+      logRoot: "/tmp/gini-vision-test-logs"
+    };
+    const raw = await browserVision("vision-missing-q", {}, config);
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/question/i);
   });
 });
