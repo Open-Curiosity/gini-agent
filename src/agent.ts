@@ -266,11 +266,19 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
       // `.catch(failTask)` records the side-effect failure.
       if (config.dangerouslyAutoApprove && next.status === "waiting_approval" && next.approvalIds.length > 0) {
         const approvalId = next.approvalIds[next.approvalIds.length - 1]!;
-        await resolveApproval(config, approvalId, {
-          actor: "runtime",
-          resumeChatTask: false,
-          evidenceExtra: { autoApproved: true, autoApprovedReason: "dangerouslyAutoApprove" }
-        });
+        try {
+          await resolveApproval(config, approvalId, {
+            actor: "runtime",
+            resumeChatTask: false,
+            evidenceExtra: { autoApproved: true, autoApprovedReason: "dangerouslyAutoApprove" }
+          });
+        } catch (err) {
+          // Race-loss is benign on the imperative path too: another
+          // caller decided the approval first and owns the task's
+          // terminal transition. Anything else propagates to
+          // submitTask's outer .catch(failTask).
+          if (!(err instanceof ApprovalRaceLostError)) throw err;
+        }
         const refreshed = readState(config.instance).tasks.find((t) => t.id === taskId);
         return finishTaskTransition(config, refreshed ?? next);
       }
@@ -642,6 +650,25 @@ export class ApprovedActionFailedError extends Error {
   }
 }
 
+// Thrown when resolveApproval is called on an approval that another
+// caller already decided (a concurrent deny, sibling-cancel cascade, or
+// double approve). The auto-approve path uses this to distinguish "the
+// approval was decided by someone else while I was scheduling" — which
+// is benign and should produce a no-op tool result — from a real
+// side-effect failure that must fail the owning task. The other party
+// already handled the task's terminal transition; the auto path's job
+// is just to stop pretending it owns the action.
+export class ApprovalRaceLostError extends Error {
+  public approvalId: string;
+  public status: string;
+  constructor(approvalId: string, status: string) {
+    super(`Approval is already ${status}`);
+    this.name = "ApprovalRaceLostError";
+    this.approvalId = approvalId;
+    this.status = status;
+  }
+}
+
 export async function resolveApproval(
   config: RuntimeConfig,
   approvalId: string,
@@ -652,7 +679,7 @@ export async function resolveApproval(
   const approval = await mutateState(config.instance, (state) => {
     const item = state.approvals.find((candidate) => candidate.id === approvalId);
     if (!item) throw new Error(`Approval not found: ${approvalId}`);
-    if (item.status !== "pending") throw new Error(`Approval is already ${item.status}`);
+    if (item.status !== "pending") throw new ApprovalRaceLostError(approvalId, item.status);
     item.status = "approved";
     item.updatedAt = now();
     addAudit(state, {
@@ -758,7 +785,10 @@ async function executeApprovedAction(
         taskId: approval.taskId,
         runId: approval.taskId ? state.tasks.find((task) => task.id === approval.taskId)?.runId : undefined,
         approvalId: approval.id,
-        evidence: { beforeBytes: before.length, afterBytes: String(approval.payload.content).length, ...extraEvidence }
+        // Spread caller markers FIRST so the runtime-owned canonical
+        // fields (beforeBytes/afterBytes/etc.) cannot be overwritten by
+        // an `as any` cast smuggling extra keys past AutoApproveMarkers.
+        evidence: { ...extraEvidence, beforeBytes: before.length, afterBytes: String(approval.payload.content).length }
       });
       if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, "File write completed.");
       return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
@@ -792,7 +822,7 @@ async function executeApprovedAction(
         taskId: approval.taskId,
         runId: approval.taskId ? state.tasks.find((task) => task.id === approval.taskId)?.runId : undefined,
         approvalId: approval.id,
-        evidence: { diff: approval.payload.diff, beforeBytes: before.length, afterBytes: after.length, ...extraEvidence }
+        evidence: { ...extraEvidence, diff: approval.payload.diff, beforeBytes: before.length, afterBytes: after.length }
       });
       if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, "File patch completed.");
       return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
@@ -848,6 +878,7 @@ async function executeApprovedAction(
         runId: approval.taskId ? state.tasks.find((task) => task.id === approval.taskId)?.runId : undefined,
         approvalId: approval.id,
         evidence: {
+          ...extraEvidence,
           exitCode,
           stdout: stdout.slice(0, 4000),
           stderr: stderr.slice(0, 4000),
@@ -857,8 +888,7 @@ async function executeApprovedAction(
           stderrTruncated: stderr.length > 4000,
           artifactPath: artifact?.path,
           artifactRelPath: artifact?.relPath,
-          pty: usePty,
-          ...extraEvidence
+          pty: usePty
         }
       });
       if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, exitCode === 0 ? "Command completed." : "Command failed.", exitCode === 0 ? undefined : stderr);
@@ -924,7 +954,7 @@ async function executeApprovedAction(
         taskId: approval.taskId,
         runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
         approvalId: approval.id,
-        evidence: { ref, path: displayPath, success: parsed.success !== false, error: parsed.error ?? null, ...extraEvidence }
+        evidence: { ...extraEvidence, ref, path: displayPath, success: parsed.success !== false, error: parsed.error ?? null }
       });
       if (approval.taskId && !chatToolCallId) {
         completeApprovedTask(
@@ -1015,6 +1045,7 @@ export async function runTerminalCommand(
       taskId,
       runId: item.runId,
       evidence: {
+        ...options.evidenceExtra,
         exitCode,
         stdout: stdout.slice(0, 4000),
         stderr: stderr.slice(0, 4000),
@@ -1024,8 +1055,7 @@ export async function runTerminalCommand(
         stderrTruncated: stderr.length > 4000,
         artifactPath: artifact.path,
         artifactRelPath: artifact.relPath,
-        pty: usePty,
-        ...options.evidenceExtra
+        pty: usePty
       }
     });
     item.updatedAt = now();

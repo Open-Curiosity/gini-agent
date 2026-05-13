@@ -322,6 +322,39 @@ describe("dangerouslyAutoApprove dispatch", () => {
     rmSync(outside, { recursive: true, force: true });
   });
 
+  test("rejects writes through a broken symlink leaf pointing outside the workspace (S1 round 2)", async () => {
+    // existsSync follows symlinks and would treat a workspace-internal
+    // symlink whose target doesn't yet exist as "missing leaf",
+    // letting the parent realpath check pass. lstatSync stops the walk
+    // at the symlink itself, realpath resolves to the outside target,
+    // and the escape is detected.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-dangerously-ws-"));
+    const outside = mkdtempSync(join(tmpdir(), "gini-dangerously-outside-"));
+    // Symlink leaf -> nonexistent file outside workspace.
+    symlinkSync(join(outside, "nonexistent.txt"), join(workspaceRoot, "broken-leaf"));
+    const config = buildConfig(workspaceRoot, "dangerously-broken-sym", { dangerouslyAutoApprove: true });
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_w", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "broken-leaf", content: "should-not-land" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const task = await submitTask(config, "write through broken symlink", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("failed");
+    expect(existsSync(join(outside, "nonexistent.txt"))).toBe(false);
+    expect(finished.error ?? "").toContain("escapes workspace");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
   test("approved side-effect failures fail the task instead of being swallowed (B2)", async () => {
     // B2: With dangerouslyAutoApprove on, pendingOrAuto runs the side
     // effect inside dispatchToolCall via resolveApproval. If

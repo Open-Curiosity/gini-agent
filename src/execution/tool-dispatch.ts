@@ -21,7 +21,7 @@ import {
   now,
   readState
 } from "../state";
-import { ApprovedActionFailedError, findTask, resolveApproval, runTerminalCommand } from "../agent";
+import { ApprovalRaceLostError, ApprovedActionFailedError, findTask, resolveApproval, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
@@ -943,6 +943,16 @@ async function pendingOrAuto(
     });
     return { kind: "sync", result: toolResult ?? "Auto-approved." };
   } catch (err) {
+    // Race-loss: another caller (concurrent deny / cancel / double-
+    // approve) decided this approval between our request* call and our
+    // resolveApproval call. The other party is responsible for the
+    // task's terminal transition; we just stop pretending we own the
+    // action and let the chat-task loop's next-iteration cancellation
+    // check observe the decided state. Returning a sync tool result
+    // keeps the dispatch loop honest without escalating to task failure.
+    if (err instanceof ApprovalRaceLostError) {
+      return { kind: "sync", result: `Action skipped: approval was already ${err.status} by another caller.` };
+    }
     // Side-effect failed AFTER we marked the approval approved. Wrap in
     // ApprovedActionFailedError so the chat-task loop's generic catch
     // re-throws it (instead of converting to a recoverable tool result)

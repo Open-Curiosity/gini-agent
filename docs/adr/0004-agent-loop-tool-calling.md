@@ -64,7 +64,13 @@ through the same loop. So the loop comes first.
   messages so the timeline is unambiguous.
 - Approvals stay the only path to side effects. The model cannot bypass
   them: `dispatchToolCall` always creates an approval for high-risk
-  tools, and `executeApprovedAction` is the only writer.
+  tools, and `executeApprovedAction` is the only writer. The operator
+  may opt into the sanctioned bypass documented in ADR 0006
+  (`dangerouslyAutoApprove`), which still routes through approval
+  creation and `executeApprovedAction` but skips the human gate; the
+  audit trail then carries an `evidence.autoApprovedReason` marker so
+  reviewers can distinguish auto-approved actions from human-approved
+  ones.
 
 ## Deferred
 

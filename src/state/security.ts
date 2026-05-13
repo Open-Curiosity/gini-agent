@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 
 export function assertInsideWorkspace(workspaceRoot: string, targetPath: string): string {
@@ -23,16 +23,38 @@ export function assertInsideWorkspace(workspaceRoot: string, targetPath: string)
 export function assertInsideWorkspaceNoSymlinkEscape(workspaceRoot: string, targetPath: string): string {
   const target = assertInsideWorkspace(workspaceRoot, targetPath);
   const realWorkspace = realpathSync(resolve(workspaceRoot));
-  // Walk up until we find an existing ancestor of `target`. Newly-being-
-  // created directories won't realpath, so we anchor the check on the
-  // closest existing parent.
+  // Walk up until we find a path component that physically exists.
+  // lstatSync (NOT existsSync) is critical here — existsSync follows
+  // symlinks and would treat a workspace-internal symlink pointing at a
+  // *nonexistent* outside file (e.g. `workspace/out -> /tmp/x/new.txt`)
+  // as "missing leaf", letting the parent realpath pass and the
+  // subsequent writeFileSync materialize the file outside the
+  // workspace. lstat on a broken symlink returns the symlink's own
+  // stat, so we stop the walk at the symlink, realpath that, and
+  // detect that the symlink's target is outside.
   let probe = target;
-  while (!existsSync(probe)) {
-    const parent = dirname(probe);
-    if (parent === probe) break;
-    probe = parent;
+  while (true) {
+    try {
+      lstatSync(probe);
+      break;
+    } catch {
+      const parent = dirname(probe);
+      if (parent === probe) break;
+      probe = parent;
+    }
   }
-  const realProbe = existsSync(probe) ? realpathSync(probe) : probe;
+  // realpath resolves any symlinks in `probe` itself, so a symlink leaf
+  // whose target is outside the workspace becomes the outside path here
+  // and the relative check below catches it.
+  let realProbe: string;
+  try {
+    realProbe = realpathSync(probe);
+  } catch {
+    // Probe doesn't physically exist (we walked up past everything).
+    // Treat the lexical path as authoritative — assertInsideWorkspace
+    // already passed, so we're inside.
+    realProbe = probe;
+  }
   const rel = relative(realWorkspace, realProbe);
   // An empty `rel` means the probe IS the workspace root — allowed.
   // A leading `..` means we walked out of the workspace via a symlink.

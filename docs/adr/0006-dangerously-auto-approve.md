@@ -120,9 +120,11 @@ human gate or routes through the same shared path.
 - A chat-task `file_write` with the flag off produces
   `status: "waiting_approval"` on the task and a single pending
   approval; with the flag on, the task completes with the file on
-  disk and audit rows
-  (`approval.requested`, `approval.approved`, `file.write`) all
-  carrying `autoApprovedReason: "dangerouslyAutoApprove"`.
+  disk and the `approval.approved` and `file.write` audit rows carry
+  `autoApprovedReason: "dangerouslyAutoApprove"`. The
+  `approval.requested` row is stamped by `createApproval` before the
+  marker is known and therefore does NOT carry the marker — its
+  presence still confirms the approval was created.
 - The same applies to `terminal_exec` when no `autoApproveCommands`
   pattern matches; an allowlist match preserves the existing fast
   path with no approval row created.
