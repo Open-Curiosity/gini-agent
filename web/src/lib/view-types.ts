@@ -122,17 +122,3 @@ export interface HindsightReflectView {
   usage: Record<string, unknown>;
 }
 
-// UI-shaped readiness response (the runtime's ParityCheck has the same
-// shape; the surrounding `ReadinessResult` is constructed in the HTTP layer
-// and is not exported from src/types.ts).
-export interface ReadinessResult {
-  ok: boolean;
-  generatedAt: string;
-  checks: Array<{
-    id: string;
-    label: string;
-    status: "pass" | "partial" | "missing";
-    evidence: string[];
-    requiredForV1: boolean;
-  }>;
-}

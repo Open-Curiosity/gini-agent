@@ -4,20 +4,14 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { PageHeader } from "@/components/PageHeader";
 import { api } from "@/lib/api";
-import { useInvalidate, useParity, useReadiness, useState_ } from "@/lib/queries";
-import { InstanceCard } from "./_components/InstanceCard";
+import { useInvalidate } from "@/lib/queries";
 import { ProviderCard, type ProviderCatalogItem } from "./_components/ProviderCard";
 import { ProfileCard, type ProfileRow } from "./_components/ProfileCard";
 import { ToolsetsCard, type ToolsetRow } from "./_components/ToolsetsCard";
 import { McpCard, MessagingCard, type McpRow, type MessagingRow } from "./_components/McpCard";
-import { DevicesCard, PromotionsCard, type DeviceRow, type PromotionRow } from "./_components/DevicesCard";
-import { SnapshotsCard, type SnapshotRow } from "./_components/SnapshotsCard";
-import { ParityCard } from "./_components/ParityCard";
+import { DevicesCard, type DeviceRow } from "./_components/DevicesCard";
 
 export default function SettingsPage() {
-  const state = useState_();
-  const parity = useParity();
-  const readiness = useReadiness();
   const invalidate = useInvalidate();
   const catalog = useQuery({
     queryKey: ["providers"],
@@ -44,13 +38,6 @@ export default function SettingsPage() {
     queryKey: ["devices"],
     queryFn: () => api<DeviceRow[]>("/devices")
   });
-  const promotions = useQuery({
-    queryKey: ["promotions"],
-    queryFn: () => api<PromotionRow[]>("/promotions")
-  });
-  // Snapshots are exposed via /api/state but not via a dedicated /snapshots
-  // route, so we read from the state snapshot. (See src/state.ts:readState.)
-  const snapshots = ((state.data?.snapshots ?? []) as SnapshotRow[]).slice().reverse();
 
   const useProfile = useMutation({
     mutationFn: (id: string) => api(`/profiles/${encodeURIComponent(id)}/use`, { method: "POST" }),
@@ -101,16 +88,13 @@ export default function SettingsPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
-  const activeProfileId = profiles.data?.activeProfileId ?? state.data?.activeProfileId;
+  const activeProfileId = profiles.data?.activeProfileId;
 
   return (
     <>
-      <PageHeader title="Settings" description="Instance, providers, profiles, integrations, devices, parity & readiness" />
+      <PageHeader title="Settings" description="Providers, profiles, integrations, devices" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
-        <div className="grid gap-3 lg:grid-cols-2">
-          <InstanceCard instance={state.data?.instance} activeProfileId={activeProfileId} />
-          <ProviderCard catalog={catalog.data} />
-        </div>
+        <ProviderCard catalog={catalog.data} />
 
         <ProfileCard
           profiles={profiles.data?.profiles ?? []}
@@ -148,15 +132,6 @@ export default function SettingsPage() {
           onRevoke={(id) => deviceRevoke.mutate(id)}
           onCreatePairing={() => createPairing.mutate()}
         />
-
-        <PromotionsCard promotions={promotions.data ?? []} />
-
-        <SnapshotsCard snapshots={snapshots} />
-
-        <div className="grid gap-3 lg:grid-cols-2">
-          <ParityCard title="Hermes parity" result={parity.data} />
-          <ParityCard title="V1 readiness" result={readiness.data} />
-        </div>
       </div>
     </>
   );

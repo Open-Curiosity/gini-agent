@@ -19,7 +19,6 @@ import type {
 import type {
   ChatMessage,
   ChatSession,
-  ReadinessResult,
   RuntimeStateSnapshot
 } from "@/lib/view-types";
 
@@ -227,22 +226,6 @@ export function useRenameChatSession() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["chat"] });
     }
-  });
-}
-
-export function useReadiness() {
-  return useQuery<ReadinessResult>({
-    queryKey: ["readiness"],
-    queryFn: () => api<ReadinessResult>("/readiness/v1"),
-    refetchInterval: 30_000
-  });
-}
-
-export function useParity() {
-  return useQuery<ReadinessResult>({
-    queryKey: ["parity"],
-    queryFn: () => api<ReadinessResult>("/parity/hermes"),
-    refetchInterval: 30_000
   });
 }
 
