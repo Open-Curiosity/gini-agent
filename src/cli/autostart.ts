@@ -21,7 +21,7 @@
 //     anything else triggers a respawn.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Instance } from "../types";
@@ -80,64 +80,62 @@ export interface ResolveLaunchOptions {
   projectRootOverride?: string;
 }
 
-// Decide whether to point launchd at the installed wrapper or at the source
-// checkout. The installed wrapper at ~/.local/bin/gini sources
-// ~/.gini/secrets.env, sets GINI_INSTANCE, cds into ~/.gini/runtime, and
-// execs `bun run gini`, which gives the LaunchAgent the same environment as
-// the user's shell would.
+// Build the launchd command line. We exec the Bun-driven runtime *directly*
+// — `bun run src/server.ts --instance <name>` — instead of going through the
+// `~/.local/bin/gini` wrapper or `gini run`. Two reasons:
 //
-// We deliberately also check that ~/.gini/runtime exists as a runtime
-// checkout, not just that the wrapper file is present. A stale wrapper
-// pointing at a deleted runtime dir would fail at exec time with no useful
-// signal.
+//   1. Single-process job. The wrapper/CLI path spawns a chain
+//      (bash → bun → bun → bun-server). When launchd kills the head, child
+//      processes can outlive the head briefly and exit cleanly via their
+//      own SIGTERM handlers; launchd then sees a "successful exit" for the
+//      job and KeepAlive.SuccessfulExit:false suppresses respawn. Direct
+//      exec collapses the tree to one process, so SIGKILL = signal exit
+//      and KeepAlive respawns reliably.
+//
+//   2. Exit code is what we control. The server's SIGTERM handler
+//      (src/server.ts) does process.exit(0), so `launchctl stop` (or
+//      `gini stop` SIGTERM) produces a clean exit; KeepAlive.SuccessfulExit:false
+//      then honors that intent and won't respawn.
+//
+// The runtimeDir vs repoRoot decision still matters because that's where
+// `bun run` finds package.json / src/. Installed flow → ~/.gini/runtime.
+// Source flow → the project root we were invoked from. We sanity-check
+// that runtimeDir actually has a runtime checkout before trusting it.
 export function resolveLaunchSpec(options: ResolveLaunchOptions): LaunchSpec {
   const fileExists = options.fileExists ?? existsSync;
   const home = options.homeOverride ?? process.env.HOME ?? homedir();
   const bunPath = options.bunPathOverride ?? process.execPath;
   const repoRoot = options.projectRootOverride ?? projectRoot();
-  const wrapperPath = join(home, ".local", "bin", "gini");
   const runtimeDir = join(home, ".gini", "runtime");
 
-  const wrapperUsable = fileExists(wrapperPath)
-    && isInstallerManagedWrapper(wrapperPath, fileExists)
-    && fileExists(join(runtimeDir, "package.json"));
+  const runtimeUsable = fileExists(join(runtimeDir, "package.json"))
+    && fileExists(join(runtimeDir, "src", "server.ts"));
 
-  // Always make bun's directory available on PATH so the wrapper (or `bun
-  // run` in the source-flow branch) can resolve it. macOS launchd hands the
-  // service a minimal PATH; we explicitly extend it rather than copy the
-  // parent shell's because the agent must work across reboots too.
+  // Always make bun's directory available on PATH so child invocations
+  // (e.g. `bun install` triggers from inside the runtime) can resolve it.
+  // macOS launchd hands the service a minimal PATH; we explicitly extend
+  // it rather than copy the parent shell's because the agent must work
+  // across reboots too.
   const baseEnv: Record<string, string> = {
     PATH: buildLaunchAgentPath(bunPath, home),
     HOME: home,
     LANG: process.env.LANG ?? "en_US.UTF-8"
   };
+  // Propagate state/log root overrides so an `autostart enable` invoked
+  // with GINI_STATE_ROOT=/tmp/... (e2e test, parallel agent) embeds the
+  // same override in the plist. Without this, the launchd-spawned runtime
+  // would happily fall back to ~/.gini and trample the developer's real
+  // install. Production installs leave these env vars unset, so the
+  // embedded record is empty and the runtime uses the standard layout.
+  if (process.env.GINI_STATE_ROOT) baseEnv.GINI_STATE_ROOT = process.env.GINI_STATE_ROOT;
+  if (process.env.GINI_LOG_ROOT) baseEnv.GINI_LOG_ROOT = process.env.GINI_LOG_ROOT;
 
-  if (wrapperUsable) {
-    return {
-      programArguments: [wrapperPath, "run", "--instance", options.instance, "--no-web"],
-      workingDirectory: runtimeDir,
-      environment: { ...baseEnv, GINI_INSTANCE: options.instance }
-    };
-  }
-
-  // Source-flow: invoke `bun run gini run --instance <name>` from the
-  // repo root. We pass the absolute path of bun so we don't depend on PATH
-  // resolution at exec time (still set PATH in env for child invocations).
+  const workingDirectory = runtimeUsable ? runtimeDir : repoRoot;
   return {
-    programArguments: [bunPath, "run", "gini", "run", "--instance", options.instance, "--no-web"],
-    workingDirectory: repoRoot,
+    programArguments: [bunPath, "run", "src/server.ts", "--instance", options.instance],
+    workingDirectory,
     environment: { ...baseEnv, GINI_INSTANCE: options.instance }
   };
-}
-
-function isInstallerManagedWrapper(path: string, fileExists: (p: string) => boolean): boolean {
-  if (!fileExists(path)) return false;
-  try {
-    const contents = readFileSync(path, "utf8");
-    return contents.split("\n").some((line) => line.trim() === "# gini-agent-installer-managed");
-  } catch {
-    return false;
-  }
 }
 
 function buildLaunchAgentPath(bunPath: string, home: string): string {
@@ -186,11 +184,18 @@ export function generatePlist(options: PlistOptions): string {
 
   // Per the ADR-style decisions in /tmp/claude-context-gini-autostart.md:
   //   - KeepAlive is a dict (not bool). SuccessfulExit:false means a clean
-  //     `gini stop` (exit 0) is NOT respawned; anything non-zero IS. The
-  //     NetworkState:true gate avoids relaunching the runtime before the
-  //     network is up at boot.
+  //     `gini stop` (exit 0) is NOT respawned; anything non-zero IS.
   //   - ThrottleInterval:10 caps crashloop CPU.
   //   - RunAtLoad:true means it starts at user login.
+  //
+  // NetworkState was considered (would gate first-boot launches until the
+  // network came up) but launchd treats NetworkState as a *pended-spawn
+  // semaphore*: even after a non-zero exit, the next spawn waits for a
+  // network-state transition, which doesn't fire when the network was
+  // already up. Empirically that prevents respawn-after-SIGKILL entirely.
+  // The runtime tolerates a network-not-yet-up startup (provider auth
+  // retries with backoff), so dropping NetworkState gets us the contract
+  // that matters — clean `gini stop` honored, crash respawned.
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -213,8 +218,6 @@ ${envEntries}
     <dict>
         <key>SuccessfulExit</key>
         <false/>
-        <key>NetworkState</key>
-        <true/>
     </dict>
     <key>ThrottleInterval</key>
     <integer>${throttle}</integer>
@@ -323,7 +326,6 @@ export function unsupportedPlatformMessage(): string {
 }
 
 export const __testing = {
-  isInstallerManagedWrapper,
   buildLaunchAgentPath,
   escapeXml
 };

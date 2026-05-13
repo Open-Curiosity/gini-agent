@@ -64,14 +64,10 @@ describe("resolveLaunchSpec", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  test("prefers the installed wrapper when both wrapper and runtime/package.json exist", () => {
-    mkdirSync(join(home, ".local", "bin"), { recursive: true });
-    writeFileSync(
-      join(home, ".local", "bin", "gini"),
-      "#!/usr/bin/env bash\n# gini-agent-installer-managed\nexec bun run gini \"$@\"\n"
-    );
-    mkdirSync(join(home, ".gini", "runtime"), { recursive: true });
+  test("uses ~/.gini/runtime as workingDirectory when a runtime checkout exists", () => {
+    mkdirSync(join(home, ".gini", "runtime", "src"), { recursive: true });
     writeFileSync(join(home, ".gini", "runtime", "package.json"), '{"name":"gini-agent"}');
+    writeFileSync(join(home, ".gini", "runtime", "src", "server.ts"), "// stub\n");
 
     const spec = resolveLaunchSpec({
       instance: "main",
@@ -79,14 +75,16 @@ describe("resolveLaunchSpec", () => {
       bunPathOverride: "/Users/test/.bun/bin/bun"
     });
 
-    expect(spec.programArguments[0]).toBe(join(home, ".local", "bin", "gini"));
-    expect(spec.programArguments).toContain("--instance");
-    expect(spec.programArguments).toContain("main");
-    expect(spec.programArguments).toContain("run");
-    // --no-web: web is launched by the user/CLI, not by the agent. Auto-
-    // starting Next.js inside launchd would conflict with the dev-loop
-    // workflow (a user running `gini start --web` interactively).
-    expect(spec.programArguments).toContain("--no-web");
+    // Direct exec of bun against the server entry — no wrapper, no CLI
+    // layer. Single-process job so SIGKILL is reliably observed by launchd
+    // and KeepAlive.SuccessfulExit:false respawns it.
+    expect(spec.programArguments).toEqual([
+      "/Users/test/.bun/bin/bun",
+      "run",
+      "src/server.ts",
+      "--instance",
+      "main"
+    ]);
     expect(spec.workingDirectory).toBe(join(home, ".gini", "runtime"));
     expect(spec.environment.GINI_INSTANCE).toBe("main");
     expect(spec.environment.PATH).toContain("/Users/test/.bun/bin");
@@ -94,8 +92,7 @@ describe("resolveLaunchSpec", () => {
     expect(spec.environment.HOME).toBe(home);
   });
 
-  test("falls back to bun run when no installer-managed wrapper is present", () => {
-    // No wrapper at all → source-flow.
+  test("falls back to repo root when ~/.gini/runtime is not a runtime checkout", () => {
     const spec = resolveLaunchSpec({
       instance: "dev",
       homeOverride: home,
@@ -105,20 +102,16 @@ describe("resolveLaunchSpec", () => {
 
     expect(spec.programArguments[0]).toBe("/opt/bun/bin/bun");
     expect(spec.programArguments).toContain("run");
-    expect(spec.programArguments).toContain("gini");
+    expect(spec.programArguments).toContain("src/server.ts");
     expect(spec.programArguments).toContain("--instance");
     expect(spec.programArguments).toContain("dev");
-    expect(spec.programArguments).toContain("--no-web");
     expect(spec.workingDirectory).toBe("/repo/gini");
     expect(spec.environment.GINI_INSTANCE).toBe("dev");
     expect(spec.environment.PATH).toContain("/opt/bun/bin");
   });
 
-  test("rejects wrappers that aren't installer-managed (no marker comment)", () => {
-    // A user might have their own ~/.local/bin/gini for a different agent;
-    // we must not exec it from launchd.
-    mkdirSync(join(home, ".local", "bin"), { recursive: true });
-    writeFileSync(join(home, ".local", "bin", "gini"), "#!/usr/bin/env bash\nexec foo\n");
+  test("falls back to repo root when runtime dir lacks src/server.ts (stale install)", () => {
+    // package.json present but no src/server.ts → not a usable checkout.
     mkdirSync(join(home, ".gini", "runtime"), { recursive: true });
     writeFileSync(join(home, ".gini", "runtime", "package.json"), '{"name":"gini-agent"}');
 
@@ -129,29 +122,51 @@ describe("resolveLaunchSpec", () => {
       projectRootOverride: "/repo/gini"
     });
 
-    // Source-flow because the wrapper isn't recognized as ours.
-    expect(spec.programArguments[0]).toBe("/Users/test/.bun/bin/bun");
     expect(spec.workingDirectory).toBe("/repo/gini");
   });
 
-  test("rejects wrapper when runtime dir is missing (stale wrapper)", () => {
-    mkdirSync(join(home, ".local", "bin"), { recursive: true });
-    writeFileSync(
-      join(home, ".local", "bin", "gini"),
-      "#!/usr/bin/env bash\n# gini-agent-installer-managed\nexec bun run gini \"$@\"\n"
-    );
-    // Note: no ~/.gini/runtime/package.json — wrapper would fail at exec.
-
-    const spec = resolveLaunchSpec({
-      instance: "main",
-      homeOverride: home,
-      bunPathOverride: "/Users/test/.bun/bin/bun",
-      projectRootOverride: "/repo/gini"
-    });
-
-    expect(spec.programArguments[0]).toBe("/Users/test/.bun/bin/bun");
-    expect(spec.workingDirectory).toBe("/repo/gini");
+  test("propagates GINI_STATE_ROOT and GINI_LOG_ROOT into the plist environment when set", () => {
+    const prevState = process.env.GINI_STATE_ROOT;
+    const prevLog = process.env.GINI_LOG_ROOT;
+    process.env.GINI_STATE_ROOT = "/tmp/scratch-state";
+    process.env.GINI_LOG_ROOT = "/tmp/scratch-logs";
+    try {
+      const spec = resolveLaunchSpec({
+        instance: "dev",
+        homeOverride: home,
+        bunPathOverride: "/opt/bun/bin/bun",
+        projectRootOverride: "/repo/gini"
+      });
+      expect(spec.environment.GINI_STATE_ROOT).toBe("/tmp/scratch-state");
+      expect(spec.environment.GINI_LOG_ROOT).toBe("/tmp/scratch-logs");
+    } finally {
+      if (prevState === undefined) delete process.env.GINI_STATE_ROOT;
+      else process.env.GINI_STATE_ROOT = prevState;
+      if (prevLog === undefined) delete process.env.GINI_LOG_ROOT;
+      else process.env.GINI_LOG_ROOT = prevLog;
+    }
   });
+
+  test("omits GINI_STATE_ROOT and GINI_LOG_ROOT from env when unset (production default)", () => {
+    const prevState = process.env.GINI_STATE_ROOT;
+    const prevLog = process.env.GINI_LOG_ROOT;
+    delete process.env.GINI_STATE_ROOT;
+    delete process.env.GINI_LOG_ROOT;
+    try {
+      const spec = resolveLaunchSpec({
+        instance: "dev",
+        homeOverride: home,
+        bunPathOverride: "/opt/bun/bin/bun",
+        projectRootOverride: "/repo/gini"
+      });
+      expect(spec.environment.GINI_STATE_ROOT).toBeUndefined();
+      expect(spec.environment.GINI_LOG_ROOT).toBeUndefined();
+    } finally {
+      if (prevState !== undefined) process.env.GINI_STATE_ROOT = prevState;
+      if (prevLog !== undefined) process.env.GINI_LOG_ROOT = prevLog;
+    }
+  });
+
 });
 
 describe("generatePlist", () => {
@@ -173,7 +188,7 @@ describe("generatePlist", () => {
     expect(xml).toContain(`<string>${LABEL_PREFIX}.main</string>`);
   });
 
-  test("KeepAlive is a dict with SuccessfulExit=false and NetworkState=true", () => {
+  test("KeepAlive is a dict with SuccessfulExit=false", () => {
     const xml = generatePlist({
       instance: "main",
       spec: baseSpec,
@@ -183,7 +198,10 @@ describe("generatePlist", () => {
     // The exact dict shape is load-bearing: changing it to a <true/>
     // bool would make `gini stop` immediately respawn, which defeats the
     // whole "user intent honored" contract.
-    expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<dict>[\s\S]*?<key>SuccessfulExit<\/key>\s*<false\/>[\s\S]*?<key>NetworkState<\/key>\s*<true\/>[\s\S]*?<\/dict>/);
+    expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<dict>[\s\S]*?<key>SuccessfulExit<\/key>\s*<false\/>[\s\S]*?<\/dict>/);
+    // NetworkState was deliberately omitted — see the comment in
+    // generatePlist for why (pended-spawn semaphore prevents respawn).
+    expect(xml).not.toContain("<key>NetworkState</key>");
   });
 
   test("ThrottleInterval defaults to 10 and is overridable", () => {

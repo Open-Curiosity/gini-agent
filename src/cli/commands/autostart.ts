@@ -19,6 +19,7 @@ import {
   bootout,
   bootstrap,
   isLoaded,
+  kickstart,
   labelFor,
   loadedLastExitStatus,
   loadedPid,
@@ -64,6 +65,10 @@ export async function autostart(ctx: CliContext): Promise<void> {
     print(status(instance));
     return;
   }
+  if (sub === "kick") {
+    print(kick(instance));
+    return;
+  }
 
   print({
     ok: false,
@@ -77,12 +82,14 @@ function usage(): Record<string, unknown> {
     usage: [
       "gini autostart enable  [--instance <name>]",
       "gini autostart disable [--instance <name>]",
-      "gini autostart status  [--instance <name>]"
+      "gini autostart status  [--instance <name>]",
+      "gini autostart kick    [--instance <name>]   # force respawn (see notes)"
     ],
     notes: [
       "macOS only in v1 (Linux systemd --user is a follow-up).",
-      "PID supervision via launchd KeepAlive. No health watchdog yet — a wedged-but-alive runtime won't be detected here.",
-      "`gini stop` is honored: SuccessfulExit:false means clean exits do NOT respawn."
+      "PID supervision only — a wedged-but-alive runtime is not detected here. A health watchdog hitting /api/healthz is a follow-up.",
+      "`gini stop` is honored: SuccessfulExit:false means clean exits do NOT respawn.",
+      "macOS 26 (Tahoe): launchd often defers auto-respawn after SIGKILL indefinitely (`pended nondemand spawn = inefficient`). Use `gini autostart kick` to force a respawn when this happens; RunAtLoad still fires at login.",
     ]
   };
 }
@@ -258,9 +265,53 @@ function status(instance: string): StatusResult {
     lastExitStatus: lastExit,
     limitations: [
       "PID supervision only — a wedged-but-alive runtime is not detected.",
+      "macOS 26+: launchd auto-respawn after SIGKILL is unreliable. Use `gini autostart kick` to force respawn.",
       "macOS only in v1."
     ]
   };
+}
+
+interface KickResult {
+  ok: boolean;
+  instance: string;
+  label: string;
+  loaded: boolean;
+  kicked: boolean;
+  error?: string;
+  stderr?: string;
+}
+
+// `kick` is a manual respawn trigger. macOS 26 (Tahoe) sometimes refuses to
+// auto-respawn a launchd job after a SIGKILL, leaving it stuck in
+// `pended nondemand spawn = inefficient` indefinitely. `gini autostart kick`
+// runs `launchctl kickstart -k` to force a stop+start. Practical use: a
+// healthcheck loop discovers the runtime is wedged and shells out to
+// `gini autostart kick` rather than `gini stop && gini start`.
+function kick(instance: string): KickResult {
+  const loaded = isLoaded(instance);
+  if (!loaded) {
+    return {
+      ok: false,
+      instance,
+      label: labelFor(instance),
+      loaded: false,
+      kicked: false,
+      error: `Autostart is not enabled for instance '${instance}'. Run \`gini autostart enable\` first.`
+    };
+  }
+  const res = kickstart(instance);
+  if (!res.ok) {
+    return {
+      ok: false,
+      instance,
+      label: labelFor(instance),
+      loaded: true,
+      kicked: false,
+      error: "launchctl kickstart failed",
+      stderr: res.stderr.trim()
+    };
+  }
+  return { ok: true, instance, label: labelFor(instance), loaded: true, kicked: true };
 }
 
 // Best-effort autostart-disable for use by `gini uninstall --instance`.
