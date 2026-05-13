@@ -2,7 +2,9 @@
 
 ## Decision
 
-Connector secrets are stored as encrypted files inside the instance directory, not in the macOS Keychain. Each instance owns a per-instance encryption key on disk; individual secrets are encrypted with that key and written under `~/.gini/instances/<instance>/secrets/`.
+Connector secrets are stored as encrypted files inside the instance directory. Each instance owns a per-instance encryption key on disk; individual secrets are encrypted with that key and written under `~/.gini/instances/<instance>/secrets/`.
+
+The macOS Keychain is rejected as a secret storage backend for this product. It is not deferred and not an opt-in alternative.
 
 The gateway is the only process that reads or writes secrets. Clients (CLI, web, mobile) submit and rotate secrets through the gateway HTTP API; they never touch the secret files directly.
 
@@ -17,9 +19,11 @@ macOS Keychain protects items with an ACL keyed to the calling binary's code sig
 - Gini upgrades, signature changes, binary path moves.
 - A manually locked keychain.
 
-Each of these would strand a remote user. The Keychain security win (binary-ACL protection against malicious processes running as the same user) does not survive the headless-Mac constraint.
+Each of these would strand a remote user. The Keychain security win (binary-ACL protection against malicious processes running as the same user) does not survive the headless-Mac constraint, and the headless-Mac constraint is structural to the product, not a v1 limitation.
 
 Single-user developer tooling on macOS overwhelmingly stores credentials as files at mode `0600` (`~/.aws/credentials`, `~/.ssh/id_rsa`, `~/.npmrc`, `~/.config/gh/hosts.yml`, Cursor, Claude Code). FileVault, on by default, provides the at-rest protection that Keychain otherwise contributes. The remaining gap (in-process attacker as the same user) is real but acceptable for this product.
+
+A future requirement for hardware-backed key material is addressed by Secure Enclave wrapping of the instance key, not by reintroducing Keychain. Secure Enclave does not produce ACL dialogs and is compatible with the headless-Mac model.
 
 ## Required Now
 
@@ -32,21 +36,23 @@ Single-user developer tooling on macOS overwhelmingly stores credentials as file
 - Health probes (`POST /api/connectors/:id/health`) decrypt the secret in-process, hit the third-party API, and surface only the result.
 - The smoke flow exercises add, use, rotate, and delete for at least one non-demo connector kind.
 
+## Rejected
+
+- macOS Keychain in any form (default, opt-in, hardened tier). Reintroduction requires a superseding ADR.
+
 ## Deferred
 
-- macOS Keychain as an opt-in hardened backend for users sitting at the Mac.
-- Secure Enclave-backed encryption keys.
-- Per-secret accessibility classes or hardware attestation.
+- Secure Enclave-wrapped instance keys.
 - Cross-instance secret sharing.
 - Cloud-backed secret sync or backup.
+- Per-secret rotation policy and expiry.
 
 ## Consequences For Coding Agents
 
-- Do not import or shell out to `keytar`, `security`, or any Keychain API.
+- Do not import, shell out to, or add a dependency on `keytar`, the `security` CLI, or any Keychain API. Do not add a `backend` discriminator anticipating one.
 - Do not add fields to `ConnectorRecord` that hold plaintext secret material; only references.
 - Route new connector kinds through the gateway add/rotate/delete endpoints. Do not read or write the `secrets/` directory from clients.
 - When adding a tool that consumes a connector, fetch the secret through the gateway's resolver, stamp the connector id into the audit event, and never include the secret in trace evidence.
-- If a future change reintroduces Keychain as an opt-in backend, add it as a `backend` discriminator on the secret reference; do not replace the file backend.
 
 ## Acceptance Checks
 
