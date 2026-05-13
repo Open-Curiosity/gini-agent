@@ -1309,6 +1309,174 @@ export async function browserSelectOption(taskId: string, args: Record<string, u
   }
 }
 
+// Wait for either a known element to reach a particular state, or for a
+// substring of text to appear anywhere in document.body.innerText. Either
+// `ref` or `text` must be supplied (exclusively). After the wait completes
+// we re-snapshot so any newly visible interactive elements pick up fresh
+// `@eN` refs. Timeouts surface as a structured `Wait timed out...` error
+// rather than the raw Playwright stack.
+export async function browserWaitFor(taskId: string, args: Record<string, unknown>): Promise<string> {
+  const ref = str(args.ref);
+  const text = str(args.text);
+  if (ref && text) return fail("Provide either 'ref' or 'text', not both.");
+  if (!ref && !text) return fail("Missing required argument: provide either 'ref' or 'text'.");
+  const stateArg = args.state;
+  const allowedStates = new Set(["visible", "hidden", "attached", "detached"]);
+  let waitState: "visible" | "hidden" | "attached" | "detached" = "visible";
+  if (stateArg !== undefined) {
+    if (typeof stateArg !== "string" || !allowedStates.has(stateArg)) {
+      return fail("Argument 'state' must be one of: visible, hidden, attached, detached.");
+    }
+    waitState = stateArg as typeof waitState;
+  }
+  let timeoutMs = 10_000;
+  if (args.timeoutMs !== undefined) {
+    if (typeof args.timeoutMs !== "number" || !Number.isFinite(args.timeoutMs) || args.timeoutMs <= 0) {
+      return fail("Argument 'timeoutMs' must be a positive number.");
+    }
+    timeoutMs = args.timeoutMs;
+  }
+  try {
+    return await withSession(taskId, async (session) => {
+      try {
+        if (ref) {
+          const locator = session.refs.get(ref);
+          if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+          await locator.waitFor({ state: waitState, timeout: timeoutMs });
+        } else {
+          // text-mode: poll the page for the substring. Playwright's
+          // waitForFunction handles the timing for us; we pass the needle in
+          // as an argument so it crosses the page boundary as a string.
+          await session.page.waitForFunction(
+            (needle: string) => document.body?.innerText?.includes(needle) ?? false,
+            text!,
+            { timeout: timeoutMs }
+          );
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/timeout|exceeded/i.test(message)) {
+          return fail(`Wait timed out after ${timeoutMs}ms: ${message}`);
+        }
+        return fail(message);
+      }
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        title: await session.page.title(),
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
+      });
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Multi-tab management. Drives BrowserContext.pages() and context.newPage()
+// for list / new / switch / close. Critically, every action that swaps the
+// active page clears `session.refs` BEFORE assigning `session.page` so any
+// concurrent stale ref lookup fails fast against the old refs map rather
+// than silently resolving against the new page.
+export async function browserTabs(taskId: string, args: Record<string, unknown>): Promise<string> {
+  const action = str(args.action);
+  if (!action) return fail("Missing required string argument: action");
+  if (action !== "list" && action !== "new" && action !== "switch" && action !== "close") {
+    return fail("Argument 'action' must be one of: list, new, switch, close.");
+  }
+  try {
+    return await withSession(taskId, async (session) => {
+      if (action === "list") {
+        const pages = session.context.pages();
+        const tabs = await Promise.all(
+          pages.map(async (p, i) => ({
+            index: i,
+            url: p.url(),
+            title: await p.title().catch(() => ""),
+            active: p === session.page
+          }))
+        );
+        return ok({ url: session.page.url(), tabs });
+      }
+      if (action === "new") {
+        const url = str(args.url);
+        if (url) {
+          const blocked = safetyCheck(url);
+          if (blocked) return fail(blocked);
+        }
+        const page = await session.context.newPage();
+        attachConsole(taskId, page);
+        if (url) {
+          await page.goto(url, { waitUntil: "domcontentloaded" });
+        }
+        // Clear refs BEFORE swapping the page so any concurrent stale ref
+        // lookup hitting session.refs while session.page is the new tab
+        // fails fast against an empty map rather than silently resolving
+        // against a locator that points at the old page.
+        session.refs = new Map();
+        session.page = page;
+        await page.bringToFront().catch(() => undefined);
+        const snap = await snapshot(session.page, false);
+        session.refs = snap.refs;
+        return ok({
+          url: session.page.url(),
+          title: await session.page.title(),
+          snapshot: snap.text,
+          elementCount: snap.elementCount,
+          truncated: snap.truncated
+        });
+      }
+      if (action === "switch") {
+        if (typeof args.index !== "number" || !Number.isInteger(args.index) || args.index < 0) {
+          return fail("Argument 'index' must be a non-negative integer.");
+        }
+        const target = session.context.pages()[args.index];
+        if (!target) return fail(`No tab at index ${args.index}.`);
+        session.refs = new Map();
+        session.page = target;
+        await target.bringToFront().catch(() => undefined);
+        const snap = await snapshot(session.page, false);
+        session.refs = snap.refs;
+        return ok({
+          url: session.page.url(),
+          title: await session.page.title(),
+          snapshot: snap.text,
+          elementCount: snap.elementCount,
+          truncated: snap.truncated
+        });
+      }
+      // close
+      if (typeof args.index !== "number" || !Number.isInteger(args.index) || args.index < 0) {
+        return fail("Argument 'index' must be a non-negative integer.");
+      }
+      const target = session.context.pages()[args.index];
+      if (!target) return fail(`No tab at index ${args.index}.`);
+      const wasActive = target === session.page;
+      await target.close();
+      if (wasActive) {
+        // Pick whatever's left, or create a fresh page so the session
+        // isn't left pointing at a closed handle.
+        const remaining = session.context.pages();
+        session.page = remaining[0] ?? (await session.context.newPage());
+      }
+      session.refs = new Map();
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        title: await session.page.title(),
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
+      });
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
 export async function browserClose(taskId: string, _args: Record<string, unknown>): Promise<string> {
   try {
     consoleLogs.delete(taskId);

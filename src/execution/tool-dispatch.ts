@@ -39,8 +39,10 @@ import {
   browserScroll,
   browserSelectOption,
   browserSnapshot,
+  browserTabs,
   browserType,
-  browserVision
+  browserVision,
+  browserWaitFor
 } from "../tools/browser";
 
 export type DispatchResult =
@@ -103,6 +105,20 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.drag", browserDrag, args) };
     case "browser_select_option":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.select_option", browserSelectOption, args) };
+    case "browser_wait_for":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.wait_for", browserWaitFor, args) };
+    case "browser_tabs": {
+      // tabs.list is read-only (low risk); tabs.new/switch/close mutate the
+      // active page (medium). Encode that into the action label so the risk
+      // set in runBrowserDispatch picks the right bucket without re-parsing
+      // args downstream.
+      const tabsAction = typeof args.action === "string" ? args.action : "";
+      const label =
+        tabsAction === "new" || tabsAction === "switch" || tabsAction === "close"
+          ? `browser.tabs.${tabsAction}`
+          : "browser.tabs.list";
+      return { kind: "sync", result: await browserDispatch(config, taskId, label, browserTabs, args) };
+    }
     case "browser_vision":
       return { kind: "sync", result: await browserDispatchWithConfig(config, taskId, "browser.vision", browserVision, args) };
     case "file_write":
@@ -252,7 +268,10 @@ async function runBrowserDispatch(
     "browser.click",
     "browser.type",
     "browser.drag",
-    "browser.select_option"
+    "browser.select_option",
+    "browser.tabs.new",
+    "browser.tabs.switch",
+    "browser.tabs.close"
   ]);
   const risk: "low" | "medium" = MEDIUM_RISK_ACTIONS.has(action) ? "medium" : "low";
   let parsed: { success?: boolean; error?: string } = {};

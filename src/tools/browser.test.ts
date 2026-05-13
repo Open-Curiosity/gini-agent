@@ -6,7 +6,9 @@ import {
   browserHover,
   browserNavigate,
   browserSelectOption,
+  browserTabs,
   browserVision,
+  browserWaitFor,
   closeAll,
   disconnectSharedBrowser,
   safetyCheck,
@@ -956,5 +958,355 @@ describe("browserSelectOption", () => {
     const parsed = JSON.parse(raw) as { success: boolean; error?: string };
     expect(parsed.success).toBe(false);
     expect(parsed.error).toMatch(/ref/);
+  });
+});
+
+describe("browserWaitFor", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("ref-mode forwards { state, timeout } to locator.waitFor", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("wait-ref", fakePage);
+    let captured: { state?: string; timeout?: number } | undefined;
+    const loc = {
+      waitFor: async (opts: { state?: string; timeout?: number }) => {
+        captured = { state: opts.state, timeout: opts.timeout };
+      }
+    };
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", loc);
+    browserTest.setFakeSessionRefsForTest("wait-ref", refs);
+
+    const raw = await browserWaitFor("wait-ref", { ref: "@e3", state: "hidden", timeoutMs: 2500 });
+    const parsed = JSON.parse(raw) as { success: boolean };
+    expect(parsed.success).toBe(true);
+    expect(captured).toBeDefined();
+    expect(captured!.state).toBe("hidden");
+    expect(captured!.timeout).toBe(2500);
+  });
+
+  test("ref-mode defaults state to 'visible' and timeout to 10000", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("wait-defaults", fakePage);
+    let captured: { state?: string; timeout?: number } | undefined;
+    const loc = {
+      waitFor: async (opts: { state?: string; timeout?: number }) => {
+        captured = { state: opts.state, timeout: opts.timeout };
+      }
+    };
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", loc);
+    browserTest.setFakeSessionRefsForTest("wait-defaults", refs);
+
+    await browserWaitFor("wait-defaults", { ref: "@e1" });
+    expect(captured!.state).toBe("visible");
+    expect(captured!.timeout).toBe(10_000);
+  });
+
+  test("text-mode calls page.waitForFunction with the needle and timeout", async () => {
+    let captured: { needle?: string; timeout?: number } | undefined;
+    const fakePage = {
+      url: () => "https://example.com/",
+      title: () => Promise.resolve("Example"),
+      evaluate: (async () => []) as unknown as import("playwright-core").Page["evaluate"],
+      waitForFunction: (async (
+        _fn: unknown,
+        arg: unknown,
+        opts?: { timeout?: number }
+      ): Promise<undefined> => {
+        captured = { needle: typeof arg === "string" ? arg : undefined, timeout: opts?.timeout };
+        return undefined;
+      }) as unknown as import("playwright-core").Page["waitForFunction"]
+    } as Partial<import("playwright-core").Page>;
+    browserTest.installFakeSessionWithPageForTest("wait-text", fakePage);
+
+    const raw = await browserWaitFor("wait-text", { text: "Logged in", timeoutMs: 5000 });
+    const parsed = JSON.parse(raw) as { success: boolean };
+    expect(parsed.success).toBe(true);
+    expect(captured).toBeDefined();
+    expect(captured!.needle).toBe("Logged in");
+    expect(captured!.timeout).toBe(5000);
+  });
+
+  test("surfaces a structured 'Wait timed out' error when waitFor throws timeout", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("wait-timeout", fakePage);
+    const loc = {
+      waitFor: async () => {
+        throw new Error("locator.waitFor: Timeout 2000ms exceeded.");
+      }
+    };
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", loc);
+    browserTest.setFakeSessionRefsForTest("wait-timeout", refs);
+
+    const raw = await browserWaitFor("wait-timeout", { ref: "@e1", timeoutMs: 2000 });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/^Wait timed out after 2000ms/);
+  });
+
+  test("rejects when both ref and text are supplied", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("wait-both", fakePage);
+    const raw = await browserWaitFor("wait-both", { ref: "@e1", text: "Hello" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/either 'ref' or 'text'/);
+  });
+
+  test("rejects when neither ref nor text is supplied", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("wait-neither", fakePage);
+    const raw = await browserWaitFor("wait-neither", {});
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/either 'ref' or 'text'/);
+  });
+
+  test("rejects invalid state values", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("wait-bad-state", fakePage);
+    const raw = await browserWaitFor("wait-bad-state", { ref: "@e1", state: "bogus" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/state.*visible.*hidden.*attached.*detached/i);
+  });
+
+  test("rejects invalid timeoutMs", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("wait-bad-timeout", fakePage);
+    const rawZero = await browserWaitFor("wait-bad-timeout", { ref: "@e1", timeoutMs: 0 });
+    expect(JSON.parse(rawZero).error).toMatch(/positive number/);
+    const rawNeg = await browserWaitFor("wait-bad-timeout", { ref: "@e1", timeoutMs: -100 });
+    expect(JSON.parse(rawNeg).error).toMatch(/positive number/);
+    const rawStr = await browserWaitFor("wait-bad-timeout", { ref: "@e1", timeoutMs: "10s" });
+    expect(JSON.parse(rawStr).error).toMatch(/positive number/);
+  });
+
+  test("returns Unknown ref when the ref isn't planted", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("wait-bad-ref", fakePage);
+    const raw = await browserWaitFor("wait-bad-ref", { ref: "@e99" });
+    expect(JSON.parse(raw).error).toContain("Unknown ref @e99");
+  });
+});
+
+// Tabs tests need a fake context.pages() controllable from the test, plus a
+// way to assert which page is currently active on the session after a swap.
+// We use installFakeSessionWithPageAndContextForTest to plant both.
+type FakeTabPage = Partial<import("playwright-core").Page> & {
+  _label: string;
+  _closed?: boolean;
+};
+
+function makeFakeTabPage(label: string, url: string): FakeTabPage {
+  const page: FakeTabPage = {
+    _label: label,
+    url: () => url,
+    title: () => Promise.resolve(`title:${label}`),
+    evaluate: (async () => []) as unknown as import("playwright-core").Page["evaluate"],
+    goto: (async () => null) as unknown as import("playwright-core").Page["goto"],
+    bringToFront: (async () => undefined) as unknown as import("playwright-core").Page["bringToFront"],
+    on: (() => undefined) as unknown as import("playwright-core").Page["on"],
+    close: (async () => {
+      page._closed = true;
+    }) as unknown as import("playwright-core").Page["close"]
+  };
+  return page;
+}
+
+describe("browserTabs", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("list returns one entry per page with active flag", async () => {
+    const p0 = makeFakeTabPage("p0", "https://a.example/");
+    const p1 = makeFakeTabPage("p1", "https://b.example/");
+    const pages = [p0, p1];
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => pages) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => makeFakeTabPage("new", "about:blank")) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-list", p1, context);
+
+    const raw = await browserTabs("tabs-list", { action: "list" });
+    const parsed = JSON.parse(raw) as {
+      success: boolean;
+      url?: string;
+      tabs?: Array<{ index: number; url: string; title: string; active: boolean }>;
+    };
+    expect(parsed.success).toBe(true);
+    expect(parsed.url).toBe("https://b.example/");
+    expect(parsed.tabs).toBeDefined();
+    expect(parsed.tabs!.length).toBe(2);
+    expect(parsed.tabs![0]!.index).toBe(0);
+    expect(parsed.tabs![0]!.url).toBe("https://a.example/");
+    expect(parsed.tabs![0]!.active).toBe(false);
+    expect(parsed.tabs![1]!.active).toBe(true);
+  });
+
+  test("new creates a page, swaps session.page, clears refs, and navigates if url given", async () => {
+    const initial = makeFakeTabPage("initial", "https://a.example/");
+    let gotoCalls: Array<{ url: string }> = [];
+    const fresh = makeFakeTabPage("fresh", "https://c.example/");
+    fresh.goto = (async (url: string) => {
+      gotoCalls.push({ url });
+      return null;
+    }) as unknown as import("playwright-core").Page["goto"];
+    const pages = [initial];
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => pages) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => {
+        pages.push(fresh);
+        return fresh;
+      }) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-new", initial, context);
+    // Plant a stale ref so we can prove it gets cleared.
+    const staleRefs = new Map<string, unknown>();
+    staleRefs.set("@e1", { _stale: true });
+    browserTest.setFakeSessionRefsForTest("tabs-new", staleRefs);
+
+    const raw = await browserTabs("tabs-new", { action: "new", url: "https://c.example/" });
+    const parsed = JSON.parse(raw) as { success: boolean; url?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.url).toBe("https://c.example/");
+    expect(gotoCalls.length).toBe(1);
+    expect(gotoCalls[0]!.url).toBe("https://c.example/");
+    // session.page should have been swapped to the new tab.
+    const activePage = browserTest.getFakeSessionPageForTest("tabs-new") as FakeTabPage | undefined;
+    expect(activePage?._label).toBe("fresh");
+    // Refs map should be a fresh empty map (we wrote a stale entry pre-call,
+    // and snapshot on the fresh page returns no rows in our fake walker).
+    const refs = browserTest.getFakeSessionRefsForTest("tabs-new");
+    expect(refs?.size ?? 0).toBe(0);
+  });
+
+  test("new blocks a metadata URL via safetyCheck before opening anything", async () => {
+    const initial = makeFakeTabPage("initial", "https://a.example/");
+    let newPageCalls = 0;
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => [initial]) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => {
+        newPageCalls++;
+        return makeFakeTabPage("blocked", "about:blank");
+      }) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-block", initial, context);
+
+    const raw = await browserTabs("tabs-block", { action: "new", url: "http://169.254.169.254/" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/^Blocked:/);
+    expect(newPageCalls).toBe(0);
+  });
+
+  test("switch swaps the active page and clears refs", async () => {
+    const p0 = makeFakeTabPage("p0", "https://a.example/");
+    const p1 = makeFakeTabPage("p1", "https://b.example/");
+    const pages = [p0, p1];
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => pages) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => p0) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-switch", p0, context);
+    const stale = new Map<string, unknown>();
+    stale.set("@e1", {});
+    browserTest.setFakeSessionRefsForTest("tabs-switch", stale);
+
+    const raw = await browserTabs("tabs-switch", { action: "switch", index: 1 });
+    const parsed = JSON.parse(raw) as { success: boolean };
+    expect(parsed.success).toBe(true);
+    const active = browserTest.getFakeSessionPageForTest("tabs-switch") as FakeTabPage | undefined;
+    expect(active?._label).toBe("p1");
+    expect(browserTest.getFakeSessionRefsForTest("tabs-switch")?.size ?? 0).toBe(0);
+  });
+
+  test("switch fails for an out-of-range index", async () => {
+    const p0 = makeFakeTabPage("p0", "https://a.example/");
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => [p0]) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => p0) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-switch-bad", p0, context);
+    const raw = await browserTabs("tabs-switch-bad", { action: "switch", index: 5 });
+    expect(JSON.parse(raw).error).toContain("No tab at index 5");
+  });
+
+  test("close closes the page, swaps if needed, and clears refs", async () => {
+    const p0 = makeFakeTabPage("p0", "https://a.example/");
+    const p1 = makeFakeTabPage("p1", "https://b.example/");
+    const pages = [p0, p1];
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => pages.filter((p) => !p._closed)) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => makeFakeTabPage("fresh-after-close", "about:blank")) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    // Active page is p1; we'll close it and expect the session to swap to p0.
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-close-active", p1, context);
+    const stale = new Map<string, unknown>();
+    stale.set("@e1", {});
+    browserTest.setFakeSessionRefsForTest("tabs-close-active", stale);
+
+    const raw = await browserTabs("tabs-close-active", { action: "close", index: 1 });
+    const parsed = JSON.parse(raw) as { success: boolean };
+    expect(parsed.success).toBe(true);
+    expect(p1._closed).toBe(true);
+    const active = browserTest.getFakeSessionPageForTest("tabs-close-active") as FakeTabPage | undefined;
+    expect(active?._label).toBe("p0");
+    expect(browserTest.getFakeSessionRefsForTest("tabs-close-active")?.size ?? 0).toBe(0);
+  });
+
+  test("close on the last tab opens a fresh tab so session.page isn't dangling", async () => {
+    const only = makeFakeTabPage("only", "https://a.example/");
+    let newPageCalls = 0;
+    const after = makeFakeTabPage("after", "about:blank");
+    const pages = [only];
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => pages.filter((p) => !p._closed)) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => {
+        newPageCalls++;
+        pages.push(after);
+        return after;
+      }) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-close-last", only, context);
+
+    const raw = await browserTabs("tabs-close-last", { action: "close", index: 0 });
+    const parsed = JSON.parse(raw) as { success: boolean };
+    expect(parsed.success).toBe(true);
+    expect(only._closed).toBe(true);
+    expect(newPageCalls).toBe(1);
+    const active = browserTest.getFakeSessionPageForTest("tabs-close-last") as FakeTabPage | undefined;
+    expect(active?._label).toBe("after");
+  });
+
+  test("rejects an unknown action", async () => {
+    const p0 = makeFakeTabPage("p0", "https://a.example/");
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => [p0]) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => p0) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-bad-action", p0, context);
+    const raw = await browserTabs("tabs-bad-action", { action: "fly" });
+    expect(JSON.parse(raw).error).toMatch(/action.*list.*new.*switch.*close/);
+  });
+
+  test("rejects missing index on switch/close", async () => {
+    const p0 = makeFakeTabPage("p0", "https://a.example/");
+    const context: Partial<import("playwright-core").BrowserContext> = {
+      pages: (() => [p0]) as unknown as import("playwright-core").BrowserContext["pages"],
+      newPage: (async () => p0) as unknown as import("playwright-core").BrowserContext["newPage"]
+    };
+    browserTest.installFakeSessionWithPageAndContextForTest("tabs-missing-index", p0, context);
+    const rawSwitch = await browserTabs("tabs-missing-index", { action: "switch" });
+    expect(JSON.parse(rawSwitch).error).toMatch(/non-negative integer/);
+    const rawClose = await browserTabs("tabs-missing-index", { action: "close" });
+    expect(JSON.parse(rawClose).error).toMatch(/non-negative integer/);
   });
 });
