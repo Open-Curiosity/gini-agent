@@ -117,6 +117,13 @@ export interface RuntimeConfig {
   // evidence.autoApproved=true plus the matched pattern, so the activity
   // trail stays intact. Empty / undefined means no auto-approval.
   autoApproveCommands?: string[];
+  // When true, bypass the approval gate for every approval-gated tool
+  // (file_write, file_patch, terminal_exec, code_exec). The side effect
+  // still emits a fully-populated approval record (status="approved" with
+  // evidence.autoApproved=true / autoApprovedReason="dangerouslyAutoApprove")
+  // and an audit row, so the trail stays inspectable — only the human
+  // gate is skipped. Intended for trusted, dev-mode use only.
+  dangerouslyAutoApprove?: boolean;
   // Power-user agent budget knobs. Lives under a nested `agent` namespace so
   // future budgets (token cap, wall-clock cap, etc.) can hang off the same
   // object without further config-shape churn. Validated leniently at the

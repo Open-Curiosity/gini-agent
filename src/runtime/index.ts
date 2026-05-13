@@ -122,3 +122,12 @@ export function updateAutoApproveCommands(config: RuntimeConfig, patterns: strin
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   return cleaned;
 }
+
+// Toggle the global "skip every approval" flag. See
+// RuntimeConfig.dangerouslyAutoApprove for the safety contract.
+export function updateDangerouslyAutoApprove(config: RuntimeConfig, enabled: boolean): boolean {
+  config.dangerouslyAutoApprove = enabled;
+  ensureDir(instanceRoot(config.instance));
+  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  return enabled;
+}

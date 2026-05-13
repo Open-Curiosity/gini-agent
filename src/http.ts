@@ -13,7 +13,7 @@ import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, DEF
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./governance/pairing";
 import { proposePromotion, reviewPromotion } from "./governance/promotions";
-import { status, updateAutoApproveCommands } from "./runtime";
+import { status, updateAutoApproveCommands, updateDangerouslyAutoApprove } from "./runtime";
 import { searchSessions } from "./execution/search";
 import { listToolsets, setToolsetStatus } from "./capabilities/toolsets";
 import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/subagents";
@@ -37,12 +37,21 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
     // Settings: auto-approve allowlist for terminal_exec.
-    ["GET", /^\/api\/settings\/auto-approve$/, () => json({ patterns: config.autoApproveCommands ?? [] })],
+    ["GET", /^\/api\/settings\/auto-approve$/, () => json({
+      patterns: config.autoApproveCommands ?? [],
+      dangerouslyAutoApprove: Boolean(config.dangerouslyAutoApprove),
+    })],
     ["PATCH", /^\/api\/settings\/auto-approve$/, async (request) => {
       const payload = await body(request);
-      const raw = Array.isArray(payload.patterns) ? payload.patterns : [];
-      const cleaned = updateAutoApproveCommands(config, raw.map(String));
-      return json({ patterns: cleaned });
+      let patterns = config.autoApproveCommands ?? [];
+      if (Array.isArray(payload.patterns)) {
+        patterns = updateAutoApproveCommands(config, payload.patterns.map(String));
+      }
+      let dangerous = Boolean(config.dangerouslyAutoApprove);
+      if (typeof payload.dangerouslyAutoApprove === "boolean") {
+        dangerous = updateDangerouslyAutoApprove(config, payload.dangerouslyAutoApprove);
+      }
+      return json({ patterns, dangerouslyAutoApprove: dangerous });
     }],
     ["GET", /^\/api\/mobile\/bootstrap$/, () => json(mobileBootstrap(config))],
     ["GET", /^\/api\/chat$/, () => json(listChatSessions(config))],
