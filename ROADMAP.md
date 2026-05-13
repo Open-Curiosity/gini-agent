@@ -20,6 +20,18 @@ This is the long-form version of the short list in the [README](README.md#roadma
 
 ## Planned
 
+The three items the roadmap is built around — what "done" looks like — are **task self-learning and iteration loop**, **native macOS client**, and **iOS mobile app for remote control**. Everything else is supporting infrastructure that makes those three load-bearing pieces work well.
+
+### Task self-learning and iteration loop
+
+Trace-backed improvement proposals (shipped) let memory, skills, and jobs evolve from observed runs. The next step is closing the loop at the task level: a task observes its own attempts, refines its plan, and retries — without a human relaying the lesson each time.
+
+- ⚪ **Per-task trace introspection.** A task can read its own prior runs, plan steps, tool calls, and outcomes as structured signal, not just a chat log.
+- ⚪ **Plan revision from outcomes.** When a step fails or produces a low-quality result, the next attempt revises the plan rather than retrying verbatim.
+- ⚪ **Auto-proposed memory and skill writes.** Lessons from a task's own runs surface as improvement proposals against the relevant memory bank or skill, gated by the existing approval surface.
+- ⚪ **Multi-attempt budgets.** Tasks declare a budget (time, tokens, attempts) and the loop terminates cleanly when exhausted, with an explanation rather than a hang.
+- ⚪ **Replay determinism.** A failed task can be re-run from any checkpoint with the same provider, tools, and memory state — so the iteration loop is debuggable, not magic.
+
 ### Always-on runtime
 
 The webapp dead-ends if you haven't run `gini start`. A native client without a supervised runtime hits the same wall. The fix is to make the gateway a real macOS background service so "is it running" is almost always yes.
@@ -60,6 +72,17 @@ The structural property the architecture already gives us: **the native client h
 - ⚪ **Live debug pane.** `cmd+opt+I`-style view showing real-time API calls between the app and the gateway. Nothing the app does is hidden from a user who wants to look.
 - ⚪ **`TRUST.md`.** Public document listing every entitlement requested, every network endpoint contacted, and the exact verification commands users can run to confirm each claim.
 
+### iOS mobile app (remote control)
+
+The phone is not a place to run the gateway — the gateway lives on the Mac. The phone is a **remote control** for that running agent: see what's pending, approve from anywhere, trigger tasks, receive notifications. This is what the paired-device auth and mobile bootstrap contracts (shipped) were designed for.
+
+- ⚪ **Native iOS client.** SwiftUI app pairing once with a Mac instance and storing its token in the Secure Enclave.
+- ⚪ **Approvals on the phone.** Pending approvals delivered as push notifications, actioned with Face ID confirmation, audit-logged on the gateway like any other approval.
+- ⚪ **Run and task visibility.** Live view of in-flight runs, queued tasks, and recent traces — the same SSE stream the Mac client consumes.
+- ⚪ **Voice and quick triggers.** Shortcuts.app and Siri integration so a task can be kicked off without unlocking the phone.
+- ⚪ **Off-LAN reachability.** Requires the production relay (see Reach) before remote control works outside the home network. Local-network usage works without it.
+- ⚪ **Android later.** Same paired-device contract, lower priority.
+
 ### Gini as MCP server
 
 The gateway already records MCP. The reverse direction — Gini *as* an MCP server consumed by Claude Desktop, Cursor, Zed, Warp, and other AI-native hosts — turns trusted host apps into inherited trust surfaces. Users reuse permissions they already granted to those tools instead of being asked to grant Gini new ones.
@@ -80,11 +103,10 @@ The "official native client" is opinionated, but the architecture is plural. Ref
 
 ### Reach
 
-These items extend Gini beyond a single Mac. The native macOS client and the trust layer are prerequisites for several of them, but the items themselves are orthogonal to which UI is "official."
+These items extend Gini beyond a single Mac. The native macOS client and the iOS remote control are the consumers; these items are the plumbing that makes them work outside the home network.
 
 - ⚪ **Production relay.** Off-LAN access without exposing localhost. Tailscale-style mesh or a thin Cloudflare Worker relay, with end-to-end auth that never trusts the relay operator.
 - ⚪ **Native push notifications.** APNs for iOS, FCM for Android, surfaced into the existing approval and run-completion events.
-- ⚪ **Native mobile client.** iOS first using the existing paired-device contract; Android later. Same gateway, same `/api/*`, same trust layer.
 - ⚪ **Cross-instance federation.** Optional shared memory and skill sync between a user's own instances (laptop ↔ desktop) under user-controlled keys.
 
 ## What's deliberately not on the roadmap

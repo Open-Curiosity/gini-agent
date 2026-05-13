@@ -198,24 +198,23 @@ GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --instance sandbox s
 
 ## Roadmap
 
-- ✅ Local-first Bun gateway with authenticated `/api/*` and SSE
-- ✅ Next.js webapp with server-side BFF (browser never holds a token)
-- ✅ CLI with parallel instances and isolated state per worktree
-- ✅ Persistent chat, runs, plan steps, tasks, approvals, audit, traces
-- ✅ Approval-gated file, terminal, and code tools
-- ✅ Four-network memory with local embeddings and reranking
-- ✅ Trace-backed improvement proposals for memory, skills, and jobs
-- ✅ Provider support (Codex OAuth, OpenAI API key, OpenRouter records)
-- ✅ Paired-device auth and mobile bootstrap contracts
-- ✅ Instance-local snapshots and promotion proposal records
-- ✅ Hermes-inspired primitives and OpenClaw-inspired connectors
-- ⚪ Always-on runtime via LaunchAgent (start at login, restart on crash)
-- ⚪ Official native macOS client (open source, reproducible builds)
-- ⚪ Trust layer: `gini verify-app`, zero phone-home, network-policy lint
-- ⚪ Gini as MCP server consumed by Claude Desktop, Cursor, Zed, Warp
-- ⚪ Reference integrations: Raycast extension, Shortcuts.app, Hammerspoon
-- ⚪ Native push notifications for approvals and run completion
-- ⚪ Production relay for off-LAN access
-- ⚪ Native mobile client (paired-device contract already in place)
+- ✅ Local Bun runtime gateway
+- ✅ Next.js webapp with BFF
+- ✅ CLI with parallel instances
+- ✅ Persistent chat, runs, approvals, audit, traces
+- ✅ Approval-gated tools (file, terminal, code)
+- ✅ Local memory with embeddings and reranking
+- ✅ Trace-backed improvement proposals
+- ✅ Provider support (Codex OAuth, OpenAI)
+- ✅ Paired-device auth
+- ⚪ Task self-learning and iteration loop
+- ⚪ Native macOS app
+- ⚪ iOS mobile app for remote control
+- ⚪ Always-on runtime
+- ⚪ Trust layer (reproducible builds, verify-app)
+- ⚪ Gini as MCP server
+- ⚪ Raycast / Shortcuts integrations
+- ⚪ Push notifications
+- ⚪ Off-LAN relay
 
 This is the short preview. See the full roadmap in [ROADMAP.md](ROADMAP.md).
