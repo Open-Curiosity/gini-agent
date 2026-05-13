@@ -472,6 +472,206 @@ describe("snapshot walker — <select> option surfacing", () => {
   });
 });
 
+// Tests for hidden-element surfacing in the snapshot walker. The walker
+// must emit invisible interactive elements (with a [hidden] marker) so
+// wait_for state:"hidden"/"attached"/"detached" can target them, AND must
+// always emit <input type="file"> regardless of visibility so hidden file
+// inputs behind styled-button uploaders are still drivable via
+// browser_upload_file.
+describe("snapshot walker — hidden interactive elements", () => {
+  // Shared fake-DOM scaffolding. Each test plants its own document.body,
+  // calls __test.snapshotForTest with a fake page that runs the
+  // evaluate-callback locally, and restores globals on exit.
+  type FakeEl = {
+    tagName: string;
+    type?: string;
+    value?: string;
+    disabled?: boolean;
+    hidden?: boolean;
+    label?: string;
+    text?: string;
+    _attrs: Record<string, string>;
+    _children: FakeEl[];
+    _textContent: string;
+    _visible: boolean;
+    getAttribute(name: string): string | null;
+    setAttribute(name: string, value: string): void;
+    removeAttribute(name: string): void;
+    getBoundingClientRect(): { width: number; height: number };
+    get children(): FakeEl[];
+    get textContent(): string;
+    querySelectorAll(selector: string): FakeEl[];
+  };
+  const makeEl = (init: Partial<FakeEl> & { tagName: string; visible?: boolean; children?: FakeEl[]; textContent?: string; attrs?: Record<string, string> }): FakeEl => {
+    const visible = init.visible ?? true;
+    const children = init.children ?? [];
+    const el: FakeEl = {
+      tagName: init.tagName,
+      type: init.type,
+      value: init.value,
+      disabled: init.disabled,
+      hidden: init.hidden,
+      label: init.label,
+      text: init.text,
+      _attrs: { ...(init.attrs ?? {}) },
+      _children: children,
+      _textContent: init.textContent ?? "",
+      _visible: visible,
+      getAttribute(name: string) {
+        return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
+      },
+      setAttribute(name: string, value: string) {
+        this._attrs[name] = value;
+      },
+      removeAttribute(name: string) {
+        delete this._attrs[name];
+      },
+      getBoundingClientRect() {
+        return this._visible ? { width: 100, height: 20 } : { width: 0, height: 0 };
+      },
+      get children() {
+        return this._children;
+      },
+      get textContent() {
+        return this._textContent;
+      },
+      querySelectorAll(selector: string) {
+        const matches: FakeEl[] = [];
+        const recurse = (node: FakeEl) => {
+          if (selector === "option") {
+            if (node.tagName === "OPTION") matches.push(node);
+          } else if (selector.startsWith("[") && selector.endsWith("]")) {
+            const attr = selector.slice(1, -1);
+            if (Object.prototype.hasOwnProperty.call(node._attrs, attr)) matches.push(node);
+          }
+          for (const child of node._children) recurse(child);
+        };
+        for (const child of this._children) recurse(child);
+        return matches;
+      }
+    };
+    return el;
+  };
+  // Installs the fake DOM globals the walker reads from inside the
+  // page.evaluate callback (which runs locally under the fake page). The
+  // returned `restore` function puts the originals back.
+  const installFakeDom = (body: FakeEl): (() => void) => {
+    const originalDocument = (globalThis as Record<string, unknown>).document;
+    const originalWindow = (globalThis as Record<string, unknown>).window;
+    const originalCSS = (globalThis as Record<string, unknown>).CSS;
+    (globalThis as unknown as { document: unknown }).document = {
+      body,
+      querySelectorAll: (selector: string) => body.querySelectorAll(selector),
+      querySelector: (_sel: string) => null,
+      getElementById: (_id: string) => null
+    };
+    (globalThis as unknown as { window: unknown }).window = {
+      getComputedStyle: (_el: unknown) => ({ display: "block", visibility: "visible" })
+    };
+    (globalThis as unknown as { CSS: unknown }).CSS = { escape: (s: string) => s };
+    return () => {
+      if (originalDocument === undefined) {
+        delete (globalThis as Record<string, unknown>).document;
+      } else {
+        (globalThis as Record<string, unknown>).document = originalDocument;
+      }
+      if (originalWindow === undefined) {
+        delete (globalThis as Record<string, unknown>).window;
+      } else {
+        (globalThis as Record<string, unknown>).window = originalWindow;
+      }
+      if (originalCSS === undefined) {
+        delete (globalThis as Record<string, unknown>).CSS;
+      } else {
+        (globalThis as Record<string, unknown>).CSS = originalCSS;
+      }
+    };
+  };
+
+  // Fake Page whose page.evaluate(fn, arg) runs fn(arg) locally; the
+  // locator factory returns a synthetic locator stub keyed by selector so
+  // the post-walk `refs` map can carry distinct values per ref.
+  const makeFakePage = (): { page: import("playwright-core").Page; locatorOf: (sel: string) => unknown } => {
+    const fakeLocators = new Map<string, unknown>();
+    const page = {
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => {
+        if (!fakeLocators.has(sel)) fakeLocators.set(sel, { __sel: sel });
+        return fakeLocators.get(sel) as unknown;
+      }
+    } as unknown as import("playwright-core").Page;
+    return { page, locatorOf: (sel: string) => fakeLocators.get(sel) };
+  };
+
+  test("emits visible button + hidden file input + hidden dialog with [hidden] markers and all three resolve via refs", async () => {
+    // <body>
+    //   <button>Save</button>
+    //   <input type="file" style="display:none">     ← hidden but force-emitted
+    //   <div role="dialog" style="display:none">…</div>  ← invisible interactive
+    // </body>
+    const button = makeEl({ tagName: "BUTTON", textContent: "Save" });
+    const fileInput = makeEl({ tagName: "INPUT", type: "file", visible: false });
+    const dialog = makeEl({
+      tagName: "DIV",
+      visible: false,
+      attrs: { role: "dialog" },
+      textContent: "Modal content"
+    });
+    const body = makeEl({ tagName: "BODY", children: [button, fileInput, dialog] });
+    const restore = installFakeDom(body);
+    const { page } = makeFakePage();
+    try {
+      const result = await browserTest.snapshotForTest(page, false);
+
+      // Visible button: normal ref + name, no [hidden] annotation.
+      expect(result.text).toMatch(/\[@e\d+\] button "Save"/);
+      expect(result.text).not.toMatch(/\[@e\d+\] button "Save".*\[hidden\]/);
+
+      // File input: role "file" + [hidden] marker, no name/value noise.
+      const fileLine = result.text.split("\n").find((line) => line.includes(" file "));
+      expect(fileLine).toBeDefined();
+      expect(fileLine).toMatch(/\[@e\d+\] file \[hidden\]/);
+
+      // Hidden dialog: role "dialog" + [hidden] marker.
+      const dialogLine = result.text.split("\n").find((line) => line.includes(" dialog"));
+      expect(dialogLine).toBeDefined();
+      expect(dialogLine).toMatch(/\[@e\d+\] dialog \[hidden\]/);
+
+      // All three refs must resolve via the refs map returned by the
+      // walker (this is what session.refs gets populated with).
+      const allRefs = Array.from(result.text.matchAll(/\[(@e\d+)\]/g)).map((m) => m[1]!);
+      expect(allRefs.length).toBeGreaterThanOrEqual(3);
+      for (const ref of allRefs) {
+        expect(result.refs.has(ref)).toBe(true);
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("caps hidden entries at 50 and appends [...hidden truncated] marker", async () => {
+    const hiddenChildren: FakeEl[] = [];
+    for (let i = 0; i < 100; i++) {
+      // Each child is a hidden <button> — interactive but offsetParent-less
+      // in real Chromium. The walker should emit at most 50 of them.
+      hiddenChildren.push(makeEl({ tagName: "BUTTON", visible: false, textContent: `btn-${i}` }));
+    }
+    const body = makeEl({ tagName: "BODY", children: hiddenChildren });
+    const restore = installFakeDom(body);
+    const { page } = makeFakePage();
+    try {
+      const result = await browserTest.snapshotForTest(page, false);
+      const hiddenLines = result.text.split("\n").filter((line) => line.includes("[hidden]"));
+      expect(hiddenLines.length).toBeLessThanOrEqual(50);
+      // We planted 100, so cap must have engaged.
+      expect(hiddenLines.length).toBe(50);
+      expect(result.text).toContain("[...hidden truncated]");
+    } finally {
+      restore();
+    }
+  });
+});
+
 describe("chromeProfileDirFor", () => {
   test("derives the per-instance profile path from instance name", async () => {
     const { chromeProfileDirFor } = await import("./browser");
@@ -827,9 +1027,11 @@ function makeFakePageForRefTools(url = "https://example.com/"): Partial<import("
     url: () => url,
     title: () => Promise.resolve("Example"),
     // Walker invokes page.evaluate twice (clear stale refs, then walk). We
-    // resolve to undefined for the cleanup pass and an empty array for the
-    // walk so the snapshot text is just empty.
-    evaluate: (async () => []) as unknown as import("playwright-core").Page["evaluate"],
+    // resolve to undefined for the cleanup pass and an empty walker result
+    // for the walk so the snapshot text is just empty. The walker now
+    // returns { entries, hiddenEmitted, hiddenTotal, hiddenBudget }; the
+    // text-rendering loop reads `.entries` so we mirror that shape.
+    evaluate: (async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 })) as unknown as import("playwright-core").Page["evaluate"],
     waitForLoadState: (async () => undefined) as unknown as import("playwright-core").Page["waitForLoadState"]
   };
 }
@@ -1111,7 +1313,7 @@ describe("browserWaitFor", () => {
     const fakePage = {
       url: () => "https://example.com/",
       title: () => Promise.resolve("Example"),
-      evaluate: (async () => []) as unknown as import("playwright-core").Page["evaluate"],
+      evaluate: (async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 })) as unknown as import("playwright-core").Page["evaluate"],
       waitForFunction: (async (
         _fn: unknown,
         arg: unknown,
@@ -1208,7 +1410,7 @@ function makeFakeTabPage(label: string, url: string): FakeTabPage {
     _label: label,
     url: () => url,
     title: () => Promise.resolve(`title:${label}`),
-    evaluate: (async () => []) as unknown as import("playwright-core").Page["evaluate"],
+    evaluate: (async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 })) as unknown as import("playwright-core").Page["evaluate"],
     goto: (async () => null) as unknown as import("playwright-core").Page["goto"],
     bringToFront: (async () => undefined) as unknown as import("playwright-core").Page["bringToFront"],
     on: (() => undefined) as unknown as import("playwright-core").Page["on"],

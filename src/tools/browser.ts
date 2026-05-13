@@ -824,7 +824,14 @@ interface SnapEntry {
   url: string;
   depth: number;
   full: boolean; // true when emitted only because we're in `full` mode
+  hidden: boolean; // true when the element exists but isn't visible
 }
+
+// Cap on the number of invisible-but-locatable interactive elements we
+// emit per snapshot. A page with thousands of hidden nodes (e.g. a
+// virtualized list with prerendered rows) would otherwise blow up the
+// snapshot. Visible entries are budgeted separately via SNAPSHOT_CHAR_BUDGET.
+const SNAPSHOT_HIDDEN_BUDGET = 50;
 
 interface SnapshotResult {
   text: string;
@@ -853,10 +860,11 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
     url: string;
     depth: number;
     full: boolean;
+    hidden: boolean;
   };
 
   const raw = await page.evaluate(
-    ({ attr, fullMode }: { attr: string; fullMode: boolean }) => {
+    ({ attr, fullMode, hiddenBudget }: { attr: string; fullMode: boolean; hiddenBudget: number }) => {
       const INTERACTIVE_TAGS = new Set([
         "A",
         "BUTTON",
@@ -887,7 +895,12 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
         password: "textbox",
         tel: "textbox",
         url: "textbox",
-        number: "spinbutton"
+        number: "spinbutton",
+        // `file` is a first-class role so the model can distinguish a
+        // file-picker input from a normal textbox — most upload widgets
+        // hide the underlying <input type="file"> behind a styled button,
+        // and the agent needs to be able to target the input by ref.
+        file: "file"
       };
 
       const roleOf = (el: Element): string | undefined => {
@@ -934,12 +947,22 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
 
       const out: Raw[] = [];
       let nextId = 1;
+      let hiddenEmitted = 0;
+      let hiddenTotal = 0;
+      const isFileInput = (el: Element): boolean =>
+        el.tagName === "INPUT" && ((el as HTMLInputElement).type?.toLowerCase() ?? "text") === "file";
       const walk = (el: Element, depth: number): void => {
         const tag = el.tagName;
         const role = roleOf(el);
         const interactive = role !== undefined && (INTERACTIVE_TAGS.has(tag) || el.getAttribute("role"));
         const visible = isVisible(el);
-        if (interactive && visible) {
+        // <input type="file"> always gets a ref — most real upload widgets
+        // hide the actual input behind a styled button, and without a ref
+        // browser_upload_file can't target it. Counted in the visible
+        // budget regardless of visibility; the `[hidden]` annotation tells
+        // the model the input isn't directly clickable.
+        const forceEmit = interactive && isFileInput(el);
+        if (interactive && (visible || forceEmit)) {
           const ref = `@e${nextId++}`;
           el.setAttribute(attr, ref.slice(1));
           let value = "";
@@ -956,7 +979,8 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
             value,
             url,
             depth,
-            full: false
+            full: false,
+            hidden: !visible
           });
           // For <select>, surface its <option> children as sibling rows at
           // depth+1 so the agent can address each option by its own @eN
@@ -965,7 +989,7 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
           // rect in the native renderer; we explicitly enumerate via
           // querySelectorAll so options nested inside <optgroup> are
           // captured too.
-          if (tag === "SELECT") {
+          if (tag === "SELECT" && visible) {
             const options = (el as HTMLSelectElement).querySelectorAll("option");
             for (const opt of Array.from(options)) {
               if (opt.disabled || opt.hidden) continue;
@@ -979,9 +1003,32 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
                 value: opt.value,
                 url: "",
                 depth: depth + 1,
-                full: false
+                full: false,
+                hidden: false
               });
             }
+          }
+        } else if (interactive && !visible) {
+          // Invisible interactive element — give it a ref so wait_for can
+          // target it (state:"hidden"/"attached"/"detached"), but suppress
+          // name/value/url annotations (they're usually empty or stale
+          // and just add noise). Capped separately so a virtualized list
+          // with thousands of prerendered rows doesn't blow up the snapshot.
+          hiddenTotal++;
+          if (hiddenEmitted < hiddenBudget) {
+            const ref = `@e${nextId++}`;
+            el.setAttribute(attr, ref.slice(1));
+            out.push({
+              ref,
+              role: role!,
+              name: "",
+              value: "",
+              url: "",
+              depth,
+              full: false,
+              hidden: true
+            });
+            hiddenEmitted++;
           }
         } else if (fullMode && visible) {
           // In full mode, also record landmark/heading text so the snapshot
@@ -1003,16 +1050,16 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
           if (fallbackRole && landmarkRoles.includes(fallbackRole)) {
             const text = (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
             if (text) {
-              out.push({ ref: "", role: fallbackRole, name: text, value: "", url: "", depth, full: true });
+              out.push({ ref: "", role: fallbackRole, name: text, value: "", url: "", depth, full: true, hidden: false });
             }
           }
         }
         for (const child of Array.from(el.children)) walk(child, depth + 1);
       };
       walk(document.body, 0);
-      return out;
+      return { entries: out, hiddenEmitted, hiddenTotal, hiddenBudget };
     },
-    { attr: REF_ATTR, fullMode: full }
+    { attr: REF_ATTR, fullMode: full, hiddenBudget: SNAPSHOT_HIDDEN_BUDGET }
   );
 
   const refs = new Map<string, Locator>();
@@ -1020,14 +1067,24 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
   let charCount = 0;
   let truncated = false;
   let elementCount = 0;
-  for (const entry of raw as SnapEntry[]) {
+  const entries = (raw as { entries: SnapEntry[] }).entries;
+  const hiddenEmitted = (raw as { hiddenEmitted: number }).hiddenEmitted;
+  const hiddenTotal = (raw as { hiddenTotal: number }).hiddenTotal;
+  for (const entry of entries) {
     const indent = "  ".repeat(entry.depth);
     let line: string;
     if (entry.ref) {
       line = `${indent}[${entry.ref}] ${entry.role}`;
-      if (entry.name) line += ` "${entry.name}"`;
-      if (entry.value) line += ` value="${entry.value}"`;
-      if (entry.role === "link" && entry.url) line += ` url="${entry.url}"`;
+      if (entry.hidden) {
+        // Hidden entries get role + [hidden] only — no name/value/url
+        // annotations, since they're typically empty or stale on
+        // not-yet-shown / off-screen widgets and just add noise.
+        line += " [hidden]";
+      } else {
+        if (entry.name) line += ` "${entry.name}"`;
+        if (entry.value) line += ` value="${entry.value}"`;
+        if (entry.role === "link" && entry.url) line += ` url="${entry.url}"`;
+      }
     } else {
       line = `${indent}${entry.role} "${entry.name}"`;
     }
@@ -1044,6 +1101,10 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
   }
   let text = lines.join("\n");
   if (truncated) text += "\n[...truncated]";
+  // Separate marker for hidden-budget truncation so the model can tell
+  // "more interactive elements exist on the page, just hidden" apart
+  // from "snapshot text was clipped at the char budget".
+  if (hiddenTotal > hiddenEmitted) text += "\n[...hidden truncated]";
   return { text, refs, elementCount, truncated };
 }
 

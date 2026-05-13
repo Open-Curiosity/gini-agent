@@ -397,10 +397,9 @@ describe.skipIf(!ENABLED)("browser tools — real Chromium integration", () => {
     const nav = JSON.parse(navRaw) as NavResult;
     if (!nav.success) throw new Error(`navigate failed: ${nav.error}`);
 
-    // <input type="file"> doesn't carry text — the walker assigns it
-    // role "textbox" by default (INPUT_ROLE has no "file" entry, so it
-    // falls through to "textbox"). Pick the first textbox ref.
-    const fileRef = findRef(nav.snapshot ?? "", "textbox");
+    // <input type="file"> gets its own first-class role "file" so the
+    // model can distinguish it from a normal textbox.
+    const fileRef = findRef(nav.snapshot ?? "", "file");
     expect(fileRef).toBeDefined();
 
     const uploadRaw = await browserUploadFile(taskId, { ref: fileRef!, path: fixtureName }, workspaceRoot);
@@ -411,6 +410,47 @@ describe.skipIf(!ENABLED)("browser tools — real Chromium integration", () => {
     // document.title; read it back via console.evaluate so we don't
     // depend on the snapshot's title surface (the upload tool's
     // envelope doesn't expose title).
+    const titleRaw = await browserConsole(taskId, { expression: "document.title" });
+    const title = JSON.parse(titleRaw) as ConsoleResult;
+    if (!title.success) throw new Error(`title failed: ${title.error}`);
+    expect(title.evalResult).toBe(fixtureName);
+  }, 60_000);
+
+  it("upload_hidden_input — snapshot surfaces a display:none file input with [hidden], browserUploadFile targets it", async () => {
+    const { workspaceRoot } = await bootInstance("upload-hidden");
+
+    const fixtureName = "hidden-fixture.txt";
+    writeFileSync(join(workspaceRoot, fixtureName), "hello-from-hidden-upload\n");
+
+    const taskId = `upload-hidden-${Date.now()}`;
+    // Canonical "real" upload widget shape: a styled button that
+    // delegates to a hidden <input type=file>. The walker has to surface
+    // the hidden input as a ref (with [hidden]) so browserUploadFile
+    // can target it via setInputFiles (Playwright's setInputFiles works
+    // on display:none file inputs).
+    const url = registerPage(
+      "/upload-hidden",
+      `<button onclick="document.getElementById('picker').click()">Upload</button>
+       <input type="file" id="picker" style="display:none" onchange="document.title=this.files[0].name">`
+    );
+    const navRaw = await browserNavigate(taskId, { url });
+    const nav = JSON.parse(navRaw) as NavResult;
+    if (!nav.success) throw new Error(`navigate failed: ${nav.error}`);
+
+    // The file input must appear in the snapshot AND must carry the
+    // [hidden] marker (so the model knows it's not directly clickable).
+    const fileRef = findRef(nav.snapshot ?? "", "file");
+    expect(fileRef).toBeDefined();
+    const hiddenLine = (nav.snapshot ?? "")
+      .split("\n")
+      .find((line) => line.includes(`[${fileRef}]`));
+    expect(hiddenLine).toBeDefined();
+    expect(hiddenLine).toContain("[hidden]");
+
+    const uploadRaw = await browserUploadFile(taskId, { ref: fileRef!, path: fixtureName }, workspaceRoot);
+    const upload = JSON.parse(uploadRaw) as NavResult;
+    if (!upload.success) throw new Error(`upload failed: ${upload.error}`);
+
     const titleRaw = await browserConsole(taskId, { expression: "document.title" });
     const title = JSON.parse(titleRaw) as ConsoleResult;
     if (!title.success) throw new Error(`title failed: ${title.error}`);
