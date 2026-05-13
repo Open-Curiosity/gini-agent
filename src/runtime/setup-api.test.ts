@@ -61,15 +61,15 @@ describe("setup-api", () => {
     s.cleanup();
   });
 
-  test("status: providerConfigured is false on a fresh instance (echo provider, no creds needed but no real provider chosen)", () => {
+  test("status: providerConfigured is false on a fresh echo-default instance", () => {
     const status = getSetupStatus(config);
     expect(status.ok).toBe(true);
     expect(status.providers).toEqual(["openai", "codex"]);
-    // Default provider is "echo" — it's configured (no creds needed), but
-    // the browser /setup page does not consider echo a "configured"
-    // provider for onboarding purposes. The contract: providerConfigured
-    // mirrors providerHealth.configured.
-    expect(typeof status.providerConfigured).toBe("boolean");
+    // Default provider is "echo". providerHealth.configured is true
+    // (echo needs no creds), but for the browser /setup gate echo
+    // doesn't count as a real onboarding choice — the user lands here
+    // and is asked to pick openai or codex.
+    expect(status.providerConfigured).toBe(false);
     expect(status.current).toBe("echo");
   });
 

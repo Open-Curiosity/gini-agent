@@ -47,9 +47,16 @@ export interface SetupStatus {
 export function getSetupStatus(config: RuntimeConfig): SetupStatus {
   const health = providerHealth(config);
   const current = typeof config.provider?.name === "string" ? config.provider.name : null;
+  // Echo is "configured" in the providerHealth sense (no creds needed)
+  // but it's a stub that does nothing useful — it's not a valid choice
+  // for browser onboarding. Anyone on echo needs to pick a real
+  // provider in /setup. Other configured providers (openai with key,
+  // codex with auth.json) pass through.
+  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local";
+  const providerConfigured = isRealProvider && Boolean(health.configured);
   return {
     ok: true,
-    providerConfigured: Boolean(health.configured),
+    providerConfigured,
     providers: [...SUPPORTED_KINDS],
     current,
     message: typeof health.message === "string" ? health.message : ""
