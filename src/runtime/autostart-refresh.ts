@@ -41,10 +41,10 @@
 // Bun has flushed all in-flight responses.
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { projectRoot } from "../paths";
+import { logDir, projectRoot } from "../paths";
 import type { Instance } from "../types";
 
 // Path to the per-instance marker file. We deliberately co-locate with
@@ -202,6 +202,53 @@ export function consumeAutostartRefresh(instance: Instance, options: ConsumeOpti
   // point of stop.
   if (!refreshRequestedInProcess) return false;
 
+  // Round-4 MEDIUM: previously stdio was "ignore", so any failure inside
+  // the detached child (e.g. launchctl bootstrap returning non-zero,
+  // bun not on PATH) was silent — the user-facing symptom was a stale
+  // plist that respawns with the OLD env after the next reboot. Now we
+  // route the child's stdout+stderr into a per-instance log file and
+  // write a one-line "spawn requested" preamble synchronously before
+  // detaching, so even a spawn-time error is captured.
+  const logFile = autostartRefreshLogPath(instance);
+  try {
+    mkdirSync(dirname(logFile), { recursive: true });
+  } catch {
+    // Best-effort: if we can't mkdir the log dir, we still try the
+    // spawn — the child will likely fail to open the FD and exit, but
+    // that's no worse than the pre-fix silent-stdio state.
+  }
+
+  const timestamp = new Date().toISOString();
+  try {
+    appendFileSync(
+      logFile,
+      `[${timestamp}] consume: spawning \`gini autostart enable --instance ${instance} --kind gateway\` cwd=${projectRoot()}\n`
+    );
+  } catch {
+    /* preamble is nice-to-have; don't fail the spawn over it */
+  }
+
+  // Open the log file in append mode and pass FDs to spawn. Append
+  // semantics mean concurrent spawn instances (shouldn't happen, but
+  // defensively) interleave cleanly at line boundaries.
+  let outFd: number | null = null;
+  let errFd: number | null = null;
+  try {
+    outFd = openSync(logFile, "a");
+    errFd = openSync(logFile, "a");
+  } catch (error) {
+    // Couldn't open log FDs — fall back to "ignore" so we don't fail
+    // the whole refresh just for missing observability. Record the
+    // attempt in a side-channel append (which may itself fail; we're
+    // out of options at that point).
+    try {
+      appendFileSync(
+        logFile,
+        `[${timestamp}] consume: failed to open log FDs: ${error instanceof Error ? error.message : String(error)}\n`
+      );
+    } catch { /* swallowed */ }
+  }
+
   const spawnFn = options.spawnImpl ?? spawn;
   try {
     const child = spawnFn(process.execPath, [
@@ -211,16 +258,45 @@ export function consumeAutostartRefresh(instance: Instance, options: ConsumeOpti
     ], {
       cwd: projectRoot(),
       detached: true,
-      stdio: "ignore",
+      // stdin ignored; stdout+stderr → log file (or "ignore" fallback
+      // if we couldn't open the FDs above).
+      stdio: outFd !== null && errFd !== null
+        ? ["ignore", outFd, errFd]
+        : "ignore",
       env: { ...process.env, GINI_INSTANCE: instance }
     });
     if (typeof child.unref === "function") child.unref();
-  } catch {
+  } catch (error) {
     // Best-effort: if spawn fails the user can re-run autostart enable
     // manually. The marker is already removed.
+    try {
+      appendFileSync(
+        logFile,
+        `[${timestamp}] consume: spawn failed: ${error instanceof Error ? error.message : String(error)}\n`
+      );
+    } catch { /* swallowed */ }
     return false;
+  } finally {
+    // Parent's copies of the FDs aren't needed after spawn — the child
+    // got dup'd copies. Closing them here is good hygiene; the parent
+    // is about to exit anyway in the production flow (server.ts
+    // SIGTERM handler), but tests reuse the process so leaks would
+    // accumulate.
+    if (outFd !== null) {
+      try { closeSync(outFd); } catch { /* ignore */ }
+    }
+    if (errFd !== null) {
+      try { closeSync(errFd); } catch { /* ignore */ }
+    }
   }
   return true;
+}
+
+// Per-instance log file for autostart-refresh subprocess output. Lives
+// alongside the runtime's other logs (logDir matches the convention
+// used by src/paths.ts:197).
+export function autostartRefreshLogPath(instance: Instance): string {
+  return join(logDir(instance), "autostart-refresh.log");
 }
 
 // Exposed for tests that want to manipulate the marker directly + reset

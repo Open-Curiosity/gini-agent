@@ -19,7 +19,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { __testing, consumeAutostartRefresh, refreshMarkerPath, requestAutostartRefresh } from "./autostart-refresh";
+import { __testing, autostartRefreshLogPath, consumeAutostartRefresh, refreshMarkerPath, requestAutostartRefresh } from "./autostart-refresh";
 
 function tag(): string {
   return `${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -275,5 +275,36 @@ describe("autostart-refresh", () => {
     expect(spawnCalls).toBe(0);
     // Marker should still be there for the right instance to consume.
     expect(existsSync(marker)).toBe(true);
+  });
+
+  // Round-4 MEDIUM fix: the detached refresh subprocess used to spawn
+  // with stdio:"ignore" and no listeners. Any failure (launchctl
+  // broken, bun missing on PATH) was silent. Now we write a preamble
+  // line to a per-instance log file and redirect child stdout+stderr
+  // to that file in append mode. This test proves the log file exists
+  // and contains the preamble after consumeAutostartRefresh fires.
+  test("consume writes a non-trivial preamble to the autostart-refresh log file", () => {
+    if (process.platform !== "darwin") return;
+    const plistDir = join(s.home, "Library", "LaunchAgents");
+    mkdirSync(plistDir, { recursive: true });
+    writeFileSync(join(plistDir, `ai.lilac.gini.${instance}.gateway.plist`), "<plist/>\n");
+    expect(requestAutostartRefresh(instance)).toBe(true);
+
+    const fakeSpawn = ((..._args: unknown[]) => {
+      return { unref() { /* no-op */ } } as unknown as ReturnType<typeof import("node:child_process").spawn>;
+    }) as unknown as typeof import("node:child_process").spawn;
+
+    const result = consumeAutostartRefresh(instance, { spawnImpl: fakeSpawn });
+    expect(result).toBe(true);
+
+    const logPath = autostartRefreshLogPath(instance);
+    expect(existsSync(logPath)).toBe(true);
+    const contents = readFileSync(logPath, "utf8");
+    // Preamble line shape: "[<iso-timestamp>] consume: spawning ..."
+    expect(contents).toContain("consume: spawning");
+    expect(contents).toContain(`--instance ${instance}`);
+    expect(contents).toContain("--kind gateway");
+    // ISO-8601-ish timestamp prefix.
+    expect(contents).toMatch(/\[\d{4}-\d{2}-\d{2}T/);
   });
 });
