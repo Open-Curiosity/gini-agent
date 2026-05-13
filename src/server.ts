@@ -163,15 +163,15 @@ process.on("SIGTERM", async () => {
   // pipes and process.exit doesn't wait for pending writes — that race would
   // drop the shutdown marker.
   drained.finally(() => {
-    // Browser-driven autostart refresh: if /api/setup/provider just wrote
-    // a refresh marker for this instance, consume it and spawn the
-    // detached `gini autostart enable --kind gateway` child. The drain
-    // above guarantees that the response to that POST has been fully
-    // flushed before we get here — `server.stop(true)` waits for all
-    // in-flight responses to finish writing. The marker → spawn step
-    // is the LAST thing we do before exiting, so the connection has
-    // closed and the client has the response in hand by the time
-    // launchctl bootstrap fires in the child.
+    // Browser-driven autostart refresh: if /api/setup/provider just
+    // wrote a refresh marker for this instance, consume it and spawn
+    // the detached `gini autostart enable --kind gateway` child. The
+    // drain above guarantees the response to that POST has been
+    // fully flushed before we get here — `server.stop(false)` waits
+    // for all in-flight responses to finish writing. The marker →
+    // spawn step is the LAST thing we do before exiting, so the
+    // connection has closed and the client has the response in hand
+    // by the time launchctl bootstrap fires in the child.
     try {
       consumeAutostartRefresh(config.instance);
     } catch (error) {

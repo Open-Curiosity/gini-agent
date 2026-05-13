@@ -130,15 +130,16 @@ export async function setSetupProvider(
     config.provider = normalizeProvider({ name: "openai", model });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 
-    // Request plist refresh via a marker file + SIGTERM. The previous
-    // approach (setImmediate → setTimeout(200ms) → detached spawn) was a
-    // heuristic — a slow client could still be mid-read when launchctl
-    // bootouts the gateway, breaking the user's POST response mid-flush.
-    // The new approach hooks the actual response lifecycle: we self-
-    // signal SIGTERM so Bun's `server.stop(true)` drains in-flight
-    // responses (including this one) before our SIGTERM handler reads
-    // the marker and execs the refresh as the very last thing on the
-    // way out. See src/runtime/autostart-refresh.ts.
+    // Request plist refresh via a marker file + SIGTERM. A simpler
+    // approach (setImmediate → setTimeout(200ms) → detached spawn)
+    // would be a heuristic — a slow client could still be mid-read
+    // when launchctl bootouts the gateway, breaking the user's POST
+    // response mid-flush. Hooking the actual response lifecycle
+    // instead: we self-signal SIGTERM so Bun's `server.stop(false)`
+    // drains in-flight responses (including this one) before our
+    // SIGTERM handler reads the marker and execs the refresh as the
+    // very last thing on the way out. See
+    // src/runtime/autostart-refresh.ts.
     const refreshed = requestAutostartRefresh(config.instance);
 
     return {

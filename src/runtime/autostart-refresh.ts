@@ -24,9 +24,11 @@
 //      `<instanceRoot>/.autostart-refresh-pending` containing the instance
 //      name.
 //   2. The POST handler signals the gateway via SIGTERM. Bun's
-//      `server.stop(true)` drains all in-flight responses — including the
-//      one we're answering — BEFORE the SIGTERM handler proceeds to its
-//      final actions.
+//      `server.stop(false)` drains all in-flight responses — including
+//      the one we're answering — BEFORE the SIGTERM handler proceeds
+//      to its final actions. (We use stop(false), the polite "wait
+//      for in-flight" variant; stop(true) would force-close
+//      connections and could drop the response we just wrote.)
 //   3. After drain, the SIGTERM handler consumes the marker: removes it
 //      and execs `gini autostart enable --kind gateway` as a detached
 //      child. That child's `launchctl bootstrap` re-registers the plist
@@ -81,10 +83,11 @@ function resetRefreshFlag(): void {
   refreshRequestedInProcess = false;
 }
 
-// Called from the response handler (POST /api/setup/provider) after the
-// new key has been persisted. Writes the marker so the SIGTERM handler
-// will pick it up after Bun drains in-flight responses, then signals
-// SIGTERM to ourselves so `server.stop(true)` runs.
+// Called from the response handler (POST /api/setup/provider) after
+// the new key has been persisted. Writes the marker so the SIGTERM
+// handler will pick it up after Bun drains in-flight responses, then
+// signals SIGTERM to ourselves so `server.stop(false)` runs (see the
+// SIGTERM handler in src/server.ts).
 //
 // Returns true when a refresh was requested (marker written + SIGTERM
 // dispatched). Returns false on non-darwin or when no gateway plist
@@ -119,18 +122,20 @@ export function requestAutostartRefresh(instance: Instance): boolean {
   // contract remains observable.
   if (process.env.GINI_SKIP_PLIST_REFRESH === "1") return true;
 
-  // Self-signal SIGTERM. Bun's `server.stop(true)` (called from the
-  // SIGTERM handler in src/server.ts) waits for in-flight responses to
-  // finish writing before returning. Our response to the POST that
-  // triggered this is one of those in-flight responses — so the gateway
-  // can't actually exit until our response bytes hit the socket.
+  // Self-signal SIGTERM. Bun's `server.stop(false)` (called from the
+  // SIGTERM handler in src/server.ts) waits for in-flight responses
+  // to finish writing before returning. Our response to the POST that
+  // triggered this is one of those in-flight responses — so the
+  // gateway can't actually exit until our response bytes hit the
+  // socket.
   //
   // We dispatch via setImmediate so the current request handler's
   // Response object is fully returned to Bun before the signal lands.
-  // (Without that, an edge case where SIGTERM handlers run synchronously
-  // could interrupt the handler's return path. With setImmediate, the
-  // handler returns first; the SIGTERM enqueues; Bun starts flushing
-  // bytes; server.stop(true) waits for that flush.)
+  // (Without that, an edge case where SIGTERM handlers run
+  // synchronously could interrupt the handler's return path. With
+  // setImmediate, the handler returns first; the SIGTERM enqueues;
+  // Bun starts flushing bytes; server.stop(false) waits for that
+  // flush.)
   setImmediate(() => {
     try {
       process.kill(process.pid, "SIGTERM");
