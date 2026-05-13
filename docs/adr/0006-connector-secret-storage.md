@@ -1,0 +1,59 @@
+# ADR 0006: Connector Secret Storage
+
+## Decision
+
+Connector secrets are stored as encrypted files inside the instance directory, not in the macOS Keychain. Each instance owns a per-instance encryption key on disk; individual secrets are encrypted with that key and written under `~/.gini/instances/<instance>/secrets/`.
+
+The gateway is the only process that reads or writes secrets. Clients (CLI, web, mobile) submit and rotate secrets through the gateway HTTP API; they never touch the secret files directly.
+
+## Context
+
+Gini's product shape assumes a screenless-Mac mode: the gateway runs on the user's Mac while the user interacts from a phone, remote web client, or messaging bridge. Any blocking UI on the Mac during normal operation is a dead-end interaction the remote user cannot resolve.
+
+macOS Keychain protects items with an ACL keyed to the calling binary's code signature. Reads from a different binary (or from the same binary after a signature change) produce a modal "Always Allow / Deny" dialog. In practice this fires on:
+
+- First install.
+- Bun upgrades, since Gini runs on Bun and Bun is typically ad-hoc signed.
+- Gini upgrades, signature changes, binary path moves.
+- A manually locked keychain.
+
+Each of these would strand a remote user. The Keychain security win (binary-ACL protection against malicious processes running as the same user) does not survive the headless-Mac constraint.
+
+Single-user developer tooling on macOS overwhelmingly stores credentials as files at mode `0600` (`~/.aws/credentials`, `~/.ssh/id_rsa`, `~/.npmrc`, `~/.config/gh/hosts.yml`, Cursor, Claude Code). FileVault, on by default, provides the at-rest protection that Keychain otherwise contributes. The remaining gap (in-process attacker as the same user) is real but acceptable for this product.
+
+## Required Now
+
+- Each instance owns a key file at `~/.gini/instances/<instance>/secrets/.key`, mode `0600`, created on install.
+- Each connector secret is stored at `~/.gini/instances/<instance>/secrets/<connector-id>.json`, mode `0600`, encrypted with the instance key (AES-256-GCM or libsodium secretbox).
+- `ConnectorRecord` persists only secret *references* (`{ purpose, path }`), never plaintext values, in instance state.
+- Secrets are added, rotated, and revoked exclusively through `POST` / `PATCH` / `DELETE /api/connectors/...` on the gateway. The CLI and web client call the same endpoints.
+- The gateway is the only process that decrypts secrets. Browser code, per ADR 0001, never receives them.
+- Every secret read and write emits an audit event with `target: connector.id` and `purpose`. The plaintext value is never logged.
+- Health probes (`POST /api/connectors/:id/health`) decrypt the secret in-process, hit the third-party API, and surface only the result.
+- The smoke flow exercises add, use, rotate, and delete for at least one non-demo connector kind.
+
+## Deferred
+
+- macOS Keychain as an opt-in hardened backend for users sitting at the Mac.
+- Secure Enclave-backed encryption keys.
+- Per-secret accessibility classes or hardware attestation.
+- Cross-instance secret sharing.
+- Cloud-backed secret sync or backup.
+
+## Consequences For Coding Agents
+
+- Do not import or shell out to `keytar`, `security`, or any Keychain API.
+- Do not add fields to `ConnectorRecord` that hold plaintext secret material; only references.
+- Route new connector kinds through the gateway add/rotate/delete endpoints. Do not read or write the `secrets/` directory from clients.
+- When adding a tool that consumes a connector, fetch the secret through the gateway's resolver, stamp the connector id into the audit event, and never include the secret in trace evidence.
+- If a future change reintroduces Keychain as an opt-in backend, add it as a `backend` discriminator on the secret reference; do not replace the file backend.
+
+## Acceptance Checks
+
+- A fresh instance install creates `~/.gini/instances/<instance>/secrets/` with mode `0700` and a `.key` file with mode `0600`.
+- `POST /api/connectors` accepts a secret payload, writes an encrypted file, and returns a record whose state JSON contains only the reference.
+- Inspecting `state.json` after adding a connector shows no plaintext secret bytes.
+- `PATCH` rotates the secret without changing the record id; the old ciphertext is overwritten.
+- `DELETE` removes both the record and the secret file.
+- Audit events appear for add, rotate, use, and delete, and none of them contain the secret value.
+- The full flow runs end-to-end against a remote client (phone / web BFF) with no UI interaction on the Mac.
