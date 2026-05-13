@@ -175,7 +175,17 @@ async function enable(instance: string, testRoot?: { stateRoot?: string; logRoot
       }
     }
 
-    const res = bootstrap(instance, path);
+    // Bootstrap with a short retry. macOS launchd sometimes returns
+    // "Bootstrap failed: 5: Input/output error" when the previous
+    // bootout hasn't fully flushed yet — typically clears within ~1s.
+    // We retry up to 3 times with 500ms backoff to ride out the gap.
+    let res = bootstrap(instance, path);
+    let attempts = 1;
+    while (!res.ok && attempts < 3 && res.stderr.includes("Input/output error")) {
+      await Bun.sleep(500);
+      res = bootstrap(instance, path);
+      attempts += 1;
+    }
     if (!res.ok) {
       results.push({
         kind,
