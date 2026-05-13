@@ -77,10 +77,10 @@ export async function autostart(ctx: CliContext): Promise<void> {
 
   if (sub === "enable") {
     const kindFlag = flagValue(ctx.rawArgs, "--kind");
-    // LOW-E: validate --kind explicitly. The pre-fix behavior silently
-    // fell through to "both kinds" on a typo (e.g. `--kind gatway`),
-    // which is surprising and hides intent. Now a bad value is a clear
-    // non-zero exit with a descriptive error.
+    // Validate --kind explicitly. Without this, a typo like
+    // `--kind gatway` silently falls through to "both kinds", which is
+    // surprising and hides intent. A bad value is a clear non-zero
+    // exit with a descriptive error instead.
     if (kindFlag !== undefined && kindFlag !== "gateway" && kindFlag !== "web") {
       print({
         ok: false,
@@ -92,10 +92,10 @@ export async function autostart(ctx: CliContext): Promise<void> {
     const kinds: PlistKind[] = kindFlag === "gateway" || kindFlag === "web" ? [kindFlag] : KINDS;
     const result = await enable(instance, testRoot, kinds);
     print(result);
-    // HIGH-B: when rollback itself failed, emit a clear stderr warning so
-    // the operator sees the honest state at a glance instead of having to
-    // dig through the JSON. The result JSON already has all the per-kind
-    // detail; this is purely a "look here" pointer.
+    // When rollback itself failed, emit a clear stderr warning so the
+    // operator sees the honest state at a glance instead of having to
+    // dig through the JSON. The result JSON already has all the
+    // per-kind detail; this is purely a "look here" pointer.
     if (result.partialState === "rollback_failed") {
       const lines = (result.rollbackFailures ?? []).map(
         (f) => `  - ${f.kind}: ${f.stderr || f.error}`
@@ -107,10 +107,10 @@ export async function autostart(ctx: CliContext): Promise<void> {
         `${lines.join("\n")}\n`
       );
     }
-    // HIGH-4: exit code reflects ok:false so install.sh's `if … then`
-    // sees the failure. Previously soft failures (e.g. partial bootstrap)
-    // returned exit 0 because the JSON had ok:false but the CLI didn't
-    // surface that to the shell.
+    // Exit code reflects ok:false so install.sh's `if … then` shell
+    // guard sees the failure. Without this, soft failures (e.g.
+    // partial bootstrap) would return exit 0 even though the JSON
+    // body had ok:false — the shell side would never know.
     if (!result.ok) process.exitCode = 1;
     return;
   }
@@ -125,9 +125,9 @@ export async function autostart(ctx: CliContext): Promise<void> {
     return;
   }
   if (sub === "kick") {
-    // LOW-E: validate --kind for kick the same way enable does. The
-    // pre-fix behavior silently fell through to "both kinds" on a typo,
-    // which is surprising and hides intent.
+    // Validate --kind the same way `enable` does — a typo like
+    // `--kind gatway` would otherwise silently fall through to
+    // "both kinds", hiding the operator's intent.
     const kindFlag = flagValue(ctx.rawArgs, "--kind");
     if (kindFlag !== undefined && kindFlag !== "gateway" && kindFlag !== "web") {
       print({
@@ -179,23 +179,23 @@ interface PerKindEnableResult {
   enabled: boolean;
   error?: string;
   stderr?: string;
-  // Round-5 fix: on macOS 26 (Tahoe), `RunAtLoad` in the plist is
-  // best-effort — after `launchctl bootstrap`, services frequently end
-  // up registered but never spawn (`state = not running`, last exit code
-  // `(never exited)`). We always `kickstart` after a successful bootstrap
-  // so the service actually launches immediately, regardless of macOS
-  // version. If kickstart itself fails, the bootstrap succeeded — the
-  // user can still run `gini autostart kick` manually — so we surface
-  // it as a soft failure on the per-kind result instead of failing the
-  // whole enable.
+  // On macOS 26 (Tahoe), `RunAtLoad` in the plist is best-effort —
+  // after `launchctl bootstrap`, services frequently end up registered
+  // but never spawn (`state = not running`, last exit code
+  // `(never exited)`). We always `kickstart` after a successful
+  // bootstrap so the service actually launches immediately,
+  // regardless of macOS version. If kickstart itself fails, the
+  // bootstrap succeeded — the user can still run `gini autostart kick`
+  // manually — so we surface it as a soft failure on the per-kind
+  // result instead of failing the whole enable.
   kickstartError?: string;
   kickstartStderr?: string;
 }
 
-// HIGH-B: when a later kind in the enable sequence fails (e.g. web
-// bootstrap fails after gateway succeeds), we attempt to roll back the
-// earlier successful bootstraps via `bootout`. That rollback itself can
-// fail — and silently ignoring its failure leaves the operator with a
+// When a later kind in the enable sequence fails (e.g. web bootstrap
+// fails after gateway succeeds), we attempt to roll back the earlier
+// successful bootstraps via `bootout`. That rollback can itself fail —
+// and silently ignoring its failure leaves the operator with a
 // misleading `ok:false` while the gateway is still loaded. We surface
 // the rollback state explicitly:
 //
@@ -226,12 +226,12 @@ interface EnableResult {
 }
 
 // Compute the plist's StandardOutPath/StandardErrorPath log root WITHOUT
-// honoring process.env.GINI_LOG_ROOT. MEDIUM-6: logDir() in paths.ts
-// returns join(GINI_LOG_ROOT, instance) when that env var is set, so a
+// honoring process.env.GINI_LOG_ROOT. logDir() in paths.ts returns
+// join(GINI_LOG_ROOT, instance) when that env var is set, so a
 // developer who runs `autostart enable` from a shell with GINI_LOG_ROOT
-// set would bake scratch paths into the permanent plist. The fix: when
-// not in testRoot opt-in, compute the log root from instance state root
-// directly. When testRoot.logRoot is provided (E2E), embed that.
+// set would otherwise bake scratch paths into the permanent plist.
+// When not in testRoot opt-in, compute the log root from instance state
+// root directly. When testRoot.logRoot is provided (E2E), embed that.
 function resolveLogRoot(instance: string, testRoot?: { stateRoot?: string; logRoot?: string }): string {
   if (testRoot?.logRoot) return join(testRoot.logRoot, instance);
   if (testRoot?.stateRoot) return join(testRoot.stateRoot, "instances", instance, "logs");
@@ -243,8 +243,8 @@ function resolveLogRoot(instance: string, testRoot?: { stateRoot?: string; logRo
   return join(home, ".gini", "instances", instance, "logs");
 }
 
-// Test seam: HIGH-B's rollback-failure surfacing has no other reachable
-// path — we can't easily make a real `launchctl bootout` fail without
+// Test seam: rollback-failure surfacing has no other reachable path —
+// we can't easily make a real `launchctl bootout` fail without
 // holding launchd hostage. Tests inject mocks here to assert the
 // partialState bookkeeping. Production callers omit `__deps` and get
 // the real launchctl shellouts.
@@ -255,9 +255,9 @@ export interface EnableLaunchctlDeps {
   kickstart: typeof kickstart;
 }
 
-// Exported for HIGH-B testing of rollback-failure surfacing via injected
-// launchctl deps. Production CLI dispatch still goes through `autostart()`
-// at the top of this file.
+// Exported so tests can drive the rollback-failure path via injected
+// launchctl deps. Production CLI dispatch still goes through
+// `autostart()` at the top of this file.
 export async function enable(
   instance: string,
   testRoot?: { stateRoot?: string; logRoot?: string },
@@ -296,12 +296,12 @@ export async function enable(
     }
   }
 
-  // HIGH-5: clean up the round-1 legacy single-plist
-  // `<currentPrefix>.<instance>` (no kind suffix) BEFORE bootstrapping
-  // the round-2 split pair. Otherwise an upgrade from round 1 → round 2
-  // leaves the legacy service running alongside the new pair, which
-  // either fights for the gateway port or wedges launchd. `bootout` on
-  // an unknown label is a no-op (we ignore "Could not find service"),
+  // Clean up the older single-plist `<currentPrefix>.<instance>` (no
+  // kind suffix) BEFORE bootstrapping the gateway/web split pair.
+  // Without this, an upgrade from the pre-split shape leaves the
+  // legacy service running alongside the new pair, which either
+  // fights for the gateway port or wedges launchd. `bootout` on an
+  // unknown label is a no-op (we ignore "Could not find service"),
   // so it's safe to always run.
   if (deps.isLoaded(instance) && kinds.includes("gateway")) {
     const out = deps.bootout(instance);
@@ -322,20 +322,20 @@ export async function enable(
   }
   // Remove the legacy plist file too so a future `disable` doesn't
   // bother re-cleaning it (and so `ls ~/Library/LaunchAgents/` shows
-  // only the round-2 split files).
+  // only the current gateway/web split files).
   const legacyPlist = plistPathFor(instance);
   if (existsSync(legacyPlist) && kinds.includes("gateway")) {
     try { rmSync(legacyPlist, { force: true }); } catch { /* best-effort */ }
   }
 
-  // HIGH-4 (b): track which kinds we successfully bootstrapped so we
-  // can roll them back if a later kind fails. Leaving a half-loaded
-  // service set is worse than nothing loaded — `gini status` would
-  // report the gateway up but the user can't reach the webapp.
+  // Track which kinds we successfully bootstrapped so we can roll
+  // them back if a later kind fails. Leaving a half-loaded service
+  // set is worse than nothing loaded — `gini status` would report
+  // the gateway up but the user can't reach the webapp.
   const bootstrapped: PlistKind[] = [];
 
-  // HIGH-B: rollback bookkeeping. Populated when a later kind fails and
-  // we attempt to bootout the earlier successful ones. Each entry
+  // Rollback bookkeeping: populated when a later kind fails and we
+  // attempt to bootout the earlier successful ones. Each entry
   // represents a rollback bootout that itself returned non-zero — the
   // operator must clean it up manually because the service is still
   // loaded.
@@ -397,17 +397,17 @@ export async function enable(
         stderr: res.stderr.trim()
       });
       allOk = false;
-      // HIGH-4 (b) / HIGH-B: roll back any kinds we already bootstrapped
-      // in this call so we don't leave a half-loaded service set behind.
-      // Skip kinds that were `wasLoaded:true` on entry — those are the
-      // user's prior state, not something this call created. If the
-      // rollback bootout itself fails, capture the per-kind error and
-      // flip partialState to "rollback_failed" so the operator sees
-      // the honest state: the gateway is still loaded but the web
-      // never came up, and we couldn't clean up either. Round-3 review
-      // (HIGH-B) called this out: silently ignoring rollback failures
-      // returned ok:false while the gateway stayed loaded — misleading
-      // state for the operator.
+      // Roll back any kinds we already bootstrapped in this call so
+      // we don't leave a half-loaded service set behind. Skip kinds
+      // that were `wasLoaded:true` on entry — those are the user's
+      // prior state, not something this call created. If the rollback
+      // bootout itself fails, capture the per-kind error and flip
+      // partialState to "rollback_failed" so the operator sees the
+      // honest state: the gateway is still loaded but the web never
+      // came up, and we couldn't clean up either. Silently swallowing
+      // rollback failures (returning ok:false with the gateway still
+      // loaded) is misleading; the operator needs to see it so they
+      // can clean up by hand.
       let allRolledBack = bootstrapped.length > 0;
       for (const earlier of bootstrapped) {
         const r = deps.bootout(instance, earlier);
@@ -426,12 +426,12 @@ export async function enable(
       continue;
     }
     bootstrapped.push(kind);
-    // Round-5 fix: macOS 26 frequently registers the service via
-    // `launchctl bootstrap` but never actually spawns it — `RunAtLoad`
-    // is honored as best-effort, not a guarantee. The symptom: `state
-    // = not running`, `last exit code = (never exited)`, indefinitely.
-    // We `kickstart` immediately after every successful bootstrap so
-    // the service actually runs regardless of macOS version. `-k` is
+    // macOS 26 frequently registers the service via `launchctl
+    // bootstrap` but never actually spawns it — `RunAtLoad` is honored
+    // as best-effort, not a guarantee. The symptom: `state = not
+    // running`, `last exit code = (never exited)`, indefinitely. We
+    // `kickstart` immediately after every successful bootstrap so the
+    // service actually runs regardless of macOS version. `-k` is
     // idempotent on a not-running service (it's a no-op kill + start);
     // it doesn't matter that the service hasn't launched yet.
     //
@@ -493,9 +493,9 @@ interface DisableResult {
 }
 
 async function disable(instance: string): Promise<DisableResult> {
-  // Pull legacy (round-1) single-plist into the cleanup loop too. If a
-  // user upgrades from round 1 → round 2 and runs `autostart disable`,
-  // we want to clean up the old `ai.lilac.gini.<instance>` plist too.
+  // Pull the older single-plist into the cleanup loop too. If a user
+  // upgrades from the pre-split shape and runs `autostart disable`,
+  // we want to clean up the old `<prefix>.<instance>` plist as well.
   // It's safe to call bootout on a label that isn't loaded — launchctl
   // returns "Could not find service".
   const legacyPath = plistPathFor(instance);
@@ -624,8 +624,9 @@ interface StatusResult {
   ok: true;
   instance: string;
   services: PerKindStatus[];
-  // Round-1 single-plist fields, surfaced for compatibility (some tests and
-  // user scripts grep on them). Reflects the gateway service.
+  // Legacy single-plist fields from before the gateway/web split,
+  // surfaced for compatibility (some tests and user scripts grep on
+  // them). Reflects the gateway service.
   label: string;
   plistPath: string;
   plistExists: boolean;

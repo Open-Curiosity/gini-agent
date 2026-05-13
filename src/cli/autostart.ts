@@ -38,8 +38,8 @@ export const LABEL_PREFIX = "ai.lilaclabs.gini";
 // out and removes any plists registered under these so an upgrade is clean
 // (no orphan launchd jobs, no plist files left in ~/Library/LaunchAgents/).
 // Add new entries here — never remove — so users who skip releases still
-// migrate correctly. Each prefix is matched for both the round-1
-// single-plist label (`<prefix>.<instance>`) and the round-2 split pair
+// migrate correctly. Each prefix is matched both for the older
+// single-plist label (`<prefix>.<instance>`) and the current split pair
 // (`<prefix>.<instance>.gateway` / `<prefix>.<instance>.web`).
 export const LEGACY_LABEL_PREFIXES: readonly string[] = ["ai.lilac.gini"];
 
@@ -71,10 +71,11 @@ export function legacyHandlesFor(instance: Instance): LegacyHandle[] {
   return handles;
 }
 
-// The legacy single-plist label `ai.lilac.gini.<instance>` (round 1).
-// `labelFor()` keeps returning this for callers that still want a single
-// instance handle (e.g. internal logging, label tests). New code that
-// distinguishes the gateway/web pair should use `labelForKind`.
+// The single-plist label `<prefix>.<instance>` from before the
+// gateway/web split. `labelFor()` keeps returning this for callers
+// that still want a single instance handle (e.g. internal logging,
+// label tests). New code that distinguishes the gateway/web pair
+// should use `labelForKind`.
 export function labelFor(instance: Instance): string {
   return `${LABEL_PREFIX}.${instance}`;
 }
@@ -274,7 +275,7 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
     // whatever else is using 3000. Pin to the per-instance default that
     // `gini start` would have picked.
     PORT: String(defaultWebPort(options.instance)),
-    // MEDIUM-C: per-instance Next.js dist dir. `gini start` already sets
+    // Per-instance Next.js dist dir. `gini start` already sets
     // GINI_DIST_DIR=.next-<instance> in src/cli/process.ts so two
     // instances from the same checkout don't race each other's build
     // artifacts in `.next/`. The autostart web plist execs `bun run dev`

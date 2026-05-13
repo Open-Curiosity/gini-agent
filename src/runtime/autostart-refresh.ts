@@ -7,13 +7,13 @@
 // so the user's session keeps working — this is purely a survive-future-
 // respawn concern.
 //
-// The naive approach (round-3 entry state) was:
+// A naive approach would be:
 //   POST /api/setup/provider → setImmediate → setTimeout(200ms) →
 //   spawn detached `gini autostart enable --kind gateway`.
 //
-// That's a heuristic. `setImmediate` runs in the next I/O tick, and 200ms
-// is a hope, not a guarantee. A slow client (or a non-trivial response
-// body) can still be mid-read when the detached child issues
+// That's a heuristic. `setImmediate` runs in the next I/O tick, and
+// 200ms is a hope, not a guarantee. A slow client (or a non-trivial
+// response body) can still be mid-read when the detached child issues
 // `launchctl bootout` and SIGTERMs the gateway, breaking the user's
 // POST mid-response.
 //
@@ -151,10 +151,11 @@ export function requestAutostartRefresh(instance: Instance): boolean {
 // If the marker exists but the in-process flag is FALSE, this SIGTERM
 // did NOT originate from our /api/setup/provider flow — it came from
 // somewhere else (e.g. user ran `gini stop`). In that case we still
-// clean up the stale marker (so it doesn't accumulate on disk and fire
-// at the next setup POST) but we do NOT spawn the bootstrap. This is
-// the round-4 HIGH-2 fix: a `gini stop` issued while a marker was
-// sitting around from a prior crash must not respawn the gateway.
+// clean up the stale marker (so it doesn't accumulate on disk and
+// fire at the next setup POST) but we do NOT spawn the bootstrap.
+// Without this gate, a `gini stop` issued while a marker was sitting
+// around from a prior crash would respawn the gateway and defeat
+// the user's explicit stop intent.
 //
 // Returns true when a refresh was kicked off; false otherwise (no
 // marker, non-darwin, or marker present without the in-process flag).
@@ -202,20 +203,21 @@ export function consumeAutostartRefresh(instance: Instance, options: ConsumeOpti
   // point of stop.
   if (!refreshRequestedInProcess) return false;
 
-  // Round-4 MEDIUM: previously stdio was "ignore", so any failure inside
-  // the detached child (e.g. launchctl bootstrap returning non-zero,
-  // bun not on PATH) was silent — the user-facing symptom was a stale
-  // plist that respawns with the OLD env after the next reboot. Now we
-  // route the child's stdout+stderr into a per-instance log file and
-  // write a one-line "spawn requested" preamble synchronously before
-  // detaching, so even a spawn-time error is captured.
+  // Route the detached child's stdout+stderr into a per-instance log
+  // file. A naive `stdio: "ignore"` would swallow launchctl errors
+  // (bootstrap returning non-zero, bun not on PATH) silently — the
+  // user-facing symptom would be a stale plist that respawns with the
+  // OLD env after the next reboot, with no audit trail. We also write
+  // a one-line "spawn requested" preamble synchronously before
+  // detaching so even a spawn-time error is captured.
   const logFile = autostartRefreshLogPath(instance);
   try {
     mkdirSync(dirname(logFile), { recursive: true });
   } catch {
     // Best-effort: if we can't mkdir the log dir, we still try the
-    // spawn — the child will likely fail to open the FD and exit, but
-    // that's no worse than the pre-fix silent-stdio state.
+    // spawn — the child will likely fail to open the FD and exit,
+    // but that's no worse than silently swallowing the launchctl
+    // error (which is what we'd get with stdio:"ignore" anyway).
   }
 
   const timestamp = new Date().toISOString();
@@ -239,8 +241,8 @@ export function consumeAutostartRefresh(instance: Instance, options: ConsumeOpti
   } catch (error) {
     // Couldn't open log FDs — fall back to "ignore" so we don't fail
     // the whole refresh just for missing observability. Record the
-    // attempt in a side-channel append (which may itself fail; we're
-    // out of options at that point).
+    // attempt in a side-channel append (which may itself fail; if it
+    // does, we're out of options at that point).
     try {
       appendFileSync(
         logFile,

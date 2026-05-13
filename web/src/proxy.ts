@@ -11,16 +11,16 @@
 // show a degraded UI than a redirect loop when the runtime is the
 // problem.
 //
-// MEDIUM-7: no cache. A previous version cached the status answer for 2s,
-// but that caused a race: when /setup posts a successful provider, the
-// page does router.replace('/') *immediately* — within the cache window.
-// The proxy on `/` then read stale `providerConfigured:false` and
-// bounced the user back to /setup. The cost of always hitting the
-// gateway: a single sub-millisecond local HTTP call per gated request.
-// That's cheap enough — the runtime is on the same machine and the call
-// hits a tiny in-memory check (providerHealth + config). The matcher
-// already excludes /_next/static and /_next/image so static asset
-// loading isn't impacted.
+// No cache on the status answer. A previous version cached the result
+// for 2s, but that caused a race: when /setup POSTs a successful
+// provider, the page calls router.replace('/') *immediately* —
+// within the cache window. The proxy on `/` would then read stale
+// `providerConfigured:false` and bounce the user back to /setup. The
+// cost of always hitting the gateway is one sub-millisecond local
+// HTTP call per gated request — cheap, because the runtime is on the
+// same machine and the call hits a tiny in-memory check
+// (providerHealth + config). The matcher already excludes
+// /_next/static and /_next/image so static asset loading is unaffected.
 
 import { NextResponse, type NextRequest } from "next/server";
 import { runtimeToken, runtimeUrl } from "@/lib/runtime";

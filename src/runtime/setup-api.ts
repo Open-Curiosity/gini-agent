@@ -1,9 +1,9 @@
 // Browser-facing setup endpoints.
 //
-// The pre-round-2 onboarding was a terminal-only affair (`gini setup`). The
-// new headline flow is "curl … | bash" → autostart → browser opens to
-// /setup. The webapp's setup page calls these endpoints to read the current
-// provider state and to write OpenAI / verify Codex creds.
+// Onboarding used to be a terminal-only affair (`gini setup`). The
+// current headline flow is "curl … | bash" → autostart → browser opens
+// to /setup. The webapp's setup page calls these endpoints to read the
+// current provider state and to write OpenAI / verify Codex creds.
 //
 // Behavior:
 //   - GET /api/setup/status reflects the live provider config plus the
@@ -19,17 +19,22 @@
 //     env on each call). The runtime config is rewritten to `openai` so
 //     status calls reflect the new active provider.
 //
-// What this DOES do for plist refresh: when an OpenAI key is written and
-// a gateway plist exists on disk, this module calls
-// requestAutostartRefresh (src/runtime/autostart-refresh.ts) which
+// What this DOES do for plist refresh: when an OpenAI key is written
+// and a gateway plist exists on disk, this module calls
+// requestAutostartRefresh (src/runtime/autostart-refresh.ts), which
 // writes a marker file and self-signals SIGTERM. The gateway's SIGTERM
 // handler then drains in-flight responses, consumes the marker, and
 // execs a detached `gini autostart enable --kind gateway` as the last
-// thing before process.exit(0). That child re-registers the plist with
-// fresh EnvironmentVariables read from secrets.env. Round-3 wired the
-// hand-off; round-4 hardened it (response drain ordering, SIGTERM
-// idempotency, in-process gate to block external-SIGTERM respawns).
-// We still keep the module API-thin: no shelling out from the request
+// thing before process.exit(0). That child re-registers the plist
+// with fresh EnvironmentVariables read from secrets.env.
+//
+// The hand-off goes via marker + SIGTERM rather than a direct
+// in-process spawn for two reasons: (1) we need Bun's `server.stop`
+// drain to finish writing this very response before launchctl
+// bootouts the gateway, and (2) the in-process gate in
+// autostart-refresh.ts ensures only self-signaled SIGTERMs trigger a
+// respawn — an external `gini stop` must NOT bring the gateway back.
+// We keep the module API-thin: no shelling out from the request
 // handler itself; the actual launchctl interaction is the detached
 // child's responsibility.
 
