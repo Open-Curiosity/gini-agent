@@ -308,13 +308,46 @@ enable_autostart() {
   fi
 }
 
-# Wait up to TIMEOUT_SECONDS for the web app to respond at /api/runtime/__healthz
-# on its default port for the main instance. Returns the URL on success, empty
-# on timeout. We poll the default web port (3000 for main) because we don't
-# know the exact port the autostart launched Next.js on; the user's first
-# browser open is to a stable URL anyway.
+# Read the per-instance web port from ~/.gini/instances/<inst>/web.port,
+# polling for up to 30s while the autostart web shim writes it. The
+# default web port is hash-derived (src/paths.ts:defaultWebPort) so it
+# is almost never 3000 for non-`main` instances; even for `main`
+# install.sh must not assume 3000 because future versions could change
+# the hashing scheme. Echoes the port on success, empty on timeout.
+read_web_port() {
+  local instance="$1"
+  local port_file="$HOME/.gini/instances/$instance/web.port"
+  local timeout=30
+  local i=0
+  while [ $i -lt $timeout ]; do
+    if [ -f "$port_file" ]; then
+      local port
+      port="$(tr -d '[:space:]' <"$port_file" 2>/dev/null || true)"
+      if [ -n "$port" ]; then
+        printf '%s' "$port"
+        return
+      fi
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  printf ''
+}
+
+# Wait up to 30s for the web app to respond at /api/runtime/__healthz on
+# the actual web port for the given instance. The port is discovered
+# from ~/.gini/instances/<inst>/web.port (written by the autostart shim
+# at startup), NOT hardcoded. Returns the URL on success, empty on
+# timeout.
 wait_for_web_healthz() {
-  local web_url="http://127.0.0.1:3000"
+  local instance="$1"
+  local port
+  port="$(read_web_port "$instance")"
+  if [ -z "$port" ]; then
+    printf ''
+    return
+  fi
+  local web_url="http://127.0.0.1:$port"
   local timeout=30
   local i=0
   while [ $i -lt $timeout ]; do
@@ -341,9 +374,9 @@ open_setup_in_browser() {
   fi
   info "Waiting for the Gini webapp to come up..."
   local web_url
-  web_url="$(wait_for_web_healthz)"
+  web_url="$(wait_for_web_healthz "$DEFAULT_INSTANCE")"
   if [ -z "$web_url" ]; then
-    info "Webapp didn't respond within 30s. After install completes, open http://127.0.0.1:3000/setup in your browser."
+    info "Webapp didn't respond within 60s. After install completes, run 'gini status' to find the web port and open <web_url>/setup in your browser."
     return
   fi
   # `open` works in both interactive and non-interactive (piped) sessions
@@ -371,8 +404,7 @@ print_done() {
   # platform != macOS), fall back to the old gini start instructions.
   print_next_commands() {
     if [ "$AUTOSTART_ENABLED" = "1" ]; then
-      printf '    open http://127.0.0.1:3000/setup    # configure your provider in the browser\n'
-      printf '    gini status                          # check the runtime\n'
+      printf '    gini status                          # shows the web URL — open <url>/setup to configure your provider\n'
     elif [ "$SETUP_RAN" = "1" ]; then
       printf '    gini start\n'
     else
@@ -391,7 +423,7 @@ print_done() {
     printf '\n'
   else
     if [ "$AUTOSTART_ENABLED" = "1" ]; then
-      printf 'The Gini webapp is opening in your browser. Configure your provider on %s/setup%s to get started.\n' "$C_BOLD" "$C_RESET"
+      printf 'The Gini webapp is opening in your browser. Configure your provider on the %s/setup%s page to get started.\n' "$C_BOLD" "$C_RESET"
       printf '\nRuntime + webapp are autostart-enabled — they will keep running across crashes and reboots until you run %sgini stop%s or %sgini autostart disable%s.\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
       if [ "$OS" = "darwin" ]; then
         printf '\n%sNote (macOS 26+):%s if SIGKILL ever takes the runtime down, launchd may defer respawn — run %sgini autostart kick%s to force it.\n' "$C_DIM" "$C_RESET" "$C_BOLD" "$C_RESET"

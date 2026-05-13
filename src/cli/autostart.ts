@@ -365,9 +365,12 @@ function buildWebShim(instance: Instance): string {
     // 3) Record the *future* bun PID so `gini stop` can SIGTERM it.
     // We use $$ — the current shell's PID — which `exec` will reuse for
     // the bun process below (exec replaces the shell with bun, keeping
-    // the same PID).
+    // the same PID). Also record the web port so install.sh and other
+    // clients can discover the actual listening port without re-hashing
+    // the instance name (PORT is set by the plist EnvironmentVariables).
     `mkdir -p "$instance_root" 2>/dev/null || true`,
     `echo $$ > "$instance_root/web.pid"`,
+    `if [ -n "$PORT" ]; then echo "$PORT" > "$instance_root/web.port"; fi`,
     // 4) Hand off to Next.js. exec so launchd tracks dev server PID.
     `exec bun run dev`
   ].join("\n");
