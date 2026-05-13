@@ -43,6 +43,29 @@ export const LABEL_PREFIX = "ai.lilaclabs.gini";
 // (`<prefix>.<instance>.gateway` / `<prefix>.<instance>.web`).
 export const LEGACY_LABEL_PREFIXES: readonly string[] = ["ai.lilac.gini"];
 
+// LaunchAgent / web-shim timing constants. Centralized so the relationships
+// between them stay explicit and reviewable in one place.
+//
+// THROTTLE_INTERVAL_SECONDS: caps how aggressively launchd respawns a
+// crashing service. 10s keeps a crashloop from melting CPU without making
+// clean-stop recovery painfully slow.
+export const THROTTLE_INTERVAL_SECONDS = 10;
+
+// Web shim wait budget. The shim polls the gateway port file and then
+// /api/status before exec'ing `bun run dev`. WEB_SHIM_WAIT_ATTEMPTS * the
+// per-attempt sleep of WEB_SHIM_WAIT_INTERVAL_SECONDS bounds the total
+// time we'll wait for the gateway to come up. Default budget: 120 * 0.5s
+// = 60s. The gateway typically lands in under 3s on warm caches.
+//
+// Contract with scripts/install.sh: install.sh polls
+// ~/.gini/instances/<inst>/web.port (which the shim writes after
+// finishing its own wait + exec'ing bun) for INSTALL_READ_WEB_PORT_TIMEOUT
+// seconds. That budget MUST exceed the shim's total wait so install.sh
+// doesn't give up before the shim has even started writing web.port. See
+// scripts/install.sh:read_web_port for the matching value.
+export const WEB_SHIM_WAIT_ATTEMPTS = 120;
+export const WEB_SHIM_WAIT_INTERVAL_SECONDS = 0.5;
+
 export type PlistKind = "gateway" | "web";
 
 // Returns every legacy label/plist-path pair that may exist on disk for
@@ -382,8 +405,9 @@ function buildWebShim(instance: Instance): string {
   // is passed; absent that, the runtime uses ~/.gini. We honor the same
   // logic here so the web shim talks to the same state dir as the gateway:
   // ${GINI_STATE_ROOT:-$HOME/.gini}.
-  // 120 attempts * 0.5s = 60s budget. The gateway typically lands in
-  // under 3s on warm caches.
+  // WEB_SHIM_WAIT_ATTEMPTS * WEB_SHIM_WAIT_INTERVAL_SECONDS bounds total
+  // wait (default 60s). The gateway typically lands in under 3s on warm
+  // caches.
   return [
     // Propagate SIGTERM during the polling phase. Without this, launchctl
     // bootout while the shim is sleeping in the poll loop would interrupt
@@ -399,12 +423,12 @@ function buildWebShim(instance: Instance): string {
     `instance_root="$state_root/instances/${instance}"`,
     // 1) Wait for the gateway port file to appear and have a value.
     `port=""`,
-    `for i in $(seq 1 120); do`,
+    `for i in $(seq 1 ${WEB_SHIM_WAIT_ATTEMPTS}); do`,
     `  if [ -f "$port_file" ]; then`,
     `    port=$(cat "$port_file" 2>/dev/null | tr -d '[:space:]')`,
     `    if [ -n "$port" ]; then break; fi`,
     `  fi`,
-    `  sleep 0.5`,
+    `  sleep ${WEB_SHIM_WAIT_INTERVAL_SECONDS}`,
     `done`,
     // 2) If we have a port, poll the gateway until it responds at all.
     // /api/status returns 401 without auth, but we don't need a 2xx —
@@ -412,9 +436,9 @@ function buildWebShim(instance: Instance): string {
     // curl from failing on the 401; -o /dev/null + --max-time 2 stops
     // a hung gateway from blocking the loop forever.
     `if [ -n "$port" ]; then`,
-    `  for i in $(seq 1 120); do`,
+    `  for i in $(seq 1 ${WEB_SHIM_WAIT_ATTEMPTS}); do`,
     `    if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$port/api/status" 2>/dev/null; then break; fi`,
-    `    sleep 0.5`,
+    `    sleep ${WEB_SHIM_WAIT_INTERVAL_SECONDS}`,
     `  done`,
     `fi`,
     // 3) Record the *future* bun PID so `gini stop` can SIGTERM it.
@@ -473,7 +497,7 @@ export interface PlistOptions {
 }
 
 export function generatePlist(options: PlistOptions): string {
-  const throttle = options.throttleIntervalSeconds ?? 10;
+  const throttle = options.throttleIntervalSeconds ?? THROTTLE_INTERVAL_SECONDS;
   const label = options.kind ? labelForKind(options.instance, options.kind) : labelFor(options.instance);
   const args = options.spec.programArguments.map(escapeXml).map((a) => `        <string>${a}</string>`).join("\n");
   const envEntries = Object.entries(options.spec.environment)

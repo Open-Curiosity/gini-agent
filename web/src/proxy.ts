@@ -25,12 +25,18 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { runtimeToken, runtimeUrl } from "@/lib/runtime";
 
+// Upper bound on the round-trip to the local gateway's /api/setup/status.
+// The gateway is on 127.0.0.1 and the call hits a tiny in-memory check, so
+// the typical latency is sub-ms. We're guarding against a hung gateway —
+// don't make the user wait long when the runtime is genuinely down.
+const PROXY_STATUS_TIMEOUT_MS = 1500;
+
 async function isProviderConfigured(): Promise<boolean | null> {
   const url = `${runtimeUrl()}/api/setup/status`;
   try {
     const response = await fetch(url, {
       headers: { authorization: `Bearer ${runtimeToken()}` },
-      signal: AbortSignal.timeout(1500)
+      signal: AbortSignal.timeout(PROXY_STATUS_TIMEOUT_MS)
     });
     if (!response.ok) {
       // 401 / 5xx — let the request through so the page can surface

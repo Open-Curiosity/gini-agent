@@ -309,21 +309,33 @@ enable_autostart() {
 }
 
 # Read the per-instance web port from ~/.gini/instances/<inst>/web.port,
-# polling for up to 90s while the autostart web shim writes it. The
-# default web port is hash-derived (src/paths.ts:defaultWebPort) so it
-# is almost never 3000 for non-`main` instances; even for `main`
-# install.sh must not assume 3000 because future versions could change
-# the hashing scheme. Echoes the port on success, empty on timeout.
+# polling for up to INSTALL_READ_WEB_PORT_TIMEOUT_S seconds while the
+# autostart web shim writes it. The default web port is hash-derived
+# (src/paths.ts:defaultWebPort) so it is almost never 3000 for non-`main`
+# instances; even for `main` install.sh must not assume 3000 because future
+# versions could change the hashing scheme. Echoes the port on success,
+# empty on timeout.
 #
-# Why 90s: the autostart web shim has a 60s budget to wait for the
-# gateway to come up before exec'ing bun run dev (see buildWebShim in
-# src/cli/autostart.ts); we leave headroom on top of that so the
-# install script doesn't give up before the shim has had a chance to
-# write web.port.
+# Cross-boundary contract with src/cli/autostart.ts:
+#   - The autostart web shim (buildWebShim) has a budget of
+#     WEB_SHIM_WAIT_ATTEMPTS * WEB_SHIM_WAIT_INTERVAL_SECONDS = 60s to
+#     wait for the gateway to come up before exec'ing `bun run dev` and
+#     finally writing web.port.
+#   - INSTALL_READ_WEB_PORT_TIMEOUT_S MUST exceed that budget so install.sh
+#     doesn't give up before the shim has had a chance to write web.port.
+#     90s leaves comfortable headroom (60s shim wait + a few seconds for
+#     Next.js startup before web.port is touched).
+# If you change either side, change both — and update the comments here
+# and in src/cli/autostart.ts:buildWebShim.
+INSTALL_READ_WEB_PORT_TIMEOUT_S=90
+# Per-instance web port healthcheck budget after web.port appears. Covers
+# Next.js dev-server compile + first response; usually fast but a cold
+# build can stretch into double digits.
+INSTALL_WAIT_HEALTHZ_TIMEOUT_S=30
 read_web_port() {
   local instance="$1"
   local port_file="$HOME/.gini/instances/$instance/web.port"
-  local timeout=90
+  local timeout=$INSTALL_READ_WEB_PORT_TIMEOUT_S
   local i=0
   while [ $i -lt $timeout ]; do
     if [ -f "$port_file" ]; then
@@ -340,11 +352,11 @@ read_web_port() {
   printf ''
 }
 
-# Wait up to 30s for the web app to respond at /api/runtime/__healthz on
-# the actual web port for the given instance. The port is discovered
-# from ~/.gini/instances/<inst>/web.port (written by the autostart shim
-# at startup), NOT hardcoded. Returns the URL on success, empty on
-# timeout.
+# Wait up to INSTALL_WAIT_HEALTHZ_TIMEOUT_S seconds for the web app to
+# respond at /api/runtime/__healthz on the actual web port for the given
+# instance. The port is discovered from ~/.gini/instances/<inst>/web.port
+# (written by the autostart shim at startup), NOT hardcoded. Returns the
+# URL on success, empty on timeout.
 wait_for_web_healthz() {
   local instance="$1"
   local port
@@ -354,7 +366,7 @@ wait_for_web_healthz() {
     return
   fi
   local web_url="http://127.0.0.1:$port"
-  local timeout=30
+  local timeout=$INSTALL_WAIT_HEALTHZ_TIMEOUT_S
   local i=0
   while [ $i -lt $timeout ]; do
     if curl -fsS "$web_url/api/runtime/__healthz" >/dev/null 2>&1; then

@@ -8,6 +8,21 @@ import { appendLog } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 
+// Shutdown drain budgets. Centralized so both timeouts are visible in one
+// place — each guards a different unwind step on SIGTERM.
+//
+// SERVER_DRAIN_TIMEOUT_MS: how long we wait for in-flight HTTP responses
+// (server.stop(false)) to finish writing before tearing the process down.
+// A single stalled client (broken pipe) shouldn't block shutdown forever;
+// 5s is a comfortable bound for normal local HTTP latencies.
+//
+// SCHEDULER_DRAIN_TIMEOUT_MS: bounds the wait for the in-flight scheduler
+// tick to unwind. A hung tick (e.g. a script job blocking on stdio)
+// shouldn't keep the runtime alive forever — the OS reaps the child
+// process tree on exit anyway.
+const SERVER_DRAIN_TIMEOUT_MS = 5000;
+const SCHEDULER_DRAIN_TIMEOUT_MS = 5000;
+
 const instance = parseInstance();
 const config = loadConfig(instance);
 install(config);
@@ -119,15 +134,15 @@ process.on("SIGTERM", async () => {
   // want stop(false) — the polite "wait for in-flight" variant.
   //
   // Failsafe: if a single connection is hung (stalled client, broken
-  // pipe), don't block shutdown indefinitely. Race the drain against a
-  // 5s budget; on timeout, log and proceed (a force-stop happens
-  // implicitly on process.exit).
+  // pipe), don't block shutdown indefinitely. Race the drain against
+  // SERVER_DRAIN_TIMEOUT_MS; on timeout, log and proceed (a force-stop
+  // happens implicitly on process.exit).
   try {
     await Promise.race([
       server.stop(false),
-      Bun.sleep(5000).then(() => {
+      Bun.sleep(SERVER_DRAIN_TIMEOUT_MS).then(() => {
         appendLog(config.instance, "runtime.stop.timeout", {
-          waited_ms: 5000
+          waited_ms: SERVER_DRAIN_TIMEOUT_MS
         });
       })
     ]);
@@ -142,13 +157,13 @@ process.on("SIGTERM", async () => {
   // attach a no-op .catch() defensively (any error already landed in
   // appendLog from the loop itself).
   //
-  // Bound the wait at 5 seconds: a hung tick (e.g. a script job that
-  // spawned a child blocking on stdio) shouldn't block shutdown
-  // forever. After 5s we proceed even if the tick hasn't unwound — the
-  // OS will reap the child process tree on exit.
+  // Bound the wait at SCHEDULER_DRAIN_TIMEOUT_MS: a hung tick (e.g. a
+  // script job that spawned a child blocking on stdio) shouldn't block
+  // shutdown forever. After the timeout we proceed even if the tick
+  // hasn't unwound — the OS will reap the child process tree on exit.
   const drained = Promise.race([
     schedulerDone.catch(() => {}),
-    Bun.sleep(5000)
+    Bun.sleep(SCHEDULER_DRAIN_TIMEOUT_MS)
   ]);
   // Print a stable shutdown marker so the foreground log capture (and any
   // human tailing the file) can see that the runtime is going down. Without
