@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { labelFor, plistPathFor } from "../autostart";
+import { labelForKind, plistPathFor } from "../autostart";
 
 function tag(): string {
   return `${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -69,7 +69,7 @@ const isDarwin = process.platform === "darwin";
     rmSync(scratch.logRoot, { recursive: true, force: true });
   });
 
-  test("reports plistExists:false and loaded:false for a fresh instance", () => {
+  test("reports plistExists:false and loaded:false for a fresh instance (both kinds)", () => {
     const result = runCli(
       ["autostart", "status", "--instance", uniqueInstance, "--state-root", scratch.stateRoot, "--log-root", scratch.logRoot],
       {}
@@ -77,10 +77,24 @@ const isDarwin = process.platform === "darwin";
     expect(result.status).toBe(0);
     const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
     expect(parsed.instance).toBe(uniqueInstance);
-    expect(parsed.label).toBe(labelFor(uniqueInstance));
+    // round-2: both gateway and web are reported under `services`. The
+    // top-level `label` field mirrors the gateway service for back-compat
+    // with shell scripts that grep on it.
+    expect(parsed.label).toBe(labelForKind(uniqueInstance, "gateway"));
     expect(parsed.plistExists).toBe(false);
     expect(parsed.loaded).toBe(false);
     expect(parsed.pid).toBe(null);
+    const services = parsed.services as Array<Record<string, unknown>>;
+    expect(Array.isArray(services)).toBe(true);
+    expect(services.length).toBe(2);
+    expect(services[0]!.kind).toBe("gateway");
+    expect(services[1]!.kind).toBe("web");
+    expect(services[0]!.label).toBe(labelForKind(uniqueInstance, "gateway"));
+    expect(services[1]!.label).toBe(labelForKind(uniqueInstance, "web"));
+    for (const svc of services) {
+      expect(svc.plistExists).toBe(false);
+      expect(svc.loaded).toBe(false);
+    }
     expect(Array.isArray(parsed.limitations)).toBe(true);
     expect((parsed.limitations as string[]).some((l) => l.includes("PID supervision"))).toBe(true);
   });
@@ -98,10 +112,14 @@ const isDarwin = process.platform === "darwin";
     rmSync(scratch.stateRoot, { recursive: true, force: true });
     rmSync(scratch.logRoot, { recursive: true, force: true });
     // Defensive: clean up any plist we might have written if a test failed
-    // mid-way through. We don't actually expect one to exist here, but the
-    // assertion would also catch a leak.
-    const path = plistPathFor(uniqueInstance);
-    try { rmSync(path, { force: true }); } catch { /* ignore */ }
+    // mid-way through. Both kinds and the legacy single-plist label.
+    for (const path of [
+      plistPathFor(uniqueInstance),
+      plistPathFor(uniqueInstance, "gateway"),
+      plistPathFor(uniqueInstance, "web")
+    ]) {
+      try { rmSync(path, { force: true }); } catch { /* ignore */ }
+    }
   });
 
   test("returns alreadyDisabled:true when nothing is registered", () => {

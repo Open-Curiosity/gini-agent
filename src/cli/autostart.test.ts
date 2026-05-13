@@ -64,7 +64,13 @@ describe("resolveLaunchSpec", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  test("uses ~/.gini/runtime as workingDirectory when a runtime checkout exists", () => {
+  // A neutral cwd that isn't a gini-agent checkout — so resolveLaunchSpec
+  // does NOT take the source-flow branch unless we explicitly point it
+  // at one. Without this, the test suite running from the repo cwd would
+  // always prefer source flow (the cwd-is-source-checkout branch).
+  const neutralCwd = "/tmp/gini-autostart-tests-neutral-cwd";
+
+  test("uses ~/.gini/runtime as workingDirectory when a runtime checkout exists and cwd is not a checkout", () => {
     mkdirSync(join(home, ".gini", "runtime", "src"), { recursive: true });
     writeFileSync(join(home, ".gini", "runtime", "package.json"), '{"name":"gini-agent"}');
     writeFileSync(join(home, ".gini", "runtime", "src", "server.ts"), "// stub\n");
@@ -72,7 +78,9 @@ describe("resolveLaunchSpec", () => {
     const spec = resolveLaunchSpec({
       instance: "main",
       homeOverride: home,
-      bunPathOverride: "/Users/test/.bun/bin/bun"
+      bunPathOverride: "/Users/test/.bun/bin/bun",
+      cwdOverride: neutralCwd,
+      projectRootOverride: neutralCwd
     });
 
     // Direct exec of bun against the server entry — no wrapper, no CLI
@@ -97,7 +105,8 @@ describe("resolveLaunchSpec", () => {
       instance: "dev",
       homeOverride: home,
       bunPathOverride: "/opt/bun/bin/bun",
-      projectRootOverride: "/repo/gini"
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd
     });
 
     expect(spec.programArguments[0]).toBe("/opt/bun/bin/bun");
@@ -119,26 +128,65 @@ describe("resolveLaunchSpec", () => {
       instance: "main",
       homeOverride: home,
       bunPathOverride: "/Users/test/.bun/bin/bun",
-      projectRootOverride: "/repo/gini"
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd
     });
 
     expect(spec.workingDirectory).toBe("/repo/gini");
   });
 
-  test("propagates GINI_STATE_ROOT and GINI_LOG_ROOT into the plist environment when set", () => {
+  test("prefers source flow when cwd is a gini-agent checkout (even if ~/.gini/runtime exists)", () => {
+    // Installed runtime is present and usable…
+    mkdirSync(join(home, ".gini", "runtime", "src"), { recursive: true });
+    writeFileSync(join(home, ".gini", "runtime", "package.json"), '{"name":"gini-agent"}');
+    writeFileSync(join(home, ".gini", "runtime", "src", "server.ts"), "// stub\n");
+    // …but cwd is a source checkout.
+    const sourceCwd = join(home, "Dev", "gini-agent");
+    mkdirSync(sourceCwd, { recursive: true });
+    writeFileSync(join(sourceCwd, "package.json"), '{"name":"gini-agent"}');
+
+    const spec = resolveLaunchSpec({
+      instance: "feature-x",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/some/other/repo/root",
+      cwdOverride: sourceCwd
+    });
+
+    // Source flow wins — we use the cwd, not ~/.gini/runtime.
+    expect(spec.workingDirectory).toBe(sourceCwd);
+  });
+
+  test("propagates testRoot.{stateRoot,logRoot} into plist env when passed (E2E-only)", () => {
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      testRoot: { stateRoot: "/tmp/scratch-state", logRoot: "/tmp/scratch-logs" }
+    });
+    expect(spec.environment.GINI_STATE_ROOT).toBe("/tmp/scratch-state");
+    expect(spec.environment.GINI_LOG_ROOT).toBe("/tmp/scratch-logs");
+  });
+
+  test("does NOT leak shell GINI_STATE_ROOT into plist env when testRoot is unset (production default)", () => {
     const prevState = process.env.GINI_STATE_ROOT;
     const prevLog = process.env.GINI_LOG_ROOT;
-    process.env.GINI_STATE_ROOT = "/tmp/scratch-state";
-    process.env.GINI_LOG_ROOT = "/tmp/scratch-logs";
+    process.env.GINI_STATE_ROOT = "/tmp/leak-state";
+    process.env.GINI_LOG_ROOT = "/tmp/leak-logs";
     try {
       const spec = resolveLaunchSpec({
         instance: "dev",
         homeOverride: home,
         bunPathOverride: "/opt/bun/bin/bun",
-        projectRootOverride: "/repo/gini"
+        projectRootOverride: "/repo/gini",
+        cwdOverride: neutralCwd
       });
-      expect(spec.environment.GINI_STATE_ROOT).toBe("/tmp/scratch-state");
-      expect(spec.environment.GINI_LOG_ROOT).toBe("/tmp/scratch-logs");
+      // No testRoot opt-in → no leak. This is the round-2 fix to round 1's
+      // MEDIUM bug where shell env vars baked into the persistent plist.
+      expect(spec.environment.GINI_STATE_ROOT).toBeUndefined();
+      expect(spec.environment.GINI_LOG_ROOT).toBeUndefined();
     } finally {
       if (prevState === undefined) delete process.env.GINI_STATE_ROOT;
       else process.env.GINI_STATE_ROOT = prevState;
@@ -147,26 +195,118 @@ describe("resolveLaunchSpec", () => {
     }
   });
 
-  test("omits GINI_STATE_ROOT and GINI_LOG_ROOT from env when unset (production default)", () => {
-    const prevState = process.env.GINI_STATE_ROOT;
-    const prevLog = process.env.GINI_LOG_ROOT;
-    delete process.env.GINI_STATE_ROOT;
-    delete process.env.GINI_LOG_ROOT;
-    try {
-      const spec = resolveLaunchSpec({
-        instance: "dev",
-        homeOverride: home,
-        bunPathOverride: "/opt/bun/bin/bun",
-        projectRootOverride: "/repo/gini"
-      });
-      expect(spec.environment.GINI_STATE_ROOT).toBeUndefined();
-      expect(spec.environment.GINI_LOG_ROOT).toBeUndefined();
-    } finally {
-      if (prevState !== undefined) process.env.GINI_STATE_ROOT = prevState;
-      if (prevLog !== undefined) process.env.GINI_LOG_ROOT = prevLog;
-    }
+  test("merges secrets.env into plist EnvironmentVariables (OPENAI_API_KEY)", () => {
+    const secretsBody = [
+      "# comment",
+      "export OPENAI_API_KEY='sk-test-12345'",
+      "BARE_KEY=bare-value",
+      "QUOTED=\"with spaces\""
+    ].join("\n");
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      readSecretsFile: () => secretsBody
+    });
+    expect(spec.environment.OPENAI_API_KEY).toBe("sk-test-12345");
+    expect(spec.environment.BARE_KEY).toBe("bare-value");
+    expect(spec.environment.QUOTED).toBe("with spaces");
   });
 
+  test("does not put secrets into env when secrets.env is missing", () => {
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      readSecretsFile: () => null
+    });
+    expect(spec.environment.OPENAI_API_KEY).toBeUndefined();
+  });
+
+});
+
+describe("resolveLaunchSpecPair", () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = makeTempHome("pair");
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test("web spec is a sh -c shim that gates on /api/status before exec'ing bun run dev", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const pair = resolveLaunchSpecPair({
+      instance: "main",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral",
+      readSecretsFile: () => null
+    });
+    expect(pair.web.programArguments[0]).toBe("/bin/sh");
+    expect(pair.web.programArguments[1]).toBe("-c");
+    const shim = pair.web.programArguments[2]!;
+    expect(shim).toContain("/api/status");
+    expect(shim).toContain("exec bun run dev");
+    // Polls the gateway port file under the state root.
+    expect(shim).toContain("instances/main/runtime.port");
+  });
+
+  test("gateway and web share the same workingDirectory", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const pair = resolveLaunchSpecPair({
+      instance: "main",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral"
+    });
+    expect(pair.gateway.workingDirectory).toBe(pair.web.workingDirectory);
+  });
+
+  test("rejects suspicious instance names that could break out of the shell shim", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    expect(() => resolveLaunchSpecPair({
+      instance: "bad`name",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral"
+    })).toThrow(/refusing to embed instance name/);
+  });
+});
+
+describe("parseSecretsEnv", () => {
+  test("parses a mix of export/bare/quoted/comment lines", async () => {
+    const { parseSecretsEnv } = await import("./autostart");
+    const out = parseSecretsEnv([
+      "# header",
+      "",
+      "export OPENAI_API_KEY='sk-abc'",
+      "BARE=bare-value",
+      "  WITH_WHITESPACE='quoted with spaces'",
+      "QUOTED=\"dq with \\\"escape\\\"\""
+    ].join("\n"));
+    expect(out.OPENAI_API_KEY).toBe("sk-abc");
+    expect(out.BARE).toBe("bare-value");
+    expect(out.WITH_WHITESPACE).toBe("quoted with spaces");
+    expect(out.QUOTED).toBe('dq with "escape"');
+  });
+
+  test("handles single-quote escape sequence (sh ANSI-C quoting)", async () => {
+    const { parseSecretsEnv } = await import("./autostart");
+    // shellSingleQuote in setup.ts writes `'\''` to escape an embedded single
+    // quote inside a single-quoted string. Our parser inverts that.
+    const out = parseSecretsEnv(`export TRICKY='val'\\''with'`);
+    expect(out.TRICKY).toBe("val'with");
+  });
 });
 
 describe("generatePlist", () => {
@@ -176,7 +316,7 @@ describe("generatePlist", () => {
     environment: { PATH: "/usr/bin", GINI_INSTANCE: "main", HOME: "/Users/test", LANG: "en_US.UTF-8" }
   };
 
-  test("writes a well-formed plist header and Label", () => {
+  test("writes a well-formed plist header and Label (legacy single-plist label by default)", () => {
     const xml = generatePlist({
       instance: "main",
       spec: baseSpec,
@@ -186,6 +326,25 @@ describe("generatePlist", () => {
     expect(xml.startsWith('<?xml version="1.0" encoding="UTF-8"?>')).toBe(true);
     expect(xml).toContain("<!DOCTYPE plist PUBLIC");
     expect(xml).toContain(`<string>${LABEL_PREFIX}.main</string>`);
+  });
+
+  test("kind:gateway and kind:web produce kind-suffixed labels", () => {
+    const gateway = generatePlist({
+      instance: "main",
+      kind: "gateway",
+      spec: baseSpec,
+      stdoutPath: "/tmp/out.log",
+      stderrPath: "/tmp/err.log"
+    });
+    const web = generatePlist({
+      instance: "main",
+      kind: "web",
+      spec: baseSpec,
+      stdoutPath: "/tmp/out.log",
+      stderrPath: "/tmp/err.log"
+    });
+    expect(gateway).toContain(`<string>${LABEL_PREFIX}.main.gateway</string>`);
+    expect(web).toContain(`<string>${LABEL_PREFIX}.main.web</string>`);
   });
 
   test("KeepAlive is a dict with SuccessfulExit=false", () => {

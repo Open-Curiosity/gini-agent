@@ -175,11 +175,15 @@ export async function uninstall(ctx: CliContext): Promise<void> {
 
   if (ctx.explicitInstance) {
     // Disable autostart FIRST so launchd doesn't respawn the runtime
-    // mid-uninstall. Errors are swallowed — a broken plist must not block
-    // uninstall of the instance state. The `removed` field is captured in
-    // the response so the user can see whether we actually unloaded a
-    // service or whether autostart was already off.
+    // mid-uninstall. Bootout failures are surfaced via warn() so a broken
+    // plist doesn't get silently dropped; state deletion still proceeds.
     const autostart = await disableForUninstall(ctx.config.instance);
+    if (autostart.failures.length > 0) {
+      for (const f of autostart.failures) {
+        warn(`autostart unload (${f.kind}): ${f.error}`);
+      }
+      warn("Continuing with uninstall — you may need to clean up the plist manually.");
+    }
     // Stop the runtime first if it's running — otherwise removing stateRoot
     // out from under a live process leaves the daemon writing to a deleted
     // directory until it crashes.
@@ -224,14 +228,21 @@ async function fullUninstall(flags: FullUninstallFlags): Promise<void> {
   console.log("");
   header("Uninstalling gini-agent");
 
+  // Collect autostart bootout warnings across all instances; surface them
+  // after uninstallAll completes so the warn lines don't get interleaved
+  // with the per-instance "Stopped N/M" summary lines printed below.
+  const autostartWarnings: string[] = [];
   const result = await uninstallAll({
     deleteInstances,
     stopInstance: async (name) => {
       // Disable autostart before stopping the runtime so launchd doesn't
-      // respawn it the instant we send SIGTERM. Errors are swallowed
-      // (best-effort) — a stale plist with no service is still better
-      // than a half-uninstalled instance.
-      await disableForUninstall(name);
+      // respawn it the instant we send SIGTERM. Bootout failures are
+      // captured for a post-loop warn() pass — a stale plist with no
+      // service is still better than a half-uninstalled instance.
+      const autostartResult = await disableForUninstall(name);
+      for (const f of autostartResult.failures) {
+        autostartWarnings.push(`autostart unload [${name}] (${f.kind}): ${f.error}`);
+      }
       const cfg = loadConfig(name);
       if (!(await isRunning(cfg))) return;
       const outcome = stopRuntime(cfg);
@@ -241,6 +252,7 @@ async function fullUninstall(flags: FullUninstallFlags): Promise<void> {
       }
     }
   });
+  for (const w of autostartWarnings) warn(w);
 
   // GINI_STATE_ROOT is the test-mode signal. When set, the user is not actually
   // tearing down their real install — they're exercising the code path against

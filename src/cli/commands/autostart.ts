@@ -15,22 +15,27 @@ import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { CliContext } from "../context";
 import { print } from "../output";
+import { flagValue } from "../args";
 import {
   bootout,
   bootstrap,
   isLoaded,
   kickstart,
   labelFor,
+  labelForKind,
   loadedLastExitStatus,
   loadedPid,
   platformIsSupported,
   plistPathFor,
-  resolveLaunchSpec,
+  resolveLaunchSpecPair,
   serviceTarget,
   unsupportedPlatformMessage,
-  writePlist
+  writePlist,
+  type PlistKind
 } from "../autostart";
 import { logDir } from "../../paths";
+
+const KINDS: PlistKind[] = ["gateway", "web"];
 
 export async function autostart(ctx: CliContext): Promise<void> {
   const sub = ctx.cliArgs[1];
@@ -53,8 +58,23 @@ export async function autostart(ctx: CliContext): Promise<void> {
   }
 
   const instance = ctx.config.instance;
+  // `--test-root <dir>` opts the resulting plists into a scratch state-root
+  // (and matching log-root if specified). Used by GINI_AUTOSTART_E2E tests
+  // so they can run against a private state dir without touching the
+  // developer's real install. Plain GINI_STATE_ROOT in the shell env does
+  // NOT leak into the plist — only this explicit flag (or
+  // GINI_AUTOSTART_E2E=1 + the env vars actually set) does.
+  const testRootFlag = flagValue(ctx.rawArgs, "--test-root");
+  const testLogRootFlag = flagValue(ctx.rawArgs, "--test-log-root");
+  const e2eMode = process.env.GINI_AUTOSTART_E2E === "1";
+  const testRoot = testRootFlag
+    ? { stateRoot: testRootFlag, logRoot: testLogRootFlag ?? process.env.GINI_LOG_ROOT }
+    : e2eMode
+      ? { stateRoot: process.env.GINI_STATE_ROOT, logRoot: process.env.GINI_LOG_ROOT }
+      : undefined;
+
   if (sub === "enable") {
-    print(await enable(instance));
+    print(await enable(instance, testRoot));
     return;
   }
   if (sub === "disable") {
@@ -66,7 +86,7 @@ export async function autostart(ctx: CliContext): Promise<void> {
     return;
   }
   if (sub === "kick") {
-    print(kick(instance));
+    print(kick(instance, ctx.rawArgs));
     return;
   }
 
@@ -80,166 +100,274 @@ export async function autostart(ctx: CliContext): Promise<void> {
 function usage(): Record<string, unknown> {
   return {
     usage: [
-      "gini autostart enable  [--instance <name>]",
+      "gini autostart enable  [--instance <name>] [--test-root <dir>]",
       "gini autostart disable [--instance <name>]",
       "gini autostart status  [--instance <name>]",
-      "gini autostart kick    [--instance <name>]   # force respawn (see notes)"
+      "gini autostart kick    [--instance <name>] [--kind gateway|web]  # force respawn (see notes)"
     ],
     notes: [
       "macOS only in v1 (Linux systemd --user is a follow-up).",
+      "Two services per instance: <prefix>.<instance>.gateway (Bun runtime) and <prefix>.<instance>.web (Next.js).",
       "PID supervision only — a wedged-but-alive runtime is not detected here. A health watchdog hitting /api/healthz is a follow-up.",
-      "`gini stop` is honored: SuccessfulExit:false means clean exits do NOT respawn.",
+      "`gini stop` is honored: SuccessfulExit:false means clean exits do NOT respawn. The web shim execs `bun run dev`, which exits 0 on SIGTERM; the same KeepAlive contract applies.",
       "macOS 26 (Tahoe): launchd often defers auto-respawn after SIGKILL indefinitely (`pended nondemand spawn = inefficient`). Use `gini autostart kick` to force a respawn when this happens; RunAtLoad still fires at login.",
+      "Secrets in ~/.gini/secrets.env are merged into both plists' EnvironmentVariables at enable time. If you change a key (e.g. `gini provider set`), re-run `autostart enable` to refresh the plists for future respawns.",
+      "`--test-root <dir>` is an E2E-test escape hatch: scoped state/log roots are embedded in the plist. Plain GINI_STATE_ROOT in your shell does NOT leak into a permanent plist."
     ]
   };
+}
+
+interface PerKindEnableResult {
+  kind: PlistKind;
+  label: string;
+  plistPath: string;
+  serviceTarget: string;
+  alreadyLoaded: boolean;
+  enabled: boolean;
+  error?: string;
+  stderr?: string;
 }
 
 interface EnableResult {
   ok: boolean;
   enabled: boolean;
   instance: string;
-  label: string;
-  plistPath: string;
-  serviceTarget: string;
-  alreadyLoaded: boolean;
+  resolution: "installed" | "source";
+  results: PerKindEnableResult[];
   error?: string;
-  stderr?: string;
 }
 
-async function enable(instance: string): Promise<EnableResult> {
-  const spec = resolveLaunchSpec({ instance });
+async function enable(instance: string, testRoot?: { stateRoot?: string; logRoot?: string }): Promise<EnableResult> {
+  const pair = resolveLaunchSpecPair({ instance, testRoot });
   const logRoot = logDir(instance);
-  const stdoutPath = join(logRoot, "runtime-stdout.log");
-  // launchd routes stderr to its own file by default — we keep that
-  // separate so an autostart-only crash log doesn't get tangled with the
-  // user-driven `gini run` stdout tee.
-  const stderrPath = join(logRoot, "runtime-launchd.err.log");
-  const path = writePlist({ instance, spec, stdoutPath, stderrPath });
-  const target = serviceTarget(instance);
-  const wasLoaded = isLoaded(instance);
+  const results: PerKindEnableResult[] = [];
+  let allOk = true;
 
-  if (wasLoaded) {
-    // Idempotent re-enable: the plist on disk may have changed, so we
-    // bootout the old registration first, then bootstrap the new one.
-    // `kickstart -k` alone wouldn't pick up the new plist contents.
-    const out = bootout(instance);
-    if (!out.ok && !out.stderr.includes("Could not find service")) {
-      return {
-        ok: false,
-        enabled: false,
-        instance,
-        label: labelFor(instance),
+  for (const kind of KINDS) {
+    const spec = kind === "gateway" ? pair.gateway : pair.web;
+    const stdoutPath = join(logRoot, kind === "gateway" ? "runtime-stdout.log" : "web.log");
+    // launchd routes stderr to its own file by default — we keep that
+    // separate so an autostart-only crash log doesn't get tangled with the
+    // user-driven `gini run` stdout tee.
+    const stderrPath = join(logRoot, kind === "gateway" ? "runtime-launchd.err.log" : "web-launchd.err.log");
+    const path = writePlist({ instance, kind, spec, stdoutPath, stderrPath });
+    const target = serviceTarget(instance, kind);
+    const wasLoaded = isLoaded(instance, kind);
+
+    if (wasLoaded) {
+      // Idempotent re-enable: the plist on disk may have changed, so we
+      // bootout the old registration first, then bootstrap the new one.
+      // `kickstart -k` alone wouldn't pick up the new plist contents.
+      const out = bootout(instance, kind);
+      if (!out.ok && !out.stderr.includes("Could not find service")) {
+        results.push({
+          kind,
+          label: labelForKind(instance, kind),
+          plistPath: path,
+          serviceTarget: target,
+          alreadyLoaded: wasLoaded,
+          enabled: false,
+          error: "launchctl bootout failed",
+          stderr: out.stderr.trim()
+        });
+        allOk = false;
+        continue;
+      }
+    }
+
+    const res = bootstrap(instance, path);
+    if (!res.ok) {
+      results.push({
+        kind,
+        label: labelForKind(instance, kind),
         plistPath: path,
         serviceTarget: target,
         alreadyLoaded: wasLoaded,
-        error: "launchctl bootout failed",
-        stderr: out.stderr.trim()
-      };
+        enabled: false,
+        error: "launchctl bootstrap failed",
+        stderr: res.stderr.trim()
+      });
+      allOk = false;
+      continue;
     }
-  }
-
-  const res = bootstrap(instance, path);
-  if (!res.ok) {
-    return {
-      ok: false,
-      enabled: false,
-      instance,
-      label: labelFor(instance),
+    results.push({
+      kind,
+      label: labelForKind(instance, kind),
       plistPath: path,
       serviceTarget: target,
       alreadyLoaded: wasLoaded,
-      error: "launchctl bootstrap failed",
-      stderr: res.stderr.trim()
-    };
+      enabled: true
+    });
   }
-  // `bootstrap` registers + RunAtLoad fires, so the runtime should be
-  // booting now. We don't poll for /api/status here — autostart is the
-  // supervision layer, not a health probe. `gini status` already covers
-  // the live runtime view.
+
   return {
-    ok: true,
-    enabled: true,
+    ok: allOk,
+    enabled: allOk,
     instance,
-    label: labelFor(instance),
-    plistPath: path,
-    serviceTarget: target,
-    alreadyLoaded: wasLoaded
+    resolution: pair.resolution,
+    results
   };
+}
+
+interface PerKindDisableResult {
+  kind: PlistKind;
+  label: string;
+  plistPath: string;
+  wasLoaded: boolean;
+  bootoutOk: boolean;
+  plistRemoved: boolean;
+  bootoutStderr?: string;
+  rmError?: string;
 }
 
 interface DisableResult {
   ok: boolean;
   disabled: boolean;
   instance: string;
-  label: string;
-  plistPath: string;
   alreadyDisabled: boolean;
+  results: PerKindDisableResult[];
+  // Legacy single-plist fields kept for tests / shell scripts that grep
+  // for them. Each reflects the AGGREGATE across kinds.
+  label?: string;
+  plistPath?: string;
   plistRemoved: boolean;
   stderr?: string;
 }
 
 async function disable(instance: string): Promise<DisableResult> {
-  const path = plistPathFor(instance);
-  const wasLoaded = isLoaded(instance);
+  // Pull legacy (round-1) single-plist into the cleanup loop too. If a
+  // user upgrades from round 1 → round 2 and runs `autostart disable`,
+  // we want to clean up the old `ai.lilac.gini.<instance>` plist too.
+  // It's safe to call bootout on a label that isn't loaded — launchctl
+  // returns "Could not find service".
+  const legacyPath = plistPathFor(instance);
+  const results: PerKindDisableResult[] = [];
+  const stderrParts: string[] = [];
 
-  if (!wasLoaded && !existsSync(path)) {
+  // Handle legacy plist if it's present.
+  if (existsSync(legacyPath) || isLoaded(instance)) {
+    const wasLoaded = isLoaded(instance);
+    let bootoutOk = true;
+    let bootoutStderr: string | undefined;
+    if (wasLoaded) {
+      const out = bootout(instance);
+      if (!out.ok && !out.stderr.includes("Could not find service")) {
+        bootoutOk = false;
+        bootoutStderr = out.stderr.trim();
+        stderrParts.push(`legacy bootout: ${bootoutStderr}`);
+      }
+    }
+    let plistRemoved = false;
+    let rmError: string | undefined;
+    if (existsSync(legacyPath)) {
+      try {
+        rmSync(legacyPath, { force: true });
+        plistRemoved = true;
+      } catch (error) {
+        rmError = error instanceof Error ? error.message : String(error);
+        stderrParts.push(`legacy rm: ${rmError}`);
+      }
+    }
+    results.push({
+      kind: "gateway",
+      label: labelFor(instance),
+      plistPath: legacyPath,
+      wasLoaded,
+      bootoutOk,
+      plistRemoved,
+      ...(bootoutStderr ? { bootoutStderr } : {}),
+      ...(rmError ? { rmError } : {})
+    });
+  }
+
+  for (const kind of KINDS) {
+    const path = plistPathFor(instance, kind);
+    const wasLoaded = isLoaded(instance, kind);
+
+    if (!wasLoaded && !existsSync(path)) {
+      continue;
+    }
+
+    let bootoutOk = true;
+    let bootoutStderr: string | undefined;
+    if (wasLoaded) {
+      const out = bootout(instance, kind);
+      if (!out.ok && !out.stderr.includes("Could not find service")) {
+        bootoutOk = false;
+        bootoutStderr = out.stderr.trim();
+        stderrParts.push(`${kind} bootout: ${bootoutStderr}`);
+      }
+    }
+
+    let plistRemoved = false;
+    let rmError: string | undefined;
+    if (existsSync(path)) {
+      try {
+        rmSync(path, { force: true });
+        plistRemoved = true;
+      } catch (error) {
+        rmError = error instanceof Error ? error.message : String(error);
+        stderrParts.push(`${kind} rm plist: ${rmError}`);
+      }
+    }
+
+    results.push({
+      kind,
+      label: labelForKind(instance, kind),
+      plistPath: path,
+      wasLoaded,
+      bootoutOk,
+      plistRemoved,
+      ...(bootoutStderr ? { bootoutStderr } : {}),
+      ...(rmError ? { rmError } : {})
+    });
+  }
+
+  if (results.length === 0) {
     return {
       ok: true,
       disabled: false,
       instance,
-      label: labelFor(instance),
-      plistPath: path,
       alreadyDisabled: true,
+      results: [],
+      label: labelFor(instance),
+      plistPath: legacyPath,
       plistRemoved: false
     };
   }
 
-  let stderr: string | undefined;
-  if (wasLoaded) {
-    const res = bootout(instance);
-    if (!res.ok && !res.stderr.includes("Could not find service")) {
-      // Surface the launchctl error but still try to remove the plist —
-      // a half-disabled state is worse than a leaked plist with no
-      // service.
-      stderr = res.stderr.trim();
-    }
-  }
-
-  let plistRemoved = false;
-  if (existsSync(path)) {
-    try {
-      rmSync(path, { force: true });
-      plistRemoved = true;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        ok: false,
-        disabled: !wasLoaded ? true : false,
-        instance,
-        label: labelFor(instance),
-        plistPath: path,
-        alreadyDisabled: false,
-        plistRemoved: false,
-        stderr: stderr ? `${stderr}; rm plist: ${message}` : `rm plist: ${message}`
-      };
-    }
-  }
-
+  const allOk = results.every((r) => r.bootoutOk && !r.rmError);
+  const anyPlistRemoved = results.some((r) => r.plistRemoved);
+  const aggregateStderr = stderrParts.join("; ");
   return {
-    ok: true,
-    disabled: true,
+    ok: allOk,
+    disabled: allOk,
     instance,
-    label: labelFor(instance),
-    plistPath: path,
     alreadyDisabled: false,
-    plistRemoved,
-    ...(stderr ? { stderr } : {})
+    results,
+    label: labelFor(instance),
+    plistPath: legacyPath,
+    plistRemoved: anyPlistRemoved,
+    ...(aggregateStderr ? { stderr: aggregateStderr } : {})
   };
+}
+
+interface PerKindStatus {
+  kind: PlistKind;
+  label: string;
+  plistPath: string;
+  plistExists: boolean;
+  loaded: boolean;
+  pid: number | null;
+  lastExitStatus: string | null;
 }
 
 interface StatusResult {
   ok: true;
   instance: string;
+  services: PerKindStatus[];
+  // Round-1 single-plist fields, surfaced for compatibility (some tests and
+  // user scripts grep on them). Reflects the gateway service.
   label: string;
   plistPath: string;
   plistExists: boolean;
@@ -250,30 +378,44 @@ interface StatusResult {
 }
 
 function status(instance: string): StatusResult {
-  const path = plistPathFor(instance);
-  const loaded = isLoaded(instance);
-  const pid = loaded ? loadedPid(instance) : null;
-  const lastExit = loaded ? loadedLastExitStatus(instance) : null;
+  const services: PerKindStatus[] = [];
+  for (const kind of KINDS) {
+    const path = plistPathFor(instance, kind);
+    const loaded = isLoaded(instance, kind);
+    const pid = loaded ? loadedPid(instance, kind) : null;
+    const lastExit = loaded ? loadedLastExitStatus(instance, kind) : null;
+    services.push({
+      kind,
+      label: labelForKind(instance, kind),
+      plistPath: path,
+      plistExists: existsSync(path),
+      loaded,
+      pid,
+      lastExitStatus: lastExit
+    });
+  }
+  const gateway = services[0]!;
   return {
     ok: true,
     instance,
-    label: labelFor(instance),
-    plistPath: path,
-    plistExists: existsSync(path),
-    loaded,
-    pid,
-    lastExitStatus: lastExit,
+    services,
+    label: gateway.label,
+    plistPath: gateway.plistPath,
+    plistExists: gateway.plistExists,
+    loaded: gateway.loaded,
+    pid: gateway.pid,
+    lastExitStatus: gateway.lastExitStatus,
     limitations: [
       "PID supervision only — a wedged-but-alive runtime is not detected.",
       "macOS 26+: launchd auto-respawn after SIGKILL is unreliable. Use `gini autostart kick` to force respawn.",
-      "macOS only in v1."
+      "macOS only in v1.",
+      "Two services per instance: <prefix>.<instance>.gateway and <prefix>.<instance>.web. `gini status` aggregates web/runtime health."
     ]
   };
 }
 
-interface KickResult {
-  ok: boolean;
-  instance: string;
+interface PerKindKickResult {
+  kind: PlistKind;
   label: string;
   loaded: boolean;
   kicked: boolean;
@@ -281,49 +423,94 @@ interface KickResult {
   stderr?: string;
 }
 
+interface KickResult {
+  ok: boolean;
+  instance: string;
+  results: PerKindKickResult[];
+}
+
 // `kick` is a manual respawn trigger. macOS 26 (Tahoe) sometimes refuses to
 // auto-respawn a launchd job after a SIGKILL, leaving it stuck in
 // `pended nondemand spawn = inefficient` indefinitely. `gini autostart kick`
-// runs `launchctl kickstart -k` to force a stop+start. Practical use: a
-// healthcheck loop discovers the runtime is wedged and shells out to
-// `gini autostart kick` rather than `gini stop && gini start`.
-function kick(instance: string): KickResult {
-  const loaded = isLoaded(instance);
-  if (!loaded) {
-    return {
-      ok: false,
-      instance,
-      label: labelFor(instance),
-      loaded: false,
-      kicked: false,
-      error: `Autostart is not enabled for instance '${instance}'. Run \`gini autostart enable\` first.`
-    };
+// runs `launchctl kickstart -k` to force a stop+start.
+//
+// Defaults: kick BOTH gateway and web. `--kind gateway` or `--kind web`
+// narrows it to one. Practical use: a healthcheck loop discovers a wedged
+// runtime and runs `gini autostart kick --kind gateway`.
+function kick(instance: string, rawArgs: string[]): KickResult {
+  const kindFlag = flagValue(rawArgs, "--kind");
+  const kinds: PlistKind[] = kindFlag === "gateway" || kindFlag === "web" ? [kindFlag] : KINDS;
+  const results: PerKindKickResult[] = [];
+  let allOk = true;
+  for (const kind of kinds) {
+    const loaded = isLoaded(instance, kind);
+    if (!loaded) {
+      results.push({
+        kind,
+        label: labelForKind(instance, kind),
+        loaded: false,
+        kicked: false,
+        error: `Autostart is not enabled for ${kind} on instance '${instance}'. Run \`gini autostart enable\` first.`
+      });
+      allOk = false;
+      continue;
+    }
+    const res = kickstart(instance, kind);
+    if (!res.ok) {
+      results.push({
+        kind,
+        label: labelForKind(instance, kind),
+        loaded: true,
+        kicked: false,
+        error: "launchctl kickstart failed",
+        stderr: res.stderr.trim()
+      });
+      allOk = false;
+      continue;
+    }
+    results.push({ kind, label: labelForKind(instance, kind), loaded: true, kicked: true });
   }
-  const res = kickstart(instance);
-  if (!res.ok) {
-    return {
-      ok: false,
-      instance,
-      label: labelFor(instance),
-      loaded: true,
-      kicked: false,
-      error: "launchctl kickstart failed",
-      stderr: res.stderr.trim()
-    };
-  }
-  return { ok: true, instance, label: labelFor(instance), loaded: true, kicked: true };
+  return { ok: allOk, instance, results };
 }
 
 // Best-effort autostart-disable for use by `gini uninstall --instance`.
-// Swallows errors so a broken plist doesn't block uninstall. Returns a
-// boolean for the caller's audit trail, plus a reason string when nothing
-// happened.
-export async function disableForUninstall(instance: string): Promise<{ removed: boolean; reason?: string }> {
-  if (!platformIsSupported()) return { removed: false, reason: "not macOS" };
+// Tries to tear down BOTH plists (gateway + web), but surfaces failures
+// rather than swallowing them — a broken plist must not block uninstall
+// of state, but the user deserves to know launchctl couldn't unload
+// something. State deletion proceeds either way; the caller prints any
+// warnings.
+export interface UninstallAutostartResult {
+  removed: boolean;
+  alreadyDisabled: boolean;
+  reason?: string;
+  // Per-kind audit so the uninstall command can print exactly which
+  // service had trouble unloading.
+  failures: Array<{ kind: PlistKind | "legacy"; error: string }>;
+}
+
+export async function disableForUninstall(instance: string): Promise<UninstallAutostartResult> {
+  if (!platformIsSupported()) {
+    return { removed: false, alreadyDisabled: false, reason: "not macOS", failures: [] };
+  }
   try {
     const result = await disable(instance);
-    return { removed: result.disabled || result.plistRemoved, reason: result.alreadyDisabled ? "already disabled" : undefined };
+    const failures: UninstallAutostartResult["failures"] = [];
+    for (const r of result.results) {
+      if (!r.bootoutOk) failures.push({ kind: r.kind, error: r.bootoutStderr ?? "launchctl bootout failed" });
+      if (r.rmError) failures.push({ kind: r.kind, error: `rm plist: ${r.rmError}` });
+    }
+    return {
+      removed: result.disabled || result.plistRemoved,
+      alreadyDisabled: result.alreadyDisabled,
+      reason: result.alreadyDisabled ? "already disabled" : undefined,
+      failures
+    };
   } catch (error) {
-    return { removed: false, reason: error instanceof Error ? error.message : String(error) };
+    return {
+      removed: false,
+      alreadyDisabled: false,
+      reason: error instanceof Error ? error.message : String(error),
+      failures: [{ kind: "legacy", error: error instanceof Error ? error.message : String(error) }]
+    };
   }
 }
