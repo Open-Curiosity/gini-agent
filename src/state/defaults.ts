@@ -94,7 +94,14 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
         "browser.scroll",
         "browser.back",
         "browser.console",
-        "browser.close"
+        "browser.close",
+        "browser.vision",
+        "browser.hover",
+        "browser.drag",
+        "browser.select_option",
+        "browser.wait_for",
+        "browser.tabs",
+        "browser.upload_file"
       ],
       scopes: ["task", "job", "skill", "subagent"],
       createdAt: at,
