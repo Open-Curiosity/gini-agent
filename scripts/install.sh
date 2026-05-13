@@ -294,20 +294,63 @@ enable_autostart() {
   if [ "$OS" != "darwin" ]; then
     return
   fi
-  # Provider must be configured before autostart starts the runtime —
-  # otherwise launchd will respawn a runtime that fails on every boot.
-  # The interactive flow gates on SETUP_RAN; the piped flow leaves
-  # autostart for the user to invoke after `gini setup`.
-  if [ "$SETUP_RAN" != "1" ]; then
-    info "Skipping autostart (provider not configured; run 'gini autostart enable' after 'gini setup')"
-    return
-  fi
+  # Round-2: provider configuration is no longer a precondition. The
+  # webapp's /setup route handles it in the browser; the runtime crashes
+  # on its first request without credentials, but launchd keeps it alive
+  # and the user lands on /setup to fix it. The piped-curl path
+  # (non-interactive) finally gets autostart by default, which was the
+  # entire point of the auto-start feature.
   if (cd "$RUNTIME_DIR" && GINI_INSTANCE="$DEFAULT_INSTANCE" bun run gini autostart enable >/dev/null 2>&1); then
     step "Autostart enabled (~/Library/LaunchAgents)"
     AUTOSTART_ENABLED=1
   else
     err "Autostart enable failed. Re-run 'gini autostart enable' to retry."
   fi
+}
+
+# Wait up to TIMEOUT_SECONDS for the web app to respond at /api/runtime/__healthz
+# on its default port for the main instance. Returns the URL on success, empty
+# on timeout. We poll the default web port (3000 for main) because we don't
+# know the exact port the autostart launched Next.js on; the user's first
+# browser open is to a stable URL anyway.
+wait_for_web_healthz() {
+  local web_url="http://127.0.0.1:3000"
+  local timeout=30
+  local i=0
+  while [ $i -lt $timeout ]; do
+    if curl -fsS "$web_url/api/runtime/__healthz" >/dev/null 2>&1; then
+      printf '%s' "$web_url"
+      return
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  printf ''
+}
+
+# Open the user's browser to the setup page once the web app is responsive.
+# Non-interactive runs (piped curl) print the URL and let the user open it
+# manually. Either way, the autostart-enabled webapp is the post-install
+# entry point — no terminal-driven `gini setup` required.
+open_setup_in_browser() {
+  if [ "$AUTOSTART_ENABLED" != "1" ]; then
+    return
+  fi
+  if [ "$OS" != "darwin" ]; then
+    return
+  fi
+  info "Waiting for the Gini webapp to come up..."
+  local web_url
+  web_url="$(wait_for_web_healthz)"
+  if [ -z "$web_url" ]; then
+    info "Webapp didn't respond within 30s. After install completes, open http://127.0.0.1:3000/setup in your browser."
+    return
+  fi
+  # `open` works in both interactive and non-interactive (piped) sessions
+  # on macOS. We fire and ignore errors — even if it fails (e.g. no GUI
+  # session), we still print the URL.
+  open "$web_url/setup" >/dev/null 2>&1 || true
+  step "Opened $web_url/setup in your browser"
 }
 
 print_done() {
@@ -322,13 +365,14 @@ print_done() {
     printf '\n%sgini-agent installed.%s\n\n' "$C_BOLD" "$C_RESET"
   fi
 
-  # If autostart took over, the runtime is already running and will respawn
-  # across reboots — point at `gini status` instead of `gini start`. If
-  # setup ran but autostart didn't, the user still needs to start it once.
-  # If neither ran, they need both setup and start.
+  # The target post-install flow is: autostart launches both runtime and
+  # webapp; user's browser opens to /setup; they enter their provider
+  # creds there. If autostart didn't enable (e.g. --no-autostart, or
+  # platform != macOS), fall back to the old gini start instructions.
   print_next_commands() {
     if [ "$AUTOSTART_ENABLED" = "1" ]; then
-      printf '    gini status\n'
+      printf '    open http://127.0.0.1:3000/setup    # configure your provider in the browser\n'
+      printf '    gini status                          # check the runtime\n'
     elif [ "$SETUP_RAN" = "1" ]; then
       printf '    gini start\n'
     else
@@ -347,14 +391,18 @@ print_done() {
     printf '\n'
   else
     if [ "$AUTOSTART_ENABLED" = "1" ]; then
-      printf 'Runtime is up (autostart enabled). Check it with %sgini status%s.' "$C_BOLD" "$C_RESET"
+      printf 'The Gini webapp is opening in your browser. Configure your provider on %s/setup%s to get started.\n' "$C_BOLD" "$C_RESET"
+      printf '\nRuntime + webapp are autostart-enabled — they will keep running across crashes and reboots until you run %sgini stop%s or %sgini autostart disable%s.\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+      if [ "$OS" = "darwin" ]; then
+        printf '\n%sNote (macOS 26+):%s if SIGKILL ever takes the runtime down, launchd may defer respawn — run %sgini autostart kick%s to force it.\n' "$C_DIM" "$C_RESET" "$C_BOLD" "$C_RESET"
+      fi
     elif [ "$SETUP_RAN" = "1" ]; then
       printf 'Run %sgini start%s.' "$C_BOLD" "$C_RESET"
     else
       printf 'Run %sgini setup%s, then %sgini start%s.' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
     fi
     if [ "$LOCAL_MODE" = "1" ]; then
-      printf ' After committing changes in %s, run %sgini update%s to re-sync.' "$LOCAL_REPO" "$C_BOLD" "$C_RESET"
+      printf '\n\nAfter committing changes in %s, run %sgini update%s to re-sync.' "$LOCAL_REPO" "$C_BOLD" "$C_RESET"
     fi
     printf '\n\n'
   fi
@@ -378,8 +426,12 @@ main() {
   write_wrapper
   update_path
   initialize_instance
+  # run_setup is still attempted for interactive installs that want the
+  # legacy terminal flow. For the piped-curl path it's a no-op (no TTY)
+  # — the user goes through the browser /setup route instead.
   run_setup
   enable_autostart
+  open_setup_in_browser
   print_done
 }
 
