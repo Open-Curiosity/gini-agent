@@ -22,6 +22,7 @@ import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge, listM
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createProfile, listProfiles, useProfile } from "./capabilities/profiles";
+import { connectBrowser, disconnectBrowser, getBrowserConnection, wipeBrowserProfile } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { createSkillFromInput, getSkill, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
@@ -221,6 +222,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],
     ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, async (_request, params) => json(await reviewPromotion(config, params[0], "approve"))],
     ["POST", /^\/api\/promotions\/([^/]+)\/reject$/, async (_request, params) => json(await reviewPromotion(config, params[0], "reject"))],
+    ["GET", /^\/api\/browser$/, () => json(getBrowserConnection(config))],
+    ["POST", /^\/api\/browser\/connect$/, async (request) => {
+      const payload = await body(request);
+      return json(await connectBrowser(config, payload), 201);
+    }],
+    ["POST", /^\/api\/browser\/disconnect$/, async () => json(await disconnectBrowser(config))],
+    ["POST", /^\/api\/browser\/wipe-profile$/, async () => json(await wipeBrowserProfile(config))],
     ["GET", /^\/api\/toolsets$/, () => json(listToolsets(config))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/enable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "enabled"))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "disabled"))],
@@ -324,6 +332,16 @@ function json(value: unknown, statusCode = 200): Response {
 function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Job not found") || message.startsWith("Job run not found")) return 404;
   if (message.startsWith("Invalid input")) return 400;
+  // Browser-connect surfaces user-input failures with these prefixes;
+  // forward them to 400 so the webapp can surface the original error text
+  // rather than a generic "internal error". Connectivity failures
+  // (unreachable CDP) and discovery failures (no Chrome on PATH) are also
+  // user-correctable, not internal errors.
+  if (message.startsWith("Invalid cdpUrl")) return 400;
+  if (message.startsWith("Unsupported cdpUrl protocol")) return 400;
+  if (message.startsWith("Invalid port")) return 400;
+  if (message.startsWith("Could not reach CDP endpoint")) return 400;
+  if (message.startsWith("Could not locate")) return 400;
   return 500;
 }
 

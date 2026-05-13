@@ -25,7 +25,7 @@ Use Codex OAuth as the preferred interactive provider:
 
 ```sh
 codex --login
-bun run gini provider set codex gpt-5.4
+bun run gini provider set codex gpt-5.5
 bun run gini doctor
 ```
 
@@ -118,6 +118,39 @@ If you're working on gini-agent itself and want to test the install/update/unins
 ```
 
 This is the same as the default install except it clones from your local repo into `~/.gini/runtime`. After you commit changes locally, `gini update` will pull them in. `gini uninstall` works exactly the same as a real install (same marker, same wrapper path).
+
+## Agent Iteration Cap
+
+The chat-task agent loop is bounded by a per-iteration cap that prevents
+runaway tool-calling. The default is 90 iterations (one iteration = one
+model call plus any tool dispatches that follow). Most tasks finish well
+under 10 iterations; the cap exists as a safety bound, not a meaningful
+budget for normal work.
+
+When the cap is hit the loop does NOT fail. Instead it makes one final
+tool-less model call asking for a summary of what was learned and what
+remained undone, and completes the task with that text. A warning trace
+records the cap hit so the activity is auditable.
+
+To override the cap for a single instance, edit
+`~/.gini/instances/<instance>/config.json` and add an `agent` object:
+
+```json
+{
+  "instance": "main",
+  "port": 7337,
+  "...": "...",
+  "agent": {
+    "maxIterations": 150
+  }
+}
+```
+
+`maxIterations` must be a positive integer. Invalid values (zero, negative,
+non-numeric) fall back to the built-in default and emit a warning trace on
+the next task. The runtime reads `config.json` once at server start and
+holds `RuntimeConfig` in memory, so edits don't take effect until you
+restart `gini run` (stop the tmux session and re-issue the command).
 
 ## Cleanup
 
