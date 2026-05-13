@@ -9,7 +9,7 @@
 // the rest of the runtime.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawn } from "bun";
 import type { Approval, RuntimeConfig, RuntimeState, Task } from "./types";
 import { traceDir } from "./paths";
@@ -577,6 +577,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
   if (approval.action === "file.write") {
     const target = assertInsideWorkspace(config.workspaceRoot, String(approval.payload.path));
     const before = existsSync(target) ? readFileSync(target, "utf8") : "";
+    mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, String(approval.payload.content));
     const task = await mutateState(config.instance, (state) => {
       addAudit(state, {
