@@ -1208,6 +1208,107 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
   }
 }
 
+// Hover over an element identified by its @eN ref from the last snapshot.
+// Hovering can reveal tooltips or trigger CSS :hover-only menus the agent
+// needs to interact with next; we re-snapshot afterwards so any newly
+// visible interactive elements get fresh @eN refs.
+export async function browserHover(taskId: string, args: Record<string, unknown>): Promise<string> {
+  const ref = str(args.ref);
+  if (!ref) return fail("Missing required string argument: ref");
+  try {
+    return await withSession(taskId, async (session) => {
+      const locator = session.refs.get(ref);
+      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await locator.hover({ timeout: 10_000 });
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        title: await session.page.title(),
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
+      });
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Drag one element onto another by their @eN refs. Useful for kanban-style
+// reorderings and drag-to-upload zones; we wait for any post-drop navigation
+// or DOM settle via waitForLoadState before re-snapshotting.
+export async function browserDrag(taskId: string, args: Record<string, unknown>): Promise<string> {
+  const fromRef = str(args.fromRef);
+  const toRef = str(args.toRef);
+  if (!fromRef) return fail("Missing required string argument: fromRef");
+  if (!toRef) return fail("Missing required string argument: toRef");
+  try {
+    return await withSession(taskId, async (session) => {
+      const fromLoc = session.refs.get(fromRef);
+      if (!fromLoc) return fail(`Unknown ref ${fromRef}. Take a fresh snapshot first.`);
+      const toLoc = session.refs.get(toRef);
+      if (!toLoc) return fail(`Unknown ref ${toRef}. Take a fresh snapshot first.`);
+      await fromLoc.dragTo(toLoc, { timeout: 10_000 });
+      await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        title: await session.page.title(),
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
+      });
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Select option(s) on a <select> by ref. Exactly one of `value` (single)
+// or `values` (multi-select) must be supplied; we forward whatever was
+// provided to Playwright's selectOption, which accepts both shapes.
+export async function browserSelectOption(taskId: string, args: Record<string, unknown>): Promise<string> {
+  const ref = str(args.ref);
+  if (!ref) return fail("Missing required string argument: ref");
+  const value = typeof args.value === "string" ? args.value : undefined;
+  const valuesRaw = args.values;
+  const hasValues = valuesRaw !== undefined;
+  if (value === undefined && !hasValues) {
+    return fail("Missing required argument: provide either 'value' (string) or 'values' (string[]).");
+  }
+  if (value !== undefined && hasValues) {
+    return fail("Provide either 'value' or 'values', not both.");
+  }
+  let values: string[] | undefined;
+  if (hasValues) {
+    if (!Array.isArray(valuesRaw) || !valuesRaw.every((v): v is string => typeof v === "string")) {
+      return fail("Argument 'values' must be an array of strings.");
+    }
+    values = valuesRaw;
+  }
+  try {
+    return await withSession(taskId, async (session) => {
+      const locator = session.refs.get(ref);
+      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      const selection = value ?? (values as string[]);
+      await locator.selectOption(selection, { timeout: 10_000 });
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated,
+        selected: selection
+      });
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
 export async function browserClose(taskId: string, _args: Record<string, unknown>): Promise<string> {
   try {
     consoleLogs.delete(taskId);
@@ -1331,7 +1432,7 @@ export const __test = {
   // Install a synthetic session with a caller-provided `page` so tool
   // entry points (browserVision, etc.) can be exercised against a
   // hand-built page without spawning Chromium.
-  installFakeSessionWithPageForTest(taskId: string, page: Pick<Page, "screenshot" | "url">): void {
+  installFakeSessionWithPageForTest(taskId: string, page: Partial<Page>): void {
     sessions.set(taskId, {
       context: {} as BrowserContext,
       page: page as unknown as Page,
@@ -1340,6 +1441,39 @@ export const __test = {
       inFlight: 0,
       ownsContext: false
     });
+  },
+  // Install a synthetic session with both a `page` and `context` so tab-
+  // management tests (which read context.pages() and call context.newPage())
+  // can exercise the entire flow without spawning Chromium.
+  installFakeSessionWithPageAndContextForTest(
+    taskId: string,
+    page: Partial<Page>,
+    context: Partial<BrowserContext>
+  ): void {
+    sessions.set(taskId, {
+      context: context as unknown as BrowserContext,
+      page: page as unknown as Page,
+      refs: new Map(),
+      lastActivity: Date.now(),
+      inFlight: 0,
+      ownsContext: false
+    });
+  },
+  // Read the currently-installed page on a fake session so tests can
+  // assert that a tab-management operation actually swapped session.page.
+  getFakeSessionPageForTest(taskId: string): Page | undefined {
+    return sessions.get(taskId)?.page;
+  },
+  // Read the currently-installed refs map so tests can assert it was
+  // cleared (e.g. tab switch / new / close should clear the refs).
+  getFakeSessionRefsForTest(taskId: string): Map<string, Locator> | undefined {
+    return sessions.get(taskId)?.refs;
+  },
+  // Set the refs map on a fake session so tests can plant a fake locator
+  // keyed by `@eN` before invoking a tool that needs to resolve it.
+  setFakeSessionRefsForTest(taskId: string, refs: Map<string, unknown>): void {
+    const session = sessions.get(taskId);
+    if (session) session.refs = refs as Map<string, Locator>;
   },
   setFakeSessionInFlight(taskId: string, inFlight: number): void {
     const session = sessions.get(taskId);

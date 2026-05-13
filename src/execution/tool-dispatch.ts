@@ -32,9 +32,12 @@ import {
   browserClick,
   browserClose,
   browserConsole,
+  browserDrag,
+  browserHover,
   browserNavigate,
   browserPress,
   browserScroll,
+  browserSelectOption,
   browserSnapshot,
   browserType,
   browserVision
@@ -94,6 +97,12 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.console", browserConsole, args) };
     case "browser_close":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.close", browserClose, args) };
+    case "browser_hover":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.hover", browserHover, args) };
+    case "browser_drag":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.drag", browserDrag, args) };
+    case "browser_select_option":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.select_option", browserSelectOption, args) };
     case "browser_vision":
       return { kind: "sync", result: await browserDispatchWithConfig(config, taskId, "browser.vision", browserVision, args) };
     case "file_write":
@@ -236,7 +245,16 @@ async function runBrowserDispatch(
   args: Record<string, unknown>
 ): Promise<string> {
   const result = await exec();
-  const risk: "low" | "medium" = action === "browser.click" || action === "browser.type" ? "medium" : "low";
+  // Side-effecting actions get medium risk so the activity trail flags them
+  // alongside file/terminal actions; read-only paths (navigate, snapshot,
+  // hover, console, scroll, back, close, vision) stay low.
+  const MEDIUM_RISK_ACTIONS = new Set([
+    "browser.click",
+    "browser.type",
+    "browser.drag",
+    "browser.select_option"
+  ]);
+  const risk: "low" | "medium" = MEDIUM_RISK_ACTIONS.has(action) ? "medium" : "low";
   let parsed: { success?: boolean; error?: string } = {};
   try {
     parsed = JSON.parse(result) as { success?: boolean; error?: string };

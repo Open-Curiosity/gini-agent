@@ -2,7 +2,10 @@ import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { rmSync } from "node:fs";
 import {
   __test as browserTest,
+  browserDrag,
+  browserHover,
   browserNavigate,
+  browserSelectOption,
   browserVision,
   closeAll,
   disconnectSharedBrowser,
@@ -709,5 +712,249 @@ describe("browserVision", () => {
     const parsed = JSON.parse(raw) as { success: boolean; error?: string };
     expect(parsed.success).toBe(false);
     expect(parsed.error).toMatch(/question/i);
+  });
+});
+
+// Shared helper: build a minimal fake Page that satisfies the surface our
+// tool entry points exercise (evaluate for snapshot, title/url, optional
+// waitForLoadState). Tests planted refs directly via setFakeSessionRefsForTest
+// so the walker doesn't need to run — they pass `fullMode: false` and we
+// return an empty raw array which yields an empty snapshot.
+function makeFakePageForRefTools(url = "https://example.com/"): Partial<import("playwright-core").Page> {
+  return {
+    url: () => url,
+    title: () => Promise.resolve("Example"),
+    // Walker invokes page.evaluate twice (clear stale refs, then walk). We
+    // resolve to undefined for the cleanup pass and an empty array for the
+    // walk so the snapshot text is just empty.
+    evaluate: (async () => []) as unknown as import("playwright-core").Page["evaluate"],
+    waitForLoadState: (async () => undefined) as unknown as import("playwright-core").Page["waitForLoadState"]
+  };
+}
+
+describe("browserHover", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("resolves the ref and calls locator.hover with a 10s timeout", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("hover-task", fakePage);
+    const hoverCalls: Array<{ timeout?: number }> = [];
+    const fakeLocator = {
+      hover: async (opts?: { timeout?: number }) => {
+        hoverCalls.push(opts ?? {});
+      }
+    };
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", fakeLocator);
+    browserTest.setFakeSessionRefsForTest("hover-task", refs);
+
+    const raw = await browserHover("hover-task", { ref: "@e3" });
+    const parsed = JSON.parse(raw) as { success: boolean; url?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.url).toBe("https://example.com/");
+    expect(hoverCalls.length).toBe(1);
+    expect(hoverCalls[0]!.timeout).toBe(10_000);
+  });
+
+  test("returns the standard 'Unknown ref' error for missing refs", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("hover-missing", fakePage);
+    const raw = await browserHover("hover-missing", { ref: "@e99" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e99");
+    expect(parsed.error).toContain("fresh snapshot");
+  });
+
+  test("rejects missing ref argument", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("hover-noarg", fakePage);
+    const raw = await browserHover("hover-noarg", {});
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/ref/i);
+  });
+});
+
+describe("browserDrag", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("calls dragTo(toLoc, { timeout: 10000 }) on the from-locator", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("drag-task", fakePage);
+    const fromLoc = {
+      dragTo: async (target: unknown, opts?: { timeout?: number }) => {
+        (fromLoc as unknown as { _called: { target: unknown; opts?: { timeout?: number } } })._called = {
+          target,
+          opts: opts ?? {}
+        };
+      }
+    };
+    const toLoc = { _marker: "to" };
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", fromLoc);
+    refs.set("@e2", toLoc);
+    browserTest.setFakeSessionRefsForTest("drag-task", refs);
+
+    const raw = await browserDrag("drag-task", { fromRef: "@e1", toRef: "@e2" });
+    const parsed = JSON.parse(raw) as { success: boolean };
+    expect(parsed.success).toBe(true);
+    const captured = (fromLoc as unknown as { _called?: { target: unknown; opts?: { timeout?: number } } })._called;
+    expect(captured).toBeDefined();
+    expect(captured!.target).toBe(toLoc);
+    expect(captured!.opts!.timeout).toBe(10_000);
+  });
+
+  test("returns 'Unknown ref' when fromRef is missing", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("drag-bad-from", fakePage);
+    const refs = new Map<string, unknown>();
+    refs.set("@e2", { dragTo: async () => undefined });
+    browserTest.setFakeSessionRefsForTest("drag-bad-from", refs);
+
+    const raw = await browserDrag("drag-bad-from", { fromRef: "@e1", toRef: "@e2" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e1");
+  });
+
+  test("returns 'Unknown ref' when toRef is missing", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("drag-bad-to", fakePage);
+    const fromLoc = { dragTo: async () => undefined };
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", fromLoc);
+    browserTest.setFakeSessionRefsForTest("drag-bad-to", refs);
+
+    const raw = await browserDrag("drag-bad-to", { fromRef: "@e1", toRef: "@e2" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e2");
+  });
+
+  test("rejects missing arguments", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("drag-noargs", fakePage);
+    const rawMissingFrom = await browserDrag("drag-noargs", { toRef: "@e2" });
+    expect(JSON.parse(rawMissingFrom).error).toMatch(/fromRef/);
+    const rawMissingTo = await browserDrag("drag-noargs", { fromRef: "@e1" });
+    expect(JSON.parse(rawMissingTo).error).toMatch(/toRef/);
+  });
+});
+
+describe("browserSelectOption", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("forwards single value to locator.selectOption", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("sel-single", fakePage);
+    let captured: { selection: unknown; timeout?: number } | undefined;
+    const loc = {
+      selectOption: async (selection: unknown, opts?: { timeout?: number }) => {
+        captured = { selection, timeout: opts?.timeout };
+        return [];
+      }
+    };
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", loc);
+    browserTest.setFakeSessionRefsForTest("sel-single", refs);
+
+    const raw = await browserSelectOption("sel-single", { ref: "@e3", value: "medium" });
+    const parsed = JSON.parse(raw) as { success: boolean; selected?: unknown };
+    expect(parsed.success).toBe(true);
+    expect(parsed.selected).toBe("medium");
+    expect(captured).toBeDefined();
+    expect(captured!.selection).toBe("medium");
+    expect(captured!.timeout).toBe(10_000);
+  });
+
+  test("forwards values[] to locator.selectOption for multi-select", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("sel-multi", fakePage);
+    let captured: { selection: unknown } | undefined;
+    const loc = {
+      selectOption: async (selection: unknown) => {
+        captured = { selection };
+        return [];
+      }
+    };
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", loc);
+    browserTest.setFakeSessionRefsForTest("sel-multi", refs);
+
+    const raw = await browserSelectOption("sel-multi", { ref: "@e3", values: ["a", "b"] });
+    const parsed = JSON.parse(raw) as { success: boolean; selected?: unknown };
+    expect(parsed.success).toBe(true);
+    expect(parsed.selected).toEqual(["a", "b"]);
+    expect(captured!.selection).toEqual(["a", "b"]);
+  });
+
+  test("rejects when neither value nor values is supplied", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("sel-neither", fakePage);
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", { selectOption: async () => [] });
+    browserTest.setFakeSessionRefsForTest("sel-neither", refs);
+
+    const raw = await browserSelectOption("sel-neither", { ref: "@e3" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/value/i);
+  });
+
+  test("rejects when both value and values are supplied", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("sel-both", fakePage);
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", { selectOption: async () => [] });
+    browserTest.setFakeSessionRefsForTest("sel-both", refs);
+
+    const raw = await browserSelectOption("sel-both", { ref: "@e3", value: "a", values: ["b"] });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/either.*'value'.*or.*'values'/i);
+  });
+
+  test("rejects when values is not an array of strings", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("sel-bad-values", fakePage);
+    const refs = new Map<string, unknown>();
+    refs.set("@e3", { selectOption: async () => [] });
+    browserTest.setFakeSessionRefsForTest("sel-bad-values", refs);
+
+    // Non-array
+    const rawNotArray = await browserSelectOption("sel-bad-values", { ref: "@e3", values: "not-an-array" });
+    expect(JSON.parse(rawNotArray).error).toMatch(/array of strings/i);
+
+    // Array with a non-string element
+    const rawMixed = await browserSelectOption("sel-bad-values", { ref: "@e3", values: ["a", 1] });
+    expect(JSON.parse(rawMixed).error).toMatch(/array of strings/i);
+  });
+
+  test("returns 'Unknown ref' when the ref isn't in the latest snapshot", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("sel-bad-ref", fakePage);
+    const raw = await browserSelectOption("sel-bad-ref", { ref: "@e99", value: "x" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e99");
+  });
+
+  test("rejects missing ref argument", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("sel-no-ref", fakePage);
+    const raw = await browserSelectOption("sel-no-ref", { value: "x" });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/ref/);
   });
 });

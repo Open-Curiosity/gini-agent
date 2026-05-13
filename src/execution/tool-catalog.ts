@@ -314,6 +314,54 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     toolset: "browser",
     type: "function",
     function: {
+      name: "browser_hover",
+      description: "Hover over an element on the current page by its @eN ref. Useful for revealing tooltips or :hover-only menus. Returns a fresh snapshot.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Element ref like '@e3' from the latest snapshot." }
+        },
+        required: ["ref"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_drag",
+      description: "Drag from one element to another by their @eN refs.",
+      parameters: {
+        type: "object",
+        properties: {
+          fromRef: { type: "string", description: "Source element ref like '@e3' from the latest snapshot." },
+          toRef: { type: "string", description: "Target element ref like '@e7' from the latest snapshot." }
+        },
+        required: ["fromRef", "toRef"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_select_option",
+      description: "Select an option in a <select> element by its @eN ref. Pass `value` for single-select or `values` for multi-select. Exactly one of the two must be provided.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Select element ref like '@e3' from the latest snapshot." },
+          value: { type: "string", description: "Option value to select (single-select). Mutually exclusive with `values`." },
+          values: { type: "array", items: { type: "string" }, description: "Option values to select (multi-select). Mutually exclusive with `value`." }
+        },
+        required: ["ref"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
       name: "browser_vision",
       description: "Screenshot the current page and ask the configured vision model a question about what's visible. Returns the model's text answer. Use when the accessibility snapshot can't capture what you need (charts, image-only content, visual layout, captchas-by-description). One image per call.",
       parameters: {
