@@ -22,10 +22,11 @@
 // actions (click/type) skip the approval gate; the snapshot itself is the
 // trace evidence.
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { instanceRoot } from "../paths";
 import { generateVisionAnalysis } from "../provider";
-import { readState } from "../state";
+import { assertInsideWorkspace, readState } from "../state";
 import type { BrowserConnectionRecord, Instance, RuntimeConfig } from "../types";
 
 // Per-instance Chrome profile directory. The agent persists ALL sign-ins
@@ -1516,6 +1517,85 @@ export async function browserVision(
         answer: result.text,
         bytes: buf.length,
         full
+      });
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Upload a workspace file to a file-input element by ref. The user-supplied
+// path is treated as workspace-relative, validated to be inside the
+// workspace, and then re-validated after symlink resolution so a planted
+// symlink pointing at /etc/passwd can't escape the sandbox. The realpath is
+// what gets handed to Playwright's setInputFiles.
+export async function browserUploadFile(
+  taskId: string,
+  args: Record<string, unknown>,
+  workspaceRoot: string
+): Promise<string> {
+  const ref = str(args.ref);
+  if (!ref) return fail("Missing required string argument: ref");
+  const userPath = str(args.path);
+  if (!userPath) return fail("Missing required string argument: path");
+  let absolute: string;
+  try {
+    absolute = assertInsideWorkspace(workspaceRoot, userPath);
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+  if (!existsSync(absolute)) {
+    return fail(`Upload path does not exist: ${userPath}`);
+  }
+  let st: ReturnType<typeof statSync>;
+  try {
+    st = statSync(absolute);
+  } catch (error) {
+    return fail(`Cannot stat upload path: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!st.isFile()) {
+    return fail(`Upload path is not a file: ${userPath}`);
+  }
+  // Resolve symlinks and re-run the workspace check. A symlink under the
+  // workspace pointing at /etc/passwd would otherwise let an agent
+  // exfiltrate arbitrary files via an upload widget; closing this here
+  // keeps the assertInsideWorkspace contract intact across symlink chases.
+  // We realpath both sides so a workspace itself reached via a symlink
+  // (common on macOS where /tmp -> /private/tmp) doesn't false-positive
+  // a perfectly in-workspace file.
+  let real: string;
+  try {
+    real = realpathSync(absolute);
+  } catch (error) {
+    return fail(`Cannot resolve upload path: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let realWorkspace: string;
+  try {
+    realWorkspace = realpathSync(workspaceRoot);
+  } catch {
+    // If the workspace itself can't be realpath'd, fall back to the
+    // original; the second assertInsideWorkspace below catches anything
+    // that lands outside the un-resolved tree as well.
+    realWorkspace = workspaceRoot;
+  }
+  try {
+    assertInsideWorkspace(realWorkspace, real);
+  } catch {
+    return fail(`Path resolves outside workspace via symlink: ${userPath}`);
+  }
+  try {
+    return await withSession(taskId, async (session) => {
+      const locator = session.refs.get(ref);
+      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await locator.setInputFiles(real, { timeout: 10_000 });
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        path: userPath,
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
       });
     });
   } catch (error) {

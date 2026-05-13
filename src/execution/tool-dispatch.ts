@@ -41,6 +41,7 @@ import {
   browserSnapshot,
   browserTabs,
   browserType,
+  browserUploadFile,
   browserVision,
   browserWaitFor
 } from "../tools/browser";
@@ -121,6 +122,17 @@ export async function dispatchToolCall(
     }
     case "browser_vision":
       return { kind: "sync", result: await browserDispatchWithConfig(config, taskId, "browser.vision", browserVision, args) };
+    case "browser_upload_file":
+      return {
+        kind: "sync",
+        result: await runBrowserDispatch(
+          config,
+          taskId,
+          "browser.upload_file",
+          () => browserUploadFile(taskId, args, config.workspaceRoot),
+          args
+        )
+      };
     case "file_write":
       return { kind: "pending", approvalId: await requestFileWrite(config, taskId, toolCallId, args) };
     case "file_patch":
@@ -271,7 +283,8 @@ async function runBrowserDispatch(
     "browser.select_option",
     "browser.tabs.new",
     "browser.tabs.switch",
-    "browser.tabs.close"
+    "browser.tabs.close",
+    "browser.upload_file"
   ]);
   const risk: "low" | "medium" = MEDIUM_RISK_ACTIONS.has(action) ? "medium" : "low";
   let parsed: { success?: boolean; error?: string } = {};

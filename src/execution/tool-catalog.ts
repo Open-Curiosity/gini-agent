@@ -404,6 +404,22 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     toolset: "browser",
     type: "function",
     function: {
+      name: "browser_upload_file",
+      description: "Upload a workspace file via a file input. Path is workspace-relative and validated against escapes (including symlink targets).",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "File-input element ref like '@e3' from the latest snapshot." },
+          path: { type: "string", description: "Workspace-relative path to the file to upload." }
+        },
+        required: ["ref", "path"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
       name: "browser_vision",
       description: "Screenshot the current page and ask the configured vision model a question about what's visible. Returns the model's text answer. Use when the accessibility snapshot can't capture what you need (charts, image-only content, visual layout, captchas-by-description). One image per call.",
       parameters: {

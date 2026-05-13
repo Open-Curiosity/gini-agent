@@ -1,5 +1,6 @@
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   __test as browserTest,
   browserDrag,
@@ -7,6 +8,7 @@ import {
   browserNavigate,
   browserSelectOption,
   browserTabs,
+  browserUploadFile,
   browserVision,
   browserWaitFor,
   closeAll,
@@ -1308,5 +1310,139 @@ describe("browserTabs", () => {
     expect(JSON.parse(rawSwitch).error).toMatch(/non-negative integer/);
     const rawClose = await browserTabs("tabs-missing-index", { action: "close" });
     expect(JSON.parse(rawClose).error).toMatch(/non-negative integer/);
+  });
+});
+
+describe("browserUploadFile", () => {
+  const UPLOAD_ROOT = "/tmp/gini-browser-upload-tests";
+  const WORKSPACE = join(UPLOAD_ROOT, "workspace");
+  const OUTSIDE = join(UPLOAD_ROOT, "outside");
+
+  beforeEach(() => {
+    rmSync(UPLOAD_ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    mkdirSync(OUTSIDE, { recursive: true });
+  });
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    rmSync(UPLOAD_ROOT, { recursive: true, force: true });
+  });
+
+  test("uploads a workspace file via locator.setInputFiles using the realpath", async () => {
+    writeFileSync(join(WORKSPACE, "upload.txt"), "hello\n");
+    const fakePage = makeFakePageForRefTools("https://example.com/form");
+    browserTest.installFakeSessionWithPageForTest("upload-ok", fakePage);
+    let captured: { files?: unknown; timeout?: number } | undefined;
+    const loc = {
+      setInputFiles: async (files: unknown, opts?: { timeout?: number }) => {
+        captured = { files, timeout: opts?.timeout };
+      }
+    };
+    const refs = new Map<string, unknown>();
+    refs.set("@e2", loc);
+    browserTest.setFakeSessionRefsForTest("upload-ok", refs);
+
+    const raw = await browserUploadFile("upload-ok", { ref: "@e2", path: "upload.txt" }, WORKSPACE);
+    const parsed = JSON.parse(raw) as { success: boolean; path?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.path).toBe("upload.txt");
+    expect(captured).toBeDefined();
+    expect(captured!.timeout).toBe(10_000);
+    // realpath of /tmp/... resolves to /private/tmp/... on macOS, so we
+    // only assert the file portion is correct and that the path was
+    // run through realpath (i.e. it's absolute and ends with upload.txt).
+    expect(typeof captured!.files).toBe("string");
+    expect(String(captured!.files).endsWith("/upload.txt")).toBe(true);
+  });
+
+  test("rejects a path outside the workspace", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("upload-escape", fakePage);
+    const raw = await browserUploadFile(
+      "upload-escape",
+      { ref: "@e1", path: "../outside/secret.txt" },
+      WORKSPACE
+    );
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/outside workspace/);
+  });
+
+  test("rejects a path that doesn't exist", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("upload-missing", fakePage);
+    const raw = await browserUploadFile(
+      "upload-missing",
+      { ref: "@e1", path: "nope.txt" },
+      WORKSPACE
+    );
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/does not exist/);
+  });
+
+  test("rejects a path that points at a directory", async () => {
+    mkdirSync(join(WORKSPACE, "subdir"));
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("upload-dir", fakePage);
+    const raw = await browserUploadFile(
+      "upload-dir",
+      { ref: "@e1", path: "subdir" },
+      WORKSPACE
+    );
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/not a file/);
+  });
+
+  test("rejects a symlink whose target resolves outside the workspace", async () => {
+    writeFileSync(join(OUTSIDE, "secret.txt"), "top secret\n");
+    symlinkSync(join(OUTSIDE, "secret.txt"), join(WORKSPACE, "evil-link.txt"));
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("upload-symlink", fakePage);
+    let setInputCalls = 0;
+    const loc = {
+      setInputFiles: async () => {
+        setInputCalls++;
+      }
+    };
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", loc);
+    browserTest.setFakeSessionRefsForTest("upload-symlink", refs);
+
+    const raw = await browserUploadFile(
+      "upload-symlink",
+      { ref: "@e1", path: "evil-link.txt" },
+      WORKSPACE
+    );
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/symlink/);
+    // Must NOT have reached setInputFiles.
+    expect(setInputCalls).toBe(0);
+  });
+
+  test("rejects missing ref argument", async () => {
+    const raw = await browserUploadFile("upload-no-ref", { path: "x.txt" }, WORKSPACE);
+    expect(JSON.parse(raw).error).toMatch(/ref/);
+  });
+
+  test("rejects missing path argument", async () => {
+    const raw = await browserUploadFile("upload-no-path", { ref: "@e1" }, WORKSPACE);
+    expect(JSON.parse(raw).error).toMatch(/path/);
+  });
+
+  test("returns Unknown ref when path is valid but ref isn't in the latest snapshot", async () => {
+    writeFileSync(join(WORKSPACE, "ok.txt"), "ok\n");
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("upload-bad-ref", fakePage);
+    const raw = await browserUploadFile(
+      "upload-bad-ref",
+      { ref: "@e99", path: "ok.txt" },
+      WORKSPACE
+    );
+    expect(JSON.parse(raw).error).toContain("Unknown ref @e99");
   });
 });
