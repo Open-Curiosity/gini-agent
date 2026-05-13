@@ -77,6 +77,21 @@ export async function autostart(ctx: CliContext): Promise<void> {
     const kinds: PlistKind[] = kindFlag === "gateway" || kindFlag === "web" ? [kindFlag] : KINDS;
     const result = await enable(instance, testRoot, kinds);
     print(result);
+    // HIGH-B: when rollback itself failed, emit a clear stderr warning so
+    // the operator sees the honest state at a glance instead of having to
+    // dig through the JSON. The result JSON already has all the per-kind
+    // detail; this is purely a "look here" pointer.
+    if (result.partialState === "rollback_failed") {
+      const lines = (result.rollbackFailures ?? []).map(
+        (f) => `  - ${f.kind}: ${f.stderr || f.error}`
+      );
+      process.stderr.write(
+        `autostart enable: rollback FAILED for instance '${instance}'.\n` +
+        `The gateway service may still be loaded with stale env.\n` +
+        `Run \`gini autostart status --instance ${instance}\` and clean up manually with \`launchctl bootout\`.\n` +
+        `${lines.join("\n")}\n`
+      );
+    }
     // HIGH-4: exit code reflects ok:false so install.sh's `if … then`
     // sees the failure. Previously soft failures (e.g. partial bootstrap)
     // returned exit 0 because the JSON had ok:false but the CLI didn't
@@ -139,12 +154,36 @@ interface PerKindEnableResult {
   stderr?: string;
 }
 
+// HIGH-B: when a later kind in the enable sequence fails (e.g. web
+// bootstrap fails after gateway succeeds), we attempt to roll back the
+// earlier successful bootstraps via `bootout`. That rollback itself can
+// fail — and silently ignoring its failure leaves the operator with a
+// misleading `ok:false` while the gateway is still loaded. We surface
+// the rollback state explicitly:
+//
+//   - "clean": no rollback was needed (either everything succeeded or
+//     nothing was bootstrapped before failure).
+//   - "rolled_back": a rollback was needed and it succeeded — no
+//     half-loaded services remain.
+//   - "rollback_failed": a rollback was needed and at least one bootout
+//     during rollback returned non-zero. Per-kind details are in the
+//     rollbackFailures array. The operator must clean up manually.
+export type EnablePartialState = "clean" | "rolled_back" | "rollback_failed";
+
+interface RollbackFailure {
+  kind: PlistKind;
+  error: string;
+  stderr: string;
+}
+
 interface EnableResult {
   ok: boolean;
   enabled: boolean;
   instance: string;
   resolution: "installed" | "source";
   results: PerKindEnableResult[];
+  partialState: EnablePartialState;
+  rollbackFailures?: RollbackFailure[];
   error?: string;
 }
 
@@ -166,11 +205,27 @@ function resolveLogRoot(instance: string, testRoot?: { stateRoot?: string; logRo
   return join(home, ".gini", "instances", instance, "logs");
 }
 
-async function enable(
+// Test seam: HIGH-B's rollback-failure surfacing has no other reachable
+// path — we can't easily make a real `launchctl bootout` fail without
+// holding launchd hostage. Tests inject mocks here to assert the
+// partialState bookkeeping. Production callers omit `__deps` and get
+// the real launchctl shellouts.
+export interface EnableLaunchctlDeps {
+  isLoaded: typeof isLoaded;
+  bootout: typeof bootout;
+  bootstrap: typeof bootstrap;
+}
+
+// Exported for HIGH-B testing of rollback-failure surfacing via injected
+// launchctl deps. Production CLI dispatch still goes through `autostart()`
+// at the top of this file.
+export async function enable(
   instance: string,
   testRoot?: { stateRoot?: string; logRoot?: string },
-  kinds: PlistKind[] = KINDS
+  kinds: PlistKind[] = KINDS,
+  __deps?: EnableLaunchctlDeps
 ): Promise<EnableResult> {
+  const deps: EnableLaunchctlDeps = __deps ?? { isLoaded, bootout, bootstrap };
   const pair = resolveLaunchSpecPair({ instance, testRoot });
   const logRoot = resolveLogRoot(instance, testRoot);
   const results: PerKindEnableResult[] = [];
@@ -183,8 +238,8 @@ async function enable(
   // either fights for the gateway port or wedges launchd. `bootout` on
   // an unknown label is a no-op (we ignore "Could not find service"),
   // so it's safe to always run.
-  if (isLoaded(instance) && kinds.includes("gateway")) {
-    const out = bootout(instance);
+  if (deps.isLoaded(instance) && kinds.includes("gateway")) {
+    const out = deps.bootout(instance);
     if (!out.ok && !out.stderr.includes("Could not find service")) {
       // Surface as a top-level error and bail — running both legacy
       // and new gateway simultaneously is worse than failing the
@@ -195,6 +250,7 @@ async function enable(
         instance,
         resolution: pair.resolution,
         results: [],
+        partialState: "clean",
         error: `legacy bootout failed: ${out.stderr.trim()}`
       };
     }
@@ -213,6 +269,14 @@ async function enable(
   // report the gateway up but the user can't reach the webapp.
   const bootstrapped: PlistKind[] = [];
 
+  // HIGH-B: rollback bookkeeping. Populated when a later kind fails and
+  // we attempt to bootout the earlier successful ones. Each entry
+  // represents a rollback bootout that itself returned non-zero — the
+  // operator must clean it up manually because the service is still
+  // loaded.
+  let partialState: EnablePartialState = "clean";
+  const rollbackFailures: RollbackFailure[] = [];
+
   for (const kind of kinds) {
     const spec = kind === "gateway" ? pair.gateway : pair.web;
     const stdoutPath = join(logRoot, kind === "gateway" ? "runtime-stdout.log" : "web.log");
@@ -222,13 +286,13 @@ async function enable(
     const stderrPath = join(logRoot, kind === "gateway" ? "runtime-launchd.err.log" : "web-launchd.err.log");
     const path = writePlist({ instance, kind, spec, stdoutPath, stderrPath });
     const target = serviceTarget(instance, kind);
-    const wasLoaded = isLoaded(instance, kind);
+    const wasLoaded = deps.isLoaded(instance, kind);
 
     if (wasLoaded) {
       // Idempotent re-enable: the plist on disk may have changed, so we
       // bootout the old registration first, then bootstrap the new one.
       // `kickstart -k` alone wouldn't pick up the new plist contents.
-      const out = bootout(instance, kind);
+      const out = deps.bootout(instance, kind);
       if (!out.ok && !out.stderr.includes("Could not find service")) {
         results.push({
           kind,
@@ -249,11 +313,11 @@ async function enable(
     // "Bootstrap failed: 5: Input/output error" when the previous
     // bootout hasn't fully flushed yet — typically clears within ~1s.
     // We retry up to 3 times with 500ms backoff to ride out the gap.
-    let res = bootstrap(instance, path);
+    let res = deps.bootstrap(instance, path);
     let attempts = 1;
     while (!res.ok && attempts < 3 && res.stderr.includes("Input/output error")) {
       await Bun.sleep(500);
-      res = bootstrap(instance, path);
+      res = deps.bootstrap(instance, path);
       attempts += 1;
     }
     if (!res.ok) {
@@ -268,12 +332,31 @@ async function enable(
         stderr: res.stderr.trim()
       });
       allOk = false;
-      // HIGH-4 (b): roll back any kinds we already bootstrapped in this
-      // call so we don't leave a half-loaded service set behind. Skip
-      // kinds that were `wasLoaded:true` on entry — those are the
-      // user's prior state, not something this call created.
+      // HIGH-4 (b) / HIGH-B: roll back any kinds we already bootstrapped
+      // in this call so we don't leave a half-loaded service set behind.
+      // Skip kinds that were `wasLoaded:true` on entry — those are the
+      // user's prior state, not something this call created. If the
+      // rollback bootout itself fails, capture the per-kind error and
+      // flip partialState to "rollback_failed" so the operator sees
+      // the honest state: the gateway is still loaded but the web
+      // never came up, and we couldn't clean up either. Round-3 review
+      // (HIGH-B) called this out: silently ignoring rollback failures
+      // returned ok:false while the gateway stayed loaded — misleading
+      // state for the operator.
+      let allRolledBack = bootstrapped.length > 0;
       for (const earlier of bootstrapped) {
-        bootout(instance, earlier);
+        const r = deps.bootout(instance, earlier);
+        if (!r.ok && !r.stderr.includes("Could not find service")) {
+          allRolledBack = false;
+          rollbackFailures.push({
+            kind: earlier,
+            error: "rollback bootout failed",
+            stderr: r.stderr.trim()
+          });
+        }
+      }
+      if (bootstrapped.length > 0) {
+        partialState = allRolledBack ? "rolled_back" : "rollback_failed";
       }
       continue;
     }
@@ -293,7 +376,9 @@ async function enable(
     enabled: allOk,
     instance,
     resolution: pair.resolution,
-    results
+    results,
+    partialState,
+    ...(rollbackFailures.length > 0 ? { rollbackFailures } : {})
   };
 }
 
