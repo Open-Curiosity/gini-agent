@@ -207,11 +207,13 @@ GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --instance sandbox s
 - ✅ Trace-backed improvement proposals
 - ✅ Provider support (Codex OAuth, OpenAI)
 - ✅ Paired-device auth
+- ⚪ Auto-start after install (always-on runtime)
+- ⚪ Browser-based onboarding at install
 - ⚪ iOS mobile app for remote control
 - ⚪ Trust layer (reproducible builds, verify-app)
 - ⚪ Gini as MCP server
 - ⚪ Task self-learning and iteration loop
-- ⚪ Native macOS app
+- ⚪ Native macOS app (Tauri shell, later)
 
 
 This is the short preview. See the full roadmap in [ROADMAP.md](ROADMAP.md).

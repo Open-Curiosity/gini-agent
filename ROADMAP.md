@@ -20,7 +20,29 @@ This is the long-form version of the short list in the [README](README.md#roadma
 
 ## Planned
 
-These five items are what the roadmap is built around. Order below matches the README preview.
+Order below matches the README preview. The webapp is the primary interface for the foreseeable future; a Tauri shell around the same UI is the eventual native client, not a near-term rewrite.
+
+### Auto-start after install (always-on runtime)
+
+The current flow makes the user type `gini start` after install. The target experience matches what tools like Paperclip do today: install completes, the runtime is already running, and it stays running across reboots and crashes.
+
+- ⚪ **LaunchAgent registration at install time.** The installer writes a per-instance `~/Library/LaunchAgents/ai.lilac.gini.<instance>.plist` and registers with `launchctl bootstrap gui/$(id -u)`. Uninstall removes it.
+- ⚪ **Crash recovery.** `KeepAlive` configured as a dict (not bool), so `gini stop` is honored but unexpected exits respawn within `ThrottleInterval`.
+- ⚪ **Network-aware startup.** `KeepAlive.NetworkState = true` so the first boot of the day waits for networking before launching provider auth flows.
+- ⚪ **Health watchdog.** A secondary `StartInterval` plist or in-process job hits `/api/healthz` and kills wedged Bun processes that launchd can't detect.
+- ⚪ **Linux equivalent.** `systemd --user` unit shipped alongside the macOS plist for parity.
+- ⚪ **Opt-out.** `--no-autostart` on the installer for users who want to manage the runtime themselves.
+
+### Browser-based onboarding at install
+
+The CLI install runs to completion, the runtime starts, and the user's browser is opened to a first-run `/onboard` route on the webapp. Provider picker, instance setup, and first-task suggestion happen in the UI instead of the terminal. The terminal `gini setup` flow remains for headless installs and power users.
+
+- ⚪ **`/onboard` route in the webapp.** Detects first-run state, walks through provider selection (Codex OAuth, OpenAI API key), and confirms instance config.
+- ⚪ **Auto-open the browser.** The installer/start sequence opens the default browser to the onboarding URL once the runtime is healthy. `--no-browser` opts out.
+- ⚪ **Provider picker UI.** Surfaces the same logic as `gini setup` (prefer Codex if `~/.codex/auth.json` exists, fall back to `OPENAI_API_KEY`, otherwise prompt), but with a real form instead of a terminal questionnaire.
+- ⚪ **First-task suggestion.** After provider setup, the onboarding ends with a "try this" example (e.g., "ask Gini to read its own architecture") so the user lands on a useful first interaction, not a blank chat.
+- ⚪ **Idempotent.** Onboarding completion is persisted to state so re-running `gini start` does not re-prompt. `gini onboard --reset` re-opens the flow.
+- ⚪ **Headless mode.** `--non-interactive` / `--yes` paths produce identical state without launching a browser, for CI and scripted installs.
 
 ### iOS mobile app (remote control)
 
@@ -69,12 +91,12 @@ Trace-backed improvement proposals (shipped) let memory, skills, and jobs evolve
 - ⚪ **Multi-attempt budgets.** Tasks declare a budget (time, tokens, attempts) and the loop terminates cleanly when exhausted, with an explanation rather than a hang.
 - ⚪ **Replay determinism.** A failed task can be re-run from any checkpoint with the same provider, tools, and memory state — so the iteration loop is debuggable, not magic.
 
-### Native macOS app
+### Native macOS app (Tauri shell, later)
 
-Gini ships an opinionated, best-in-class native client. The webapp does not go away — it gets demoted to one client among many. The Mac app is the recommended interface because approvals are interrupts, not pages, and the right shape for interrupts is the menubar and native notifications, not a browser tab.
+The webapp is the primary interface today; this item is deliberately later. When it ships, the form is a Tauri shell around the existing Next.js UI — not a from-scratch native rewrite. Once auto-start and browser onboarding are in place, the webapp covers the "always available, opens on its own" UX, and the native shell becomes a pure UX-polish layer: menubar presence, hotkey, OS notifications, and lifecycle ownership.
 
-- ⚪ **Tauri-style shell hosting the existing Next.js UI.** Reuse the frontend; add the OS-integration layer the browser can't reach.
-- ⚪ **Runtime lifecycle ownership.** The app spawns and supervises the Bun gateway as a managed child process — start at login, restart on crash, clean shutdown on quit. No orphaned processes, no stuck ports, no "did I run `gini start`."
+- ⚪ **Tauri shell hosting the existing Next.js UI.** Reuse the frontend verbatim; add the OS-integration layer the browser can't reach.
+- ⚪ **Runtime lifecycle ownership.** The app spawns and supervises the Bun gateway as a managed child process. Subsumes the LaunchAgent path once it ships.
 - ⚪ **Menubar presence.** Status dot, pending-approval badge, run-activity indicator, click-to-summon. Survives sleep, network changes, and instance restarts.
 - ⚪ **Global hotkey.** Summon a Gini chat from anywhere without switching apps. Quick-action surface for the current cursor selection.
 - ⚪ **Native notifications.** macOS notifications for pending approvals, run completion, job results, and watchdog events — fire whether the app is foregrounded or not.
