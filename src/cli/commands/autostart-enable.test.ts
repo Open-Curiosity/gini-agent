@@ -58,10 +58,15 @@ const isDarwin = process.platform === "darwin";
   });
 
   test("happy path: both kinds bootstrap → partialState 'clean', no rollbackFailures", async () => {
+    const kickstartCalls: Array<{ inst: string; kind?: "gateway" | "web" }> = [];
     const deps = {
       isLoaded: () => false,
       bootout: () => ok(),
-      bootstrap: () => ok()
+      bootstrap: () => ok(),
+      kickstart: (inst: string, kind?: "gateway" | "web") => {
+        kickstartCalls.push({ inst, kind });
+        return ok();
+      }
     };
     const result = await enable(instance, { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot }, ["gateway", "web"], deps);
     expect(result.ok).toBe(true);
@@ -69,7 +74,49 @@ const isDarwin = process.platform === "darwin";
     expect(result.partialState).toBe("clean");
     expect(result.rollbackFailures).toBeUndefined();
     expect(result.results.length).toBe(2);
-    for (const r of result.results) expect(r.enabled).toBe(true);
+    for (const r of result.results) {
+      expect(r.enabled).toBe(true);
+      expect(r.kickstartError).toBeUndefined();
+    }
+    // Round-5 fix: kickstart must fire once per successful bootstrap so
+    // services actually launch on macOS 26 (where RunAtLoad is
+    // best-effort). Order matches the kinds slice: gateway, then web.
+    expect(kickstartCalls.length).toBe(2);
+    expect(kickstartCalls[0]!.kind).toBe("gateway");
+    expect(kickstartCalls[1]!.kind).toBe("web");
+  });
+
+  test("Round-5: kickstart failure is surfaced per-kind but does NOT fail the enable", async () => {
+    // The bootstrap succeeded (services are registered), but kickstart
+    // returned non-zero. We keep enabled:true so install.sh proceeds
+    // and surface the soft failure so the user can recover with
+    // `gini autostart kick` manually.
+    let kickstartCalls = 0;
+    const deps = {
+      isLoaded: () => false,
+      bootout: () => ok(),
+      bootstrap: () => ok(),
+      kickstart: () => {
+        kickstartCalls += 1;
+        // First call (gateway) succeeds, second (web) fails — exercises
+        // both branches.
+        if (kickstartCalls === 1) return ok();
+        return fail("Could not kickstart service: 3: No such process");
+      }
+    };
+    const result = await enable(instance, { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot }, ["gateway", "web"], deps);
+    // Whole-enable still ok — bootstrap succeeded for both.
+    expect(result.ok).toBe(true);
+    expect(result.enabled).toBe(true);
+    expect(result.partialState).toBe("clean");
+    expect(result.results.length).toBe(2);
+    const gateway = result.results.find((r) => r.kind === "gateway")!;
+    const web = result.results.find((r) => r.kind === "web")!;
+    expect(gateway.enabled).toBe(true);
+    expect(gateway.kickstartError).toBeUndefined();
+    expect(web.enabled).toBe(true);
+    expect(web.kickstartError).toBe("launchctl kickstart failed");
+    expect(web.kickstartStderr).toContain("No such process");
   });
 
   test("HIGH-B: web fails AND rollback bootout fails → partialState 'rollback_failed' + stderr surfaced", async () => {
@@ -92,7 +139,8 @@ const isDarwin = process.platform === "darwin";
         // error" (we're simulating a permanent failure).
         if (bootstrapCalls === 1) return ok();
         return fail("Bootstrap failed: permanent fault");
-      }
+      },
+      kickstart: () => ok()
     };
     const result = await enable(instance, { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot }, ["gateway", "web"], deps);
     // Top-level: enable failed.
@@ -127,7 +175,8 @@ const isDarwin = process.platform === "darwin";
         bootstrapCalls += 1;
         if (bootstrapCalls === 1) return ok(); // gateway
         return fail("Bootstrap failed: web missing"); // web
-      }
+      },
+      kickstart: () => ok()
     };
     const result = await enable(instance, { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot }, ["gateway", "web"], deps);
     expect(result.ok).toBe(false);
@@ -144,7 +193,8 @@ const isDarwin = process.platform === "darwin";
         bootstrapCalls += 1;
         if (bootstrapCalls === 1) return ok();
         return fail("Bootstrap failed: web missing");
-      }
+      },
+      kickstart: () => ok()
     };
     const result = await enable(instance, { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot }, ["gateway", "web"], deps);
     expect(result.ok).toBe(false);

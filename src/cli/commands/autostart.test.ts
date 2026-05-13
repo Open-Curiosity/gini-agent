@@ -295,14 +295,31 @@ const e2eOn = isDarwin && process.env.GINI_AUTOSTART_E2E === "1";
     const disableParsed = JSON.parse(disableResult.stdout) as Record<string, unknown>;
     expect(disableParsed.ok).toBe(true);
     expect(disableParsed.disabled).toBe(true);
-
-    // Re-statusing: nothing loaded, no plists on disk.
-    const statusAgain = runCli(
-      ["autostart", "status", "--instance", uniqueInstance, "--state-root", scratch.stateRoot, "--log-root", scratch.logRoot],
-      {}
-    );
-    const statusAgainParsed = JSON.parse(statusAgain.stdout) as Record<string, unknown>;
-    const servicesAgain = statusAgainParsed.services as Array<Record<string, unknown>>;
+    // Round-5 fix: enable now calls `kickstart` after bootstrap so the
+    // service actually launches immediately on macOS 26 (where RunAtLoad
+    // is best-effort). That means by the time we reach `disable`, the
+    // child process is genuinely running, and launchctl propagation
+    // takes a beat after `bootout` returns before `launchctl print`
+    // stops finding the service. Poll briefly to let that propagate
+    // before asserting "loaded:false" — the bootout itself already
+    // returned ok above.
+    let unloaded = false;
+    let statusAgain: ReturnType<typeof runCli> | undefined;
+    let servicesAgain: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < 30; i++) {
+      statusAgain = runCli(
+        ["autostart", "status", "--instance", uniqueInstance, "--state-root", scratch.stateRoot, "--log-root", scratch.logRoot],
+        {}
+      );
+      const parsed = JSON.parse(statusAgain.stdout) as Record<string, unknown>;
+      servicesAgain = parsed.services as Array<Record<string, unknown>>;
+      if (servicesAgain.every((svc) => svc.loaded === false)) {
+        unloaded = true;
+        break;
+      }
+      Bun.sleepSync(200);
+    }
+    expect(unloaded).toBe(true);
     for (const svc of servicesAgain) {
       expect(svc.plistExists).toBe(false);
       expect(svc.loaded).toBe(false);

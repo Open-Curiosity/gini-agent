@@ -176,6 +176,17 @@ interface PerKindEnableResult {
   enabled: boolean;
   error?: string;
   stderr?: string;
+  // Round-5 fix: on macOS 26 (Tahoe), `RunAtLoad` in the plist is
+  // best-effort — after `launchctl bootstrap`, services frequently end
+  // up registered but never spawn (`state = not running`, last exit code
+  // `(never exited)`). We always `kickstart` after a successful bootstrap
+  // so the service actually launches immediately, regardless of macOS
+  // version. If kickstart itself fails, the bootstrap succeeded — the
+  // user can still run `gini autostart kick` manually — so we surface
+  // it as a soft failure on the per-kind result instead of failing the
+  // whole enable.
+  kickstartError?: string;
+  kickstartStderr?: string;
 }
 
 // HIGH-B: when a later kind in the enable sequence fails (e.g. web
@@ -238,6 +249,7 @@ export interface EnableLaunchctlDeps {
   isLoaded: typeof isLoaded;
   bootout: typeof bootout;
   bootstrap: typeof bootstrap;
+  kickstart: typeof kickstart;
 }
 
 // Exported for HIGH-B testing of rollback-failure surfacing via injected
@@ -249,7 +261,7 @@ export async function enable(
   kinds: PlistKind[] = KINDS,
   __deps?: EnableLaunchctlDeps
 ): Promise<EnableResult> {
-  const deps: EnableLaunchctlDeps = __deps ?? { isLoaded, bootout, bootstrap };
+  const deps: EnableLaunchctlDeps = __deps ?? { isLoaded, bootout, bootstrap, kickstart };
   const pair = resolveLaunchSpecPair({ instance, testRoot });
   const logRoot = resolveLogRoot(instance, testRoot);
   const results: PerKindEnableResult[] = [];
@@ -385,14 +397,34 @@ export async function enable(
       continue;
     }
     bootstrapped.push(kind);
-    results.push({
+    // Round-5 fix: macOS 26 frequently registers the service via
+    // `launchctl bootstrap` but never actually spawns it — `RunAtLoad`
+    // is honored as best-effort, not a guarantee. The symptom: `state
+    // = not running`, `last exit code = (never exited)`, indefinitely.
+    // We `kickstart` immediately after every successful bootstrap so
+    // the service actually runs regardless of macOS version. `-k` is
+    // idempotent on a not-running service (it's a no-op kill + start);
+    // it doesn't matter that the service hasn't launched yet.
+    //
+    // If kickstart itself returns non-zero we surface it as a soft
+    // failure on the per-kind result and keep `enabled: true` — the
+    // bootstrap succeeded, the user can manually run
+    // `gini autostart kick` to recover. Failing the whole enable on a
+    // kickstart error would needlessly roll back a working bootstrap.
+    const kickRes = deps.kickstart(instance, kind);
+    const perKind: PerKindEnableResult = {
       kind,
       label: labelForKind(instance, kind),
       plistPath: path,
       serviceTarget: target,
       alreadyLoaded: wasLoaded,
       enabled: true
-    });
+    };
+    if (!kickRes.ok) {
+      perKind.kickstartError = "launchctl kickstart failed";
+      perKind.kickstartStderr = kickRes.stderr.trim();
+    }
+    results.push(perKind);
   }
 
   return {
