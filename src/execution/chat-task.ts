@@ -308,21 +308,25 @@ async function runLoop(
   while (iterations < cap) {
     iterations += 1;
 
-    // Cancellation bail-out. If the task was cancelled externally (e.g.
-    // user clicked cancel, or a parent task's cancellation cascaded into
-    // this child via cancelDescendantTasks), stop the loop here so we
-    // don't keep running model calls and dispatching tools against a
-    // task that's already terminal.
+    // Terminal-state bail-out. If the task was already moved to any
+    // terminal status — cancelled externally, failed by a concurrent
+    // approval denial, or completed by a parallel path — stop the loop
+    // here so we don't (a) keep running model calls against a dead
+    // task or (b) overwrite the terminal status with a later
+    // "completed" write at the end of the loop. Previously this only
+    // checked for "cancelled", which let a race-lost auto-approve
+    // continue iterating after a concurrent user-deny had already
+    // failed the task.
     {
-      const cancelCheck = readState(config.instance).tasks.find((t) => t.id === taskId);
-      if (!cancelCheck || cancelCheck.status === "cancelled") {
+      const terminalCheck = readState(config.instance).tasks.find((t) => t.id === taskId);
+      if (!terminalCheck || terminalCheck.status === "cancelled" || terminalCheck.status === "failed" || terminalCheck.status === "completed") {
         appendTrace(config.instance, taskId, {
           type: "task",
-          message: "Chat task loop noticed cancellation",
-          data: { iterations }
+          message: `Chat task loop noticed terminal status (${terminalCheck?.status ?? "missing"})`,
+          data: { iterations, status: terminalCheck?.status }
         });
-        await syncSubagentFromTask(config, cancelCheck ?? ({ id: taskId, subagentId: undefined } as unknown as Task));
-        return cancelCheck ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
+        await syncSubagentFromTask(config, terminalCheck ?? ({ id: taskId, subagentId: undefined } as unknown as Task));
+        return terminalCheck ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
       }
     }
 

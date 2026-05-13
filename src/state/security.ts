@@ -33,9 +33,11 @@ export function assertInsideWorkspaceNoSymlinkEscape(workspaceRoot: string, targ
   // stat, so we stop the walk at the symlink, realpath that, and
   // detect that the symlink's target is outside.
   let probe = target;
+  let probeIsSymlink = false;
   while (true) {
     try {
-      lstatSync(probe);
+      const st = lstatSync(probe);
+      probeIsSymlink = st.isSymbolicLink();
       break;
     } catch {
       const parent = dirname(probe);
@@ -43,16 +45,23 @@ export function assertInsideWorkspaceNoSymlinkEscape(workspaceRoot: string, targ
       probe = parent;
     }
   }
-  // realpath resolves any symlinks in `probe` itself, so a symlink leaf
-  // whose target is outside the workspace becomes the outside path here
-  // and the relative check below catches it.
+  // realpath resolves any symlinks in `probe` itself. Three cases:
+  //   1. realpath succeeds and falls inside the workspace → safe.
+  //   2. realpath succeeds and falls outside → reject below.
+  //   3. realpath throws AND `probe` is itself a (broken) symlink →
+  //      reject. A broken symlink's target is by definition unknown
+  //      and writeFileSync will create the file at the target path,
+  //      which we cannot validate without resolving. Reject closed.
+  //   4. realpath throws because `probe` is a normal (non-symlink)
+  //      path we walked up to past everything → treat as in-workspace
+  //      (assertInsideWorkspace already passed).
   let realProbe: string;
   try {
     realProbe = realpathSync(probe);
   } catch {
-    // Probe doesn't physically exist (we walked up past everything).
-    // Treat the lexical path as authoritative — assertInsideWorkspace
-    // already passed, so we're inside.
+    if (probeIsSymlink) {
+      throw new Error(`Path escapes workspace via broken symlink: ${targetPath}`);
+    }
     realProbe = probe;
   }
   const rel = relative(realWorkspace, realProbe);

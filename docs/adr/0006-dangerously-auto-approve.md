@@ -75,6 +75,15 @@ human gate or routes through the same shared path.
   `ApprovedActionFailedError`; the chat-task loop's tool dispatch
   re-throws that class instead of swallowing it as a recoverable tool
   result.
+- `resolveApproval` distinguishes race-loss from side-effect failure
+  by throwing `ApprovalRaceLostError` when the approval is no longer
+  pending (a concurrent caller decided it first). `pendingOrAuto`
+  and the imperative auto-resolve path catch that class, do NOT
+  write `approval.approved` or a per-action audit row (the other
+  caller owns those writes), and return a benign sync tool result.
+  The chat-task loop's terminal-status bail-out then observes the
+  task state the other caller transitioned to and exits the loop
+  without overwriting it.
 - The imperative dispatch path in `runTask` checks the flag after each
   `request*` tool returns and resolves the freshly-created approval
   inline so the same bypass applies to `POST /api/tasks` /
