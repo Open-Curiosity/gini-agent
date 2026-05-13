@@ -26,22 +26,21 @@ Order below matches the README preview. The webapp is the primary interface for 
 
 The current flow makes the user type `gini start` after install. The target experience matches what tools like Paperclip do today: install completes, the runtime is already running, and it stays running across reboots and crashes.
 
-- ⚪ **LaunchAgent registration at install time.** The installer writes a per-instance `~/Library/LaunchAgents/ai.lilac.gini.<instance>.plist` and registers with `launchctl bootstrap gui/$(id -u)`. Uninstall removes it.
-- ⚪ **Crash recovery.** `KeepAlive` configured as a dict (not bool), so `gini stop` is honored but unexpected exits respawn within `ThrottleInterval`.
-- ⚪ **Network-aware startup.** `KeepAlive.NetworkState = true` so the first boot of the day waits for networking before launching provider auth flows.
+- ✅ **LaunchAgent registration at install time.** The installer writes two per-instance plists under `~/Library/LaunchAgents/` — `ai.lilac.gini.<instance>.gateway` (Bun runtime) and `ai.lilac.gini.<instance>.web` (Next.js dev) — and registers both with `launchctl bootstrap gui/$(id -u)`. Uninstall tears both down and surfaces bootout failures.
+- ✅ **Crash recovery.** `KeepAlive` configured as a dict (`SuccessfulExit: false`) on both plists, so `gini stop` (clean exit 0) is honored but unexpected exits respawn within `ThrottleInterval`. The web plist's shell shim execs `bun run dev` to keep the launchd-tracked PID accurate.
+- ✅ **Opt-out.** `--no-autostart` on the installer for users who want to manage the runtime themselves.
+- ⚠ **macOS 26+ caveat.** launchd often defers auto-respawn after SIGKILL indefinitely (`pended nondemand spawn = inefficient`). RunAtLoad still fires at login; `gini autostart kick` is the manual workaround.
 - ⚪ **Health watchdog.** A secondary `StartInterval` plist or in-process job hits `/api/healthz` and kills wedged Bun processes that launchd can't detect.
 - ⚪ **Linux equivalent.** `systemd --user` unit shipped alongside the macOS plist for parity.
-- ⚪ **Opt-out.** `--no-autostart` on the installer for users who want to manage the runtime themselves.
 
 ### Browser-based onboarding at install
 
-The CLI install runs to completion, the runtime starts, and the user's browser is opened to a first-run `/onboard` route on the webapp. Provider picker, instance setup, and first-task suggestion happen in the UI instead of the terminal. The terminal `gini setup` flow remains for headless installs and power users.
+The CLI install runs to completion, the runtime + webapp start, and the user's browser is opened to a first-run `/setup` route on the webapp. Provider picker happens in the UI instead of the terminal. The terminal `gini setup` flow remains for headless installs and power users.
 
-- ⚪ **`/onboard` route in the webapp.** Detects first-run state, walks through provider selection (Codex OAuth, OpenAI API key), and confirms instance config.
-- ⚪ **Auto-open the browser.** The installer/start sequence opens the default browser to the onboarding URL once the runtime is healthy. `--no-browser` opts out.
-- ⚪ **Provider picker UI.** Surfaces the same logic as `gini setup` (prefer Codex if `~/.codex/auth.json` exists, fall back to `OPENAI_API_KEY`, otherwise prompt), but with a real form instead of a terminal questionnaire.
+- ✅ **`/setup` route in the webapp.** Detects first-run state via `/api/setup/status`, renders a two-tab form (OpenAI API key, Codex `--login` instructions + Refresh), redirects to `/` on success.
+- ✅ **Auto-open the browser.** The installer waits for the webapp's healthz, then calls `open http://127.0.0.1:3000/setup` (works in both interactive and piped-curl runs on macOS).
+- ✅ **Proxy guard.** Next.js proxy.ts redirects unconfigured users to `/setup` from any other route. Configured users pass through.
 - ⚪ **First-task suggestion.** After provider setup, the onboarding ends with a "try this" example (e.g., "ask Gini to read its own architecture") so the user lands on a useful first interaction, not a blank chat.
-- ⚪ **Idempotent.** Onboarding completion is persisted to state so re-running `gini start` does not re-prompt. `gini onboard --reset` re-opens the flow.
 - ⚪ **Headless mode.** `--non-interactive` / `--yes` paths produce identical state without launching a browser, for CI and scripted installs.
 
 ### iOS mobile app (remote control)

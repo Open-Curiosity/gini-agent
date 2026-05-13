@@ -51,10 +51,13 @@ This repo includes a Bun TypeScript local runtime with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
-gini start
 ```
 
-The installer walks you through provider setup (OpenAI API key or existing `codex --login` auth). `gini start` prints the runtime and web URLs.
+On macOS the installer enables autostart (per-user LaunchAgents for the runtime and webapp), waits for the webapp to come up, and opens `http://127.0.0.1:3000/setup` in your browser. Pick a provider in the browser form (OpenAI API key or existing `codex --login` auth) and you land on the running app. The runtime stays alive across reboots and crashes until you explicitly run `gini stop` or `gini autostart disable`.
+
+Caveat on macOS 26 (Tahoe): after a SIGKILL, launchd sometimes refuses to auto-respawn (`pended nondemand spawn = inefficient`). Run `gini autostart kick` to force a respawn when that happens; RunAtLoad still fires at login.
+
+If you opted out of autostart (`--no-autostart`) or you're on Linux (autostart is macOS-only in v1), run `gini setup` then `gini start` to launch the runtime by hand.
 
 ### Update
 
@@ -207,8 +210,8 @@ GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --instance sandbox s
 - ✅ Trace-backed improvement proposals
 - ✅ Provider support (Codex OAuth, OpenAI)
 - ✅ Paired-device auth
-- ⚪ Auto-start after install (always-on runtime)
-- ⚪ Browser-based onboarding at install
+- ✅ Auto-start after install (macOS LaunchAgents; runtime + webapp)
+- ✅ Browser-based onboarding at install (/setup route)
 - ⚪ iOS mobile app for remote control
 - ⚪ Trust layer (reproducible builds, verify-app)
 - ⚪ Gini as MCP server
