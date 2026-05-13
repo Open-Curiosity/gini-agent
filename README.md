@@ -14,6 +14,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [Runtime Capabilities](docs/runtime-capabilities.md): current CLI/API capability map and verification commands
 - [Operations](docs/operations.md): install, start, stop, smoke, diagnostics, and cleanup
 - [Implementation Notes](docs/implementation-notes.md): source layout and module boundary rules
+- [Roadmap](ROADMAP.md): shipped surfaces and what's planned, with design intent
 
 ## Architecture In One Sentence
 
@@ -194,3 +195,27 @@ For disposable development or tests:
 ```bash
 GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --instance sandbox smoke
 ```
+
+## Roadmap
+
+- ✅ Local-first Bun gateway with authenticated `/api/*` and SSE
+- ✅ Next.js webapp with server-side BFF (browser never holds a token)
+- ✅ CLI with parallel instances and isolated state per worktree
+- ✅ Persistent chat, runs, plan steps, tasks, approvals, audit, traces
+- ✅ Approval-gated file, terminal, and code tools
+- ✅ Four-network memory with local embeddings and reranking
+- ✅ Trace-backed improvement proposals for memory, skills, and jobs
+- ✅ Provider support (Codex OAuth, OpenAI API key, OpenRouter records)
+- ✅ Paired-device auth and mobile bootstrap contracts
+- ✅ Instance-local snapshots and promotion proposal records
+- ✅ Hermes-inspired primitives and OpenClaw-inspired connectors
+- ⚪ Always-on runtime via LaunchAgent (start at login, restart on crash)
+- ⚪ Official native macOS client (open source, reproducible builds)
+- ⚪ Trust layer: `gini verify-app`, zero phone-home, network-policy lint
+- ⚪ Gini as MCP server consumed by Claude Desktop, Cursor, Zed, Warp
+- ⚪ Reference integrations: Raycast extension, Shortcuts.app, Hammerspoon
+- ⚪ Native push notifications for approvals and run completion
+- ⚪ Production relay for off-LAN access
+- ⚪ Native mobile client (paired-device contract already in place)
+
+This is the short preview. See the full roadmap in [ROADMAP.md](ROADMAP.md).
