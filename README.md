@@ -44,7 +44,7 @@ This repo includes a Bun TypeScript local runtime with:
 - paired-device auth and mobile bootstrap contracts for future mobile clients
 - instance-local snapshots and promotion proposal records
 - Hermes-inspired runtime primitives for memory, skills, jobs, search, providers, toolsets, subagents, MCP records, messaging records, and import inspection
-- OpenClaw-inspired connector and gateway structure
+- OpenClaw-inspired skill-as-package + managed identity credential plane
 
 ## Quick Start
 
@@ -105,7 +105,7 @@ bun run gini task submit "read docs and summarize the gateway"
 bun run gini approvals
 bun run gini memory list
 bun run gini job add heartbeat 60 "check runtime health"
-bun run gini connectors health
+bun run gini identities health
 bun run gini evidence
 bun run gini search "Hermes parity"
 bun run gini toolsets
