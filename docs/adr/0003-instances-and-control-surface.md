@@ -19,9 +19,26 @@ Multiple coding agents, worktrees, smoke tests, and personal runtimes need to co
 - Runtime API and web UI expose the instance.
 - Per-instance runtime and web ports are deterministic and collision-aware.
 
+## Implemented Since
+
+- **Per-instance LaunchAgents (macOS).** Each instance now writes two
+  user-domain LaunchAgents under `~/Library/LaunchAgents/`:
+  `ai.lilaclabs.gini.<instance>.gateway` (Bun runtime, runs
+  `src/server.ts` directly) and `ai.lilaclabs.gini.<instance>.web`
+  (Next.js dev server, gated on the gateway becoming healthy via a
+  shell shim). Both are supervised with
+  `KeepAlive.SuccessfulExit: false` so `gini stop` (clean exit 0) is
+  honored and crashes are respawned. Provider secrets from
+  `~/.gini/secrets.env` are merged into the gateway plist's
+  `EnvironmentVariables` only — the web BFF never invokes a provider
+  directly, so it gets none. Subcommands `gini autostart
+  enable|disable|status|kick` manage the pair; uninstall tears them
+  down and reports any launchctl failures. See `src/cli/autostart.ts`
+  and `src/cli/commands/autostart.ts`.
+
 ## Deferred
 
-- Separate LaunchAgents per instance.
+- Linux `systemd --user` parity for autostart (macOS-only in v1).
 - Fully automated production/sandbox promotion and rollback.
 - Remote multi-device relay and push paths.
 
