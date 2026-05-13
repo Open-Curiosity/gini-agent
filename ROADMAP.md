@@ -38,7 +38,7 @@ The current flow makes the user type `gini start` after install. The target expe
 The CLI install runs to completion, the runtime + webapp start, and the user's browser is opened to a first-run `/setup` route on the webapp. Provider picker happens in the UI instead of the terminal. The terminal `gini setup` flow remains for headless installs and power users.
 
 - ✅ **`/setup` route in the webapp.** Detects first-run state via `/api/setup/status`, renders a two-tab form (OpenAI API key, Codex `--login` instructions + Refresh), redirects to `/` on success.
-- ✅ **Auto-open the browser.** The installer waits for the webapp's healthz, then calls `open http://127.0.0.1:3000/setup` (works in both interactive and piped-curl runs on macOS).
+- ✅ **Auto-open the browser.** The installer waits for the webapp's healthz on the port read from `~/.gini/instances/<inst>/web.port` (hash-derived per instance, written by the autostart web shim at boot), then calls `open` on the resulting `/setup` URL. Works in both interactive and piped-curl runs on macOS.
 - ✅ **Proxy guard.** Next.js proxy.ts redirects unconfigured users to `/setup` from any other route. Configured users pass through.
 - ⚪ **First-task suggestion.** After provider setup, the onboarding ends with a "try this" example (e.g., "ask Gini to read its own architecture") so the user lands on a useful first interaction, not a blank chat.
 - ⚪ **Headless mode.** `--non-interactive` / `--yes` paths produce identical state without launching a browser, for CI and scripted installs.
