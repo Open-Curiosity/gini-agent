@@ -92,7 +92,7 @@ export default function SettingsPage() {
 
   return (
     <>
-      <PageHeader title="Settings" description="Providers, profiles, integrations, devices" />
+      <PageHeader title="Settings" description="Providers, profiles, toolsets, integrations, devices" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
         <ProviderCard catalog={catalog.data} />
 
