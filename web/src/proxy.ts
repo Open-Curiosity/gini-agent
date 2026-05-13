@@ -10,22 +10,22 @@
 // (gateway down, network glitch) let the request through — we'd rather
 // show a degraded UI than a redirect loop when the runtime is the
 // problem.
+//
+// MEDIUM-7: no cache. A previous version cached the status answer for 2s,
+// but that caused a race: when /setup posts a successful provider, the
+// page does router.replace('/') *immediately* — within the cache window.
+// The proxy on `/` then read stale `providerConfigured:false` and
+// bounced the user back to /setup. The cost of always hitting the
+// gateway: a single sub-millisecond local HTTP call per gated request.
+// That's cheap enough — the runtime is on the same machine and the call
+// hits a tiny in-memory check (providerHealth + config). The matcher
+// already excludes /_next/static and /_next/image so static asset
+// loading isn't impacted.
 
 import { NextResponse, type NextRequest } from "next/server";
 import { runtimeToken, runtimeUrl } from "@/lib/runtime";
 
-// Cache the status answer briefly so /api/runtime/* proxying isn't
-// followed by a separate roundtrip on every navigation. 2s matches the
-// runtime.ts file cache so the BFF and proxy stay in step.
-let cachedAt = 0;
-let cachedConfigured: boolean | null = null;
-const cacheTtlMs = 2000;
-
 async function isProviderConfigured(): Promise<boolean | null> {
-  const now = Date.now();
-  if (cachedConfigured !== null && now - cachedAt < cacheTtlMs) {
-    return cachedConfigured;
-  }
   const url = `${runtimeUrl()}/api/setup/status`;
   try {
     const response = await fetch(url, {
@@ -38,10 +38,7 @@ async function isProviderConfigured(): Promise<boolean | null> {
       return null;
     }
     const data = await response.json() as { providerConfigured?: unknown };
-    const configured = data.providerConfigured === true;
-    cachedAt = now;
-    cachedConfigured = configured;
-    return configured;
+    return data.providerConfigured === true;
   } catch {
     // Network error / gateway down — same logic as 5xx: don't redirect.
     return null;
