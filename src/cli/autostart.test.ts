@@ -195,7 +195,7 @@ describe("resolveLaunchSpec", () => {
     }
   });
 
-  test("merges secrets.env into plist EnvironmentVariables (OPENAI_API_KEY)", () => {
+  test("merges secrets.env into gateway plist EnvironmentVariables (OPENAI_API_KEY)", () => {
     const secretsBody = [
       "# comment",
       "export OPENAI_API_KEY='sk-test-12345'",
@@ -225,6 +225,32 @@ describe("resolveLaunchSpec", () => {
       readSecretsFile: () => null
     });
     expect(spec.environment.OPENAI_API_KEY).toBeUndefined();
+  });
+
+  // The Next.js BFF only proxies to the gateway over /api/*; it never
+  // invokes a provider directly. Provider secrets in the web plist's
+  // EnvironmentVariables would widen the trust surface for zero gain,
+  // so they belong in the gateway plist only.
+  test("does NOT merge secrets.env into web plist EnvironmentVariables", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const secretsBody = [
+      "export OPENAI_API_KEY='sk-test-web-isolation'",
+      "BARE_KEY=bare-value"
+    ].join("\n");
+    const pair = resolveLaunchSpecPair({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      readSecretsFile: () => secretsBody
+    });
+    // Gateway gets the secrets.
+    expect(pair.gateway.environment.OPENAI_API_KEY).toBe("sk-test-web-isolation");
+    expect(pair.gateway.environment.BARE_KEY).toBe("bare-value");
+    // Web must not.
+    expect(pair.web.environment.OPENAI_API_KEY).toBeUndefined();
+    expect(pair.web.environment.BARE_KEY).toBeUndefined();
   });
 
 });

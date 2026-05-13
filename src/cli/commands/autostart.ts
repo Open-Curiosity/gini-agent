@@ -164,7 +164,7 @@ function usage(): Record<string, unknown> {
       "PID supervision only — a wedged-but-alive runtime is not detected here. A health watchdog hitting /api/healthz is a follow-up.",
       "`gini stop` is honored: SuccessfulExit:false means clean exits do NOT respawn. The web shim execs `bun run dev`, which exits 0 on SIGTERM; the same KeepAlive contract applies.",
       "macOS 26 (Tahoe): launchd often defers auto-respawn after SIGKILL indefinitely (`pended nondemand spawn = inefficient`). Use `gini autostart kick` to force a respawn when this happens; RunAtLoad still fires at login.",
-      "Secrets in ~/.gini/secrets.env are merged into both plists' EnvironmentVariables at enable time. If you change a key (e.g. `gini provider set`), re-run `autostart enable` to refresh the plists for future respawns.",
+      "Secrets in ~/.gini/secrets.env are merged into the gateway plist's EnvironmentVariables only (the web plist is the BFF and never talks to providers directly). If you change a key (e.g. `gini provider set`), re-run `autostart enable` to refresh the plist for future respawns.",
       "`--test-root <dir>` is an E2E-test escape hatch: scoped state/log roots are embedded in the plist. Plain GINI_STATE_ROOT in your shell does NOT leak into a permanent plist."
     ]
   };

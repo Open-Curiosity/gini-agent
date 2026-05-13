@@ -224,13 +224,20 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   if (options.testRoot?.stateRoot) baseEnv.GINI_STATE_ROOT = options.testRoot.stateRoot;
   if (options.testRoot?.logRoot) baseEnv.GINI_LOG_ROOT = options.testRoot.logRoot;
 
-  // Merge ~/.gini/secrets.env into the plist environment. The installed
-  // `gini` wrapper sources this file at the top of every invocation, but
-  // the autostart plist execs `bun run src/server.ts` directly (no shell
-  // sourcing) — so without this merge the launchd-spawned runtime has no
-  // OPENAI_API_KEY in its env and the provider throws. We read the file
-  // every time `autostart enable` is called, so `gini provider set` →
-  // re-enable picks up new keys automatically.
+  // Merge ~/.gini/secrets.env into the GATEWAY plist environment only.
+  // The installed `gini` wrapper sources this file at the top of every
+  // invocation, but the autostart plist execs `bun run src/server.ts`
+  // directly (no shell sourcing) — so without this merge the launchd-
+  // spawned runtime has no OPENAI_API_KEY in its env and the provider
+  // throws. We read the file every time `autostart enable` is called,
+  // so `gini provider set` → re-enable picks up new keys automatically.
+  //
+  // The WEB plist deliberately does NOT receive these secrets. The
+  // Next.js BFF only proxies to the gateway over /api/*; it never
+  // invokes a provider directly. Putting provider keys in the web
+  // process's env would widen the trust surface for zero gain — any
+  // future client-side compromise or accidental log statement in the
+  // web layer could expose a key the BFF has no business holding.
   const secretsBody = options.readSecretsFile
     ? options.readSecretsFile()
     : readSecretsEnvFile(home);
@@ -256,9 +263,11 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   // after every login. The shim's `exec bun run dev …` collapses the
   // shell into Next.js so the launchd-tracked PID is the dev server,
   // not the wrapper.
+  //
+  // Web env intentionally omits secretsEnv (see comment above the
+  // gateway env block) — the BFF doesn't talk to providers.
   const webEnv: Record<string, string> = {
     ...baseEnv,
-    ...secretsEnv,
     GINI_INSTANCE: options.instance,
     // The `bun run dev` invocation otherwise defaults to Next.js's 3000.
     // For instances other than `main`/`dev`, that would collide with
