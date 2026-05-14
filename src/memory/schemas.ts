@@ -5,7 +5,8 @@
 // OBSERVATION_SCHEMA). Each `parse` throws on shape error so callers can
 // retry-or-give-up uniformly.
 //
-// Adapted from vectorize-io/hindsight (MIT) — same field names + literals.
+// Field names and literals intentionally match the structured memory contracts
+// used by the retain/reflect pipelines.
 
 import type { StructuredValidator } from "../provider";
 import type { EntityType } from "../state";

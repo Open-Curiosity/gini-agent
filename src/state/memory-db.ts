@@ -1,10 +1,9 @@
-// Hindsight phase 1 — per-instance SQLite memory store (schema + scaffolding only).
+// Hindsight-style phase 1 — per-instance SQLite memory store (schema + scaffolding only).
 //
-// Adapted from vectorize-io/hindsight (MIT). See https://github.com/vectorize-io/hindsight
-// The upstream service uses Postgres + pgvector; we re-implement the same
-// four-network shape on top of bun:sqlite so Gini stays a single Bun binary
-// with no external services. Schema follows the paper (Eq. 1, §3.1) and
-// borrows the link-type and entity-type vocabulary from upstream.
+// Gini implements the public hindsight memory model locally: four networks,
+// link/entity vocabulary, and the paper's schema shape (Eq. 1, §3.1). The
+// reference service uses Postgres + pgvector; this module keeps the design on
+// bun:sqlite so Gini stays a single Bun binary with no external services.
 //
 // This module is additive in phase 1. The legacy in-state `MemoryRecord`
 // store remains the source of truth for user-facing memory behavior. Phases

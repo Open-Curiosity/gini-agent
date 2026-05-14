@@ -15,8 +15,9 @@
 // fact, OR whose embedding is sufficiently close (cosine ≥ 0.6). Capped at
 // 8 candidates per fact to bound LLM cost.
 //
-// Adapted from vectorize-io/hindsight (MIT). The candidate-set heuristic
-// matches upstream; thresholds tuned per the brief.
+// This is Gini's local implementation of the reinforcement pass. The
+// candidate-set heuristic keeps LLM cost bounded while preserving the paper's
+// entity/semantic matching shape; thresholds are tuned per the brief.
 
 import type { RuntimeConfig } from "../types";
 import type {
