@@ -41,7 +41,7 @@ export function TaskList({
     <Tabs value={filter} onValueChange={onFilterChange}>
       <TabsList className="w-full">
         {filters.map((f) => (
-          <TabsTrigger key={f.key} value={f.key} className="text-xs">
+          <TabsTrigger key={f.key} value={f.key} suppressHydrationWarning className="text-xs">
             {f.label}
           </TabsTrigger>
         ))}
