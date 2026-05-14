@@ -46,7 +46,7 @@ import {
   releaseApproval
 } from "./execution/approval-execution";
 import { syncSubagentFromTask } from "./capabilities/subagents";
-import { resolveActiveSkillsEnv } from "./integrations/identities";
+import { resolveActiveSkillsEnv } from "./integrations/connectors";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
 // the cycle that runs through submitTask. The finalizer flips the linked
 // JobRunRecord from "running" to a terminal status when a Task with a

@@ -28,7 +28,7 @@ import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
 import { createScheduledJob } from "../jobs";
-import { isSkillActive } from "../integrations/identities";
+import { isSkillActive } from "../integrations/connectors";
 import { riskForAction } from "./tool-risk";
 import {
   browserBack,
@@ -436,18 +436,23 @@ async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record
     throw new Error(`Skill ${name} is not trusted (current status: ${skill.status}). Ask the user to trust it via /skills before using.`);
   }
   if (!isSkillActive(state, skill)) {
-    const missing = (skill.requiredIdentities ?? []).map((entry) => entry.kind).join(", ");
-    throw new Error(`Skill ${name} is inactive: required identities not healthy (${missing || "unknown"}). Ask the user to add or repair the identity via /connections.`);
+    const missing = (skill.requiredConnectors ?? []).map((entry) => entry.provider).join(", ");
+    throw new Error(`Skill ${name} is inactive: required connectors not healthy (${missing || "unknown"}). Ask the user to add or repair the connector via /connections.`);
   }
   appendTrace(config.instance, taskId, {
     type: "tool",
     message: "Skill body read (chat-task)",
-    data: { name: skill.name, version: skill.version, bytes: skill.body.length }
+    data: { name: skill.name, version: skill.version, bytes: skill.body.length, allowedTools: skill.allowedTools }
   });
   await recordLowRiskAudit(config, taskId, "skill.read", skill.id, {
     name: skill.name,
     version: skill.version,
-    bytes: skill.body.length
+    bytes: skill.body.length,
+    // ADR 0012: capture the declared allowed-tools at read time so the audit
+    // trail records the contract the agent agreed to follow when invoking
+    // this skill. Not enforced at the tool dispatcher yet — see ADR 0012
+    // "Deferred" for the enforcement plan.
+    allowedTools: skill.allowedTools
   });
   return skill.body || "(skill body is empty)";
 }

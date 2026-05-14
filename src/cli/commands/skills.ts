@@ -1,7 +1,10 @@
+import { readFileSync, existsSync, statSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import type { CliContext } from "../context";
 import { restAfter } from "../args";
 import { api } from "../api";
 import { print } from "../output";
+import { parseSkillFile, validateParsedSkill } from "../../capabilities/skill-loader";
 
 export async function skill(ctx: CliContext): Promise<void> {
   const { config, cliArgs } = ctx;
@@ -17,7 +20,29 @@ export async function skill(ctx: CliContext): Promise<void> {
     return;
   }
   if (sub === "validate") {
-    print(await api(config, "/api/skills/validate"));
+    // Two modes:
+    //   gini skill validate           — validate every loaded skill via the API
+    //   gini skill validate <path>    — validate a SKILL.md file or skill dir
+    //                                   without hitting the runtime
+    const rest = restAfter(cliArgs, sub);
+    if (rest.length === 0) {
+      print(await api(config, "/api/skills/validate"));
+      return;
+    }
+    const results: Array<{ path: string; ok: boolean; issues: string[] }> = [];
+    for (const arg of rest) {
+      const target = resolveSkillMd(arg);
+      const parentDir = dirname(target);
+      const parentDirName = basename(parentDir);
+      const text = readFileSync(target, "utf8");
+      const parsed = parseSkillFile(text, target);
+      const issues = validateParsedSkill(parsed, { manifestPath: target, parentDirName });
+      results.push({ path: target, ok: issues.length === 0, issues });
+    }
+    print(results);
+    if (results.some((r) => !r.ok)) {
+      process.exit(1);
+    }
     return;
   }
   if (sub === "show" || sub === "test" || sub === "trust" || sub === "disable" || sub === "rollback") {
@@ -32,4 +57,23 @@ export async function skill(ctx: CliContext): Promise<void> {
     return;
   }
   print(await api(config, "/api/skills"));
+}
+
+// Resolve a CLI argument to a SKILL.md file: accept either a SKILL.md path
+// directly or a skill directory whose immediate child is SKILL.md. The
+// latter matches the common "validate this skill folder" mental model.
+function resolveSkillMd(arg: string): string {
+  const absolute = resolve(arg);
+  if (!existsSync(absolute)) {
+    throw new Error(`Path does not exist: ${arg}`);
+  }
+  const st = statSync(absolute);
+  if (st.isDirectory()) {
+    const nested = join(absolute, "SKILL.md");
+    if (!existsSync(nested)) {
+      throw new Error(`No SKILL.md found under ${arg}`);
+    }
+    return nested;
+  }
+  return absolute;
 }
