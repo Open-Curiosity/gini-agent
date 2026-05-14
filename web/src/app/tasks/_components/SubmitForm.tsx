@@ -26,6 +26,10 @@ export function SubmitForm({
           value={input}
           onChange={(event) => onChange(event.target.value)}
           placeholder="Ask Gini to do something"
+          autoComplete="off"
+          data-form-type="other"
+          data-lpignore="true"
+          data-1p-ignore="true"
           className="min-h-24"
         />
         <Button
