@@ -1,11 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -73,7 +73,7 @@ export default function ConnectionsPage() {
             <DialogTrigger asChild>
               <Button size="sm">Add identity</Button>
             </DialogTrigger>
-            <AddIdentityDialog onSubmit={(body) => create.mutate(body)} pending={create.isPending} />
+            <AddIdentityDialog open={open} onSubmit={(body) => create.mutate(body)} pending={create.isPending} />
           </Dialog>
         }
       />
@@ -136,8 +136,13 @@ export default function ConnectionsPage() {
                       last health {identity.lastHealthAt ? new Date(identity.lastHealthAt).toLocaleString() : "never"}
                     </p>
                     <div className="flex gap-2">
-                      <Button size="sm" variant="outline" disabled={health.isPending} onClick={() => health.mutate(identity.id)}>
-                        Check health
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={health.isPending}
+                        onClick={() => health.mutate(identity.id)}
+                      >
+                        {health.isPending && health.variables === identity.id ? "Checking…" : "Check health"}
                       </Button>
                       <Button
                         size="sm"
@@ -176,9 +181,11 @@ function groupDependentsByKind(skills: SkillRecord[]): Map<string, SkillRecord[]
 }
 
 function AddIdentityDialog({
+  open,
   onSubmit,
   pending
 }: {
+  open: boolean;
   onSubmit: (body: CreateBody) => void;
   pending: boolean;
 }) {
@@ -187,6 +194,16 @@ function AddIdentityDialog({
   const [scopes, setScopes] = useState("");
   const [token, setToken] = useState("");
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setKind("demo");
+      setName("");
+      setScopes("");
+      setToken("");
+      setError(null);
+    }
+  }, [open]);
 
   const submit = () => {
     setError(null);
@@ -212,6 +229,7 @@ function AddIdentityDialog({
     <DialogContent>
       <DialogHeader>
         <DialogTitle>Add identity</DialogTitle>
+        <DialogDescription>Connect a new identity for skills to use.</DialogDescription>
       </DialogHeader>
       <div className="space-y-3">
         <div className="space-y-1">
