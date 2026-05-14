@@ -26,7 +26,6 @@ export function SubmitForm({
           value={input}
           onChange={(event) => onChange(event.target.value)}
           placeholder="Ask Gini to do something"
-          suppressHydrationWarning
           autoComplete="off"
           data-form-type="other"
           data-lpignore="true"
@@ -36,7 +35,9 @@ export function SubmitForm({
         <Button
           disabled={pending || !input.trim()}
           onClick={onSubmit}
-          suppressHydrationWarning
+          data-form-type="other"
+          data-lpignore="true"
+          data-1p-ignore="true"
           className="w-full"
         >
           {pending ? "Submitting…" : "Submit task"}
