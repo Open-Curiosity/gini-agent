@@ -1,4 +1,4 @@
-# ADR 0003: Instances And Control Surface
+# ADR: Instances And Control Surface
 
 ## Decision
 
