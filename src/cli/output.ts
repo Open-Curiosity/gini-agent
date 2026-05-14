@@ -63,19 +63,20 @@ export function improvementPayload(kind: string, title: string, content: string)
   if (kind === "job") {
     return { name: title, prompt: content, intervalSeconds: 3600 };
   }
-  return { content, scope: "project", confidence: 0.75 };
+  return { content, confidence: 0.75 };
 }
 
 export function help(): void {
   console.log(`Gini CLI
 
 Usage:
-  bun run gini install [--instance dev]
-  bun run gini start|stop|status|doctor|reset [--instance dev] [--port 7337]
-  bun run gini run [--instance dev] [--no-web]
+  bun run gini install [--instance <name>]
+  bun run gini start|stop|status|doctor|reset [--instance <name>] [--port <port>]
+  bun run gini run [--instance <name>] [--no-web]
   bun run gini uninstall [--instance <name>] [--yes] [--purge]
   bun run gini update
   bun run gini setup [--force] [--yes]
+  bun run gini autostart enable|disable|status|kick [--instance dev]
   bun run gini task submit <prompt>
   bun run gini task list
   bun run gini task show <task-id>
@@ -93,13 +94,12 @@ Usage:
   bun run gini mobile bootstrap
   bun run gini search <query>
   bun run gini toolsets list|enable|disable
+  bun run gini browser status|connect [--url WSURL]|disconnect|wipe-profile [--yes]
   bun run gini subagents list|spawn
   bun run gini mcp list|add|health|invoke|disable
   bun run gini messaging list|add|health|disable
-  bun run gini import inspect hermes|openclaw <path>
-  bun run gini profiles list|create|use
-  bun run gini parity hermes
-  bun run gini readiness v1
+  bun run gini import inspect openclaw <path>
+  bun run gini agents list|create|use
   bun run gini relays list|add|health
   bun run gini notifications list|queue|send|ack
   bun run gini promotions list|propose|approve|reject
@@ -112,10 +112,19 @@ Usage:
   bun run gini smoke
 
 Process lifecycle:
-  gini start  - daemon mode; instance keeps running after the terminal closes.
-                Use this for a persistent personal agent on your machine.
-  gini run    - foreground mode; instance dies when this terminal exits or
-                you Ctrl-C. Use this for coding-agent worktrees and CI.
+  gini start      - daemon mode; instance keeps running after the terminal
+                    closes. Use this for a persistent personal agent on
+                    your machine.
+  gini run        - foreground mode; instance dies when this terminal
+                    exits or you Ctrl-C. Use this for coding-agent
+                    worktrees and CI.
+  gini autostart  - macOS LaunchAgent integration. \`enable\` registers a
+                    per-instance plist so the runtime starts at login.
+                    \`gini stop\` is honored (clean exits don't respawn).
+                    On macOS 26+, launchd auto-respawn after SIGKILL is
+                    unreliable — use \`gini autostart kick\` to force a
+                    respawn when the runtime crashed. v1 supervises by PID
+                    only; a wedged-but-alive runtime isn't detected yet.
 
 Global options:
   --instance <name>        Select a persistent instance. Smoke uses an ephemeral instance when omitted.

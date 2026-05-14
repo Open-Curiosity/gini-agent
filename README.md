@@ -14,6 +14,20 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [Runtime Capabilities](docs/runtime-capabilities.md): current CLI/API capability map and verification commands
 - [Operations](docs/operations.md): install, start, stop, smoke, diagnostics, and cleanup
 - [Implementation Notes](docs/implementation-notes.md): source layout and module boundary rules
+- [Roadmap](ROADMAP.md): shipped surfaces and what's planned, with design intent
+
+## Architecture decisions
+
+- [ADR 0001 — Local Runtime Architecture](docs/adr/0001-local-runtime-architecture.md)
+- [ADR 0002 — Minimal Trust Substrate](docs/adr/0002-trust-substrate.md)
+- [ADR 0003 — Instances And Control Surface](docs/adr/0003-instances-and-control-surface.md)
+- [ADR 0004 — Agent Loop With Native Tool Calling](docs/adr/0004-agent-loop-tool-calling.md)
+- [ADR 0005 — Subagent Delegation](docs/adr/0005-subagent-delegation.md)
+- [ADR 0006 — Agents Replace Profiles And Drive Runtime Behavior](docs/adr/0006-agents-replace-profiles.md)
+- [ADR 0006 — dangerouslyAutoApprove](docs/adr/0006-dangerously-auto-approve.md)
+- [ADR 0007 — Per-Agent Memory Isolation](docs/adr/0007-agent-memory-isolation.md)
+- [ADR 0008 — Identity Secret Storage](docs/adr/0008-identity-secret-storage.md)
+- [ADR 0009 — Skills As Packages, Identities As Credentials](docs/adr/0009-skills-and-identities.md)
 
 ## Architecture In One Sentence
 
@@ -43,17 +57,27 @@ This repo includes a Bun TypeScript local runtime with:
 - trace-backed improvement proposals for memory, skill, and job changes
 - paired-device auth and mobile bootstrap contracts for future mobile clients
 - instance-local snapshots and promotion proposal records
-- Hermes-inspired runtime primitives for memory, skills, jobs, search, providers, toolsets, subagents, MCP records, messaging records, and import inspection
-- OpenClaw-inspired skill-as-package + managed identity credential plane
+- Local-first runtime primitives for memory, skills, jobs, search, providers, toolsets, subagents, MCP records, messaging records, and import inspection
+- Skill-as-package + managed identity credential plane
 
 ## Quick Start
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
-gini start
 ```
 
-The installer walks you through provider setup (OpenAI API key or existing `codex --login` auth). `gini start` prints the runtime and web URLs.
+On macOS the installer enables autostart (per-user LaunchAgents for the runtime and webapp), waits for the webapp to come up, and opens the `/setup` page in your browser. Pick a provider in the browser form (OpenAI API key or existing `codex --login` auth) and you land on the running app. The runtime stays alive across reboots and crashes until you explicitly run `gini stop` or `gini autostart disable`.
+
+If the browser doesn't open automatically (or you want to navigate manually), run `gini status` to print the actual web URL — the port is hash-derived per instance, so it's almost never `:3000` for instances other than `dev`. The installer also prints the URL right before opening the browser.
+
+Caveat on macOS 26 (Tahoe): after a SIGKILL, launchd sometimes refuses to auto-respawn (`pended nondemand spawn = inefficient`). Run `gini autostart kick` to force a respawn when that happens; RunAtLoad still fires at login.
+
+If you opted out of autostart (`--no-autostart`) or you're on Linux (autostart is macOS-only in v1), run `gini setup` then `gini start` to launch the runtime by hand.
+
+After install, the URLs are stable:
+
+- web: `http://127.0.0.1:7777`
+- runtime: `http://127.0.0.1:7778`
 
 ### Update
 
@@ -73,12 +97,9 @@ bun run gini install
 bun run gini start
 ```
 
-When you run the CLI from a repo clone, the default instance is `dev`. The installed `gini` command from `curl | bash` defaults to `main` instead so developer state and end-user state stay separate. For the `dev` instance the URLs default to:
+When you run `bun run gini` from a repo clone, the instance is auto-derived from the repo directory basename (`gini-agent`, `boston`, `rabat`, etc.) so each worktree gets isolated state without typing `--instance` every time. The installed `gini` command from `curl | bash` always uses the `default` instance, so developer worktrees and end-user state never collide. Per-instance runtime and web ports are deterministic hashes within a 100-port window starting at 7337 (runtime) / 3000 (web); `gini status` prints the actual URLs.
 
-- runtime: `http://127.0.0.1:7337`
-- web: `http://127.0.0.1:3000`
-
-Run a foreground instance for coding-agent worktrees:
+Run a foreground instance with an explicit name:
 
 ```bash
 bun run gini run --instance feature-x
@@ -107,16 +128,14 @@ bun run gini memory list
 bun run gini job add heartbeat 60 "check runtime health"
 bun run gini identities health
 bun run gini evidence
-bun run gini search "Hermes parity"
+bun run gini search "runtime memory"
 bun run gini toolsets
 bun run gini subagent spawn reviewer "review recent traces"
 bun run gini mcp add demo echo ok
 bun run gini messaging add local demo local
-bun run gini import inspect hermes ~/.hermes
+bun run gini import inspect openclaw ~/.openclaw
 bun run gini snapshot create "before trying candidate"
 bun run gini provider show
-bun run gini parity hermes
-bun run gini readiness v1
 ```
 
 ## Providers
@@ -127,7 +146,7 @@ Use Codex OAuth:
 
 ```bash
 codex --login
-bun run gini provider set codex gpt-5.4
+bun run gini provider set codex gpt-5.5
 bun run gini doctor
 ```
 
@@ -194,3 +213,25 @@ For disposable development or tests:
 ```bash
 GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --instance sandbox smoke
 ```
+
+## Roadmap
+
+- ✅ Local Bun runtime gateway
+- ✅ Next.js webapp with BFF
+- ✅ CLI with parallel instances
+- ✅ Persistent chat, runs, approvals, audit, traces
+- ✅ Approval-gated tools (file, terminal, code)
+- ✅ Local memory with embeddings and reranking
+- ✅ Trace-backed improvement proposals
+- ✅ Provider support (Codex OAuth, OpenAI)
+- ✅ Paired-device auth
+- ✅ Auto-start after install (macOS LaunchAgents; runtime + webapp)
+- ✅ Browser-based onboarding at install (/setup route)
+- ⚪ iOS mobile app for remote control
+- ⚪ Trust layer (reproducible builds, verify-app)
+- ⚪ Gini as MCP server
+- ⚪ Task self-learning and iteration loop
+- ⚪ Native macOS app (Tauri shell, later)
+
+
+This is the short preview. See the full roadmap in [ROADMAP.md](ROADMAP.md).

@@ -1,6 +1,6 @@
 # Runtime Capabilities
 
-This document maps the current runtime surfaces to the product capabilities Gini is expected to provide. The CLI command is still named `gini readiness v1` for compatibility, but the product plan is now tracked by capability area rather than version labels.
+This document maps the current runtime surfaces to the product capabilities Gini is expected to provide.
 
 ## Verification
 
@@ -14,15 +14,11 @@ bun run gini smoke
 
 The smoke output should include:
 
-- `parityOk: true`
-- `readinessOk: true`
 - an `evidencePath`
 
 For an installed instance:
 
 ```sh
-bun run gini parity hermes
-bun run gini readiness v1
 bun run gini evidence
 ```
 
@@ -40,14 +36,15 @@ bun run gini evidence
 | Search | `gini search <query>`, `/api/search` with task, trace, memory, skill, and audit citations |
 | Jobs | `gini jobs list/add/run/pause/resume/remove/runs/replay`, prompt jobs, and script jobs |
 | File tools | task inputs: `read`, `list`, `find`, `write`, `patch` |
-| Terminal/code tools | task inputs: `shell`, `code js|python :: ...`, approval gated |
+| Terminal/code tools | task inputs: `shell`, `code js|python :: ...`, approval gated (see `dangerouslyAutoApprove` in `docs/operations.md` and ADR 0006 for the opt-in global bypass) |
+| Approval settings | `GET/PATCH /api/settings/auto-approve` for `autoApproveCommands` (shell-glob allowlist for `terminal_exec`) and `dangerouslyAutoApprove` (global bypass for every approval-gated tool) |
 | Toolsets | `gini toolsets list/enable/disable`, `/api/toolsets` |
 | Providers | `gini provider show/catalog/set`, Codex OAuth, OpenAI, OpenRouter-compatible records, echo |
 | Delegation records | `gini subagents list/spawn`, `/api/subagents` |
 | MCP/plugin records | `gini mcp list/add/health/invoke/disable` |
 | Messaging bridge records | `gini messaging list/add/health/receive/send/messages/disable`; inbound messages create tasks |
-| Profiles/config | `gini profiles list/create/use`, instance-aware config |
-| Import inspection | `gini import inspect hermes|openclaw <path>`, read-only by default |
+| Agents/config | `gini agents list/create/use/delete`, instance-aware config |
+| Import inspection | `gini import inspect openclaw <path>`, read-only by default |
 | Self-improvement proposals | `gini improvements propose/approve/reject`, trace-backed application |
 | Observability | `gini trace`, `gini audit`, `gini events`, `/api/events/stream`, `gini evidence` |
 | Web control plane | Next.js app at `web/`, launched by `gini start` or `gini run` unless `--no-web` is set |
@@ -62,8 +59,9 @@ Stable local clients use the gateway API:
 - `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`
 - `/api/skills`, `/api/jobs`, `/api/identities`, `/api/toolsets`
 - `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
-- `/api/messaging`, `/api/mcp`, `/api/subagents`
+- `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
 - `/api/audit`, `/api/events`, `/api/events/stream`
+- `/api/settings/auto-approve`
 - `/api/parity/hermes`, `/api/readiness/v1`
 
 All routes require `Authorization: Bearer <token>` except health checks and the limited SSE token compatibility path.

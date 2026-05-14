@@ -1,4 +1,4 @@
-# ADR 0006: Identity Secret Storage
+# ADR 0008: Identity Secret Storage
 
 ## Decision
 

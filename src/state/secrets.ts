@@ -1,4 +1,4 @@
-// Encrypted file-backed identity secret storage (ADR 0006).
+// Encrypted file-backed identity secret storage (ADR 0008).
 //
 // Each instance owns a 32-byte AES-256-GCM key at
 // `<instance>/secrets/.key` (mode 0600). Individual secrets live as

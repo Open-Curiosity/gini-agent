@@ -1,4 +1,4 @@
-# ADR 0007: Skills As Packages, Identities As Credentials
+# ADR 0009: Skills As Packages, Identities As Credentials
 
 ## Decision
 
@@ -33,7 +33,7 @@ Cardinality forces this separation. A single Google identity powers Gmail, Calen
 
 ### Identity record
 
-- `ConnectorRecord` is renamed to `IdentityRecord`. Field-level shape is preserved where it makes sense; secret storage follows ADR 0006.
+- `ConnectorRecord` is renamed to `IdentityRecord`. Field-level shape is preserved where it makes sense; secret storage follows ADR 0008.
 - `RuntimeState.connectors` is renamed to `RuntimeState.identities`. No back-compat shim — state files are rewritten on first load if needed.
 - HTTP route prefix is `/api/identities`. The old `/api/connectors` prefix is removed.
 - CLI command is `gini identity ...`. The old `gini connector ...` command is removed.
@@ -62,7 +62,7 @@ Cardinality forces this separation. A single Google identity powers Gmail, Calen
 - Merging Skill and Identity into one record. Breaks N:M cardinality (one identity serves many skills, one skill can need many identities) and conflates curated bundled content with user-specific runtime data on differing lifecycles.
 - An "Integration" wrapper above Skill. Hermes and OpenClaw demonstrate that the skill *is* the integration; an additional layer adds vocabulary without changing semantics.
 - Punting credentials to environment variables (Hermes/OpenClaw approach). Incompatible with the screenless-Mac model where the user has no shell access to the host.
-- Reintroducing macOS Keychain as a secret backend (see ADR 0006).
+- Reintroducing macOS Keychain as a secret backend (see ADR 0008).
 
 ## Deferred
 
