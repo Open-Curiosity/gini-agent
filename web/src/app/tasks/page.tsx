@@ -80,12 +80,7 @@ export default function TasksPage() {
         />
       </div>
       <div className="flex flex-1 flex-col gap-4 overflow-hidden p-4 md:flex-row md:p-6">
-        <div
-          data-form-type="other"
-          data-lpignore="true"
-          data-1p-ignore="true"
-          className="flex w-full shrink-0 flex-col gap-4 md:w-[420px]"
-        >
+        <div className="flex w-full shrink-0 flex-col gap-4 md:w-[420px]">
           <SubmitForm
             input={input}
             pending={submit.isPending}
