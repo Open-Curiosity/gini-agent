@@ -28,7 +28,9 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [ADR 0007 — Per-Agent Memory Isolation](docs/adr/0007-agent-memory-isolation.md)
 - [ADR 0008 — Connector Secret Storage](docs/adr/0008-connector-secret-storage.md)
 - [ADR 0009 — Skills As Packages, Connectors As Credentials](docs/adr/0009-skills-and-connectors.md)
-- [ADR 0010 — Connector + Provider vocabulary, spec compliance, meta-skills](docs/adr/0010-connector-provider-spec-compliance.md)
+- [ADR 0010 — Approval Execution Abort Protocol](docs/adr/0010-approval-execution-abort.md)
+- [ADR 0010 — Runtime Update Surface And Automatic Restart](docs/adr/0010-runtime-update-surface.md)
+- [ADR 0012 — Connector + Provider Vocabulary, Spec Compliance, And Meta-Skills](docs/adr/0012-connector-provider-spec-compliance.md)
 
 ## Architecture In One Sentence
 
@@ -86,7 +88,9 @@ After install, the URLs are stable:
 gini update
 ```
 
-Pulls the latest source into `~/.gini/runtime`, reinstalls dependencies, and leaves your state under `~/.gini/instances/` and the model cache at `~/.gini/models/` untouched. If a runtime is currently running, restart it (`gini stop && gini start`) to pick up the new code.
+Pulls the latest source into `~/.gini/runtime`, reinstalls dependencies, and leaves your state under `~/.gini/instances/` and the model cache at `~/.gini/models/` untouched. If a runtime is currently running, Gini restarts it automatically so the new code is picked up without a manual `gini stop && gini start`.
+
+When the web app is running from the installer-managed runtime, it surfaces the current package/git version in the sidebar and exposes the same update action through its Update button.
 
 If you are working from a repo clone, use `git pull && bun install` instead — `gini update` only operates on the installer-managed runtime at `~/.gini/runtime`.
 

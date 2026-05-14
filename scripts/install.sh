@@ -212,7 +212,7 @@ if [ -f "$HOME/.gini/secrets.env" ]; then
 fi
 export GINI_INSTANCE="${GINI_INSTANCE:-default}"
 cd "$HOME/.gini/runtime"
-exec bun run gini "$@"
+exec bun --silent run gini "$@"
 WRAPPER
   chmod +x "$WRAPPER_PATH"
   step "Wrapper ready"

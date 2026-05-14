@@ -16,8 +16,9 @@
 // retain handler) wrap with try/catch so a retain failure never blocks the
 // originating task.
 //
-// Adapted from vectorize-io/hindsight (MIT). Tuning constants and link math
-// follow the upstream repo where the paper underspecifies.
+// This is Gini's local retain implementation for the hindsight memory model.
+// Tuning constants and link math are kept explicit where the paper leaves
+// implementation choices open.
 
 import type { RuntimeConfig } from "../types";
 import type {

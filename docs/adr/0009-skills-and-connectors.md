@@ -1,13 +1,13 @@
 # ADR 0009: Skills As Packages, Connectors As Credentials
 
-> Renamed from "Skills As Packages, Identities As Credentials" per ADR 0010. The decision is unchanged; only the vocabulary updated.
+> Renamed from "Skills As Packages, Identities As Credentials" per ADR 0012. The decision is unchanged; only the vocabulary updated.
 
 ## Decision
 
 Gini has two top-level user-facing primitives for integrating with the outside world:
 
 - **Skill** — the package. A folder under `skills/` (bundled) or `~/.gini/instances/<inst>/skills/` (user-installed) containing `SKILL.md` (markdown for the agent), optional helper scripts, and Anthropic Agent Skills frontmatter declaring requirements. This is the unit a user thinks of as "the Linear thing my agent can do." Already present in Gini.
-- **Connector** — the managed credential record. Stores secrets, scopes, and health for an external account (e.g. Linear API key, Google OAuth tokens) or local permission grant (e.g. macOS TCC for Notes). Renamed from "Identity" per ADR 0010.
+- **Connector** — the managed credential record. Stores secrets, scopes, and health for an external account (e.g. Linear API key, Google OAuth tokens) or local permission grant (e.g. macOS TCC for Notes). Renamed from "Identity" per ADR 0012.
 
 A skill is **active** if and only if every connector it declares as required exists and is healthy. Activation is automatic; deactivation is automatic when a connector becomes unhealthy. The agent loop never sees inactive skills.
 
@@ -76,7 +76,7 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 ## Consequences For Coding Agents
 
 - Use `ConnectorRecord`, `/api/connectors`, and `gini connector` everywhere. Do not introduce or revive `Identity` naming.
-- When adding a provider, place per-provider code under `src/integrations/connectors/<provider>.ts`. Export a `ProviderModule` (ADR 0010) — fields, optional probe, optional detect — and register it in `registry.ts`.
+- When adding a provider, place per-provider code under `src/integrations/connectors/<provider>.ts`. Export a `ProviderModule` (ADR 0012) — fields, optional probe, optional detect — and register it in `registry.ts`.
 - When adding a skill that needs credentials, declare them in the skill's frontmatter under `metadata.gini.requires.connectors` and reference them in scripts via env vars. Do not read connector records directly from skill code.
 - Skill activation filtering is a runtime concern. Do not duplicate the "is this skill active" check at the UI layer; ask the gateway.
 - Do not introduce an "Integration" type, table, or route. The skill is the package.

@@ -729,7 +729,7 @@ export interface ConnectorRecord {
   name: string;
   // Discriminator: identifies which provider module handles this connector
   // ("demo", "linear", "claude-code", "codex", "generic", or any module id
-  // in the registry). Renamed from `kind` in ADR 0010.
+  // in the registry). Renamed from `kind` in ADR 0012.
   provider: string;
   status: "configured" | "disabled" | "error";
   scopes: string[];
@@ -844,8 +844,39 @@ export interface RuntimeStatus {
   missedJobs: number;
   connectors: number;
   memoryUnits?: number;
+  version?: GiniVersionInfo;
   provider?: ProviderHealth;
   activeAgent?: ActiveAgentSnapshot;
+}
+
+export interface GiniVersionInfo {
+  packageVersion: string;
+  runtimeDir: string;
+  git: {
+    sha: string | null;
+    shortSha: string | null;
+    branch: string | null;
+    origin: string | null;
+    upstreamSha: string | null;
+    updateAvailable: boolean;
+  };
+  installedRuntimePresent: boolean;
+  update: {
+    supported: boolean;
+    reason?: string;
+  };
+}
+
+export interface GiniUpdateResult {
+  beforeSha: string;
+  afterSha: string;
+  commitCount: string;
+  upToDate: boolean;
+  runtimeDir: string;
+  version: GiniVersionInfo;
+  restart?: {
+    requested: boolean;
+  };
 }
 
 export interface ProviderResult {

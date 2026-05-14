@@ -12,9 +12,8 @@
 //
 // Bank profile CRUD lives in src/state/memory-db.ts (getBank / updateBank).
 //
-// Adapted from vectorize-io/hindsight (MIT). The verbalization wording mirrors
-// the upstream phrase bands exactly so behaviour matches the paper's reported
-// distribution.
+// Gini's reflect pass keeps profile verbalization deterministic so behavior is
+// stable across providers and can be tuned against the paper's reported shape.
 
 import type { RuntimeConfig } from "../types";
 import type {

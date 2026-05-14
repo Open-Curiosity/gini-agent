@@ -1,10 +1,19 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import type { Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState } from "../types";
+import type { Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState, TaskStatus } from "../types";
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
 import { defaultAgent, defaultTools, defaultToolsets } from "./defaults";
 import { addAudit } from "./audit";
 import { getMemoryDb, memoryDbPath } from "./memory-db";
+
+// Shared terminal-status predicate. Every site that mutates
+// `task.status` should check this before flipping so a cancelled /
+// failed / completed task isn't resurrected by a stale in-flight
+// code path. Returns `true` for the three terminal states in the
+// TaskStatus union.
+export function isTerminalTaskStatus(status: TaskStatus): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
 
 export function createEmptyState(instance: Instance): RuntimeState {
   const at = now();
@@ -182,7 +191,7 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
   }
 }
 
-// ADR 0010 renamed `state.identities` → `state.connectors` and each
+// ADR 0012 renamed `state.identities` → `state.connectors` and each
 // record's `kind` → `provider`. State files written before that rename
 // still carry the old keys; rewrite them in-place so mutateState persists
 // the new shape on the next write. No back-compat shim is exposed outside
@@ -506,7 +515,7 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     // separate rows. Legacy records (pre-fix) default to "user" — bundled
     // records get re-tagged on the next loadSkillsFromDisk pass.
     skill.source ??= "user";
-    // ADR 0010 renamed SkillRecord.requiredIdentities (with `kind` keys) to
+    // ADR 0012 renamed SkillRecord.requiredIdentities (with `kind` keys) to
     // requiredConnectors (with `provider` keys). Rewrite in-place so the
     // record uses the new vocabulary; the loader will overwrite from disk
     // on the next reload anyway.

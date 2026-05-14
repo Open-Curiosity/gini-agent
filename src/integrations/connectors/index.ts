@@ -167,7 +167,7 @@ export async function resolveConnectorSecret(
   return value;
 }
 
-// Per-provider health probe dispatch. Probes are optional per ADR 0010: a
+// Per-provider health probe dispatch. Probes are optional per ADR 0012: a
 // provider without a `probe` falls back to a configured-status check (no
 // remote system to query). Connector records that reference an unknown
 // provider land at `unhealthy` with a surfaced message so the activation

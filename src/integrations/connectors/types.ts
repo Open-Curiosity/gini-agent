@@ -1,4 +1,4 @@
-// Provider-module contract (ADR 0010).
+// Provider-module contract (ADR 0012).
 //
 // A ProviderModule encapsulates everything Gini needs to know about a
 // specific external integration — its label, the fields the Add Connector
@@ -75,7 +75,7 @@ export interface ProviderModule {
   // Secret spec — purposes and env-var bindings the provider declares.
   // Omitted for providers that don't store secrets.
   secrets?: ProviderSecretSpec;
-  // Probe is optional per ADR 0010. Providers with no remote system to
+  // Probe is optional per ADR 0012. Providers with no remote system to
   // query (apple-notes via TCC, generic by definition) omit it; the
   // connector record's health falls back to a status-only check.
   probe?(ctx: ProbeContext): Promise<ProbeResult>;

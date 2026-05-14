@@ -32,12 +32,22 @@ import { createSkillFromInput, getSkill, installSkillFromBody, listSkills, reloa
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
+import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
+import { projectRoot } from "./paths";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
 export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
+    ["GET", /^\/api\/version$/, () => json(currentVersionInfo())],
+    ["POST", /^\/api\/update\/check$/, () => json(refreshVersionInfo())],
+    ["POST", /^\/api\/update$/, () => {
+      assertCurrentRuntimeUpdateSupported();
+      const result = updateRuntime(projectRoot());
+      const restartRequested = result.upToDate ? false : scheduleRuntimeRestart(config.instance);
+      return json({ ...result, restart: { requested: restartRequested } });
+    }],
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
     // Settings: auto-approve controls.
     //   - `patterns`: shell-glob allowlist for terminal_exec only.
@@ -238,7 +248,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const query = new URL(request.url).searchParams.get("q");
       return json(query ? searchSkills(config, query) : listSkills(config));
     }],
-    // POST /api/skills accepts two payload shapes per ADR 0010:
+    // POST /api/skills accepts two payload shapes per ADR 0012:
     //   - { body: "<SKILL.md text>", files?: [...] }: install-from-disk
     //     flow used by the install-skill meta-skill and remote/mobile UIs.
     //     Writes to ~/.gini/instances/<instance>/skills/<category>/<name>/
@@ -485,6 +495,7 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Invalid port")) return 400;
   if (message.startsWith("Could not reach CDP endpoint")) return 400;
   if (message.startsWith("Could not locate")) return 400;
+  if (message.startsWith("Web update is only available")) return 400;
   return 500;
 }
 

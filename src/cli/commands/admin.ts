@@ -1,10 +1,11 @@
 // Lifecycle and instance-admin commands: install, start, stop, status, doctor, reset, run.
 import type { ChildProcess } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
 import * as readline from "node:readline/promises";
+import type { RuntimeConfig } from "../../types";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
@@ -15,11 +16,14 @@ import {
   isRunning,
   remoteOrLocalStatus,
   start as startLifecycle,
-  stopRuntime
+  stopRuntime,
+  waitForRuntimeStopped
 } from "../process";
 import { print, printStartBanner } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
 import { disableForUninstall } from "./autostart";
+import { installedRuntimeDir, updateRuntime } from "../../runtime/update";
+import { api } from "../api";
 
 export async function install_(ctx: CliContext): Promise<void> {
   // Provider configuration is optional at install time. The piped-curl
@@ -75,7 +79,7 @@ export function reset(ctx: CliContext): void {
   print({ reset: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot });
 }
 
-export async function update(_ctx: CliContext): Promise<void> {
+export async function update(ctx: CliContext): Promise<void> {
   // GINI_STATE_ROOT is the test-mode signal — same convention as `uninstall`.
   // Skip every step that would touch the real $HOME so the command stays
   // exercisable from subprocess tests without clobbering the developer's
@@ -85,98 +89,98 @@ export async function update(_ctx: CliContext): Promise<void> {
     return;
   }
 
-  const home = homedir();
-  const runtimeDir = join(home, ".gini", "runtime");
-
-  if (!existsSync(runtimeDir) || !existsSync(join(runtimeDir, ".git"))) {
-    console.error("gini update operates on the installed runtime at ~/.gini/runtime, which is not present. Reinstall with: curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash");
+  let result;
+  try {
+    result = updateRuntime(installedRuntimeDir());
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);
   }
 
-  const expectedOrigin = "https://github.com/Lilac-Labs/gini-agent";
-  const originRes = spawnSync("git", ["-C", runtimeDir, "remote", "get-url", "origin"], { encoding: "utf8" });
-  if (originRes.status !== 0) {
-    const stderr = (originRes.stderr ?? "").trim();
-    console.error(`gini update could not read git origin in ${runtimeDir}${stderr ? `: ${stderr}` : "."}`);
-    process.exit(1);
-  }
-  const actualOrigin = (originRes.stdout ?? "").trim();
-  const normalize = (url: string): string => url.replace(/\.git$/, "");
-  const isExpectedRemote = normalize(actualOrigin) === normalize(expectedOrigin);
-  // Local-test installs (via scripts/install.sh --local) set origin to a
-  // filesystem path. Accept that as a valid origin so the test loop
-  // (edit → commit in local repo → gini update) works end to end.
-  const isLocalCheckout = actualOrigin.startsWith("/") && existsSync(join(actualOrigin, ".git"));
-  if (!isExpectedRemote && !isLocalCheckout) {
-    console.error(`gini update refuses to touch ~/.gini/runtime because its git origin is ${actualOrigin} (expected ${expectedOrigin} or a local repo path). Move that directory aside and reinstall.`);
-    process.exit(1);
-  }
+  refreshInstalledWrapper();
+  step(formatUpdateSummary(result));
 
-  const beforeRes = spawnSync("git", ["-C", runtimeDir, "rev-parse", "HEAD"], { encoding: "utf8" });
-  if (beforeRes.status !== 0) {
-    const stderr = (beforeRes.stderr ?? "").trim();
-    console.error(`gini update could not read current HEAD${stderr ? `: ${stderr}` : "."}`);
-    process.exit(1);
-  }
-  const beforeSha = (beforeRes.stdout ?? "").trim();
-
-  header("Updating gini-agent");
-
-  const fetchRes = spawnSync("git", ["-C", runtimeDir, "fetch", "origin"], { encoding: "utf8" });
-  if (fetchRes.status !== 0) {
-    const stderr = (fetchRes.stderr ?? "").trim();
-    console.error(`gini update: git fetch origin failed${stderr ? `: ${stderr}` : "."}`);
-    process.exit(1);
-  }
-
-  // origin/HEAD follows the remote's default branch — works for both the
-  // GitHub install (main) and local-test installs that may be on any branch.
-  const resetRes = spawnSync("git", ["-C", runtimeDir, "reset", "--hard", "origin/HEAD"], { encoding: "utf8" });
-  if (resetRes.status !== 0) {
-    const stderr = (resetRes.stderr ?? "").trim();
-    console.error(`gini update: git reset --hard origin/HEAD failed${stderr ? `: ${stderr}` : "."}`);
-    process.exit(1);
-  }
-
-  const afterRes = spawnSync("git", ["-C", runtimeDir, "rev-parse", "HEAD"], { encoding: "utf8" });
-  if (afterRes.status !== 0) {
-    const stderr = (afterRes.stderr ?? "").trim();
-    console.error(`gini update could not read new HEAD${stderr ? `: ${stderr}` : "."}`);
-    process.exit(1);
-  }
-  const afterSha = (afterRes.stdout ?? "").trim();
-
-  const installRes = spawnSync("bun", ["install"], { cwd: runtimeDir, stdio: "inherit" });
-  if (installRes.status !== 0) {
-    console.error(`gini update: bun install failed (exit ${installRes.status ?? "null"}).`);
-    process.exit(1);
-  }
-
-  const webDir = join(runtimeDir, "web");
-  if (existsSync(join(webDir, "package.json"))) {
-    const webResult = spawnSync("bun", ["install"], { cwd: webDir, stdio: "inherit" });
-    if (webResult.status !== 0) {
-      console.error(`gini update: bun install in web/ failed (exit ${webResult.status ?? "null"}).`);
-      process.exit(1);
+  if (await runningRuntimeNeedsRestart(ctx.config, result)) {
+    step("Restarting running instance");
+    const stopResult = stopRuntime(ctx.config);
+    const stopped = await waitForRuntimeStopped(ctx.config, typeof stopResult.pid === "number" ? stopResult.pid : undefined);
+    if (!stopped) {
+      throw new Error(`Timed out waiting for instance '${ctx.config.instance}' to stop before restart.`);
     }
+    await startLifecycle(ctx.config, ctx.web);
+    step("Running instance restarted");
   }
+}
 
-  const upToDate = beforeSha === afterSha;
-  const countRes = upToDate
-    ? null
-    : spawnSync("git", ["-C", runtimeDir, "rev-list", "--count", `${beforeSha}..${afterSha}`], { encoding: "utf8" });
-  const commitCount = upToDate
-    ? "0"
-    : countRes && countRes.status === 0 ? (countRes.stdout ?? "").trim() : "?";
+interface UpdateRestartInput {
+  upToDate: boolean;
+  afterSha: string;
+}
 
-  footer("gini-agent updated.");
-  if (upToDate) {
-    info(`Already at ${afterSha.slice(0, 7)}`);
-  } else {
-    info(`${beforeSha.slice(0, 7)} → ${afterSha.slice(0, 7)} (${commitCount} commit${commitCount === "1" ? "" : "s"})`);
+export function updateRequiresRuntimeRestart(result: UpdateRestartInput, runningStatus: unknown): boolean {
+  if (!result.upToDate) return true;
+  return statusVersionSha(runningStatus) !== result.afterSha;
+}
+
+export function formatUpdateSummary(result: UpdateRestartInput & { commitCount: string }): string {
+  const commitLabel = `${result.commitCount} commit${result.commitCount === "1" ? "" : "s"}`;
+  const shortSha = result.afterSha.slice(0, 7);
+  return result.upToDate
+    ? `Gini already up to date at ${shortSha} (${commitLabel})`
+    : `Gini updated to ${shortSha} (${commitLabel})`;
+}
+
+async function runningRuntimeNeedsRestart(config: RuntimeConfig, result: UpdateRestartInput): Promise<boolean> {
+  if (!await isRunning(config)) return false;
+  if (!result.upToDate) return true;
+  try {
+    return updateRequiresRuntimeRestart(result, await api(config, "/api/status"));
+  } catch {
+    return false;
   }
-  info("If a runtime is running, restart it: gini stop && gini start");
-  console.log("");
+}
+
+function statusVersionSha(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const version = (value as { version?: unknown }).version;
+  if (!version || typeof version !== "object") return null;
+  const git = (version as { git?: unknown }).git;
+  if (!git || typeof git !== "object") return null;
+  const sha = (git as { sha?: unknown }).sha;
+  return typeof sha === "string" && sha.length > 0 ? sha : null;
+}
+
+function refreshInstalledWrapper(): void {
+  const wrapperPath = join(homedir(), ".local", "bin", "gini");
+  if (!existsSync(wrapperPath)) return;
+  let contents: string;
+  try {
+    contents = readFileSync(wrapperPath, "utf8");
+  } catch {
+    return;
+  }
+  if (!contents.includes("gini-agent-installer-managed")) return;
+  const next = `#!/usr/bin/env bash
+# gini-agent-installer-managed
+set -euo pipefail
+if [ -f "$HOME/.gini/secrets.env" ]; then
+  set +e
+  set -a
+  . "$HOME/.gini/secrets.env" || printf 'gini: warning — failed to source ~/.gini/secrets.env, continuing without it\\n' >&2
+  set +a
+  set -e
+fi
+export GINI_INSTANCE="\${GINI_INSTANCE:-default}"
+cd "$HOME/.gini/runtime"
+exec bun --silent run gini "$@"
+`;
+  if (contents === next) return;
+  try {
+    writeFileSync(wrapperPath, next, { mode: 0o755 });
+  } catch {
+    // Best-effort. The update itself succeeded; a stale wrapper only affects
+    // whether Bun prints the script command before future CLI output.
+  }
 }
 
 export async function uninstall(ctx: CliContext): Promise<void> {

@@ -1,6 +1,6 @@
 # ADR 0008: Connector Secret Storage
 
-> Renamed from "Identity Secret Storage" per ADR 0010. The decision is unchanged; only the vocabulary updated.
+> Renamed from "Identity Secret Storage" per ADR 0012. The decision is unchanged; only the vocabulary updated.
 
 ## Decision
 

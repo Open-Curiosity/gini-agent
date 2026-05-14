@@ -1,4 +1,4 @@
-# ADR 0010: Connector + Provider Vocabulary, Spec Compliance, and Meta-Skills
+# ADR 0012: Connector + Provider Vocabulary, Spec Compliance, and Meta-Skills
 
 ## Decision
 
