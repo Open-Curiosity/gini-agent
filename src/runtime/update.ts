@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -19,6 +19,10 @@ export interface GiniVersionInfo {
     updateAvailable: boolean;
   };
   installedRuntimePresent: boolean;
+  update: {
+    supported: boolean;
+    reason?: string;
+  };
 }
 
 export interface GiniUpdateResult {
@@ -31,7 +35,7 @@ export interface GiniUpdateResult {
 }
 
 export function installedRuntimeDir(): string {
-  return join(homedir(), ".gini", "runtime");
+  return join(process.env.HOME || homedir(), ".gini", "runtime");
 }
 
 export function currentVersionInfo(runtimeDir = projectRoot()): GiniVersionInfo {
@@ -51,11 +55,14 @@ export function currentVersionInfo(runtimeDir = projectRoot()): GiniVersionInfo 
       upstreamSha,
       updateAvailable: Boolean(sha && upstreamSha && sha !== upstreamSha)
     },
-    installedRuntimePresent: existsSync(join(installedRuntimeDir(), ".git"))
+    installedRuntimePresent: existsSync(join(installedRuntimeDir(), ".git")),
+    update: updateSupport(runtimeDir)
   };
 }
 
 export function refreshVersionInfo(runtimeDir = projectRoot()): GiniVersionInfo {
+  const support = updateSupport(runtimeDir);
+  if (!support.supported) return currentVersionInfo(runtimeDir);
   if (existsSync(join(runtimeDir, ".git"))) {
     const fetchRes = spawnSync("git", ["-C", runtimeDir, "fetch", "origin"], { encoding: "utf8" });
     if (fetchRes.status !== 0) {
@@ -113,6 +120,7 @@ export function updateRuntime(runtimeDir = installedRuntimeDir(), options: { std
 
 export function scheduleRuntimeRestart(instance: Instance): boolean {
   const root = projectRoot();
+  const oldPid = process.pid;
   const logFile = join(logDir(instance), "update-restart.log");
   try {
     mkdirSync(dirname(logFile), { recursive: true });
@@ -130,12 +138,22 @@ export function scheduleRuntimeRestart(instance: Instance): boolean {
     // Fall back to ignored stdio.
   }
 
-  const script = [
-    "sleep 0.8",
-    `cd ${shellQuote(root)}`,
-    `bun run src/cli.ts stop --instance ${shellQuote(instance)} || true`,
-    `bun run src/cli.ts start --instance ${shellQuote(instance)}`
-  ].join("; ");
+  const script = `
+cd ${shellQuote(root)}
+old_pid=${oldPid}
+for i in {1..100}; do
+  kill -0 "$old_pid" 2>/dev/null || break
+  sleep 0.1
+done
+if kill -0 "$old_pid" 2>/dev/null; then
+  bun run src/cli.ts stop --instance ${shellQuote(instance)} || true
+  for i in {1..100}; do
+    kill -0 "$old_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+fi
+bun run src/cli.ts start --instance ${shellQuote(instance)}
+`;
 
   const child = spawn("bash", ["-lc", script], {
     cwd: root,
@@ -154,6 +172,13 @@ export function scheduleRuntimeRestart(instance: Instance): boolean {
   return true;
 }
 
+export function assertCurrentRuntimeUpdateSupported(runtimeDir = projectRoot()): void {
+  const support = updateSupport(runtimeDir);
+  if (!support.supported) {
+    throw new Error(support.reason ?? "Runtime update is not available from this checkout.");
+  }
+}
+
 function assertUpdateTarget(runtimeDir: string): void {
   if (!existsSync(runtimeDir) || !existsSync(join(runtimeDir, ".git"))) {
     throw new Error(
@@ -170,6 +195,29 @@ function assertUpdateTarget(runtimeDir: string): void {
       `gini update refuses to touch ~/.gini/runtime because its git origin is ${actualOrigin} ` +
       `(expected ${EXPECTED_ORIGIN} or a local repo path). Move that directory aside and reinstall.`
     );
+  }
+}
+
+function updateSupport(runtimeDir: string): { supported: boolean; reason?: string } {
+  if (!existsSync(join(installedRuntimeDir(), ".git"))) {
+    return { supported: false, reason: "Installer-managed runtime is not present. Use git pull from this checkout." };
+  }
+  if (!sameRealPath(runtimeDir, installedRuntimeDir())) {
+    return { supported: false, reason: "Web update is only available from the installer-managed runtime. Use git pull from this checkout." };
+  }
+  try {
+    assertUpdateTarget(runtimeDir);
+    return { supported: true };
+  } catch (error) {
+    return { supported: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function sameRealPath(left: string, right: string): boolean {
+  try {
+    return realpathSync(left) === realpathSync(right);
+  } catch {
+    return false;
   }
 }
 

@@ -52,6 +52,37 @@ describe("runtime proxy", () => {
     expect(received.body).toBe(JSON.stringify({ input: "hello" }));
   });
 
+  test("blocks cross-origin runtime update posts before bearer-token forwarding", async () => {
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://localhost/api/runtime/update", {
+      method: "POST",
+      headers: { origin: "https://example.test" }
+    });
+    const response = await proxyRequest(request, ["update"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    const value = await response.json() as { error: string };
+
+    expect(response.status).toBe(403);
+    expect(value.error).toBe("Forbidden");
+  });
+
+  test("allows same-origin runtime update posts through the BFF", async () => {
+    const captured: { auth: string | null } = { auth: null };
+    const fetcher = mockFetcher((_url, init) => {
+      captured.auth = (init.headers as Headers).get("authorization");
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const request = new Request("http://localhost/api/runtime/update", {
+      method: "POST",
+      headers: { origin: "http://localhost" }
+    });
+    const response = await proxyRequest(request, ["update"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+
+    expect(response.status).toBe(200);
+    expect(captured.auth).toBe(`Bearer ${TOKEN}`);
+  });
+
   test("supports PATCH and DELETE methods", async () => {
     const seen: string[] = [];
     const fetcher = mockFetcher(async (_url, init) => {

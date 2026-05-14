@@ -506,6 +506,16 @@ export function processAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+export async function waitForRuntimeStopped(config: RuntimeConfig, pid?: number, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pidAlive = typeof pid === "number" ? processAlive(pid) : false;
+    if (!pidAlive && !(await isRunning(config))) return true;
+    await Bun.sleep(100);
+  }
+  return false;
+}
+
 export async function isRunning(config: RuntimeConfig): Promise<boolean> {
   try {
     const response = await fetch(`${url(config)}/api/status`, { headers: auth(config) });

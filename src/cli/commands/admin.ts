@@ -15,7 +15,8 @@ import {
   isRunning,
   remoteOrLocalStatus,
   start as startLifecycle,
-  stopRuntime
+  stopRuntime,
+  waitForRuntimeStopped
 } from "../process";
 import { print, printStartBanner } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
@@ -105,7 +106,11 @@ export async function update(ctx: CliContext): Promise<void> {
 
   if (!result.upToDate && await isRunning(ctx.config)) {
     step("Restarting running instance");
-    stopRuntime(ctx.config);
+    const stopResult = stopRuntime(ctx.config);
+    const stopped = await waitForRuntimeStopped(ctx.config, typeof stopResult.pid === "number" ? stopResult.pid : undefined);
+    if (!stopped) {
+      throw new Error(`Timed out waiting for instance '${ctx.config.instance}' to stop before restart.`);
+    }
     await startLifecycle(ctx.config, ctx.web);
     info("Running instance restarted with the updated code.");
   }

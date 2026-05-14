@@ -19,10 +19,13 @@ The CLI `gini update` keeps the same installer-managed target
 `gini stop && gini start`. If the selected instance is running and the
 update changed code, the CLI restarts it directly.
 
-The web control plane surfaces the version in the sidebar and lets the
-operator trigger the update from the browser. The browser still never
-receives the gateway bearer token; the Next.js BFF forwards the request
-to the gateway like other `/api/runtime/*` calls.
+When it is running from the installer-managed runtime, the web control
+plane surfaces the version in the sidebar and lets the operator trigger
+the update from the browser. Repo/worktree runs show version metadata
+but do not mutate `~/.gini/runtime`; those still use normal git
+workflows. The browser still never receives the gateway bearer token;
+the Next.js BFF forwards same-origin requests to the gateway like other
+`/api/runtime/*` calls and rejects cross-origin update POSTs.
 
 ## Context
 
@@ -44,6 +47,9 @@ installer-origin guardrails rather than adding a browser-only shortcut.
 - `gini update` and the web update button share the same update helper,
   keeping origin validation, fetch/reset behavior, and dependency install
   behavior consistent.
+- Web-triggered updates are only enabled when the running source tree is
+  the installer-managed runtime. This prevents a repo checkout from
+  accidentally mutating a different installed runtime.
 - Browser-triggered updates schedule a post-response restart helper so the
   HTTP response can flush before the current gateway exits.
 - Update remains scoped to the installer-managed runtime. Repo worktrees

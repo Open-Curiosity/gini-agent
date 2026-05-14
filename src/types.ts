@@ -841,6 +841,10 @@ export interface GiniVersionInfo {
     updateAvailable: boolean;
   };
   installedRuntimePresent: boolean;
+  update: {
+    supported: boolean;
+    reason?: string;
+  };
 }
 
 export interface GiniUpdateResult {

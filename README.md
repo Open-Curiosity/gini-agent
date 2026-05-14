@@ -87,7 +87,7 @@ gini update
 
 Pulls the latest source into `~/.gini/runtime`, reinstalls dependencies, and leaves your state under `~/.gini/instances/` and the model cache at `~/.gini/models/` untouched. If a runtime is currently running, Gini restarts it automatically so the new code is picked up without a manual `gini stop && gini start`.
 
-The web app surfaces the current package/git version in the sidebar and exposes the same update action through its Update button.
+When the web app is running from the installer-managed runtime, it surfaces the current package/git version in the sidebar and exposes the same update action through its Update button.
 
 If you are working from a repo clone, use `git pull && bun install` instead — `gini update` only operates on the installer-managed runtime at `~/.gini/runtime`.
 

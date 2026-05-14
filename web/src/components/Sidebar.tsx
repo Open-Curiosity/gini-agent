@@ -27,11 +27,11 @@ import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { useEffect, useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { useStatus } from "@/lib/queries";
-import type { GiniUpdateResult } from "@runtime/types";
+import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
 
 const NAV = [
   { href: "/", label: "Home", icon: Home },
@@ -108,7 +108,15 @@ function SidebarBody({ instance, onNavigate }: { instance: string; onNavigate?: 
 function UpdateReminder() {
   const status = useStatus();
   const qc = useQueryClient();
-  const version = status.data?.version;
+  const statusVersion = status.data?.version;
+  const updateSupported = statusVersion?.update.supported === true;
+  const versionCheck = useQuery({
+    queryKey: ["version", "check"],
+    queryFn: () => api<GiniVersionInfo>("/update/check", { method: "POST" }),
+    enabled: updateSupported,
+    refetchInterval: 5 * 60_000
+  });
+  const version = versionCheck.data ?? statusVersion;
   const updateAvailable = version?.git.updateAvailable === true;
   const update = useMutation({
     mutationFn: () => api<GiniUpdateResult>("/update", { method: "POST" }),
@@ -141,7 +149,7 @@ function UpdateReminder() {
           size="sm"
           variant={updateAvailable ? "default" : "outline"}
           className="h-7 shrink-0"
-          disabled={update.isPending}
+          disabled={update.isPending || !updateSupported}
           onClick={() => update.mutate()}
         >
           {update.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}

@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 // is critical for SSE reconnect dedup (see src/http.ts:eventStream) — without
 // it, every reconnect re-replays the entire event log.
 const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control", "last-event-id"]);
+const PRIVILEGED_POST_ROUTES = new Set(["update", "update/check"]);
 
 // Cache the file-read values across requests but invalidate on mtime change,
 // so a gateway respawn that picks a different port doesn't strand the BFF
@@ -102,6 +103,9 @@ export async function proxyRequest(
   pathSegments: string[],
   options: ProxyOptions
 ): Promise<Response> {
+  const guard = guardPrivilegedRequest(request, pathSegments);
+  if (guard) return guard;
+
   const upstreamUrl = new URL(request.url);
   const target = `${options.runtimeUrl}/api/${pathSegments.join("/")}${upstreamUrl.search}`;
   const headers = pickForwardHeaders(request.headers);
@@ -134,6 +138,24 @@ export async function proxyRequest(
     status: upstream.status,
     headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" }
   });
+}
+
+function guardPrivilegedRequest(request: Request, pathSegments: string[]): Response | null {
+  const route = pathSegments.join("/");
+  if (request.method !== "POST" || !PRIVILEGED_POST_ROUTES.has(route)) return null;
+
+  const requestOrigin = new URL(request.url).origin;
+  const origin = request.headers.get("origin");
+  if (origin && origin !== requestOrigin) {
+    return Response.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  const fetchSite = request.headers.get("sec-fetch-site");
+  if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
+    return Response.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  return null;
 }
 
 export async function runtimeFetch(path: string, init: RequestInit = {}): Promise<Response> {
