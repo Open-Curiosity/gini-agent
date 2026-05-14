@@ -76,6 +76,7 @@ Usage:
   bun run gini uninstall [--instance <name>] [--yes] [--purge]
   bun run gini update
   bun run gini setup [--force] [--yes]
+  bun run gini autostart enable|disable|status|kick [--instance dev]
   bun run gini task submit <prompt>
   bun run gini task list
   bun run gini task show <task-id>
@@ -111,10 +112,19 @@ Usage:
   bun run gini smoke
 
 Process lifecycle:
-  gini start  - daemon mode; instance keeps running after the terminal closes.
-                Use this for a persistent personal agent on your machine.
-  gini run    - foreground mode; instance dies when this terminal exits or
-                you Ctrl-C. Use this for coding-agent worktrees and CI.
+  gini start      - daemon mode; instance keeps running after the terminal
+                    closes. Use this for a persistent personal agent on
+                    your machine.
+  gini run        - foreground mode; instance dies when this terminal
+                    exits or you Ctrl-C. Use this for coding-agent
+                    worktrees and CI.
+  gini autostart  - macOS LaunchAgent integration. \`enable\` registers a
+                    per-instance plist so the runtime starts at login.
+                    \`gini stop\` is honored (clean exits don't respawn).
+                    On macOS 26+, launchd auto-respawn after SIGKILL is
+                    unreliable — use \`gini autostart kick\` to force a
+                    respawn when the runtime crashed. v1 supervises by PID
+                    only; a wedged-but-alive runtime isn't detected yet.
 
 Global options:
   --instance <name>        Select a persistent instance. Smoke uses an ephemeral instance when omitted.

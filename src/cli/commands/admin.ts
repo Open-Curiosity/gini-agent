@@ -19,22 +19,33 @@ import {
 } from "../process";
 import { print, printStartBanner } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
+import { disableForUninstall } from "./autostart";
 
 export async function install_(ctx: CliContext): Promise<void> {
-  // A fresh install must pick a real LLM provider. We refuse to silently
-  // materialize the `echo` stub config — that bites users who then have to
-  // remember to switch providers on every new worktree. Re-installing an
-  // existing instance is still fine without env vars.
+  // Provider configuration is optional at install time. The piped-curl
+  // install path (`curl … | bash`) has no GINI_PROVIDER env, and the
+  // browser /setup flow is responsible for picking a provider. If no env
+  // is set and no config exists yet, materialize a placeholder ("echo")
+  // config; the runtime starts, /api/setup/status reports
+  // providerConfigured:false, and the browser /setup page replaces the
+  // placeholder. Existing configs are not overwritten.
+  //
+  // For users who want to skip the browser flow, GINI_PROVIDER=openai|codex
+  // is still honored — it short-circuits the placeholder and writes the
+  // real provider directly.
   const instance = parseInstance(ctx.rawArgs);
   if (!existsSync(configPath(instance))) {
     const envProvider = process.env.GINI_PROVIDER;
-    if (envProvider !== "openai" && envProvider !== "codex") {
+    if (envProvider && envProvider !== "openai" && envProvider !== "codex") {
       throw new Error(
-        `No LLM provider configured for instance '${instance}'. ` +
-        `Set GINI_PROVIDER=codex|openai (and optionally GINI_MODEL) in the environment, ` +
+        `GINI_PROVIDER='${envProvider}' is not a recognized provider. ` +
+        `Use 'openai' or 'codex', leave it unset for a placeholder config that the /setup page replaces, ` +
         `or run \`gini provider set <name> [model]\` after install.`
       );
     }
+    // envProvider is undefined → placeholder config will materialize via
+    // defaultConfig() inside install(); /api/setup/status will report
+    // providerConfigured:false; the browser /setup flow takes over.
   }
   const { config } = ctx;
   install(config);
@@ -173,12 +184,22 @@ export async function uninstall(ctx: CliContext): Promise<void> {
   const purge = hasFlag(ctx.rawArgs, "--purge");
 
   if (ctx.explicitInstance) {
+    // Disable autostart FIRST so launchd doesn't respawn the runtime
+    // mid-uninstall. Bootout failures are surfaced via warn() so a broken
+    // plist doesn't get silently dropped; state deletion still proceeds.
+    const autostart = await disableForUninstall(ctx.config.instance);
+    if (autostart.failures.length > 0) {
+      for (const f of autostart.failures) {
+        warn(`autostart unload (${f.kind}): ${f.error}`);
+      }
+      warn("Continuing with uninstall — you may need to clean up the plist manually.");
+    }
     // Stop the runtime first if it's running — otherwise removing stateRoot
     // out from under a live process leaves the daemon writing to a deleted
     // directory until it crashes.
     if (await isRunning(ctx.config)) stopRuntime(ctx.config);
     uninstallInstance(ctx.config);
-    print({ uninstalled: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot, logRoot: ctx.config.logRoot });
+    print({ uninstalled: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot, logRoot: ctx.config.logRoot, autostart });
     return;
   }
 
@@ -217,9 +238,21 @@ async function fullUninstall(flags: FullUninstallFlags): Promise<void> {
   console.log("");
   header("Uninstalling gini-agent");
 
+  // Collect autostart bootout warnings across all instances; surface them
+  // after uninstallAll completes so the warn lines don't get interleaved
+  // with the per-instance "Stopped N/M" summary lines printed below.
+  const autostartWarnings: string[] = [];
   const result = await uninstallAll({
     deleteInstances,
     stopInstance: async (name) => {
+      // Disable autostart before stopping the runtime so launchd doesn't
+      // respawn it the instant we send SIGTERM. Bootout failures are
+      // captured for a post-loop warn() pass — a stale plist with no
+      // service is still better than a half-uninstalled instance.
+      const autostartResult = await disableForUninstall(name);
+      for (const f of autostartResult.failures) {
+        autostartWarnings.push(`autostart unload [${name}] (${f.kind}): ${f.error}`);
+      }
       const cfg = loadConfig(name);
       if (!(await isRunning(cfg))) return;
       const outcome = stopRuntime(cfg);
@@ -229,6 +262,7 @@ async function fullUninstall(flags: FullUninstallFlags): Promise<void> {
       }
     }
   });
+  for (const w of autostartWarnings) warn(w);
 
   // GINI_STATE_ROOT is the test-mode signal. When set, the user is not actually
   // tearing down their real install — they're exercising the code path against

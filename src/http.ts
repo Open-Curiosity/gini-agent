@@ -26,6 +26,7 @@ import { resolveEffectiveContext } from "./execution/effective-context";
 import { connectBrowser, disconnectBrowser, getBrowserConnection, wipeBrowserProfile } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
+import { getSetupStatus, setSetupProvider } from "./runtime/setup-api";
 import { createSkillFromInput, getSkill, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
 import { v1Readiness } from "./runtime/readiness";
@@ -302,6 +303,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/messaging\/([^/]+)\/health$/, async (_request, params) => json(await checkMessagingBridge(config, params[0]))],
     ["POST", /^\/api\/messaging\/([^/]+)\/disable$/, async (_request, params) => json(await disableMessagingBridge(config, params[0]))],
     ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],
+    // Browser-driven onboarding endpoints. The webapp's /setup route polls
+    // /api/setup/status to decide whether to render the form, and POSTs
+    // /api/setup/provider to set credentials. The runtime writes
+    // secrets.env (so future processes pick it up) AND updates
+    // process.env.OPENAI_API_KEY so the running gateway uses the new key
+    // immediately. Plist refresh for the next launchd respawn is signaled
+    // back via plistRefreshNeeded — the CLI layer hooks that.
+    ["GET", /^\/api\/setup\/status$/, () => json(getSetupStatus(config))],
+    ["POST", /^\/api\/setup\/provider$/, async (request) => {
+      const payload = await body(request);
+      const result = await setSetupProvider(config, payload);
+      return json(result, result.ok ? 200 : 400);
+    }],
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],
     ["POST", /^\/api\/agents$/, async (request) => json(await createAgent(config, await body(request)), 201)],
     ["POST", /^\/api\/agents\/([^/]+)\/use$/, async (_request, params) => json(await useAgent(config, params[0]))],

@@ -27,9 +27,26 @@ Pinning `default` to fixed memorable ports lets `gini start` produce a stable UR
 - The `default` instance gets pinned ports (web `7777`, runtime `7778`).
 - All other instances get deterministic hash-derived ports within a 100-port window.
 
+## Implemented Since
+
+- **Per-instance LaunchAgents (macOS).** Each instance now writes two
+  user-domain LaunchAgents under `~/Library/LaunchAgents/`:
+  `ai.lilaclabs.gini.<instance>.gateway` (Bun runtime, runs
+  `src/server.ts` directly) and `ai.lilaclabs.gini.<instance>.web`
+  (Next.js dev server, gated on the gateway becoming healthy via a
+  shell shim). Both are supervised with
+  `KeepAlive.SuccessfulExit: false` so `gini stop` (clean exit 0) is
+  honored and crashes are respawned. Provider secrets from
+  `~/.gini/secrets.env` are merged into the gateway plist's
+  `EnvironmentVariables` only — the web BFF never invokes a provider
+  directly, so it gets none. Subcommands `gini autostart
+  enable|disable|status|kick` manage the pair; uninstall tears them
+  down and reports any launchctl failures. See `src/cli/autostart.ts`
+  and `src/cli/commands/autostart.ts`.
+
 ## Deferred
 
-- Separate LaunchAgents per instance.
+- Linux `systemd --user` parity for autostart (macOS-only in v1).
 - Fully automated production/sandbox promotion and rollback.
 - Remote multi-device relay and push paths.
 

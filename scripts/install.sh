@@ -11,14 +11,22 @@ SETUP_RAN=0
 
 LOCAL_MODE=0
 LOCAL_REPO=""
+# Autostart (macOS LaunchAgent) is on by default — the target install UX is
+# "install completes → runtime is running and stays running across reboots".
+# --no-autostart opts out; useful on shared dev machines, CI, or for users
+# who explicitly don't want a per-user launchd job.
+AUTOSTART=1
+AUTOSTART_ENABLED=0
 
 usage() {
   cat <<USAGE
-Usage: install.sh [--local[=PATH]]
+Usage: install.sh [--local[=PATH]] [--no-autostart]
 
   (no flag)         Install from $REPO_URL (default).
   --local           Install from the local repo containing this script.
   --local=PATH      Install from PATH (must be a gini-agent git checkout).
+  --no-autostart    Skip macOS LaunchAgent registration. (Linux is a no-op
+                    in v1 either way.)
 
 USAGE
 }
@@ -27,6 +35,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --local) LOCAL_MODE=1; LOCAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"; LOCAL_REPO="${LOCAL_REPO%/}" ;;
     --local=*) LOCAL_MODE=1; LOCAL_REPO="${1#--local=}"; LOCAL_REPO="${LOCAL_REPO%/}" ;;
+    --no-autostart) AUTOSTART=0 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'unknown flag: %s\n' "$1" >&2; usage >&2; exit 1 ;;
   esac
@@ -274,6 +283,127 @@ run_setup() {
   fi
 }
 
+enable_autostart() {
+  # Skip if the user opted out or if we're not on macOS — `gini autostart`
+  # prints a clear platform message on Linux, but we don't want a noisy
+  # "macOS-only" line on every Linux install.
+  if [ "$AUTOSTART" = "0" ]; then
+    info "Skipping autostart (--no-autostart)"
+    return
+  fi
+  if [ "$OS" != "darwin" ]; then
+    return
+  fi
+  # Round-2: provider configuration is no longer a precondition. The
+  # webapp's /setup route handles it in the browser; the runtime crashes
+  # on its first request without credentials, but launchd keeps it alive
+  # and the user lands on /setup to fix it. The piped-curl path
+  # (non-interactive) finally gets autostart by default, which was the
+  # entire point of the auto-start feature.
+  if (cd "$RUNTIME_DIR" && GINI_INSTANCE="$DEFAULT_INSTANCE" bun run gini autostart enable >/dev/null 2>&1); then
+    step "Autostart enabled (~/Library/LaunchAgents)"
+    AUTOSTART_ENABLED=1
+  else
+    err "Autostart enable failed. Re-run 'gini autostart enable' to retry."
+  fi
+}
+
+# Read the per-instance web port from ~/.gini/instances/<inst>/web.port,
+# polling for up to INSTALL_READ_WEB_PORT_TIMEOUT_S seconds while the
+# autostart web shim writes it. The default web port is hash-derived
+# (src/paths.ts:defaultWebPort) so it is almost never 3000 for non-`main`
+# instances; even for `main` install.sh must not assume 3000 because future
+# versions could change the hashing scheme. Echoes the port on success,
+# empty on timeout.
+#
+# Cross-boundary contract with src/cli/autostart.ts:
+#   - The autostart web shim (buildWebShim) has a budget of
+#     WEB_SHIM_WAIT_ATTEMPTS * WEB_SHIM_WAIT_INTERVAL_SECONDS = 60s to
+#     wait for the gateway to come up before exec'ing `bun run dev` and
+#     finally writing web.port.
+#   - INSTALL_READ_WEB_PORT_TIMEOUT_S MUST exceed that budget so install.sh
+#     doesn't give up before the shim has had a chance to write web.port.
+#     90s leaves comfortable headroom (60s shim wait + a few seconds for
+#     Next.js startup before web.port is touched).
+# If you change either side, change both — and update the comments here
+# and in src/cli/autostart.ts:buildWebShim.
+INSTALL_READ_WEB_PORT_TIMEOUT_S=90
+# Per-instance web port healthcheck budget after web.port appears. Covers
+# Next.js dev-server compile + first response; usually fast but a cold
+# build can stretch into double digits.
+INSTALL_WAIT_HEALTHZ_TIMEOUT_S=30
+read_web_port() {
+  local instance="$1"
+  local port_file="$HOME/.gini/instances/$instance/web.port"
+  local timeout=$INSTALL_READ_WEB_PORT_TIMEOUT_S
+  local i=0
+  while [ $i -lt $timeout ]; do
+    if [ -f "$port_file" ]; then
+      local port
+      port="$(tr -d '[:space:]' <"$port_file" 2>/dev/null || true)"
+      if [ -n "$port" ]; then
+        printf '%s' "$port"
+        return
+      fi
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  printf ''
+}
+
+# Wait up to INSTALL_WAIT_HEALTHZ_TIMEOUT_S seconds for the web app to
+# respond at /api/runtime/__healthz on the actual web port for the given
+# instance. The port is discovered from ~/.gini/instances/<inst>/web.port
+# (written by the autostart shim at startup), NOT hardcoded. Returns the
+# URL on success, empty on timeout.
+wait_for_web_healthz() {
+  local instance="$1"
+  local port
+  port="$(read_web_port "$instance")"
+  if [ -z "$port" ]; then
+    printf ''
+    return
+  fi
+  local web_url="http://127.0.0.1:$port"
+  local timeout=$INSTALL_WAIT_HEALTHZ_TIMEOUT_S
+  local i=0
+  while [ $i -lt $timeout ]; do
+    if curl -fsS "$web_url/api/runtime/__healthz" >/dev/null 2>&1; then
+      printf '%s' "$web_url"
+      return
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  printf ''
+}
+
+# Open the user's browser to the setup page once the web app is responsive.
+# Non-interactive runs (piped curl) print the URL and let the user open it
+# manually. Either way, the autostart-enabled webapp is the post-install
+# entry point — no terminal-driven `gini setup` required.
+open_setup_in_browser() {
+  if [ "$AUTOSTART_ENABLED" != "1" ]; then
+    return
+  fi
+  if [ "$OS" != "darwin" ]; then
+    return
+  fi
+  info "Waiting for the Gini webapp to come up..."
+  local web_url
+  web_url="$(wait_for_web_healthz "$DEFAULT_INSTANCE")"
+  if [ -z "$web_url" ]; then
+    info "Webapp didn't respond within 120s. After install completes, run 'gini status' to find the web port and open <web_url>/setup in your browser."
+    return
+  fi
+  # `open` works in both interactive and non-interactive (piped) sessions
+  # on macOS. We fire and ignore errors — even if it fails (e.g. no GUI
+  # session), we still print the URL.
+  open "$web_url/setup" >/dev/null 2>&1 || true
+  step "Opened $web_url/setup in your browser"
+}
+
 print_done() {
   local path_ready=0
   case ":$PATH:" in
@@ -286,11 +416,14 @@ print_done() {
     printf '\n%sgini-agent installed.%s\n\n' "$C_BOLD" "$C_RESET"
   fi
 
-  # If setup ran during install, point at `gini start` directly. Otherwise
-  # list the two commands the user needs to run, each on its own line so
-  # they read as commands, not prose.
+  # The target post-install flow is: autostart launches both runtime and
+  # webapp; user's browser opens to /setup; they enter their provider
+  # creds there. If autostart didn't enable (e.g. --no-autostart, or
+  # platform != macOS), fall back to the old gini start instructions.
   print_next_commands() {
-    if [ "$SETUP_RAN" = "1" ]; then
+    if [ "$AUTOSTART_ENABLED" = "1" ]; then
+      printf '    gini status                          # shows the web URL — open <url>/setup to configure your provider\n'
+    elif [ "$SETUP_RAN" = "1" ]; then
       printf '    gini start\n'
     else
       printf '    gini setup\n'
@@ -307,13 +440,19 @@ print_done() {
     print_next_commands
     printf '\n'
   else
-    if [ "$SETUP_RAN" = "1" ]; then
+    if [ "$AUTOSTART_ENABLED" = "1" ]; then
+      printf 'The Gini webapp is opening in your browser. Configure your provider on the %s/setup%s page to get started.\n' "$C_BOLD" "$C_RESET"
+      printf '\nRuntime + webapp are autostart-enabled — they will keep running across crashes and reboots until you run %sgini stop%s or %sgini autostart disable%s.\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+      if [ "$OS" = "darwin" ]; then
+        printf '\n%sNote (macOS 26+):%s if SIGKILL ever takes the runtime down, launchd may defer respawn — run %sgini autostart kick%s to force it.\n' "$C_DIM" "$C_RESET" "$C_BOLD" "$C_RESET"
+      fi
+    elif [ "$SETUP_RAN" = "1" ]; then
       printf 'Run %sgini start%s.' "$C_BOLD" "$C_RESET"
     else
       printf 'Run %sgini setup%s, then %sgini start%s.' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
     fi
     if [ "$LOCAL_MODE" = "1" ]; then
-      printf ' After committing changes in %s, run %sgini update%s to re-sync.' "$LOCAL_REPO" "$C_BOLD" "$C_RESET"
+      printf '\n\nAfter committing changes in %s, run %sgini update%s to re-sync.' "$LOCAL_REPO" "$C_BOLD" "$C_RESET"
     fi
     printf '\n\n'
   fi
@@ -337,7 +476,12 @@ main() {
   write_wrapper
   update_path
   initialize_instance
+  # run_setup is still attempted for interactive installs that want the
+  # legacy terminal flow. For the piped-curl path it's a no-op (no TTY)
+  # — the user goes through the browser /setup route instead.
   run_setup
+  enable_autostart
+  open_setup_in_browser
   print_done
 }
 

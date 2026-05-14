@@ -14,6 +14,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [Runtime Capabilities](docs/runtime-capabilities.md): current CLI/API capability map and verification commands
 - [Operations](docs/operations.md): install, start, stop, smoke, diagnostics, and cleanup
 - [Implementation Notes](docs/implementation-notes.md): source layout and module boundary rules
+- [Roadmap](ROADMAP.md): shipped surfaces and what's planned, with design intent
 
 ## Architecture decisions
 
@@ -60,10 +61,15 @@ This repo includes a Bun TypeScript local runtime with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
-gini start
 ```
 
-The installer walks you through provider setup (OpenAI API key or existing `codex --login` auth). `gini start` prints the runtime and web URLs.
+On macOS the installer enables autostart (per-user LaunchAgents for the runtime and webapp), waits for the webapp to come up, and opens the `/setup` page in your browser. Pick a provider in the browser form (OpenAI API key or existing `codex --login` auth) and you land on the running app. The runtime stays alive across reboots and crashes until you explicitly run `gini stop` or `gini autostart disable`.
+
+If the browser doesn't open automatically (or you want to navigate manually), run `gini status` to print the actual web URL — the port is hash-derived per instance, so it's almost never `:3000` for instances other than `dev`. The installer also prints the URL right before opening the browser.
+
+Caveat on macOS 26 (Tahoe): after a SIGKILL, launchd sometimes refuses to auto-respawn (`pended nondemand spawn = inefficient`). Run `gini autostart kick` to force a respawn when that happens; RunAtLoad still fires at login.
+
+If you opted out of autostart (`--no-autostart`) or you're on Linux (autostart is macOS-only in v1), run `gini setup` then `gini start` to launch the runtime by hand.
 
 After install, the URLs are stable:
 
@@ -204,3 +210,25 @@ For disposable development or tests:
 ```bash
 GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --instance sandbox smoke
 ```
+
+## Roadmap
+
+- ✅ Local Bun runtime gateway
+- ✅ Next.js webapp with BFF
+- ✅ CLI with parallel instances
+- ✅ Persistent chat, runs, approvals, audit, traces
+- ✅ Approval-gated tools (file, terminal, code)
+- ✅ Local memory with embeddings and reranking
+- ✅ Trace-backed improvement proposals
+- ✅ Provider support (Codex OAuth, OpenAI)
+- ✅ Paired-device auth
+- ✅ Auto-start after install (macOS LaunchAgents; runtime + webapp)
+- ✅ Browser-based onboarding at install (/setup route)
+- ⚪ iOS mobile app for remote control
+- ⚪ Trust layer (reproducible builds, verify-app)
+- ⚪ Gini as MCP server
+- ⚪ Task self-learning and iteration loop
+- ⚪ Native macOS app (Tauri shell, later)
+
+
+This is the short preview. See the full roadmap in [ROADMAP.md](ROADMAP.md).
