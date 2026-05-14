@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { updateRequiresRuntimeRestart } from "./commands/admin";
+import { formatUpdateSummary, updateRequiresRuntimeRestart } from "./commands/admin";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..", "..");
 const CLI_PATH = join(PROJECT_ROOT, "src", "cli.ts");
@@ -47,6 +47,19 @@ function scratch(tag: string): string {
 }
 
 describe("gini update", () => {
+  test("formats success output without installer noise", () => {
+    expect(formatUpdateSummary({
+      upToDate: false,
+      afterSha: "1ecfc5dabc123",
+      commitCount: "3"
+    })).toBe("Gini updated to 1ecfc5d (3 commits)");
+    expect(formatUpdateSummary({
+      upToDate: true,
+      afterSha: "1ecfc5dabc123",
+      commitCount: "0"
+    })).toBe("Gini already up to date at 1ecfc5d (0 commits)");
+  });
+
   test("restarts when checkout is current but the running runtime has no version metadata", () => {
     expect(updateRequiresRuntimeRestart(
       { upToDate: true, afterSha: "abc123" },
