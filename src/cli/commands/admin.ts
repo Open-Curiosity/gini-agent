@@ -5,6 +5,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as readline from "node:readline/promises";
+import type { RuntimeConfig } from "../../types";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
@@ -22,6 +23,7 @@ import { print, printStartBanner } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
 import { disableForUninstall } from "./autostart";
 import { installedRuntimeDir, updateRuntime } from "../../runtime/update";
+import { api } from "../api";
 
 export async function install_(ctx: CliContext): Promise<void> {
   // Provider configuration is optional at install time. The piped-curl
@@ -87,24 +89,18 @@ export async function update(ctx: CliContext): Promise<void> {
     return;
   }
 
-  header("Updating gini-agent");
-
   let result;
   try {
-    result = updateRuntime(installedRuntimeDir(), { stdio: "inherit" });
+    result = updateRuntime(installedRuntimeDir());
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);
   }
 
-  footer("gini-agent updated.");
-  if (result.upToDate) {
-    info(`Already at ${result.afterSha.slice(0, 7)}`);
-  } else {
-    info(`${result.beforeSha.slice(0, 7)} → ${result.afterSha.slice(0, 7)} (${result.commitCount} commit${result.commitCount === "1" ? "" : "s"})`);
-  }
+  refreshInstalledWrapper();
+  step(formatUpdateSummary(result));
 
-  if (!result.upToDate && await isRunning(ctx.config)) {
+  if (await runningRuntimeNeedsRestart(ctx.config, result)) {
     step("Restarting running instance");
     const stopResult = stopRuntime(ctx.config);
     const stopped = await waitForRuntimeStopped(ctx.config, typeof stopResult.pid === "number" ? stopResult.pid : undefined);
@@ -112,9 +108,79 @@ export async function update(ctx: CliContext): Promise<void> {
       throw new Error(`Timed out waiting for instance '${ctx.config.instance}' to stop before restart.`);
     }
     await startLifecycle(ctx.config, ctx.web);
-    info("Running instance restarted with the updated code.");
+    step("Running instance restarted");
   }
-  console.log("");
+}
+
+interface UpdateRestartInput {
+  upToDate: boolean;
+  afterSha: string;
+}
+
+export function updateRequiresRuntimeRestart(result: UpdateRestartInput, runningStatus: unknown): boolean {
+  if (!result.upToDate) return true;
+  return statusVersionSha(runningStatus) !== result.afterSha;
+}
+
+export function formatUpdateSummary(result: UpdateRestartInput & { commitCount: string }): string {
+  const commitLabel = `${result.commitCount} commit${result.commitCount === "1" ? "" : "s"}`;
+  const shortSha = result.afterSha.slice(0, 7);
+  return result.upToDate
+    ? `Gini already up to date at ${shortSha} (${commitLabel})`
+    : `Gini updated to ${shortSha} (${commitLabel})`;
+}
+
+async function runningRuntimeNeedsRestart(config: RuntimeConfig, result: UpdateRestartInput): Promise<boolean> {
+  if (!await isRunning(config)) return false;
+  if (!result.upToDate) return true;
+  try {
+    return updateRequiresRuntimeRestart(result, await api(config, "/api/status"));
+  } catch {
+    return false;
+  }
+}
+
+function statusVersionSha(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const version = (value as { version?: unknown }).version;
+  if (!version || typeof version !== "object") return null;
+  const git = (version as { git?: unknown }).git;
+  if (!git || typeof git !== "object") return null;
+  const sha = (git as { sha?: unknown }).sha;
+  return typeof sha === "string" && sha.length > 0 ? sha : null;
+}
+
+function refreshInstalledWrapper(): void {
+  const wrapperPath = join(homedir(), ".local", "bin", "gini");
+  if (!existsSync(wrapperPath)) return;
+  let contents: string;
+  try {
+    contents = readFileSync(wrapperPath, "utf8");
+  } catch {
+    return;
+  }
+  if (!contents.includes("gini-agent-installer-managed")) return;
+  const next = `#!/usr/bin/env bash
+# gini-agent-installer-managed
+set -euo pipefail
+if [ -f "$HOME/.gini/secrets.env" ]; then
+  set +e
+  set -a
+  . "$HOME/.gini/secrets.env" || printf 'gini: warning — failed to source ~/.gini/secrets.env, continuing without it\\n' >&2
+  set +a
+  set -e
+fi
+export GINI_INSTANCE="\${GINI_INSTANCE:-default}"
+cd "$HOME/.gini/runtime"
+exec bun --silent run gini "$@"
+`;
+  if (contents === next) return;
+  try {
+    writeFileSync(wrapperPath, next, { mode: 0o755 });
+  } catch {
+    // Best-effort. The update itself succeeded; a stale wrapper only affects
+    // whether Bun prints the script command before future CLI output.
+  }
 }
 
 export async function uninstall(ctx: CliContext): Promise<void> {
