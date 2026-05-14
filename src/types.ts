@@ -120,6 +120,18 @@ export interface RuntimeConfig {
   // evidence.autoApproved=true plus the matched pattern, so the activity
   // trail stays intact. Empty / undefined means no auto-approval.
   autoApproveCommands?: string[];
+  // When true, bypass the approval gate for every approval-gated tool —
+  // chat-task (file_write, file_patch, terminal_exec, code_exec,
+  // browser_upload_file) AND the legacy imperative dispatch path
+  // (`POST /api/tasks` / `gini task submit "write …"`). Each call
+  // still produces an approval row (status="approved") and matching
+  // audit rows (approval.approved and the per-action side-effect row)
+  // carry `evidence.autoApproved=true` plus
+  // `evidence.autoApprovedReason="dangerouslyAutoApprove"`, so the
+  // trail stays inspectable — only the human gate is skipped.
+  // Intended for trusted, dev-mode use only. See ADR 0006 for the
+  // full audit contract.
+  dangerouslyAutoApprove?: boolean;
   // Power-user agent budget knobs. Lives under a nested `agent` namespace so
   // future budgets (token cap, wall-clock cap, etc.) can hang off the same
   // object without further config-shape churn. Validated leniently at the
