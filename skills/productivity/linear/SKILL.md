@@ -23,7 +23,7 @@ Use the Linear GraphQL API to query issues, comments, projects, and teams, and t
 
 ## Auth
 
-Linear personal API keys are sent in the `Authorization` header as the **raw token**, not with a `Bearer` prefix. The gateway injects `LINEAR_API_KEY` into the subprocess environment when a healthy `linear` identity exists; do not ask the user for it.
+Linear personal API keys are sent in the `Authorization` header as the **raw token**, not with a `Bearer` prefix. The gateway injects `LINEAR_API_KEY` into the subprocess environment when a healthy `linear` connector exists; do not ask the user for it.
 
 ```bash
 curl -sS https://api.linear.app/graphql \

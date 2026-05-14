@@ -24,7 +24,7 @@ SKILL.md plus optional scripts the agent can later run.
 - User asks "create a skill for X" or "add a skill that does X".
 - User pastes a SKILL.md that is missing required fields or uses the
   legacy top-level fields (`version`, `author`, `platforms`,
-  `prerequisites`, `requires.identities`).
+  `prerequisites`, `requires.connectors`).
 - User asks "make this work" while looking at a non-spec SKILL.md.
 
 ## Spec Reference
@@ -133,9 +133,12 @@ Gini extensions (under `metadata.gini`):
 When converting a legacy SKILL.md, the recipe is:
 
 1. Move `version`, `author`, `platforms`, `prerequisites`, and
-   `requires.identities` (with `kind:` items) under
-   `metadata.gini.*` — paying attention to renames:
+   `requires.connectors` (with `provider:` items) under
+   `metadata.gini.*` — paying attention to the renames introduced by
+   ADR 0010:
    - `requires.identities[].kind` → `requires.connectors[].provider`.
+   The legacy `requires.identities` / `kind:` shape is what older
+   pre-ADR-0010 SKILL.md files used; rewrite both keys when migrating.
 
 2. Move `compatibility` to the top level if you can describe the host
    contract in ≤ 500 chars.
