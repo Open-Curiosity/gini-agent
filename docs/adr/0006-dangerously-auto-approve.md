@@ -99,11 +99,13 @@ human gate or routes through the same shared path.
 - UI surface for toggling the flag from `/settings`. Today the flag
   is set via `PATCH /api/settings/auto-approve` or by editing
   `config.json` directly.
-- A more general approval-execution claim/cancellation protocol that
-  lets `cancelTask` abort an already-approved async side effect
-  (e.g. a long-running `browser_upload_file`). Tracked separately;
-  the race is pre-existing and not specific to this flag, but the
-  bypass makes it more reachable in practice.
+- ~~A more general approval-execution claim/cancellation protocol that
+  lets `cancelTask` abort an already-approved async side effect~~ —
+  shipped in ADR 0010. The in-flight registry threads an
+  `AbortSignal` through `executeApprovedAction` and `cancelTask`
+  fans the abort out to every active executor for the cancelled
+  task. The audit trail gains `*_aborted` action names plus an
+  `approval.in_flight_aborted` orchestration row.
 
 ## Consequences For Coding Agents
 
