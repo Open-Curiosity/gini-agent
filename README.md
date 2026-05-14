@@ -18,19 +18,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 
 ## Architecture decisions
 
-- [ADR 0001 — Local Runtime Architecture](docs/adr/0001-local-runtime-architecture.md)
-- [ADR 0002 — Minimal Trust Substrate](docs/adr/0002-trust-substrate.md)
-- [ADR 0003 — Instances And Control Surface](docs/adr/0003-instances-and-control-surface.md)
-- [ADR 0004 — Agent Loop With Native Tool Calling](docs/adr/0004-agent-loop-tool-calling.md)
-- [ADR 0005 — Subagent Delegation](docs/adr/0005-subagent-delegation.md)
-- [ADR 0006 — Agents Replace Profiles And Drive Runtime Behavior](docs/adr/0006-agents-replace-profiles.md)
-- [ADR 0006 — dangerouslyAutoApprove](docs/adr/0006-dangerously-auto-approve.md)
-- [ADR 0007 — Per-Agent Memory Isolation](docs/adr/0007-agent-memory-isolation.md)
-- [ADR 0008 — Connector Secret Storage](docs/adr/0008-connector-secret-storage.md)
-- [ADR 0009 — Skills As Packages, Connectors As Credentials](docs/adr/0009-skills-and-connectors.md)
-- [ADR 0010 — Approval Execution Abort Protocol](docs/adr/0010-approval-execution-abort.md)
-- [ADR 0010 — Runtime Update Surface And Automatic Restart](docs/adr/0010-runtime-update-surface.md)
-- [ADR 0012 — Connector + Provider Vocabulary, Spec Compliance, And Meta-Skills](docs/adr/0012-connector-provider-spec-compliance.md)
+- [Architecture Decision Records](docs/adr/README.md): index of all ADRs and how to add new ones
 
 ## Architecture In One Sentence
 
