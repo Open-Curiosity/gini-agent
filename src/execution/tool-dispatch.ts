@@ -27,7 +27,7 @@ import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
 import { createScheduledJob } from "../jobs";
-import { isSkillActive, resolveSkillEnv } from "../integrations/identities";
+import { isSkillActive } from "../integrations/identities";
 
 export type DispatchResult =
   | { kind: "sync"; result: string }

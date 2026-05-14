@@ -118,7 +118,7 @@ export default function ConnectionsPage() {
                       ) : (
                         <ul className="space-y-1">
                           {dependents.map((skill) => {
-                            const active = identity.health === "healthy";
+                            const active = identity.health === "healthy" && skill.status === "trusted";
                             return (
                               <li key={skill.id} className="flex items-center justify-between gap-2 text-xs">
                                 <span className="font-mono">{skill.name}</span>
