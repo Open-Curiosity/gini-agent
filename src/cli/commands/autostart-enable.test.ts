@@ -3,7 +3,7 @@
 // is covered by autostart.test.ts under GINI_AUTOSTART_E2E=1; this file
 // targets the bookkeeping branches that real launchctl can't reach —
 // notably HIGH-B (rollback bootout itself fails) and the corresponding
-// EnableResult.partialState contract.
+// EnableResult.rollbackState contract.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
@@ -57,7 +57,7 @@ const isDarwin = process.platform === "darwin";
     rmSync(join(scratch.home, "Library"), { recursive: true, force: true });
   });
 
-  test("happy path: both kinds bootstrap → partialState 'clean', no rollbackFailures", async () => {
+  test("happy path: both kinds bootstrap → rollbackState 'clean', no rollbackFailures", async () => {
     const kickstartCalls: Array<{ inst: string; kind?: "gateway" | "web" }> = [];
     const deps = {
       isLoaded: () => false,
@@ -71,7 +71,7 @@ const isDarwin = process.platform === "darwin";
     const result = await enable(instance, { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot }, ["gateway", "web"], deps);
     expect(result.ok).toBe(true);
     expect(result.enabled).toBe(true);
-    expect(result.partialState).toBe("clean");
+    expect(result.rollbackState).toBe("clean");
     expect(result.rollbackFailures).toBeUndefined();
     expect(result.results.length).toBe(2);
     for (const r of result.results) {
@@ -108,7 +108,7 @@ const isDarwin = process.platform === "darwin";
     // Whole-enable still ok — bootstrap succeeded for both.
     expect(result.ok).toBe(true);
     expect(result.enabled).toBe(true);
-    expect(result.partialState).toBe("clean");
+    expect(result.rollbackState).toBe("clean");
     expect(result.results.length).toBe(2);
     const gateway = result.results.find((r) => r.kind === "gateway")!;
     const web = result.results.find((r) => r.kind === "web")!;
@@ -119,7 +119,7 @@ const isDarwin = process.platform === "darwin";
     expect(web.kickstartStderr).toContain("No such process");
   });
 
-  test("HIGH-B: web fails AND rollback bootout fails → partialState 'rollback_failed' + stderr surfaced", async () => {
+  test("HIGH-B: web fails AND rollback bootout fails → rollbackState 'rollback_failed' + stderr surfaced", async () => {
     // Bookkeeping: track per-call so the test can distinguish web's
     // bootstrap call (fails) from the rollback bootout call (also fails).
     let bootstrapCalls = 0;
@@ -148,7 +148,7 @@ const isDarwin = process.platform === "darwin";
     expect(result.enabled).toBe(false);
     // The honest state: gateway was bootstrapped, web failed, rollback of
     // gateway also failed → "rollback_failed".
-    expect(result.partialState).toBe("rollback_failed");
+    expect(result.rollbackState).toBe("rollback_failed");
     expect(result.rollbackFailures).toBeDefined();
     expect(result.rollbackFailures!.length).toBe(1);
     expect(result.rollbackFailures![0]!.kind).toBe("gateway");
@@ -166,7 +166,7 @@ const isDarwin = process.platform === "darwin";
     expect(bootoutStderrSeen).toBeDefined();
   });
 
-  test("web fails but rollback bootout SUCCEEDS → partialState 'rolled_back', no rollbackFailures", async () => {
+  test("web fails but rollback bootout SUCCEEDS → rollbackState 'rolled_back', no rollbackFailures", async () => {
     let bootstrapCalls = 0;
     const deps = {
       isLoaded: () => false,
@@ -180,7 +180,7 @@ const isDarwin = process.platform === "darwin";
     };
     const result = await enable(instance, { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot }, ["gateway", "web"], deps);
     expect(result.ok).toBe(false);
-    expect(result.partialState).toBe("rolled_back");
+    expect(result.rollbackState).toBe("rolled_back");
     expect(result.rollbackFailures).toBeUndefined();
   });
 
@@ -200,6 +200,6 @@ const isDarwin = process.platform === "darwin";
     expect(result.ok).toBe(false);
     // "Could not find service" doesn't count as a real rollback failure —
     // the service was never loaded in the first place.
-    expect(result.partialState).toBe("rolled_back");
+    expect(result.rollbackState).toBe("rolled_back");
   });
 });

@@ -96,7 +96,7 @@ export async function autostart(ctx: CliContext): Promise<void> {
     // operator sees the honest state at a glance instead of having to
     // dig through the JSON. The result JSON already has all the
     // per-kind detail; this is purely a "look here" pointer.
-    if (result.partialState === "rollback_failed") {
+    if (result.rollbackState === "rollback_failed") {
       const lines = (result.rollbackFailures ?? []).map(
         (f) => `  - ${f.kind}: ${f.stderr || f.error}`
       );
@@ -206,7 +206,7 @@ interface PerKindEnableResult {
 //   - "rollback_failed": a rollback was needed and at least one bootout
 //     during rollback returned non-zero. Per-kind details are in the
 //     rollbackFailures array. The operator must clean up manually.
-export type EnablePartialState = "clean" | "rolled_back" | "rollback_failed";
+export type RollbackState = "clean" | "rolled_back" | "rollback_failed";
 
 interface RollbackFailure {
   kind: PlistKind;
@@ -220,7 +220,7 @@ interface EnableResult {
   instance: string;
   resolution: "installed" | "source";
   results: PerKindEnableResult[];
-  partialState: EnablePartialState;
+  rollbackState: RollbackState;
   rollbackFailures?: RollbackFailure[];
   error?: string;
 }
@@ -246,7 +246,7 @@ function resolveLogRoot(instance: string, testRoot?: { stateRoot?: string; logRo
 // Test seam: rollback-failure surfacing has no other reachable path —
 // we can't easily make a real `launchctl bootout` fail without
 // holding launchd hostage. Tests inject mocks here to assert the
-// partialState bookkeeping. Production callers omit `__deps` and get
+// rollbackState bookkeeping. Production callers omit `__deps` and get
 // the real launchctl shellouts.
 export interface EnableLaunchctlDeps {
   isLoaded: typeof isLoaded;
@@ -315,7 +315,7 @@ export async function enable(
         instance,
         resolution: pair.resolution,
         results: [],
-        partialState: "clean",
+        rollbackState: "clean",
         error: `legacy bootout failed: ${out.stderr.trim()}`
       };
     }
@@ -339,7 +339,7 @@ export async function enable(
   // represents a rollback bootout that itself returned non-zero — the
   // operator must clean it up manually because the service is still
   // loaded.
-  let partialState: EnablePartialState = "clean";
+  let rollbackState: RollbackState = "clean";
   const rollbackFailures: RollbackFailure[] = [];
 
   for (const kind of kinds) {
@@ -402,7 +402,7 @@ export async function enable(
       // that were `wasLoaded:true` on entry — those are the user's
       // prior state, not something this call created. If the rollback
       // bootout itself fails, capture the per-kind error and flip
-      // partialState to "rollback_failed" so the operator sees the
+      // rollbackState to "rollback_failed" so the operator sees the
       // honest state: the gateway is still loaded but the web never
       // came up, and we couldn't clean up either. Silently swallowing
       // rollback failures (returning ok:false with the gateway still
@@ -421,7 +421,7 @@ export async function enable(
         }
       }
       if (bootstrapped.length > 0) {
-        partialState = allRolledBack ? "rolled_back" : "rollback_failed";
+        rollbackState = allRolledBack ? "rolled_back" : "rollback_failed";
       }
       continue;
     }
@@ -462,7 +462,7 @@ export async function enable(
     instance,
     resolution: pair.resolution,
     results,
-    partialState,
+    rollbackState,
     ...(rollbackFailures.length > 0 ? { rollbackFailures } : {})
   };
 }
