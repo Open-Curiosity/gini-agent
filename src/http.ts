@@ -28,7 +28,7 @@ import { connectBrowser, disconnectBrowser, getBrowserConnection, wipeBrowserPro
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { getSetupStatus, setSetupProvider } from "./runtime/setup-api";
-import { createSkillFromInput, getSkill, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
+import { createSkillFromInput, getSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
@@ -238,7 +238,28 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const query = new URL(request.url).searchParams.get("q");
       return json(query ? searchSkills(config, query) : listSkills(config));
     }],
-    ["POST", /^\/api\/skills$/, async (request) => json(await createSkillFromInput(config, await body(request)), 201)],
+    // POST /api/skills accepts two payload shapes per ADR 0010:
+    //   - { body: "<SKILL.md text>", files?: [...] }: install-from-disk
+    //     flow used by the install-skill meta-skill and remote/mobile UIs.
+    //     Writes to ~/.gini/instances/<instance>/skills/<category>/<name>/
+    //     and reloads.
+    //   - legacy CRUD payload (`name`, `description`, `steps`, …): create
+    //     an in-memory SkillRecord without a manifest file.
+    ["POST", /^\/api\/skills$/, async (request) => {
+      const payload = await body(request);
+      if (typeof payload?.body === "string" && payload.body.trim().startsWith("---")) {
+        const files = Array.isArray(payload.files)
+          ? payload.files.filter((f: unknown): f is { name: string; content: string } =>
+              !!f && typeof f === "object" && typeof (f as { name?: unknown }).name === "string" && typeof (f as { content?: unknown }).content === "string")
+          : undefined;
+        return json(await installSkillFromBody(config, {
+          body: String(payload.body),
+          category: typeof payload.category === "string" ? payload.category : undefined,
+          files
+        }), 201);
+      }
+      return json(await createSkillFromInput(config, payload), 201);
+    }],
     ["GET", /^\/api\/skills\/validate$/, () => json(validateSkills(config))],
     // Manual filesystem skill reload — re-runs loadSkillsFromDisk so a user
     // can drop a new SKILL.md under <instance>/skills/ without restarting.
