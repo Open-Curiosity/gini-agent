@@ -31,12 +31,22 @@ import { createSkillFromInput, getSkill, listSkills, reloadSkills, rollbackSkill
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
+import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
+import { projectRoot } from "./paths";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
 export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
+    ["GET", /^\/api\/version$/, () => json(currentVersionInfo())],
+    ["POST", /^\/api\/update\/check$/, () => json(refreshVersionInfo())],
+    ["POST", /^\/api\/update$/, () => {
+      assertCurrentRuntimeUpdateSupported();
+      const result = updateRuntime(projectRoot());
+      const restartRequested = result.upToDate ? false : scheduleRuntimeRestart(config.instance);
+      return json({ ...result, restart: { requested: restartRequested } });
+    }],
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
     // Settings: auto-approve controls.
     //   - `patterns`: shell-glob allowlist for terminal_exec only.
@@ -445,6 +455,7 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Invalid port")) return 400;
   if (message.startsWith("Could not reach CDP endpoint")) return 400;
   if (message.startsWith("Could not locate")) return 400;
+  if (message.startsWith("Web update is only available")) return 400;
   return 500;
 }
 
