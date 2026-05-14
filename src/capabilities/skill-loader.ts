@@ -29,13 +29,6 @@ import type { RuntimeConfig, RuntimeState, SkillRecord, SkillStatus } from "../t
 import { addAudit, appendEvent, createSkill, mutateState, now } from "../state";
 import { projectRoot, skillsDir } from "../paths";
 
-// Bundled skills the loader auto-trusts on first import. Vendored in-repo
-// content is reviewed by maintainers, so the demo flow doesn't have to
-// click through `/api/skills/<id>/trust` for each apple skill. If the user
-// already disabled a skill (e.g. they don't want to use Apple Notes) we
-// honor that — disabled stays disabled across reloads.
-const AUTO_TRUSTED_BUNDLED_SKILLS = new Set<string>(["apple-notes", "apple-reminders"]);
-
 export interface ParsedSkillFile {
   name: string;
   description: string;
@@ -328,11 +321,12 @@ export function bundledSkillsRoot(): string {
 // (name, source) — bundled and user-instance skills with the same name
 // are kept as separate rows so a user-instance SKILL.md cannot hijack the
 // trust grant of a vendored bundled skill (see Review P1 #1). Preserves
-// user-managed fields (`status`, `tests`, success/failure counts,
-// previousVersions, lastUsedAt). On match: only mutate when the content
-// changed, and bump the numeric version. On miss: create a new skill with
-// status="draft" (or "trusted" only when the new record is bundled and is
-// in AUTO_TRUSTED_BUNDLED_SKILLS).
+// user-managed fields (`tests`, success/failure counts, previousVersions,
+// lastUsedAt, and explicit disabled/archived status). Existing bundled records
+// left as draft by older loader versions are promoted to trusted on reload.
+// On match: only bump the numeric version when the content changed. On miss:
+// create bundled Gini skills with status="trusted" and user-instance skills
+// with status="draft".
 function upsertSkillFromFile(
   state: RuntimeState,
   parsed: ParsedSkillFile,
@@ -358,32 +352,33 @@ function upsertSkillFromFile(
       JSON.stringify(existing.platforms ?? null) !== JSON.stringify(parsed.platforms ?? null) ||
       JSON.stringify(existing.prerequisites ?? null) !== JSON.stringify(parsed.prerequisites ?? null) ||
       JSON.stringify(existing.requiredIdentities ?? null) !== JSON.stringify(parsed.requiredIdentities ?? null);
-    if (!changed) return { record: existing, kind: "noop" };
-    existing.previousVersions.unshift({
-      version: existing.version,
-      updatedAt: existing.updatedAt,
-      description: existing.description,
-      trigger: existing.trigger,
-      steps: existing.steps,
-      requiredTools: existing.requiredTools,
-      requiredPermissions: existing.requiredPermissions
-    });
-    existing.description = parsed.description;
-    existing.body = trimmedBody;
-    existing.manifestPath = origin.manifestPath;
-    existing.category = origin.category;
-    existing.platforms = parsed.platforms;
-    existing.prerequisites = parsed.prerequisites;
-    existing.requiredIdentities = parsed.requiredIdentities;
-    existing.version += 1;
+    const promoteBundledDraft = origin.source === "bundled" && existing.status === "draft";
+    if (!changed && !promoteBundledDraft) return { record: existing, kind: "noop" };
+    if (changed) {
+      existing.previousVersions.unshift({
+        version: existing.version,
+        updatedAt: existing.updatedAt,
+        description: existing.description,
+        trigger: existing.trigger,
+        steps: existing.steps,
+        requiredTools: existing.requiredTools,
+        requiredPermissions: existing.requiredPermissions
+      });
+      existing.description = parsed.description;
+      existing.body = trimmedBody;
+      existing.manifestPath = origin.manifestPath;
+      existing.category = origin.category;
+      existing.platforms = parsed.platforms;
+      existing.prerequisites = parsed.prerequisites;
+      existing.requiredIdentities = parsed.requiredIdentities;
+      existing.version += 1;
+    }
+    if (promoteBundledDraft) existing.status = "trusted";
     existing.updatedAt = at;
     return { record: existing, kind: "updated" };
   }
 
-  const initialStatus: SkillStatus =
-    origin.source === "bundled" && AUTO_TRUSTED_BUNDLED_SKILLS.has(parsed.name)
-      ? "trusted"
-      : "draft";
+  const initialStatus: SkillStatus = origin.source === "bundled" ? "trusted" : "draft";
   const record = createSkill(state, {
     name: parsed.name,
     description: parsed.description,

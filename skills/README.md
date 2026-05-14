@@ -24,17 +24,6 @@ skill lands as its own row instead of overwriting the vendored one.
 Re-running the loader bumps the numeric `version` when content changes
 without resetting user-set fields like `status`.
 
-## Auto-trust allowlist
-
-Vendored bundled skills in this directory are reviewed by maintainers, so
-the loader auto-trusts the following on first import (the demo flow can
-exercise them without the user clicking through `/api/skills/<id>/trust`):
-
-- `apple-notes`
-- `apple-reminders`
-
-A skill the user has explicitly disabled stays disabled across reloads.
-
 ## Platform gating
 
 Skills with a `platforms:` frontmatter list that doesn't include the host
@@ -45,10 +34,9 @@ runtime event.
 ## Adding a new bundled skill
 
 1. Create `skills/<category>/<your-skill>/SKILL.md` with the frontmatter
-   shape used by the existing apple skills.
+   shape used by the existing skills.
 2. Restart the runtime (or `curl -X POST /api/skills/reload`).
-3. The skill appears in the `/skills` page; trust it from the UI or via
-   `POST /api/skills/<id>/trust` to expose it to the agent loop.
+3. The skill appears in the `/skills` page.
 
 ## Auto-approving the underlying shell commands
 

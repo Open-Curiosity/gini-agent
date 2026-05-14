@@ -15,6 +15,7 @@ The product promise is operational trust. The system can start small, but it mus
 - Approved side effects emit audit evidence.
 - Task/run-linked approvals and tool calls append trace records.
 - Memory created by the agent starts as proposed and can be reviewed before becoming trusted.
+- Bundled Gini skills are trusted on first import because they are vendored runtime content; user-instance skills start as draft and must be explicitly trusted before the agent can read them.
 
 ## Deferred
 
@@ -29,6 +30,7 @@ The product promise is operational trust. The system can start small, but it mus
 - If a new action can mutate state outside the task/run record, add an audit event.
 - If a new action can affect user files or system state, route it through approval first. The operator can opt into the sanctioned bypass (`dangerouslyAutoApprove`, ADR 0006) which still produces the full approval + audit trail with an explicit auto-approved marker — but new tools should be designed assuming the human gate is the default.
 - If a new action happens during execution, append trace evidence.
+- If a new bundled skill wraps a side-effecting command, keep the underlying command approval-gated unless an explicit auto-approve rule covers it.
 
 ## Acceptance Checks
 
@@ -36,3 +38,4 @@ The product promise is operational trust. The system can start small, but it mus
 - Denying the approval prevents the write.
 - Approving the approval writes the file and records audit evidence.
 - Submitting `remember ...` creates proposed memory, not hidden active memory.
+- Loading bundled skills creates trusted skill records, while a same-name user skill remains a separate draft record.
