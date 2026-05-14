@@ -428,12 +428,17 @@ async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record
   appendTrace(config.instance, taskId, {
     type: "tool",
     message: "Skill body read (chat-task)",
-    data: { name: skill.name, version: skill.version, bytes: skill.body.length }
+    data: { name: skill.name, version: skill.version, bytes: skill.body.length, allowedTools: skill.allowedTools }
   });
   await recordLowRiskAudit(config, taskId, "skill.read", skill.id, {
     name: skill.name,
     version: skill.version,
-    bytes: skill.body.length
+    bytes: skill.body.length,
+    // ADR 0010: capture the declared allowed-tools at read time so the audit
+    // trail records the contract the agent agreed to follow when invoking
+    // this skill. Not enforced at the tool dispatcher yet — see ADR 0010
+    // "Deferred" for the enforcement plan.
+    allowedTools: skill.allowedTools
   });
   return skill.body || "(skill body is empty)";
 }

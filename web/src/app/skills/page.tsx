@@ -12,8 +12,9 @@ import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { MarkdownContent } from "@/components/chat/MarkdownContent";
 import { api } from "@/lib/api";
-import { useInvalidate, useSkills } from "@/lib/queries";
-import type { SkillRecord } from "@runtime/types";
+import Link from "next/link";
+import { useConnectors, useInvalidate, useSkills } from "@/lib/queries";
+import type { ConnectorRecord, SkillRecord } from "@runtime/types";
 
 type ReloadReport = {
   added: Array<{ id: string; name: string }>;
@@ -26,6 +27,7 @@ export default function SkillsPage() {
   const [debounced, setDebounced] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const skills = useSkills(debounced);
+  const connectors = useConnectors();
   const invalidate = useInvalidate();
 
   useEffect(() => {
@@ -170,14 +172,52 @@ export default function SkillsPage() {
                 {detail.description ? (
                   <p className="text-sm text-muted-foreground">{detail.description}</p>
                 ) : null}
+                {detail.compatibility ? (
+                  <p className="text-xs text-muted-foreground">{detail.compatibility}</p>
+                ) : null}
+                <ActivationRow skill={detail} connectorsByProvider={connectorsByProvider(connectors.data ?? [])} />
                 <div className="flex flex-wrap gap-2">
                   <Button size="sm" disabled={action.isPending} onClick={() => action.mutate({ id: detail.id, op: "test" })}>Test</Button>
-                  <Button size="sm" variant="outline" disabled={action.isPending} onClick={() => action.mutate({ id: detail.id, op: "trust" })}>Trust</Button>
-                  <Button size="sm" variant="outline" disabled={action.isPending} onClick={() => action.mutate({ id: detail.id, op: "disable" })}>Disable</Button>
+                  {/*
+                    Trust toggle. Bundled skills (source === "bundled") are
+                    auto-trusted and the buttons are read-only. ADR 0010 §UI.
+                  */}
+                  <Button size="sm" variant="outline" disabled={action.isPending || detail.source === "bundled"} onClick={() => action.mutate({ id: detail.id, op: "trust" })}>Trust</Button>
+                  <Button size="sm" variant="outline" disabled={action.isPending || detail.source === "bundled"} onClick={() => action.mutate({ id: detail.id, op: "disable" })}>Disable</Button>
                   <Button size="sm" variant="outline" disabled={action.isPending || detail.previousVersions.length === 0} onClick={() => action.mutate({ id: detail.id, op: "rollback" })}>
                     Rollback
                   </Button>
                 </div>
+                {detail.allowedTools ? (
+                  <Section title="Allowed tools (from SKILL.md frontmatter)">
+                    <p className="font-mono text-[11px] text-muted-foreground">{detail.allowedTools}</p>
+                  </Section>
+                ) : null}
+                {(detail.requiredConnectors ?? []).length > 0 ? (
+                  <Section title="Required connectors">
+                    <ul className="space-y-1">
+                      {(detail.requiredConnectors ?? []).map((req) => {
+                        const matches = (connectors.data ?? []).filter((c) => c.provider === req.provider);
+                        const healthy = matches.find((c) => c.health === "healthy");
+                        return (
+                          <li key={req.provider} className="flex items-center justify-between gap-2 text-xs">
+                            <span className="font-mono">{req.provider}{req.scopes?.length ? ` (${req.scopes.join(", ")})` : ""}</span>
+                            {healthy ? (
+                              <Badge variant="outline" className="text-[10px] text-emerald-600">healthy ({healthy.name})</Badge>
+                            ) : (
+                              <Link
+                                href={`/connections?provider=${encodeURIComponent(req.provider)}`}
+                                className="rounded border border-border bg-card px-1.5 py-0.5 text-[10px] hover:bg-accent"
+                              >
+                                Connect →
+                              </Link>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </Section>
+                ) : null}
 
                 <Tabs defaultValue={detail.body ? "content" : "overview"}>
                   <TabsList>
@@ -309,6 +349,64 @@ function Section({ title, children }: { title: string; children: React.ReactNode
       {children}
     </div>
   );
+}
+
+// Compute the effective activation status for the Skills page. The runtime
+// is the source of truth for "is this skill in the agent's set"; we replay
+// the same dependency check here so users see the badge that matches what
+// the agent loop sees. The runtime API returns connectors with their
+// current health; the gate is healthy iff every required-connector provider
+// has at least one healthy connector record.
+function deriveActivation(
+  skill: SkillRecord,
+  connectorsByProv: Map<string, ConnectorRecord[]>
+): { label: "active" | "needs setup" | "untrusted" | "unsupported"; tone: "ok" | "warn" | "neutral" | "danger" } {
+  if (skill.validationStatus === "unsupported") return { label: "unsupported", tone: "danger" };
+  if (skill.status === "draft" || skill.status === "disabled") return { label: "untrusted", tone: "neutral" };
+  const required = skill.requiredConnectors ?? [];
+  if (required.length === 0) return { label: "active", tone: "ok" };
+  for (const req of required) {
+    const matches = connectorsByProv.get(req.provider) ?? [];
+    if (!matches.some((c) => c.health === "healthy")) {
+      return { label: "needs setup", tone: "warn" };
+    }
+  }
+  return { label: "active", tone: "ok" };
+}
+
+function ActivationRow({
+  skill,
+  connectorsByProvider
+}: {
+  skill: SkillRecord;
+  connectorsByProvider: Map<string, ConnectorRecord[]>;
+}) {
+  const status = deriveActivation(skill, connectorsByProvider);
+  const tone = status.tone === "ok"
+    ? "bg-emerald-500/10 text-emerald-600"
+    : status.tone === "warn"
+    ? "bg-amber-500/10 text-amber-600"
+    : status.tone === "danger"
+    ? "bg-red-500/10 text-red-600"
+    : "bg-muted text-muted-foreground";
+  return (
+    <div className="flex items-center gap-2 text-xs">
+      <span className={`rounded px-2 py-0.5 text-[10px] font-medium ${tone}`}>{status.label}</span>
+      {skill.validationStatus === "unsupported" && skill.validationMessage ? (
+        <span className="text-[11px] text-muted-foreground">{skill.validationMessage}</span>
+      ) : null}
+    </div>
+  );
+}
+
+function connectorsByProvider(connectors: ConnectorRecord[]): Map<string, ConnectorRecord[]> {
+  const map = new Map<string, ConnectorRecord[]>();
+  for (const c of connectors) {
+    const list = map.get(c.provider) ?? [];
+    list.push(c);
+    map.set(c.provider, list);
+  }
+  return map;
 }
 
 function groupByCategory(skills: SkillRecord[]): Array<{ category: string; items: SkillRecord[] }> {
