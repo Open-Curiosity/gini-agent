@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { updateRequiresRuntimeRestart } from "./commands/admin";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..", "..");
 const CLI_PATH = join(PROJECT_ROOT, "src", "cli.ts");
@@ -46,6 +47,20 @@ function scratch(tag: string): string {
 }
 
 describe("gini update", () => {
+  test("restarts when checkout is current but the running runtime has no version metadata", () => {
+    expect(updateRequiresRuntimeRestart(
+      { upToDate: true, afterSha: "abc123" },
+      { ok: true }
+    )).toBe(true);
+  });
+
+  test("does not restart when checkout and running runtime report the same sha", () => {
+    expect(updateRequiresRuntimeRestart(
+      { upToDate: true, afterSha: "abc123" },
+      { ok: true, version: { git: { sha: "abc123" } } }
+    )).toBe(false);
+  });
+
   test("GINI_STATE_ROOT short-circuits", async () => {
     const stateRoot = scratch("short-circuit");
     const result = await runCli({

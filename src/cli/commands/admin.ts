@@ -5,6 +5,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as readline from "node:readline/promises";
+import type { RuntimeConfig } from "../../types";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
@@ -22,6 +23,7 @@ import { print, printStartBanner } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
 import { disableForUninstall } from "./autostart";
 import { installedRuntimeDir, updateRuntime } from "../../runtime/update";
+import { api } from "../api";
 
 export async function install_(ctx: CliContext): Promise<void> {
   // Provider configuration is optional at install time. The piped-curl
@@ -104,7 +106,7 @@ export async function update(ctx: CliContext): Promise<void> {
     info(`${result.beforeSha.slice(0, 7)} → ${result.afterSha.slice(0, 7)} (${result.commitCount} commit${result.commitCount === "1" ? "" : "s"})`);
   }
 
-  if (!result.upToDate && await isRunning(ctx.config)) {
+  if (await runningRuntimeNeedsRestart(ctx.config, result)) {
     step("Restarting running instance");
     const stopResult = stopRuntime(ctx.config);
     const stopped = await waitForRuntimeStopped(ctx.config, typeof stopResult.pid === "number" ? stopResult.pid : undefined);
@@ -115,6 +117,36 @@ export async function update(ctx: CliContext): Promise<void> {
     info("Running instance restarted with the updated code.");
   }
   console.log("");
+}
+
+interface UpdateRestartInput {
+  upToDate: boolean;
+  afterSha: string;
+}
+
+export function updateRequiresRuntimeRestart(result: UpdateRestartInput, runningStatus: unknown): boolean {
+  if (!result.upToDate) return true;
+  return statusVersionSha(runningStatus) !== result.afterSha;
+}
+
+async function runningRuntimeNeedsRestart(config: RuntimeConfig, result: UpdateRestartInput): Promise<boolean> {
+  if (!await isRunning(config)) return false;
+  if (!result.upToDate) return true;
+  try {
+    return updateRequiresRuntimeRestart(result, await api(config, "/api/status"));
+  } catch {
+    return false;
+  }
+}
+
+function statusVersionSha(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const version = (value as { version?: unknown }).version;
+  if (!version || typeof version !== "object") return null;
+  const git = (version as { git?: unknown }).git;
+  if (!git || typeof git !== "object") return null;
+  const sha = (git as { sha?: unknown }).sha;
+  return typeof sha === "string" && sha.length > 0 ? sha : null;
 }
 
 export async function uninstall(ctx: CliContext): Promise<void> {
