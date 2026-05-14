@@ -28,6 +28,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [ADR 0007 — Per-Agent Memory Isolation](docs/adr/0007-agent-memory-isolation.md)
 - [ADR 0008 — Identity Secret Storage](docs/adr/0008-identity-secret-storage.md)
 - [ADR 0009 — Skills As Packages, Identities As Credentials](docs/adr/0009-skills-and-identities.md)
+- [ADR 0010 — Approval Execution Abort Protocol](docs/adr/0010-approval-execution-abort.md)
 
 ## Architecture In One Sentence
 
