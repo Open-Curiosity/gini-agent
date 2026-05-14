@@ -141,7 +141,9 @@ export function validateSkills(config: RuntimeConfig) {
 function validateSkillRecord(skill: SkillRecord): string[] {
   const failures: string[] = [];
   if (!skill.name.trim()) failures.push("Skill name is required.");
-  if (skill.status === "trusted" && skill.tests.length === 0) failures.push("Trusted skills need at least one test.");
+  if (skill.status === "trusted" && skill.tests.length === 0 && !skill.manifestPath) {
+    failures.push("Trusted API-created skills need at least one test.");
+  }
   if (skill.steps.some((step) => !step.trim())) failures.push("Skill steps cannot be empty.");
   return failures;
 }

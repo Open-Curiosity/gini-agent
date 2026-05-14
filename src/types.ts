@@ -624,8 +624,8 @@ export interface SkillRecord {
   // <repo>/skills/), "user" for skills under ~/.gini/instances/<inst>/skills/.
   // Used by the loader to keep bundled and user records separate (so a
   // user-instance SKILL.md named "apple-notes" can't hijack the vendored
-  // trust grant) and by the auto-trust allowlist (only bundled records may
-  // be auto-trusted). Defaults to "user" for legacy records via
+  // trust grant). Bundled records are trusted by default; user records start
+  // draft. Defaults to "user" for legacy records via
   // normalizeState so older state files keep loading.
   source?: "bundled" | "user";
 }

@@ -3,7 +3,7 @@
 //   - bundled + user roots both walked
 //   - platform filtering (skipped reason recorded)
 //   - re-load preserves user-set status, bumps version on content change
-//   - apple-notes / apple-reminders bundled SKILL.md files load on macOS
+//   - bundled Gini SKILL.md files are trusted on first load
 //
 // Tests stand up an isolated temp instance via GINI_STATE_ROOT and an
 // override bundled-skills root via GINI_BUNDLED_SKILLS, so the test never
@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { loadSkillsFromDisk, parseSkillFile, parseFrontmatter, splitFrontmatter } from "./skill-loader";
 import { readState, mutateState } from "../state";
 import type { RuntimeConfig } from "../types";
-import { setSkillStatus } from "./skills";
+import { setSkillStatus, validateSkills } from "./skills";
 
 function buildConfig(instance: string): RuntimeConfig {
   return {
@@ -226,10 +226,10 @@ describe("loadSkillsFromDisk", () => {
     expect(result.added.length).toBe(1);
     const initial = readState(config.instance).skills.find((s) => s.name === "my-skill");
     expect(initial?.version).toBe(1);
-    expect(initial?.status).toBe("draft");
+    expect(initial?.status).toBe("trusted");
 
-    // User trusts the skill.
-    await setSkillStatus(config, initial!.id, "trusted");
+    // User disables the skill.
+    await setSkillStatus(config, initial!.id, "disabled");
 
     const v2 = v1.replace("First body.", "Second body, much improved.");
     writeSkill(bundled, null, "my-skill", v2);
@@ -240,8 +240,8 @@ describe("loadSkillsFromDisk", () => {
     const updated = readState(config.instance).skills.find((s) => s.name === "my-skill");
     expect(updated?.version).toBeGreaterThan(1);
     expect(updated?.body).toContain("Second body");
-    // Trusted status preserved.
-    expect(updated?.status).toBe("trusted");
+    // User-managed status preserved.
+    expect(updated?.status).toBe("disabled");
   });
 
   test("noop when content is unchanged across loads", async () => {
@@ -263,15 +263,44 @@ describe("loadSkillsFromDisk", () => {
     expect(result.updated.length).toBe(0);
   });
 
-  test("auto-trusts vendored apple skills on first load", async () => {
+  test("promotes legacy bundled draft records to trusted on reload", async () => {
+    const config = buildConfig("loader-legacy-draft");
+    const platformTag = process.platform === "darwin" ? "macos" : "linux";
+    const text = [
+      "---",
+      "name: legacy-bundled",
+      'description: "legacy"',
+      `platforms: [${platformTag}]`,
+      "---",
+      "",
+      "Body."
+    ].join("\n");
+    writeSkill(bundled, null, "legacy-bundled", text);
+    await loadSkillsFromDisk(config);
+    await mutateState(config.instance, (state) => {
+      const skill = state.skills.find((s) => s.name === "legacy-bundled");
+      if (!skill) throw new Error("missing skill");
+      skill.status = "draft";
+    });
+
+    const result = await loadSkillsFromDisk(config);
+    expect(result.added.length).toBe(0);
+    expect(result.updated.length).toBe(1);
+    const skill = readState(config.instance).skills.find((s) => s.name === "legacy-bundled");
+    expect(skill?.status).toBe("trusted");
+    expect(skill?.version).toBe(1);
+    expect(skill?.previousVersions.length).toBe(0);
+  });
+
+  test("auto-trusts bundled skills on first load", async () => {
     writeSkill(
       bundled,
-      "apple",
-      "apple-notes",
+      "tools",
+      "repo-review",
       [
         "---",
-        "name: apple-notes",
-        'description: "Apple Notes."',
+        "name: repo-review",
+        'description: "Review repository changes."',
         `platforms: [${process.platform === "darwin" ? "macos" : "linux"}]`,
         "---",
         "",
@@ -280,9 +309,10 @@ describe("loadSkillsFromDisk", () => {
     );
     const config = buildConfig("loader-autotrust");
     await loadSkillsFromDisk(config);
-    const skill = readState(config.instance).skills.find((s) => s.name === "apple-notes");
+    const skill = readState(config.instance).skills.find((s) => s.name === "repo-review");
     expect(skill?.status).toBe("trusted");
     expect(skill?.source).toBe("bundled");
+    expect(validateSkills(config).find((item) => item.name === "repo-review")?.ok).toBe(true);
   });
 
   // Trust-hijack regression test (Review P1 #1): a user-instance skill named
@@ -424,7 +454,7 @@ describe("bundled autonomous agent skills", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("loads codex and claude-code as draft bundled skills", async () => {
+  test("loads codex and claude-code as trusted bundled skills", async () => {
     const config = buildConfig("loader-autonomous-agent-vendored");
     const result = await loadSkillsFromDisk(config);
     const names = result.added.map((s) => s.name);
@@ -435,13 +465,13 @@ describe("bundled autonomous agent skills", () => {
     const codex = skills.find((s) => s.name === "codex");
     expect(codex?.source).toBe("bundled");
     expect(codex?.category).toBe("agnets");
-    expect(codex?.status).toBe("draft");
+    expect(codex?.status).toBe("trusted");
     expect(codex?.prerequisites?.commands).toEqual(["codex", "git"]);
 
     const claudeCode = skills.find((s) => s.name === "claude-code");
     expect(claudeCode?.source).toBe("bundled");
     expect(claudeCode?.category).toBe("agnets");
-    expect(claudeCode?.status).toBe("draft");
+    expect(claudeCode?.status).toBe("trusted");
     expect(claudeCode?.prerequisites?.commands).toEqual(["claude", "git"]);
   });
 });
