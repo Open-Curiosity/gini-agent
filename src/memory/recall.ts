@@ -19,8 +19,9 @@
 // RRF order — cross-encoder cost grows with candidates and tail items
 // rarely survive the token-budget pack anyway.
 //
-// Adapted from vectorize-io/hindsight (MIT). Channel-multiplier values and
-// the RRF k=60 default match the upstream reference implementation.
+// This is Gini's local retrieval implementation for the hindsight memory
+// model. Channel multipliers and the RRF k=60 default are documented here so
+// recall behavior can be tuned deliberately.
 
 import type { RuntimeConfig } from "../types";
 import type {

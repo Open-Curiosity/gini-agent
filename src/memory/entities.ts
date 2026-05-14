@@ -9,8 +9,8 @@
 // canonical's most-recent mention. We keep the function lightweight so retain
 // can call it once per extracted entity without an N^2 blowup.
 //
-// Adapted from vectorize-io/hindsight (MIT) — same weights, same merge-on-
-// strong-match policy, same fallback-to-create-new for low-confidence cases.
+// Gini's entity resolver keeps the paper's weighted-match shape while making
+// the merge threshold and low-confidence fallback explicit for local tuning.
 
 import type { Instance } from "../types";
 import type { Database } from "bun:sqlite";
