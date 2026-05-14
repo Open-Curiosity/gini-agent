@@ -42,6 +42,7 @@ import {
   labelFor,
   labelForKind,
   plistPathFor,
+  serviceTarget,
   type PlistKind
 } from "../integrations/launchd";
 
@@ -286,6 +287,55 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   };
 
   return { gateway, web, resolution };
+}
+
+// Per-instance descriptor for a supervised LaunchAgent service. Encodes
+// everything that varies per kind (label, plist path, service target,
+// spec, per-kind log filenames) so command implementations
+// (enable/disable/status/kick) can iterate uniformly instead of
+// scattering `kind === "gateway" ? … : …` ternaries.
+//
+// `resolution` is recorded on every descriptor (rather than once per
+// instance) so callers that pass a single descriptor around still have
+// the source-vs-installed answer in hand.
+export interface SupervisedService {
+  kind: PlistKind;
+  label: string;
+  plistPath: string;
+  serviceTarget: string;
+  spec: LaunchSpec;
+  // Per-kind launchd stdio destinations. Different filenames per kind
+  // keep autostart crash logs distinguishable from user-driven `gini run`
+  // stdout tees.
+  stdoutLogFilename: string;
+  stderrLogFilename: string;
+  resolution: "installed" | "source";
+}
+
+export interface SupervisedServicesOptions extends ResolveLaunchOptions {
+  // Narrow to a subset of kinds. Defaults to both ["gateway", "web"]. The
+  // `--kind` CLI flag and the setup-api refresh path pass a one-element
+  // array so they don't touch the other service.
+  kinds?: PlistKind[];
+}
+
+// Returns the descriptors that drive every per-kind launchctl interaction.
+// The order matches `kinds` (defaults to ["gateway","web"]) so enable's
+// rollback semantics ("kinds bootstrapped earlier in the loop") stay
+// deterministic.
+export function supervisedServices(options: SupervisedServicesOptions): SupervisedService[] {
+  const kinds = options.kinds ?? (["gateway", "web"] satisfies PlistKind[]);
+  const pair = resolveLaunchSpecPair(options);
+  return kinds.map((kind): SupervisedService => ({
+    kind,
+    label: labelForKind(options.instance, kind),
+    plistPath: plistPathFor(options.instance, kind),
+    serviceTarget: serviceTarget(options.instance, kind),
+    spec: kind === "gateway" ? pair.gateway : pair.web,
+    stdoutLogFilename: kind === "gateway" ? "runtime-stdout.log" : "web.log",
+    stderrLogFilename: kind === "gateway" ? "runtime-launchd.err.log" : "web-launchd.err.log",
+    resolution: pair.resolution
+  }));
 }
 
 // Read ~/.gini/secrets.env. Returns null when missing; never throws on

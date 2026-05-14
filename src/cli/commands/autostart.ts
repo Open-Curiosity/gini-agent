@@ -24,17 +24,16 @@ import {
   isLoadedTarget,
   kickstart,
   labelFor,
-  labelForKind,
   legacyHandlesFor,
   loadedLastExitStatus,
   loadedPid,
   platformIsSupported,
   plistPathFor,
-  resolveLaunchSpecPair,
-  serviceTarget,
+  supervisedServices,
   unsupportedPlatformMessage,
   writePlist,
-  type PlistKind
+  type PlistKind,
+  type SupervisedService
 } from "../autostart";
 
 const KINDS: PlistKind[] = ["gateway", "web"];
@@ -277,7 +276,8 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
   const { instance, testRoot } = options;
   const kinds = options.kinds ?? KINDS;
   const deps: EnableLaunchctlDeps = options.launchctl ?? { isLoaded, bootout, bootstrap, kickstart };
-  const pair = resolveLaunchSpecPair({ instance, testRoot });
+  const services = supervisedServices({ instance, testRoot, kinds });
+  const resolution = services[0]?.resolution ?? "installed";
   const logRoot = resolveLogRoot(instance, testRoot);
   const results: PerKindEnableResult[] = [];
   let allOk = true;
@@ -325,7 +325,7 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
         ok: false,
         enabled: false,
         instance,
-        resolution: pair.resolution,
+        resolution,
         results: [],
         rollbackState: "clean",
         error: `legacy bootout failed: ${out.stderr.trim()}`
@@ -354,28 +354,26 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
   let rollbackState: RollbackState = "clean";
   const rollbackFailures: RollbackFailure[] = [];
 
-  for (const kind of kinds) {
-    const spec = kind === "gateway" ? pair.gateway : pair.web;
-    const stdoutPath = join(logRoot, kind === "gateway" ? "runtime-stdout.log" : "web.log");
+  for (const svc of services) {
+    const stdoutPath = join(logRoot, svc.stdoutLogFilename);
     // launchd routes stderr to its own file by default — we keep that
     // separate so an autostart-only crash log doesn't get tangled with the
     // user-driven `gini run` stdout tee.
-    const stderrPath = join(logRoot, kind === "gateway" ? "runtime-launchd.err.log" : "web-launchd.err.log");
-    const path = writePlist({ instance, kind, spec, stdoutPath, stderrPath });
-    const target = serviceTarget(instance, kind);
-    const wasLoaded = deps.isLoaded(instance, kind);
+    const stderrPath = join(logRoot, svc.stderrLogFilename);
+    const path = writePlist({ instance, kind: svc.kind, spec: svc.spec, stdoutPath, stderrPath });
+    const wasLoaded = deps.isLoaded(instance, svc.kind);
 
     if (wasLoaded) {
       // Idempotent re-enable: the plist on disk may have changed, so we
       // bootout the old registration first, then bootstrap the new one.
       // `kickstart -k` alone wouldn't pick up the new plist contents.
-      const out = deps.bootout(instance, kind);
+      const out = deps.bootout(instance, svc.kind);
       if (!out.ok && !out.stderr.includes("Could not find service")) {
         results.push({
-          kind,
-          label: labelForKind(instance, kind),
+          kind: svc.kind,
+          label: svc.label,
           plistPath: path,
-          serviceTarget: target,
+          serviceTarget: svc.serviceTarget,
           alreadyLoaded: wasLoaded,
           enabled: false,
           error: "launchctl bootout failed",
@@ -399,10 +397,10 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
     }
     if (!res.ok) {
       results.push({
-        kind,
-        label: labelForKind(instance, kind),
+        kind: svc.kind,
+        label: svc.label,
         plistPath: path,
-        serviceTarget: target,
+        serviceTarget: svc.serviceTarget,
         alreadyLoaded: wasLoaded,
         enabled: false,
         error: "launchctl bootstrap failed",
@@ -437,7 +435,7 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
       }
       continue;
     }
-    bootstrapped.push(kind);
+    bootstrapped.push(svc.kind);
     // macOS 26 frequently registers the service via `launchctl
     // bootstrap` but never actually spawns it — `RunAtLoad` is honored
     // as best-effort, not a guarantee. The symptom: `state = not
@@ -452,12 +450,12 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
     // bootstrap succeeded, the user can manually run
     // `gini autostart kick` to recover. Failing the whole enable on a
     // kickstart error would needlessly roll back a working bootstrap.
-    const kickRes = deps.kickstart(instance, kind);
+    const kickRes = deps.kickstart(instance, svc.kind);
     const perKind: PerKindEnableResult = {
-      kind,
-      label: labelForKind(instance, kind),
+      kind: svc.kind,
+      label: svc.label,
       plistPath: path,
-      serviceTarget: target,
+      serviceTarget: svc.serviceTarget,
       alreadyLoaded: wasLoaded,
       enabled: true
     };
@@ -472,7 +470,7 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
     ok: allOk,
     enabled: allOk,
     instance,
-    resolution: pair.resolution,
+    resolution,
     results,
     rollbackState,
     ...(rollbackFailures.length > 0 ? { rollbackFailures } : {})
@@ -550,9 +548,12 @@ async function disable(instance: string): Promise<DisableResult> {
     });
   }
 
-  for (const kind of KINDS) {
-    const path = plistPathFor(instance, kind);
-    const wasLoaded = isLoaded(instance, kind);
+  // Iterate the supervised service table so this loop stays in lockstep
+  // with enable/status/kick — any per-kind difference (label, path) is
+  // encoded in the descriptor, not re-derived here.
+  for (const svc of supervisedServices({ instance })) {
+    const path = svc.plistPath;
+    const wasLoaded = isLoaded(instance, svc.kind);
 
     if (!wasLoaded && !existsSync(path)) {
       continue;
@@ -561,11 +562,11 @@ async function disable(instance: string): Promise<DisableResult> {
     let bootoutOk = true;
     let bootoutStderr: string | undefined;
     if (wasLoaded) {
-      const out = bootout(instance, kind);
+      const out = bootout(instance, svc.kind);
       if (!out.ok && !out.stderr.includes("Could not find service")) {
         bootoutOk = false;
         bootoutStderr = out.stderr.trim();
-        stderrParts.push(`${kind} bootout: ${bootoutStderr}`);
+        stderrParts.push(`${svc.kind} bootout: ${bootoutStderr}`);
       }
     }
 
@@ -577,13 +578,13 @@ async function disable(instance: string): Promise<DisableResult> {
         plistRemoved = true;
       } catch (error) {
         rmError = error instanceof Error ? error.message : String(error);
-        stderrParts.push(`${kind} rm plist: ${rmError}`);
+        stderrParts.push(`${svc.kind} rm plist: ${rmError}`);
       }
     }
 
     results.push({
-      kind,
-      label: labelForKind(instance, kind),
+      kind: svc.kind,
+      label: svc.label,
       plistPath: path,
       wasLoaded,
       bootoutOk,
@@ -650,16 +651,15 @@ interface StatusResult {
 
 function status(instance: string): StatusResult {
   const services: PerKindStatus[] = [];
-  for (const kind of KINDS) {
-    const path = plistPathFor(instance, kind);
-    const loaded = isLoaded(instance, kind);
-    const pid = loaded ? loadedPid(instance, kind) : null;
-    const lastExit = loaded ? loadedLastExitStatus(instance, kind) : null;
+  for (const svc of supervisedServices({ instance })) {
+    const loaded = isLoaded(instance, svc.kind);
+    const pid = loaded ? loadedPid(instance, svc.kind) : null;
+    const lastExit = loaded ? loadedLastExitStatus(instance, svc.kind) : null;
     services.push({
-      kind,
-      label: labelForKind(instance, kind),
-      plistPath: path,
-      plistExists: existsSync(path),
+      kind: svc.kind,
+      label: svc.label,
+      plistPath: svc.plistPath,
+      plistExists: existsSync(svc.plistPath),
       loaded,
       pid,
       lastExitStatus: lastExit
@@ -713,24 +713,24 @@ function kick(instance: string, rawArgs: string[]): KickResult {
   const kinds: PlistKind[] = kindFlag === "gateway" || kindFlag === "web" ? [kindFlag] : KINDS;
   const results: PerKindKickResult[] = [];
   let allOk = true;
-  for (const kind of kinds) {
-    const loaded = isLoaded(instance, kind);
+  for (const svc of supervisedServices({ instance, kinds })) {
+    const loaded = isLoaded(instance, svc.kind);
     if (!loaded) {
       results.push({
-        kind,
-        label: labelForKind(instance, kind),
+        kind: svc.kind,
+        label: svc.label,
         loaded: false,
         kicked: false,
-        error: `Autostart is not enabled for ${kind} on instance '${instance}'. Run \`gini autostart enable\` first.`
+        error: `Autostart is not enabled for ${svc.kind} on instance '${instance}'. Run \`gini autostart enable\` first.`
       });
       allOk = false;
       continue;
     }
-    const res = kickstart(instance, kind);
+    const res = kickstart(instance, svc.kind);
     if (!res.ok) {
       results.push({
-        kind,
-        label: labelForKind(instance, kind),
+        kind: svc.kind,
+        label: svc.label,
         loaded: true,
         kicked: false,
         error: "launchctl kickstart failed",
@@ -739,7 +739,7 @@ function kick(instance: string, rawArgs: string[]): KickResult {
       allOk = false;
       continue;
     }
-    results.push({ kind, label: labelForKind(instance, kind), loaded: true, kicked: true });
+    results.push({ kind: svc.kind, label: svc.label, loaded: true, kicked: true });
   }
   return { ok: allOk, instance, results };
 }
