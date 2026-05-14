@@ -135,7 +135,10 @@ export async function testSkill(config: RuntimeConfig, idOrName: string) {
 }
 
 export function validateSkills(config: RuntimeConfig) {
-  return readState(config.instance).skills.map((skill) => ({ id: skill.id, name: skill.name, ok: validateSkillRecord(skill).length === 0, failures: validateSkillRecord(skill) }));
+  return readState(config.instance).skills.map((skill) => {
+    const failures = validateSkillRecord(skill);
+    return { id: skill.id, name: skill.name, ok: failures.length === 0, failures };
+  });
 }
 
 function validateSkillRecord(skill: SkillRecord): string[] {
@@ -145,5 +148,10 @@ function validateSkillRecord(skill: SkillRecord): string[] {
     failures.push("Trusted API-created skills need at least one test.");
   }
   if (skill.steps.some((step) => !step.trim())) failures.push("Skill steps cannot be empty.");
+  // Surface loader-time validation results so /api/skills/validate
+  // reports spec compliance issues alongside legacy CRUD checks.
+  if (skill.validationStatus === "unsupported" && skill.validationMessage) {
+    failures.push(skill.validationMessage);
+  }
   return failures;
 }
