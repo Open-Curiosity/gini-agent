@@ -61,6 +61,20 @@ export async function provider(ctx: CliContext): Promise<void> {
       extraBody = parsed as Record<string, unknown>;
     }
 
+    // Echo and codex don't honor extraBody/baseUrl/apiKeyEnv — echo bypasses
+    // HTTP entirely and codex uses /responses with codex-OAuth bearer + a
+    // fixed ChatGPT base URL. Surface a stderr warning so the user doesn't
+    // think their flag took effect when normalizeProvider drops it.
+    if (name === "echo" || name === "codex") {
+      const ignored: string[] = [];
+      if (baseUrl !== undefined) ignored.push("--base-url");
+      if (apiKeyEnv !== undefined) ignored.push("--api-key-env");
+      if (extraBody !== undefined) ignored.push("--extra-body");
+      if (ignored.length > 0) {
+        process.stderr.write(`gini: warning — ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored for the ${name} provider; only local/openai/openrouter honor these flags.\n`);
+      }
+    }
+
     config.provider = normalizeProvider({
       name,
       model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.5" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : "gpt-5.4-mini"),

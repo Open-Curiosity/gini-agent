@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import {
   clearEchoToolCallingResponses,
@@ -1065,19 +1065,19 @@ describe("provider", () => {
     }
   });
 
-  test("extraBody.max_tokens flows through for non-vision calls (vision still wins via post-spread)", async () => {
-    // The runtime only sets max_tokens/max_completion_tokens for vision,
-    // and vision spreads tokenBudgetField AFTER the sanitized extras. So
+  test("extraBody.max_tokens flows through for tool-calling, structured, and summary calls", async () => {
+    // The runtime only sets max_tokens/max_completion_tokens for vision (and
+    // vision strips both via VISION_RESERVED_EXTRA_BODY_KEYS). So
     // tool-calling/structured/summary callers must be able to set
-    // max_tokens via extraBody legitimately, and vision callers must
-    // still see their explicit budget win.
+    // max_tokens via extraBody legitimately. Vision behavior is covered by
+    // the dedicated vision-bypass test below.
     const originalFetch = globalThis.fetch;
     const requestBodies: Record<string, unknown>[] = [];
     globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
       requestBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
       return Promise.resolve(new Response(JSON.stringify({
         id: "x",
-        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "{}" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
     }) as typeof fetch;
 
@@ -1092,16 +1092,88 @@ describe("provider", () => {
       await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
       expect(requestBodies[0]?.max_tokens).toBe(256);
 
-      // Vision: caller's explicit maxTokens wins (post-spread).
+      // Structured: extraBody.max_tokens flows through.
       requestBodies.length = 0;
-      await generateVisionAnalysis(config(provider), {
-        prompt: "what?",
-        imageBase64: "AAAA",
-        mimeType: "image/png",
-        maxTokens: 32
+      await generateStructured(config(provider), {
+        system: "s", user: "u", schemaName: "X", validator: { parse: (v) => v }
       });
-      // local provider uses the legacy max_tokens field (not max_completion_tokens).
-      expect(requestBodies[0]?.max_tokens).toBe(32);
+      expect(requestBodies[0]?.max_tokens).toBe(256);
+
+      // Summary (callChatCompletions): only fires for openrouter/local on
+      // generateTaskSummary. Verify with openrouter to also cover that branch.
+      const original = process.env.OPENROUTER_API_KEY;
+      process.env.OPENROUTER_API_KEY = "test-or-key";
+      try {
+        const orProvider = normalizeProvider({
+          name: "openrouter",
+          model: "m",
+          extraBody: { max_tokens: 128 }
+        });
+        requestBodies.length = 0;
+        await generateTaskSummary(config(orProvider), "summarize", []);
+        expect(requestBodies[0]?.max_tokens).toBe(128);
+      } finally {
+        if (original === undefined) delete process.env.OPENROUTER_API_KEY;
+        else process.env.OPENROUTER_API_KEY = original;
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("vision strips BOTH max_tokens and max_completion_tokens from extraBody so the runtime budget always wins", async () => {
+    // Round-2 fix removed the global denylist of these keys, but vision
+    // sets only ONE of them (max_completion_tokens for openai, max_tokens
+    // for others) — so a poisoned extraBody could supply the OTHER and
+    // both end up in the request. That breaks OpenAI o-series (which
+    // rejects max_tokens) and defeats the cap on local/openrouter.
+    // Vision now passes VISION_RESERVED_EXTRA_BODY_KEYS to sanitizeExtraBody
+    // so neither token-budget key from extraBody survives.
+    const originalFetch = globalThis.fetch;
+    const requestBodies: Record<string, unknown>[] = [];
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      requestBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const original = process.env.OPENAI_API_KEY;
+      process.env.OPENAI_API_KEY = "test-key";
+      try {
+        // OpenAI vision: runtime sets max_completion_tokens; extraBody
+        // attempts to leak max_tokens. The leak must NOT happen.
+        const openaiProvider = normalizeProvider({
+          name: "openai",
+          model: "gpt-test",
+          extraBody: { max_tokens: 999, max_completion_tokens: 888 }
+        });
+        await generateVisionAnalysis(config(openaiProvider), {
+          prompt: "what?", imageBase64: "AAAA", mimeType: "image/png", maxTokens: 32
+        });
+        expect(requestBodies[0]?.max_tokens).toBeUndefined();
+        expect(requestBodies[0]?.max_completion_tokens).toBe(32);
+      } finally {
+        if (original === undefined) delete process.env.OPENAI_API_KEY;
+        else process.env.OPENAI_API_KEY = original;
+      }
+
+      // Local vision: runtime sets max_tokens; extraBody attempts to leak
+      // max_completion_tokens. The leak must NOT happen.
+      requestBodies.length = 0;
+      const localProvider = normalizeProvider({
+        name: "local",
+        model: "m",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: { max_tokens: 999, max_completion_tokens: 888 }
+      });
+      await generateVisionAnalysis(config(localProvider), {
+        prompt: "what?", imageBase64: "AAAA", mimeType: "image/png", maxTokens: 64
+      });
+      expect(requestBodies[0]?.max_tokens).toBe(64);
+      expect(requestBodies[0]?.max_completion_tokens).toBeUndefined();
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -1150,6 +1222,73 @@ describe("provider", () => {
       expect(sent.chat_template_kwargs).toEqual({ x: 1 });
       // The runtime's own object prototype isn't polluted.
       expect(({} as { model?: unknown }).model).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("empty-string baseUrl falls back to the default instead of producing a relative URL", async () => {
+    // Persisted config can theoretically carry baseUrl: "" (e.g.
+    // hand-edited config or a future API write that didn't validate). The
+    // old `?? DEFAULT` fallback skipped only nullish, not empty — leaving
+    // a relative `/chat/completions` URL that fetch would resolve against
+    // localhost. resolveBaseUrl now treats whitespace-only as missing.
+    const originalFetch = globalThis.fetch;
+    let capturedUrl: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      // Skip normalizeProvider so the empty baseUrl actually persists
+      // through to the call site (the normalizer would coerce missing
+      // baseUrl to default; here we want to test the resolver).
+      const provider = { name: "local" as const, model: "m", baseUrl: "" };
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      // local default baseUrl is the Ollama port — we just assert the URL
+      // is absolute, not the specific default.
+      expect(capturedUrl?.startsWith("http")).toBe(true);
+      expect(capturedUrl?.endsWith("/chat/completions")).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("extraBody.toJSON is dropped so a callable cannot replace the request body wholesale", async () => {
+    // Defense-in-depth: JSON-loaded extraBody can never carry a function,
+    // but if a future internal caller constructs ProviderConfig with a
+    // callable toJSON, the final JSON.stringify of the merged body would
+    // invoke it and could return an arbitrary replacement. The denylist
+    // strips toJSON before the spread.
+    const originalFetch = globalThis.fetch;
+    let capturedRawBody: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      capturedRawBody = String(init.body);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "real-model",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        // Callable toJSON that would hijack the request body if it survived
+        // sanitization. Cast to satisfy the Record<string, unknown> shape.
+        extraBody: { toJSON: () => ({ model: "hijacked", smuggled: true }) } as unknown as Record<string, unknown>
+      });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(capturedRawBody).toBeDefined();
+      expect(capturedRawBody!.includes("hijacked")).toBe(false);
+      expect(capturedRawBody!.includes("smuggled")).toBe(false);
+      const sent = JSON.parse(capturedRawBody!);
+      expect(sent.model).toBe("real-model");
     } finally {
       globalThis.fetch = originalFetch;
     }

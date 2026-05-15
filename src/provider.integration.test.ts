@@ -42,12 +42,6 @@ interface MockTestContext {
   uniqueEnvName(): string;
 }
 
-// Per-test counter base — combined with a closure-local counter inside each
-// withMockServer call, the resulting names are unique even across many
-// concurrent tests in the same process. The pid component covers the
-// (extremely rare) cross-process case.
-let envNameSeed = 0;
-
 async function withMockServer<T>(fn: (ctx: MockTestContext) => Promise<T>): Promise<T> {
   const server = startOpenAIMockServer();
   const envBackup = new Map<string, string | undefined>();
@@ -56,11 +50,15 @@ async function withMockServer<T>(fn: (ctx: MockTestContext) => Promise<T>): Prom
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   };
+  // Per-test unique env-var name source. Combines pid (cross-process),
+  // server.port (cross-test, since each call gets a fresh OS-assigned port),
+  // and a closure-local counter (intra-test). This keeps everything inside
+  // the closure so the file truly has no cross-test mutable state — the
+  // header comment's concurrency promise stays honest.
   let localEnvCounter = 0;
   const uniqueEnvName = (): string => {
-    envNameSeed += 1;
     localEnvCounter += 1;
-    return `GINI_TEST_KEY_${process.pid}_${envNameSeed}_${localEnvCounter}`;
+    return `GINI_TEST_KEY_${process.pid}_${server.port}_${localEnvCounter}`;
   };
   try {
     return await fn({ server, setEnv, uniqueEnvName });

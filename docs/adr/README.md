@@ -17,3 +17,4 @@ Each file in this directory captures one architecture decision: the context, the
 - [Approval Execution Abort Protocol](approval-execution-abort.md)
 - [Runtime Update Surface And Automatic Restart](runtime-update-surface.md)
 - [Connector + Provider Vocabulary, Spec Compliance, And Meta-Skills](connector-provider-spec-compliance.md)
+- [Provider extraBody Escape Hatch And Reserved-Key Denylist](provider-extra-body.md)

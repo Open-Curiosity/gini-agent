@@ -113,9 +113,13 @@ export interface ProviderConfig {
   // echo bypasses HTTP entirely.
   //
   // Reserved keys are stripped at send time so extraBody can never override
-  // runtime-controlled fields: model, messages, stream, tools, tool_choice,
-  // response_format, max_tokens, max_completion_tokens. The runtime always
-  // wins.
+  // runtime-controlled fields. The base denylist covers fields the runtime
+  // unconditionally owns: model, messages, stream, tools, tool_choice,
+  // response_format, functions, function_call, store, plus prototype-pollution
+  // payloads (__proto__, constructor, prototype). Token-budget fields
+  // (max_tokens, max_completion_tokens) are allowed in extraBody for
+  // chat/structured/tool-calling calls — vision adds them to its own
+  // per-call denylist so the runtime's vision budget always wins.
   //
   // Used to push fields like `chat_template_kwargs` for oMLX-served Gemma
   // models that need server-side reasoning toggles
