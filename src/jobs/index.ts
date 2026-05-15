@@ -72,6 +72,33 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     }
     oneShot = input.oneShot;
   }
+  // Per-job auto-approve envelope. Both fields are optional; reject malformed
+  // payloads up-front so a typo doesn't silently fall back to legacy behavior.
+  // See ADR dangerously-auto-approve.md ("Per-job scope") for the trust model.
+  let dangerouslyAutoApprove: boolean | undefined;
+  if (input.dangerouslyAutoApprove !== undefined && input.dangerouslyAutoApprove !== null) {
+    if (typeof input.dangerouslyAutoApprove !== "boolean") {
+      throw new Error(`Invalid input: dangerouslyAutoApprove must be a boolean (got ${String(input.dangerouslyAutoApprove)})`);
+    }
+    dangerouslyAutoApprove = input.dangerouslyAutoApprove;
+  }
+  let autoApproveCommands: string[] | undefined;
+  if (input.autoApproveCommands !== undefined && input.autoApproveCommands !== null) {
+    if (!Array.isArray(input.autoApproveCommands)) {
+      throw new Error(`Invalid input: autoApproveCommands must be an array of strings (got ${typeof input.autoApproveCommands})`);
+    }
+    const cleaned: string[] = [];
+    for (const entry of input.autoApproveCommands) {
+      if (typeof entry !== "string") {
+        throw new Error(`Invalid input: autoApproveCommands entries must be strings (got ${typeof entry})`);
+      }
+      if (entry.length === 0) {
+        throw new Error(`Invalid input: autoApproveCommands entries must be non-empty strings`);
+      }
+      cleaned.push(entry);
+    }
+    autoApproveCommands = cleaned;
+  }
   // A parent task that has already transitioned terminal must not
   // create a durable scheduled job. Without this, a `cancelTask`
   // queued between the dispatcher's lock-free pre-check and our
@@ -105,7 +132,9 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
       timeoutSeconds,
       costBudget: typeof input.costBudget === "number" ? input.costBudget : undefined,
       chatSessionId,
-      oneShot
+      oneShot,
+      dangerouslyAutoApprove,
+      autoApproveCommands
     });
   });
 }
@@ -189,6 +218,36 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
   }
 }
 
+// Build the per-task RuntimeConfig the spawned job-task will see. The
+// returned object is always a fresh clone so we never mutate the
+// operator's global config object. When the job carries no per-job
+// envelope, the clone is byte-identical to the input and the spawned task
+// inherits current behavior. When the job opts in, we overlay:
+//   - `dangerouslyAutoApprove=true` (full bypass for this job only)
+//   - `autoApproveCommands` merged onto the cloned array (operator's
+//     allowlist still applies; the job widens it for its own task)
+// Audit rows on the spawned task's side effects automatically pick up the
+// usual `autoApprovedReason` markers (matched pattern, or
+// "dangerouslyAutoApprove") via the existing tool-dispatch path — the
+// only thing that changes per-job is which config object the spawned
+// task sees.
+function buildTaskConfig(config: RuntimeConfig, job: JobRecord): RuntimeConfig {
+  const clone: RuntimeConfig = {
+    ...config,
+    autoApproveCommands: Array.isArray(config.autoApproveCommands)
+      ? [...config.autoApproveCommands]
+      : undefined
+  };
+  if (job.dangerouslyAutoApprove === true) {
+    clone.dangerouslyAutoApprove = true;
+  }
+  if (Array.isArray(job.autoApproveCommands) && job.autoApproveCommands.length > 0) {
+    const base = clone.autoApproveCommands ?? [];
+    clone.autoApproveCommands = [...base, ...job.autoApproveCommands];
+  }
+  return clone;
+}
+
 // Spawns the prompt task for an already-claimed JobRunRecord. Leaves the
 // run in `running` — it will be finalized via finalizeJobRunFromTask once
 // the spawned task reaches a terminal state. If submitTask itself throws,
@@ -211,6 +270,13 @@ async function dispatchPromptRun(
   trigger: "schedule" | "manual" | "replay"
 ): Promise<{ jobId: string; runId: string; taskId: string }> {
   const prompt = withCronHint(job.prompt, job.context);
+  // Per-job auto-approve envelope: clone the RuntimeConfig (NEVER mutate the
+  // original — it's the per-instance runtime-wide config) and overlay the
+  // job's opt-in fields before handing it to submitTask. The spawned task
+  // and every approval-gated dispatch inside it see the cloned config; the
+  // operator's global RuntimeConfig stays untouched. See ADR
+  // dangerously-auto-approve.md ("Per-job scope") for the trust model.
+  const taskConfig: RuntimeConfig = buildTaskConfig(config, job);
 
   // Resolve session linkage up-front. If the job points at a session that
   // no longer exists (deleted by the user), audit the gap and fall through
@@ -247,9 +313,9 @@ async function dispatchPromptRun(
   let task;
   try {
     if (chatRunId) {
-      task = await submitTask(config, prompt, { jobId: job.id, runId: chatRunId, mode: "chat" });
+      task = await submitTask(taskConfig, prompt, { jobId: job.id, runId: chatRunId, mode: "chat" });
     } else {
-      task = await submitTask(config, prompt, job.id);
+      task = await submitTask(taskConfig, prompt, job.id);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
