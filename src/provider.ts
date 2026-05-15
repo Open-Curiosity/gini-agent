@@ -276,6 +276,7 @@ async function callToolCallingChatCompletions(
   const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
   const wantStream = Boolean(onDelta);
   const body: Record<string, unknown> = {
+    ...(provider.extraBody ?? {}),
     model: provider.model,
     messages: messages.map(serializeChatMessage),
     stream: wantStream
@@ -998,6 +999,7 @@ async function callStructuredChatCompletions<T>(
     method: "POST",
     headers,
     body: JSON.stringify({
+      ...(provider.extraBody ?? {}),
       model: provider.model,
       response_format: { type: "json_object" },
       messages: [
@@ -1033,7 +1035,8 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       name: "openai",
       model: provider.model || "gpt-5.4-mini",
       baseUrl: provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL,
-      apiKeyEnv: provider.apiKeyEnv ?? "OPENAI_API_KEY"
+      apiKeyEnv: provider.apiKeyEnv ?? "OPENAI_API_KEY",
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
   if (provider.name === "openrouter") {
@@ -1041,7 +1044,8 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       name: "openrouter",
       model: provider.model || "openrouter/auto",
       baseUrl: provider.baseUrl ?? "https://openrouter.ai/api/v1",
-      apiKeyEnv: provider.apiKeyEnv ?? "OPENROUTER_API_KEY"
+      apiKeyEnv: provider.apiKeyEnv ?? "OPENROUTER_API_KEY",
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
   if (provider.name === "local") {
@@ -1049,7 +1053,8 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       name: "local",
       model: provider.model || "local/default",
       baseUrl: provider.baseUrl ?? "http://127.0.0.1:11434/v1",
-      apiKeyEnv: provider.apiKeyEnv ?? "GINI_LOCAL_API_KEY"
+      apiKeyEnv: provider.apiKeyEnv ?? "GINI_LOCAL_API_KEY",
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
   if (provider.name === "codex") {
@@ -1133,6 +1138,7 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
     method: "POST",
     headers,
     body: JSON.stringify({
+      ...(provider.extraBody ?? {}),
       model: provider.model,
       messages: [
         { role: "system", content: systemContext },
@@ -1551,6 +1557,7 @@ async function callVisionChatCompletions(
     method: "POST",
     headers,
     body: JSON.stringify({
+      ...(provider.extraBody ?? {}),
       model: provider.model,
       messages: [
         {

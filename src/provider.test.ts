@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import {
   clearEchoToolCallingResponses,
   clearEchoVisionResponses,
+  generateStructured,
   generateTaskSummary,
   generateToolCallingResponse,
   generateVisionAnalysis,
@@ -698,6 +699,297 @@ describe("provider", () => {
       globalThis.fetch = originalFetch;
       if (original === undefined) delete process.env.OPENROUTER_API_KEY;
       else process.env.OPENROUTER_API_KEY = original;
+    }
+  });
+
+  // ---------------- extraBody plumbing (oMLX-style chat_template_kwargs) ----------------
+
+  // The openai/openrouter/local providers all forward `extraBody` into the
+  // request body of every chat-completions call (tool-calling, structured,
+  // vision, generateTaskSummary). Codex uses /responses with its own shape
+  // and is not expected to honor extraBody — verified separately by the
+  // /responses tests above which already assert the request body keys.
+
+  test("normalizeProvider preserves extraBody for local/openai/openrouter and drops it for echo/codex", () => {
+    const xb = { chat_template_kwargs: { enable_thinking: true } };
+    expect(normalizeProvider({ name: "local", model: "m", extraBody: xb }).extraBody).toEqual(xb);
+    expect(normalizeProvider({ name: "openai", model: "m", extraBody: xb }).extraBody).toEqual(xb);
+    expect(normalizeProvider({ name: "openrouter", model: "m", extraBody: xb }).extraBody).toEqual(xb);
+    // echo and codex don't carry extraBody through. Echo is deterministic and
+    // bypasses the HTTP path; codex uses /responses (different wire shape).
+    expect(normalizeProvider({ name: "echo", model: "m", extraBody: xb }).extraBody).toBeUndefined();
+    expect(normalizeProvider({ name: "codex", model: "m", extraBody: xb }).extraBody).toBeUndefined();
+  });
+
+  test("local tool-calling merges extraBody into the chat-completions request body", async () => {
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_local_1",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "ok" }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "gemma-4-26b-a4b-it-uncensored-8bit",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: { chat_template_kwargs: { preserve_thinking: false, enable_thinking: true } }
+      });
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hello" }],
+        []
+      );
+      expect(captured?.url).toBe("http://127.0.0.1:8000/v1/chat/completions");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.chat_template_kwargs).toEqual({ preserve_thinking: false, enable_thinking: true });
+      expect(sent.model).toBe("gemma-4-26b-a4b-it-uncensored-8bit");
+      expect(Array.isArray(sent.messages)).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("local tool-calling streaming also forwards extraBody", async () => {
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const events = [
+        { choices: [{ index: 0, delta: { content: "hi" } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }
+      ];
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          for (const e of events) {
+            controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+          }
+          controller.enqueue(enc.encode("data: [DONE]\n\n"));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "gemma-4-26b-a4b-it-uncensored-8bit",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: { chat_template_kwargs: { enable_thinking: true } }
+      });
+      let streamed = "";
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        [],
+        (delta) => { streamed += delta; }
+      );
+      expect(result.text).toBe("hi");
+      expect(streamed).toBe("hi");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
+      expect(sent.stream).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("openai structured chat-completions merges extraBody but keeps response_format", async () => {
+    const original = process.env.OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "test-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_struct_1",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: '{"ok":true}' }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "openai",
+        model: "gpt-test",
+        extraBody: { chat_template_kwargs: { enable_thinking: false } }
+      });
+      const result = await generateStructured(config(provider), {
+        system: "be brief",
+        user: "say ok",
+        schemaName: "Ok",
+        validator: { parse: (v) => v as { ok: boolean } }
+      });
+      expect(result.data).toEqual({ ok: true });
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: false });
+      expect(sent.response_format).toEqual({ type: "json_object" });
+      expect(sent.model).toBe("gpt-test");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = original;
+    }
+  });
+
+  test("local vision chat-completions merges extraBody", async () => {
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_vision_local",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "described." }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "vlm-test",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: { chat_template_kwargs: { enable_thinking: true } }
+      });
+      const result = await generateVisionAnalysis(config(provider), {
+        prompt: "what is shown?",
+        imageBase64: "AAAA",
+        mimeType: "image/png"
+      });
+      expect(result.text).toBe("described.");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
+      // Image content part should still be present.
+      expect(sent.messages[0].content[1].type).toBe("image_url");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("openrouter generateTaskSummary chat-completions merges extraBody", async () => {
+    const original = process.env.OPENROUTER_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENROUTER_API_KEY = "test-or-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_or_summary",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "summary." }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "openrouter",
+        model: "or-model",
+        extraBody: { chat_template_kwargs: { enable_thinking: true }, provider: { order: ["mistral"] } }
+      });
+      const result = await generateTaskSummary(config(provider), "hello", []);
+      expect(result.text).toBe("summary.");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
+      expect(sent.provider).toEqual({ order: ["mistral"] });
+      expect(sent.model).toBe("or-model");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = original;
+    }
+  });
+
+  test("extraBody cannot override built-in fields like model/messages/stream/tools", async () => {
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_override",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "ok" }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "real-model",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        // Caller maliciously/accidentally tries to override built-ins via
+        // extraBody. Built-ins must win because the request would otherwise
+        // be inconsistent (e.g. wrong model billed, no tools sent).
+        extraBody: {
+          model: "hijacked-model",
+          messages: [{ role: "user", content: "hijacked" }],
+          stream: true,
+          tools: [{ type: "function", function: { name: "evil", description: "x", parameters: {} } }],
+          chat_template_kwargs: { enable_thinking: true }
+        }
+      });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "real_tool", description: "real", parameters: { type: "object" } }
+      }];
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "real prompt" }],
+        tools
+      );
+      const sent = JSON.parse(String(captured!.init!.body));
+      // Built-ins override the extraBody attempt.
+      expect(sent.model).toBe("real-model");
+      expect(sent.messages).toEqual([{ role: "user", content: "real prompt" }]);
+      expect(sent.stream).toBe(false);
+      expect(sent.tools).toHaveLength(1);
+      expect(sent.tools[0].function.name).toBe("real_tool");
+      expect(sent.tool_choice).toBe("auto");
+      // Non-conflicting extraBody field flows through.
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
+    } finally {
+      globalThis.fetch = originalFetch;
     }
   });
 });

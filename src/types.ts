@@ -103,6 +103,14 @@ export interface ProviderConfig {
   model: string;
   baseUrl?: string;
   apiKeyEnv?: string;
+  // Provider-specific request fields merged into every chat-completions /
+  // structured-output / vision request body. Forwarded by the local,
+  // openai, and openrouter branches; ignored by echo and codex (codex uses
+  // /responses with its own shape). Used to push fields like
+  // `chat_template_kwargs` for oMLX-served Gemma models that need
+  // server-side reasoning toggles. Caller is responsible for keeping
+  // values JSON-serializable.
+  extraBody?: Record<string, unknown>;
 }
 
 export interface RuntimeConfig {
