@@ -17,7 +17,8 @@ const EVENT_KINDS = [
   "messaging",
   "provider",
   "runtime",
-  "notification"
+  "notification",
+  "run"
 ] as const;
 
 export type RuntimeStreamEvent = { kind: string; data: string };

@@ -4,10 +4,31 @@ import { useCallback } from "react";
 import { useRuntimeStream } from "@/lib/useRuntimeStream";
 import { useInvalidate } from "@/lib/queries";
 
-// Maps server-side event kinds (RuntimeEventKind in src/types.ts) to the
-// react-query keys that should refetch on each event. Every event also
-// invalidates the derived feeds ("events", "audit", "state") which the
-// activity page consumes regardless of kind.
+// Maps domain prefixes (the first segment of an event's `action` field, e.g.
+// `approval.create` → "approval") to react-query keys that should refetch.
+//
+// Action-based dispatch is the primary discriminator because addAudit() funnels
+// every domain mutation through `kind: "runtime"`, so the SSE `kind` alone is
+// too coarse — a connector.create and a skill.trust both arrive as "runtime"
+// events.
+const ACTION_TO_KEYS: Record<string, string[]> = {
+  approval: ["approvals"],
+  task: ["tasks", "task", "chat"],
+  connector: ["connectors"],
+  skill: ["skills"],
+  memory: ["memory"],
+  job: ["jobs", "jobRuns", "improvements"],
+  subagent: ["subagents"],
+  chat: ["chat"],
+  provider: ["status"],
+  mcp: [],
+  messaging: ["chat"],
+  notification: [],
+  runtime: ["status"],
+  run: ["tasks", "task", "chat"]
+};
+
+// Fallback when the event has no parseable action — uses the SSE kind only.
 const KIND_TO_KEYS: Record<string, string[]> = {
   task: ["tasks", "task", "chat"],
   approval: ["approvals"],
@@ -19,10 +40,20 @@ const KIND_TO_KEYS: Record<string, string[]> = {
   messaging: ["chat"],
   provider: ["status"],
   runtime: ["status"],
-  notification: []
+  notification: [],
+  run: ["tasks", "task", "chat"]
 };
 
 const ALWAYS = ["events", "audit", "state"];
+
+function parseAction(data: string): string | null {
+  try {
+    const parsed = JSON.parse(data) as { action?: unknown };
+    return typeof parsed.action === "string" ? parsed.action : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Mounted once at the app root. Subscribes to the runtime SSE stream and
@@ -35,9 +66,12 @@ export function RuntimeStreamBridge(): null {
   const invalidate = useInvalidate();
   useRuntimeStream(
     useCallback(
-      ({ kind }) => {
-        const keys = KIND_TO_KEYS[kind] ?? [];
-        invalidate([...keys, ...ALWAYS]);
+      ({ kind, data }) => {
+        const action = parseAction(data);
+        const head = action?.split(".")[0];
+        const keysFromAction = head ? ACTION_TO_KEYS[head] ?? [] : [];
+        const keysFromKind = KIND_TO_KEYS[kind] ?? [];
+        invalidate([...new Set([...keysFromAction, ...keysFromKind, ...ALWAYS])]);
       },
       [invalidate]
     )
