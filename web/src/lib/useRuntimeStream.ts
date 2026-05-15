@@ -21,58 +21,65 @@ const EVENT_KINDS = [
 ] as const;
 
 export type RuntimeStreamEvent = { kind: string; data: string };
+type Listener = (event: RuntimeStreamEvent) => void;
+
+// Module-level singleton — one EventSource per browser tab, shared by every
+// `useRuntimeStream` caller and the global `RuntimeStreamBridge`. Subscribing
+// from N places does not open N connections.
+let source: EventSource | null = null;
+const listeners = new Set<Listener>();
+
+function ensureConnection(): void {
+  if (source) return;
+  const next = new EventSource("/api/runtime/events/stream");
+  const fanOut = (kind: string) => (event: MessageEvent) => {
+    for (const listener of listeners) listener({ kind, data: event.data });
+  };
+  for (const kind of EVENT_KINDS) next.addEventListener(kind, fanOut(kind));
+  // Default `message` listener kept as a fallback for servers that emit
+  // unnamed events; the local runtime does not, but this avoids breakage if
+  // the upstream surface changes.
+  next.addEventListener("message", fanOut("message"));
+  // Intentionally NOT closing on error — EventSource has built-in reconnect
+  // with backoff, and closing turns transient hiccups into permanent
+  // disconnects. Some browsers fire onerror on every reconnect attempt during
+  // a brief outage, so we stay quiet.
+  next.onerror = () => {};
+  source = next;
+}
+
+function subscribe(listener: Listener): () => void {
+  ensureConnection();
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0 && source) {
+      source.close();
+      source = null;
+    }
+  };
+}
 
 /**
- * Subscribes to /api/runtime/events/stream once per mount.
+ * Subscribes to /api/runtime/events/stream. Multiple callers share a single
+ * underlying EventSource (module-level singleton), so mounting many
+ * subscribers across the app does not open many connections.
  *
- * Stability rules (these matter — get them wrong and you'll re-open the
- * EventSource on every render, which causes the runtime to re-replay all
- * historical events from src/http.ts:eventStream() and produces a
- * connection/invalidation storm):
- *
- *  1. The effect deps must be EMPTY. The stream URL is constant, and `onEvent`
- *     is captured via a ref so callers can pass a fresh closure each render
- *     without retriggering the effect.
- *  2. Do NOT close() the EventSource in onerror. EventSource has built-in
- *     reconnect with backoff; calling close() turns transient hiccups into
- *     permanent disconnects. Callers can read state from `onopen`/`onerror` if
- *     they want to surface UI, but the connection itself must persist.
+ * Stability:
+ *   The effect deps are EMPTY and `onEvent` is captured via a ref so callers
+ *   can pass a fresh closure each render without retriggering the effect or
+ *   re-opening the connection.
  */
-export function useRuntimeStream(onEvent: (event: RuntimeStreamEvent) => void): void {
+export function useRuntimeStream(onEvent: Listener): void {
   const callbackRef = useRef(onEvent);
   // Layout effect so the ref updates synchronously after every commit, before
-  // any subsequent SSE message can fire from the long-lived EventSource.
+  // any subsequent SSE message can fire.
   useLayoutEffect(() => {
     callbackRef.current = onEvent;
   });
 
   useEffect(() => {
-    const source = new EventSource("/api/runtime/events/stream");
-    const dispatch = (kind: string) => (event: MessageEvent) =>
-      callbackRef.current({ kind, data: event.data });
-    const handlers: Array<{ kind: string; handler: (event: MessageEvent) => void }> = [];
-    for (const kind of EVENT_KINDS) {
-      const handler = dispatch(kind);
-      source.addEventListener(kind, handler);
-      handlers.push({ kind, handler });
-    }
-    // Default `message` listener kept as a fallback for servers that emit
-    // unnamed events; the local runtime does not, but this avoids breakage if
-    // the upstream surface changes.
-    const defaultHandler = dispatch("message");
-    source.addEventListener("message", defaultHandler);
-    // Intentionally NOT closing on error — let the browser auto-reconnect.
-    // Logging is fine; closing is not.
-    source.onerror = () => {
-      // EventSource will transition to readyState=CONNECTING and retry; nothing
-      // to do here. We avoid console noise because some browsers fire onerror
-      // on every reconnect attempt during a brief upstream outage.
-    };
-    return () => {
-      for (const { kind, handler } of handlers) source.removeEventListener(kind, handler);
-      source.removeEventListener("message", defaultHandler);
-      source.close();
-    };
+    return subscribe((event) => callbackRef.current(event));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 }
