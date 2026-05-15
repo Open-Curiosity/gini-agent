@@ -632,6 +632,12 @@ export interface SkillRecord {
   // Spec-compliant top-level `license` and `compatibility` fields.
   license?: string;
   compatibility?: string;
+  // Author-declared semver from SKILL.md frontmatter (`metadata.gini.version`,
+  // legacy top-level `version`). Distinct from `SkillRecord.version` which is
+  // an internal monotonic counter incremented on every detected change. UIs
+  // should display this field; the runtime counter is for change detection
+  // and `previousVersions` history.
+  manifestVersion?: string;
   // Set when the skill fails frontmatter or spec validation (unknown
   // provider, bad name format, etc.). When present, the skill never reaches
   // the activation gate.

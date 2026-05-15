@@ -480,7 +480,8 @@ function upsertSkillFromFile(
       existing.validationMessage !== validationMessage ||
       JSON.stringify(existing.platforms ?? null) !== JSON.stringify(parsed.platforms ?? null) ||
       JSON.stringify(existing.prerequisites ?? null) !== JSON.stringify(parsed.prerequisites ?? null) ||
-      JSON.stringify(existing.requiredConnectors ?? null) !== JSON.stringify(parsed.requiredConnectors ?? null);
+      JSON.stringify(existing.requiredConnectors ?? null) !== JSON.stringify(parsed.requiredConnectors ?? null) ||
+      (existing.manifestVersion ?? null) !== (parsed.version ?? null);
     const promoteBundledDraft = origin.source === "bundled" && existing.status === "draft";
     if (!changed && !promoteBundledDraft) return { record: existing, kind: "noop" };
     if (changed) {
@@ -503,6 +504,7 @@ function upsertSkillFromFile(
       existing.allowedTools = parsed.allowedTools;
       existing.license = parsed.license;
       existing.compatibility = parsed.compatibility;
+      existing.manifestVersion = parsed.version;
       existing.validationStatus = validationStatus;
       existing.validationMessage = validationMessage;
       existing.version += 1;
@@ -530,6 +532,7 @@ function upsertSkillFromFile(
     allowedTools: parsed.allowedTools,
     license: parsed.license,
     compatibility: parsed.compatibility,
+    manifestVersion: parsed.version,
     validationStatus,
     validationMessage,
     source: origin.source

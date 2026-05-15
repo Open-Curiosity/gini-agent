@@ -138,8 +138,11 @@ export default function SkillsPage() {
   });
 
   const filtered = skills.data ?? [];
-  const grouped = useMemo(() => groupByCategory(filtered), [filtered]);
-  const detail = filtered.find((s) => s.id === selected) ?? filtered[0];
+  const sorted = useMemo(
+    () => filtered.slice().sort((a, b) => a.name.localeCompare(b.name)),
+    [filtered]
+  );
+  const detail = filtered.find((s) => s.id === selected) ?? sorted[0];
   const connectorsByProv = useMemo(
     () => connectorsByProvider(connectors.data ?? []),
     [connectors.data]
@@ -180,40 +183,31 @@ export default function SkillsPage() {
               description={debounced ? undefined : "Drop a SKILL.md under skills/ and click Reload from disk."}
             />
           ) : (
-            <div className="flex-1 space-y-4 overflow-auto pr-1">
-              {grouped.map(({ category, items }) => (
-                <div key={category} className="space-y-2">
-                  <div className="px-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                    {category}
-                  </div>
-                  <ul className="space-y-2">
-                    {items.map((skill) => (
-                      <li key={skill.id}>
-                        <button
-                          onClick={() => setSelected(skill.id)}
-                          className={`w-full rounded-md border px-3 py-2 text-left transition-colors ${
-                            detail?.id === skill.id ? "border-primary bg-accent" : "border-border bg-card hover:bg-accent/50"
-                          }`}
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="line-clamp-1 text-sm font-medium">{skill.name}</span>
-                            <ActivationPill
-                              activation={deriveActivation(skill, connectorsByProv, providersById)}
-                            />
-                          </div>
-                          {skill.description ? (
-                            <p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">{skill.description}</p>
-                          ) : null}
-                          <span className="mt-1 block font-mono text-[10px] text-muted-foreground">
-                            v{skill.version} · {skill.source ?? "user"}
-                          </span>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
+            <ul className="flex-1 space-y-2 overflow-auto pr-1">
+              {sorted.map((skill) => (
+                <li key={skill.id}>
+                  <button
+                    onClick={() => setSelected(skill.id)}
+                    className={`w-full rounded-md border px-3 py-2 text-left transition-colors ${
+                      detail?.id === skill.id ? "border-primary bg-accent" : "border-border bg-card hover:bg-accent/50"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="line-clamp-1 text-sm font-medium">{skill.name}</span>
+                      <ActivationPill
+                        activation={deriveActivation(skill, connectorsByProv, providersById)}
+                      />
+                    </div>
+                    {skill.description ? (
+                      <p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">{skill.description}</p>
+                    ) : null}
+                    <span className="mt-1 block font-mono text-[10px] text-muted-foreground">
+                      {skill.source ?? "user"}
+                    </span>
+                  </button>
+                </li>
               ))}
-            </div>
+            </ul>
           )}
         </div>
 
@@ -226,10 +220,11 @@ export default function SkillsPage() {
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <CardTitle className="text-base">{detail.name}</CardTitle>
-                    <CardDescription className="font-mono text-[11px]">
-                      v{detail.version}
-                      {detail.trigger ? ` · trigger “${detail.trigger}”` : ""}
-                    </CardDescription>
+                    {detail.trigger ? (
+                      <CardDescription className="font-mono text-[11px]">
+                        trigger “{detail.trigger}”
+                      </CardDescription>
+                    ) : null}
                   </div>
                   <ActivationPill
                     activation={deriveActivation(detail, connectorsByProv, providersById)}
@@ -653,18 +648,3 @@ function countDependentSkills(skills: SkillRecord[], providerId: string): number
   return count;
 }
 
-function groupByCategory(skills: SkillRecord[]): Array<{ category: string; items: SkillRecord[] }> {
-  const buckets = new Map<string, SkillRecord[]>();
-  for (const skill of skills) {
-    const key = skill.category ?? "uncategorized";
-    const bucket = buckets.get(key) ?? [];
-    bucket.push(skill);
-    buckets.set(key, bucket);
-  }
-  return Array.from(buckets.entries())
-    .map(([category, items]) => ({
-      category,
-      items: items.slice().sort((a, b) => a.name.localeCompare(b.name))
-    }))
-    .sort((a, b) => a.category.localeCompare(b.category));
-}

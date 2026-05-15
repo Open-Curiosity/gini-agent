@@ -86,9 +86,8 @@ Gini extensions (under `metadata.gini`):
 
 4. Write the body. The body is the model's manual for this skill at
    runtime — concrete examples, when-to-use / when-not-to-use sections,
-   exact commands. Imitate the body shape of `skills/productivity/linear/
-   SKILL.md` or `skills/apple/apple-notes/SKILL.md` for a working
-   reference.
+   exact commands. Imitate the body shape of
+   `skills/apple/apple-notes/SKILL.md` for a working reference.
 
 5. Validate before writing to disk. Run:
 
