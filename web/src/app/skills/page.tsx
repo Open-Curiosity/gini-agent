@@ -202,7 +202,7 @@ export default function SkillsPage() {
                       <p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">{skill.description}</p>
                     ) : null}
                     <span className="mt-1 block font-mono text-[10px] text-muted-foreground">
-                      v{skill.manifestVersion ?? skill.version} · {skill.source ?? "user"}
+                      {skill.source ?? "user"}
                     </span>
                   </button>
                 </li>
@@ -220,10 +220,11 @@ export default function SkillsPage() {
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <CardTitle className="text-base">{detail.name}</CardTitle>
-                    <CardDescription className="font-mono text-[11px]">
-                      v{detail.manifestVersion ?? detail.version}
-                      {detail.trigger ? ` · trigger “${detail.trigger}”` : ""}
-                    </CardDescription>
+                    {detail.trigger ? (
+                      <CardDescription className="font-mono text-[11px]">
+                        trigger “{detail.trigger}”
+                      </CardDescription>
+                    ) : null}
                   </div>
                   <ActivationPill
                     activation={deriveActivation(detail, connectorsByProv, providersById)}
