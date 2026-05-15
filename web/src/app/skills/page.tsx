@@ -205,7 +205,7 @@ export default function SkillsPage() {
                             <p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">{skill.description}</p>
                           ) : null}
                           <span className="mt-1 block font-mono text-[10px] text-muted-foreground">
-                            v{skill.version} · {skill.source ?? "user"}
+                            v{skill.manifestVersion ?? skill.version} · {skill.source ?? "user"}
                           </span>
                         </button>
                       </li>
@@ -227,7 +227,7 @@ export default function SkillsPage() {
                   <div className="min-w-0">
                     <CardTitle className="text-base">{detail.name}</CardTitle>
                     <CardDescription className="font-mono text-[11px]">
-                      v{detail.version}
+                      v{detail.manifestVersion ?? detail.version}
                       {detail.trigger ? ` · trigger “${detail.trigger}”` : ""}
                     </CardDescription>
                   </div>
