@@ -11,6 +11,7 @@ import { RiskPill, StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import {
   useApprovals,
+  useChatSessions,
   useEvents,
   useInvalidate,
   useMemories,
@@ -30,6 +31,7 @@ export default function HomePage() {
   const approvals = useApprovals();
   const events = useEvents();
   const memories = useMemories();
+  const chatSessions = useChatSessions();
   const invalidate = useInvalidate();
 
   // Pure invalidate — useInvalidate now returns a stable function that batches
@@ -48,6 +50,19 @@ export default function HomePage() {
     },
     onError: (error: Error) => toast.error(error.message)
   });
+
+  // Tasks don't carry back-refs to their chat session, so build a lookup from
+  // session.taskIds. Last-write-wins is fine; in practice a task lives in one
+  // session.
+  const taskToSession = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const session of chatSessions.data ?? []) {
+      for (const taskId of session.taskIds ?? []) {
+        map.set(taskId, session.id);
+      }
+    }
+    return map;
+  }, [chatSessions.data]);
 
   const activeTasks = (tasks.data ?? []).filter((t) => ["queued", "running", "waiting_approval"].includes(t.status));
   const pending = (approvals.data ?? []).filter((a) => a.status === "pending");
@@ -182,15 +197,32 @@ export default function HomePage() {
               <EmptyState title="No active tasks" description="Submit a task from the Tasks tab." />
             ) : (
               <ul className="divide-y divide-border">
-                {activeTasks.map((task) => (
-                  <li key={task.id} className="flex items-center justify-between gap-3 py-2">
-                    <div className="min-w-0">
-                      <p className="truncate text-sm font-medium">{task.title}</p>
-                      <p className="truncate font-mono text-[11px] text-muted-foreground">{task.id}</p>
-                    </div>
-                    <StatusPill value={task.status} />
-                  </li>
-                ))}
+                {activeTasks.map((task) => {
+                  const sessionId = taskToSession.get(task.id);
+                  const body = (
+                    <>
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-medium">{task.title}</p>
+                        <p className="truncate font-mono text-[11px] text-muted-foreground">{task.id}</p>
+                      </div>
+                      <StatusPill value={task.status} />
+                    </>
+                  );
+                  return (
+                    <li key={task.id}>
+                      {sessionId ? (
+                        <Link
+                          href={`/chat?session=${sessionId}`}
+                          className="-mx-2 flex items-center justify-between gap-3 rounded-md px-2 py-2 hover:bg-accent"
+                        >
+                          {body}
+                        </Link>
+                      ) : (
+                        <div className="flex items-center justify-between gap-3 py-2">{body}</div>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </CardContent>
