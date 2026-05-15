@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import {
   clearEchoToolCallingResponses,
   clearEchoVisionResponses,
+  generateStructured,
   generateTaskSummary,
   generateToolCallingResponse,
   generateVisionAnalysis,
@@ -698,6 +699,774 @@ describe("provider", () => {
       globalThis.fetch = originalFetch;
       if (original === undefined) delete process.env.OPENROUTER_API_KEY;
       else process.env.OPENROUTER_API_KEY = original;
+    }
+  });
+
+  // ---------------- extraBody plumbing (oMLX-style chat_template_kwargs) ----------------
+
+  // The openai/openrouter/local providers all forward `extraBody` into the
+  // request body of every chat-completions call (tool-calling, structured,
+  // vision, generateTaskSummary). Codex uses /responses with its own shape
+  // and is not expected to honor extraBody — verified separately by the
+  // /responses tests above which already assert the request body keys.
+
+  test("normalizeProvider preserves extraBody for local/openai/openrouter and drops it for echo/codex", () => {
+    const extraBody = { chat_template_kwargs: { enable_thinking: true } };
+    expect(normalizeProvider({ name: "local", model: "m", extraBody }).extraBody).toEqual(extraBody);
+    expect(normalizeProvider({ name: "openai", model: "m", extraBody }).extraBody).toEqual(extraBody);
+    expect(normalizeProvider({ name: "openrouter", model: "m", extraBody }).extraBody).toEqual(extraBody);
+    // echo and codex don't carry extraBody through. Echo is deterministic and
+    // bypasses the HTTP path; codex uses /responses (different wire shape).
+    expect(normalizeProvider({ name: "echo", model: "m", extraBody }).extraBody).toBeUndefined();
+    expect(normalizeProvider({ name: "codex", model: "m", extraBody }).extraBody).toBeUndefined();
+  });
+
+  test("local tool-calling merges extraBody into the chat-completions request body", async () => {
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_local_1",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "ok" }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "gemma-4-26b-a4b-it-uncensored-8bit",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: { chat_template_kwargs: { preserve_thinking: false, enable_thinking: true } }
+      });
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hello" }],
+        []
+      );
+      expect(captured?.url).toBe("http://127.0.0.1:8000/v1/chat/completions");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.chat_template_kwargs).toEqual({ preserve_thinking: false, enable_thinking: true });
+      expect(sent.model).toBe("gemma-4-26b-a4b-it-uncensored-8bit");
+      expect(Array.isArray(sent.messages)).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("local tool-calling streaming also forwards extraBody", async () => {
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const events = [
+        { choices: [{ index: 0, delta: { content: "hi" } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }
+      ];
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          for (const e of events) {
+            controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+          }
+          controller.enqueue(enc.encode("data: [DONE]\n\n"));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "gemma-4-26b-a4b-it-uncensored-8bit",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: { chat_template_kwargs: { enable_thinking: true } }
+      });
+      let streamed = "";
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        [],
+        (delta) => { streamed += delta; }
+      );
+      expect(result.text).toBe("hi");
+      expect(streamed).toBe("hi");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
+      expect(sent.stream).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("openai structured chat-completions merges extraBody but keeps response_format", async () => {
+    const original = process.env.OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "test-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_struct_1",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: '{"ok":true}' }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "openai",
+        model: "gpt-test",
+        extraBody: { chat_template_kwargs: { enable_thinking: false } }
+      });
+      const result = await generateStructured(config(provider), {
+        system: "be brief",
+        user: "say ok",
+        schemaName: "Ok",
+        validator: { parse: (v) => v as { ok: boolean } }
+      });
+      expect(result.data).toEqual({ ok: true });
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: false });
+      expect(sent.response_format).toEqual({ type: "json_object" });
+      expect(sent.model).toBe("gpt-test");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = original;
+    }
+  });
+
+  test("local vision chat-completions merges extraBody", async () => {
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_vision_local",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "described." }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "vlm-test",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: { chat_template_kwargs: { enable_thinking: true } }
+      });
+      const result = await generateVisionAnalysis(config(provider), {
+        prompt: "what is shown?",
+        imageBase64: "AAAA",
+        mimeType: "image/png"
+      });
+      expect(result.text).toBe("described.");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
+      // Image content part should still be present.
+      expect(sent.messages[0].content[1].type).toBe("image_url");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("openrouter generateTaskSummary chat-completions merges extraBody", async () => {
+    const original = process.env.OPENROUTER_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENROUTER_API_KEY = "test-or-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_or_summary",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "summary." }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "openrouter",
+        model: "or-model",
+        extraBody: { chat_template_kwargs: { enable_thinking: true }, provider: { order: ["mistral"] } }
+      });
+      const result = await generateTaskSummary(config(provider), "hello", []);
+      expect(result.text).toBe("summary.");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
+      expect(sent.provider).toEqual({ order: ["mistral"] });
+      expect(sent.model).toBe("or-model");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = original;
+    }
+  });
+
+  test("extraBody.tools/tool_choice are stripped even when caller passes empty tools (iteration-cap summary case)", async () => {
+    // The chat-task agent loop, when it hits its iteration cap, asks for a
+    // final summary by re-calling the provider with an empty tools array.
+    // If a poisoned config had `tools: [...]` in extraBody, the spread-
+    // before-conditional pattern would let those tools survive into the
+    // summary request and the model would happily emit more tool calls.
+    // sanitizeExtraBody must strip them before the runtime fields land.
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "resp_summary_empty_tools",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "summary." } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "m",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: {
+          tools: [{ type: "function", function: { name: "evil", description: "", parameters: {} } }],
+          tool_choice: "required",
+          chat_template_kwargs: { enable_thinking: true }
+        }
+      });
+      // Call with EMPTY tools array — the summary-turn case.
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "summarize" }], []);
+      const sent = JSON.parse(String(captured!.init!.body));
+      // The reserved keys must NOT survive into the request body.
+      expect("tools" in sent).toBe(false);
+      expect("tool_choice" in sent).toBe(false);
+      // Non-reserved keys still flow through.
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("non-streaming paths force stream:false even when extraBody tries to enable streaming", async () => {
+    // extraBody.stream=true would make the server emit SSE while the
+    // non-streaming code paths read response.text() and JSON.parse(). The
+    // runtime must always pin stream:false for callChatCompletions,
+    // callStructuredChatCompletions, and callVisionChatCompletions.
+    const originalFetch = globalThis.fetch;
+    const requestBodies: Record<string, unknown>[] = [];
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      requestBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      // Use "{}" as message content so generateStructured's JSON.parse
+      // succeeds — the test asserts on the request body, not the response.
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "{}" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const original = process.env.OPENROUTER_API_KEY;
+      process.env.OPENROUTER_API_KEY = "test-or-key";
+      try {
+        const provider = normalizeProvider({
+          name: "openrouter",
+          model: "m",
+          extraBody: { stream: true }
+        });
+        // generateTaskSummary → callChatCompletions for openrouter
+        await generateTaskSummary(config(provider), "hi", []);
+        // generateStructured → callStructuredChatCompletions
+        await generateStructured(config(provider), {
+          system: "s", user: "u", schemaName: "X", validator: { parse: (v) => v }
+        });
+        // generateVisionAnalysis → callVisionChatCompletions
+        await generateVisionAnalysis(config(provider), {
+          prompt: "what?", imageBase64: "AAAA", mimeType: "image/png"
+        });
+        expect(requestBodies).toHaveLength(3);
+        for (const body of requestBodies) {
+          expect(body.stream).toBe(false);
+        }
+      } finally {
+        if (original === undefined) delete process.env.OPENROUTER_API_KEY;
+        else process.env.OPENROUTER_API_KEY = original;
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("extraBody.functions/function_call/store are stripped (legacy + retention guards)", async () => {
+    // OpenAI's deprecated function-calling fields and the data-retention
+    // `store` flag must not be settable through extraBody. The runtime
+    // doesn't read message.function_call from responses, so a poisoned
+    // legacy schema would silently drop function results; `store` would
+    // change retention behavior inconsistently with the /responses path.
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "m",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: {
+          functions: [{ name: "evil", parameters: {} }],
+          function_call: { name: "evil" },
+          store: true,
+          chat_template_kwargs: { enable_thinking: true }
+        }
+      });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect("functions" in sent).toBe(false);
+      expect("function_call" in sent).toBe(false);
+      expect("store" in sent).toBe(false);
+      // Non-reserved key still flows through.
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("extraBody.max_tokens flows through for tool-calling, structured, and summary calls", async () => {
+    // The runtime only sets max_tokens/max_completion_tokens for vision (and
+    // vision strips both via VISION_RESERVED_EXTRA_BODY_KEYS). So
+    // tool-calling/structured/summary callers must be able to set
+    // max_tokens via extraBody legitimately. Vision behavior is covered by
+    // the dedicated vision-bypass test below.
+    const originalFetch = globalThis.fetch;
+    const requestBodies: Record<string, unknown>[] = [];
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      requestBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "{}" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "m",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: { max_tokens: 256 }
+      });
+      // Tool-calling: extraBody.max_tokens flows through.
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(requestBodies[0]?.max_tokens).toBe(256);
+
+      // Structured: extraBody.max_tokens flows through.
+      requestBodies.length = 0;
+      await generateStructured(config(provider), {
+        system: "s", user: "u", schemaName: "X", validator: { parse: (v) => v }
+      });
+      expect(requestBodies[0]?.max_tokens).toBe(256);
+
+      // Summary (callChatCompletions): only fires for openrouter/local on
+      // generateTaskSummary. Verify with openrouter to also cover that branch.
+      const original = process.env.OPENROUTER_API_KEY;
+      process.env.OPENROUTER_API_KEY = "test-or-key";
+      try {
+        const orProvider = normalizeProvider({
+          name: "openrouter",
+          model: "m",
+          extraBody: { max_tokens: 128 }
+        });
+        requestBodies.length = 0;
+        await generateTaskSummary(config(orProvider), "summarize", []);
+        expect(requestBodies[0]?.max_tokens).toBe(128);
+      } finally {
+        if (original === undefined) delete process.env.OPENROUTER_API_KEY;
+        else process.env.OPENROUTER_API_KEY = original;
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("vision strips BOTH max_tokens and max_completion_tokens from extraBody so the runtime budget always wins", async () => {
+    // Round-2 fix removed the global denylist of these keys, but vision
+    // sets only ONE of them (max_completion_tokens for openai, max_tokens
+    // for others) — so a poisoned extraBody could supply the OTHER and
+    // both end up in the request. That breaks OpenAI o-series (which
+    // rejects max_tokens) and defeats the cap on local/openrouter.
+    // Vision now passes VISION_RESERVED_EXTRA_BODY_KEYS to sanitizeExtraBody
+    // so neither token-budget key from extraBody survives.
+    const originalFetch = globalThis.fetch;
+    const requestBodies: Record<string, unknown>[] = [];
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      requestBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const original = process.env.OPENAI_API_KEY;
+      process.env.OPENAI_API_KEY = "test-key";
+      try {
+        // OpenAI vision: runtime sets max_completion_tokens; extraBody
+        // attempts to leak max_tokens. The leak must NOT happen.
+        const openaiProvider = normalizeProvider({
+          name: "openai",
+          model: "gpt-test",
+          extraBody: { max_tokens: 999, max_completion_tokens: 888 }
+        });
+        await generateVisionAnalysis(config(openaiProvider), {
+          prompt: "what?", imageBase64: "AAAA", mimeType: "image/png", maxTokens: 32
+        });
+        expect(requestBodies[0]?.max_tokens).toBeUndefined();
+        expect(requestBodies[0]?.max_completion_tokens).toBe(32);
+      } finally {
+        if (original === undefined) delete process.env.OPENAI_API_KEY;
+        else process.env.OPENAI_API_KEY = original;
+      }
+
+      // Local vision: runtime sets max_tokens; extraBody attempts to leak
+      // max_completion_tokens. The leak must NOT happen.
+      requestBodies.length = 0;
+      const localProvider = normalizeProvider({
+        name: "local",
+        model: "m",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: { max_tokens: 999, max_completion_tokens: 888 }
+      });
+      await generateVisionAnalysis(config(localProvider), {
+        prompt: "what?", imageBase64: "AAAA", mimeType: "image/png", maxTokens: 64
+      });
+      expect(requestBodies[0]?.max_tokens).toBe(64);
+      expect(requestBodies[0]?.max_completion_tokens).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("extraBody with __proto__/constructor/prototype keys cannot pollute or smuggle", async () => {
+    // Object.entries on a JSON.parse-produced object yields __proto__ as an
+    // own enumerable key. Without an explicit drop, the spread would forward
+    // it to the API. The denylist + Object.create(null) output object keep
+    // both runtime safety and wire safety.
+    const originalFetch = globalThis.fetch;
+    let capturedRawBody: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      capturedRawBody = String(init.body);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const polluted = JSON.parse('{"__proto__":{"model":"hijacked"},"constructor":1,"prototype":2,"chat_template_kwargs":{"x":1}}');
+      const provider = normalizeProvider({
+        name: "local",
+        model: "real-model",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: polluted
+      });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      // Wire-level check: the serialized JSON must not contain the
+      // prototype-pollution keys at all. We check the raw body string
+      // because `"__proto__" in parsedObject` is always true (inherited
+      // from Object.prototype) — it doesn't reflect what was sent.
+      expect(capturedRawBody).toBeDefined();
+      expect(capturedRawBody!.includes("__proto__")).toBe(false);
+      expect(capturedRawBody!.includes("\"constructor\"")).toBe(false);
+      expect(capturedRawBody!.includes("\"prototype\"")).toBe(false);
+      // Object-level check via hasOwnProperty (the safe predicate).
+      const sent = JSON.parse(capturedRawBody!);
+      expect(Object.prototype.hasOwnProperty.call(sent, "__proto__")).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(sent, "constructor")).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(sent, "prototype")).toBe(false);
+      // Runtime model still wins regardless.
+      expect(sent.model).toBe("real-model");
+      // The legitimate non-reserved field still flows through.
+      expect(sent.chat_template_kwargs).toEqual({ x: 1 });
+      // The runtime's own object prototype isn't polluted.
+      expect(({} as { model?: unknown }).model).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("empty-string baseUrl falls back to the per-provider default (local → Ollama, not OpenAI)", async () => {
+    // Persisted config can theoretically carry baseUrl: "" (e.g.
+    // hand-edited config or a future API write that didn't validate). The
+    // old `?? DEFAULT` fallback skipped only nullish, not empty — leaving
+    // a relative `/chat/completions` URL that fetch would resolve against
+    // localhost. The round-3 fix used resolveBaseUrl with a hardcoded
+    // `DEFAULT_OPENAI_BASE_URL` fallback at every call site, which sent
+    // local-with-empty-baseUrl traffic to api.openai.com. The round-4 fix
+    // dispatches per provider via `defaultBaseUrl(provider)`. This test
+    // pins the EXACT URL so a regression to the wrong default fails fast.
+    const originalFetch = globalThis.fetch;
+    let capturedUrl: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      // Skip normalizeProvider so the empty baseUrl actually persists
+      // through to the call site (the normalizer would coerce missing
+      // baseUrl to default; here we want to test the call-site resolver).
+      const provider = { name: "local" as const, model: "m", baseUrl: "" };
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(capturedUrl).toBe("http://127.0.0.1:11434/v1/chat/completions");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("empty-string baseUrl on openrouter falls back to the openrouter default (not OpenAI)", async () => {
+    const original = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_API_KEY = "test-or-key";
+    const originalFetch = globalThis.fetch;
+    let capturedUrl: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = { name: "openrouter" as const, model: "m", baseUrl: "" };
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(capturedUrl).toBe("https://openrouter.ai/api/v1/chat/completions");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = original;
+    }
+  });
+
+  test("empty-string baseUrl on openai falls back to the openai default", async () => {
+    const original = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "test-key";
+    const originalFetch = globalThis.fetch;
+    let capturedUrl: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = { name: "openai" as const, model: "m", baseUrl: "" };
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(capturedUrl).toBe("https://api.openai.com/v1/chat/completions");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = original;
+    }
+  });
+
+  test("empty-string baseUrl on codex routes /responses to the codex backend (not OpenAI)", async () => {
+    // Round-4 caught that codex /responses paths fell back to
+    // DEFAULT_OPENAI_BASE_URL when baseUrl was empty, which would have
+    // sent codex traffic to api.openai.com. Pinning the exact codex URL
+    // catches any regression to a wrong default at the codex call sites.
+    // Pass a tool so the routing lands on callToolCallingResponses
+    // (which handles `response.completed.output` cleanly); the call-site
+    // baseUrl resolution is identical between the two codex /responses
+    // helpers, so this still exercises the regression surface.
+    const { restore } = installCodexAuth("codex-empty-baseurl");
+    const originalFetch = globalThis.fetch;
+    let capturedUrl: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          const ev = { type: "response.completed", response: { id: "r", output: [
+            { id: "msg_1", type: "message", content: [{ type: "output_text", text: "ok" }] }
+          ] } };
+          controller.enqueue(enc.encode(`event: response.completed\ndata: ${JSON.stringify(ev)}\n\n`));
+          controller.enqueue(enc.encode("data: [DONE]\n\n"));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = { name: "codex" as const, model: "m", baseUrl: "" };
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], tools);
+      expect(capturedUrl).toBe("https://chatgpt.com/backend-api/codex/responses");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("extraBody.toJSON is dropped so a callable cannot replace the request body wholesale", async () => {
+    // Defense-in-depth: JSON-loaded extraBody can never carry a function,
+    // but if a future internal caller constructs ProviderConfig with a
+    // callable toJSON, the final JSON.stringify of the merged body would
+    // invoke it and could return an arbitrary replacement. The denylist
+    // strips toJSON before the spread.
+    const originalFetch = globalThis.fetch;
+    let capturedRawBody: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      capturedRawBody = String(init.body);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "real-model",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        // Callable toJSON that would hijack the request body if it survived
+        // sanitization. Cast to satisfy the Record<string, unknown> shape.
+        extraBody: { toJSON: () => ({ model: "hijacked", smuggled: true }) } as unknown as Record<string, unknown>
+      });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(capturedRawBody).toBeDefined();
+      expect(capturedRawBody!.includes("hijacked")).toBe(false);
+      expect(capturedRawBody!.includes("smuggled")).toBe(false);
+      const sent = JSON.parse(capturedRawBody!);
+      expect(sent.model).toBe("real-model");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("baseUrl with trailing slash is normalized so the path doesn't double up", async () => {
+    const originalFetch = globalThis.fetch;
+    let capturedUrl: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "m",
+        baseUrl: "http://127.0.0.1:8000/v1/" // note trailing slash
+      });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(capturedUrl).toBe("http://127.0.0.1:8000/v1/chat/completions");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("extraBody cannot override built-in fields like model/messages/stream/tools", async () => {
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_override",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "ok" }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "real-model",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        // Caller maliciously/accidentally tries to override built-ins via
+        // extraBody. Built-ins must win because the request would otherwise
+        // be inconsistent (e.g. wrong model billed, no tools sent).
+        extraBody: {
+          model: "hijacked-model",
+          messages: [{ role: "user", content: "hijacked" }],
+          stream: true,
+          tools: [{ type: "function", function: { name: "evil", description: "x", parameters: {} } }],
+          chat_template_kwargs: { enable_thinking: true }
+        }
+      });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "real_tool", description: "real", parameters: { type: "object" } }
+      }];
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "real prompt" }],
+        tools
+      );
+      const sent = JSON.parse(String(captured!.init!.body));
+      // Built-ins override the extraBody attempt.
+      expect(sent.model).toBe("real-model");
+      expect(sent.messages).toEqual([{ role: "user", content: "real prompt" }]);
+      expect(sent.stream).toBe(false);
+      expect(sent.tools).toHaveLength(1);
+      expect(sent.tools[0].function.name).toBe("real_tool");
+      expect(sent.tool_choice).toBe("auto");
+      // Non-conflicting extraBody field flows through.
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
+    } finally {
+      globalThis.fetch = originalFetch;
     }
   });
 });

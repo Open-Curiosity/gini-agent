@@ -105,6 +105,14 @@ Usage:
   bun run gini promotions list|propose|approve|reject
   bun run gini snapshots list|create|restore
   bun run gini provider show|catalog|set echo|openai|codex|openrouter|local [model]
+                  [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]
+                  --base-url and --api-key-env work for local / openai /
+                  openrouter (point at OpenAI-compatible servers like oMLX,
+                  vLLM, LM Studio) AND for codex (override the backend URL
+                  or auth-file env var). --extra-body forwards server-
+                  specific request fields like \`chat_template_kwargs\` and
+                  applies to local / openai / openrouter chat-completions
+                  calls; codex (/responses) and echo ignore it.
   bun run gini trace <task-id>
   bun run gini events
   bun run gini audit

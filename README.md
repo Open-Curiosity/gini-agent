@@ -155,6 +155,19 @@ bun run gini doctor
 
 API keys are read from the environment and are not written to Gini config.
 
+### OpenAI-compatible local servers (oMLX, vLLM, LM Studio, llama.cpp)
+
+The `local` provider speaks the OpenAI chat-completions wire shape so any compatible server works. Override the default base URL, the env var holding the API key, and any server-specific request fields with the corresponding flags:
+
+```bash
+bun run gini provider set local gemma-4-31b-it-8bit \
+  --base-url http://127.0.0.1:8000/v1 \
+  --api-key-env GINI_LOCAL_API_KEY \
+  --extra-body '{"chat_template_kwargs":{"preserve_thinking":false,"enable_thinking":true}}'
+```
+
+`--base-url` and `--api-key-env` also work for `openai` and `openrouter` (point at a proxy, swap which env var holds the key). `--extra-body` is forwarded into every chat-completions request — see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the full contract, the reserved-key denylist, and the trust boundary.
+
 ## Parallel Development
 
 Use instances for isolated work:

@@ -273,9 +273,10 @@ async function callToolCallingChatCompletions(
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
-  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const wantStream = Boolean(onDelta);
   const body: Record<string, unknown> = {
+    ...sanitizeExtraBody(provider.extraBody),
     model: provider.model,
     messages: messages.map(serializeChatMessage),
     stream: wantStream
@@ -477,7 +478,7 @@ async function callToolCallingResponses(
   onDelta?: (text: string) => void
 ): Promise<ToolCallingResult> {
   const bearer = readCodexBearer(provider);
-  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const { instructions, input } = translateMessagesToResponsesInput(messages);
   const responsesTools = tools.map((tool) => ({
     type: "function" as const,
@@ -928,7 +929,7 @@ async function callStructuredCodex<T>(
   request: StructuredRequest<T>
 ): Promise<StructuredResult<T>> {
   const bearer = readCodexBearer(provider);
-  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
     headers: {
@@ -993,17 +994,19 @@ async function callStructuredChatCompletions<T>(
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
-  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
     body: JSON.stringify({
+      ...sanitizeExtraBody(provider.extraBody),
       model: provider.model,
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: request.system },
         { role: "user", content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema.` }
-      ]
+      ],
+      stream: false
     })
   });
   const rawPayload = await response.text();
@@ -1027,36 +1030,46 @@ async function callStructuredChatCompletions<T>(
   };
 }
 
+// Treat both nullish and whitespace-only as missing so persisted
+// `baseUrl: ""` doesn't slip through normalize and end up resolving against
+// the wrong provider's default at the call site.
+function pickBaseUrl(persisted: string | undefined, fallback: string): string {
+  return persisted && persisted.trim().length > 0 ? persisted : fallback;
+}
+
 export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   if (provider.name === "openai") {
     return {
       name: "openai",
       model: provider.model || "gpt-5.4-mini",
-      baseUrl: provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL,
-      apiKeyEnv: provider.apiKeyEnv ?? "OPENAI_API_KEY"
+      baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL),
+      apiKeyEnv: provider.apiKeyEnv ?? "OPENAI_API_KEY",
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
   if (provider.name === "openrouter") {
     return {
       name: "openrouter",
       model: provider.model || "openrouter/auto",
-      baseUrl: provider.baseUrl ?? "https://openrouter.ai/api/v1",
-      apiKeyEnv: provider.apiKeyEnv ?? "OPENROUTER_API_KEY"
+      baseUrl: pickBaseUrl(provider.baseUrl, "https://openrouter.ai/api/v1"),
+      apiKeyEnv: provider.apiKeyEnv ?? "OPENROUTER_API_KEY",
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
   if (provider.name === "local") {
     return {
       name: "local",
       model: provider.model || "local/default",
-      baseUrl: provider.baseUrl ?? "http://127.0.0.1:11434/v1",
-      apiKeyEnv: provider.apiKeyEnv ?? "GINI_LOCAL_API_KEY"
+      baseUrl: pickBaseUrl(provider.baseUrl, "http://127.0.0.1:11434/v1"),
+      apiKeyEnv: provider.apiKeyEnv ?? "GINI_LOCAL_API_KEY",
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
   if (provider.name === "codex") {
     return {
       name: "codex",
       model: provider.model || DEFAULT_CODEX_MODEL,
-      baseUrl: provider.baseUrl ?? DEFAULT_CODEX_BASE_URL,
+      baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_CODEX_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv
     };
   }
@@ -1076,7 +1089,8 @@ async function callOpenAIResponses(
   const headers = provider.name === "codex" ? codexHeaders(bearer) : {};
 
   const isCodex = provider.name === "codex";
-  const response = await fetch(`${provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL}/responses`, {
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
+  const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${bearer}`,
@@ -1129,15 +1143,18 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
-  const response = await fetch(`${provider.baseUrl}/chat/completions`, {
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
+  const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
     body: JSON.stringify({
+      ...sanitizeExtraBody(provider.extraBody),
       model: provider.model,
       messages: [
         { role: "system", content: systemContext },
         { role: "user", content: input }
-      ]
+      ],
+      stream: false
     })
   });
   const rawPayload = await response.text();
@@ -1410,6 +1427,122 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+// Reserved fields that the runtime must own — never let `extraBody` overwrite
+// them. Without this, a poisoned config (or a careless --extra-body argument)
+// could redirect the call to a different model, smuggle in extra tools, flip
+// stream mode and break response parsing, or change data-retention behavior.
+// The denylist is the single source of truth so every chat-completions call
+// site stays consistent.
+//
+// Maintainer note: when you add a runtime-owned chat-completions request
+// field (e.g. another tool-shape variant, a new structured-output mode), add
+// it here too. Vision's `max_tokens`/`max_completion_tokens` are NOT in the
+// list — vision spreads its `tokenBudgetField` AFTER the sanitized extras so
+// vision callers still win, while non-vision callers can put their own
+// `max_tokens` in extraBody legitimately.
+//
+// `functions` and `function_call` cover OpenAI's deprecated legacy
+// function-calling API. The runtime ignores `message.function_call` in
+// responses (extractToolCalls only walks `tool_calls`), so a poisoned
+// extraBody using the legacy schema would silently drop function results.
+//
+// `store` controls whether the provider persists the chat completion for
+// distillation/evals. The /responses path pins `store: false` explicitly;
+// chat-completions paths must stay consistent.
+//
+// Also block `__proto__`/`constructor`/`prototype` to defend against
+// prototype-pollution-style payloads — Object.entries already returns
+// __proto__ as an own key when JSON.parse produced it, so without an
+// explicit drop the spread would forward it to the API.
+//
+// `toJSON` is blocked as a defense-in-depth measure. JSON-loaded extraBody
+// (the only documented entry point) cannot carry functions, so this is
+// dormant in practice. But if a future internal caller constructs
+// ProviderConfig programmatically with a callable `toJSON`, the final
+// `JSON.stringify({ ...sanitized, model, ... })` would invoke it and could
+// return an arbitrary replacement object — including reserved fields.
+// Stripping `toJSON` keeps that escape hatch shut.
+const RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
+  "model",
+  "messages",
+  "stream",
+  "tools",
+  "tool_choice",
+  "response_format",
+  "functions",
+  "function_call",
+  "store",
+  "__proto__",
+  "constructor",
+  "prototype",
+  "toJSON"
+]);
+
+function sanitizeExtraBody(
+  extraBody: Record<string, unknown> | undefined,
+  // Per-call extension to the base denylist. Vision passes its token-budget
+  // keys (`max_tokens`, `max_completion_tokens`) here so a poisoned extraBody
+  // can't smuggle the OTHER token field alongside the runtime-set one — a
+  // real bug that broke OpenAI o-series vision (which rejects requests with
+  // `max_tokens` present) and could defeat the cap on local/openrouter
+  // gateways. Non-vision callers leave this empty so users can legitimately
+  // set `max_tokens` via extraBody for chat/structured/tool-calling.
+  extraDeny?: ReadonlySet<string>
+): Record<string, unknown> {
+  if (!extraBody) return {};
+  // `Object.create(null)` for the output so future spreads can't be
+  // surprised by an inherited prototype. Object.entries on the input only
+  // yields own enumerable string-keyed properties, which is what we want.
+  const out: Record<string, unknown> = Object.create(null);
+  for (const [key, value] of Object.entries(extraBody)) {
+    if (RESERVED_EXTRA_BODY_KEYS.has(key)) continue;
+    if (extraDeny && extraDeny.has(key)) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+// Token-budget fields owned by callVisionChatCompletions. Centralized so the
+// runtime never accidentally allows extraBody to set the OTHER budget field
+// alongside the runtime-set one (e.g. extraBody.max_tokens leaking through
+// when openai vision sets max_completion_tokens, or vice versa).
+const VISION_RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
+  "max_tokens",
+  "max_completion_tokens"
+]);
+
+// Strip a trailing slash from a baseUrl so callers can write either
+// `http://x/v1` or `http://x/v1/` and the resulting request URL stays
+// `http://x/v1/chat/completions` (not `http://x/v1//chat/completions` —
+// some OpenAI-compatible servers reject the doubled slash). Mirrors the
+// pattern in src/embeddings.ts.
+//
+// `provider.baseUrl` is technically optional but a persisted empty string
+// would slip past `?? DEFAULT`. `resolveBaseUrl` short-circuits to the
+// default in both the nullish and empty-string cases so neither produces
+// a relative `/chat/completions` URL.
+function trimBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, "");
+}
+
+function resolveBaseUrl(baseUrl: string | undefined, fallback: string): string {
+  const candidate = baseUrl && baseUrl.trim().length > 0 ? baseUrl : fallback;
+  return trimBaseUrl(candidate);
+}
+
+// Per-provider default baseUrl. Use this at call sites instead of hardcoding
+// DEFAULT_OPENAI_BASE_URL — otherwise an unnormalized provider (or one whose
+// persisted baseUrl somehow slipped through normalize as empty) would send
+// codex /responses traffic to api.openai.com, or local/Ollama traffic to
+// OpenAI. Mirrors the per-provider defaults set by normalizeProvider so the
+// call-site fallback agrees with the persisted-config fallback.
+function defaultBaseUrl(provider: ProviderConfig): string {
+  if (provider.name === "codex") return DEFAULT_CODEX_BASE_URL;
+  if (provider.name === "openrouter") return "https://openrouter.ai/api/v1";
+  if (provider.name === "local") return "http://127.0.0.1:11434/v1";
+  return DEFAULT_OPENAI_BASE_URL;
+}
+
 // ---------------- Vision (image input) ----------------
 //
 // Single-shot vision call: caller provides a prompt + one inline base64 PNG/JPEG,
@@ -1481,7 +1614,7 @@ async function callVisionCodex(
   maxTokens: number
 ): Promise<VisionResult> {
   const bearer = readCodexBearer(provider);
-  const baseUrl = provider.baseUrl ?? DEFAULT_CODEX_BASE_URL;
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
@@ -1536,7 +1669,7 @@ async function callVisionChatCompletions(
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
-  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
   // OpenAI's newer o-series chat models reject `max_tokens` outright and
   // require `max_completion_tokens`. Older OpenAI models still accept the
@@ -1551,6 +1684,7 @@ async function callVisionChatCompletions(
     method: "POST",
     headers,
     body: JSON.stringify({
+      ...sanitizeExtraBody(provider.extraBody, VISION_RESERVED_EXTRA_BODY_KEYS),
       model: provider.model,
       messages: [
         {
@@ -1561,6 +1695,7 @@ async function callVisionChatCompletions(
           ]
         }
       ],
+      stream: false,
       ...tokenBudgetField
     })
   });
