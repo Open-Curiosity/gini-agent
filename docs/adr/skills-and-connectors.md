@@ -56,8 +56,8 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 
 ### UI
 
-- The web Connectors page (`/connectors`) supports add, rotate, and delete in addition to the existing health probe.
-- Skills view surfaces dependency state: each skill shows its required connectors and whether they are satisfied.
+- Connector setup happens inline on the Skills page next to the rows that depend on a connector. There is no standalone Connectors page; auto-detected connectors with no dependent skill are not surfaced in the UI.
+- Each skill row shows its required connectors and whether they are satisfied. Missing connectors expose `[Set up <Label>]`; healthy connectors expose `[Disconnect]`. Disconnect physically removes user-source records and tombstones auto-source records (`status: "disabled"`) so the auto-detection pass won't immediately re-create them.
 
 ## Rejected
 
