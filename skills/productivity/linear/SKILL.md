@@ -1,14 +1,20 @@
 ---
 name: linear
 description: "Query and update Linear issues via the Linear GraphQL API."
-version: 1.0.0
-author: Gini
 license: MIT
-prerequisites:
-  env: [LINEAR_API_KEY]
-requires:
-  identities:
-    - kind: linear
+compatibility: "Requires curl, jq, and a healthy Linear connector."
+allowed-tools: "Bash"
+metadata:
+  gini:
+    version: 1.0.0
+    author: Gini
+    prerequisites:
+      commands: [curl, jq]
+      env: [LINEAR_API_KEY]
+    requires:
+      connectors:
+        - provider: linear
+          scopes: [issues:read, issues:write]
 ---
 
 # Linear
@@ -17,7 +23,7 @@ Use the Linear GraphQL API to query issues, comments, projects, and teams, and t
 
 ## Auth
 
-Linear personal API keys are sent in the `Authorization` header as the **raw token**, not with a `Bearer` prefix. The gateway injects `LINEAR_API_KEY` into the subprocess environment when a healthy `linear` identity exists; do not ask the user for it.
+Linear personal API keys are sent in the `Authorization` header as the **raw token**, not with a `Bearer` prefix. The gateway injects `LINEAR_API_KEY` into the subprocess environment when a healthy `linear` connector exists; do not ask the user for it.
 
 ```bash
 curl -sS https://api.linear.app/graphql \

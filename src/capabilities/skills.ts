@@ -1,9 +1,113 @@
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join, normalize, sep } from "node:path";
 import type { RuntimeConfig, SkillRecord } from "../types";
 import { addAudit, appendEvent, createSkill, mutateState, now, readState } from "../state";
-import { loadSkillsFromDisk, type SkillLoadResult } from "./skill-loader";
+import { skillsDir } from "../paths";
+import { loadSkillsFromDisk, parseSkillFile, validateParsedSkill, type SkillLoadResult } from "./skill-loader";
 
 export async function reloadSkills(config: RuntimeConfig): Promise<SkillLoadResult> {
   return loadSkillsFromDisk(config);
+}
+
+export interface InstallSkillInput {
+  // Raw SKILL.md contents (frontmatter + body).
+  body: string;
+  // Optional category override. When omitted, falls back to
+  // metadata.gini.category or "user". The resulting file lives at
+  // `<instance>/skills/<category>/<name>/SKILL.md`.
+  category?: string;
+  // Optional named-file payloads written next to SKILL.md
+  // (e.g. `scripts/linear.sh`). Each entry's `name` is treated as a
+  // relative path under the skill folder and must not escape it.
+  files?: Array<{ name: string; content: string }>;
+}
+
+export interface InstallSkillResult {
+  skill: SkillRecord;
+  manifestPath: string;
+  validation: { ok: boolean; issues: string[] };
+}
+
+// Persist a SKILL.md (and optional sidecar files) to the user-skills
+// directory and trigger a reload so the new skill enters the runtime.
+// This is the API counterpart to dropping a file in
+// `~/.gini/instances/<instance>/skills/<category>/<name>/`; both end up
+// in the same watched directory.
+export async function installSkillFromBody(
+  config: RuntimeConfig,
+  input: InstallSkillInput
+): Promise<InstallSkillResult> {
+  if (typeof input.body !== "string" || !input.body.trim()) {
+    throw new Error("Invalid input: body is required.");
+  }
+  const parsed = parseSkillFile(input.body);
+  if (!parsed.name.trim()) {
+    throw new Error("Invalid input: SKILL.md must declare a top-level `name`.");
+  }
+  // Derive a category from caller input → metadata.gini.category →
+  // fallback "user". Keep the chosen value sanitized so the resulting path
+  // can't escape the skills root.
+  const meta = (parsed.frontmatter.metadata && typeof parsed.frontmatter.metadata === "object")
+    ? (parsed.frontmatter.metadata as Record<string, unknown>)
+    : {};
+  const gini = (meta.gini && typeof meta.gini === "object") ? (meta.gini as Record<string, unknown>) : {};
+  const category = sanitizeName(input.category ?? (typeof gini.category === "string" ? gini.category : "") ?? "user") || "user";
+  const folderName = sanitizeName(parsed.name);
+  if (!folderName) throw new Error(`Invalid skill name "${parsed.name}".`);
+
+  // Validate before writing so the API rejects obviously-broken input.
+  const issues = validateParsedSkill(parsed, { parentDirName: folderName });
+  if (issues.length > 0) {
+    throw new Error(`Skill failed validation:\n - ${issues.join("\n - ")}`);
+  }
+
+  const root = skillsDir(config.instance);
+  const dir = join(root, category, folderName);
+  mkdirSync(dir, { recursive: true });
+  const manifestPath = join(dir, "SKILL.md");
+  writeFileSync(manifestPath, input.body.endsWith("\n") ? input.body : `${input.body}\n`);
+
+  for (const file of input.files ?? []) {
+    if (typeof file?.name !== "string" || !file.name.trim()) continue;
+    if (typeof file?.content !== "string") continue;
+    const safe = sanitizeRelativePath(file.name);
+    if (!safe) throw new Error(`Refusing to write file outside skill folder: ${file.name}`);
+    const target = join(dir, safe);
+    mkdirSync(join(target, ".."), { recursive: true });
+    // Files dropped under `scripts/` are meant to be executed by the
+    // agent's terminal_exec wrapper (see ADR connector-provider-spec-compliance.md §Skills); land them
+    // mode 0755 so the spawn isn't blocked by a missing exec bit. Other
+    // payloads (REFERENCES.md, asset files) keep default permissions.
+    const isScript = safe.split(sep)[0] === "scripts";
+    writeFileSync(target, file.content, isScript ? { mode: 0o755 } : undefined);
+  }
+
+  await loadSkillsFromDisk(config);
+  const state = readState(config.instance);
+  const skill = state.skills.find((s) => s.name === parsed.name && (s.source ?? "user") === "user");
+  if (!skill) {
+    throw new Error("Skill written to disk but did not appear in state after reload.");
+  }
+  return {
+    skill,
+    manifestPath,
+    validation: { ok: issues.length === 0, issues }
+  };
+}
+
+function sanitizeName(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function sanitizeRelativePath(value: string): string | null {
+  const normalized = normalize(value).replace(/^[/\\]+/, "");
+  if (normalized.split(sep).some((segment) => segment === "..")) return null;
+  if (normalized.startsWith(sep)) return null;
+  return normalized;
 }
 
 export function listSkills(config: RuntimeConfig) {
@@ -42,6 +146,32 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
   return mutateState(config.instance, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
+    // Status-only PATCH (used by install-skill meta-skill to flip trust)
+    // skips the version bump and previousVersions push — it's a trust
+    // decision, not a content edit. ADR connector-provider-spec-compliance.md §UI requires this surface.
+    if (
+      typeof input.status === "string" &&
+      Object.keys(input).length === 1 &&
+      ["trusted", "untrusted", "disabled", "archived", "draft"].includes(input.status)
+    ) {
+      // "untrusted" collapses to "draft" — the runtime status taxonomy
+      // doesn't have an explicit "untrusted" cell.
+      const next = input.status === "untrusted" ? "draft" : input.status as SkillRecord["status"];
+      // Capture prior status BEFORE mutating so the audit evidence
+      // accurately records the transition; otherwise previousStatus and
+      // status would always be equal.
+      const prev = skill.status;
+      skill.status = next;
+      skill.updatedAt = now();
+      addAudit(state, {
+        actor: "user",
+        action: "skill.trust",
+        target: skill.id,
+        risk: "medium",
+        evidence: { previousStatus: prev, status: next }
+      });
+      return skill;
+    }
     skill.previousVersions.unshift({
       version: skill.version,
       updatedAt: skill.updatedAt,
@@ -135,7 +265,10 @@ export async function testSkill(config: RuntimeConfig, idOrName: string) {
 }
 
 export function validateSkills(config: RuntimeConfig) {
-  return readState(config.instance).skills.map((skill) => ({ id: skill.id, name: skill.name, ok: validateSkillRecord(skill).length === 0, failures: validateSkillRecord(skill) }));
+  return readState(config.instance).skills.map((skill) => {
+    const failures = validateSkillRecord(skill);
+    return { id: skill.id, name: skill.name, ok: failures.length === 0, failures };
+  });
 }
 
 function validateSkillRecord(skill: SkillRecord): string[] {
@@ -145,5 +278,10 @@ function validateSkillRecord(skill: SkillRecord): string[] {
     failures.push("Trusted API-created skills need at least one test.");
   }
   if (skill.steps.some((step) => !step.trim())) failures.push("Skill steps cannot be empty.");
+  // Surface loader-time validation results so /api/skills/validate
+  // reports spec compliance issues alongside legacy CRUD checks.
+  if (skill.validationStatus === "unsupported" && skill.validationMessage) {
+    failures.push(skill.validationMessage);
+  }
   return failures;
 }

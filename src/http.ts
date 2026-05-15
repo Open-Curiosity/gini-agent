@@ -4,7 +4,8 @@ import { cancelTask, decideApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import { readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./runtime/views";
-import { checkIdentity, createIdentity, deleteIdentity, updateIdentity } from "./integrations/identities";
+import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
+import { listProviders } from "./integrations/connectors/registry";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
 import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./memory";
 import { embeddingStatus, reembedBank } from "./memory/embedding";
@@ -27,7 +28,7 @@ import { connectBrowser, disconnectBrowser, getBrowserConnection, wipeBrowserPro
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { getSetupStatus, setSetupProvider } from "./runtime/setup-api";
-import { createSkillFromInput, getSkill, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
+import { createSkillFromInput, getSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
@@ -247,7 +248,28 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const query = new URL(request.url).searchParams.get("q");
       return json(query ? searchSkills(config, query) : listSkills(config));
     }],
-    ["POST", /^\/api\/skills$/, async (request) => json(await createSkillFromInput(config, await body(request)), 201)],
+    // POST /api/skills accepts two payload shapes per ADR connector-provider-spec-compliance.md:
+    //   - { body: "<SKILL.md text>", files?: [...] }: install-from-disk
+    //     flow used by the install-skill meta-skill and remote/mobile UIs.
+    //     Writes to ~/.gini/instances/<instance>/skills/<category>/<name>/
+    //     and reloads.
+    //   - legacy CRUD payload (`name`, `description`, `steps`, …): create
+    //     an in-memory SkillRecord without a manifest file.
+    ["POST", /^\/api\/skills$/, async (request) => {
+      const payload = await body(request);
+      if (typeof payload?.body === "string" && payload.body.trim().startsWith("---")) {
+        const files = Array.isArray(payload.files)
+          ? payload.files.filter((f: unknown): f is { name: string; content: string } =>
+              !!f && typeof f === "object" && typeof (f as { name?: unknown }).name === "string" && typeof (f as { content?: unknown }).content === "string")
+          : undefined;
+        return json(await installSkillFromBody(config, {
+          body: String(payload.body),
+          category: typeof payload.category === "string" ? payload.category : undefined,
+          files
+        }), 201);
+      }
+      return json(await createSkillFromInput(config, payload), 201);
+    }],
     ["GET", /^\/api\/skills\/validate$/, () => json(validateSkills(config))],
     // Manual filesystem skill reload — re-runs loadSkillsFromDisk so a user
     // can drop a new SKILL.md under <instance>/skills/ without restarting.
@@ -270,36 +292,54 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/job-runs\/([^/]+)\/replay$/, async (_request, params) => json(await replayJobRun(config, params[0]))],
     ["POST", /^\/api\/jobs\/([^/]+)\/pause$/, async (_request, params) => json(await updateJobStatus(config, params[0], "paused"))],
     ["POST", /^\/api\/jobs\/([^/]+)\/resume$/, async (_request, params) => json(await updateJobStatus(config, params[0], "active"))],
-    ["GET", /^\/api\/identities$/, () => json(readState(config.instance).identities)],
-    ["POST", /^\/api\/identities$/, async (request) => {
+    ["GET", /^\/api\/connectors$/, () => json(readState(config.instance).connectors)],
+    ["GET", /^\/api\/connectors\/providers$/, () => json(listProviders().map((p) => ({
+      id: p.id,
+      label: p.label,
+      description: p.description,
+      fields: p.fields,
+      secrets: p.secrets,
+      hasProbe: Boolean(p.probe),
+      hasDetect: Boolean(p.detect),
+      probeIntervalMs: p.probeIntervalMs
+    })))],
+    ["POST", /^\/api\/connectors$/, async (request) => {
       const payload = await body(request);
       const secrets = payload.secrets && typeof payload.secrets === "object" && !Array.isArray(payload.secrets)
         ? payload.secrets as Record<string, string>
         : undefined;
-      return json(await createIdentity(config, {
+      const metadata = payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
+        ? payload.metadata as Record<string, unknown>
+        : undefined;
+      return json(await createConnector(config, {
         name: String(payload.name ?? ""),
-        kind: String(payload.kind ?? ""),
+        provider: String(payload.provider ?? ""),
         scopes: Array.isArray(payload.scopes) ? payload.scopes.map(String) : undefined,
-        secrets
+        secrets,
+        metadata
       }), 201);
     }],
-    ["PATCH", /^\/api\/identities\/([^/]+)$/, async (request, params) => {
+    ["PATCH", /^\/api\/connectors\/([^/]+)$/, async (request, params) => {
       const payload = await body(request);
       const secrets = payload.secrets && typeof payload.secrets === "object" && !Array.isArray(payload.secrets)
         ? payload.secrets as Record<string, string>
+        : undefined;
+      const metadata = payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
+        ? payload.metadata as Record<string, unknown>
         : undefined;
       const status = payload.status === "configured" || payload.status === "disabled" || payload.status === "error"
         ? payload.status
         : undefined;
-      return json(await updateIdentity(config, params[0], {
+      return json(await updateConnector(config, params[0], {
         name: typeof payload.name === "string" ? payload.name : undefined,
         scopes: Array.isArray(payload.scopes) ? payload.scopes.map(String) : undefined,
         status,
-        secrets
+        secrets,
+        metadata
       }));
     }],
-    ["DELETE", /^\/api\/identities\/([^/]+)$/, async (_request, params) => json(await deleteIdentity(config, params[0]))],
-    ["POST", /^\/api\/identities\/([^/]+)\/health$/, async (_request, params) => json(await checkIdentity(config, params[0]))],
+    ["DELETE", /^\/api\/connectors\/([^/]+)$/, async (_request, params) => json(await deleteConnector(config, params[0]))],
+    ["POST", /^\/api\/connectors\/([^/]+)\/health$/, async (_request, params) => json(await checkConnector(config, params[0]))],
     ["GET", /^\/api\/improvements$/, () => json(readState(config.instance).improvements)],
     ["POST", /^\/api\/improvements$/, async (request) => json(await proposeImprovement(config, await body(request)), 201)],
     ["POST", /^\/api\/improvements\/([^/]+)\/approve$/, async (_request, params) => json(await reviewImprovement(config, params[0], "approve"))],

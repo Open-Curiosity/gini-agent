@@ -41,7 +41,7 @@ export function status(config: RuntimeConfig) {
     pendingApprovals: state.approvals.filter((approval) => approval.status === "pending").length,
     activeJobs: state.jobs.filter((job) => job.status === "active").length,
     missedJobs,
-    identities: state.identities.length,
+    connectors: state.connectors.length,
     memoryUnits,
     version: currentVersionInfo(),
     provider: providerHealth(config),

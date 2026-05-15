@@ -108,5 +108,5 @@ export {
   createRelayRecord,
   createNotificationRecord,
   activateAgent,
-  updateIdentityHealth
+  updateConnectorHealth
 } from "./records";
