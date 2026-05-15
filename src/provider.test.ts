@@ -1227,12 +1227,16 @@ describe("provider", () => {
     }
   });
 
-  test("empty-string baseUrl falls back to the default instead of producing a relative URL", async () => {
+  test("empty-string baseUrl falls back to the per-provider default (local → Ollama, not OpenAI)", async () => {
     // Persisted config can theoretically carry baseUrl: "" (e.g.
     // hand-edited config or a future API write that didn't validate). The
     // old `?? DEFAULT` fallback skipped only nullish, not empty — leaving
     // a relative `/chat/completions` URL that fetch would resolve against
-    // localhost. resolveBaseUrl now treats whitespace-only as missing.
+    // localhost. The round-3 fix used resolveBaseUrl with a hardcoded
+    // `DEFAULT_OPENAI_BASE_URL` fallback at every call site, which sent
+    // local-with-empty-baseUrl traffic to api.openai.com. The round-4 fix
+    // dispatches per provider via `defaultBaseUrl(provider)`. This test
+    // pins the EXACT URL so a regression to the wrong default fails fast.
     const originalFetch = globalThis.fetch;
     let capturedUrl: string | undefined;
     globalThis.fetch = ((input: RequestInfo | URL) => {
@@ -1246,15 +1250,105 @@ describe("provider", () => {
     try {
       // Skip normalizeProvider so the empty baseUrl actually persists
       // through to the call site (the normalizer would coerce missing
-      // baseUrl to default; here we want to test the resolver).
+      // baseUrl to default; here we want to test the call-site resolver).
       const provider = { name: "local" as const, model: "m", baseUrl: "" };
       await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
-      // local default baseUrl is the Ollama port — we just assert the URL
-      // is absolute, not the specific default.
-      expect(capturedUrl?.startsWith("http")).toBe(true);
-      expect(capturedUrl?.endsWith("/chat/completions")).toBe(true);
+      expect(capturedUrl).toBe("http://127.0.0.1:11434/v1/chat/completions");
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("empty-string baseUrl on openrouter falls back to the openrouter default (not OpenAI)", async () => {
+    const original = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_API_KEY = "test-or-key";
+    const originalFetch = globalThis.fetch;
+    let capturedUrl: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = { name: "openrouter" as const, model: "m", baseUrl: "" };
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(capturedUrl).toBe("https://openrouter.ai/api/v1/chat/completions");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = original;
+    }
+  });
+
+  test("empty-string baseUrl on openai falls back to the openai default", async () => {
+    const original = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "test-key";
+    const originalFetch = globalThis.fetch;
+    let capturedUrl: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = { name: "openai" as const, model: "m", baseUrl: "" };
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(capturedUrl).toBe("https://api.openai.com/v1/chat/completions");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = original;
+    }
+  });
+
+  test("empty-string baseUrl on codex routes /responses to the codex backend (not OpenAI)", async () => {
+    // Round-4 caught that codex /responses paths fell back to
+    // DEFAULT_OPENAI_BASE_URL when baseUrl was empty, which would have
+    // sent codex traffic to api.openai.com. Pinning the exact codex URL
+    // catches any regression to a wrong default at the codex call sites.
+    // Pass a tool so the routing lands on callToolCallingResponses
+    // (which handles `response.completed.output` cleanly); the call-site
+    // baseUrl resolution is identical between the two codex /responses
+    // helpers, so this still exercises the regression surface.
+    const { restore } = installCodexAuth("codex-empty-baseurl");
+    const originalFetch = globalThis.fetch;
+    let capturedUrl: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          const ev = { type: "response.completed", response: { id: "r", output: [
+            { id: "msg_1", type: "message", content: [{ type: "output_text", text: "ok" }] }
+          ] } };
+          controller.enqueue(enc.encode(`event: response.completed\ndata: ${JSON.stringify(ev)}\n\n`));
+          controller.enqueue(enc.encode("data: [DONE]\n\n"));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = { name: "codex" as const, model: "m", baseUrl: "" };
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], tools);
+      expect(capturedUrl).toBe("https://chatgpt.com/backend-api/codex/responses");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
     }
   });
 

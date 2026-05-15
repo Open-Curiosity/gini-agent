@@ -141,6 +141,103 @@ describe("provider CLI", () => {
     const ctx = makeCtx(["provider", "set", "local", "model-a", "model-b"]);
     await expect(provider(ctx)).rejects.toThrow(/Unexpected extra argument/);
   });
+
+  // ---------------- warning-surface tests ----------------
+  // The CLI warns when a flag is passed for a provider that doesn't honor
+  // it. The warning text is precise (and was wrong in round 3 — codex DOES
+  // honor --base-url and --api-key-env, only --extra-body is dropped) so
+  // these tests pin the surface to the actual behavior.
+
+  test("echo provider warns for ALL three flags (none of them apply)", async () => {
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx([
+        "provider", "set", "echo", "gini-echo-v0",
+        "--base-url", "http://x/v1",
+        "--api-key-env", "FOO",
+        "--extra-body", "{}"
+      ]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    const msg = captured.join("");
+    expect(msg).toContain("--base-url");
+    expect(msg).toContain("--api-key-env");
+    expect(msg).toContain("--extra-body");
+    expect(msg).toContain("echo provider");
+  });
+
+  test("codex provider warns ONLY for --extra-body (it honors --base-url and --api-key-env)", async () => {
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx([
+        "provider", "set", "codex", "gpt-5.5",
+        "--base-url", "http://example/v1",
+        "--api-key-env", "MY_CODEX_AUTH",
+        "--extra-body", "{}"
+      ]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    const msg = captured.join("");
+    expect(msg).toContain("--extra-body");
+    expect(msg).toContain("codex provider");
+    expect(msg).not.toContain("--base-url");
+    expect(msg).not.toContain("--api-key-env");
+  });
+
+  test("codex with --base-url and --api-key-env (no --extra-body) emits NO warning", async () => {
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx([
+        "provider", "set", "codex", "gpt-5.5",
+        "--base-url", "http://example/v1",
+        "--api-key-env", "MY_CODEX_AUTH"
+      ]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    expect(captured.join("")).toBe("");
+  });
+
+  test("local provider with all three flags emits NO warning (every flag applies)", async () => {
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx([
+        "provider", "set", "local", "m",
+        "--base-url", "http://x/v1",
+        "--api-key-env", "FOO",
+        "--extra-body", "{}"
+      ]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    expect(captured.join("")).toBe("");
+  });
 });
 
 function makeCtx(cliArgs: string[]): CliContext {

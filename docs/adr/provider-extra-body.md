@@ -65,7 +65,7 @@ The mock server in `src/test-utils/openai-mock-server.ts` is bundled so anyone c
 - `/api/providers/*` HTTP route to mutate `extraBody` from the web UI.
 - Full `AgentRecord` transport config (currently inherits — see "Agent Override Inheritance" above).
 - Runtime validation of persisted `extraBody` values (the CLI parses; future API writers must match).
-- README and `docs/operations.md` updates for the new `local` provider flags.
+- `docs/operations.md` updates for the new `local` provider flags. (`README.md` was updated in this PR with a new "OpenAI-compatible local servers" section linking back here; `docs/operations.md` still documents only the original Codex/OpenAI setup.)
 - A `--` option-terminator convention for `parseSubArgs()` so users can pass dash-prefixed positional values.
 
 ## Consequences

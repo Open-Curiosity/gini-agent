@@ -273,7 +273,7 @@ async function callToolCallingChatCompletions(
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
-  const baseUrl = resolveBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL);
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const wantStream = Boolean(onDelta);
   const body: Record<string, unknown> = {
     ...sanitizeExtraBody(provider.extraBody),
@@ -478,7 +478,7 @@ async function callToolCallingResponses(
   onDelta?: (text: string) => void
 ): Promise<ToolCallingResult> {
   const bearer = readCodexBearer(provider);
-  const baseUrl = resolveBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL);
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const { instructions, input } = translateMessagesToResponsesInput(messages);
   const responsesTools = tools.map((tool) => ({
     type: "function" as const,
@@ -929,7 +929,7 @@ async function callStructuredCodex<T>(
   request: StructuredRequest<T>
 ): Promise<StructuredResult<T>> {
   const bearer = readCodexBearer(provider);
-  const baseUrl = resolveBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL);
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
     headers: {
@@ -994,7 +994,7 @@ async function callStructuredChatCompletions<T>(
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
-  const baseUrl = resolveBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL);
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
@@ -1030,12 +1030,19 @@ async function callStructuredChatCompletions<T>(
   };
 }
 
+// Treat both nullish and whitespace-only as missing so persisted
+// `baseUrl: ""` doesn't slip through normalize and end up resolving against
+// the wrong provider's default at the call site.
+function pickBaseUrl(persisted: string | undefined, fallback: string): string {
+  return persisted && persisted.trim().length > 0 ? persisted : fallback;
+}
+
 export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   if (provider.name === "openai") {
     return {
       name: "openai",
       model: provider.model || "gpt-5.4-mini",
-      baseUrl: provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL,
+      baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv ?? "OPENAI_API_KEY",
       ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
@@ -1044,7 +1051,7 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
     return {
       name: "openrouter",
       model: provider.model || "openrouter/auto",
-      baseUrl: provider.baseUrl ?? "https://openrouter.ai/api/v1",
+      baseUrl: pickBaseUrl(provider.baseUrl, "https://openrouter.ai/api/v1"),
       apiKeyEnv: provider.apiKeyEnv ?? "OPENROUTER_API_KEY",
       ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
@@ -1053,7 +1060,7 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
     return {
       name: "local",
       model: provider.model || "local/default",
-      baseUrl: provider.baseUrl ?? "http://127.0.0.1:11434/v1",
+      baseUrl: pickBaseUrl(provider.baseUrl, "http://127.0.0.1:11434/v1"),
       apiKeyEnv: provider.apiKeyEnv ?? "GINI_LOCAL_API_KEY",
       ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
@@ -1062,7 +1069,7 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
     return {
       name: "codex",
       model: provider.model || DEFAULT_CODEX_MODEL,
-      baseUrl: provider.baseUrl ?? DEFAULT_CODEX_BASE_URL,
+      baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_CODEX_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv
     };
   }
@@ -1082,7 +1089,7 @@ async function callOpenAIResponses(
   const headers = provider.name === "codex" ? codexHeaders(bearer) : {};
 
   const isCodex = provider.name === "codex";
-  const baseUrl = resolveBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL);
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
     headers: {
@@ -1136,7 +1143,7 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
-  const baseUrl = resolveBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL);
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
@@ -1523,6 +1530,19 @@ function resolveBaseUrl(baseUrl: string | undefined, fallback: string): string {
   return trimBaseUrl(candidate);
 }
 
+// Per-provider default baseUrl. Use this at call sites instead of hardcoding
+// DEFAULT_OPENAI_BASE_URL — otherwise an unnormalized provider (or one whose
+// persisted baseUrl somehow slipped through normalize as empty) would send
+// codex /responses traffic to api.openai.com, or local/Ollama traffic to
+// OpenAI. Mirrors the per-provider defaults set by normalizeProvider so the
+// call-site fallback agrees with the persisted-config fallback.
+function defaultBaseUrl(provider: ProviderConfig): string {
+  if (provider.name === "codex") return DEFAULT_CODEX_BASE_URL;
+  if (provider.name === "openrouter") return "https://openrouter.ai/api/v1";
+  if (provider.name === "local") return "http://127.0.0.1:11434/v1";
+  return DEFAULT_OPENAI_BASE_URL;
+}
+
 // ---------------- Vision (image input) ----------------
 //
 // Single-shot vision call: caller provides a prompt + one inline base64 PNG/JPEG,
@@ -1594,7 +1614,7 @@ async function callVisionCodex(
   maxTokens: number
 ): Promise<VisionResult> {
   const bearer = readCodexBearer(provider);
-  const baseUrl = resolveBaseUrl(provider.baseUrl, DEFAULT_CODEX_BASE_URL);
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
@@ -1649,7 +1669,7 @@ async function callVisionChatCompletions(
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
-  const baseUrl = resolveBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL);
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
   // OpenAI's newer o-series chat models reject `max_tokens` outright and
   // require `max_completion_tokens`. Older OpenAI models still accept the

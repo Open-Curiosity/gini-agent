@@ -61,18 +61,21 @@ export async function provider(ctx: CliContext): Promise<void> {
       extraBody = parsed as Record<string, unknown>;
     }
 
-    // Echo and codex don't honor extraBody/baseUrl/apiKeyEnv — echo bypasses
-    // HTTP entirely and codex uses /responses with codex-OAuth bearer + a
-    // fixed ChatGPT base URL. Surface a stderr warning so the user doesn't
-    // think their flag took effect when normalizeProvider drops it.
-    if (name === "echo" || name === "codex") {
+    // Echo bypasses HTTP entirely and ignores every flag.
+    // Codex uses /responses with its own request shape, so it ignores
+    // --extra-body — but it DOES honor --base-url (the codex backend URL)
+    // and --api-key-env (codexAuthPath reads process.env[apiKeyEnv] to
+    // locate the auth.json file). Warn precisely.
+    if (name === "echo") {
       const ignored: string[] = [];
       if (baseUrl !== undefined) ignored.push("--base-url");
       if (apiKeyEnv !== undefined) ignored.push("--api-key-env");
       if (extraBody !== undefined) ignored.push("--extra-body");
       if (ignored.length > 0) {
-        process.stderr.write(`gini: warning — ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored for the ${name} provider; only local/openai/openrouter honor these flags.\n`);
+        process.stderr.write(`gini: warning — ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored for the echo provider; echo bypasses HTTP entirely.\n`);
       }
+    } else if (name === "codex" && extraBody !== undefined) {
+      process.stderr.write("gini: warning — --extra-body is ignored for the codex provider; codex uses the /responses API with its own request shape.\n");
     }
 
     config.provider = normalizeProvider({
