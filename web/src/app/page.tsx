@@ -2,20 +2,26 @@
 
 import Link from "next/link";
 import { useCallback, useMemo } from "react";
+import { useMutation } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
-import { StatusPill } from "@/components/StatusPill";
+import { RiskPill, StatusPill } from "@/components/StatusPill";
+import { api } from "@/lib/api";
 import {
   useApprovals,
-  useConnectors,
+  useChatSessions,
   useEvents,
   useInvalidate,
-  useJobs,
   useMemories,
   useStatus,
   useTasks
 } from "@/lib/queries";
 import { useRuntimeStream } from "@/lib/useRuntimeStream";
+import type { Approval } from "@runtime/types";
+
+const HOME_APPROVAL_LIMIT = 3;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -23,23 +29,45 @@ export default function HomePage() {
   const status = useStatus();
   const tasks = useTasks();
   const approvals = useApprovals();
-  const jobs = useJobs();
-  const connectors = useConnectors();
   const events = useEvents();
   const memories = useMemories();
+  const chatSessions = useChatSessions();
   const invalidate = useInvalidate();
 
   // Pure invalidate — useInvalidate now returns a stable function that batches
   // microtask-coalesced refetches. Wrapping in useCallback is harmless but no
   // longer load-bearing.
   useRuntimeStream(useCallback(() => {
-    invalidate(["status", "state", "tasks", "approvals", "jobs", "connectors", "events", "memory"]);
+    invalidate(["status", "state", "tasks", "approvals", "events", "memory"]);
   }, [invalidate]));
+
+  const decide = useMutation({
+    mutationFn: ({ id, op }: { id: string; op: "approve" | "deny" }) =>
+      api<Approval>(`/approvals/${id}/${op}`, { method: "POST" }),
+    onSuccess: (_, vars) => {
+      toast.success(`${vars.op}: ${vars.id}`);
+      invalidate(["approvals", "tasks", "task", "state", "events", "audit"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  // Tasks don't carry back-refs to their chat session, so build a lookup from
+  // session.taskIds. Last-write-wins is fine; in practice a task lives in one
+  // session.
+  const taskToSession = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const session of chatSessions.data ?? []) {
+      for (const taskId of session.taskIds ?? []) {
+        map.set(taskId, session.id);
+      }
+    }
+    return map;
+  }, [chatSessions.data]);
 
   const activeTasks = (tasks.data ?? []).filter((t) => ["queued", "running", "waiting_approval"].includes(t.status));
   const pending = (approvals.data ?? []).filter((a) => a.status === "pending");
-  const failedJobs = (jobs.data ?? []).filter((j) => j.status === "failed");
-  const connectorIssues = (connectors.data ?? []).filter((c) => c.health === "unhealthy" || c.status === "error");
+  const pendingVisible = pending.slice(0, HOME_APPROVAL_LIMIT);
+  const pendingExtra = pending.length - pendingVisible.length;
   const recent = (events.data ?? []).slice().reverse().slice(0, 8);
   const proposedMemories = (memories.data ?? []).filter((m) => m.status === "proposed");
 
@@ -66,12 +94,10 @@ export default function HomePage() {
     <>
       <PageHeader title="Home" description="Live runtime overview" />
       <div className="flex-1 space-y-6 overflow-auto p-4 md:p-6">
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+        <div className="grid gap-3 sm:grid-cols-3">
           <Stat title="Health" value={status.data?.ok ? "Healthy" : status.isLoading ? "…" : "Down"} sub={`port ${status.data?.port ?? "—"}`} />
           <Stat title="Active tasks" value={String(activeTasks.length)} sub={activeTasks.length > 0 ? "in flight" : "no work in flight"} />
           <Stat title="Pending approvals" value={String(pending.length)} sub={pending.length > 0 ? "needs review" : "all clear"} />
-          <Stat title="Failed jobs" value={String(failedJobs.length)} sub={`${jobs.data?.length ?? 0} jobs`} />
-          <Stat title="Connector issues" value={String(connectorIssues.length)} sub={`${connectors.data?.length ?? 0} configured`} />
         </div>
 
         <div className="grid gap-3 md:grid-cols-2">
@@ -107,6 +133,60 @@ export default function HomePage() {
           </Card>
         </div>
 
+        {pending.length > 0 ? (
+          <Card>
+            <CardHeader>
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <CardTitle className="text-sm">Needs your approval</CardTitle>
+                  <CardDescription>Pending actions blocking tasks</CardDescription>
+                </div>
+                {pendingExtra > 0 ? (
+                  <Link
+                    href="/permissions"
+                    className="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium hover:bg-accent"
+                  >
+                    View all ({pending.length})
+                  </Link>
+                ) : null}
+              </div>
+            </CardHeader>
+            <CardContent>
+              <ul className="divide-y divide-border">
+                {pendingVisible.map((approval) => (
+                  <li key={approval.id} className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-mono text-[11px]">{approval.action}</span>
+                        <RiskPill value={approval.risk} />
+                      </div>
+                      <p className="truncate font-mono text-[11px] text-muted-foreground">{approval.target}</p>
+                      <p className="line-clamp-2 text-sm">{approval.reason}</p>
+                    </div>
+                    <div className="flex shrink-0 gap-2">
+                      <Button
+                        size="sm"
+                        disabled={decide.isPending}
+                        onClick={() => decide.mutate({ id: approval.id, op: "approve" })}
+                      >
+                        Approve
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={decide.isPending}
+                        onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
+                      >
+                        Deny
+                      </Button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        ) : null}
+
         <Card>
           <CardHeader>
             <CardTitle className="text-sm">Active tasks</CardTitle>
@@ -117,15 +197,32 @@ export default function HomePage() {
               <EmptyState title="No active tasks" description="Submit a task from the Tasks tab." />
             ) : (
               <ul className="divide-y divide-border">
-                {activeTasks.map((task) => (
-                  <li key={task.id} className="flex items-center justify-between gap-3 py-2">
-                    <div className="min-w-0">
-                      <p className="truncate text-sm font-medium">{task.title}</p>
-                      <p className="truncate font-mono text-[11px] text-muted-foreground">{task.id}</p>
-                    </div>
-                    <StatusPill value={task.status} />
-                  </li>
-                ))}
+                {activeTasks.map((task) => {
+                  const sessionId = taskToSession.get(task.id);
+                  const body = (
+                    <>
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-medium">{task.title}</p>
+                        <p className="truncate font-mono text-[11px] text-muted-foreground">{task.id}</p>
+                      </div>
+                      <StatusPill value={task.status} />
+                    </>
+                  );
+                  return (
+                    <li key={task.id}>
+                      {sessionId ? (
+                        <Link
+                          href={`/chat?session=${sessionId}`}
+                          className="-mx-2 flex items-center justify-between gap-3 rounded-md px-2 py-2 hover:bg-accent"
+                        >
+                          {body}
+                        </Link>
+                      ) : (
+                        <div className="flex items-center justify-between gap-3 py-2">{body}</div>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </CardContent>
