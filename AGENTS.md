@@ -28,6 +28,28 @@ Keep ADRs current when architecture changes.
 - Side-effecting tools must preserve approval, audit, and trace behavior.
 - Instance-aware paths, ports, logs, and state must remain isolated.
 
+## Commits and PR titles
+
+Commit messages and PR titles describe the technical change, not the process that produced it. Public history is what reviewers and future readers see; the back-and-forth that shaped the diff is internal.
+
+Don't write:
+
+- `Address codex review round 3: ...`
+- `Round-2 fix: ...`
+- `Apply review feedback`
+- `Fix bugs from <reviewer name>`
+- `Sanitize PR-review meta-narration` — even meta-cleanup messages can leak the meta
+
+Do write:
+
+- `Sanitize extraBody and tighten provider parsers`
+- `Per-provider baseUrl defaults; tighten CLI flag accuracy`
+- `Tighten provider and provider-test comments`
+
+The same rule applies to **comments inside source and tests**: describe the hazard generically (what the test pins, why a guard exists) rather than its history (`Round-3 caught that…`). Grep your diff for `[Rr]ound[- ]?[0-9]` and `review` in comments before pushing.
+
+If iterating with multiple review-fix commits before the PR lands, squash to a clean narrative first (`git rebase -i`, or use squash-merge). Once the PR is merged, the messages are permanent.
+
 ## Verification
 
 For code changes, run relevant tests plus broader checks when practical:
