@@ -1511,20 +1511,21 @@ const VISION_RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
   "max_completion_tokens"
 ]);
 
-// Strip a trailing slash from a baseUrl so callers can write either
+// Strip trailing slashes from a baseUrl so callers can write either
 // `http://x/v1` or `http://x/v1/` and the resulting request URL stays
 // `http://x/v1/chat/completions` (not `http://x/v1//chat/completions` —
-// some OpenAI-compatible servers reject the doubled slash). Mirrors the
-// pattern in src/embeddings.ts.
-//
-// `provider.baseUrl` is technically optional but a persisted empty string
-// would slip past `?? DEFAULT`. `resolveBaseUrl` short-circuits to the
-// default in both the nullish and empty-string cases so neither produces
-// a relative `/chat/completions` URL.
+// some OpenAI-compatible servers reject the doubled slash). The `+`
+// collapses runs of trailing slashes; src/embeddings.ts has a similar
+// `/\/$/` strip but only catches a single slash.
 function trimBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, "");
 }
 
+// Resolve a persisted baseUrl to a request-ready URL. `provider.baseUrl`
+// is technically optional but a persisted empty string would also slip
+// past `?? DEFAULT`. resolveBaseUrl treats nullish AND whitespace-only
+// as missing so neither produces a relative `/chat/completions` URL,
+// then trims trailing slashes via trimBaseUrl.
 function resolveBaseUrl(baseUrl: string | undefined, fallback: string): string {
   const candidate = baseUrl && baseUrl.trim().length > 0 ? baseUrl : fallback;
   return trimBaseUrl(candidate);
