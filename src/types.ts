@@ -686,6 +686,23 @@ export interface JobRecord {
   // first terminal run (success or fail). The user can resume manually
   // through /jobs. Defaults to undefined/false (recurring behavior).
   oneShot?: boolean;
+  // Per-job auto-approve envelope (see ADR dangerously-auto-approve.md, "Per-job
+  // scope"). When the agent's `create_job` tool schedules an unattended job,
+  // it can opt into approval-bypass for just that job's spawned tasks
+  // without touching the operator's global RuntimeConfig. Both fields are
+  // optional and default to absent, in which case the job inherits the
+  // current per-instance RuntimeConfig behavior (i.e. the legacy default).
+  //
+  // - `autoApproveCommands` are merged onto the cloned RuntimeConfig at
+  //   job-fire time and matched against terminal commands via the same
+  //   `matchAutoApprove` allowlist path. Each match produces an audit row
+  //   with `evidence.autoApproved=true, autoApprovedReason=<matched pattern>`.
+  // - `dangerouslyAutoApprove`, when true, sets the same flag on the cloned
+  //   RuntimeConfig so EVERY approval-gated tool the spawned task issues
+  //   bypasses the human gate. Audit rows carry
+  //   `autoApprovedReason="dangerouslyAutoApprove"` (job-scoped, not global).
+  autoApproveCommands?: string[];
+  dangerouslyAutoApprove?: boolean;
   createdAt: string;
   updatedAt: string;
   lastRunAt?: string;
