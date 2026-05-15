@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useMemo } from "react";
+import { useMemo } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -18,7 +18,6 @@ import {
   useStatus,
   useTasks
 } from "@/lib/queries";
-import { useRuntimeStream } from "@/lib/useRuntimeStream";
 import type { Approval } from "@runtime/types";
 
 const HOME_APPROVAL_LIMIT = 3;
@@ -34,12 +33,8 @@ export default function HomePage() {
   const chatSessions = useChatSessions();
   const invalidate = useInvalidate();
 
-  // Pure invalidate — useInvalidate now returns a stable function that batches
-  // microtask-coalesced refetches. Wrapping in useCallback is harmless but no
-  // longer load-bearing.
-  useRuntimeStream(useCallback(() => {
-    invalidate(["status", "state", "tasks", "approvals", "events", "memory"]);
-  }, [invalidate]));
+  // SSE invalidation is handled globally by RuntimeStreamBridge — no local
+  // useRuntimeStream subscription needed.
 
   const decide = useMutation({
     mutationFn: ({ id, op }: { id: string; op: "approve" | "deny" }) =>

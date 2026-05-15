@@ -12,6 +12,7 @@
 // tool result; the loop then continues from where it stopped.
 
 import {
+  appendEvent,
   appendLog,
   appendTaskPartial,
   appendTrace,
@@ -612,6 +613,7 @@ async function runLoop(
         // task waits a long time before resuming.
         item.cost = accumulatedCost;
         item.updatedAt = now();
+        appendEvent(state, { kind: "task", action: "task.waiting_approval", target: item.id, taskId: item.id, risk: "medium", summary: "task.waiting_approval" });
         return item;
       });
       appendTrace(config.instance, taskId, {

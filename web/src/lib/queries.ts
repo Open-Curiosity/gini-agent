@@ -27,7 +27,7 @@ export function useStatus(options?: Partial<UseQueryOptions<RuntimeStatus>>) {
   return useQuery<RuntimeStatus>({
     queryKey: ["status"],
     queryFn: () => api<RuntimeStatus>("/status"),
-    refetchInterval: 5000,
+    refetchInterval: 60_000,
     ...options
   });
 }
@@ -36,7 +36,7 @@ export function useState_(options?: Partial<UseQueryOptions<RuntimeStateSnapshot
   return useQuery<RuntimeStateSnapshot>({
     queryKey: ["state"],
     queryFn: () => api<RuntimeStateSnapshot>("/state"),
-    refetchInterval: 5000,
+    refetchInterval: 60_000,
     ...options
   });
 }
@@ -45,7 +45,7 @@ export function useTasks(options?: Partial<UseQueryOptions<Task[]>>) {
   return useQuery<Task[]>({
     queryKey: ["tasks"],
     queryFn: () => api<Task[]>("/tasks"),
-    refetchInterval: 3000,
+    refetchInterval: 60_000,
     ...options
   });
 }
@@ -55,7 +55,7 @@ export function useTask(id: string | null) {
     queryKey: ["task", id],
     queryFn: () => api<{ task: Task; trace: TraceRecord[] }>(`/tasks/${id}`),
     enabled: Boolean(id),
-    refetchInterval: 3000
+    refetchInterval: 60_000
   });
 }
 
@@ -63,7 +63,7 @@ export function useApprovals() {
   return useQuery<Approval[]>({
     queryKey: ["approvals"],
     queryFn: () => api<Approval[]>("/approvals"),
-    refetchInterval: 3000
+    refetchInterval: 60_000
   });
 }
 
@@ -71,7 +71,7 @@ export function useMemories() {
   return useQuery<MemoryRecord[]>({
     queryKey: ["memory"],
     queryFn: () => api<MemoryRecord[]>("/memory"),
-    refetchInterval: 5000
+    refetchInterval: 60_000
   });
 }
 
@@ -85,7 +85,7 @@ export function useHindsightUnits(network: string = "all") {
       if (network !== "all") params.set("network", network);
       return api<HindsightUnitView[]>(`/memory/units?${params.toString()}`);
     },
-    refetchInterval: 5000
+    refetchInterval: 60_000
   });
 }
 
@@ -93,7 +93,7 @@ export function useHindsightBanks() {
   return useQuery<HindsightBankView[]>({
     queryKey: ["memory", "banks"],
     queryFn: () => api<HindsightBankView[]>("/memory/banks"),
-    refetchInterval: 10_000
+    refetchInterval: 60_000
   });
 }
 
@@ -101,7 +101,7 @@ export function useSubagents() {
   return useQuery<SubagentRecord[]>({
     queryKey: ["subagents"],
     queryFn: () => api<SubagentRecord[]>("/subagents"),
-    refetchInterval: 3000
+    refetchInterval: 60_000
   });
 }
 
@@ -110,7 +110,7 @@ export function useSkills(query?: string) {
   return useQuery<SkillRecord[]>({
     queryKey: ["skills", trimmed],
     queryFn: () => api<SkillRecord[]>(trimmed ? `/skills?q=${encodeURIComponent(trimmed)}` : "/skills"),
-    refetchInterval: 5000
+    refetchInterval: 60_000
   });
 }
 
@@ -118,7 +118,7 @@ export function useJobs() {
   return useQuery<JobRecord[]>({
     queryKey: ["jobs"],
     queryFn: () => api<JobRecord[]>("/jobs"),
-    refetchInterval: 5000
+    refetchInterval: 60_000
   });
 }
 
@@ -126,7 +126,7 @@ export function useJobRuns(jobId?: string) {
   return useQuery<JobRunRecord[]>({
     queryKey: ["jobRuns", jobId ?? "all"],
     queryFn: () => api<JobRunRecord[]>(jobId ? `/jobs/${jobId}/runs` : "/job-runs"),
-    refetchInterval: 5000
+    refetchInterval: 60_000
   });
 }
 
@@ -134,7 +134,7 @@ export function useConnectors() {
   return useQuery<ConnectorRecord[]>({
     queryKey: ["connectors"],
     queryFn: () => api<ConnectorRecord[]>("/connectors"),
-    refetchInterval: 10_000
+    refetchInterval: 60_000
   });
 }
 
@@ -163,7 +163,7 @@ export function useImprovements() {
   return useQuery<ImprovementProposal[]>({
     queryKey: ["improvements"],
     queryFn: () => api<ImprovementProposal[]>("/improvements"),
-    refetchInterval: 5000
+    refetchInterval: 60_000
   });
 }
 
@@ -171,7 +171,7 @@ export function useEvents() {
   return useQuery<RuntimeEvent[]>({
     queryKey: ["events"],
     queryFn: () => api<RuntimeEvent[]>("/events"),
-    refetchInterval: 3000
+    refetchInterval: 60_000
   });
 }
 
@@ -179,7 +179,7 @@ export function useAudit() {
   return useQuery<AuditEvent[]>({
     queryKey: ["audit"],
     queryFn: () => api<AuditEvent[]>("/audit"),
-    refetchInterval: 5000
+    refetchInterval: 60_000
   });
 }
 
@@ -187,7 +187,7 @@ export function useChatSessions() {
   return useQuery<ChatSession[]>({
     queryKey: ["chat"],
     queryFn: () => api<ChatSession[]>("/chat"),
-    refetchInterval: 5000
+    refetchInterval: 60_000
   });
 }
 
@@ -331,31 +331,48 @@ export function useWipeBrowserProfile() {
 
 
 /**
- * Returns a function that batches invalidate() calls within a tick.
+ * Returns a function that batches invalidate() calls within a short time
+ * window.
  *
- * Why this matters: the SSE stream can fire many events in rapid succession
- * (e.g. on connection open the runtime replays the recent event log). If every
- * event triggers a separate invalidateQueries() call, React Query schedules a
- * refetch + render per call, which re-runs the SSE-subscribing component's
- * effects, which can re-open the EventSource, which replays again. Coalescing
- * via queueMicrotask collapses N events in the same tick into a single
- * invalidate-per-key, breaking the feedback loop.
+ * Why this matters: the SSE stream fires many events in rapid succession on
+ * connection open (the runtime replays its recent event log — 100+ events).
+ * Each event arrives in its own task tick, so microtask-level coalescing
+ * does NOT batch them. We need a small wall-clock window.
  *
- * The returned function reference is stable across renders so it can be used
- * directly as a dep without retriggering effects.
+ * Trailing-edge debounce with a hard max-wait:
+ *   - First call: schedule a flush BURST_MS later.
+ *   - Subsequent calls within the window: add keys, reset the timer (up to
+ *     BURST_MAX_MS total wait so we still flush during a sustained stream).
+ *
+ * 80ms is below human perception latency for "instant" UI updates and well
+ * above the inter-arrival gap of replayed SSE events (~ms apart), so the
+ * historical replay collapses to a single flush per unique key.
+ *
+ * The returned function reference is stable across renders.
  */
+const BURST_MS = 80;
+const BURST_MAX_MS = 500;
+
 export function useInvalidate() {
   const qc = useQueryClient();
   const pendingRef = useRef<Set<string> | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const firstScheduledAtRef = useRef<number>(0);
   const flush = useCallback(() => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
     const set = pendingRef.current;
     pendingRef.current = null;
+    firstScheduledAtRef.current = 0;
     if (!set) return;
     for (const key of set) qc.invalidateQueries({ queryKey: [key] });
   }, [qc]);
   useEffect(() => {
-    // On unmount, drop any pending batch.
     return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = null;
       pendingRef.current = null;
     };
   }, []);
@@ -363,9 +380,13 @@ export function useInvalidate() {
     (keys: string[]) => {
       if (!pendingRef.current) {
         pendingRef.current = new Set();
-        queueMicrotask(flush);
+        firstScheduledAtRef.current = Date.now();
       }
       for (const key of keys) pendingRef.current.add(key);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      const elapsed = Date.now() - firstScheduledAtRef.current;
+      const wait = Math.min(BURST_MS, Math.max(0, BURST_MAX_MS - elapsed));
+      timerRef.current = setTimeout(flush, wait);
     },
     [flush]
   );

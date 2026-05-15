@@ -9,7 +9,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { RiskPill, StatusPill } from "@/components/StatusPill";
 import { cn } from "@/lib/utils";
-import { useAudit, useEvents, useInvalidate } from "@/lib/queries";
+import { useAudit, useEvents } from "@/lib/queries";
 import { useRuntimeStream } from "@/lib/useRuntimeStream";
 import type { RiskLevel, RuntimeEventKind } from "@runtime/types";
 
@@ -31,20 +31,18 @@ const RISK_OPTIONS: RiskLevel[] = ["low", "medium", "high"];
 export default function ActivityPage() {
   const audit = useAudit();
   const events = useEvents();
-  const invalidate = useInvalidate();
   const [search, setSearch] = useState("");
   const [liveCount, setLiveCount] = useState(0);
   const [kindFilter, setKindFilter] = useState<Set<string>>(new Set());
   const [riskFilter, setRiskFilter] = useState<Set<string>>(new Set());
   const [actorFilter, setActorFilter] = useState<Set<string>>(new Set());
 
+  // Bump the live-tail counter on every event. Query invalidation is handled
+  // globally by RuntimeStreamBridge — we share its EventSource via the
+  // module-level singleton in useRuntimeStream.
   useRuntimeStream(useCallback(() => {
     setLiveCount((value) => value + 1);
-    // Activity invalidates many keys per event because it's the live tail —
-    // batched via queueMicrotask in useInvalidate, so a 50-event burst still
-    // produces only one refetch per key in the tick.
-    invalidate(["events", "audit", "state", "tasks", "approvals", "jobs", "memory", "skills"]);
-  }, [invalidate]));
+  }, []));
 
   // Actor filter values are derived from the data (audit log) since there's a
   // small fixed set in practice (user/runtime/agent/system) and we want the

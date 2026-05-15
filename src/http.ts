@@ -515,6 +515,7 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
     request.headers.get("last-event-id") ??
     new URL(request.url).searchParams.get("lastEventId") ??
     undefined;
+  let lastFlushAt = Date.now();
   const stream = new ReadableStream({
     start(controller) {
       const seen = new Set<string>();
@@ -542,12 +543,26 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
       }
       const send = () => {
         if (closed) return;
+        let wrote = false;
         const events = readState(config.instance).events.slice().reverse();
         for (const event of events) {
           if (seen.has(event.id)) continue;
           controller.enqueue(encoder.encode(`id: ${event.id}\nevent: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`));
           seen.add(event.id);
+          wrote = true;
         }
+        // Keepalive comment when nothing real has flowed for a while.
+        // Bun.serve defaults to a 10s idleTimeout and proxies (Next.js dev,
+        // CDNs, etc.) often cap idle streams around 30-60s. A comment line
+        // (`: ...`) is ignored by the EventSource API but resets the
+        // idle-byte clock at every hop, so the connection survives quiet
+        // periods. Without this the client reconnects every ~10s and the
+        // runtime re-replays the event window each time.
+        if (!wrote && Date.now() - lastFlushAt >= 5_000) {
+          controller.enqueue(encoder.encode(`: keepalive\n\n`));
+          wrote = true;
+        }
+        if (wrote) lastFlushAt = Date.now();
       };
       send();
       interval = setInterval(send, 1000);

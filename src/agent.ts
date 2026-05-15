@@ -15,6 +15,7 @@ import type { Approval, RuntimeConfig, RuntimeState, Task } from "./types";
 import { statePath, traceDir } from "./paths";
 import {
   addAudit,
+  appendEvent,
   appendLog,
   appendTaskPartial,
   appendTrace,
@@ -293,6 +294,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     item.currentStep = "Thinking";
     item.updatedAt = now();
     upsertTask(state, item);
+    appendEvent(state, { kind: "task", action: "task.running", target: item.id, taskId: item.id, risk: "low", summary: "task.running" });
     return item;
   });
   if (isTerminalTaskStatus(task.status)) {
@@ -503,6 +505,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     item.cost = providerResult.cost;
     item.updatedAt = now();
     upsertTask(state, item);
+    appendEvent(state, { kind: "task", action: "task.completed", target: item.id, taskId: item.id, risk: "low", summary: "task.completed" });
     return item;
   });
   if (isTerminalTaskStatus(task.status) && task.status !== "completed") {
