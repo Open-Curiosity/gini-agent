@@ -127,9 +127,10 @@ describe("provider CLI", () => {
   });
 
   test("--extra-body with non-object JSON gets the right error (not the JSON-parse-error wrapper)", async () => {
-    // Round-1 wrapped the shape error inside the JSON-parse catch, producing
-    // the misleading "is not valid JSON: --extra-body must be a JSON object".
-    // Now the error should be just "--extra-body must be a JSON object".
+    // Easy mistake: throw the shape error inside the JSON.parse catch,
+    // which wraps it as "is not valid JSON: --extra-body must be a JSON
+    // object". Parse and shape-validate are kept separate so non-object
+    // JSON reports its own error verbatim.
     const ctx = makeCtx(["provider", "set", "local", "m", "--extra-body", JSON.stringify(["a", "b"])]);
     await expect(provider(ctx)).rejects.toThrow(/^--extra-body must be a JSON object$/);
   });
@@ -144,9 +145,11 @@ describe("provider CLI", () => {
 
   // ---------------- warning-surface tests ----------------
   // The CLI warns when a flag is passed for a provider that doesn't honor
-  // it. The warning text is precise (and was wrong in round 3 — codex DOES
-  // honor --base-url and --api-key-env, only --extra-body is dropped) so
-  // these tests pin the surface to the actual behavior.
+  // it. Codex DOES honor --base-url (the backend URL) and --api-key-env
+  // (codexAuthPath reads process.env[apiKeyEnv]); only --extra-body is
+  // dropped for codex because /responses uses a different request shape.
+  // Echo bypasses HTTP entirely and ignores all three. These tests pin
+  // the warning surface so the precise per-provider behavior can't drift.
 
   test("echo provider warns for ALL three flags (none of them apply)", async () => {
     const captured: string[] = [];

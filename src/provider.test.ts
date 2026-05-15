@@ -1122,13 +1122,14 @@ describe("provider", () => {
   });
 
   test("vision strips BOTH max_tokens and max_completion_tokens from extraBody so the runtime budget always wins", async () => {
-    // Round-2 fix removed the global denylist of these keys, but vision
-    // sets only ONE of them (max_completion_tokens for openai, max_tokens
-    // for others) — so a poisoned extraBody could supply the OTHER and
-    // both end up in the request. That breaks OpenAI o-series (which
-    // rejects max_tokens) and defeats the cap on local/openrouter.
-    // Vision now passes VISION_RESERVED_EXTRA_BODY_KEYS to sanitizeExtraBody
-    // so neither token-budget key from extraBody survives.
+    // The base denylist allows token-budget keys so non-vision callers
+    // can set their own budget via extraBody. Vision sets only ONE of
+    // them (max_completion_tokens for openai, max_tokens for others), so
+    // a poisoned extraBody could supply the OTHER and both end up in the
+    // request — that breaks OpenAI o-series (which rejects max_tokens)
+    // and defeats the cap on local/openrouter. Vision passes
+    // VISION_RESERVED_EXTRA_BODY_KEYS to sanitizeExtraBody so neither
+    // token-budget key from extraBody survives this code path.
     const originalFetch = globalThis.fetch;
     const requestBodies: Record<string, unknown>[] = [];
     globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
@@ -1229,14 +1230,13 @@ describe("provider", () => {
 
   test("empty-string baseUrl falls back to the per-provider default (local → Ollama, not OpenAI)", async () => {
     // Persisted config can theoretically carry baseUrl: "" (e.g.
-    // hand-edited config or a future API write that didn't validate). The
-    // old `?? DEFAULT` fallback skipped only nullish, not empty — leaving
-    // a relative `/chat/completions` URL that fetch would resolve against
-    // localhost. The round-3 fix used resolveBaseUrl with a hardcoded
-    // `DEFAULT_OPENAI_BASE_URL` fallback at every call site, which sent
-    // local-with-empty-baseUrl traffic to api.openai.com. The round-4 fix
-    // dispatches per provider via `defaultBaseUrl(provider)`. This test
-    // pins the EXACT URL so a regression to the wrong default fails fast.
+    // hand-edited config or a future API write that didn't validate). A
+    // plain `?? DEFAULT` fallback would skip only nullish and produce a
+    // relative `/chat/completions` URL. A single-default `resolveBaseUrl`
+    // would coerce empty strings but send local-with-empty-baseUrl traffic
+    // to whatever default it hardcoded (e.g. api.openai.com). The current
+    // resolver dispatches per provider via `defaultBaseUrl(provider)`.
+    // Pinning the EXACT URL here makes both regressions fail fast.
     const originalFetch = globalThis.fetch;
     let capturedUrl: string | undefined;
     globalThis.fetch = ((input: RequestInfo | URL) => {
@@ -1308,10 +1308,10 @@ describe("provider", () => {
   });
 
   test("empty-string baseUrl on codex routes /responses to the codex backend (not OpenAI)", async () => {
-    // Round-4 caught that codex /responses paths fell back to
-    // DEFAULT_OPENAI_BASE_URL when baseUrl was empty, which would have
-    // sent codex traffic to api.openai.com. Pinning the exact codex URL
-    // catches any regression to a wrong default at the codex call sites.
+    // The codex /responses helpers must fall back to DEFAULT_CODEX_BASE_URL
+    // when baseUrl is empty — a hardcoded DEFAULT_OPENAI_BASE_URL fallback
+    // would silently send codex traffic to api.openai.com. Pinning the
+    // exact codex URL catches any regression at the codex call sites.
     // Pass a tool so the routing lands on callToolCallingResponses
     // (which handles `response.completed.output` cleanly); the call-site
     // baseUrl resolution is identical between the two codex /responses
