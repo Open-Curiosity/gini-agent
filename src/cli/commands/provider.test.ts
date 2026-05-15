@@ -2,9 +2,10 @@
 // parsing, especially the new --base-url / --api-key-env / --extra-body
 // flags introduced for OpenAI-compatible local servers like oMLX.
 //
-// We swap the shared print() function out via mocking so command output
-// can be captured and the test never writes to a real config.json — the
-// CliContext we hand provider() points at a tmp instance dir.
+// We isolate state per test by pointing HOME and GINI_STATE_ROOT at a fresh
+// tmp dir so the real-on-disk config.json never gets touched. The command's
+// print() output goes to stdout — we don't assert on it; the source of
+// truth for these tests is the persisted config.json contents.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
@@ -17,7 +18,6 @@ describe("provider CLI", () => {
   let scratchHome: string;
   let originalHome: string | undefined;
   let originalState: string | undefined;
-  let printed: unknown[];
 
   beforeEach(() => {
     scratchHome = `/tmp/gini-provider-cli-tests/${process.pid}-${Math.random().toString(36).slice(2)}`;
@@ -26,7 +26,6 @@ describe("provider CLI", () => {
     originalState = process.env.GINI_STATE_ROOT;
     process.env.HOME = scratchHome;
     process.env.GINI_STATE_ROOT = join(scratchHome, ".gini");
-    printed = [];
     // Pre-create the instance dir so writeFileSync(configPath(...)) succeeds.
     mkdirSync(join(process.env.GINI_STATE_ROOT, "instances", "test-instance"), { recursive: true });
   });
@@ -103,6 +102,28 @@ describe("provider CLI", () => {
   test("set rejects unknown provider names", async () => {
     const ctx = makeCtx(["provider", "set", "anthropic"]);
     await expect(provider(ctx)).rejects.toThrow(/Usage: gini provider set/);
+  });
+
+  test("set rejects unknown flags instead of silently ignoring them", async () => {
+    // Previously, unknown flags were skipped without complaint and their
+    // following token could become the model. The tightened parser surfaces
+    // them so users see typos immediately.
+    const ctx = makeCtx(["provider", "set", "local", "m", "--unknown-flag", "value"]);
+    await expect(provider(ctx)).rejects.toThrow(/Unknown flag/);
+  });
+
+  test("set rejects a value-bearing flag with a missing value", async () => {
+    // `--base-url` with no following token should fail loudly rather than
+    // consuming the next positional and producing a confusing config.
+    const ctx = makeCtx(["provider", "set", "local", "m", "--base-url"]);
+    await expect(provider(ctx)).rejects.toThrow(/--base-url requires a value/);
+  });
+
+  test("set rejects a value-bearing flag whose value is another flag", async () => {
+    // `--base-url --api-key-env X` would silently make "--api-key-env" the
+    // base URL under the previous parser. Reject this.
+    const ctx = makeCtx(["provider", "set", "local", "m", "--base-url", "--api-key-env", "FOO"]);
+    await expect(provider(ctx)).rejects.toThrow(/--base-url requires a value/);
   });
 });
 

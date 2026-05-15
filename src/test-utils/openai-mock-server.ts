@@ -14,7 +14,7 @@
 //   2. Anyone who clones the repo can flip a local provider to point at this
 //      server's URL and exercise the full chat-task agent loop end-to-end
 //      without an API key or external service. Useful for reproducing user
-//      reports against a known-determinstic backend.
+//      reports against a known-deterministic backend.
 //
 // Behavior:
 //   - Echoes the last user message back as assistant content. Lets tests
@@ -24,8 +24,14 @@
 //     tests can drive the agent loop without coordinating a smarter mock.
 //   - Streaming SSE is supported via `stream: true`. Splits the canned text
 //     into ~5-character chunks so the receiver exercises buffer assembly.
-//   - Captures every received request (URL, method, headers, parsed body)
-//     in `received[]` for tests to inspect after the call returns.
+//   - Captures every received non-probe request (URL, method, headers, parsed
+//     body) in `received[]` for tests to inspect after the call returns.
+//     `/v1/models` health probes are intentionally NOT pushed so callers can
+//     wait on readiness without skewing per-test request counts.
+//   - The `authorization` header is redacted to `[REDACTED]` before being
+//     stored in `received[]`. Tests that need to assert auth presence/shape
+//     check for that sentinel; the real bearer never lands in test output
+//     even if a developer points the mock at a real env-keyed provider.
 //   - `/v1/embeddings` returns a deterministic 16-dim hash-bag vector per
 //     input string. Same input → same vector across runs.
 
@@ -69,6 +75,14 @@ export function startOpenAIMockServer(): MockServerHandle {
     port: 0, // OS-assigned, avoids collisions with parallel test files
     fetch: async (req: Request): Promise<Response> => {
       const url = new URL(req.url);
+
+      // Health probe — intentionally do NOT capture into `received[]` so
+      // callers can poll for readiness without inflating per-test request
+      // counts (a primary cause of flakiness in shared-server fixtures).
+      if (url.pathname === "/v1/models" && req.method === "GET") {
+        return Response.json({ data: [{ id: "mock-model", object: "model" }] });
+      }
+
       let parsed: unknown = null;
       try {
         parsed = req.method === "GET" ? null : await req.json();
@@ -76,7 +90,13 @@ export function startOpenAIMockServer(): MockServerHandle {
         parsed = null;
       }
       const headers: Record<string, string> = {};
-      req.headers.forEach((value, key) => { headers[key] = value; });
+      req.headers.forEach((value, key) => {
+        // Redact the bearer before storing. Tests that need to assert auth
+        // presence check for the `[REDACTED]` sentinel rather than the raw
+        // token, so a real key accidentally pointed at this mock never lands
+        // in CI logs.
+        headers[key] = key.toLowerCase() === "authorization" ? "[REDACTED]" : value;
+      });
       received.push({ url: req.url, method: req.method, headers, body: parsed });
 
       if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
@@ -84,11 +104,6 @@ export function startOpenAIMockServer(): MockServerHandle {
       }
       if (url.pathname === "/v1/embeddings" && req.method === "POST") {
         return handleEmbeddings(parsed as { input?: unknown; model?: string });
-      }
-      // Health probe so tests can wait for readiness without hitting a real
-      // endpoint and skewing `received[]`.
-      if (url.pathname === "/v1/models" && req.method === "GET") {
-        return Response.json({ data: [{ id: "mock-model", object: "model" }] });
       }
       return Response.json({ error: { message: `Mock has no handler for ${req.method} ${url.pathname}` } }, { status: 404 });
     }

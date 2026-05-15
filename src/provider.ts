@@ -276,7 +276,7 @@ async function callToolCallingChatCompletions(
   const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
   const wantStream = Boolean(onDelta);
   const body: Record<string, unknown> = {
-    ...(provider.extraBody ?? {}),
+    ...sanitizeExtraBody(provider.extraBody),
     model: provider.model,
     messages: messages.map(serializeChatMessage),
     stream: wantStream
@@ -999,13 +999,14 @@ async function callStructuredChatCompletions<T>(
     method: "POST",
     headers,
     body: JSON.stringify({
-      ...(provider.extraBody ?? {}),
+      ...sanitizeExtraBody(provider.extraBody),
       model: provider.model,
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: request.system },
         { role: "user", content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema.` }
-      ]
+      ],
+      stream: false
     })
   });
   const rawPayload = await response.text();
@@ -1138,12 +1139,13 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
     method: "POST",
     headers,
     body: JSON.stringify({
-      ...(provider.extraBody ?? {}),
+      ...sanitizeExtraBody(provider.extraBody),
       model: provider.model,
       messages: [
         { role: "system", content: systemContext },
         { role: "user", content: input }
-      ]
+      ],
+      stream: false
     })
   });
   const rawPayload = await response.text();
@@ -1416,6 +1418,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+// Reserved fields that the runtime must own — never let `extraBody` overwrite
+// them. Without this, a poisoned config (or a careless --extra-body argument)
+// could redirect the call to a different model, smuggle in extra tools, or
+// flip stream mode and break response parsing. The denylist is the single
+// source of truth so every chat-completions call site stays consistent.
+const RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
+  "model",
+  "messages",
+  "stream",
+  "tools",
+  "tool_choice",
+  "response_format",
+  "max_tokens",
+  "max_completion_tokens"
+]);
+
+function sanitizeExtraBody(extraBody: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!extraBody) return {};
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(extraBody)) {
+    if (RESERVED_EXTRA_BODY_KEYS.has(key)) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
 // ---------------- Vision (image input) ----------------
 //
 // Single-shot vision call: caller provides a prompt + one inline base64 PNG/JPEG,
@@ -1557,7 +1585,7 @@ async function callVisionChatCompletions(
     method: "POST",
     headers,
     body: JSON.stringify({
-      ...(provider.extraBody ?? {}),
+      ...sanitizeExtraBody(provider.extraBody),
       model: provider.model,
       messages: [
         {
@@ -1568,6 +1596,7 @@ async function callVisionChatCompletions(
           ]
         }
       ],
+      stream: false,
       ...tokenBudgetField
     })
   });

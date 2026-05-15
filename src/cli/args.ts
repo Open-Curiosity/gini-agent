@@ -68,3 +68,44 @@ export function restAfter(cliArgs: string[], marker: string): string[] {
   const index = cliArgs.indexOf(marker);
   return index >= 0 ? cliArgs.slice(index + 1) : [];
 }
+
+export interface ParsedSubArgs {
+  positional: string[];
+  flags: Record<string, string>;
+  unknownFlags: string[];
+}
+
+// Single-pass partition of a sub-command's arg list into positionals + flag
+// values. The caller declares which flags are value-bearing so the parser
+// knows to consume the next token. Critical: only ONE source of truth for
+// value-bearing flag names — the previous pattern (separate positional
+// sweep + flagValue() calls) had two lists that could disagree, letting a
+// missed entry consume `--api-key-env`'s value as the model name.
+//
+// Throws when a value-bearing flag is missing its value (better than
+// silently consuming the next positional and producing a confusing config).
+// Unknown flags are returned for the caller to handle (warn vs reject vs
+// pass-through), since policy varies by command.
+export function parseSubArgs(tokens: string[], valueFlags: ReadonlySet<string>): ParsedSubArgs {
+  const positional: string[] = [];
+  const flags: Record<string, string> = {};
+  const unknownFlags: string[] = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i] ?? "";
+    if (token.startsWith("--")) {
+      if (valueFlags.has(token)) {
+        const value = tokens[i + 1];
+        if (value === undefined || value.startsWith("--")) {
+          throw new Error(`Flag ${token} requires a value.`);
+        }
+        flags[token] = value;
+        i += 1;
+      } else {
+        unknownFlags.push(token);
+      }
+      continue;
+    }
+    positional.push(token);
+  }
+  return { positional, flags, unknownFlags };
+}

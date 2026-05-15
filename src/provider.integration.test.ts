@@ -6,10 +6,19 @@
 // the captured request body. If a future patch breaks the wire shape, these
 // catch it; the fetch-mock tests can't.
 //
+// Each test gets its OWN mock server (beforeEach/afterEach) so `received[]`
+// can never be polluted by a sibling test even under `bun test --concurrent`.
+// Bun.serve startup is microseconds, so the per-test cost is negligible
+// compared to the isolation guarantee.
+//
+// Tests that mutate `process.env.GINI_LOCAL_API_KEY` use a per-test unique
+// env var name (`GINI_TEST_KEY_<id>`) so concurrent execution never has two
+// tests racing on the same env slot.
+//
 // Anyone cloning the repo can run these without API keys, downloads, or a
 // running model server — `bun install` is the only prerequisite.
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   generateStructured,
   generateTaskSummary,
@@ -22,18 +31,43 @@ import { startOpenAIMockServer, type MockServerHandle } from "./test-utils/opena
 import type { RuntimeConfig } from "./types";
 
 let server: MockServerHandle;
+const envSnapshot = new Map<string, string | undefined>();
 
-beforeAll(() => {
+beforeEach(() => {
   server = startOpenAIMockServer();
 });
 
-afterAll(async () => {
+afterEach(async () => {
   await server.stop();
+  // Restore any env vars that the test mutated. Map preserves insertion
+  // order; we walk it once and apply or delete based on the snapshot value.
+  for (const [key, value] of envSnapshot.entries()) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  envSnapshot.clear();
 });
+
+// Capture-and-set helper: records the original value (only on first call per
+// key per test) so afterEach can restore it. Using a unique env key per test
+// avoids cross-test races when bun test runs with --concurrent.
+function setEnv(key: string, value: string | undefined): void {
+  if (!envSnapshot.has(key)) envSnapshot.set(key, process.env[key]);
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+}
+
+// Generate a per-test unique env-var name so two tests racing under
+// --concurrent never poke the same slot. The id is derived from a counter
+// scoped to this module — deterministic within a run, unique across calls.
+let envCounter = 0;
+function uniqueEnvName(): string {
+  envCounter += 1;
+  return `GINI_TEST_KEY_${process.pid}_${envCounter}`;
+}
 
 describe("provider integration (against in-process mock server)", () => {
   test("local tool-calling round-trips through real HTTP and forwards extraBody", async () => {
-    server.received.length = 0;
     const provider = normalizeProvider({
       name: "local",
       model: "gemma-mock-1",
@@ -58,7 +92,6 @@ describe("provider integration (against in-process mock server)", () => {
   });
 
   test("local tool-calling streaming reassembles tool_call argument deltas", async () => {
-    server.received.length = 0;
     const provider = normalizeProvider({
       name: "local",
       model: "gemma-mock-1",
@@ -94,7 +127,6 @@ describe("provider integration (against in-process mock server)", () => {
   });
 
   test("local structured chat-completions returns parsed JSON and forwards extraBody", async () => {
-    server.received.length = 0;
     const provider = normalizeProvider({
       name: "local",
       model: "gemma-mock-1",
@@ -114,7 +146,6 @@ describe("provider integration (against in-process mock server)", () => {
   });
 
   test("local vision chat-completions sends image_url part and forwards extraBody", async () => {
-    server.received.length = 0;
     const provider = normalizeProvider({
       name: "local",
       model: "gemma-mock-1",
@@ -134,63 +165,68 @@ describe("provider integration (against in-process mock server)", () => {
   });
 
   test("openrouter generateTaskSummary round-trips with extraBody", async () => {
-    server.received.length = 0;
-    const original = process.env.OPENROUTER_API_KEY;
-    process.env.OPENROUTER_API_KEY = "test-or-key";
-    try {
-      const provider = normalizeProvider({
-        name: "openrouter",
-        model: "or-mock",
-        baseUrl: server.url,
-        extraBody: { chat_template_kwargs: { enable_thinking: true } }
-      });
-      const result = await generateTaskSummary(cfg(provider), "summarize me", []);
-      expect(result.text).toBe("mock-echo: summarize me");
-      const captured = server.received[0]!;
-      expect(captured.headers["http-referer"]).toBe("http://127.0.0.1:7337");
-      expect(captured.headers["x-title"]).toBe("Gini Agent");
-      const sent = captured.body as Record<string, unknown>;
-      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
-    } finally {
-      if (original === undefined) delete process.env.OPENROUTER_API_KEY;
-      else process.env.OPENROUTER_API_KEY = original;
-    }
+    const keyEnv = uniqueEnvName();
+    setEnv(keyEnv, "test-or-key");
+    const provider = normalizeProvider({
+      name: "openrouter",
+      model: "or-mock",
+      baseUrl: server.url,
+      apiKeyEnv: keyEnv,
+      extraBody: { chat_template_kwargs: { enable_thinking: true } }
+    });
+    const result = await generateTaskSummary(cfg(provider), "summarize me", []);
+    expect(result.text).toBe("mock-echo: summarize me");
+    const captured = server.received[0]!;
+    expect(captured.headers["http-referer"]).toBe("http://127.0.0.1:7337");
+    expect(captured.headers["x-title"]).toBe("Gini Agent");
+    const sent = captured.body as Record<string, unknown>;
+    expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
   });
 
-  test("local provider sends no Authorization header when GINI_LOCAL_API_KEY is unset", async () => {
-    server.received.length = 0;
-    const original = process.env.GINI_LOCAL_API_KEY;
-    delete process.env.GINI_LOCAL_API_KEY;
-    try {
-      const provider = normalizeProvider({
-        name: "local",
-        model: "gemma-mock-1",
-        baseUrl: server.url
-      });
-      await generateToolCallingResponse(cfg(provider), [{ role: "user", content: "hi" }], []);
-      const captured = server.received[0]!;
-      expect(captured.headers.authorization).toBeUndefined();
-    } finally {
-      if (original !== undefined) process.env.GINI_LOCAL_API_KEY = original;
-    }
+  test("local provider sends no Authorization header when api key env is unset", async () => {
+    const keyEnv = uniqueEnvName();
+    // Ensure the unique env var is unset — by definition it isn't.
+    const provider = normalizeProvider({
+      name: "local",
+      model: "gemma-mock-1",
+      baseUrl: server.url,
+      apiKeyEnv: keyEnv
+    });
+    await generateToolCallingResponse(cfg(provider), [{ role: "user", content: "hi" }], []);
+    const captured = server.received[0]!;
+    expect(captured.headers.authorization).toBeUndefined();
   });
 
-  test("local provider sends Bearer header when GINI_LOCAL_API_KEY is set", async () => {
-    server.received.length = 0;
-    const original = process.env.GINI_LOCAL_API_KEY;
-    process.env.GINI_LOCAL_API_KEY = "mock-key-xyz";
-    try {
-      const provider = normalizeProvider({
-        name: "local",
-        model: "gemma-mock-1",
-        baseUrl: server.url
-      });
-      await generateToolCallingResponse(cfg(provider), [{ role: "user", content: "hi" }], []);
-      expect(server.received[0]!.headers.authorization).toBe("Bearer mock-key-xyz");
-    } finally {
-      if (original === undefined) delete process.env.GINI_LOCAL_API_KEY;
-      else process.env.GINI_LOCAL_API_KEY = original;
-    }
+  test("local provider sends Bearer header when api key env is set, and mock redacts it", async () => {
+    const keyEnv = uniqueEnvName();
+    setEnv(keyEnv, "mock-key-xyz");
+    const provider = normalizeProvider({
+      name: "local",
+      model: "gemma-mock-1",
+      baseUrl: server.url,
+      apiKeyEnv: keyEnv
+    });
+    await generateToolCallingResponse(cfg(provider), [{ role: "user", content: "hi" }], []);
+    // The mock server intentionally redacts Authorization before recording so
+    // a real bearer token never ends up in test output. The test asserts on
+    // the sentinel rather than the raw value.
+    expect(server.received[0]!.headers.authorization).toBe("[REDACTED]");
+  });
+
+  test("/v1/models health probes do NOT pollute received[]", async () => {
+    // Anyone wiring readiness polling against the mock server should be able
+    // to hit /v1/models without inflating per-test request counts.
+    const probe = await fetch(`${server.url}/models`);
+    expect(probe.ok).toBe(true);
+    expect(server.received).toHaveLength(0);
+    // A real chat call should still record normally.
+    const provider = normalizeProvider({
+      name: "local",
+      model: "gemma-mock-1",
+      baseUrl: server.url
+    });
+    await generateToolCallingResponse(cfg(provider), [{ role: "user", content: "hi" }], []);
+    expect(server.received).toHaveLength(1);
   });
 });
 

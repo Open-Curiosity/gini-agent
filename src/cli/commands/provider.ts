@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 import type { CliContext } from "../context";
-import { flagValue, restAfter } from "../args";
+import { parseSubArgs, restAfter } from "../args";
 import { configPath } from "../../paths";
 import { normalizeProvider, providerHealth } from "../../provider";
 import { api } from "../api";
@@ -9,33 +9,35 @@ import { maybeRefreshAutostart } from "./autostart";
 
 const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]";
 
+// Single source of truth for value-bearing flags on `gini provider set`.
+// `parseSubArgs` uses this to both partition positionals and extract flag
+// values, so the parser can never disagree with itself about which tokens
+// belong to which flag.
+const PROVIDER_SET_FLAGS: ReadonlySet<string> = new Set([
+  "--base-url",
+  "--api-key-env",
+  "--extra-body"
+]);
+
 export async function provider(ctx: CliContext): Promise<void> {
   const { config, cliArgs } = ctx;
   const sub = cliArgs[1] ?? "show";
   if (sub === "set") {
     const tail = restAfter(cliArgs, sub);
-    // Positional args: <name> [model]. Skip flag tokens so users can write
-    // `gini provider set local --base-url X gemma-...` if they prefer that
-    // ordering. We collect the first two non-flag tokens as name/model.
-    const positional: string[] = [];
-    for (let i = 0; i < tail.length; i += 1) {
-      const token = tail[i] ?? "";
-      if (token.startsWith("--")) {
-        // Skip the value that follows recognized value-bearing flags.
-        if (token === "--base-url" || token === "--api-key-env" || token === "--extra-body") i += 1;
-        continue;
-      }
-      positional.push(token);
+    const { positional, flags, unknownFlags } = parseSubArgs(tail, PROVIDER_SET_FLAGS);
+    if (unknownFlags.length > 0) {
+      throw new Error(`Unknown flag${unknownFlags.length > 1 ? "s" : ""}: ${unknownFlags.join(", ")}\n${USAGE}`);
     }
+
     const name = positional[0];
     const model = positional[1];
     if (name !== "echo" && name !== "openai" && name !== "codex" && name !== "openrouter" && name !== "local") {
       throw new Error(USAGE);
     }
 
-    const baseUrl = flagValue(tail, "--base-url");
-    const apiKeyEnv = flagValue(tail, "--api-key-env");
-    const extraBodyRaw = flagValue(tail, "--extra-body");
+    const baseUrl = flags["--base-url"];
+    const apiKeyEnv = flags["--api-key-env"];
+    const extraBodyRaw = flags["--extra-body"];
     let extraBody: Record<string, unknown> | undefined;
     if (extraBodyRaw !== undefined) {
       try {

@@ -103,13 +103,28 @@ export interface ProviderConfig {
   model: string;
   baseUrl?: string;
   apiKeyEnv?: string;
-  // Provider-specific request fields merged into every chat-completions /
-  // structured-output / vision request body. Forwarded by the local,
-  // openai, and openrouter branches; ignored by echo and codex (codex uses
-  // /responses with its own shape). Used to push fields like
-  // `chat_template_kwargs` for oMLX-served Gemma models that need
-  // server-side reasoning toggles. Caller is responsible for keeping
-  // values JSON-serializable.
+  // Provider-specific request fields merged into chat-completions request
+  // bodies (tool-calling, structured JSON, vision, and the chat-completions
+  // branch of generateTaskSummary). The local and openrouter providers route
+  // every call through chat-completions, so extraBody applies everywhere for
+  // them. The openai provider uses /responses for generateTaskSummary, so
+  // extraBody only applies on its tool-calling, structured, and vision
+  // calls. Codex uses /responses with its own shape and ignores extraBody;
+  // echo bypasses HTTP entirely.
+  //
+  // Reserved keys are stripped at send time so extraBody can never override
+  // runtime-controlled fields: model, messages, stream, tools, tool_choice,
+  // response_format, max_tokens, max_completion_tokens. The runtime always
+  // wins.
+  //
+  // Used to push fields like `chat_template_kwargs` for oMLX-served Gemma
+  // models that need server-side reasoning toggles
+  // (`{enable_thinking: true, preserve_thinking: false}`).
+  //
+  // extraBody flows through providerHealth/status/trace records — treat it
+  // as non-secret transport config. Bearer tokens belong in env vars
+  // referenced by `apiKeyEnv`, never in extraBody. Caller is responsible
+  // for keeping values JSON-serializable.
   extraBody?: Record<string, unknown>;
 }
 
