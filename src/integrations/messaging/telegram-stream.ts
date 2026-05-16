@@ -129,6 +129,16 @@ export async function dispatchOutboundMessage(
   // `resolveConnectorSecret` await right above is the narrowest race
   // window for `disableMessagingBridge` to land; re-read live state
   // here so a disabled bridge never reaches api.telegram.org.
+  //
+  // This re-check covers connector status implicitly: the
+  // connector→bridge cascade in `updateConnector` / `deleteConnector`
+  // flips both the connector and every dependent telegram bridge inside
+  // a single `mutateState`, so a connector that's no longer
+  // `configured` always corresponds to a bridge that's no longer
+  // `configured`. There is no observation window in which the connector
+  // is disabled but the bridge still says `configured`, so a separate
+  // connector-status re-read here would only fire after the bridge
+  // check above already failed.
   const liveBridge = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
   if (!liveBridge || liveBridge.status !== "configured") {
     return markMessageFailed(config, message.id, `Bridge is ${liveBridge?.status ?? "missing"}`);

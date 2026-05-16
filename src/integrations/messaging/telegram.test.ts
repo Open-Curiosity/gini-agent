@@ -593,6 +593,67 @@ describe("inbound message authorization", () => {
     const live = state.messagingBridges.find((b) => b.id === bridge.id);
     expect(live?.telegram?.updateOffset).toBe(100);
   });
+
+  test("backing connector flipped non-configured drops the dispatch with connector_unavailable", async () => {
+    // The gate re-reads the backing connector's live status alongside
+    // the bridge status. A direct state-edit / import path can leave a
+    // connector `disabled` while the bridge row still says
+    // `configured`; without the connector check the gate would proceed
+    // and submit a task whose reply path is already broken. The
+    // operator-visible outcome must be a `messaging.telegram.dropped`
+    // audit row with `reason: "connector_unavailable"` and no task.
+    const config = buildConfig("telegram-gate-connector-unavailable");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    const agentId = readState(config.instance).agents[0]!.id;
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 100, agentId });
+    // Stop the poller so its loop doesn't see the disabled connector
+    // first and flip the bridge to `error` (which would trip the
+    // earlier bridge-status check instead of the connector check we
+    // want to exercise).
+    await stopAllPollers();
+    // Flip the connector directly to `disabled` without going through
+    // updateConnector, leaving the bridge `configured`. This is the
+    // import / hand-edit shape the connector check defends against.
+    await mutateState(config.instance, (state) => {
+      const c = state.connectors.find((c) => c.id === "id_conn")!;
+      c.status = "disabled";
+    });
+
+    const tasksBefore = readState(config.instance).tasks.length;
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+
+    await handleInboundMessage(config, bridge.id, {
+      message_id: 1,
+      from: { id: 100, username: "u" },
+      chat: { id: 555, type: "private" },
+      date: 0,
+      text: "drive under disabled connector"
+    }, 42);
+
+    const state = readState(config.instance);
+    expect(state.tasks.length).toBe(tasksBefore);
+    const inbound = state.messagingMessages.find(
+      (m) => m.bridgeId === bridge.id && m.direction === "inbound"
+    );
+    expect(inbound).toBeUndefined();
+    const drop = state.audit.find(
+      (a) =>
+        a.action === "messaging.telegram.dropped" &&
+        (a.evidence as Record<string, unknown> | undefined)?.reason === "connector_unavailable"
+    );
+    expect(drop).toBeDefined();
+    expect((drop!.evidence as Record<string, unknown>).connectorStatus).toBe("disabled");
+    // Offset advanced in the same mutation as the drop audit so a
+    // restart doesn't re-dispatch.
+    const live = state.messagingBridges.find((b) => b.id === bridge.id);
+    expect(live?.telegram?.updateOffset).toBe(43);
+  });
 });
 
 describe("callback_query handling", () => {
@@ -1181,6 +1242,76 @@ describe("connector status cascade", () => {
     );
     expect(audit).toBeDefined();
     expect((audit!.evidence as Record<string, unknown>).connectorId).toBe("id_conn");
+  });
+
+  test("connector + bridge flip atomically; no observer sees configured bridge under a disabled connector", async () => {
+    // The cascade pulls the bridge-flip into the same `mutateState` as
+    // the connector flip so any reader between the two writes is
+    // impossible: there is only one write. We pin atomicity by holding
+    // the next `mutateState` open behind a long-running fetch (the
+    // poller's `getUpdates`) and then snapshotting state at the moment
+    // `updateConnector` returns. If the bridge weren't part of the same
+    // write the snapshot would show `(connector: disabled, bridge:
+    // configured)`.
+    const config = buildConfig("telegram-cascade-atomic");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+
+    // The poller's `getUpdates` hangs forever on this fetch so its
+    // `await handle.done` blocks the disable's `stopPoller` call until
+    // we abort. The `mutateState` that flips the connector + bridge
+    // commits BEFORE `stopPoller` is awaited, so we can snapshot in
+    // that window.
+    const { promise: getUpdatesHit, resolve: signalGetUpdatesHit } = Promise.withResolvers<void>();
+    const { promise: getUpdatesUnblock, resolve: releaseGetUpdates } = Promise.withResolvers<void>();
+    globalThis.fetch = (async (input: Request | string | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("getUpdates")) {
+        signalGetUpdatesHit();
+        // Block until the test releases us OR the abort signal fires.
+        const signal = init?.signal;
+        if (signal?.aborted) {
+          return new Response("", { status: 599 });
+        }
+        const aborted = new Promise<void>((resolve) => {
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        await Promise.race([getUpdatesUnblock, aborted]);
+        return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    // Wait for the poller to land in its long-poll so a disable will
+    // exercise the drain window.
+    await getUpdatesHit;
+
+    // Kick off the disable. `updateConnector` returns once its
+    // `mutateState` commits; the drain (`stopPoller`) runs after. We
+    // snapshot AFTER updateConnector resolves but BEFORE we release
+    // the long poll, so we are guaranteed to be inside the drain
+    // window.
+    const updatePromise = updateConnector(config, "id_conn", { status: "disabled" });
+    await updatePromise;
+    const snapshot = readState(config.instance);
+    const snapBridge = snapshot.messagingBridges.find((b) => b.id === bridge.id);
+    const snapConnector = snapshot.connectors.find((c) => c.id === "id_conn");
+    expect(snapConnector?.status).toBe("disabled");
+    // Atomic invariant: if the connector is `disabled` then any
+    // dependent telegram bridge must also no longer be `configured` —
+    // both writes happen in the same mutateState.
+    expect(snapBridge?.status).not.toBe("configured");
+    expect(snapBridge?.status).toBe("error");
+
+    // Release the long-poll fetch so the drain can complete. Without
+    // this the afterEach teardown would hang.
+    releaseGetUpdates();
+    await stopAllPollers();
   });
 
   test("dispatchOutboundMessage refuses to ship through a disabled connector", async () => {

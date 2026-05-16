@@ -212,6 +212,35 @@ export async function handleInboundMessage(
       advanceTelegramOffset(state, bridgeId, updateId);
       return { kind: "skip" };
     }
+    // Backing-connector status check. The connector→bridge cascade flips
+    // both atomically inside one `mutateState`, so under normal flow this
+    // is redundant with the bridge check above. The defense exists for
+    // direct state-edit / import paths that leave the connector
+    // `disabled` while the bridge row still says `configured`: in those
+    // cases the connector check is the only thing standing between an
+    // operator-disabled credential and a dispatched task.
+    const liveConnector = liveBridge.connectorId
+      ? state.connectors.find((c) => c.id === liveBridge.connectorId)
+      : undefined;
+    if (!liveConnector || liveConnector.status !== "configured") {
+      addAudit(state, {
+        actor: "runtime",
+        action: "messaging.telegram.dropped",
+        target: bridgeId,
+        risk: "low",
+        evidence: {
+          bridgeId,
+          reason: "connector_unavailable",
+          chatId,
+          telegramUserId: fromId,
+          messageId: message.message_id,
+          connectorId: liveBridge.connectorId,
+          connectorStatus: liveConnector?.status
+        }
+      });
+      advanceTelegramOffset(state, bridgeId, updateId);
+      return { kind: "skip" };
+    }
     const liveEntry = liveBridge.telegram?.allowlist.find(
       (e) => e.telegramUserId === fromId
     );
@@ -292,6 +321,14 @@ export async function handleInboundMessage(
   // active-agent pointer (multi-user safe). Reaching this point means
   // the atomic gate above committed under "configured" status, so any
   // disable that lands now races a write the operator already lost.
+  //
+  // A bridge or backing-connector disable that lands between this gate
+  // commit and `submitTask`'s own `mutateState` will leave the task on
+  // the queue. That residual window only burns one LLM round: the
+  // outbound dispatcher (`dispatchOutboundMessage`) re-reads live state
+  // immediately before each network call and refuses to ship a reply
+  // through a non-`configured` bridge, so no traffic reaches
+  // api.telegram.org under a credential the operator has revoked.
   const run = await createConversationRun(config, { conversationId: gate.sessionId, input: text });
   const task = await submitTask(config, text, {
     runId: run.id,

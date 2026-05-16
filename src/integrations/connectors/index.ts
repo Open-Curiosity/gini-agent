@@ -3,6 +3,45 @@ import { addAudit, id, mutateState, now, readState, updateConnectorHealth } from
 import { deleteConnectorSecrets, readSecret, writeSecret } from "../../state/secrets";
 import { getProvider, listProviders } from "./registry";
 
+// Walk the live state and flip every telegram bridge that points at
+// `connectorId` to `status: "error"`. Designed to run INSIDE the same
+// `mutateState` that flips the connector itself so observers never see
+// `(connector: disabled, bridge: configured)`. Returns the affected
+// bridge ids so the caller can drain pollers after the mutation commits.
+function flipDependentTelegramBridges(state: RuntimeState, connectorId: string): string[] {
+  const affected: string[] = [];
+  for (const live of state.messagingBridges) {
+    if (live.kind !== "telegram" || live.connectorId !== connectorId) continue;
+    live.status = "error";
+    live.message = "Connector disabled; re-enable to resume bridge.";
+    live.updatedAt = now();
+    addAudit(state, {
+      actor: "runtime",
+      action: "messaging.telegram.bridge_quiesced",
+      target: live.id,
+      risk: "medium",
+      evidence: { bridgeId: live.id, connectorId }
+    });
+    affected.push(live.id);
+  }
+  return affected;
+}
+
+// Drain pollers for telegram bridges flipped by
+// `flipDependentTelegramBridges`. Dynamic import avoids a connectors →
+// messaging-registry → connectors cycle (the registry transitively imports
+// resolveConnectorSecret from this module). Per-iteration the poller's
+// status guard sees the flipped bridge and exits cleanly on the next loop
+// turn; this call awaits that drain so the caller doesn't return before
+// the worker stops.
+async function drainTelegramPollers(bridgeIds: string[]): Promise<void> {
+  if (bridgeIds.length === 0) return;
+  const { stopPoller } = await import("../messaging/telegram-registry");
+  for (const bridgeId of bridgeIds) {
+    await stopPoller(bridgeId);
+  }
+}
+
 export interface CreateConnectorInput {
   name: string;
   provider: string;
@@ -96,6 +135,13 @@ export async function updateConnector(
     wroteRefs.push(writeSecret(config.instance, connectorId, purpose, value));
   }
   const previousStatus = readState(config.instance).connectors.find((c) => c.id === connectorId)?.status;
+  // Single-write cascade. The connector flip AND any dependent telegram
+  // bridge flips happen inside one `mutateState` so observers reading
+  // state between writes never see `(connector: disabled, bridge:
+  // configured)`. The poller-drain step runs after this returns; the
+  // poller's per-iteration status check exits cleanly on its next loop
+  // turn once it sees the flipped bridge.
+  let cascadedBridgeIds: string[] = [];
   const updated = await mutateState(config.instance, (state) => {
     const connector = state.connectors.find((candidate) => candidate.id === connectorId);
     if (!connector) throw new Error(`Connector not found: ${connectorId}`);
@@ -119,56 +165,17 @@ export async function updateConnector(
         rotatedPurposes: wroteRefs.map((ref) => ref.purpose)
       }
     });
+    if (
+      connector.provider === "telegram" &&
+      previousStatus === "configured" &&
+      connector.status !== "configured"
+    ) {
+      cascadedBridgeIds = flipDependentTelegramBridges(state, connector.id);
+    }
     return connector;
   });
-  // Cascade visibility for telegram connectors whose status flipped out
-  // of `configured`. Any bridge pointing at this connector must stop
-  // polling and surface the disabled-connector reason in its own status
-  // so operators see it in /api/messaging rather than waiting for the
-  // next dispatch attempt to fail.
-  if (
-    updated.provider === "telegram" &&
-    previousStatus === "configured" &&
-    updated.status !== "configured"
-  ) {
-    await quiesceTelegramBridgesForConnector(config, updated.id);
-  }
+  await drainTelegramPollers(cascadedBridgeIds);
   return updated;
-}
-
-// Stop the poller and flip every telegram bridge that references this
-// connector to `status: "error"` with an operator-readable message.
-// Dynamic import avoids a connectors → messaging-registry → connectors
-// cycle (the registry transitively imports resolveConnectorSecret from
-// this module). Called from updateConnector / deleteConnector after a
-// telegram connector flips out of `configured`.
-async function quiesceTelegramBridgesForConnector(
-  config: RuntimeConfig,
-  connectorId: string
-): Promise<void> {
-  const affected = readState(config.instance).messagingBridges.filter(
-    (b) => b.kind === "telegram" && b.connectorId === connectorId
-  );
-  if (affected.length === 0) return;
-  const { stopPoller } = await import("../messaging/telegram-registry");
-  for (const bridge of affected) {
-    await stopPoller(bridge.id);
-  }
-  await mutateState(config.instance, (state) => {
-    for (const live of state.messagingBridges) {
-      if (live.kind !== "telegram" || live.connectorId !== connectorId) continue;
-      live.status = "error";
-      live.message = "Connector disabled; re-enable to resume bridge.";
-      live.updatedAt = now();
-      addAudit(state, {
-        actor: "runtime",
-        action: "messaging.telegram.bridge_quiesced",
-        target: live.id,
-        risk: "medium",
-        evidence: { bridgeId: live.id, connectorId }
-      });
-    }
-  });
 }
 
 export async function deleteConnector(config: RuntimeConfig, connectorId: string): Promise<{ id: string; tombstoned?: boolean }> {
@@ -185,9 +192,16 @@ export async function deleteConnector(config: RuntimeConfig, connectorId: string
     deleteConnectorSecrets(config.instance, connectorId);
   }
 
+  // Single-write cascade. Both the tombstone path and the hard-delete
+  // path leave bridges pointing at a connector that's no longer usable;
+  // folding the bridge-flip into this same `mutateState` collapses the
+  // observation window where state could appear `(connector: gone-or-
+  // disabled, bridge: configured)` to zero.
+  let cascadedBridgeIds: string[] = [];
   const result = await mutateState(config.instance, (state) => {
     const index = state.connectors.findIndex((candidate) => candidate.id === connectorId);
     if (index < 0) throw new Error(`Connector not found: ${connectorId}`);
+    const shouldCascade = initial.provider === "telegram" && initial.status === "configured";
     if (isAuto) {
       // Tombstone — keep the record around with `status: "disabled"` so
       // the detection job (which skips disabled rows) doesn't immediately
@@ -204,6 +218,7 @@ export async function deleteConnector(config: RuntimeConfig, connectorId: string
         risk: "medium",
         evidence: { provider: connector.provider, name: connector.name, source: connector.source }
       });
+      if (shouldCascade) cascadedBridgeIds = flipDependentTelegramBridges(state, connectorId);
       return { id: connectorId, tombstoned: true };
     }
     const [connector] = state.connectors.splice(index, 1);
@@ -214,15 +229,10 @@ export async function deleteConnector(config: RuntimeConfig, connectorId: string
       risk: "medium",
       evidence: { provider: connector?.provider, name: connector?.name }
     });
+    if (shouldCascade) cascadedBridgeIds = flipDependentTelegramBridges(state, connectorId);
     return { id: connectorId };
   });
-  // Cascade visibility for telegram connectors. Both the tombstone path
-  // and the hard-delete path leave bridges pointing at a connector
-  // that's no longer usable; quiesce them so the poller stops and the
-  // bridge surfaces the disabled-connector reason.
-  if (initial.provider === "telegram" && initial.status === "configured") {
-    await quiesceTelegramBridgesForConnector(config, connectorId);
-  }
+  await drainTelegramPollers(cascadedBridgeIds);
   return result;
 }
 
