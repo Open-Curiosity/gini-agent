@@ -697,7 +697,12 @@ export interface JobRecord {
   name: string;
   prompt: string;
   script?: string;
-  intervalSeconds: number;
+  // Interval-driven schedule. Optional — cron-driven jobs (cronExpression
+  // set) carry no intervalSeconds at all. Exactly one of (intervalSeconds,
+  // cronExpression) is the active driver per job. The pair is validated
+  // at create/update time; the scheduler picks the appropriate advance
+  // helper based on which field is set.
+  intervalSeconds?: number;
   status: JobStatus;
   deliveryTargets: string[];
   context: string[];
@@ -735,9 +740,9 @@ export interface JobRecord {
   // drives the job's nextRunAt instead of `intervalSeconds`. Exactly one
   // of (intervalSeconds, cronExpression) is the active driver per job;
   // `createScheduledJob` rejects payloads that supply both explicitly.
-  // For cron-driven jobs `intervalSeconds` is stored as `0` (a sentinel
-  // meaning "not interval-driven") rather than left undefined, to avoid
-  // a state migration on every existing JobRecord.
+  // Cron-driven jobs leave `intervalSeconds` undefined (no sentinel).
+  // Legacy state files with `{intervalSeconds: 0, cronExpression: "..."}`
+  // are normalized on load (see store.ts normalizer).
   cronExpression?: string;
   // IANA timezone identifier (e.g. "America/Los_Angeles", "Europe/Berlin").
   // Resolved at create time — defaults to "UTC" when `cronExpression` is

@@ -116,6 +116,68 @@ describe("normalizeState toolset/tool backfill", () => {
     }
   });
 
+  test("normalizes legacy intervalSeconds: 0 sentinel on cron-driven jobs to undefined", () => {
+    // Earlier versions of the runtime stored `intervalSeconds: 0` on cron
+    // jobs so the field stayed a `number`. After the type was made
+    // optional, cron jobs carry no intervalSeconds at all. The normalizer
+    // migrates legacy rows on load — interval jobs are left untouched.
+    const state = createEmptyState("test-instance-cron-migrate");
+    state.jobs = [
+      // Legacy cron job: intervalSeconds: 0, cronExpression set.
+      {
+        id: "job_legacy_cron",
+        instance: "test-instance-cron-migrate",
+        name: "legacy cron",
+        prompt: "x",
+        intervalSeconds: 0,
+        cronExpression: "0 9 * * *",
+        cronTimezone: "UTC",
+        status: "active",
+        deliveryTargets: [],
+        context: [],
+        retryLimit: 0,
+        timeoutSeconds: 600,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        nextRunAt: "2026-01-02T09:00:00.000Z",
+        runCount: 0,
+        missedRuns: 0,
+        taskIds: [],
+        runIds: []
+      },
+      // Legacy interval job: positive intervalSeconds, no cronExpression.
+      {
+        id: "job_legacy_interval",
+        instance: "test-instance-cron-migrate",
+        name: "legacy interval",
+        prompt: "x",
+        intervalSeconds: 60,
+        status: "active",
+        deliveryTargets: [],
+        context: [],
+        retryLimit: 0,
+        timeoutSeconds: 600,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        nextRunAt: "2026-01-01T00:01:00.000Z",
+        runCount: 0,
+        missedRuns: 0,
+        taskIds: [],
+        runIds: []
+      }
+    ];
+
+    const normalized = normalizeState("test-instance-cron-migrate", state);
+
+    const cronJob = normalized.jobs.find((j) => j.id === "job_legacy_cron");
+    const intervalJob = normalized.jobs.find((j) => j.id === "job_legacy_interval");
+    // Cron-driven row: the 0 sentinel is dropped.
+    expect(cronJob?.intervalSeconds).toBeUndefined();
+    expect(cronJob?.cronExpression).toBe("0 9 * * *");
+    // Interval-driven row: untouched.
+    expect(intervalJob?.intervalSeconds).toBe(60);
+  });
+
   test("backfilled tool rows for a DISABLED toolset stay disabled", () => {
     const state = createEmptyState("test-instance-6");
     const browser = state.toolsets.find((ts) => ts.name === "browser");

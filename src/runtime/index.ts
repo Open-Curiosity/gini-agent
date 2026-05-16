@@ -9,7 +9,23 @@ import { currentVersionInfo } from "./update";
 
 export function status(config: RuntimeConfig) {
   const state = readState(config.instance);
-  const missedJobs = state.jobs.filter((job) => job.status === "active" && new Date(job.nextRunAt).getTime() + job.intervalSeconds * 1000 < Date.now()).length;
+  // A job is "missed" when it's active AND its nextRunAt is far enough in
+  // the past that the scheduler should have already fired it. For
+  // interval-driven jobs that's `nextRunAt + intervalSeconds` (one full
+  // cadence overdue); for cron-driven jobs there's no fixed step, so we
+  // fall back to "nextRunAt is in the past" as a coarse approximation —
+  // a precise cron-aware comparison would require calling croner here
+  // and isn't worth the cycles for a status counter.
+  const missedJobs = state.jobs.filter((job) => {
+    if (job.status !== "active") return false;
+    const dueAt = new Date(job.nextRunAt).getTime();
+    if (job.intervalSeconds !== undefined) {
+      return dueAt + job.intervalSeconds * 1000 < Date.now();
+    }
+    // Cron-driven (or hand-edited shape with no schedule): treat any
+    // overdue nextRunAt as missed.
+    return dueAt < Date.now();
+  }).length;
   // Memory DB probe is best-effort: a fresh instance will have 0 units. We don't
   // open the DB here unless one already exists on disk to avoid creating an
   // empty memory.db side-effect from a read-only status call.

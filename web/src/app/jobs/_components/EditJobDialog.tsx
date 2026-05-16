@@ -25,8 +25,17 @@ export function EditJobDialog({ job }: { job: JobRecord }) {
   // Per the brief: editable fields are schedule (interval seconds OR cron
   // expression + timezone), retryLimit, timeoutSeconds, costBudget,
   // deliveryTargets[].
+  // For a cron-driven job (no intervalSeconds), prefill the input with "60"
+  // as a sensible default for when the user switches the mode toggle to
+  // Interval. For an interval-driven job, prefill with the current value.
+  // A defensive fallback of "" handles a record that's lost its interval
+  // (hand-edited state) so the input doesn't render "undefined".
   const [intervalSeconds, setIntervalSeconds] = useState(
-    job.cronExpression ? "60" : String(job.intervalSeconds)
+    job.cronExpression
+      ? "60"
+      : job.intervalSeconds !== undefined
+        ? String(job.intervalSeconds)
+        : ""
   );
   const [cronExpression, setCronExpression] = useState(job.cronExpression ?? "");
   const [cronTimezone, setCronTimezone] = useState(job.cronTimezone ?? "UTC");
@@ -44,7 +53,13 @@ export function EditJobDialog({ job }: { job: JobRecord }) {
   // an interval one doesn't strand the form in the wrong shape.
   useEffect(() => {
     setMode(job.cronExpression ? "cron" : "interval");
-    setIntervalSeconds(job.cronExpression ? "60" : String(job.intervalSeconds));
+    setIntervalSeconds(
+      job.cronExpression
+        ? "60"
+        : job.intervalSeconds !== undefined
+          ? String(job.intervalSeconds)
+          : ""
+    );
     setCronExpression(job.cronExpression ?? "");
     setCronTimezone(job.cronTimezone ?? "UTC");
     setRetryLimit(String(job.retryLimit));

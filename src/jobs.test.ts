@@ -596,7 +596,8 @@ describe("cron lifecycle", () => {
     expect(jobs).toHaveLength(1);
     expect(jobs[0]?.cronExpression).toBe("0 9 * * *");
     expect(jobs[0]?.cronTimezone).toBe("America/Los_Angeles");
-    expect(jobs[0]?.intervalSeconds).toBe(0);
+    // Cron-driven jobs carry no intervalSeconds (field is optional).
+    expect(jobs[0]?.intervalSeconds).toBeUndefined();
 
     // Audit + return-message both reflect the cron cadence so a reviewer
     // and the agent's follow-up reply describe the schedule correctly.

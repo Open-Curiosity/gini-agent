@@ -554,6 +554,17 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     job.retryLimit ??= 0;
     job.timeoutSeconds ??= 600;
     job.runIds ??= [];
+    // Drop the legacy `intervalSeconds: 0` sentinel on cron-driven jobs.
+    // Earlier versions stored 0 on a cron-driven JobRecord so the field
+    // stayed a `number`; we made `intervalSeconds` optional and cron jobs
+    // now carry no interval at all. Idempotent: a state file already on
+    // the new shape (intervalSeconds undefined) passes through untouched,
+    // and an interval-driven legacy record with `intervalSeconds: 0` and
+    // no cronExpression stays as-is so the next mutate-time guard surfaces
+    // the bogus shape (which can't have been produced by current code).
+    if (job.cronExpression && job.intervalSeconds === 0) {
+      job.intervalSeconds = undefined;
+    }
   }
   // Browser connection record is purely opt-in — feature added after the
   // initial state shape. Normalize obviously bad shapes to null so a

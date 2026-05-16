@@ -85,8 +85,8 @@ describe("updateJob schedule-mode transitions", () => {
     expect(updated.cronExpression).toBe("0 17 * * *");
     // Timezone preserved when not specified in patch.
     expect(updated.cronTimezone).toBe("UTC");
-    // Cron sentinel preserved.
-    expect(updated.intervalSeconds).toBe(0);
+    // Cron-driven jobs carry no intervalSeconds.
+    expect(updated.intervalSeconds).toBeUndefined();
     // nextRunAt should match what croner says for the new expression/TZ.
     const expected = new Cron("0 17 * * *", { timezone: "UTC" }).nextRun(new Date(before));
     expect(expected).not.toBeNull();
@@ -113,7 +113,7 @@ describe("updateJob schedule-mode transitions", () => {
     expect([16, 17]).toContain(utcHour);
   });
 
-  test("interval -> cron (set cronExpression with intervalSeconds: null, sentinel applied)", async () => {
+  test("interval -> cron (set cronExpression with intervalSeconds: null, field dropped)", async () => {
     const config = buildConfig("update-interval-to-cron");
     const created = await createScheduledJob(config, {
       name: "watch",
@@ -129,8 +129,8 @@ describe("updateJob schedule-mode transitions", () => {
     });
     expect(updated.cronExpression).toBe("0 9 * * *");
     expect(updated.cronTimezone).toBe("UTC");
-    // The cron-driven sentinel.
-    expect(updated.intervalSeconds).toBe(0);
+    // Cron-driven jobs carry no intervalSeconds.
+    expect(updated.intervalSeconds).toBeUndefined();
     // nextRunAt should be a real cron-matched future moment, not now + 60s.
     const expected = new Cron("0 9 * * *", { timezone: "UTC" }).nextRun(new Date());
     expect(expected).not.toBeNull();
@@ -138,9 +138,9 @@ describe("updateJob schedule-mode transitions", () => {
     expect(Math.abs(nextMs - expected!.getTime())).toBeLessThanOrEqual(2000);
   });
 
-  test("interval -> cron without explicit intervalSeconds: null still coerces sentinel", async () => {
+  test("interval -> cron without explicit intervalSeconds: null still drops the field", async () => {
     // A polite caller can patch just `cronExpression` and trust the runtime
-    // to coerce intervalSeconds to the 0 sentinel.
+    // to drop the stale intervalSeconds.
     const config = buildConfig("update-interval-to-cron-implicit");
     const created = await createScheduledJob(config, {
       name: "watch",
@@ -153,7 +153,7 @@ describe("updateJob schedule-mode transitions", () => {
     });
     expect(updated.cronExpression).toBe("0 9 * * *");
     expect(updated.cronTimezone).toBe("UTC"); // default
-    expect(updated.intervalSeconds).toBe(0);
+    expect(updated.intervalSeconds).toBeUndefined();
   });
 
   test("cron -> interval (clear cron with cronExpression: null + positive intervalSeconds)", async () => {
