@@ -10,6 +10,7 @@ import { appendLog, mutateState, readState } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
+import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
@@ -190,6 +191,28 @@ const reprobeDone: Promise<void> = (async function reprobeLoop(): Promise<void> 
   }
 })();
 
+// Telegram inbound poller. The supervisor reconciles per-bridge long-poll
+// loops against state every few seconds, so a bridge added or disabled at
+// runtime is picked up without restarting the runtime. Each loop streams
+// updates from api.telegram.org and funnels them through
+// receiveMessagingInput, which submits a task per inbound message.
+const TELEGRAM_RECONCILE_INTERVAL_MS = Number(process.env.GINI_TELEGRAM_RECONCILE_MS ?? 5000);
+const telegramSupervisor = createTelegramPollerSupervisor(config);
+let telegramStopped = false;
+const telegramDone: Promise<void> = (async function telegramReconcileLoop(): Promise<void> {
+  while (!telegramStopped) {
+    try {
+      telegramSupervisor.reconcile();
+    } catch (error) {
+      appendLog(config.instance, "messaging.telegram.supervisor_error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+    if (telegramStopped) break;
+    await Bun.sleep(TELEGRAM_RECONCILE_INTERVAL_MS);
+  }
+})();
+
 // Guard against concurrent SIGTERMs. launchctl bootout, `kill`, and our
 // own self-signal from src/runtime/autostart-refresh.ts can all arrive
 // in quick succession; we only want to drain + consume the refresh
@@ -205,6 +228,11 @@ process.on("SIGTERM", async () => {
   appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
   schedulerStopped = true;
   reprobeStopped = true;
+  telegramStopped = true;
+  // Abort all in-flight Telegram long-polls so they don't keep us alive
+  // waiting out their 25s timeout. The .catch below swallows the abort
+  // rejection — it's expected.
+  void telegramSupervisor.stopAll().catch(() => {});
   // Drain in-flight HTTP responses BEFORE we start tearing the process
   // down. `server.stop(false)` returns a promise that resolves when
   // active requests have completed writing — without this, a setup POST
@@ -247,6 +275,8 @@ process.on("SIGTERM", async () => {
     Promise.all([
       schedulerDone.catch(() => {}),
       reprobeDone.catch(() => {}),
+      telegramDone.catch(() => {}),
+      telegramSupervisor.stopAll().catch(() => {}),
       // Close any live headless browser contexts so Chromium child
       // processes exit cleanly with the runtime instead of being reaped
       // by the OS at the very end. Errors are swallowed — a stuck
