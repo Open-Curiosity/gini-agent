@@ -121,4 +121,3 @@ export interface HindsightReflectView {
   recalled: number;
   usage: Record<string, unknown>;
 }
-
