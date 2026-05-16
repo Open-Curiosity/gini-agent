@@ -24,7 +24,12 @@ import type { ProviderDescriptor } from "@/lib/queries";
 export interface CreateConnectorBody {
   provider: string;
   name: string;
-  scopes: string[];
+  // Optional so rotate mode can omit it. The runtime's updateConnector
+  // treats any provided scopes array as a full replacement, so sending
+  // `scopes: []` from a rotate (where the dialog hides the input) would
+  // wipe the stored scopes despite the dialog promising they stay the
+  // same. Create mode still always sends scopes.
+  scopes?: string[];
   secrets: Record<string, string>;
   metadata?: Record<string, unknown>;
 }
@@ -143,10 +148,17 @@ export function AddConnectorDialog({
       return;
     }
 
+    // In rotate mode the dialog hides the scopes input and the description
+    // promises name and scopes stay the same. Sending an empty `scopes`
+    // array would have updateConnector treat it as a full replacement and
+    // wipe the stored scopes. Omit the field entirely on rotate so only
+    // the new secrets land.
     onSubmit({
       provider,
       name: (mode === "rotate" ? defaultName ?? name : name).trim(),
-      scopes: scopes.split(",").map((s) => s.trim()).filter(Boolean),
+      ...(mode === "create"
+        ? { scopes: scopes.split(",").map((s) => s.trim()).filter(Boolean) }
+        : {}),
       secrets,
       metadata: Object.keys(metadataFields).length > 0 ? { fields: metadataFields } : undefined
     });
