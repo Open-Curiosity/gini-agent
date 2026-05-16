@@ -68,9 +68,8 @@ describe("createScheduledJob cron + timezone", () => {
     });
     expect(job.cronExpression).toBe("0 9 * * *");
     expect(job.cronTimezone).toBe("UTC");
-    // Cron-driven jobs store intervalSeconds=0 as the "not driven by
-    // interval" sentinel.
-    expect(job.intervalSeconds).toBe(0);
+    // Cron-driven jobs carry no intervalSeconds (the field is optional).
+    expect(job.intervalSeconds).toBeUndefined();
 
     const nextMs = new Date(job.nextRunAt).getTime();
     expect(nextMs).toBeGreaterThan(before);

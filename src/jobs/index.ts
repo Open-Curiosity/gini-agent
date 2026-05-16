@@ -118,11 +118,11 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
   // Only fall back to defaults when the field is truly absent. An explicit
   // NaN-from-JSON arrives as `null`, and `null ?? 60` would silently
   // promote a bogus payload to a happy path — instead, validate it.
-  // When cronExpression is set, intervalSeconds is stored as 0 (sentinel
-  // for "not interval-driven") so the field stays a `number` and the
-  // existing JobRecord shape isn't disturbed by a giant migration.
-  const intervalSeconds = cronExpression !== undefined
-    ? 0
+  // When cronExpression is set, the JobRecord stores no intervalSeconds
+  // at all (the field is optional on the type). Interval-driven jobs
+  // default to 60s when the field is absent.
+  const intervalSeconds: number | undefined = cronExpression !== undefined
+    ? undefined
     : input.intervalSeconds === undefined
       ? 60
       : assertPositiveInt("intervalSeconds", input.intervalSeconds);
@@ -227,10 +227,14 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     }
     // Initial nextRunAt: cron-driven jobs anchor to the next cron-matched
     // wall-clock moment (resolved above via Cron.nextRun()), interval-driven
-    // jobs anchor `intervalSeconds` from now.
+    // jobs anchor `intervalSeconds` from now. By construction
+    // intervalSeconds is a positive number on the non-cron branch (the
+    // ternary above assigned `60` or the validated input value), and
+    // undefined when cronExpression is set — we only read it in the
+    // interval branch so the `!` assertion is sound.
     const initialNextRunAtMs = cronExpression !== undefined
       ? (initialCronNextRunMs as number)
-      : Date.now() + intervalSeconds * 1000;
+      : Date.now() + intervalSeconds! * 1000;
     return createJob(state, {
       name: String(input.name ?? "Untitled job"),
       prompt: String(input.prompt ?? ""),
@@ -339,10 +343,16 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
       // tick we're claiming now; each additional advance is a missed run.
       // Cron-driven jobs use the cron-aware helper so DST + month-end
       // boundaries are handled natively; interval jobs keep the linear
-      // step math.
+      // step math. An interval-driven job must have a positive
+      // intervalSeconds by construction (creation + update guard); the
+      // assert here catches a state file hand-edited into an unfireable
+      // shape rather than silently looping forever.
+      if (!job.cronExpression && (job.intervalSeconds === undefined || job.intervalSeconds <= 0)) {
+        throw new Error(`Job ${job.id} has neither cronExpression nor a positive intervalSeconds`);
+      }
       const { nextRunAtMs, missed } = job.cronExpression
         ? advanceCronNextRunAt(job.cronExpression, job.cronTimezone ?? "UTC", dueAt, dateNow)
-        : advanceNextRunAt(dueAt, job.intervalSeconds, dateNow);
+        : advanceNextRunAt(dueAt, job.intervalSeconds as number, dateNow);
       job.nextRunAt = new Date(nextRunAtMs).toISOString();
       if (missed > 0) job.missedRuns += missed;
       job.lastRunAt = now();
@@ -570,9 +580,16 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
       const dueAt = new Date(item.nextRunAt).getTime();
       const dateNow = Date.now();
       if (dueAt <= dateNow) {
+        // Same well-formedness guard as in runDueJobs: a non-cron job must
+        // carry a positive intervalSeconds. The assert is defense in depth
+        // against hand-edited state files; the create/update paths enforce
+        // this invariant on every write.
+        if (!item.cronExpression && (item.intervalSeconds === undefined || item.intervalSeconds <= 0)) {
+          throw new Error(`Job ${item.id} has neither cronExpression nor a positive intervalSeconds`);
+        }
         const { nextRunAtMs, missed } = item.cronExpression
           ? advanceCronNextRunAt(item.cronExpression, item.cronTimezone ?? "UTC", dueAt, dateNow)
-          : advanceNextRunAt(dueAt, item.intervalSeconds, dateNow);
+          : advanceNextRunAt(dueAt, item.intervalSeconds as number, dateNow);
         item.nextRunAt = new Date(nextRunAtMs).toISOString();
         if (missed > 0) item.missedRuns += missed;
       }
@@ -716,20 +733,24 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
 
     // If we end up cron-driven, validate via croner and recompute nextRunAt
     // from the cron schedule. If we end up interval-driven, recompute
-    // nextRunAt from `now + intervalSeconds`.
-    let newIntervalSeconds = job.intervalSeconds;
+    // nextRunAt from `now + intervalSeconds`. Cron-driven jobs leave
+    // intervalSeconds undefined entirely — no sentinel.
+    let newIntervalSeconds: number | undefined = job.intervalSeconds;
     if (typeof input.intervalSeconds === "number") {
       newIntervalSeconds = input.intervalSeconds;
     } else if (clearingInterval && newCronExpression !== undefined) {
-      // Cron-driven jobs use 0 as the sentinel for "not interval-driven"
-      // (matches createScheduledJob's storage convention).
-      newIntervalSeconds = 0;
+      // Interval cleared and we're cron-driven post-patch — drop the field.
+      newIntervalSeconds = undefined;
     } else if (newCronExpression !== undefined && job.cronExpression === undefined) {
       // Caller is switching interval -> cron but didn't explicitly null the
-      // intervalSeconds. Coerce it to the sentinel so the JobRecord stays in
-      // a coherent shape.
-      newIntervalSeconds = 0;
-    } else if (newCronExpression === undefined && job.cronExpression !== undefined && job.intervalSeconds === 0) {
+      // intervalSeconds. Drop the field so the JobRecord stays coherent
+      // (no leftover stale interval on a cron job).
+      newIntervalSeconds = undefined;
+    } else if (
+      newCronExpression === undefined &&
+      job.cronExpression !== undefined &&
+      (job.intervalSeconds === undefined || job.intervalSeconds <= 0)
+    ) {
       // Cron -> interval requested (cronExpression: null) but caller forgot
       // to supply a positive intervalSeconds. Refuse so we don't leave the
       // job in an unfireable shape.
@@ -771,7 +792,7 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
         job.nextRunAt = new Date(next.getTime()).toISOString();
       } else {
         // Interval-driven post-patch. Anchor nextRunAt to now + interval.
-        if (!Number.isFinite(newIntervalSeconds) || newIntervalSeconds <= 0) {
+        if (newIntervalSeconds === undefined || !Number.isFinite(newIntervalSeconds) || newIntervalSeconds <= 0) {
           throw new Error("Invalid input: a non-cron job requires a positive intervalSeconds");
         }
         job.nextRunAt = new Date(Date.now() + newIntervalSeconds * 1000).toISOString();

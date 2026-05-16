@@ -35,6 +35,12 @@ export interface CalendarStatus {
 
 export function adaptJob(job: JobRecord): CalendarJob {
   const createdAtMs = Date.parse(job.createdAt);
+  // Calendar's CalendarSchedule shape is `{ kind: "every"; everyMs }` and
+  // doesn't model cron natively. For cron-driven jobs (no intervalSeconds)
+  // we fall back to 0 — the calendar treats that as "no recurring step"
+  // and just renders the next run anchor. A future enhancement could thread
+  // cron through with a new CalendarSchedule variant.
+  const everyMs = job.intervalSeconds !== undefined ? job.intervalSeconds * 1000 : 0;
   return {
     id: job.id,
     name: job.name,
@@ -42,7 +48,7 @@ export function adaptJob(job: JobRecord): CalendarJob {
     createdAtMs,
     schedule: {
       kind: "every",
-      everyMs: job.intervalSeconds * 1000,
+      everyMs,
       anchorMs: createdAtMs
     },
     state: {
