@@ -777,7 +777,7 @@ describe("dispatchOutboundMessage", () => {
     globalThis.fetch = (async () => {
       fetchCount += 1;
       throw new Error("telegram.test: bridge-disabled path must not fetch");
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     const message = {
       id: "msg_disabled",
@@ -868,7 +868,7 @@ describe("connector status cascade", () => {
     globalThis.fetch = (async () => {
       fetchCount += 1;
       throw new Error("telegram.test: disabled connector must not fetch");
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
     const reloaded = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id)!;
     await dispatchOutboundMessage(config, reloaded, message);
     expect(fetchCount).toBe(0);
@@ -925,7 +925,7 @@ describe("replyToMessagingFromTask status guard", () => {
     globalThis.fetch = (async () => {
       fetchCount += 1;
       throw new Error("telegram.test: finalize must not dispatch on a disabled bridge");
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     const task = readState(config.instance).tasks.find((t) => t.id === taskId)!;
     await replyToMessagingFromTask(config, task);
