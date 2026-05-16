@@ -18,6 +18,12 @@ import {
   mutateState,
   readState
 } from "../state";
+import {
+  addMessagingBridge,
+  addTelegramAllowlistEntry
+} from "../integrations/messaging";
+import { stopAllPollers } from "../integrations/messaging/telegram-registry";
+import { writeSecret } from "../state/secrets";
 import type { RuntimeConfig } from "../types";
 
 function buildConfig(workspaceRoot: string, instance: string, stateRoot: string): RuntimeConfig {
@@ -177,6 +183,67 @@ describe("createAgent", () => {
     await expect(deleteAgent(config, created.id)).rejects.toThrow(
       "Cannot delete the active agent; switch to another agent first."
     );
+  });
+
+  test("deleteAgent drops Telegram allowlist entries that pin the agent", async () => {
+    const config = buildConfig(workspaceRoot, "delete-agent-allowlist-cascade", root);
+    install(config);
+    // Seed a telegram connector so addMessagingBridge accepts a
+    // telegram bridge (the bridge starts a poller eagerly).
+    const ref = writeSecret(config.instance, "id_conn", "token", "token");
+    await mutateState(config.instance, (state) => {
+      state.connectors.push({
+        id: "id_conn",
+        instance: state.instance,
+        name: "telegram-test",
+        provider: "telegram",
+        status: "configured",
+        scopes: [],
+        secretRefs: [ref],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        health: "healthy",
+        source: "user"
+      });
+    });
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    try {
+      const created = await createAgent(config, { name: "doomed" });
+      const defaultAgentId = readState(config.instance).agents.find((a) => a.id === "agent_default")!.id;
+      // Two allowlist entries: one pinned to the soon-to-be-deleted
+      // agent, one pinned to the default agent (which must survive the
+      // cascade untouched).
+      await addTelegramAllowlistEntry(config, bridge.id, {
+        telegramUserId: 100,
+        agentId: created.id
+      });
+      await addTelegramAllowlistEntry(config, bridge.id, {
+        telegramUserId: 200,
+        agentId: defaultAgentId
+      });
+
+      const result = await deleteAgent(config, created.id);
+      expect(result.ok).toBe(true);
+
+      const after = readState(config.instance);
+      const liveBridge = after.messagingBridges.find((b) => b.id === bridge.id)!;
+      const remaining = liveBridge.telegram!.allowlist;
+      expect(remaining.length).toBe(1);
+      expect(remaining[0]!.telegramUserId).toBe(200);
+      expect(remaining[0]!.agentId).toBe(defaultAgentId);
+
+      const audit = after.audit.find((a) => a.action === "agent.deleted" && a.target === created.id);
+      expect(audit).toBeDefined();
+      const evidence = audit!.evidence as Record<string, unknown>;
+      expect(evidence.messagingAllowlistEntriesRemoved).toBe(1);
+      expect(evidence.affectedBridgeIds).toEqual([bridge.id]);
+    } finally {
+      await stopAllPollers();
+    }
   });
 
   test("deleteAgent throws when the agent does not exist", async () => {

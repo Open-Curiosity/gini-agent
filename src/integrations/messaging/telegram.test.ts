@@ -376,6 +376,52 @@ describe("inbound message authorization", () => {
     expect(inboundA!.taskId).not.toBe(inboundB!.taskId);
   });
 
+  test("inbound from an allowlist entry whose agent was deleted drops with agent_missing", async () => {
+    // Layered defense: deleteAgent already cascades-cleans the
+    // allowlist, but state imports, manual JSON edits, or future
+    // regressions can leave an orphan reference. Simulate the gap by
+    // mutating state directly after the allowlist is established.
+    const config = buildConfig("telegram-inbound-agent-missing");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    const agentId = readState(config.instance).agents[0]!.id;
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 100, agentId });
+    // Manually create an orphan: the allowlist entry survives but the
+    // agent row is gone. This is the state shape the cascade would
+    // miss for an imported state file.
+    await mutateState(config.instance, (state) => {
+      const live = state.messagingBridges.find((b) => b.id === bridge.id)!;
+      live.telegram!.allowlist[0]!.agentId = "agent_ghost";
+    });
+
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+
+    await handleInboundMessage(config, bridge.id, {
+      message_id: 1,
+      from: { id: 100, username: "u" },
+      chat: { id: 555, type: "private" },
+      date: 0,
+      text: "should drop"
+    }, 17);
+
+    const state = readState(config.instance);
+    const inbound = state.messagingMessages.find((m) => m.bridgeId === bridge.id && m.direction === "inbound");
+    expect(inbound).toBeUndefined();
+    const audit = state.audit.find(
+      (a) =>
+        a.action === "messaging.telegram.dropped" &&
+        (a.evidence as Record<string, unknown> | undefined)?.reason === "agent_missing"
+    );
+    expect(audit).toBeDefined();
+    expect((audit!.evidence as Record<string, unknown>).agentId).toBe("agent_ghost");
+    expect((audit!.evidence as Record<string, unknown>).telegramUserId).toBe(100);
+  });
+
   test("concurrent inbound submissions from distinct allowlist entries run under their own agent", async () => {
     const config = buildConfig("telegram-concurrent-agents");
     install(config);

@@ -6,9 +6,11 @@ import {
   deleteBankAndUnits,
   ensureAgentBank,
   mutateState,
+  now,
   readState
 } from "../state";
 import { addAudit } from "../state/audit";
+import { restartPoller } from "../integrations/messaging/telegram-registry";
 
 export function listAgents(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -67,6 +69,10 @@ export async function useAgent(config: RuntimeConfig, idOrName: string) {
 //   - Legacy MemoryRecord rows where `agentId === <deletedAgentId>` are
 //     hard-deleted. The owning agent is going away, so archiving them
 //     serves no purpose.
+//   - Telegram allowlist entries that pin this agent are dropped from
+//     every bridge so a future inbound from those users no longer
+//     stamps the stale agent id onto a Task (which would silently fall
+//     back to the instance default per ADR agent-memory-isolation.md).
 //   - The agent row is removed from `state.agents`.
 // Returns counts so callers/tests can verify the cascade scope. A single
 // audit event records the deletion + cleanup counts.
@@ -86,8 +92,36 @@ export async function deleteAgent(
     const memoriesBefore = state.memories.length;
     state.memories = state.memories.filter((memory) => memory.agentId !== agent.id);
     const memoriesArchived = memoriesBefore - state.memories.length;
+
+    // Telegram allowlist cascade. Walk every bridge with a telegram
+    // config and drop entries that pinned the agent we're deleting.
+    // Track affected bridge ids so we can restart their pollers below
+    // (the poller re-reads the live allowlist each iteration, but a
+    // restart makes the change observable in tests immediately).
+    let messagingAllowlistEntriesRemoved = 0;
+    const affectedBridgeIds: string[] = [];
+    for (const bridge of state.messagingBridges) {
+      if (bridge.kind !== "telegram" || !bridge.telegram) continue;
+      const before = bridge.telegram.allowlist.length;
+      bridge.telegram.allowlist = bridge.telegram.allowlist.filter(
+        (entry) => entry.agentId !== agent.id
+      );
+      const removed = before - bridge.telegram.allowlist.length;
+      if (removed > 0) {
+        messagingAllowlistEntriesRemoved += removed;
+        affectedBridgeIds.push(bridge.id);
+        bridge.updatedAt = now();
+      }
+    }
+
     state.agents = state.agents.filter((item) => item.id !== agent.id);
-    return { id: agent.id, name: agent.name, memoriesArchived };
+    return {
+      id: agent.id,
+      name: agent.name,
+      memoriesArchived,
+      messagingAllowlistEntriesRemoved,
+      affectedBridgeIds
+    };
   });
 
   // Drop the per-agent Hindsight bank + its units outside the JSON state
@@ -97,6 +131,15 @@ export async function deleteAgent(
     config.instance,
     bankIdForAgent(result.id)
   );
+
+  // Restart pollers for bridges whose allowlist was modified so the
+  // in-memory poller state matches the persisted allowlist. The
+  // resolveTelegramConnector guard inside the poller still re-reads on
+  // each iteration, so this is belt-and-braces — the more meaningful
+  // protection is the layered re-validation at inbound time.
+  for (const bridgeId of result.affectedBridgeIds) {
+    await restartPoller(config, bridgeId);
+  }
 
   // Single audit event covering the whole cascade. Routed through a
   // follow-up mutateState so the cleanup counts are visible alongside
@@ -112,7 +155,9 @@ export async function deleteAgent(
         name: result.name,
         memoriesArchived: result.memoriesArchived,
         unitsDeleted,
-        bankDeleted
+        bankDeleted,
+        messagingAllowlistEntriesRemoved: result.messagingAllowlistEntriesRemoved,
+        affectedBridgeIds: result.affectedBridgeIds
       }
     });
     return result.id;

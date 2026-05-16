@@ -184,6 +184,16 @@ describe("resolveEffectiveContext", () => {
     expect(ctx.warnings).not.toContain("agent references unknown messaging target 'local'");
   });
 
+  test("explicit taskAgentId that doesn't resolve falls back with a diagnostic warning", () => {
+    const state = buildState();
+    const ctx = resolveEffectiveContext(state, buildConfig(), "agent_ghost");
+    // Fail-closed liveness: the resolver still returns the instance
+    // provider so a stale task can keep running; the warning surfaces
+    // the mismatch instead of silently masking it.
+    expect(ctx.providerSource).toBe("instance");
+    expect(ctx.warnings).toContain("task references unknown agent 'agent_ghost'");
+  });
+
   test("no warnings when agent fields all resolve cleanly", () => {
     const agent = buildAgent({
       providerName: "openai",

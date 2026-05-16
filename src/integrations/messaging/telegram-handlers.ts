@@ -115,6 +115,25 @@ export async function handleInboundMessage(
     return;
   }
 
+  // Defense-in-depth re-validation. The deleteAgent cascade removes
+  // allowlist entries whose agent is gone, but an orphan can still
+  // arrive via a state import, manual JSON edit, or a future
+  // regression that bypasses the cascade. Failing closed at the
+  // inbound boundary preserves the per-user identity-mapping guarantee
+  // from ADR agent-memory-isolation.md instead of silently falling
+  // through to the instance default in resolveEffectiveContext.
+  const agentExists = readState(config.instance).agents.some((a) => a.id === entry.agentId);
+  if (!agentExists) {
+    await auditDropped(config, bridgeId, updateId, "agent_missing", {
+      chatId,
+      telegramUserId: fromId,
+      telegramUsername: message.from?.username,
+      messageId: message.message_id,
+      agentId: entry.agentId
+    });
+    return;
+  }
+
   // Dedupe by externalId. A restart between submitTask and the durable
   // inbound row could otherwise re-deliver the same message_id and
   // create a second Task. If we already stamped an inbound row for this

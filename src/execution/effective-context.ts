@@ -49,10 +49,20 @@ export function resolveEffectiveContext(
   const resolvedId = taskAgentId ?? state.activeAgentId;
   const agent = state.agents.find((candidate) => candidate.id === resolvedId);
   if (!agent) {
+    // Loud-but-not-fatal: when the caller asked for a specific agent
+    // and we can't resolve it (deleted between submit and resolve,
+    // imported state with dangling refs, etc.), surface a diagnostic
+    // warning rather than silently falling back to the instance
+    // default. Throwing would burn an in-flight chat task; the
+    // fail-closed responsibility lives at the inbound handler.
+    const warnings: string[] = [];
+    if (taskAgentId) {
+      warnings.push(`task references unknown agent '${taskAgentId}'`);
+    }
     return {
       provider: config.provider,
       providerSource: "instance",
-      warnings: []
+      warnings
     };
   }
 
