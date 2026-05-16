@@ -530,6 +530,7 @@ function statusFromErrorMessage(message: string): number {
   // 400 validation.
   if (message.startsWith("Telegram bridges require")) return 400;
   if (message.startsWith("Telegram bridge connector must be a telegram provider")) return 400;
+  if (message.startsWith("Telegram connector")) return 400;
   if (message.startsWith("telegramUserId must be")) return 400;
   if (message.startsWith("agentId is required")) return 400;
   if (message.startsWith("Allowlist applies to telegram bridges only")) return 400;

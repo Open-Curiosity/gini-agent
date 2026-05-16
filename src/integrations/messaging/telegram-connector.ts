@@ -24,5 +24,15 @@ export function resolveTelegramConnector(
   if (connector.provider !== "telegram") {
     throw new Error(`Telegram bridge connector must be a telegram provider, got ${connector.provider}.`);
   }
+  // Status guard. Mirrors the skill-activation contract — a connector
+  // that's been flipped to `disabled`/`error` must not drive any
+  // outbound calls, even though its encrypted token is still on disk.
+  // The poller's try/catch around this helper flips the bridge to
+  // `error`; the outbound dispatcher's try/catch marks the message
+  // failed; the bridge-probe path surfaces the same message in
+  // `bridge.message`.
+  if (connector.status !== "configured") {
+    throw new Error(`Telegram connector ${connectorId} is ${connector.status}; only configured connectors may be used.`);
+  }
   return connector;
 }

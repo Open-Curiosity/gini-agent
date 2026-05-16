@@ -24,9 +24,10 @@ import {
   receiveMessagingInput
 } from "../messaging";
 import { replyToMessagingFromTask } from "../messaging-finalize";
+import { updateConnector } from "../connectors";
 import { handleCallbackQuery, handleInboundMessage } from "./telegram-handlers";
 import { dispatchOutboundMessage, splitForTelegram } from "./telegram-stream";
-import { stopAllPollers } from "./telegram-registry";
+import { isPollerRunning, stopAllPollers } from "./telegram-registry";
 
 const ROOT = "/tmp/gini-telegram-messaging-unit";
 
@@ -754,6 +755,80 @@ describe("dispatchOutboundMessage", () => {
     const updated = readState(config.instance).messagingMessages.find((m) => m.id === "msg_disabled");
     expect(updated?.status).toBe("failed");
     expect(updated?.error).toBe("Bridge is disabled");
+  });
+});
+
+describe("connector status cascade", () => {
+  test("disabling the telegram connector stops the poller and flips the bridge to error", async () => {
+    const config = buildConfig("telegram-connector-cascade-disable");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    // addMessagingBridge starts a poller eagerly when the bridge is
+    // configured; assert it's running so the post-cascade check is
+    // meaningful.
+    expect(isPollerRunning(bridge.id)).toBe(true);
+
+    await updateConnector(config, "id_conn", { status: "disabled" });
+
+    expect(isPollerRunning(bridge.id)).toBe(false);
+    const reloaded = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id)!;
+    expect(reloaded.status).toBe("error");
+    expect(reloaded.message).toMatch(/Connector disabled/);
+    const audit = readState(config.instance).audit.find(
+      (a) => a.action === "messaging.telegram.bridge_quiesced" && a.target === bridge.id
+    );
+    expect(audit).toBeDefined();
+    expect((audit!.evidence as Record<string, unknown>).connectorId).toBe("id_conn");
+  });
+
+  test("dispatchOutboundMessage refuses to ship through a disabled connector", async () => {
+    const config = buildConfig("telegram-connector-resolver-guard");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    // Flip the connector status directly so the resolver sees a
+    // disabled record while the bridge still claims `configured`. The
+    // resolver throw is the line of defense even if the cascade somehow
+    // failed to update the bridge.
+    await mutateState(config.instance, (state) => {
+      const c = state.connectors.find((c) => c.id === "id_conn")!;
+      c.status = "disabled";
+    });
+
+    const message = {
+      id: "msg_disabled_conn",
+      instance: config.instance,
+      bridgeId: bridge.id,
+      direction: "outbound" as const,
+      status: "queued" as const,
+      target: "555",
+      text: "hello",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    await mutateState(config.instance, (s) => {
+      s.messagingMessages.unshift(message);
+    });
+    let fetchCount = 0;
+    globalThis.fetch = (async () => {
+      fetchCount += 1;
+      throw new Error("telegram.test: disabled connector must not fetch");
+    }) as typeof fetch;
+    const reloaded = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id)!;
+    await dispatchOutboundMessage(config, reloaded, message);
+    expect(fetchCount).toBe(0);
+    const updated = readState(config.instance).messagingMessages.find((m) => m.id === "msg_disabled_conn");
+    expect(updated?.status).toBe("failed");
+    expect(updated?.error).toMatch(/disabled; only configured connectors/);
   });
 });
 
