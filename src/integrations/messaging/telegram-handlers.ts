@@ -118,9 +118,13 @@ export async function handleInboundMessage(
   // Dedupe by externalId. A restart between submitTask and the durable
   // inbound row could otherwise re-deliver the same message_id and
   // create a second Task. If we already stamped an inbound row for this
-  // (bridgeId, message_id), skip the side effects entirely and just
-  // advance the offset.
-  const externalId = String(message.message_id);
+  // (bridgeId, chatId, message_id), skip the side effects entirely and
+  // just advance the offset. Telegram's `message_id` is unique per chat
+  // (https://core.telegram.org/bots/api#message), not per bot, so the
+  // chat prefix is required: two distinct chats can independently produce
+  // identical `message_id` values and the un-prefixed key would silently
+  // drop the second one.
+  const externalId = `${chatId}:${message.message_id}`;
   const existingInbound = readState(config.instance).messagingMessages.find(
     (m) => m.bridgeId === bridgeId && m.direction === "inbound" && m.externalId === externalId
   );

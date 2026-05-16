@@ -215,7 +215,10 @@ describe("inbound message authorization", () => {
     const inbound = state.messagingMessages.find((m) => m.bridgeId === bridge.id && m.direction === "inbound");
     expect(inbound).toBeDefined();
     expect(inbound!.target).toBe("555");
-    expect(inbound!.externalId).toBe("100");
+    // externalId is `${chatId}:${message_id}` so the dedupe key is
+    // chat-scoped — distinct chats sharing a numeric message_id stay
+    // distinct rows.
+    expect(inbound!.externalId).toBe("555:100");
     expect(inbound!.text).toBe("hello bot");
     expect(inbound!.chatSessionId).toBeDefined();
     expect(inbound!.taskId).toBeDefined();
@@ -319,6 +322,55 @@ describe("inbound message authorization", () => {
     // The offset advanced past update_id=50 on both invocations.
     const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
     expect(live?.telegram?.updateOffset).toBe(51);
+  });
+
+  test("distinct chats sharing a numeric message_id both produce inbound rows and tasks", async () => {
+    // Telegram `message_id` is unique per chat, not per bot. Two
+    // allowlisted users in two separate chats can independently send
+    // `message_id=1`; the dedupe must not collapse them.
+    const config = buildConfig("telegram-cross-chat-dedupe");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    const agentId = readState(config.instance).agents[0]!.id;
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 100, agentId });
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 200, agentId });
+
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+
+    await handleInboundMessage(config, bridge.id, {
+      message_id: 1,
+      from: { id: 100, username: "userA" },
+      chat: { id: 111, type: "private" },
+      date: 0,
+      text: "from chat A"
+    }, 10);
+    await handleInboundMessage(config, bridge.id, {
+      message_id: 1,
+      from: { id: 200, username: "userB" },
+      chat: { id: 222, type: "private" },
+      date: 0,
+      text: "from chat B"
+    }, 11);
+
+    const state = readState(config.instance);
+    const inboundA = state.messagingMessages.find(
+      (m) => m.bridgeId === bridge.id && m.direction === "inbound" && m.target === "111"
+    );
+    const inboundB = state.messagingMessages.find(
+      (m) => m.bridgeId === bridge.id && m.direction === "inbound" && m.target === "222"
+    );
+    expect(inboundA).toBeDefined();
+    expect(inboundB).toBeDefined();
+    expect(inboundA!.externalId).toBe("111:1");
+    expect(inboundB!.externalId).toBe("222:1");
+    expect(inboundA!.taskId).toBeDefined();
+    expect(inboundB!.taskId).toBeDefined();
+    expect(inboundA!.taskId).not.toBe(inboundB!.taskId);
   });
 
   test("concurrent inbound submissions from distinct allowlist entries run under their own agent", async () => {
