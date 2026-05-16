@@ -94,6 +94,13 @@ export async function dispatchOutboundMessage(
   options: { replyMarkup?: TelegramInlineKeyboardMarkup } = {}
 ): Promise<MessagingMessageRecord> {
   if (bridge.kind !== "telegram") return message;
+  // Status guard. Refuses to ship traffic when the bridge is
+  // `disabled` or `error`, matching the `Bridge is ${status}` failure
+  // pattern in sendMessagingOutput (src/integrations/messaging.ts) for
+  // any future caller that bypasses the messaging-finalize hook.
+  if (bridge.status !== "configured") {
+    return markMessageFailed(config, message.id, `Bridge is ${bridge.status}`);
+  }
   if (!bridge.connectorId) {
     return markMessageFailed(config, message.id, "Telegram bridge missing connectorId.");
   }

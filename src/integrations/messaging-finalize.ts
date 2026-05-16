@@ -40,6 +40,31 @@ export async function replyToMessagingFromTask(config: RuntimeConfig, task: Task
   // bridges still get the messaging row but no remote dispatch.
   if (bridge.kind !== "telegram") return;
 
+  // Status guard. Once a bridge is `disabled` or `error`, no outbound
+  // traffic ships — including the terminal reply from a task that was
+  // already in flight when the operator disabled the bridge. Without
+  // this gate the inbound path stops (the poller is stopped by
+  // disableMessagingBridge) but the assistant's final reply still
+  // leaks to the user's phone after they tried to silence the channel.
+  if (bridge.status !== "configured") {
+    await mutateState(config.instance, (s) => {
+      addAudit(s, {
+        actor: "runtime",
+        action: "messaging.telegram.skipped_disabled",
+        target: bridge.id,
+        risk: "low",
+        taskId: task.id,
+        evidence: {
+          bridgeId: bridge.id,
+          taskId: task.id,
+          bridgeStatus: bridge.status,
+          chatId: inbound.target
+        }
+      });
+    });
+    return;
+  }
+
   // Idempotency: if a non-approval outbound reply already exists for
   // this task, skip. Approval prompts (which carry `approvalId`) don't
   // count as the "reply" — those are emitted by the approval site.

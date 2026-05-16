@@ -20,8 +20,10 @@ import { install } from "../../runtime";
 import {
   addMessagingBridge,
   addTelegramAllowlistEntry,
+  disableMessagingBridge,
   receiveMessagingInput
 } from "../messaging";
+import { replyToMessagingFromTask } from "../messaging-finalize";
 import { handleCallbackQuery, handleInboundMessage } from "./telegram-handlers";
 import { dispatchOutboundMessage, splitForTelegram } from "./telegram-stream";
 import { stopAllPollers } from "./telegram-registry";
@@ -705,6 +707,122 @@ describe("dispatchOutboundMessage", () => {
     const updated = readState(config.instance).messagingMessages.find((m) => m.id === "msg_net_throw");
     expect(updated?.status).toBe("failed");
     expect(updated?.error).toContain("network unreachable");
+  });
+
+  test("dispatch on a disabled bridge fails the row instead of shipping traffic", async () => {
+    // Defense-in-depth: the messaging-finalize hook short-circuits
+    // first, but any future caller (manual dispatch, future approval
+    // re-emission) must also be refused once the bridge is disabled.
+    const config = buildConfig("telegram-dispatch-disabled");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    await disableMessagingBridge(config, bridge.id);
+
+    // The fail-closed fetch would throw if we leaked a request, so the
+    // assertion below is two-fold: the row goes to "failed" AND the
+    // mock is never invoked.
+    let fetchCount = 0;
+    globalThis.fetch = (async () => {
+      fetchCount += 1;
+      throw new Error("telegram.test: bridge-disabled path must not fetch");
+    }) as typeof fetch;
+
+    const message = {
+      id: "msg_disabled",
+      instance: config.instance,
+      bridgeId: bridge.id,
+      direction: "outbound" as const,
+      status: "queued" as const,
+      target: "555",
+      text: "should not ship",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    await mutateState(config.instance, (s) => {
+      s.messagingMessages.unshift(message);
+    });
+    const reloaded = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id)!;
+    expect(reloaded.status).toBe("disabled");
+    await dispatchOutboundMessage(config, reloaded, message);
+
+    expect(fetchCount).toBe(0);
+    const updated = readState(config.instance).messagingMessages.find((m) => m.id === "msg_disabled");
+    expect(updated?.status).toBe("failed");
+    expect(updated?.error).toBe("Bridge is disabled");
+  });
+});
+
+describe("replyToMessagingFromTask status guard", () => {
+  test("disabled bridge causes the terminal reply hook to audit-skip without dispatch", async () => {
+    // Reproduces the operator-intuitive contract: once `disable` runs,
+    // no outbound traffic ships — including the reply from a task that
+    // was already running when the bridge was disabled.
+    const config = buildConfig("telegram-finalize-disabled");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    const agentId = readState(config.instance).agents[0]!.id;
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 100, agentId });
+
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+
+    await handleInboundMessage(config, bridge.id, {
+      message_id: 1,
+      from: { id: 100, username: "user" },
+      chat: { id: 555, type: "private" },
+      date: 0,
+      text: "in-flight"
+    }, 5);
+
+    const inbound = readState(config.instance).messagingMessages.find(
+      (m) => m.bridgeId === bridge.id && m.direction === "inbound"
+    );
+    const taskId = inbound!.taskId!;
+    // Force-complete the task in state so the finalize hook treats it
+    // as terminal.
+    await mutateState(config.instance, (state) => {
+      const task = state.tasks.find((t) => t.id === taskId);
+      if (!task) throw new Error("task missing");
+      task.status = "completed";
+      task.summary = "all done";
+    });
+
+    // Now disable the bridge before the finalize hook runs.
+    await disableMessagingBridge(config, bridge.id);
+
+    // Replace fetch with a counter so a leaked send is loud.
+    let fetchCount = 0;
+    globalThis.fetch = (async () => {
+      fetchCount += 1;
+      throw new Error("telegram.test: finalize must not dispatch on a disabled bridge");
+    }) as typeof fetch;
+
+    const task = readState(config.instance).tasks.find((t) => t.id === taskId)!;
+    await replyToMessagingFromTask(config, task);
+
+    expect(fetchCount).toBe(0);
+    const state = readState(config.instance);
+    const outbound = state.messagingMessages.find(
+      (m) => m.bridgeId === bridge.id && m.direction === "outbound" && m.taskId === taskId
+    );
+    expect(outbound).toBeUndefined();
+    const skip = state.audit.find(
+      (a) =>
+        a.action === "messaging.telegram.skipped_disabled" &&
+        (a.evidence as Record<string, unknown> | undefined)?.bridgeId === bridge.id
+    );
+    expect(skip).toBeDefined();
+    expect((skip!.evidence as Record<string, unknown>).bridgeStatus).toBe("disabled");
+    expect((skip!.evidence as Record<string, unknown>).taskId).toBe(taskId);
   });
 });
 
