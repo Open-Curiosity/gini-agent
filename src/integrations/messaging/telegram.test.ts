@@ -530,6 +530,69 @@ describe("inbound message authorization", () => {
     const live = state.messagingBridges.find((b) => b.id === bridge.id);
     expect(live?.telegram?.updateOffset).toBe(100);
   });
+
+  test("disable racing the inbound handler keeps tasks unchanged and skips the dispatch", async () => {
+    // Pins the atomic gate inside handleInboundMessage. The pre-gate
+    // awaits (resolveConnectorSecret, sendChatAction, ensureChatSessionForUser)
+    // each yield to the per-instance mutateState queue; a
+    // disableMessagingBridge fired concurrently lands somewhere in that
+    // window. The gate guarantees the dispatch is either entirely
+    // before-disable (proceed, write durable rows, submit task) or
+    // entirely after-disable (skip, audit, advance offset). It must
+    // never half-commit: enqueueing a task whose reply path the
+    // operator just revoked is what this guard prevents.
+    const config = buildConfig("telegram-inbound-disable-race");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    const agentId = readState(config.instance).agents[0]!.id;
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 100, agentId });
+
+    const tasksBefore = readState(config.instance).tasks.length;
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+
+    // Race shape: fire the handler, then immediately fire the disable.
+    // The handler's first awaited mutateState (the connector.secret.use
+    // audit row inside resolveConnectorSecret) enqueues on the
+    // per-instance queue; the disable's mutateState queues right behind
+    // it and lands before the atomic gate runs. The captured-at-entry
+    // bridge snapshot still says "configured" but the gate sees
+    // "disabled" and skips.
+    const handlerPromise = handleInboundMessage(config, bridge.id, {
+      message_id: 1,
+      from: { id: 100, username: "u" },
+      chat: { id: 555, type: "private" },
+      date: 0,
+      text: "should not dispatch under a racing disable"
+    }, 99);
+    const disablePromise = disableMessagingBridge(config, bridge.id);
+    await Promise.all([handlerPromise, disablePromise]);
+
+    const state = readState(config.instance);
+    // No task was submitted under the racing disable.
+    expect(state.tasks.length).toBe(tasksBefore);
+    // No inbound row was written.
+    const inbound = state.messagingMessages.find(
+      (m) => m.bridgeId === bridge.id && m.direction === "inbound"
+    );
+    expect(inbound).toBeUndefined();
+    // The drop audit captures the bridgeStatus seen by the gate.
+    const drop = state.audit.find(
+      (a) =>
+        a.action === "messaging.telegram.dropped" &&
+        (a.evidence as Record<string, unknown> | undefined)?.reason === "disabled_during_dispatch"
+    );
+    expect(drop).toBeDefined();
+    expect((drop!.evidence as Record<string, unknown>).bridgeStatus).toBe("disabled");
+    // Offset still advanced in the same mutation that audited the
+    // drop, so a poller restart doesn't re-dispatch this update.
+    const live = state.messagingBridges.find((b) => b.id === bridge.id);
+    expect(live?.telegram?.updateOffset).toBe(100);
+  });
 });
 
 describe("callback_query handling", () => {

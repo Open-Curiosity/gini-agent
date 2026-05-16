@@ -155,7 +155,10 @@ export async function handleInboundMessage(
   }
 
   // Best-effort `typing` indicator. Failure here doesn't change behavior;
-  // we just want the user to see the bot is alive while the LLM runs.
+  // we just want the user to see the bot is alive while the LLM runs. We
+  // emit this before the atomic gate because telemetry that races a
+  // disable is harmless — the only state mutation in this branch is the
+  // connector.secret.use audit emitted by resolveConnectorSecret.
   if (bridge.connectorId) {
     const token = await resolveConnectorSecret(config, bridge.connectorId, "token");
     if (token) {
@@ -168,24 +171,117 @@ export async function handleInboundMessage(
   // landing in the same session (preserving context).
   const sessionId = await ensureChatSessionForUser(config, bridge.id, entry);
 
-  // Live-status re-check before the side-effect-heavy submitTask call.
-  // The bridge snapshot at line 105 is stale across every await above
-  // (secret resolve, sendChatAction, ensureChatSessionForUser). A
-  // concurrent `disableMessagingBridge` lands here as a status flip on
-  // the persisted state file; refuse to submit a task whose reply path
-  // is no longer permitted.
-  const preDispatchBridge = readState(config.instance).messagingBridges.find(
-    (b) => b.id === bridgeId
-  );
-  if (preDispatchBridge?.status !== "configured") {
-    await auditDropped(config, bridgeId, updateId, "disabled_during_dispatch", {
-      chatId,
-      telegramUserId: fromId,
-      messageId: message.message_id,
-      bridgeStatus: preDispatchBridge?.status
+  // Atomic gate. The durable inbound-row write, the chat-message write,
+  // the offset advance, and the live-state re-validation all happen
+  // inside a single mutateState so a concurrent `disableMessagingBridge`,
+  // `removeTelegramAllowlistEntry`, or `deleteAgent` cannot land
+  // BETWEEN the status check and the work that follows. If the live
+  // state has flipped since the snapshot at line 105, we audit the
+  // drop, advance the offset, and return a "skip" verdict so the caller
+  // never enqueues a task whose reply path the operator just revoked.
+  // Otherwise we stamp the inbound + chat-message rows (without taskId
+  // yet — backfilled below after submitTask) and return a "proceed"
+  // verdict carrying the resolved ids.
+  type GateVerdict =
+    | { kind: "skip" }
+    | {
+        kind: "proceed";
+        inboundId: string;
+        chatMessageId: string;
+        sessionId: string;
+        agentId: string;
+        telegramUserId: number;
+      };
+  const gate = await mutateState<GateVerdict>(config.instance, (state) => {
+    const liveBridge = state.messagingBridges.find((b) => b.id === bridgeId);
+    if (!liveBridge || liveBridge.status !== "configured") {
+      addAudit(state, {
+        actor: "runtime",
+        action: "messaging.telegram.dropped",
+        target: bridgeId,
+        risk: "low",
+        evidence: {
+          bridgeId,
+          reason: "disabled_during_dispatch",
+          chatId,
+          telegramUserId: fromId,
+          messageId: message.message_id,
+          bridgeStatus: liveBridge?.status
+        }
+      });
+      advanceTelegramOffset(state, bridgeId, updateId);
+      return { kind: "skip" };
+    }
+    const liveEntry = liveBridge.telegram?.allowlist.find(
+      (e) => e.telegramUserId === fromId
+    );
+    if (!liveEntry) {
+      addAudit(state, {
+        actor: "runtime",
+        action: "messaging.telegram.dropped",
+        target: bridgeId,
+        risk: "low",
+        evidence: {
+          bridgeId,
+          reason: "unauthorized",
+          chatId,
+          telegramUserId: fromId,
+          telegramUsername: message.from?.username,
+          messageId: message.message_id
+        }
+      });
+      advanceTelegramOffset(state, bridgeId, updateId);
+      return { kind: "skip" };
+    }
+    const liveAgent = state.agents.some((a) => a.id === liveEntry.agentId);
+    if (!liveAgent) {
+      addAudit(state, {
+        actor: "runtime",
+        action: "messaging.telegram.dropped",
+        target: bridgeId,
+        risk: "low",
+        evidence: {
+          bridgeId,
+          reason: "agent_missing",
+          chatId,
+          telegramUserId: fromId,
+          telegramUsername: message.from?.username,
+          messageId: message.message_id,
+          agentId: liveEntry.agentId
+        }
+      });
+      advanceTelegramOffset(state, bridgeId, updateId);
+      return { kind: "skip" };
+    }
+
+    // Write durable artifacts. taskId/runId backfilled after submitTask
+    // returns; the gate is what keeps a disable from racing in between.
+    const chatMessage = createChatMessage(state, {
+      sessionId,
+      role: "user",
+      content: text
     });
-    return;
-  }
+    const inboundRow = createMessagingMessageRecord(state, {
+      bridgeId,
+      direction: "inbound",
+      status: "received",
+      target: String(chatId),
+      text,
+      chatSessionId: sessionId,
+      externalId
+    });
+    advanceTelegramOffset(state, bridgeId, updateId);
+    return {
+      kind: "proceed",
+      inboundId: inboundRow.id,
+      chatMessageId: chatMessage.id,
+      sessionId,
+      agentId: liveEntry.agentId,
+      telegramUserId: liveEntry.telegramUserId
+    };
+  });
+
+  if (gate.kind === "skip") return;
 
   // Create a conversation run + submit the chat task, mirroring
   // submitChatMessage in src/execution/chat.ts so messaging messages
@@ -193,88 +289,58 @@ export async function handleInboundMessage(
   // entry's pinned agent is stamped onto the Task row via the
   // `agentId` option so the asynchronously-scheduled chat-task loop
   // resolves the intended agent without racing on the instance-wide
-  // active-agent pointer (multi-user safe).
-  const run = await createConversationRun(config, { conversationId: sessionId, input: text });
+  // active-agent pointer (multi-user safe). Reaching this point means
+  // the atomic gate above committed under "configured" status, so any
+  // disable that lands now races a write the operator already lost.
+  const run = await createConversationRun(config, { conversationId: gate.sessionId, input: text });
   const task = await submitTask(config, text, {
     runId: run.id,
     mode: "chat",
-    agentId: entry.agentId
+    agentId: gate.agentId
   });
   await linkRunToTask(config, run.id, task);
 
+  // Backfill taskId/runId onto the durable artifacts the gate wrote.
+  // createChatMessage usually populates session.taskIds/runIds at write
+  // time; we replicate that here since the rows were stamped before the
+  // task existed.
   await mutateState(config.instance, (state) => {
-    // Second live-status check inside the durable write. submitTask
-    // already fired (we can't unsubmit it cleanly mid-flow), but the
-    // user-visible chat-message row, the inbound row that drives the
-    // reply target, and the run<->task binding are all gated here so a
-    // disable that lands between submitTask and this write doesn't
-    // create artifacts the operator just tried to silence.
-    const liveBridge = state.messagingBridges.find((b) => b.id === bridgeId);
-    if (liveBridge?.status !== "configured") {
-      addAudit(state, {
-        actor: "runtime",
-        action: "messaging.telegram.disabled_during_dispatch",
-        target: bridgeId,
-        risk: "low",
-        taskId: task.id,
-        evidence: {
-          bridgeId,
-          chatId,
-          telegramUserId: fromId,
-          messageId: message.message_id,
-          bridgeStatus: liveBridge?.status,
-          taskId: task.id
-        }
-      });
-      advanceTelegramOffset(state, bridgeId, updateId);
-      return;
+    const inboundRow = state.messagingMessages.find((m) => m.id === gate.inboundId);
+    if (inboundRow) {
+      inboundRow.taskId = task.id;
+      inboundRow.updatedAt = now();
     }
-    const chatMessage = createChatMessage(state, {
-      sessionId,
-      role: "user",
-      content: text,
-      taskId: task.id,
-      runId: run.id
-    });
+    const chatMessageRow = state.chatMessages.find((m) => m.id === gate.chatMessageId);
+    if (chatMessageRow) {
+      chatMessageRow.taskId = task.id;
+      chatMessageRow.runId = run.id;
+    }
+    const session = state.chatSessions.find((s) => s.id === gate.sessionId);
+    if (session) {
+      if (!session.taskIds.includes(task.id)) session.taskIds.push(task.id);
+      if (!session.runIds.includes(run.id)) session.runIds.push(run.id);
+      session.updatedAt = now();
+    }
     const runRecord = state.runs.find((r) => r.id === run.id);
     if (runRecord) {
-      runRecord.userMessageId = chatMessage.id;
-      runRecord.updatedAt = chatMessage.createdAt;
+      runRecord.userMessageId = gate.chatMessageId;
+      runRecord.updatedAt = now();
     }
-
-    // Stamp the inbound message row. We persist target = String(chatId)
-    // so the messaging-finalize hook can find the chat to reply into
-    // when the task settles.
-    createMessagingMessageRecord(state, {
-      bridgeId: bridge.id,
-      direction: "inbound",
-      status: "received",
-      target: String(chatId),
-      text,
-      taskId: task.id,
-      chatSessionId: sessionId,
-      externalId
-    });
-
     addAudit(state, {
       actor: "runtime",
       action: "messaging.telegram.inbound_dispatched",
-      target: bridge.id,
+      target: bridgeId,
       risk: "low",
       taskId: task.id,
       evidence: {
-        bridgeId: bridge.id,
-        telegramUserId: entry.telegramUserId,
-        agentId: entry.agentId,
-        chatSessionId: sessionId,
+        bridgeId,
+        telegramUserId: gate.telegramUserId,
+        agentId: gate.agentId,
+        chatSessionId: gate.sessionId,
         chatId,
         messageId: message.message_id
       }
     });
-
-    // Advance the persisted poll offset in the same write so a restart
-    // never re-delivers this update.
-    advanceTelegramOffset(state, bridgeId, updateId);
   });
 }
 

@@ -607,7 +607,7 @@ export function createMessagingBridgeRecord(
       deliveryTargets: item.deliveryTargets,
       // Connector id is metadata only (the bot token lives in encrypted
       // storage per ADR connector-secret-storage.md). Surfacing it on the
-      // audit row lets reviewers trace which connector a bridge depends
+      // audit row lets operators trace which connector a bridge depends
       // on without leaking secret material.
       connectorId: item.connectorId
     }
