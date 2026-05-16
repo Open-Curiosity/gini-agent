@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { createEmptyState } from "../../state";
+import { createEmptyState, mutateState } from "../../state";
+import { writeSecret } from "../../state/secrets";
 import type { ConnectorRecord, SkillRecord } from "../../types";
-import { isSkillActive } from "./index";
+import { isSkillActive, resolveSkillEnv } from "./index";
 
 const ROOT = "/tmp/gini-connectors-unit";
 
@@ -108,5 +109,98 @@ describe("isSkillActive", () => {
     state.connectors = [newConnector({ provider: "demo", health: "unknown" })];
     const skill = newSkill({ requiredConnectors: [{ provider: "demo" }] });
     expect(isSkillActive(state, skill)).toBe(true);
+  });
+
+  test("disabled connector with healthy probe does NOT satisfy a skill", () => {
+    // The user explicitly turned this connector off. A stale `health:
+    // "healthy"` from before they disabled it (or a probe job that ran
+    // anyway) must not let dependent skills activate behind their back.
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({ provider: "linear", status: "disabled", health: "healthy" })];
+    const skill = newSkill({ requiredConnectors: [{ provider: "linear" }] });
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
+
+  test("error-status connector does NOT satisfy a skill even if a probe later returns healthy", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({ provider: "linear", status: "error", health: "healthy" })];
+    const skill = newSkill({ requiredConnectors: [{ provider: "linear" }] });
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
+
+  test("disabled connector does NOT satisfy a no-probe provider either", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({ provider: "demo", status: "disabled", health: "unknown" })];
+    const skill = newSkill({ requiredConnectors: [{ provider: "demo" }] });
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
+});
+
+describe("resolveSkillEnv", () => {
+  // resolveSkillEnv resolves prerequisites.env for a skill by finding a
+  // matching connector and reading its secret. The find predicate must
+  // mirror the isSkillActive guard — otherwise a disabled or error-status
+  // connector with a stale `health: "healthy"` could leak its secret into
+  // a terminal_exec spawn even though the activation gate excludes the
+  // skill.
+
+  test("disabled connector with healthy probe does NOT inject its secret", async () => {
+    const instance = "resolve-disabled";
+    const config = {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+    const ref = writeSecret(instance, "id_disabled", "token", "leaked-token");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_disabled",
+        instance,
+        provider: "linear",
+        status: "disabled",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      requiredConnectors: [{ provider: "linear" }],
+      prerequisites: { env: ["LINEAR_API_KEY"] }
+    });
+    const env = await resolveSkillEnv(config, skill);
+    expect(env).toEqual({});
+  });
+
+  test("configured + healthy connector DOES inject its secret (regression)", async () => {
+    const instance = "resolve-configured";
+    const config = {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+    const ref = writeSecret(instance, "id_ok", "token", "real-token");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_ok",
+        instance,
+        provider: "linear",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      requiredConnectors: [{ provider: "linear" }],
+      prerequisites: { env: ["LINEAR_API_KEY"] }
+    });
+    const env = await resolveSkillEnv(config, skill);
+    expect(env).toEqual({ LINEAR_API_KEY: "real-token" });
   });
 });
