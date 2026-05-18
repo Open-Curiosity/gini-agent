@@ -348,6 +348,107 @@ describe("messaging telegram wiring", () => {
     expect(sessions.filter((s) => s.source !== undefined)).toEqual([]);
   });
 
+  test("first private DM auto-pairs as owner and lands on the allowlist", async () => {
+    const config = testConfig("telegram-autopair-owner");
+    const { client } = stubClient();
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const { authorizeTelegramChat, listAllowedChats } = await import("./messaging");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+
+    const first = await authorizeTelegramChat(config, bridge.id, 4242, "private");
+    expect(first).toEqual({ allowed: true, paired: true });
+
+    const view = listAllowedChats(config, bridge.id);
+    expect(view.allowedChatIds).toEqual([4242]);
+    expect(view.ownerChatId).toBe(4242);
+
+    // Second DM from the same owner is allowed without re-pairing.
+    const second = await authorizeTelegramChat(config, bridge.id, 4242, "private");
+    expect(second).toEqual({ allowed: true, paired: false });
+  });
+
+  test("group chats never auto-pair — they need explicit enrollment", async () => {
+    const config = testConfig("telegram-group-no-autopair");
+    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
+    const { authorizeTelegramChat, listAllowedChats } = await import("./messaging");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+
+    const access = await authorizeTelegramChat(config, bridge.id, -987654321, "supergroup");
+    expect(access).toEqual({ allowed: false, paired: false });
+
+    const view = listAllowedChats(config, bridge.id);
+    expect(view.allowedChatIds).toEqual([]);
+    expect(view.ownerChatId).toBeUndefined();
+  });
+
+  test("strangers DMing a paired bridge are denied silently", async () => {
+    const config = testConfig("telegram-stranger-denied");
+    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
+    const { authorizeTelegramChat } = await import("./messaging");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+
+    // Owner pairs first.
+    await authorizeTelegramChat(config, bridge.id, 100, "private");
+    // A different private chat — denied because the allowlist is no
+    // longer empty.
+    const access = await authorizeTelegramChat(config, bridge.id, 200, "private");
+    expect(access).toEqual({ allowed: false, paired: false });
+  });
+
+  test("allowChat / denyChat enroll and remove chats; ownerChatId persists across deny", async () => {
+    const config = testConfig("telegram-allow-deny");
+    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
+    const { allowChat, authorizeTelegramChat, denyChat, listAllowedChats } = await import("./messaging");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+
+    // Owner pair by first DM.
+    await authorizeTelegramChat(config, bridge.id, 11, "private");
+    // Owner enrolls a group.
+    const after = await allowChat(config, bridge.id, -7000);
+    expect(after.allowedChatIds.sort()).toEqual([-7000, 11]);
+    expect(after.ownerChatId).toBe(11);
+
+    // Group is now allowed.
+    const groupAccess = await authorizeTelegramChat(config, bridge.id, -7000, "supergroup");
+    expect(groupAccess.allowed).toBe(true);
+
+    // Deny the group. Owner stays recorded on the bridge.
+    const afterDeny = await denyChat(config, bridge.id, -7000);
+    expect(afterDeny.allowedChatIds).toEqual([11]);
+    expect(afterDeny.ownerChatId).toBe(11);
+
+    // The denied group is back to silent-drop.
+    const reDenied = await authorizeTelegramChat(config, bridge.id, -7000, "supergroup");
+    expect(reDenied.allowed).toBe(false);
+
+    expect(listAllowedChats(config, bridge.id).allowedChatIds).toEqual([11]);
+  });
+
   test("disableMessagingBridge erases the stored bot token", async () => {
     const config = testConfig("telegram-disable");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });

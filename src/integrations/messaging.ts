@@ -250,6 +250,143 @@ export function findTelegramChatSession(
   );
 }
 
+// Chat allowlist + first-DM pairing.
+//
+// Telegram bots are addressable by anyone who finds the @username, so
+// without an allowlist a stranger can add the bot to their group and
+// drive the runtime — burning the owner's provider tokens and
+// potentially reaching workspace tools. The bridge stores a list of
+// permitted chat_ids on `metadata.allowedChatIds`; the poller silently
+// drops updates from anyone not on the list. The first private chat
+// to reach an empty allowlist auto-pairs as the bridge owner — that's
+// the convention the user already expects from local-first tooling
+// ("the first thing I do with a fresh bridge is DM it from my own
+// account").
+
+export interface ChatAllowlistView {
+  allowedChatIds: number[];
+  ownerChatId?: number;
+}
+
+function readAllowedChatIds(bridge: MessagingBridgeRecord): number[] {
+  const raw = bridge.metadata?.allowedChatIds;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((value) => Number(value)).filter((n) => Number.isFinite(n));
+}
+
+function readOwnerChatId(bridge: MessagingBridgeRecord): number | undefined {
+  const raw = bridge.metadata?.ownerChatId;
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : undefined;
+}
+
+export function isChatAllowed(bridge: MessagingBridgeRecord, chatId: number): boolean {
+  return readAllowedChatIds(bridge).includes(chatId);
+}
+
+// Atomically resolve the allow decision for an inbound update. Returns
+// `{ allowed: true, paired: true }` when this call auto-paired the
+// owner; `{ allowed: true }` when the chat was already on the list;
+// `{ allowed: false }` when the update should be dropped. The whole
+// check-and-set runs inside mutateState so two concurrent first-DMs
+// can't both win the owner slot.
+export async function authorizeTelegramChat(
+  config: RuntimeConfig,
+  bridgeId: string,
+  chatId: number,
+  chatType: "private" | "group" | "supergroup" | "channel"
+): Promise<{ allowed: boolean; paired: boolean }> {
+  return mutateState(config.instance, (state) => {
+    const live = state.messagingBridges.find((b) => b.id === bridgeId);
+    if (!live) return { allowed: false, paired: false };
+    const allowed = readAllowedChatIds(live);
+    if (allowed.includes(chatId)) return { allowed: true, paired: false };
+    // Auto-pair: empty allowlist + private chat = first DM owns the bot.
+    // Group chats never auto-pair; the owner must explicitly enroll them.
+    if (allowed.length === 0 && chatType === "private") {
+      const meta = { ...(live.metadata ?? {}) };
+      meta.allowedChatIds = [chatId];
+      meta.ownerChatId = chatId;
+      live.metadata = meta;
+      live.updatedAt = now();
+      addAudit(state, {
+        actor: "runtime",
+        action: "messaging.chat.paired",
+        target: live.id,
+        risk: "medium",
+        evidence: { chatId, ownerChatId: chatId }
+      });
+      return { allowed: true, paired: true };
+    }
+    return { allowed: false, paired: false };
+  });
+}
+
+export async function allowChat(config: RuntimeConfig, idOrName: string, chatId: number) {
+  if (!Number.isFinite(chatId)) throw new Error("chatId must be a finite number.");
+  return mutateState(config.instance, (state) => {
+    const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
+    if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
+    const meta = { ...(live.metadata ?? {}) };
+    const allowed = readAllowedChatIds(live);
+    if (!allowed.includes(chatId)) allowed.push(chatId);
+    meta.allowedChatIds = allowed;
+    // Owner stays whoever it was; if there's no owner yet (manual
+    // enrollment from the CLI before any DM) we leave it unset so the
+    // first private-chat DM still gets pair-recognized.
+    live.metadata = meta;
+    live.updatedAt = now();
+    addAudit(state, {
+      actor: "user",
+      action: "messaging.chat.allowed",
+      target: live.id,
+      risk: "medium",
+      evidence: { chatId }
+    });
+    return chatAllowlistView(live);
+  });
+}
+
+export async function denyChat(config: RuntimeConfig, idOrName: string, chatId: number) {
+  if (!Number.isFinite(chatId)) throw new Error("chatId must be a finite number.");
+  return mutateState(config.instance, (state) => {
+    const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
+    if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
+    const meta = { ...(live.metadata ?? {}) };
+    const allowed = readAllowedChatIds(live).filter((id) => id !== chatId);
+    meta.allowedChatIds = allowed;
+    // Removing the owner chat doesn't clear ownerChatId — keep the
+    // historical record so an audit reader can see who originally
+    // paired the bridge. The bridge stops responding to that chat
+    // either way because it's no longer on the allowlist.
+    live.metadata = meta;
+    live.updatedAt = now();
+    addAudit(state, {
+      actor: "user",
+      action: "messaging.chat.denied",
+      target: live.id,
+      risk: "medium",
+      evidence: { chatId }
+    });
+    return chatAllowlistView(live);
+  });
+}
+
+export function listAllowedChats(config: RuntimeConfig, idOrName: string): ChatAllowlistView {
+  const bridge = readState(config.instance).messagingBridges.find(
+    (b) => b.id === idOrName || b.name === idOrName
+  );
+  if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
+  return chatAllowlistView(bridge);
+}
+
+function chatAllowlistView(bridge: MessagingBridgeRecord): ChatAllowlistView {
+  const owner = readOwnerChatId(bridge);
+  return {
+    allowedChatIds: readAllowedChatIds(bridge),
+    ...(owner !== undefined ? { ownerChatId: owner } : {})
+  };
+}
+
 function parseInboundMedia(raw: unknown): MessagingMessageMedia | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const value = raw as MessagingMessageMedia;
