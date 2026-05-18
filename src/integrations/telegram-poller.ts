@@ -7,12 +7,16 @@
 // via AbortController so SIGTERM doesn't have to wait out the long-poll
 // timeout.
 
-import type { MessagingBridgeRecord, RuntimeConfig } from "../types";
+import { mkdirSync } from "node:fs";
+import { extname, join } from "node:path";
+import type { MessagingBridgeRecord, MessagingMessageMedia, RuntimeConfig } from "../types";
 import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
+import { instanceRoot } from "../paths";
 import { readBridgeBotToken, receiveMessagingInput } from "./messaging";
 import {
   createTelegramClient,
-  extractIncomingText,
+  extractIncomingPayload,
+  type IncomingPayload,
   type TelegramClient
 } from "./telegram";
 
@@ -145,12 +149,28 @@ async function runLoop(
 
     for (const update of updates) {
       if (signal.aborted) return;
-      const incoming = extractIncomingText(update);
+      const incoming = extractIncomingPayload(update);
       if (incoming) {
+        // Resolve photo bytes to a local file before submitting the
+        // task. A download failure logs and continues with whatever
+        // text/caption we already have so a transient network blip
+        // doesn't drop the message entirely.
+        const downloaded = incoming.photo
+          ? await downloadIncomingPhoto(config, bridgeId, update.update_id, incoming, client).catch((error) => {
+              appendLog(config.instance, "messaging.telegram.photo_download_error", {
+                bridgeId,
+                fileId: incoming.photo?.file_id,
+                error: error instanceof Error ? error.message : String(error)
+              });
+              return undefined;
+            })
+          : undefined;
         try {
+          const taskInput = buildTaskInput(incoming, downloaded?.path);
           const record = await receiveMessagingInput(config, bridgeId, {
-            text: incoming.text,
-            target: String(incoming.chatId)
+            text: taskInput,
+            target: String(incoming.chatId),
+            media: downloaded?.media
           });
           // Surface a "typing…" indicator in the chat while the agent
           // works on the just-submitted task. The pulse is best-effort
@@ -214,6 +234,46 @@ async function maintainTypingIndicator(
     }
     await sleepUnlessAborted(TYPING_REFRESH_MS, signal);
   }
+}
+
+// Resolve an inbound photo's file_id to a local path under the instance
+// inbound directory. The path is stable across restarts (keyed on
+// bridge + update_id + file_id), and the media descriptor records both
+// the local path and the Telegram file_id so the agent can re-fetch via
+// sendPhoto if it needs to echo the image back.
+async function downloadIncomingPhoto(
+  config: RuntimeConfig,
+  bridgeId: string,
+  updateId: number,
+  incoming: IncomingPayload,
+  client: TelegramClient
+): Promise<{ path: string; media: MessagingMessageMedia } | undefined> {
+  if (!incoming.photo) return undefined;
+  const file = await client.getFile(incoming.photo.file_id);
+  if (!file.file_path) {
+    throw new Error("Telegram returned no file_path (file may exceed the 20MB Bot API limit)");
+  }
+  const bytes = await client.downloadFile(file.file_path);
+  const ext = (extname(file.file_path) || ".jpg").toLowerCase();
+  const dir = join(instanceRoot(config.instance), "inbound", bridgeId);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, `${updateId}-${incoming.photo.file_id}${ext}`);
+  await Bun.write(path, bytes);
+  return {
+    path,
+    media: { kind: "photo", path, fileId: incoming.photo.file_id }
+  };
+}
+
+// Compose the input string handed to submitTask. When a photo arrives
+// we prefix the caption (or empty body) with a single line pointing at
+// the saved file, so an agent inspecting `task.input` can pick up the
+// attachment via the file toolset without changing how task inputs
+// flow through the runtime.
+function buildTaskInput(incoming: IncomingPayload, savedPath: string | undefined): string {
+  if (!savedPath) return incoming.text;
+  const header = `[photo: ${savedPath}]`;
+  return incoming.text ? `${header}\n${incoming.text}` : header;
 }
 
 async function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {

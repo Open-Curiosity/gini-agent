@@ -45,6 +45,12 @@ function deferredClient(): {
     async sendPhoto(chatId) {
       return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
     },
+    async getFile(fileId) {
+      return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` };
+    },
+    async downloadFile() {
+      return new Uint8Array([1, 2, 3]).buffer;
+    },
     getUpdates(_offset, _timeout, signal) {
       return new Promise<TelegramUpdate[]>((resolve, reject) => {
         const entry: Pending = { resolve, reject };
@@ -156,6 +162,12 @@ describe("telegram poller supervisor", () => {
         chatActionCalls += 1;
         return true as const;
       },
+      async getFile(fileId) {
+        return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` };
+      },
+      async downloadFile() {
+        return new Uint8Array().buffer;
+      },
       getUpdates(_offset, _timeout, signal) {
         return new Promise((resolve, reject) => {
           updateQueue.push({ resolve });
@@ -183,6 +195,84 @@ describe("telegram poller supervisor", () => {
     ]);
 
     await waitFor(() => chatActionCalls >= 1, "typing indicator fired at least once");
+
+    await supervisor.stopAll();
+  });
+
+  test("inbound photo updates are downloaded to disk and the saved path is folded into the task input", async () => {
+    const config = testConfig("poller-photo");
+    const downloadedBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+    type Pending = { resolve: (u: import("./telegram").TelegramUpdate[]) => void };
+    const queue: Pending[] = [];
+    const downloadedPaths: string[] = [];
+    const client: TelegramClient = {
+      async getMe() { return { id: 1, is_bot: true }; },
+      async sendMessage(chatId, text) {
+        return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendPhoto(chatId) {
+        return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
+      },
+      async sendChatAction() { return true as const; },
+      async getFile(fileId) {
+        return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` };
+      },
+      async downloadFile(path) {
+        downloadedPaths.push(path);
+        return downloadedBytes.buffer.slice(0);
+      },
+      getUpdates(_offset, _timeout, signal) {
+        return new Promise((resolve, reject) => {
+          queue.push({ resolve });
+          signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+
+    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    supervisor.reconcile();
+
+    queue.shift()?.resolve([
+      {
+        update_id: 20,
+        message: {
+          message_id: 4,
+          date: 0,
+          chat: { id: 77, type: "private" },
+          photo: [
+            { file_id: "small", file_unique_id: "small", width: 90, height: 60 },
+            { file_id: "BIG", file_unique_id: "BIG", width: 1280, height: 960 }
+          ],
+          caption: "look at this"
+        }
+      }
+    ]);
+
+    await waitFor(
+      () => readState(config.instance).messagingMessages.some((m) => m.bridgeId === bridge.id),
+      "inbound message recorded"
+    );
+    const record = readState(config.instance).messagingMessages.find((m) => m.bridgeId === bridge.id);
+
+    expect(downloadedPaths).toEqual(["photos/BIG.jpg"]);
+    expect(record?.media?.kind).toBe("photo");
+    expect(record?.media?.fileId).toBe("BIG");
+    expect(String(record?.media?.path ?? "")).toContain("inbound");
+    expect(String(record?.media?.path ?? "")).toContain("BIG.jpg");
+    expect(record?.text ?? "").toContain("[photo:");
+    expect(record?.text ?? "").toContain("look at this");
+
+    // The bytes really landed on disk.
+    const onDisk = await Bun.file(record!.media!.path!).arrayBuffer();
+    expect(new Uint8Array(onDisk)).toEqual(downloadedBytes);
 
     await supervisor.stopAll();
   });

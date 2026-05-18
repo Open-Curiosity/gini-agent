@@ -181,7 +181,11 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
   if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
   if (bridge.status !== "configured") throw new Error(`Messaging bridge is not configured: ${idOrName}`);
   const text = String(input.text ?? "").trim();
-  if (!text) throw new Error("Inbound message text is required.");
+  const media = parseInboundMedia(input.media);
+  // Photo-only messages (no caption) still need to produce a task — the
+  // text body will already carry a `[photo: …]` header inserted by the
+  // caller (the poller), so empty here only happens for malformed input.
+  if (!text && !media) throw new Error("Inbound message text or media is required.");
   const target = String(input.target ?? "local");
   const task = await submitTask(config, text);
   return mutateState(config.instance, (state) => createMessagingMessageRecord(state, {
@@ -190,8 +194,21 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
     status: "received",
     target,
     text,
-    taskId: task.id
+    taskId: task.id,
+    media
   }));
+}
+
+function parseInboundMedia(raw: unknown): MessagingMessageMedia | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const value = raw as MessagingMessageMedia;
+  if (value.kind !== "photo") return undefined;
+  return {
+    kind: "photo",
+    ...(typeof value.url === "string" ? { url: value.url } : {}),
+    ...(typeof value.fileId === "string" ? { fileId: value.fileId } : {}),
+    ...(typeof value.path === "string" ? { path: value.path } : {})
+  };
 }
 
 export async function sendMessagingOutput(config: RuntimeConfig, idOrName: string, input: Record<string, unknown>) {

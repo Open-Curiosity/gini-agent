@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createTelegramClient, extractIncomingText, type TelegramFetch } from "./telegram";
+import { createTelegramClient, extractIncomingPayload, extractIncomingText, type TelegramFetch } from "./telegram";
 
 function stubFetch(handler: (url: string, init: RequestInit) => unknown): TelegramFetch {
   return (async (input: string | URL | Request, init?: RequestInit) => {
@@ -167,6 +167,73 @@ describe("telegram client", () => {
 
   test("empty token is rejected up front", () => {
     expect(() => createTelegramClient("")).toThrow(/required/);
+  });
+});
+
+describe("getFile / downloadFile", () => {
+  test("getFile returns the file_path the Bot API hands back", async () => {
+    let payload: Record<string, unknown> = {};
+    const client = createTelegramClient("TOK", {
+      fetchImpl: stubFetch((_url, init) => {
+        payload = JSON.parse(String(init.body));
+        return {
+          ok: true,
+          result: { file_id: "FID", file_unique_id: "FID", file_path: "photos/FID.jpg" }
+        };
+      })
+    });
+    const file = await client.getFile("FID");
+    expect(payload).toEqual({ file_id: "FID" });
+    expect(file.file_path).toBe("photos/FID.jpg");
+  });
+
+  test("downloadFile hits the /file/bot<token>/<path> base and returns raw bytes", async () => {
+    let observedUrl = "";
+    const client = createTelegramClient("TOK", {
+      fetchImpl: stubFetch((url) => {
+        observedUrl = url;
+        const bytes = new Uint8Array([7, 8, 9]);
+        return new Response(bytes, { status: 200 });
+      })
+    });
+    const buf = await client.downloadFile("photos/x.jpg");
+    expect(observedUrl).toContain("/file/botTOK/photos/x.jpg");
+    expect(new Uint8Array(buf)).toEqual(new Uint8Array([7, 8, 9]));
+  });
+
+  test("downloadFile raises on non-2xx responses", async () => {
+    const client = createTelegramClient("TOK", {
+      fetchImpl: stubFetch(() => new Response("nope", { status: 404 }))
+    });
+    await expect(client.downloadFile("missing")).rejects.toThrow(/HTTP 404/);
+  });
+});
+
+describe("extractIncomingPayload", () => {
+  test("returns text-only payloads unchanged", () => {
+    const out = extractIncomingPayload({
+      update_id: 1,
+      message: { message_id: 1, date: 0, chat: { id: 9, type: "private" }, text: "hi" }
+    });
+    expect(out).toEqual({ chatId: 9, text: "hi", photo: undefined });
+  });
+
+  test("picks the largest PhotoSize for photo updates", () => {
+    const photo = [
+      { file_id: "s", file_unique_id: "s", width: 90, height: 60 },
+      { file_id: "m", file_unique_id: "m", width: 320, height: 240 },
+      { file_id: "l", file_unique_id: "l", width: 1280, height: 960 }
+    ];
+    const out = extractIncomingPayload({
+      update_id: 2,
+      message: { message_id: 2, date: 0, chat: { id: 1, type: "private" }, photo, caption: "look" }
+    });
+    expect(out?.photo?.file_id).toBe("l");
+    expect(out?.text).toBe("look");
+  });
+
+  test("returns undefined for empty updates", () => {
+    expect(extractIncomingPayload({ update_id: 3 })).toBeUndefined();
   });
 });
 
