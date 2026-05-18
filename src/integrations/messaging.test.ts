@@ -42,6 +42,10 @@ function stubClient(overrides: Partial<TelegramClient> = {}): { client: Telegram
       calls.push({ method: "sendMessage", args: [chatId, text] });
       return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
     },
+    sendChatAction: async (chatId, action) => {
+      calls.push({ method: "sendChatAction", args: [chatId, action] });
+      return true as const;
+    },
     getUpdates: async () => {
       calls.push({ method: "getUpdates", args: [] });
       return [];

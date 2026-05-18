@@ -8,7 +8,7 @@
 // timeout.
 
 import type { MessagingBridgeRecord, RuntimeConfig } from "../types";
-import { appendLog, mutateState, now, readState } from "../state";
+import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { readBridgeBotToken, receiveMessagingInput } from "./messaging";
 import {
   createTelegramClient,
@@ -24,6 +24,11 @@ const LONG_POLL_SECONDS = 25;
 // Backoff after an error so a flaky network or a revoked token doesn't
 // hammer the API.
 const ERROR_BACKOFF_MS = 5000;
+
+// Telegram chat actions auto-clear after ~5 seconds. We refresh just under
+// that so the "is typing…" stays visible continuously until the task
+// settles, without piling on requests.
+const TYPING_REFRESH_MS = 4000;
 
 export interface PollerDeps {
   clientFactory?: (token: string) => TelegramClient;
@@ -143,10 +148,24 @@ async function runLoop(
       const incoming = extractIncomingText(update);
       if (incoming) {
         try {
-          await receiveMessagingInput(config, bridgeId, {
+          const record = await receiveMessagingInput(config, bridgeId, {
             text: incoming.text,
             target: String(incoming.chatId)
           });
+          // Surface a "typing…" indicator in the chat while the agent
+          // works on the just-submitted task. The pulse is best-effort
+          // and runs detached so a slow chat_action call doesn't block
+          // the next update.
+          if (record.taskId) {
+            void maintainTypingIndicator(config, record.taskId, incoming.chatId, client, signal).catch(
+              (error) => {
+                appendLog(config.instance, "messaging.telegram.typing_error", {
+                  bridgeId,
+                  error: error instanceof Error ? error.message : String(error)
+                });
+              }
+            );
+          }
         } catch (error) {
           appendLog(config.instance, "messaging.telegram.receive_error", {
             bridgeId,
@@ -170,6 +189,31 @@ async function runLoop(
 function readLastOffset(bridge: MessagingBridgeRecord): number | undefined {
   const raw = bridge.metadata?.lastOffset;
   return typeof raw === "number" ? raw : undefined;
+}
+
+// Refresh sendChatAction("typing") on a ~4s cadence for as long as the
+// originating task is in a non-terminal state. The first action fires
+// immediately so the user sees "is typing…" the moment they finish
+// sending. Errors halt the pulse — a revoked chat (`chat not found`) or
+// a network blip shouldn't keep us looping forever.
+async function maintainTypingIndicator(
+  config: RuntimeConfig,
+  taskId: string,
+  chatId: number,
+  client: TelegramClient,
+  signal: AbortSignal
+): Promise<void> {
+  while (!signal.aborted) {
+    const task = readState(config.instance).tasks.find((t) => t.id === taskId);
+    if (!task) return;
+    if (isTerminalTaskStatus(task.status)) return;
+    try {
+      await client.sendChatAction(chatId, "typing");
+    } catch {
+      return;
+    }
+    await sleepUnlessAborted(TYPING_REFRESH_MS, signal);
+  }
 }
 
 async function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {

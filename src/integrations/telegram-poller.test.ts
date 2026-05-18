@@ -39,6 +39,9 @@ function deferredClient(): {
     async sendMessage(chatId, text) {
       return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
     },
+    async sendChatAction() {
+      return true as const;
+    },
     getUpdates(_offset, _timeout, signal) {
       return new Promise<TelegramUpdate[]>((resolve, reject) => {
         const entry: Pending = { resolve, reject };
@@ -129,6 +132,51 @@ describe("telegram poller supervisor", () => {
       () => readState(config.instance).messagingBridges.find((b) => b.id === bridge.id)?.metadata?.lastOffset === 11,
       "offset advanced"
     );
+
+    await supervisor.stopAll();
+  });
+
+  test("fires sendChatAction(typing) for the originating chat while the task is non-terminal", async () => {
+    const config = testConfig("poller-typing");
+    type Pending = { resolve: (u: import("./telegram").TelegramUpdate[]) => void };
+    const updateQueue: Pending[] = [];
+    let chatActionCalls = 0;
+    const client: TelegramClient = {
+      async getMe() { return { id: 1, is_bot: true }; },
+      async sendMessage(chatId, text) {
+        return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendChatAction() {
+        chatActionCalls += 1;
+        return true as const;
+      },
+      getUpdates(_offset, _timeout, signal) {
+        return new Promise((resolve, reject) => {
+          updateQueue.push({ resolve });
+          signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+
+    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    supervisor.reconcile();
+
+    updateQueue.shift()?.resolve([
+      {
+        update_id: 5,
+        message: { message_id: 1, date: 0, chat: { id: 88, type: "private" }, text: "hello" }
+      }
+    ]);
+
+    await waitFor(() => chatActionCalls >= 1, "typing indicator fired at least once");
 
     await supervisor.stopAll();
   });

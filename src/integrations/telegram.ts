@@ -42,9 +42,25 @@ interface TelegramResponse<T> {
   error_code?: number;
 }
 
+// Telegram's documented chat-action set. We expose them as a union so
+// callers can't typo "typing" and silently no-op.
+export type TelegramChatAction =
+  | "typing"
+  | "upload_photo"
+  | "record_video"
+  | "upload_video"
+  | "record_voice"
+  | "upload_voice"
+  | "upload_document"
+  | "choose_sticker"
+  | "find_location"
+  | "record_video_note"
+  | "upload_video_note";
+
 export interface TelegramClient {
   getMe(): Promise<TelegramUser>;
   sendMessage(chatId: string | number, text: string): Promise<TelegramMessage>;
+  sendChatAction(chatId: string | number, action: TelegramChatAction): Promise<true>;
   getUpdates(offset: number | undefined, longPollSeconds: number, signal?: AbortSignal): Promise<TelegramUpdate[]>;
 }
 
@@ -86,6 +102,7 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
   return {
     getMe: () => call<TelegramUser>("getMe", {}),
     sendMessage: (chatId, text) => call<TelegramMessage>("sendMessage", { chat_id: chatId, text }),
+    sendChatAction: (chatId, action) => call<true>("sendChatAction", { chat_id: chatId, action }),
     getUpdates: (offset, longPollSeconds, signal) =>
       call<TelegramUpdate[]>(
         "getUpdates",
