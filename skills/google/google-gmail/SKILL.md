@@ -23,7 +23,8 @@ Use `gws gmail` to read, search, send, reply, forward, draft, label, and triage 
   - Read-only triage: `gmail.readonly`
   - Send a new message: `gmail.send`
   - Reply, reply-all, forward: `gmail.modify` — upstream helpers fetch the original message to thread `In-Reply-To` / `References` headers, which `gmail.send` alone cannot do
-  - Drafts and labels: `gmail.modify` (or full `gmail`)
+  - Drafts and labels: `gmail.modify` (or `https://mail.google.com/` for full access including permanent delete)
+  - Watch for new mail (`+watch`): `gmail.modify` AND `https://www.googleapis.com/auth/pubsub` — Cloud Pub/Sub is a separate Google API and its scope must be granted alongside the Gmail scope
 
 ## When to Use
 
@@ -119,7 +120,7 @@ gws gmail +watch        # streams new messages as NDJSON (one JSON object per li
 1. Every send is a side-effecting action. Confirm recipient list, subject, and body with the user before invoking `gws gmail +send` (or any `messages.send` / `drafts.send` call), even when `gws *` is auto-approved.
 2. Prefer the curated helpers (`+send`, `+reply`, `+read`, `+triage`) over the raw `gws gmail <resource> <method>` surface — they handle MIME, base64, threading, and HTML-to-text conversion automatically.
 3. When replying, use `+reply` / `+reply-all` so the thread stays intact. Building a new message with `+send` and pasting in the prior subject does not thread correctly.
-4. Treat the Gmail scopes as three separate trust boundaries: `gmail.readonly` covers `+read` / `+triage` and any `messages.list`/`get` call; `gmail.send` covers a brand-new `+send` only; `gmail.modify` is required for `+reply`, `+reply-all`, `+forward`, labels, and drafts because those helpers must fetch the original message or mutate its state. If the user only granted a narrower scope at setup, never silently call a verb that needs a wider one — direct them back to `google-workspace-setup` to widen scopes.
+4. Treat the Gmail scopes as four separate trust boundaries: `gmail.readonly` covers `+read` / `+triage` and any `messages.list`/`get` call; `gmail.send` covers a brand-new `+send` only; `gmail.modify` is required for `+reply`, `+reply-all`, `+forward`, labels, and drafts because those helpers must fetch the original message or mutate its state; `+watch` requires `gmail.modify` AND `https://www.googleapis.com/auth/pubsub` because the upstream helper requests both tokens (Pub/Sub is a separate Google API). If the user only granted a narrower scope at setup, never silently call a verb that needs a wider one — direct them back to `google-workspace-setup` to widen scopes.
 5. Do not bulk-send from a personal `@gmail.com` account. Google throttles or suspends accounts that look like bulk senders. Use a transactional provider for newsletters or anything addressed to more than a handful of recipients.
 6. Attachment cap is 25 MB total. For larger files, upload via `google-drive` and send the share link instead.
 7. Never paste raw message bodies that contain secrets (API keys, passwords, MFA codes) back into the chat transcript. Summarize, redact, or write to a file the user controls.
