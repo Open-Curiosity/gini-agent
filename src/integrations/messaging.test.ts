@@ -50,6 +50,14 @@ function stubClient(overrides: Partial<TelegramClient> = {}): { client: Telegram
       calls.push({ method: "sendPhoto", args: [chatId, source, opts] });
       return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
     },
+    getFile: async (fileId) => {
+      calls.push({ method: "getFile", args: [fileId] });
+      return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` };
+    },
+    downloadFile: async (path) => {
+      calls.push({ method: "downloadFile", args: [path] });
+      return new Uint8Array([1, 2, 3]).buffer;
+    },
     getUpdates: async () => {
       calls.push({ method: "getUpdates", args: [] });
       return [];

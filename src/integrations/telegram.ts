@@ -23,12 +23,35 @@ export interface TelegramChat {
   username?: string;
 }
 
+export interface TelegramPhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
 export interface TelegramMessage {
   message_id: number;
   date: number;
   chat: TelegramChat;
   from?: TelegramUser;
   text?: string;
+  // Photos arrive as an array of progressively larger sizes — the last
+  // entry is the original-resolution variant.
+  photo?: TelegramPhotoSize[];
+  // Caption text for media messages (photos, documents, videos).
+  caption?: string;
+}
+
+export interface TelegramFile {
+  file_id: string;
+  file_unique_id: string;
+  file_size?: number;
+  // Server-relative path to download via the file API. Telegram says
+  // this may be missing if the file is too large; we treat that as an
+  // error since the bot can't fetch it anyway.
+  file_path?: string;
 }
 
 export interface TelegramUpdate {
@@ -86,6 +109,12 @@ export interface TelegramClient {
   sendMessage(chatId: string | number, text: string, options?: SendMessageOptions): Promise<TelegramMessage>;
   sendPhoto(chatId: string | number, source: TelegramPhotoSource, options?: SendPhotoOptions): Promise<TelegramMessage>;
   sendChatAction(chatId: string | number, action: TelegramChatAction): Promise<true>;
+  getFile(fileId: string): Promise<TelegramFile>;
+  // Download the bytes for a previously-resolved file path. The path
+  // comes from getFile and is server-relative; this method handles the
+  // base-URL difference (downloads live under /file/bot<TOK>/<path>,
+  // not /bot<TOK>/<method>).
+  downloadFile(filePath: string): Promise<ArrayBuffer>;
   getUpdates(offset: number | undefined, longPollSeconds: number, signal?: AbortSignal): Promise<TelegramUpdate[]>;
 }
 
@@ -148,6 +177,15 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
         ...(opts?.disableWebPagePreview ? { disable_web_page_preview: true } : {})
       }),
     sendChatAction: (chatId, action) => call<true>("sendChatAction", { chat_id: chatId, action }),
+    getFile: (fileId) => call<TelegramFile>("getFile", { file_id: fileId }),
+    downloadFile: async (filePath) => {
+      const url = `${base}/file/bot${token}/${filePath}`;
+      const response = await fetchImpl(url, { method: "GET" });
+      if (!response.ok) {
+        throw new Error(`Telegram file download failed: HTTP ${response.status}`);
+      }
+      return await response.arrayBuffer();
+    },
     sendPhoto: async (chatId, source, opts) => {
       const captionFields = {
         ...(opts?.caption !== undefined ? { caption: opts.caption } : {}),
@@ -202,4 +240,35 @@ export function extractIncomingText(update: TelegramUpdate): { chatId: number; t
   const message = update.message ?? update.edited_message;
   if (!message || !message.text) return undefined;
   return { chatId: message.chat.id, text: message.text };
+}
+
+export interface IncomingPayload {
+  chatId: number;
+  // Plain-text body of the message. For photo-only messages this is the
+  // caption (or "" if neither caption nor text is set).
+  text: string;
+  // Largest available PhotoSize when the message is a photo. The poller
+  // resolves this via getFile + downloadFile and saves the bytes locally.
+  photo?: TelegramPhotoSize;
+}
+
+// Surface the routable payload from an update — text or photo. Returns
+// undefined when the update carries nothing we can act on.
+export function extractIncomingPayload(update: TelegramUpdate): IncomingPayload | undefined {
+  const message = update.message ?? update.edited_message;
+  if (!message) return undefined;
+  const photo = pickLargestPhoto(message.photo);
+  const text = message.text ?? message.caption ?? "";
+  if (!photo && !text) return undefined;
+  return { chatId: message.chat.id, text, photo };
+}
+
+function pickLargestPhoto(sizes: TelegramPhotoSize[] | undefined): TelegramPhotoSize | undefined {
+  if (!sizes || sizes.length === 0) return undefined;
+  // Telegram orders sizes ascending; the last entry is the original
+  // resolution. Defensive max-by area in case a future API tweak breaks
+  // that assumption.
+  return sizes.reduce((acc, candidate) =>
+    candidate.width * candidate.height > acc.width * acc.height ? candidate : acc
+  );
 }
