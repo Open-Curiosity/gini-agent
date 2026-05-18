@@ -55,9 +55,15 @@ Gini extensions (under `metadata.gini`):
    posts to Slack", clarify whether the skill should also read messages,
    list channels, etc. — surface the cardinality so the design is right.
 
-2. Decide on a provider. If a fitting connector exists in
-   `/api/connectors/providers`, use it. If not, declare `provider: generic`
-   under `requires.connectors`. Do not ask the user to pick between
+2. Decide whether the skill needs a connector. Use
+   `requires.connectors` only when the skill needs a configured account,
+   credential, remote API, or connector-backed local integration. If the
+   skill only needs local commands such as `git`, `gh`, `jq`, or `curl`,
+   record those under `prerequisites.commands` and set
+   `requires.connectors: []`. If a fitting connector exists in
+   `/api/connectors/providers`, use it. If the skill truly needs an
+   unsupported external system, declare `provider: generic` under
+   `requires.connectors`. Do not ask the user to pick between
    install/skip on unknown providers — default to forward motion.
 
 3. Draft the frontmatter. Use this template:
@@ -78,9 +84,9 @@ Gini extensions (under `metadata.gini`):
          commands: [<cli names>]
          env: [<ENV_VAR_NAMES>]
        requires:
-         connectors:
-           - provider: <id>
-             scopes: [<optional>]
+         # Leave empty for local-command-only skills. If a connector is
+         # needed, use: [{ provider: <id>, scopes: [<optional>] }]
+         connectors: []
    ---
    ```
 
@@ -99,8 +105,9 @@ Gini extensions (under `metadata.gini`):
    - `name` is uppercase or contains underscores → switch to kebab-case.
    - `description` exceeds 1024 chars → tighten it.
    - parent dir name doesn't match `name` → adjust whichever is wrong.
-   - required provider doesn't exist → switch to `generic` or add the
-     provider module first.
+   - required provider doesn't exist → if the skill needs a real external
+     system, switch to `generic` or add the provider module first; if it
+     only needs local commands, remove the connector requirement.
 
 6. Install the skill via the API so the runtime picks it up:
 
@@ -153,7 +160,8 @@ When converting a legacy SKILL.md, the recipe is:
 
 - Never write a skill without validating first.
 - Always check `GET /api/connectors/providers` for the providers the new
-  skill will depend on. Prefer existing providers over `generic`.
+  skill will depend on. Prefer existing providers over `generic`, and do
+  not add `generic` for local-command-only skills.
 - Bundled skills are immutable from the agent's perspective — if the
   user asks to edit a bundled skill, instead create a user-source copy
   with the same name. The runtime keeps both as separate rows.
