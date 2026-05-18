@@ -359,7 +359,8 @@ export interface ChatSessionRecord {
 }
 
 export type ChatSessionSource =
-  | { kind: "telegram"; bridgeId: string; chatId: number; target: string };
+  | { kind: "telegram"; bridgeId: string; chatId: number; target: string }
+  | { kind: "discord"; bridgeId: string; channelId: string; target: string };
 
 export interface ChatMessageRecord {
   id: string;

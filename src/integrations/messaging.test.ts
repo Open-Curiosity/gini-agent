@@ -12,6 +12,7 @@ import {
   setMessagingDeps
 } from "./messaging";
 import type { TelegramClient } from "./telegram";
+import type { DiscordClient } from "./discord";
 
 function testConfig(instance: string): RuntimeConfig {
   const root = "/tmp/gini-messaging-tests";
@@ -349,6 +350,199 @@ describe("messaging telegram wiring", () => {
     expect(live?.secretRefs ?? []).toEqual([]);
     // Reading a token after disable must fail (file gone), so the helper
     // returns undefined for a bridge with no refs.
+    expect(readBridgeBotToken(config, live!)).toBeUndefined();
+  });
+});
+
+interface DiscordStubCall { method: string; args: unknown[] }
+
+function stubDiscordClient(overrides: Partial<DiscordClient> = {}): { client: DiscordClient; calls: DiscordStubCall[] } {
+  const calls: DiscordStubCall[] = [];
+  const client: DiscordClient = {
+    getMe: async () => {
+      calls.push({ method: "getMe", args: [] });
+      return { id: "100", username: "Gini", discriminator: "3715", bot: true };
+    },
+    sendMessage: async (channelId, content) => {
+      calls.push({ method: "sendMessage", args: [channelId, content] });
+      return {
+        id: "msg-1",
+        channel_id: channelId,
+        content,
+        timestamp: "2026-01-01T00:00:00Z",
+        author: { id: "100", username: "Gini", bot: true }
+      };
+    },
+    triggerTypingIndicator: async (channelId) => {
+      calls.push({ method: "triggerTypingIndicator", args: [channelId] });
+      return true as const;
+    },
+    fetchChannelMessages: async () => {
+      calls.push({ method: "fetchChannelMessages", args: [] });
+      return [];
+    },
+    ...overrides
+  };
+  return { client, calls };
+}
+
+describe("messaging discord wiring", () => {
+  afterEach(() => resetMessagingDeps());
+
+  test("addMessagingBridge requires a botToken for discord and persists it via the secret store", async () => {
+    const config = testConfig("discord-add");
+
+    await expect(
+      addMessagingBridge(config, { name: "disc", kind: "discord", deliveryTargets: ["999"] })
+    ).rejects.toThrow(/botToken/);
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["999"],
+      botToken: "SECRET-TOKEN"
+    });
+
+    expect(bridge.kind).toBe("discord");
+    expect(bridge.secretRefs?.[0]?.purpose).toBe("bot-token");
+    expect(readBridgeBotToken(config, bridge)).toBe("SECRET-TOKEN");
+  });
+
+  test("checkMessagingBridge round-trips getMe and stores the bot identity on metadata", async () => {
+    const config = testConfig("discord-health");
+    const { client, calls } = stubDiscordClient();
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["999"],
+      botToken: "TOK"
+    });
+
+    const checked = await checkMessagingBridge(config, bridge.id);
+    expect(checked.status).toBe("configured");
+    expect(String(checked.message)).toContain("Gini#3715");
+    expect(checked.metadata?.botUsername).toBe("Gini");
+    expect(checked.metadata?.botId).toBe("100");
+    expect(calls.some((c) => c.method === "getMe")).toBe(true);
+  });
+
+  test("checkMessagingBridge surfaces the API error description on failure", async () => {
+    const config = testConfig("discord-health-fail");
+    const { client } = stubDiscordClient({
+      getMe: async () => {
+        throw new Error("401: Unauthorized");
+      }
+    });
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["999"],
+      botToken: "TOK"
+    });
+
+    const checked = await checkMessagingBridge(config, bridge.id);
+    expect(checked.status).toBe("error");
+    expect(String(checked.message)).toContain("401: Unauthorized");
+  });
+
+  test("checkMessagingBridge handles the new global_name account shape (discriminator '0')", async () => {
+    const config = testConfig("discord-health-globalname");
+    const { client } = stubDiscordClient({
+      getMe: async () => ({ id: "5", username: "raw.handle", discriminator: "0", global_name: "Display Name", bot: true })
+    });
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["999"],
+      botToken: "TOK"
+    });
+
+    const checked = await checkMessagingBridge(config, bridge.id);
+    expect(checked.status).toBe("configured");
+    expect(String(checked.message)).toContain("Display Name");
+    expect(String(checked.message)).not.toContain("#0");
+  });
+
+  test("sendMessagingOutput dispatches via REST and records the outbound message", async () => {
+    const config = testConfig("discord-send");
+    const { client, calls } = stubDiscordClient();
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    const message = await sendMessagingOutput(config, bridge.id, { text: "hi gini" });
+    expect(message.status).toBe("sent");
+    expect(message.target).toBe("chan-1");
+
+    const send = calls.find((c) => c.method === "sendMessage");
+    expect(send).toBeDefined();
+    expect(send?.args).toEqual(["chan-1", "hi gini"]);
+  });
+
+  test("sendMessagingOutput records 'failed' with the API description on send failure", async () => {
+    const config = testConfig("discord-send-fail");
+    const { client } = stubDiscordClient({
+      sendMessage: async () => {
+        throw new Error("Missing Access (code 50001)");
+      }
+    });
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    const message = await sendMessagingOutput(config, bridge.id, { text: "hi" });
+    expect(message.status).toBe("failed");
+    expect(String(message.error)).toContain("Missing Access");
+  });
+
+  test("sendMessagingOutput refuses empty text without hitting the API", async () => {
+    const config = testConfig("discord-send-empty");
+    const { client, calls } = stubDiscordClient();
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    // sendMessagingOutput's top-level guard rejects empty text outright;
+    // verify we never reach the API.
+    await expect(
+      sendMessagingOutput(config, bridge.id, { text: "" })
+    ).rejects.toThrow(/text or a photo/);
+    expect(calls.find((c) => c.method === "sendMessage")).toBeUndefined();
+  });
+
+  test("disableMessagingBridge clears secrets for discord-kind bridges", async () => {
+    const config = testConfig("discord-disable");
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+    await disableMessagingBridge(config, bridge.id);
+    const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    expect(live?.status).toBe("disabled");
+    expect(live?.secretRefs ?? []).toEqual([]);
     expect(readBridgeBotToken(config, live!)).toBeUndefined();
   });
 });

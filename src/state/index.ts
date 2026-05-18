@@ -104,6 +104,7 @@ export {
   createMessagingBridgeRecord,
   createMessagingMessageRecord,
   findOrCreateTelegramChatSession,
+  findOrCreateDiscordChatSession,
   createImportReport,
   createAgentRecord,
   createRelayRecord,

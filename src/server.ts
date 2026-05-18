@@ -11,6 +11,7 @@ import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
 import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
+import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
 
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
@@ -213,6 +214,29 @@ const telegramDone: Promise<void> = (async function telegramReconcileLoop(): Pro
   }
 })();
 
+// Discord inbound poller. Same supervisor shape as Telegram — reconcile
+// per-bridge REST-poll loops against state, drain on SIGTERM. Discord
+// has no long-poll, so each loop polls every configured delivery target
+// on a short cadence and advances a per-channel snowflake watermark in
+// bridge.metadata.lastInboundExternalIds. The reconcile cadence is
+// shared with Telegram by default — a bridge added at runtime gets
+// picked up within one reconcile interval without a restart.
+const discordSupervisor = createDiscordPollerSupervisor(config);
+let discordStopped = false;
+const discordDone: Promise<void> = (async function discordReconcileLoop(): Promise<void> {
+  while (!discordStopped) {
+    try {
+      discordSupervisor.reconcile();
+    } catch (error) {
+      appendLog(config.instance, "messaging.discord.supervisor_error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+    if (discordStopped) break;
+    await Bun.sleep(TELEGRAM_RECONCILE_INTERVAL_MS);
+  }
+})();
+
 // Guard against concurrent SIGTERMs. launchctl bootout, `kill`, and our
 // own self-signal from src/runtime/autostart-refresh.ts can all arrive
 // in quick succession; we only want to drain + consume the refresh
@@ -229,10 +253,13 @@ process.on("SIGTERM", async () => {
   schedulerStopped = true;
   reprobeStopped = true;
   telegramStopped = true;
+  discordStopped = true;
   // Abort all in-flight Telegram long-polls so they don't keep us alive
-  // waiting out their 25s timeout. The .catch below swallows the abort
-  // rejection — it's expected.
+  // waiting out their 25s timeout, and abort every Discord poll cycle
+  // so the runtime exits promptly even if a fetch is in-flight. The
+  // .catch below swallows the abort rejection — it's expected.
   void telegramSupervisor.stopAll().catch(() => {});
+  void discordSupervisor.stopAll().catch(() => {});
   // Drain in-flight HTTP responses BEFORE we start tearing the process
   // down. `server.stop(false)` returns a promise that resolves when
   // active requests have completed writing — without this, a setup POST
@@ -277,6 +304,8 @@ process.on("SIGTERM", async () => {
       reprobeDone.catch(() => {}),
       telegramDone.catch(() => {}),
       telegramSupervisor.stopAll().catch(() => {}),
+      discordDone.catch(() => {}),
+      discordSupervisor.stopAll().catch(() => {}),
       // Close any live headless browser contexts so Chromium child
       // processes exit cleanly with the runtime instead of being reaped
       // by the OS at the very end. Errors are swallowed — a stuck

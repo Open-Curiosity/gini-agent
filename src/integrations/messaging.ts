@@ -4,6 +4,7 @@ import {
   addAudit,
   createMessagingBridgeRecord,
   createMessagingMessageRecord,
+  findOrCreateDiscordChatSession,
   findOrCreateTelegramChatSession,
   mutateState,
   now,
@@ -18,6 +19,11 @@ import {
   type TelegramClientOptions,
   type TelegramPhotoSource
 } from "./telegram";
+import {
+  createDiscordClient,
+  type DiscordClient,
+  type DiscordClientOptions
+} from "./discord";
 import { formatTelegramMarkdownV2 } from "./telegram-format";
 import type { MessagingMessageMedia } from "../types";
 
@@ -28,10 +34,13 @@ function bridgeSecretNamespace(bridgeId: string): string {
   return `messaging.${bridgeId}`;
 }
 
-// Test seam: production code calls Telegram for real, but tests inject a
-// stubbed client so we can exercise send/health/poll without network IO.
+// Test seam: production code calls Telegram / Discord for real, but tests
+// inject stubbed clients so we can exercise send/health/poll without
+// network IO. Each provider gets its own factory so a test can swap one
+// without disturbing the other.
 export interface MessagingDeps {
   telegramClientFactory?: (token: string) => TelegramClient;
+  discordClientFactory?: (token: string) => DiscordClient;
 }
 
 let injectedDeps: MessagingDeps = {};
@@ -45,6 +54,11 @@ export function resetMessagingDeps(): void {
 function telegramClientFor(token: string, options?: TelegramClientOptions): TelegramClient {
   if (injectedDeps.telegramClientFactory) return injectedDeps.telegramClientFactory(token);
   return createTelegramClient(token, options);
+}
+
+function discordClientFor(token: string, options?: DiscordClientOptions): DiscordClient {
+  if (injectedDeps.discordClientFactory) return injectedDeps.discordClientFactory(token);
+  return createDiscordClient(token, options);
 }
 
 // Translate the caller's photo input into a TelegramPhotoSource. Returns
@@ -87,13 +101,14 @@ export async function addMessagingBridge(config: RuntimeConfig, input: Record<st
   const kind = String(input.kind ?? "demo");
   if (!name) throw new Error("Messaging bridge name is required.");
 
-  // Telegram needs a bot token. The credential travels in on the create
-  // payload exactly once and is immediately handed to the encrypted secret
-  // store; the plaintext never lands on the bridge record or in audit
-  // evidence.
-  const botToken = kind === "telegram" && typeof input.botToken === "string" ? input.botToken.trim() : "";
-  if (kind === "telegram" && !botToken) {
-    throw new Error("Telegram bridges require a botToken in the create payload.");
+  // Telegram and Discord both need a bot token. The credential travels
+  // in on the create payload exactly once and is immediately handed to
+  // the encrypted secret store; the plaintext never lands on the bridge
+  // record or in audit evidence.
+  const requiresToken = kind === "telegram" || kind === "discord";
+  const botToken = requiresToken && typeof input.botToken === "string" ? input.botToken.trim() : "";
+  if (requiresToken && !botToken) {
+    throw new Error(`${kind === "telegram" ? "Telegram" : "Discord"} bridges require a botToken in the create payload.`);
   }
 
   const bridge = await mutateState(config.instance, (state) => createMessagingBridgeRecord(state, {
@@ -102,7 +117,7 @@ export async function addMessagingBridge(config: RuntimeConfig, input: Record<st
     deliveryTargets: Array.isArray(input.deliveryTargets) ? input.deliveryTargets.map(String) : []
   }));
 
-  if (kind === "telegram") {
+  if (requiresToken) {
     const ref = writeSecret(config.instance, bridgeSecretNamespace(bridge.id), "bot-token", botToken);
     return mutateState(config.instance, (state) => attachSecretRef(state.messagingBridges, bridge.id, ref));
   }
@@ -155,6 +170,29 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
         nextMessage = error instanceof Error ? error.message : String(error);
       }
     }
+  } else if (bridge.kind === "discord") {
+    const token = readBridgeBotToken(config, bridge);
+    if (!token) {
+      nextStatus = "error";
+      nextMessage = "Discord bot token is missing — recreate the bridge with a botToken.";
+    } else {
+      try {
+        const me = await discordClientFor(token).getMe();
+        nextMetadata.botUsername = me.username;
+        nextMetadata.botId = me.id;
+        // Newer Discord accounts return discriminator "0" and surface
+        // the handle via global_name; older bots keep username#discriminator.
+        const handle = me.global_name && me.global_name.length > 0
+          ? me.global_name
+          : me.discriminator && me.discriminator !== "0"
+            ? `${me.username}#${me.discriminator}`
+            : me.username;
+        nextMessage = `Connected as ${handle}.`;
+      } catch (error) {
+        nextStatus = "error";
+        nextMessage = error instanceof Error ? error.message : String(error);
+      }
+    }
   } else if (bridge.kind === "demo") {
     nextMessage = "Demo messaging bridge is available for local inbound/outbound task messages.";
   } else {
@@ -194,11 +232,12 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
   if (!text && !media) throw new Error("Inbound message text or media is required.");
   const target = String(input.target ?? "local");
 
-  // Telegram inbound runs through the chat-task path so each chat_id
-  // gets a persistent conversation — same surface as the web chat UI.
-  // The session carries a `source` descriptor so the runtime can mirror
-  // assistant replies back out to the originating chat. demo / generic
-  // bridges keep the standalone-task path for tests and CLI parity.
+  // Telegram + Discord inbound run through the chat-task path so each
+  // chat / channel gets a persistent conversation — same surface as the
+  // web chat UI. The session carries a `source` descriptor so the
+  // runtime can mirror assistant replies back out to the originating
+  // chat. demo / generic bridges keep the standalone-task path for
+  // tests and CLI parity.
   let taskId: string;
   let sessionId: string | undefined;
   if (bridge.kind === "telegram") {
@@ -208,6 +247,16 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
     }
     const session = await mutateState(config.instance, (state) =>
       findOrCreateTelegramChatSession(state, bridge.id, chatId)
+    );
+    const result = await submitChatMessage(config, session.id, { content: text });
+    taskId = result.taskId;
+    sessionId = session.id;
+  } else if (bridge.kind === "discord") {
+    if (!target) {
+      throw new Error("Discord inbound target (channel id) is required.");
+    }
+    const session = await mutateState(config.instance, (state) =>
+      findOrCreateDiscordChatSession(state, bridge.id, target)
     );
     const result = await submitChatMessage(config, session.id, { content: text });
     taskId = result.taskId;
@@ -247,6 +296,22 @@ export function findTelegramChatSession(
       session.source?.kind === "telegram" &&
       session.source.bridgeId === bridgeId &&
       session.source.chatId === chatId
+  );
+}
+
+// Same shape, Discord side: resolve the chat session bound to a
+// (bridge, channel) pair so the reply-mirror in the discord poller can
+// look up the dispatch target without re-querying Discord.
+export function findDiscordChatSession(
+  config: RuntimeConfig,
+  bridgeId: string,
+  channelId: string
+): ChatSessionRecord | undefined {
+  return readState(config.instance).chatSessions.find(
+    (session) =>
+      session.source?.kind === "discord" &&
+      session.source.bridgeId === bridgeId &&
+      session.source.channelId === channelId
   );
 }
 
@@ -327,6 +392,31 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
         } else {
           await client.sendMessage(target, formatted, useMdv2 ? { parseMode: "MarkdownV2" } : undefined);
         }
+      } catch (error) {
+        status = "failed";
+        errorMessage = error instanceof Error ? error.message : String(error);
+      }
+    }
+  } else if (status === "sent" && bridge.kind === "discord") {
+    const token = readBridgeBotToken(config, bridge);
+    if (!token) {
+      status = "failed";
+      errorMessage = "Discord bot token is missing.";
+    } else if (photoSource) {
+      // Photo uploads are a follow-up — Discord requires multipart
+      // attachments with a different payload shape. Fail loudly so the
+      // outbound record records the reason instead of silently dropping.
+      status = "failed";
+      errorMessage = "Discord bridge does not support photo sends yet.";
+    } else if (!text) {
+      // Discord rejects content-less messages with HTTP 400. We
+      // intercept before the network call so the audit row carries a
+      // useful reason.
+      status = "failed";
+      errorMessage = "Discord messages require non-empty text.";
+    } else {
+      try {
+        await discordClientFor(token).sendMessage(target, text);
       } catch (error) {
         status = "failed";
         errorMessage = error instanceof Error ? error.message : String(error);
