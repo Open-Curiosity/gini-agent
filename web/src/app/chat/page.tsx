@@ -234,7 +234,7 @@ export default function ChatPage() {
             <Plus className="size-4" /> New chat
           </button>
         </div>
-        <ScrollArea className="flex-1">
+        <ScrollArea className="min-h-0 flex-1">
           <div className="px-2 pb-3">
             {orderedSessions.length === 0 ? (
               <p className="px-2.5 py-3 text-xs text-muted-foreground">No chats yet</p>
@@ -273,7 +273,7 @@ export default function ChatPage() {
               </h1>
             </header>
 
-            <ScrollArea className="flex-1">
+            <ScrollArea className="min-h-0 flex-1">
               <div className="mx-auto w-full max-w-3xl px-4 py-6">
                 {!messages || messages.length === 0 ? (
                   <div className="flex min-h-[40vh] items-center justify-center">
