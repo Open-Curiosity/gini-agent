@@ -17,6 +17,7 @@ import {
   findTelegramChatSession,
   readBridgeBotToken,
   receiveMessagingInput,
+  recordDeniedChatAttempt,
   sendMessagingOutput
 } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
@@ -161,30 +162,29 @@ async function runLoop(
       if (signal.aborted) return;
       const incoming = extractIncomingPayload(update, { botUsername });
       if (incoming) {
-        // Allowlist gate: drop updates from chats the owner hasn't
-        // enrolled. The first private-chat DM auto-pairs as owner when
-        // the allowlist is empty (see authorizeTelegramChat). Denied
-        // updates are dropped silently — we don't acknowledge the
-        // bot's presence to a stranger — but the offset still advances
-        // below so the runtime doesn't replay them on next poll.
-        const access = await authorizeTelegramChat(config, bridgeId, incoming.chatId, incoming.chatType);
-        if (!access.allowed) {
+        // Allowlist gate: every chat — including the owner's first DM
+        // — is denied until explicitly enrolled via `gini messaging
+        // allow`. Denied updates are dropped silently so we don't
+        // acknowledge the bot's presence to a stranger, but we DO
+        // record the attempt on `bridge.metadata.recentDeniedChats`
+        // so the owner can find their own chat_id via `gini messaging
+        // chats <bridge>` without tailing the log. The offset still
+        // advances so the same denied update doesn't get re-fetched.
+        const allowed = await authorizeTelegramChat(config, bridgeId, incoming.chatId);
+        if (!allowed) {
           appendLog(config.instance, "messaging.telegram.chat_denied", {
             bridgeId,
             chatId: incoming.chatId,
             chatType: incoming.chatType,
             senderHandle: incoming.senderHandle
           });
-          // Skip processing. The offset advance below still runs so
-          // the same denied update doesn't get re-fetched forever.
+          await recordDeniedChatAttempt(config, bridgeId, {
+            chatId: incoming.chatId,
+            chatType: incoming.chatType,
+            sender: incoming.senderHandle
+          });
           await advanceOffset(config, bridgeId, update.update_id);
           continue;
-        }
-        if (access.paired) {
-          appendLog(config.instance, "messaging.telegram.chat_paired", {
-            bridgeId,
-            chatId: incoming.chatId
-          });
         }
         // Resolve photo bytes to a local file before submitting the
         // task. A download failure logs and continues with whatever

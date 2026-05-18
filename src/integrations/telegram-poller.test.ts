@@ -116,6 +116,10 @@ describe("telegram poller supervisor", () => {
       deliveryTargets: ["1"],
       botToken: "TOK"
     });
+    // Pre-enroll the chat — no TOFU, so the poller would otherwise
+    // drop this update silently as a denied stranger.
+    const { allowChat } = await import("./messaging");
+    await allowChat(config, bridge.id, 42);
 
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
@@ -177,12 +181,14 @@ describe("telegram poller supervisor", () => {
     };
     setMessagingDeps({ telegramClientFactory: () => client });
 
-    await addMessagingBridge(config, {
+    const bridgeForTyping = await addMessagingBridge(config, {
       name: "tg",
       kind: "telegram",
       deliveryTargets: ["1"],
       botToken: "TOK"
     });
+    const { allowChat: allowChatTyping } = await import("./messaging");
+    await allowChatTyping(config, bridgeForTyping.id, 88);
 
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
@@ -236,6 +242,8 @@ describe("telegram poller supervisor", () => {
       deliveryTargets: ["1"],
       botToken: "TOK"
     });
+    const { allowChat: allowChatPhoto } = await import("./messaging");
+    await allowChatPhoto(config, bridge.id, 77);
 
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
@@ -393,10 +401,10 @@ describe("telegram poller supervisor", () => {
       botToken: "TOK"
     });
 
-    // Owner pairs themselves by DM-ing first; this leaves the allowlist
-    // populated with just [11], so any subsequent chat is a stranger.
-    const { authorizeTelegramChat } = await import("./messaging");
-    await authorizeTelegramChat(config, bridge.id, 11, "private");
+    // Owner enrolls themselves explicitly. The allowlist contains
+    // just [11], so any subsequent chat is a stranger.
+    const { allowChat } = await import("./messaging");
+    await allowChat(config, bridge.id, 11);
 
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
@@ -424,6 +432,15 @@ describe("telegram poller supervisor", () => {
 
     expect(readState(config.instance).messagingMessages.filter((m) => m.bridgeId === bridge.id)).toEqual([]);
     expect(sendCalls).toBe(0);
+
+    // The denied attempt is recorded on the bridge metadata so the
+    // owner can find the chat_id via `gini messaging chats` without
+    // tailing the log.
+    const { listAllowedChats } = await import("./messaging");
+    const view = listAllowedChats(config, bridge.id);
+    const stranger = view.recentDeniedChats.find((entry) => entry.chatId === 9999);
+    expect(stranger).toBeDefined();
+    expect(stranger?.sender).toBe("Stranger");
 
     await supervisor.stopAll();
   });
