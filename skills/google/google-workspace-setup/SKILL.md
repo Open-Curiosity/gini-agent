@@ -137,10 +137,12 @@ For finer-grained gating, list each product the user has agreed to auto-approve:
 You can also patch this at runtime without restarting:
 
 ```bash
-curl -X PATCH http://localhost:<port>/api/settings/auto-approve \
-  -H 'content-type: application/json' \
-  -d '{"patterns":["gws *"]}'
+curl -X PATCH -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"patterns": ["gws *"]}' \
+  http://127.0.0.1:<port>/api/settings/auto-approve
 ```
+
+Set `$TOKEN` from `~/.gini/instances/<instance>/config.json` (the `apiToken` field) or `gini status`. Every `/api/*` route except `POST /api/pairing/claim` is gated on this bearer token. For finer-grained globs, swap `["gws *"]` for per-product entries (e.g. `["gws gmail *", "gws drive *"]`).
 
 Auto-approved commands still leave a `terminal.exec` audit row with `evidence.autoApproved=true`, so the activity trail stays intact.
 
