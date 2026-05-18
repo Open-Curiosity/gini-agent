@@ -310,9 +310,12 @@ describe("telegram poller supervisor", () => {
       botToken: "TOK"
     });
     // Health probe seeds bridge.metadata.botUsername so the poller can
-    // pass it to extractIncomingPayload for mention stripping.
-    const { checkMessagingBridge } = await import("./messaging");
+    // pass it to extractIncomingPayload for mention stripping. Then
+    // enroll the group on the allowlist — groups never auto-pair, so
+    // without this the chat would be silently denied.
+    const { allowChat, checkMessagingBridge } = await import("./messaging");
     await checkMessagingBridge(config, bridge.id);
+    await allowChat(config, bridge.id, -987654321);
 
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
@@ -353,6 +356,74 @@ describe("telegram poller supervisor", () => {
     await waitFor(() => sendCalls.length > 0, "assistant reply mirrored to Telegram", 5000);
     expect(sendCalls[0]?.chatId).toBe("-987654321");
     expect(sendCalls[0]?.opts?.replyToMessageId).toBe(222);
+
+    await supervisor.stopAll();
+  });
+
+  test("strangers' updates are silently dropped (no inbound record), but the offset still advances", async () => {
+    const config = testConfig("poller-stranger-deny");
+    type Pending = { resolve: (u: import("./telegram").TelegramUpdate[]) => void };
+    const queue: Pending[] = [];
+    let sendCalls = 0;
+    const client: TelegramClient = {
+      async getMe() { return { id: 1, is_bot: true, username: "gini_agent_bot" }; },
+      async sendMessage(chatId, text) {
+        sendCalls += 1;
+        return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendPhoto(chatId) {
+        return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
+      },
+      async sendChatAction() { return true as const; },
+      async getFile(fileId) { return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` }; },
+      async downloadFile() { return new Uint8Array().buffer; },
+      getUpdates(_offset, _timeout, signal) {
+        return new Promise((resolve, reject) => {
+          queue.push({ resolve });
+          signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+
+    // Owner pairs themselves by DM-ing first; this leaves the allowlist
+    // populated with just [11], so any subsequent chat is a stranger.
+    const { authorizeTelegramChat } = await import("./messaging");
+    await authorizeTelegramChat(config, bridge.id, 11, "private");
+
+    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    supervisor.reconcile();
+
+    queue.shift()?.resolve([
+      {
+        update_id: 70,
+        message: {
+          message_id: 1,
+          date: 0,
+          chat: { id: 9999, type: "private" },
+          text: "hi can I use this bot",
+          from: { id: 99, is_bot: false, first_name: "Stranger" }
+        }
+      }
+    ]);
+
+    // Wait until the offset advances — the only deterministic signal
+    // that the loop processed the denied update without producing a
+    // messagingMessage record.
+    await waitFor(() => {
+      const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+      return live?.metadata?.lastOffset === 71;
+    }, "offset advanced past denied update", 3000);
+
+    expect(readState(config.instance).messagingMessages.filter((m) => m.bridgeId === bridge.id)).toEqual([]);
+    expect(sendCalls).toBe(0);
 
     await supervisor.stopAll();
   });

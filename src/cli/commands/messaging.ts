@@ -45,5 +45,26 @@ export async function messaging(ctx: CliContext): Promise<void> {
     print(await api(config, id ? `/api/messaging/${encodeURIComponent(id)}/messages` : "/api/messaging/messages"));
     return;
   }
+  if (sub === "allow" || sub === "deny") {
+    const [id, chatIdStr] = restAfter(cliArgs, sub);
+    if (!id || !chatIdStr) {
+      throw new Error(`Usage: gini messaging ${sub} <bridge-id-or-name> <chat-id>`);
+    }
+    const chatId = Number(chatIdStr);
+    if (!Number.isFinite(chatId)) {
+      throw new Error(`chat-id must be a number (got '${chatIdStr}'). Negative ids are valid for groups.`);
+    }
+    print(await api(config, `/api/messaging/${encodeURIComponent(id)}/${sub}`, {
+      method: "POST",
+      body: JSON.stringify({ chatId })
+    }));
+    return;
+  }
+  if (sub === "chats") {
+    const id = restAfter(cliArgs, sub)[0];
+    if (!id) throw new Error("Usage: gini messaging chats <bridge-id-or-name>");
+    print(await api(config, `/api/messaging/${encodeURIComponent(id)}/chats`));
+    return;
+  }
   print(await api(config, "/api/messaging"));
 }
