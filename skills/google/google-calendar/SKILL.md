@@ -104,6 +104,33 @@ gws calendar events delete \
   --params '{"calendarId":"primary","eventId":"<EVENT_ID>"}'
 ```
 
+### Respond to an invite (RSVP)
+
+Google does not expose a dedicated RSVP method — you respond by patching the event and updating the current user's entry in the `attendees` array. That means the agent needs three things first: the `eventId`, the user's own email address (so it can find its attendee entry), and the full existing `attendees` array (so the patch can preserve everyone else).
+
+```bash
+# 1. Look up the signed-in user's email — pull "email" from the JSON response.
+gws auth whoami
+
+# 2. Fetch the event to read the existing attendees array.
+gws calendar events get \
+  --params '{"calendarId":"primary","eventId":"<EVENT_ID>"}'
+
+# 3. Patch the event with the full attendees array, flipping just the
+#    current user's responseStatus to accepted | declined | tentative.
+gws calendar events patch \
+  --params '{"calendarId":"primary","eventId":"<EVENT_ID>","sendUpdates":"all"}' \
+  --json '{
+    "attendees": [
+      {"email":"alice@example.com"},
+      {"email":"bob@example.com"},
+      {"email":"me@example.com","responseStatus":"accepted"}
+    ]
+  }'
+```
+
+Set `sendUpdates` to `"all"` (notify everyone), `"externalOnly"`, or `"none"` based on what the user wants. RSVP changes always notify the organizer when `sendUpdates` is `"all"`.
+
 ### Find free time
 
 ```bash
@@ -130,11 +157,12 @@ gws calendar acl insert --params '{"calendarId":"primary"}' \
 
 1. Calendar events are **time-bound things on a schedule** — meetings, appointments, focus blocks. For personal to-dos that should appear on the user's iPhone, prefer `apple-reminders`. For agent-internal alerts ("remind me in 2 hours"), use the cronjob tool. Confirm intent before deciding which.
 2. Every `events.insert`, `events.patch`, `events.delete`, `+insert` is a write. Confirm summary, start/end (with timezone), attendees, and whether to send notifications before invoking, even when `gws *` is auto-approved.
-3. Use RFC 3339 times with an explicit offset on `+insert` and `events.insert`. Naked local times silently drift across DST boundaries.
-4. Prefer `+insert` over hand-rolling `events.insert --json` when the user just wants a normal event. The helper sets sane defaults (visibility, reminders) without forcing the agent to learn the full body schema.
-5. Adding `--meet` to `+insert` creates a Google Meet space attached to the event — this is the simplest way to give the user a join link. Do not separately call `google-meet` to create a standalone space when an event will exist anyway.
-6. When listing events, set `singleEvents:true` and `orderBy:"startTime"` so recurring events expand into individual instances and arrive in chronological order. Without those, the response is grouped by recurrence master and confusing to summarize.
-7. Free/busy queries are read-only and cheap — prefer them over scraping multiple `events.list` calls when the user only needs availability, not event content.
-8. Respect the calendar's timezone, not just the host's. `+agenda` defaults to the Google account timezone; only override with `--timezone` when the user is travelling.
+3. When the user says "accept" / "decline" / "tentative" on a meeting, confirm **which event** and **which response status** before patching. Resolve the user's own email via `gws auth whoami` (or read it from the event's `attendees` array) so the patch updates the right attendee, and re-send the full `attendees` array so other invitees aren't dropped. RSVP changes email-notify the organizer when `sendUpdates` is `"all"`.
+4. Use RFC 3339 times with an explicit offset on `+insert` and `events.insert`. Naked local times silently drift across DST boundaries.
+5. Prefer `+insert` over hand-rolling `events.insert --json` when the user just wants a normal event. The helper sets sane defaults (visibility, reminders) without forcing the agent to learn the full body schema.
+6. Adding `--meet` to `+insert` creates a Google Meet space attached to the event — this is the simplest way to give the user a join link. Do not separately call `google-meet` to create a standalone space when an event will exist anyway.
+7. When listing events, set `singleEvents:true` and `orderBy:"startTime"` so recurring events expand into individual instances and arrive in chronological order. Without those, the response is grouped by recurrence master and confusing to summarize.
+8. Free/busy queries are read-only and cheap — prefer them over scraping multiple `events.list` calls when the user only needs availability, not event content.
+9. Respect the calendar's timezone, not just the host's. `+agenda` defaults to the Google account timezone; only override with `--timezone` when the user is travelling.
 
 For flags not shown here, run `gws calendar --help` or `gws calendar <verb> --help` (e.g. `gws calendar +insert --help`).
