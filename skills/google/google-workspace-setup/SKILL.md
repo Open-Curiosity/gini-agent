@@ -100,7 +100,7 @@ gws auth login --scopes "https://www.googleapis.com/auth/gmail.readonly,https://
 
 Recommended starting scopes per product. The first column is the `-s` shorthand (Service column from `gws auth login --help`); the second column is the full URL to pass to `--scopes` when picking a non-uniform mix:
 
-- **Gmail** — `-s gmail` ↔ `https://www.googleapis.com/auth/gmail` (or `.readonly` / `.send` / `.modify` URLs for narrower picks).
+- **Gmail (full, incl. permanent delete)** — `-s gmail` ↔ `https://mail.google.com/` (the actual "full access" Gmail scope; there is no `auth/gmail` URL). Prefer `https://www.googleapis.com/auth/gmail.readonly` / `.send` / `.modify` / `.compose` for narrower picks.
 - **Drive** — `-s drive` ↔ `https://www.googleapis.com/auth/drive` (`.file`, `.readonly`, `.metadata.readonly` available as full URLs).
 - **Calendar** — `-s calendar` ↔ `https://www.googleapis.com/auth/calendar` (`.events`, `.readonly`, `.freebusy` available as full URLs).
 - **Docs** — `-s docs` ↔ `https://www.googleapis.com/auth/documents` (`.readonly` available as a full URL when the agent only needs to read).
