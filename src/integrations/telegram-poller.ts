@@ -148,9 +148,12 @@ async function runLoop(
 
     if (updates.length === 0) continue;
 
+    const botUsername =
+      typeof bridge.metadata?.botUsername === "string" ? bridge.metadata.botUsername : undefined;
+
     for (const update of updates) {
       if (signal.aborted) return;
-      const incoming = extractIncomingPayload(update);
+      const incoming = extractIncomingPayload(update, { botUsername });
       if (incoming) {
         // Resolve photo bytes to a local file before submitting the
         // task. A download failure logs and continues with whatever
@@ -185,7 +188,8 @@ async function runLoop(
               record.taskId,
               incoming.chatId,
               client,
-              signal
+              signal,
+              incoming.messageId
             ).catch((error) => {
               appendLog(config.instance, "messaging.telegram.typing_error", {
                 bridgeId,
@@ -230,7 +234,8 @@ async function maintainTypingAndMirrorReply(
   taskId: string,
   chatId: number,
   client: TelegramClient,
-  signal: AbortSignal
+  signal: AbortSignal,
+  replyToMessageId?: number
 ): Promise<void> {
   await maintainTypingIndicator(config, taskId, chatId, client, signal);
   if (signal.aborted) return;
@@ -261,7 +266,8 @@ async function maintainTypingAndMirrorReply(
   try {
     await sendMessagingOutput(config, bridgeId, {
       text: replyText,
-      target: session.source.target
+      target: session.source.target,
+      ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
     });
   } catch (error) {
     appendLog(config.instance, "messaging.telegram.reply_error", {
@@ -326,15 +332,24 @@ async function downloadIncomingPhoto(
   };
 }
 
-// Compose the input string handed to submitTask. When a photo arrives
-// we prefix the caption (or empty body) with a single line pointing at
-// the saved file, so an agent inspecting `task.input` can pick up the
-// attachment via the file toolset without changing how task inputs
-// flow through the runtime.
+// Compose the input string handed to submitTask. Two prefixes can land
+// on the message before the body:
+//   - `[photo: <path>]` when an inbound photo was captured to disk, so
+//     the agent's file toolset can inspect the attachment without any
+//     changes to how task inputs flow through the runtime.
+//   - `<sender>:` for group/supergroup chats where multiple people can
+//     speak. The agent needs to know whose turn it is so it can address
+//     the right person (and not confuse one user's question with
+//     another's reply).
 function buildTaskInput(incoming: IncomingPayload, savedPath: string | undefined): string {
-  if (!savedPath) return incoming.text;
-  const header = `[photo: ${savedPath}]`;
-  return incoming.text ? `${header}\n${incoming.text}` : header;
+  const parts: string[] = [];
+  if (savedPath) parts.push(`[photo: ${savedPath}]`);
+  const isGroupChat = incoming.chatType === "group" || incoming.chatType === "supergroup";
+  const body = isGroupChat && incoming.senderHandle
+    ? `${incoming.senderHandle}: ${incoming.text}`
+    : incoming.text;
+  if (body) parts.push(body);
+  return parts.join("\n");
 }
 
 async function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {

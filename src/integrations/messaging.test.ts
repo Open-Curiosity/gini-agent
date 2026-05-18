@@ -170,6 +170,22 @@ describe("messaging telegram wiring", () => {
     expect(opts?.parseMode).toBe("MarkdownV2");
   });
 
+  test("replyToMessageId on send threads the reply onto an inbound message", async () => {
+    const config = testConfig("telegram-send-reply-to");
+    const { client, calls } = stubClient();
+    setMessagingDeps({ telegramClientFactory: () => client });
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+    await sendMessagingOutput(config, bridge.id, { text: "hi", replyToMessageId: 99 });
+    const [, , opts] = calls[0]!.args as [string, string, { parseMode?: string; replyToMessageId?: number } | undefined];
+    expect(opts?.replyToMessageId).toBe(99);
+    expect(opts?.parseMode).toBe("MarkdownV2");
+  });
+
   test("parseMode=\"none\" skips the transform and sends raw text", async () => {
     const config = testConfig("telegram-send-raw");
     const { client, calls } = stubClient();
