@@ -161,7 +161,11 @@ export function createPlanStep(
   return item;
 }
 
-export function createChatSession(state: RuntimeState, title: string): ChatSessionRecord {
+export function createChatSession(
+  state: RuntimeState,
+  title: string,
+  source?: ChatSessionRecord["source"]
+): ChatSessionRecord {
   const at = now();
   const session: ChatSessionRecord = {
     id: id("chat"),
@@ -171,7 +175,8 @@ export function createChatSession(state: RuntimeState, title: string): ChatSessi
     updatedAt: at,
     messageIds: [],
     taskIds: [],
-    runIds: []
+    runIds: [],
+    ...(source ? { source } : {})
   };
   state.chatSessions.unshift(session);
   appendEvent(state, {
@@ -182,6 +187,31 @@ export function createChatSession(state: RuntimeState, title: string): ChatSessi
     summary: `Chat session created: ${session.title}`
   });
   return session;
+}
+
+// Find an existing chat session bound to a (bridge, chat_id) pair, or
+// create one. We key on the bridge id + chat id so that if a user
+// disables and re-creates the bridge, conversations from a different
+// bridge id start fresh (which matches the user's mental model: a new
+// bridge is a new bot).
+export function findOrCreateTelegramChatSession(
+  state: RuntimeState,
+  bridgeId: string,
+  chatId: number
+): ChatSessionRecord {
+  const target = String(chatId);
+  const existing = state.chatSessions.find((session) =>
+    session.source?.kind === "telegram" &&
+    session.source.bridgeId === bridgeId &&
+    session.source.chatId === chatId
+  );
+  if (existing) return existing;
+  return createChatSession(state, `Telegram chat ${target}`, {
+    kind: "telegram",
+    bridgeId,
+    chatId,
+    target
+  });
 }
 
 export function deleteChatSession(state: RuntimeState, id: string): ChatSessionRecord {

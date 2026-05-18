@@ -1,6 +1,15 @@
-import type { ConnectorSecretRef, MessagingBridgeRecord, RuntimeConfig } from "../types";
+import type { ChatSessionRecord, ConnectorSecretRef, MessagingBridgeRecord, RuntimeConfig } from "../types";
 import { submitTask } from "../agent";
-import { addAudit, createMessagingBridgeRecord, createMessagingMessageRecord, mutateState, now, readState } from "../state";
+import {
+  addAudit,
+  createMessagingBridgeRecord,
+  createMessagingMessageRecord,
+  findOrCreateTelegramChatSession,
+  mutateState,
+  now,
+  readState
+} from "../state";
+import { submitChatMessage } from "../execution/chat";
 import { deleteConnectorSecrets, readSecret, writeSecret } from "../state/secrets";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import {
@@ -182,21 +191,63 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
   if (bridge.status !== "configured") throw new Error(`Messaging bridge is not configured: ${idOrName}`);
   const text = String(input.text ?? "").trim();
   const media = parseInboundMedia(input.media);
-  // Photo-only messages (no caption) still need to produce a task — the
-  // text body will already carry a `[photo: …]` header inserted by the
-  // caller (the poller), so empty here only happens for malformed input.
   if (!text && !media) throw new Error("Inbound message text or media is required.");
   const target = String(input.target ?? "local");
-  const task = await submitTask(config, text);
-  return mutateState(config.instance, (state) => createMessagingMessageRecord(state, {
-    bridgeId: bridge.id,
-    direction: "inbound",
-    status: "received",
-    target,
-    text,
-    taskId: task.id,
-    media
-  }));
+
+  // Telegram inbound runs through the chat-task path so each chat_id
+  // gets a persistent conversation — same surface as the web chat UI.
+  // The session carries a `source` descriptor so the runtime can mirror
+  // assistant replies back out to the originating chat. demo / generic
+  // bridges keep the standalone-task path for tests and CLI parity.
+  let taskId: string;
+  let sessionId: string | undefined;
+  if (bridge.kind === "telegram") {
+    const chatId = Number.parseInt(target, 10);
+    if (!Number.isFinite(chatId)) {
+      throw new Error(`Telegram inbound target must be a numeric chat_id (got '${target}').`);
+    }
+    const session = await mutateState(config.instance, (state) =>
+      findOrCreateTelegramChatSession(state, bridge.id, chatId)
+    );
+    const result = await submitChatMessage(config, session.id, { content: text });
+    taskId = result.taskId;
+    sessionId = session.id;
+  } else {
+    const task = await submitTask(config, text);
+    taskId = task.id;
+  }
+
+  // The chat session id is preserved on the message record itself —
+  // see notificationId field reuse below would be wrong, so we just
+  // re-resolve via taskId when the reply mirror needs it.
+  void sessionId;
+  return mutateState(config.instance, (state) =>
+    createMessagingMessageRecord(state, {
+      bridgeId: bridge.id,
+      direction: "inbound",
+      status: "received",
+      target,
+      text,
+      taskId,
+      media
+    })
+  );
+}
+
+// Resolve a telegram-sourced chat session from a (bridge, chat_id)
+// pair. The reply-mirror loop calls this to find where to land the
+// assistant message and where to dispatch the outbound reply.
+export function findTelegramChatSession(
+  config: RuntimeConfig,
+  bridgeId: string,
+  chatId: number
+): ChatSessionRecord | undefined {
+  return readState(config.instance).chatSessions.find(
+    (session) =>
+      session.source?.kind === "telegram" &&
+      session.source.bridgeId === bridgeId &&
+      session.source.chatId === chatId
+  );
 }
 
 function parseInboundMedia(raw: unknown): MessagingMessageMedia | undefined {
