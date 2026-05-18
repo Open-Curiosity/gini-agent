@@ -18,7 +18,8 @@ Use `gws drive` to search, list, upload, download, copy, and share files and fol
 
 ## Prerequisites
 
-- `gws` installed and authenticated. If `gws auth login` has never been run on this instance, invoke the `google-workspace-setup` skill first.
+- `gws` installed and authenticated. If `gws` is not on PATH, or `gws auth status` reports no authenticated user, call `read_skill` with name `google-workspace-setup` and walk the user through onboarding before doing anything else.
+- If any `gws drive ...` call fails with `command not found` / ENOENT, or an auth-related error (HTTP 401, "no credentials", "scope required"), STOP — do NOT report failure to the user. Instead call `read_skill` with `google-workspace-setup` and run that skill's onboarding flow. Only report failure if the setup skill itself blocks.
 - OAuth scopes the user picked at login must cover the verbs the agent will use:
   - `drive.file` — see and modify only files the agent creates or that the user explicitly opens (narrowest, recommended for untrusted agents)
   - `drive.readonly` — read all of the user's files and metadata
