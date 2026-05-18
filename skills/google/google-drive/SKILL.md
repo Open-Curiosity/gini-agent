@@ -138,9 +138,11 @@ gws drive files delete --params '{"fileId":"<FILE_ID>"}'
 
 ### Shared drives
 
+Generate a fresh UUID per call, e.g. `uuidgen`. `drives.create` uses `requestId` as an idempotency token — reusing the same value collides.
+
 ```bash
 gws drive drives list
-gws drive drives create --params '{"requestId":"$(uuidgen)"}' --json '{"name":"Marketing"}'
+gws drive drives create --params '{"requestId":"<REQUEST_ID>"}' --json '{"name":"Marketing"}'
 ```
 
 ## Rules
