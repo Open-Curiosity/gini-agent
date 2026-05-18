@@ -103,6 +103,7 @@ export {
   createMcpServerRecord,
   createMessagingBridgeRecord,
   createMessagingMessageRecord,
+  findOrCreateTelegramChatSession,
   createImportReport,
   createAgentRecord,
   createRelayRecord,

@@ -349,7 +349,17 @@ export interface ChatSessionRecord {
   taskIds: string[];
   runIds: string[];
   summary?: string;
+  // Origin descriptor when the session was created by a non-UI surface.
+  // The web chat omits this; the Telegram bridge sets `kind: "telegram"`
+  // so the runtime can mirror assistant replies back out to the chat the
+  // user started in. The same shape generalizes to future bridges
+  // (Discord, Slack, …) — `target` is the bridge-specific addressing
+  // string passed back to sendMessagingOutput.
+  source?: ChatSessionSource;
 }
+
+export type ChatSessionSource =
+  | { kind: "telegram"; bridgeId: string; chatId: number; target: string };
 
 export interface ChatMessageRecord {
   id: string;

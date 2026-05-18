@@ -273,6 +273,65 @@ describe("messaging telegram wiring", () => {
     await expect(sendMessagingOutput(config, bridge.id, {})).rejects.toThrow(/text or a photo/);
   });
 
+  test("telegram inbound runs through a per-chat ChatSession (creates once, reuses on next message)", async () => {
+    const config = testConfig("telegram-inbound-chat-session");
+    const { client } = stubClient();
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const { receiveMessagingInput, findTelegramChatSession } = await import("./messaging");
+    const { readState } = await import("../state");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+
+    await receiveMessagingInput(config, bridge.id, { text: "first", target: "555" });
+    await receiveMessagingInput(config, bridge.id, { text: "second", target: "555" });
+
+    const sessions = readState(config.instance).chatSessions;
+    const telegramSessions = sessions.filter(
+      (s) => s.source?.kind === "telegram" && s.source.bridgeId === bridge.id && s.source.chatId === 555
+    );
+    expect(telegramSessions).toHaveLength(1);
+    expect(telegramSessions[0]?.source).toEqual({
+      kind: "telegram",
+      bridgeId: bridge.id,
+      chatId: 555,
+      target: "555"
+    });
+
+    const found = findTelegramChatSession(config, bridge.id, 555);
+    expect(found?.id).toBe(telegramSessions[0]!.id);
+
+    // Both user turns landed in the same session.
+    const userMessages = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === telegramSessions[0]!.id && m.role === "user"
+    );
+    expect(userMessages.map((m) => m.content)).toEqual(["first", "second"]);
+  });
+
+  test("non-telegram bridges keep using the standalone-task path", async () => {
+    const config = testConfig("messaging-demo-no-chat-session");
+    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
+
+    const { receiveMessagingInput } = await import("./messaging");
+    const { readState } = await import("../state");
+
+    // Demo bridges don't need a token and don't go through chat sessions.
+    const bridge = await addMessagingBridge(config, {
+      name: "local",
+      kind: "demo",
+      deliveryTargets: ["local"]
+    });
+    await receiveMessagingInput(config, bridge.id, { text: "hello", target: "local" });
+
+    const sessions = readState(config.instance).chatSessions;
+    expect(sessions.filter((s) => s.source !== undefined)).toEqual([]);
+  });
+
   test("disableMessagingBridge erases the stored bot token", async () => {
     const config = testConfig("telegram-disable");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });

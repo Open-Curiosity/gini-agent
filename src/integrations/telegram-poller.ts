@@ -12,7 +12,8 @@ import { extname, join } from "node:path";
 import type { MessagingBridgeRecord, MessagingMessageMedia, RuntimeConfig } from "../types";
 import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { instanceRoot } from "../paths";
-import { readBridgeBotToken, receiveMessagingInput } from "./messaging";
+import { findTelegramChatSession, readBridgeBotToken, receiveMessagingInput, sendMessagingOutput } from "./messaging";
+import { syncChatTaskResult } from "../execution/chat";
 import {
   createTelegramClient,
   extractIncomingPayload,
@@ -172,19 +173,25 @@ async function runLoop(
             target: String(incoming.chatId),
             media: downloaded?.media
           });
-          // Surface a "typing…" indicator in the chat while the agent
-          // works on the just-submitted task. The pulse is best-effort
-          // and runs detached so a slow chat_action call doesn't block
-          // the next update.
+          // Surface a "typing…" indicator while the agent works, and
+          // once the task settles mirror the assistant reply back to
+          // the originating chat. The pulse is best-effort and runs
+          // detached so a slow chat_action call doesn't block the
+          // next update.
           if (record.taskId) {
-            void maintainTypingIndicator(config, record.taskId, incoming.chatId, client, signal).catch(
-              (error) => {
-                appendLog(config.instance, "messaging.telegram.typing_error", {
-                  bridgeId,
-                  error: error instanceof Error ? error.message : String(error)
-                });
-              }
-            );
+            void maintainTypingAndMirrorReply(
+              config,
+              bridgeId,
+              record.taskId,
+              incoming.chatId,
+              client,
+              signal
+            ).catch((error) => {
+              appendLog(config.instance, "messaging.telegram.typing_error", {
+                bridgeId,
+                error: error instanceof Error ? error.message : String(error)
+              });
+            });
           }
         } catch (error) {
           appendLog(config.instance, "messaging.telegram.receive_error", {
@@ -209,6 +216,60 @@ async function runLoop(
 function readLastOffset(bridge: MessagingBridgeRecord): number | undefined {
   const raw = bridge.metadata?.lastOffset;
   return typeof raw === "number" ? raw : undefined;
+}
+
+// Combined typing pulse + reply mirror. While the task is non-terminal
+// we refresh sendChatAction("typing") on a ~4s cadence so the chat
+// shows "is typing…". Once the task settles we sync the assistant
+// message into the chat session (the web UI's sync path) and dispatch
+// the resulting text back to Telegram via sendMessagingOutput, which
+// applies the MarkdownV2 transform and records an outbound message.
+async function maintainTypingAndMirrorReply(
+  config: RuntimeConfig,
+  bridgeId: string,
+  taskId: string,
+  chatId: number,
+  client: TelegramClient,
+  signal: AbortSignal
+): Promise<void> {
+  await maintainTypingIndicator(config, taskId, chatId, client, signal);
+  if (signal.aborted) return;
+
+  // Resolve the chat session for this (bridge, chat) so we can land
+  // the assistant message and look up the dispatch target. The session
+  // exists because receiveMessagingInput went through the chat path.
+  const session = findTelegramChatSession(config, bridgeId, chatId);
+  if (!session || !session.source || session.source.kind !== "telegram") return;
+
+  let replyText: string | undefined;
+  try {
+    const message = await syncChatTaskResult(config, session.id, taskId);
+    if (message && message.role === "assistant") replyText = message.content;
+  } catch (error) {
+    appendLog(config.instance, "messaging.telegram.sync_error", {
+      bridgeId,
+      taskId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return;
+  }
+
+  // Empty replies or [SILENT]-suppressed messages produce nothing to
+  // dispatch — leave the inbound record in place but stay quiet.
+  if (!replyText || replyText.trim().length === 0) return;
+
+  try {
+    await sendMessagingOutput(config, bridgeId, {
+      text: replyText,
+      target: session.source.target
+    });
+  } catch (error) {
+    appendLog(config.instance, "messaging.telegram.reply_error", {
+      bridgeId,
+      taskId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
 }
 
 // Refresh sendChatAction("typing") on a ~4s cadence for as long as the
