@@ -698,6 +698,375 @@ describe("cron lifecycle", () => {
     expect(readState(config.instance).jobs).toHaveLength(0);
   });
 
+  test("list_jobs dispatch returns a compact summary of all jobs", async () => {
+    const config = testConfig("jobs-list-tool");
+    const handler = createHandler(config);
+    // Two jobs of mixed schedule shape so we can confirm both cron and
+    // interval drivers surface correctly in the summary.
+    await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "alpha-reminder", script: "true", intervalSeconds: 60 })
+    });
+    await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "beta-daily",
+        script: "true",
+        cronExpression: "0 9 * * *",
+        cronTimezone: "America/Los_Angeles"
+      })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "list_jobs",
+      "call_list_1",
+      JSON.stringify({})
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("expected sync result");
+    const parsed = JSON.parse(result.result) as { count: number; jobs: Array<Record<string, unknown>> };
+    expect(parsed.count).toBe(2);
+    const names = new Set(parsed.jobs.map((j) => j.name));
+    expect(names.has("alpha-reminder")).toBe(true);
+    expect(names.has("beta-daily")).toBe(true);
+    const cronEntry = parsed.jobs.find((j) => j.name === "beta-daily");
+    expect(cronEntry?.cronExpression).toBe("0 9 * * *");
+    expect(cronEntry?.cronTimezone).toBe("America/Los_Angeles");
+
+    // Audit row for the listing call so reviewers can see when the agent
+    // pulled the job inventory.
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.listed"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.total).toBe(2);
+    expect(audit?.evidence?.returned).toBe(2);
+  });
+
+  test("list_jobs dispatch filters by nameContains (case-insensitive)", async () => {
+    const config = testConfig("jobs-list-tool-filter");
+    const handler = createHandler(config);
+    await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "Daily Report", script: "true", intervalSeconds: 60 })
+    });
+    await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "cake-reminder", script: "true", intervalSeconds: 60 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "list_jobs",
+      "call_list_filter",
+      JSON.stringify({ nameContains: "DAILY" })
+    );
+    if (result.kind !== "sync") throw new Error("expected sync result");
+    const parsed = JSON.parse(result.result) as { count: number; jobs: Array<Record<string, unknown>> };
+    expect(parsed.count).toBe(1);
+    expect(parsed.jobs[0]?.name).toBe("Daily Report");
+  });
+
+  test("list_jobs dispatch rejects non-string nameContains", async () => {
+    const config = testConfig("jobs-list-tool-bad-filter");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "list_jobs",
+        "call_bad_filter",
+        JSON.stringify({ nameContains: 7 })
+      )
+    ).rejects.toThrow(/nameContains must be a string/);
+  });
+
+  test("list_jobs dispatch truncates long prompts to ~200 chars", async () => {
+    const config = testConfig("jobs-list-tool-truncate");
+    const handler = createHandler(config);
+    const longPrompt = "x".repeat(500);
+    await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "long", prompt: longPrompt, intervalSeconds: 60 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "list_jobs",
+      "call_truncate",
+      JSON.stringify({})
+    );
+    if (result.kind !== "sync") throw new Error("expected sync result");
+    const parsed = JSON.parse(result.result) as { jobs: Array<{ prompt: string }> };
+    // Truncated form is 200 chars + ellipsis marker.
+    expect(parsed.jobs[0]?.prompt.length).toBeLessThan(longPrompt.length);
+    expect(parsed.jobs[0]?.prompt.endsWith("…")).toBe(true);
+  });
+
+  test("update_job dispatch patches schedule and writes job.updated audit", async () => {
+    const config = testConfig("jobs-update-tool");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "to-update", script: "true", intervalSeconds: 60 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "update_job",
+      "call_update_1",
+      JSON.stringify({
+        jobId: job.id,
+        cronExpression: "0 23 * * *",
+        cronTimezone: "America/Los_Angeles",
+        intervalSeconds: null,
+        name: "renamed"
+      })
+    );
+    expect(result.kind).toBe("sync");
+    const after = readState(config.instance).jobs.find((j) => j.id === job.id);
+    expect(after?.cronExpression).toBe("0 23 * * *");
+    expect(after?.cronTimezone).toBe("America/Los_Angeles");
+    expect(after?.intervalSeconds).toBeUndefined();
+    expect(after?.name).toBe("renamed");
+
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.updated" && event.target === job.id && event.actor === "agent"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.jobId).toBe(job.id);
+    expect(audit?.evidence?.appliedFields).toContain("cronExpression");
+    expect(audit?.evidence?.appliedFields).toContain("name");
+    // Previous schedule preserved so a reviewer can see what the patch
+    // replaced.
+    expect((audit?.evidence?.previousSchedule as Record<string, unknown>)?.intervalSeconds).toBe(60);
+  });
+
+  test("update_job dispatch can pause a running job", async () => {
+    const config = testConfig("jobs-update-tool-pause");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "to-pause", script: "true", intervalSeconds: 60 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "update_job",
+      "call_pause",
+      JSON.stringify({ jobId: job.id, status: "paused" })
+    );
+    expect(result.kind).toBe("sync");
+    const after = readState(config.instance).jobs.find((j) => j.id === job.id);
+    expect(after?.status).toBe("paused");
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.updated" && event.target === job.id && event.actor === "agent"
+    );
+    expect(audit?.evidence?.appliedFields).toContain("status");
+  });
+
+  test("update_job dispatch rejects missing jobId", async () => {
+    const config = testConfig("jobs-update-tool-bad-1");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "update_job",
+        "call_bad_no_id",
+        JSON.stringify({ name: "x" })
+      )
+    ).rejects.toThrow(/jobId/);
+  });
+
+  test("update_job dispatch rejects empty patch", async () => {
+    const config = testConfig("jobs-update-tool-empty");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "empty-patch", script: "true", intervalSeconds: 60 })
+    });
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "update_job",
+        "call_empty_patch",
+        JSON.stringify({ jobId: job.id })
+      )
+    ).rejects.toThrow(/at least one field/);
+  });
+
+  test("update_job dispatch rejects unknown jobId", async () => {
+    const config = testConfig("jobs-update-tool-missing");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "update_job",
+        "call_unknown",
+        JSON.stringify({ jobId: "job_does_not_exist", name: "x" })
+      )
+    ).rejects.toThrow(/Job not found/);
+  });
+
+  test("update_job dispatch rejects invalid status value", async () => {
+    const config = testConfig("jobs-update-tool-bad-status");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "bad-status", script: "true", intervalSeconds: 60 })
+    });
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "update_job",
+        "call_bad_status",
+        JSON.stringify({ jobId: job.id, status: "failed" })
+      )
+    ).rejects.toThrow(/status must be 'active' or 'paused'/);
+  });
+
+  test("delete_job dispatch removes the job and writes job.deleted audit", async () => {
+    const config = testConfig("jobs-delete-tool");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "to-delete",
+        script: "true",
+        cronExpression: "0 9 * * *",
+        cronTimezone: "UTC"
+      })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "delete_job",
+      "call_delete_1",
+      JSON.stringify({ jobId: job.id })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toContain(job.id);
+      expect(result.result).toContain("to-delete");
+    }
+
+    expect(readState(config.instance).jobs.find((j) => j.id === job.id)).toBeUndefined();
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.deleted" && event.target === job.id && event.actor === "agent"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.jobId).toBe(job.id);
+    expect(audit?.evidence?.name).toBe("to-delete");
+    // Previous schedule shape captured so a reviewer can reconstruct the
+    // job from the audit row alone.
+    const prev = audit?.evidence?.previousSchedule as Record<string, unknown> | undefined;
+    expect(prev?.cronExpression).toBe("0 9 * * *");
+    expect(prev?.cronTimezone).toBe("UTC");
+  });
+
+  test("delete_job dispatch rejects missing jobId", async () => {
+    const config = testConfig("jobs-delete-tool-bad-1");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "delete_job",
+        "call_delete_bad",
+        JSON.stringify({})
+      )
+    ).rejects.toThrow(/jobId/);
+  });
+
+  test("delete_job dispatch rejects unknown jobId", async () => {
+    const config = testConfig("jobs-delete-tool-missing");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "delete_job",
+        "call_delete_unknown",
+        JSON.stringify({ jobId: "job_nope" })
+      )
+    ).rejects.toThrow(/Job not found/);
+  });
+
   test("scheduled prompt job with chatSessionId delivers an assistant chat message", async () => {
     // End-to-end test: create a job linked to a chat session, force its
     // nextRunAt into the past, let runDueJobs claim + dispatch it, wait
