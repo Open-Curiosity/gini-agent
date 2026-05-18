@@ -55,6 +55,22 @@ describe("telegram client", () => {
     expect(payload).toEqual({ offset: 101, timeout: 25, allowed_updates: ["message"] });
   });
 
+  test("sendChatAction posts chat_id and action and returns true", async () => {
+    let payload: Record<string, unknown> = {};
+    let observedUrl = "";
+    const client = createTelegramClient("TOK", {
+      fetchImpl: stubFetch((url, init) => {
+        observedUrl = url;
+        payload = JSON.parse(String(init.body));
+        return { ok: true, result: true };
+      })
+    });
+    const ok = await client.sendChatAction(7, "typing");
+    expect(observedUrl.endsWith("/botTOK/sendChatAction")).toBe(true);
+    expect(payload).toEqual({ chat_id: 7, action: "typing" });
+    expect(ok).toBe(true);
+  });
+
   test("getUpdates omits offset when undefined (first poll)", async () => {
     let payload: Record<string, unknown> = {};
     const client = createTelegramClient("TOK", {
