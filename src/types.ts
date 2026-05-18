@@ -477,7 +477,7 @@ export interface MessagingBridgeRecord {
   // so each kind can evolve without forcing a schema migration on the
   // others. Current shapes:
   //   telegram: { botUsername, botId, lastOffset }
-  //   discord:  { botUsername, botId, lastInboundExternalIds: Record<channelId, snowflake> }
+  //   discord:  { botUsername, botId, globalName?, lastInboundExternalIds: Record<channelId, snowflake> }
   metadata?: Record<string, unknown>;
 }
 

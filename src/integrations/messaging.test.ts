@@ -619,6 +619,96 @@ describe("messaging discord wiring", () => {
     await waitForTaskSettled(config, [first.taskId!, second.taskId!], isTerminalTaskStatus);
   });
 
+  test("addMessagingBridge rejects bot tokens with non-printable / whitespace characters", async () => {
+    // Without this gate, a token containing a control char would be
+    // accepted, stored, and then leak via the eventual fetch error
+    // (Bun echoes the auth header value in its rejection message,
+    // which we'd persist to bridge.message).
+    const config = testConfig("discord-bad-token");
+
+    await expect(
+      addMessagingBridge(config, {
+        name: "disc",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "valid-prefix\ninjected"
+      })
+    ).rejects.toThrow(/invalid characters/);
+
+    await expect(
+      addMessagingBridge(config, {
+        name: "disc",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "valid prefix space"
+      })
+    ).rejects.toThrow(/invalid characters/);
+
+    // Same gate applies to Telegram tokens.
+    await expect(
+      addMessagingBridge(config, {
+        name: "tg",
+        kind: "telegram",
+        deliveryTargets: ["1"],
+        botToken: "valid-prefix\rinjected"
+      })
+    ).rejects.toThrow(/invalid characters/);
+  });
+
+  test("checkMessagingBridge marks status='error' when the underlying send error mentions the auth header (token is redacted)", async () => {
+    // Belt-and-suspenders for the security fix: even if a future
+    // code path lets a token reach a fetch and the underlying
+    // transport echoes the auth header in its error, we redact it
+    // before landing in state.
+    const config = testConfig("discord-redact-error");
+    const { client } = stubDiscordClient({
+      getMe: async () => {
+        throw new Error("Header 'authorization' has invalid value: 'Bot SUPER_SECRET_TOKEN_LEAK'");
+      }
+    });
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "valid-prefix"
+    });
+
+    const checked = await checkMessagingBridge(config, bridge.id);
+    expect(checked.status).toBe("error");
+    expect(String(checked.message)).not.toContain("SUPER_SECRET_TOKEN_LEAK");
+    expect(String(checked.message)).toContain("Bot <redacted>");
+  });
+
+  test("checkMessagingBridge marks status='error' on a missing secret file instead of 500ing the API", async () => {
+    // Before the readBridgeBotTokenQuiet fix, a missing on-disk
+    // secret would throw ENOENT out of checkMessagingBridge, causing
+    // the HTTP endpoint to 500 instead of producing a typed bridge
+    // error the UI can surface.
+    const config = testConfig("discord-missing-secret");
+    setMessagingDeps({ discordClientFactory: () => stubDiscordClient().client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "valid-prefix"
+    });
+
+    // Wipe the secret file out from under the bridge. The record
+    // still references it via secretRefs, so a naive read throws.
+    const { rmSync } = await import("node:fs");
+    const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    const ref = live?.secretRefs?.[0];
+    expect(ref).toBeDefined();
+    rmSync(ref!.path);
+
+    const checked = await checkMessagingBridge(config, bridge.id);
+    expect(checked.status).toBe("error");
+    expect(String(checked.message)).toContain("Discord bot token is missing");
+  });
+
   test("discord receiveMessagingInput refuses a missing target instead of silently routing to 'local'", async () => {
     // Pinpointed regression: the shared "local" default used to mask
     // the Discord guard. Now a missing target throws so the inbound

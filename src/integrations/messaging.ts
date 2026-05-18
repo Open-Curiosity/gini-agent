@@ -34,6 +34,32 @@ function bridgeSecretNamespace(bridgeId: string): string {
   return `messaging.${bridgeId}`;
 }
 
+// Validate that a bot token is safe to embed in an HTTP request line —
+// printable ASCII only, no whitespace, no control characters. Without
+// this, a token containing a newline or control char would be rejected
+// at fetch time and the resulting error message includes the full
+// `Authorization: Bot <token>` header value, which then lands in
+// `bridge.message` / `MessagingMessageRecord.error` and leaks via
+// `GET /api/messaging`. Rejecting at create time stops the leak at
+// the source.
+const HEADER_SAFE_TOKEN = /^[\x21-\x7E]+$/;
+function assertHeaderSafeToken(kind: string, raw: string): void {
+  if (!HEADER_SAFE_TOKEN.test(raw)) {
+    throw new Error(
+      `${kind === "telegram" ? "Telegram" : "Discord"} bot token contains invalid characters — header-safe printable ASCII only.`
+    );
+  }
+}
+
+// Strip any "Bot <token>" residue from error strings before they land
+// in state. Belt-and-suspenders defense for the case where some
+// future code path constructs a request with a token that slipped
+// past assertHeaderSafeToken (e.g. test seam injecting raw tokens),
+// and the underlying transport echoes the auth header.
+function sanitizeBridgeError(message: string): string {
+  return message.replace(/Bot\s+\S+/g, "Bot <redacted>");
+}
+
 // Test seam: production code calls Telegram / Discord for real, but tests
 // inject stubbed clients so we can exercise send/health/poll without
 // network IO. Each provider gets its own factory so a test can swap one
@@ -96,6 +122,21 @@ export function readBridgeBotToken(config: RuntimeConfig, bridge: MessagingBridg
   return readSecret(config.instance, ref);
 }
 
+// Read the bot token without surfacing ENOENT — used by the API
+// callers (checkMessagingBridge, sendMessagingOutput) that need to
+// distinguish "no secret on record" (undefined) from "secret on
+// record but unreadable" (still undefined here; the poller's
+// markBridgeError path handles flipping status to "error"). Without
+// this, a missing/corrupt secret file 500s the HTTP endpoint instead
+// of producing a typed bridge error.
+function readBridgeBotTokenQuiet(config: RuntimeConfig, bridge: MessagingBridgeRecord): string | undefined {
+  try {
+    return readBridgeBotToken(config, bridge);
+  } catch {
+    return undefined;
+  }
+}
+
 export async function addMessagingBridge(config: RuntimeConfig, input: Record<string, unknown>) {
   const name = String(input.name ?? "");
   const kind = String(input.kind ?? "demo");
@@ -109,6 +150,14 @@ export async function addMessagingBridge(config: RuntimeConfig, input: Record<st
   const botToken = requiresToken && typeof input.botToken === "string" ? input.botToken.trim() : "";
   if (requiresToken && !botToken) {
     throw new Error(`${kind === "telegram" ? "Telegram" : "Discord"} bridges require a botToken in the create payload.`);
+  }
+  if (requiresToken) {
+    // Reject malformed tokens at create time. Without this, a token
+    // containing a control character would be accepted, persisted to
+    // the encrypted secret store, and then leak via the eventual
+    // fetch error (Bun's HTTP layer echoes the auth header value in
+    // its rejection message, which we persist to bridge.message).
+    assertHeaderSafeToken(kind, botToken);
   }
 
   const bridge = await mutateState(config.instance, (state) => createMessagingBridgeRecord(state, {
@@ -157,7 +206,7 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
   const metadataPatch: Record<string, unknown> = {};
 
   if (bridge.kind === "telegram") {
-    const token = readBridgeBotToken(config, bridge);
+    const token = readBridgeBotTokenQuiet(config, bridge);
     if (!token) {
       nextStatus = "error";
       nextMessage = "Telegram bot token is missing — recreate the bridge with a botToken.";
@@ -171,11 +220,11 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
           : `Connected as bot ${me.id}.`;
       } catch (error) {
         nextStatus = "error";
-        nextMessage = error instanceof Error ? error.message : String(error);
+        nextMessage = sanitizeBridgeError(error instanceof Error ? error.message : String(error));
       }
     }
   } else if (bridge.kind === "discord") {
-    const token = readBridgeBotToken(config, bridge);
+    const token = readBridgeBotTokenQuiet(config, bridge);
     if (!token) {
       nextStatus = "error";
       nextMessage = "Discord bot token is missing — recreate the bridge with a botToken.";
@@ -184,6 +233,9 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
         const me = await discordClientFor(token).getMe();
         metadataPatch.botUsername = me.username;
         metadataPatch.botId = me.id;
+        if (typeof me.global_name === "string" && me.global_name.length > 0) {
+          metadataPatch.globalName = me.global_name;
+        }
         // Newer Discord accounts return discriminator "0" and surface
         // the handle via global_name; older bots keep username#discriminator.
         const handle = me.global_name && me.global_name.length > 0
@@ -194,7 +246,7 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
         nextMessage = `Connected as ${handle}.`;
       } catch (error) {
         nextStatus = "error";
-        nextMessage = error instanceof Error ? error.message : String(error);
+        nextMessage = sanitizeBridgeError(error instanceof Error ? error.message : String(error));
       }
     }
   } else if (bridge.kind === "demo") {
@@ -241,8 +293,15 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
   // Target validation is per-kind. Don't coerce a missing target to
   // "local" before the kind branches — that would mask required-target
   // guards (e.g. Discord's channel id). Each branch decides whether
-  // the target is optional and what default applies.
-  const rawTarget = typeof input.target === "string" ? input.target : "";
+  // the target is optional and what default applies. We accept
+  // strings and finite numbers (JSON clients commonly send Telegram
+  // chat_ids as numbers); everything else collapses to the empty
+  // string which the per-kind guards reject.
+  const rawTarget = typeof input.target === "string"
+    ? input.target
+    : typeof input.target === "number" && Number.isFinite(input.target)
+      ? String(input.target)
+      : "";
 
   // Telegram + Discord inbound run through the chat-task path so each
   // chat / channel gets a persistent conversation — same surface as the
@@ -344,7 +403,21 @@ function parseInboundMedia(raw: unknown): MessagingMessageMedia | undefined {
   };
 }
 
-export async function sendMessagingOutput(config: RuntimeConfig, idOrName: string, input: Record<string, unknown>) {
+// In-process options that don't travel over HTTP. Today this carries
+// only an AbortSignal so the supervisor's stopAll can cancel an
+// in-flight Discord POST instead of waiting it out. HTTP callers
+// (POST /api/messaging/:id/send) pass undefined; internal callers
+// (the poller's detached reply mirror) pass the loop's signal.
+export interface SendMessagingOptions {
+  signal?: AbortSignal;
+}
+
+export async function sendMessagingOutput(
+  config: RuntimeConfig,
+  idOrName: string,
+  input: Record<string, unknown>,
+  options: SendMessagingOptions = {}
+) {
   const bridge = readState(config.instance).messagingBridges.find(
     (item) => item.id === idOrName || item.name === idOrName
   );
@@ -386,7 +459,7 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
     status === "failed" ? `Bridge is ${bridge.status}` : undefined;
 
   if (status === "sent" && bridge.kind === "telegram") {
-    const token = readBridgeBotToken(config, bridge);
+    const token = readBridgeBotTokenQuiet(config, bridge);
     if (!token) {
       status = "failed";
       errorMessage = "Telegram bot token is missing.";
@@ -411,11 +484,11 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
         }
       } catch (error) {
         status = "failed";
-        errorMessage = error instanceof Error ? error.message : String(error);
+        errorMessage = sanitizeBridgeError(error instanceof Error ? error.message : String(error));
       }
     }
   } else if (status === "sent" && bridge.kind === "discord") {
-    const token = readBridgeBotToken(config, bridge);
+    const token = readBridgeBotTokenQuiet(config, bridge);
     if (!token) {
       status = "failed";
       errorMessage = "Discord bot token is missing.";
@@ -433,10 +506,10 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
       errorMessage = "Discord messages require non-empty text.";
     } else {
       try {
-        await discordClientFor(token).sendMessage(target, text);
+        await discordClientFor(token).sendMessage(target, text, { signal: options.signal });
       } catch (error) {
         status = "failed";
-        errorMessage = error instanceof Error ? error.message : String(error);
+        errorMessage = sanitizeBridgeError(error instanceof Error ? error.message : String(error));
       }
     }
   }

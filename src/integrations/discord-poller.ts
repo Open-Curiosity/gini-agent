@@ -41,10 +41,20 @@ const ERROR_BACKOFF_MS = 5000;
 // the agent task is running.
 const TYPING_REFRESH_MS = 7000;
 
-// Max messages to fetch per poll. Discord caps `limit` at 100; the
-// poller uses a smaller window because a steady-state bridge should
-// only see one or two new messages per tick.
+// Max messages to fetch per single REST call. Discord caps `limit`
+// at 100; the poller uses a smaller window because a steady-state
+// bridge should only see one or two new messages per tick. When a
+// burst lands (>FETCH_BATCH_LIMIT messages between polls) the
+// pagination loop in pollChannel keeps catching up.
 const FETCH_BATCH_LIMIT = 50;
+
+// Safety cap on the per-tick pagination loop. Discord's REST `after`
+// returns the NEWEST N messages above the cursor, NOT the oldest N
+// — so a burst of >FETCH_BATCH_LIMIT messages requires multiple
+// calls to fully catch up. The cap bounds a runaway channel from
+// starving sibling channels on the same bridge; remaining messages
+// land on the next poll tick.
+const MAX_PAGES_PER_TICK = 10;
 
 export interface PollerDeps {
   clientFactory?: (token: string) => DiscordClient;
@@ -221,24 +231,49 @@ async function pollChannel(
   typingRefreshMs: number,
   trackDetached: (work: Promise<void>) => void
 ): Promise<void> {
-  const watermark = readChannelWatermark(config, bridgeId, channelId);
+  const initialWatermark = readChannelWatermark(config, bridgeId, channelId);
 
-  let messages: DiscordMessage[];
-  try {
-    messages = await client.fetchChannelMessages(channelId, {
-      afterId: watermark,
-      limit: FETCH_BATCH_LIMIT,
-      signal
-    });
-  } catch (error) {
+  // Pagination loop. Discord's REST `after` cursor returns the NEWEST
+  // FETCH_BATCH_LIMIT messages above the cursor, NOT the oldest N. A
+  // burst of >FETCH_BATCH_LIMIT messages between polls would silently
+  // drop the older ones without this catch-up loop (the watermark
+  // advances to the newest in the batch, and the next tick's `after`
+  // skips everything below it). discord.py's _after_strategy uses
+  // the same shape — loop until a partial batch lands or a per-tick
+  // safety cap fires.
+  const collected: DiscordMessage[] = [];
+  let cursor: string | undefined = initialWatermark;
+  for (let page = 0; page < MAX_PAGES_PER_TICK; page += 1) {
     if (signal.aborted) return;
-    appendLog(config.instance, "messaging.discord.poll_error", {
-      bridgeId,
-      channelId,
-      error: error instanceof Error ? error.message : String(error)
-    });
-    await sleepUnlessAborted(ERROR_BACKOFF_MS, signal);
-    return;
+    let batch: DiscordMessage[];
+    try {
+      batch = await client.fetchChannelMessages(channelId, {
+        afterId: cursor,
+        limit: FETCH_BATCH_LIMIT,
+        signal
+      });
+    } catch (error) {
+      if (signal.aborted) return;
+      appendLog(config.instance, "messaging.discord.poll_error", {
+        bridgeId,
+        channelId,
+        page,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      await sleepUnlessAborted(ERROR_BACKOFF_MS, signal);
+      return;
+    }
+    if (batch.length === 0) break;
+    collected.push(...batch);
+    // Next page's cursor is the newest snowflake in this batch — see
+    // the comment above; Discord returns NEWEST-N, so to catch up we
+    // pivot on that and re-query for messages strictly above it.
+    let newestSeen = batch[0]!.id;
+    for (const m of batch) {
+      if (snowflakeCompare(m.id, newestSeen) > 0) newestSeen = m.id;
+    }
+    cursor = newestSeen;
+    if (batch.length < FETCH_BATCH_LIMIT) break;
   }
 
   // First-contact seeding. We have to pin a watermark on the very
@@ -249,24 +284,24 @@ async function pollChannel(
   // strictly less than every real Discord snowflake (which start at
   // ~10^18), so the next poll with afterId="0" correctly fetches the
   // user's message.
-  if (messages.length === 0) {
-    if (watermark === undefined) {
+  if (collected.length === 0) {
+    if (initialWatermark === undefined) {
       await advanceWatermark(config, bridgeId, channelId, "0");
     }
     return;
   }
 
-  // Discord returns newest-first; process oldest-first so the watermark
-  // advances monotonically and we don't reply to messages out of order.
-  // Sort by BigInt-comparable snowflake (decimal strings of mixed
-  // length sort wrong lexically — "999" sorts after "1000" — so a
-  // future digit-length boundary would mis-order without this).
-  const ordered = [...messages].sort((a, b) => snowflakeCompare(a.id, b.id));
+  // Process oldest-first so the watermark advances monotonically and
+  // we don't reply to messages out of order. Sort by BigInt-comparable
+  // snowflake (decimal strings of mixed length sort wrong lexically
+  // — "999" sorts after "1000" — so a future digit-length boundary
+  // would mis-order without this).
+  const ordered = [...collected].sort((a, b) => snowflakeCompare(a.id, b.id));
 
   // Non-empty first poll: pin to the newest existing message and
   // skip routing so a fresh bridge attaching to an active channel
   // doesn't backfill history into the agent.
-  if (watermark === undefined) {
+  if (initialWatermark === undefined) {
     const newest = ordered[ordered.length - 1]!;
     await advanceWatermark(config, bridgeId, channelId, newest.id);
     return;
@@ -364,11 +399,18 @@ async function maintainTypingAndMirrorReply(
 
   if (!replyText || replyText.trim().length === 0) return;
 
+  // Re-check abort just before dispatch. The signal is also threaded
+  // into sendMessagingOutput so a hung Discord POST gets cancelled on
+  // shutdown — without that, stopAll (which awaits this worker)
+  // would block forever on a stuck send.
+  if (signal.aborted) return;
   try {
-    await sendMessagingOutput(config, bridgeId, {
-      text: replyText,
-      target: session.source.target
-    });
+    await sendMessagingOutput(
+      config,
+      bridgeId,
+      { text: replyText, target: session.source.target },
+      { signal }
+    );
   } catch (error) {
     appendLog(config.instance, "messaging.discord.reply_error", {
       bridgeId,
@@ -470,6 +512,12 @@ function snowflakeCompare(a: string, b: string): number {
 // best-effort — a state write failure here is logged but does not
 // propagate further; the worst case is that the supervisor restarts
 // the loop on the next reconcile tick.
+//
+// Critically: only flip a bridge that is still "configured". A
+// concurrent disableMessagingBridge can land while this loop is
+// catching an ENOENT (disable deleted the secret file the loop was
+// about to read), and we must not stamp "error" over the user's
+// explicit "disabled" status.
 async function markBridgeError(
   config: RuntimeConfig,
   bridgeId: string,
@@ -481,6 +529,7 @@ async function markBridgeError(
     await mutateState(config.instance, (state) => {
       const live = state.messagingBridges.find((item) => item.id === bridgeId);
       if (!live) return;
+      if (live.status !== "configured") return;
       live.status = "error";
       live.message = message;
       live.updatedAt = now();

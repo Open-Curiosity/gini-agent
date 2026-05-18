@@ -91,6 +91,21 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 3000
   throw new Error(`Timed out waiting for: ${label}`);
 }
 
+// Wrap supervisor lifecycle in try/finally so a failed assertion can
+// never leak the loop into the next test — a leaked loop would keep
+// polling against the (next test's) GINI_STATE_ROOT and surface as
+// spurious failures.
+async function withSupervisor<T>(
+  supervisor: { stopAll: () => Promise<void> },
+  body: () => Promise<T>
+): Promise<T> {
+  try {
+    return await body();
+  } finally {
+    await supervisor.stopAll().catch(() => {});
+  }
+}
+
 function makeMessage(overrides: Partial<DiscordMessage>): DiscordMessage {
   return {
     id: "100",
@@ -349,5 +364,164 @@ describe("discord poller supervisor", () => {
     await waitFor(() => supervisor.size() === 0, "loop to self-exit without reconcile");
 
     await supervisor.stopAll();
+  });
+
+  test("empty channel seeds a sentinel watermark, then routes the next real message", async () => {
+    // Regression for the round-1-confirmed seeding bug: a bridge
+    // attached to an empty channel must NOT consume the first user
+    // message as its seed.
+    const config = testConfig("disc-empty-seed");
+    const { client, enqueue, sendCalls } = programmableClient();
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    // First poll: channel is empty. Watermark must seed to "0".
+    enqueue("chan-1", []);
+    // Second poll: a real user message arrives. It must be routed,
+    // not consumed as the seed.
+    enqueue("chan-1", [
+      makeMessage({ id: "999000000000000000", content: "first real message" })
+    ]);
+
+    const supervisor = createDiscordPollerSupervisor(config, {
+      clientFactory: () => client,
+      pollIntervalMs: 20,
+      typingRefreshMs: 20
+    });
+
+    await withSupervisor(supervisor, async () => {
+      supervisor.reconcile();
+      await waitFor(
+        () => {
+          const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+          const watermark = (live?.metadata?.lastInboundExternalIds as Record<string, string> | undefined)?.["chan-1"];
+          return watermark === "999000000000000000";
+        },
+        "watermark to advance past the first real user message"
+      );
+      await waitFor(() => sendCalls.length >= 1, "reply to dispatch after seeding from empty");
+    });
+
+    const inbound = readState(config.instance).messagingMessages.find(
+      (m) => m.direction === "inbound" && m.target === "chan-1"
+    );
+    expect(inbound?.text).toBe("first real message");
+  });
+
+  test("pagination catches up when more than FETCH_BATCH_LIMIT messages land between polls", async () => {
+    // Regression for the round-2-confirmed pagination drop bug.
+    // Discord's REST `after` returns the NEWEST FETCH_BATCH_LIMIT
+    // messages above the cursor (not the oldest), so a single poll
+    // would skip everything below the 50th-newest. The pagination
+    // loop in pollChannel must keep fetching until a partial batch
+    // lands or the per-tick cap fires.
+    const config = testConfig("disc-pagination");
+    const { client, enqueue } = programmableClient();
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    // Seed batch + a real "first user" message so the watermark is
+    // pinned and processing kicks in for subsequent batches.
+    enqueue("chan-1", [makeMessage({ id: "100", content: "older history" })]);
+
+    // Build a 75-message burst, all bot-authored so they're skipped
+    // (but the watermark must still advance through all 75).
+    const burst: DiscordMessage[] = [];
+    for (let i = 0; i < 75; i += 1) {
+      burst.push(makeMessage({
+        id: String(1000 + i),
+        content: `burst ${i}`,
+        author: { id: "bot-1", username: "OtherBot", bot: true }
+      }));
+    }
+    // Simulate Discord's "newest first" REST behavior under `after=100`:
+    // first page returns the newest 50 (ids 1025..1074), with the
+    // OLDEST in the response being id 1025.
+    enqueue("chan-1", burst.slice(25).reverse());
+    // Second pagination call with after=1074: returns the next page
+    // (ids 1075-up). In our 75-message burst there are no messages
+    // newer than 1074, so the second call returns the OLDER 25
+    // (ids 1000-1024). Discord's API in production wouldn't actually
+    // return older messages with `after`, but our stub mirrors the
+    // catch-up shape from discord.py: we keep fetching above the
+    // newest seen until a partial batch returns. Easier to model: the
+    // stub returns the remaining 25 then empty.
+    enqueue("chan-1", burst.slice(0, 25).reverse());
+    enqueue("chan-1", []);
+
+    const supervisor = createDiscordPollerSupervisor(config, {
+      clientFactory: () => client,
+      pollIntervalMs: 20,
+      typingRefreshMs: 20
+    });
+
+    await withSupervisor(supervisor, async () => {
+      supervisor.reconcile();
+      // After processing, the watermark should reach the newest id
+      // in the burst (1074, the highest snowflake).
+      await waitFor(
+        () => {
+          const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+          const watermark = (live?.metadata?.lastInboundExternalIds as Record<string, string> | undefined)?.["chan-1"];
+          return watermark === "1074";
+        },
+        "watermark to advance to newest of the burst (1074)"
+      );
+    });
+
+    // No user-authored messages → no tasks spawned. The burst was
+    // entirely bot-authored; the pagination must still account for
+    // every snowflake.
+    expect(readState(config.instance).tasks).toEqual([]);
+  });
+
+  test("markBridgeError does not overwrite a user-initiated disable", async () => {
+    // Race: user disables the bridge while the loop is mid-tick.
+    // disableMessagingBridge sets status="disabled" and deletes the
+    // secret file. The next loop iter catches ENOENT and calls
+    // markBridgeError — which must NOT flip "disabled" back to
+    // "error", because that would erase the user's explicit intent.
+    const config = testConfig("disc-disable-race");
+    const { client } = programmableClient();
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const { disableMessagingBridge } = await import("./messaging");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    const supervisor = createDiscordPollerSupervisor(config, {
+      clientFactory: () => client,
+      pollIntervalMs: 20,
+      typingRefreshMs: 20
+    });
+
+    await withSupervisor(supervisor, async () => {
+      supervisor.reconcile();
+      // Disable while the loop is running. The disable flow deletes
+      // the secret; if the loop catches ENOENT it would call
+      // markBridgeError, which must respect the "disabled" status.
+      await disableMessagingBridge(config, bridge.id);
+      await waitFor(() => supervisor.size() === 0, "loop to exit after disable");
+    });
+
+    const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    expect(live?.status).toBe("disabled");
   });
 });

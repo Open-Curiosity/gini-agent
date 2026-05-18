@@ -60,6 +60,14 @@ export function createTelegramPollerSupervisor(
   const loops = new Map<string, RunningLoop>();
   const factory = deps.clientFactory ?? ((token: string) => createTelegramClient(token));
   let stopped = false;
+  // Mirrors the Discord supervisor's detached-worker tracking. The
+  // typing+reply mirror in maintainTypingAndMirrorReply is launched
+  // detached; without this set, stopAll would resolve before
+  // in-flight reply mirrors finish their state writes — observable
+  // in tests as orphaned mutateState landing against the next test's
+  // GINI_STATE_ROOT, and in production as a torn-down runtime
+  // mid-state-write at shutdown.
+  const detached = new Set<Promise<void>>();
 
   function shouldRun(bridge: MessagingBridgeRecord): boolean {
     if (bridge.kind !== "telegram") return false;
@@ -70,7 +78,16 @@ export function createTelegramPollerSupervisor(
   function startLoop(bridgeId: string): void {
     if (loops.has(bridgeId) || stopped) return;
     const controller = new AbortController();
-    const done = runLoop(config, bridgeId, controller.signal, factory).finally(() => {
+    const trackDetached = (work: Promise<void>): void => {
+      detached.add(work);
+      void work.finally(() => detached.delete(work));
+    };
+    const done = runLoop(config, bridgeId, controller.signal, factory, trackDetached).finally(() => {
+      // Always abort the controller when the loop exits, so detached
+      // children captured this signal observe abort and unwind on
+      // natural returns (status flip, missing secret) as well as on
+      // stopAll-driven aborts.
+      controller.abort();
       loops.delete(bridgeId);
     });
     loops.set(bridgeId, { controller, done });
@@ -101,6 +118,9 @@ export function createTelegramPollerSupervisor(
       stopped = true;
       for (const loop of loops.values()) loop.controller.abort();
       await Promise.all(Array.from(loops.values()).map((loop) => loop.done.catch(() => {})));
+      // Wait for any in-flight detached typing+reply workers to
+      // unwind so a state write in flight at shutdown lands cleanly.
+      await Promise.all(Array.from(detached).map((work) => work.catch(() => {})));
     },
     size() {
       return loops.size;
@@ -112,7 +132,8 @@ async function runLoop(
   config: RuntimeConfig,
   bridgeId: string,
   signal: AbortSignal,
-  factory: (token: string) => TelegramClient
+  factory: (token: string) => TelegramClient,
+  trackDetached: (work: Promise<void>) => void
 ): Promise<void> {
   while (!signal.aborted) {
     const bridge = readState(config.instance).messagingBridges.find((item) => item.id === bridgeId);
@@ -193,9 +214,11 @@ async function runLoop(
           // once the task settles mirror the assistant reply back to
           // the originating chat. The pulse is best-effort and runs
           // detached so a slow chat_action call doesn't block the
-          // next update.
+          // next update. Tracked via trackDetached so stopAll awaits
+          // the in-flight state writes — see the matching shape in
+          // src/integrations/discord-poller.ts.
           if (record.taskId) {
-            void maintainTypingAndMirrorReply(
+            const work = maintainTypingAndMirrorReply(
               config,
               bridgeId,
               record.taskId,
@@ -208,6 +231,7 @@ async function runLoop(
                 error: error instanceof Error ? error.message : String(error)
               });
             });
+            trackDetached(work);
           }
         } catch (error) {
           appendLog(config.instance, "messaging.telegram.receive_error", {
@@ -357,6 +381,12 @@ function buildTaskInput(incoming: IncomingPayload, savedPath: string | undefined
 // from the desired set (shouldRun checks status === "configured").
 // Same shape as the Discord poller — the user re-enables by
 // re-supplying the bot token.
+//
+// Critically: only flip a bridge that is still "configured". A
+// concurrent disableMessagingBridge can land while this loop is
+// catching an ENOENT (disable deleted the secret file the loop was
+// about to read), and we must not stamp "error" over the user's
+// explicit "disabled" status.
 async function markBridgeError(
   config: RuntimeConfig,
   bridgeId: string,
@@ -368,6 +398,7 @@ async function markBridgeError(
     await mutateState(config.instance, (state) => {
       const live = state.messagingBridges.find((item) => item.id === bridgeId);
       if (!live) return;
+      if (live.status !== "configured") return;
       live.status = "error";
       live.message = message;
       live.updatedAt = now();

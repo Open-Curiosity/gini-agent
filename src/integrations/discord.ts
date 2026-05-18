@@ -42,6 +42,15 @@ interface DiscordError {
   code?: number;
 }
 
+// Options bag for the outbound send. Today it carries only an optional
+// AbortSignal so the supervisor's stopAll can cancel a hung POST
+// instead of waiting it out — without this a hung Discord
+// `sendMessage` blocks the detached reply-mirror worker, and
+// supervisor.stopAll (which now awaits those workers) deadlocks.
+export interface SendMessageOptions {
+  signal?: AbortSignal;
+}
+
 export interface FetchChannelMessagesOptions {
   // Snowflake to fetch strictly newer messages than. Omitted on the
   // first poll — the poller seeds the watermark from the channel
@@ -56,7 +65,7 @@ export interface FetchChannelMessagesOptions {
 
 export interface DiscordClient {
   getMe(): Promise<DiscordUser>;
-  sendMessage(channelId: string, content: string): Promise<DiscordMessage>;
+  sendMessage(channelId: string, content: string, options?: SendMessageOptions): Promise<DiscordMessage>;
   // Trigger Discord's typing indicator. The indicator persists for ~10
   // seconds before clearing automatically; the poller refreshes on a
   // shorter cadence so long-running tasks stay visible. The optional
@@ -132,7 +141,7 @@ export function createDiscordClient(token: string, options: DiscordClientOptions
 
   return {
     getMe: () => call<DiscordUser>("GET", "/users/@me", undefined),
-    sendMessage: (channelId, content) => {
+    sendMessage: (channelId, content, options) => {
       if (!channelId) return Promise.reject(new Error("Discord channel id is required."));
       // Discord caps message content at 2000 chars. We truncate on the
       // client so callers don't have to pre-check; the cap is unlikely
@@ -142,7 +151,8 @@ export function createDiscordClient(token: string, options: DiscordClientOptions
       return call<DiscordMessage>(
         "POST",
         `/channels/${encodeURIComponent(channelId)}/messages`,
-        { content: trimmed }
+        { content: trimmed },
+        options?.signal
       );
     },
     triggerTypingIndicator: (channelId, signal) => {
