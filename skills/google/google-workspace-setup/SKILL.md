@@ -83,7 +83,10 @@ If `gcloud` is not available, fall back to the manual flow:
 Unverified OAuth apps in testing mode are capped at roughly 25 scopes by Google, and the default "recommended" preset is 85+ scopes — it will fail for `@gmail.com` accounts. There are two ways to narrow the list at login time:
 
 ```bash
-# Pick services by short name (full read-write across each)
+# Pick services by short name. `-s` picks the default scope per service —
+# typically read+write but NOT permanent-delete or admin-level operations
+# (e.g. `gmail.modify` for Gmail, `drive` for Drive). For broader or
+# narrower access, use `--readonly` or `--scopes` (see below).
 gws auth login -s drive,gmail,calendar,docs,meet,forms
 
 # Same services, but read-only everywhere — the --readonly flag applies
@@ -100,7 +103,8 @@ gws auth login --scopes "https://www.googleapis.com/auth/gmail.readonly,https://
 
 Recommended starting scopes per product. The first column is the `-s` shorthand (Service column from `gws auth login --help`); the second column is the full URL to pass to `--scopes` when picking a non-uniform mix:
 
-- **Gmail (full, incl. permanent delete)** — `-s gmail` ↔ `https://mail.google.com/` (the actual "full access" Gmail scope; there is no `auth/gmail` URL). Prefer `https://www.googleapis.com/auth/gmail.readonly` / `.send` / `.modify` / `.compose` for narrower picks.
+- **Gmail** — `-s gmail` ↔ `https://www.googleapis.com/auth/gmail.modify` (the default `-s gmail` mapping; covers read + send + reply + label + draft but NOT permanent delete). Narrower picks: `https://www.googleapis.com/auth/gmail.readonly` / `.send` / `.compose`.
+- **Gmail (full, incl. permanent delete)** — `--scopes "https://mail.google.com/"` only. No `-s` shorthand resolves to this; it must be requested explicitly via `--scopes`.
 - **Drive** — `-s drive` ↔ `https://www.googleapis.com/auth/drive` (`.file`, `.readonly`, `.metadata.readonly` available as full URLs).
 - **Calendar** — `-s calendar` ↔ `https://www.googleapis.com/auth/calendar` (`.events`, `.readonly`, `.freebusy` available as full URLs).
 - **Docs** — `-s docs` ↔ `https://www.googleapis.com/auth/documents` (`.readonly` available as a full URL when the agent only needs to read).
