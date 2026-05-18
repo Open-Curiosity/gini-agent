@@ -14,6 +14,7 @@ import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "..
 import { instanceRoot } from "../paths";
 import { findTelegramChatSession, readBridgeBotToken, receiveMessagingInput, sendMessagingOutput } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
+import { createDetachedTracker, markBridgeError } from "./messaging-poller-helpers";
 import {
   createTelegramClient,
   extractIncomingPayload,
@@ -60,14 +61,10 @@ export function createTelegramPollerSupervisor(
   const loops = new Map<string, RunningLoop>();
   const factory = deps.clientFactory ?? ((token: string) => createTelegramClient(token));
   let stopped = false;
-  // Mirrors the Discord supervisor's detached-worker tracking. The
-  // typing+reply mirror in maintainTypingAndMirrorReply is launched
-  // detached; without this set, stopAll would resolve before
-  // in-flight reply mirrors finish their state writes — observable
-  // in tests as orphaned mutateState landing against the next test's
-  // GINI_STATE_ROOT, and in production as a torn-down runtime
-  // mid-state-write at shutdown.
-  const detached = new Set<Promise<void>>();
+  // Shared detached-worker tracker. The drain has a bounded timeout
+  // so a hung Telegram send (the Telegram client doesn't thread
+  // AbortSignal) can't deadlock shutdown.
+  const detached = createDetachedTracker(config, "messaging.telegram.detached_drain_timeout");
 
   function shouldRun(bridge: MessagingBridgeRecord): boolean {
     if (bridge.kind !== "telegram") return false;
@@ -78,11 +75,7 @@ export function createTelegramPollerSupervisor(
   function startLoop(bridgeId: string): void {
     if (loops.has(bridgeId) || stopped) return;
     const controller = new AbortController();
-    const trackDetached = (work: Promise<void>): void => {
-      detached.add(work);
-      void work.finally(() => detached.delete(work));
-    };
-    const done = runLoop(config, bridgeId, controller.signal, factory, trackDetached).finally(() => {
+    const done = runLoop(config, bridgeId, controller.signal, factory, detached.track).finally(() => {
       // Always abort the controller when the loop exits, so detached
       // children captured this signal observe abort and unwind on
       // natural returns (status flip, missing secret) as well as on
@@ -118,9 +111,11 @@ export function createTelegramPollerSupervisor(
       stopped = true;
       for (const loop of loops.values()) loop.controller.abort();
       await Promise.all(Array.from(loops.values()).map((loop) => loop.done.catch(() => {})));
-      // Wait for any in-flight detached typing+reply workers to
-      // unwind so a state write in flight at shutdown lands cleanly.
-      await Promise.all(Array.from(detached).map((work) => work.catch(() => {})));
+      // Drain detached workers with a bounded timeout. Telegram's
+      // client API doesn't accept AbortSignal today, so a hung
+      // sendMessage/sendChatAction would otherwise keep stopAll
+      // pending forever.
+      await detached.drain();
     },
     size() {
       return loops.size;
@@ -149,11 +144,23 @@ async function runLoop(
     try {
       token = readBridgeBotToken(config, bridge);
     } catch (error) {
-      await markBridgeError(config, bridgeId, error);
+      await markBridgeError(
+        config,
+        bridgeId,
+        "messaging.telegram.token_error",
+        "messaging.telegram.mark_error_failed",
+        error
+      );
       return;
     }
     if (!token) {
-      await markBridgeError(config, bridgeId, new Error("Telegram bot token secret is missing."));
+      await markBridgeError(
+        config,
+        bridgeId,
+        "messaging.telegram.token_error",
+        "messaging.telegram.mark_error_failed",
+        new Error("Telegram bot token secret is missing.")
+      );
       return;
     }
 
@@ -375,40 +382,6 @@ function buildTaskInput(incoming: IncomingPayload, savedPath: string | undefined
   if (!savedPath) return incoming.text;
   const header = `[photo: ${savedPath}]`;
   return incoming.text ? `${header}\n${incoming.text}` : header;
-}
-
-// Flip a bridge to "error" so the supervisor reconcile loop drops it
-// from the desired set (shouldRun checks status === "configured").
-// Same shape as the Discord poller — the user re-enables by
-// re-supplying the bot token.
-//
-// Critically: only flip a bridge that is still "configured". A
-// concurrent disableMessagingBridge can land while this loop is
-// catching an ENOENT (disable deleted the secret file the loop was
-// about to read), and we must not stamp "error" over the user's
-// explicit "disabled" status.
-async function markBridgeError(
-  config: RuntimeConfig,
-  bridgeId: string,
-  error: unknown
-): Promise<void> {
-  const message = error instanceof Error ? error.message : String(error);
-  appendLog(config.instance, "messaging.telegram.token_error", { bridgeId, error: message });
-  try {
-    await mutateState(config.instance, (state) => {
-      const live = state.messagingBridges.find((item) => item.id === bridgeId);
-      if (!live) return;
-      if (live.status !== "configured") return;
-      live.status = "error";
-      live.message = message;
-      live.updatedAt = now();
-    });
-  } catch (err) {
-    appendLog(config.instance, "messaging.telegram.mark_error_failed", {
-      bridgeId,
-      error: err instanceof Error ? err.message : String(err)
-    });
-  }
 }
 
 async function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {

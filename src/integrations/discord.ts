@@ -52,10 +52,14 @@ export interface SendMessageOptions {
 }
 
 export interface FetchChannelMessagesOptions {
-  // Snowflake to fetch strictly newer messages than. Omitted on the
-  // first poll — the poller seeds the watermark from the channel
-  // history so a fresh bridge doesn't backfill old conversation.
+  // Snowflake to fetch strictly newer messages than. Discord returns
+  // the NEWEST N messages above this cursor, sorted newest-first.
   afterId?: string;
+  // Snowflake to fetch strictly older messages than. Discord returns
+  // the NEWEST N messages below this cursor, sorted newest-first.
+  // Discord's API allows only one of around/before/after per call —
+  // callers pass at most one.
+  beforeId?: string;
   // Discord caps `limit` at 100. We default 50 which is comfortable
   // for the polling cadence and keeps the response small.
   limit?: number;
@@ -169,7 +173,12 @@ export function createDiscordClient(token: string, options: DiscordClientOptions
       if (!channelId) return Promise.reject(new Error("Discord channel id is required."));
       const limit = Math.min(Math.max(opts?.limit ?? 50, 1), 100);
       const params = new URLSearchParams({ limit: String(limit) });
-      if (opts?.afterId) params.set("after", opts.afterId);
+      // Discord docs: "Only one of around, before, after may be
+      // passed" — so we never set both. Prefer `before` when given
+      // (the pagination loop uses it for catch-up paging once the
+      // first `after` batch comes back full).
+      if (opts?.beforeId) params.set("before", opts.beforeId);
+      else if (opts?.afterId) params.set("after", opts.afterId);
       return call<DiscordMessage[]>(
         "GET",
         `/channels/${encodeURIComponent(channelId)}/messages?${params.toString()}`,

@@ -19,6 +19,7 @@ import type { MessagingBridgeRecord, RuntimeConfig } from "../types";
 import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { findDiscordChatSession, readBridgeBotToken, receiveMessagingInput, sendMessagingOutput } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
+import { createDetachedTracker, markBridgeError } from "./messaging-poller-helpers";
 import {
   createDiscordClient,
   extractIncomingPayload,
@@ -56,6 +57,14 @@ const FETCH_BATCH_LIMIT = 50;
 // land on the next poll tick.
 const MAX_PAGES_PER_TICK = 10;
 
+// Sentinel watermark for an empty channel on first contact. Discord
+// snowflakes start at ~10^18 (the epoch is 2015-01-01), so any
+// single-digit decimal string is strictly less than every real
+// snowflake. Using a named constant — rather than a literal "0" —
+// keeps the intent visible at the call site and makes a future
+// digit-length boundary impossible to miss in code review.
+const EMPTY_CHANNEL_SEED_SNOWFLAKE = "0";
+
 export interface PollerDeps {
   clientFactory?: (token: string) => DiscordClient;
   // Per-target polling cadence override (ms). Production leaves this
@@ -88,12 +97,10 @@ export function createDiscordPollerSupervisor(
   const pollIntervalMs = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
   const typingRefreshMs = deps.typingRefreshMs ?? TYPING_REFRESH_MS;
   let stopped = false;
-  // Tracks every detached typing+reply worker so stopAll can await
-  // their completion. Without this, a worker still mid-sendMessagingOutput
-  // when the runtime tears down would land its state mutation against
-  // a stale GINI_STATE_ROOT (tests) or after the process has begun
-  // exiting (production) — both are observable as orphaned writes.
-  const detached = new Set<Promise<void>>();
+  // Shared detached-worker tracker. See messaging-poller-helpers.ts:
+  // workers are stopAll-awaited with a bounded timeout so a hung
+  // send can't deadlock shutdown.
+  const detached = createDetachedTracker(config, "messaging.discord.detached_drain_timeout");
 
   function shouldRun(bridge: MessagingBridgeRecord): boolean {
     if (bridge.kind !== "discord") return false;
@@ -105,10 +112,6 @@ export function createDiscordPollerSupervisor(
   function startLoop(bridgeId: string): void {
     if (loops.has(bridgeId) || stopped) return;
     const controller = new AbortController();
-    const trackDetached = (work: Promise<void>): void => {
-      detached.add(work);
-      void work.finally(() => detached.delete(work));
-    };
     const done = runLoop(
       config,
       bridgeId,
@@ -116,7 +119,7 @@ export function createDiscordPollerSupervisor(
       factory,
       pollIntervalMs,
       typingRefreshMs,
-      trackDetached
+      detached.track
     ).finally(() => {
       // Always abort the controller when the loop exits, even for
       // natural returns (bridge disabled, token rotated, status
@@ -155,12 +158,9 @@ export function createDiscordPollerSupervisor(
       stopped = true;
       for (const loop of loops.values()) loop.controller.abort();
       await Promise.all(Array.from(loops.values()).map((loop) => loop.done.catch(() => {})));
-      // Wait for any in-flight detached typing+reply workers to
-      // unwind before resolving. The loops aborting above lets these
-      // observe abort and short-circuit; any worker mid-state-write
-      // still gets to finish so the audit trail and outbound record
-      // land before shutdown continues.
-      await Promise.all(Array.from(detached).map((work) => work.catch(() => {})));
+      // Drain detached workers with a bounded timeout so a hung send
+      // can't deadlock shutdown.
+      await detached.drain();
     },
     size() {
       return loops.size;
@@ -193,11 +193,23 @@ async function runLoop(
     try {
       token = readBridgeBotToken(config, bridge);
     } catch (error) {
-      await markBridgeError(config, bridgeId, error);
+      await markBridgeError(
+        config,
+        bridgeId,
+        "messaging.discord.token_error",
+        "messaging.discord.mark_error_failed",
+        error
+      );
       return;
     }
     if (!token) {
-      await markBridgeError(config, bridgeId, new Error("Discord bot token secret is missing."));
+      await markBridgeError(
+        config,
+        bridgeId,
+        "messaging.discord.token_error",
+        "messaging.discord.mark_error_failed",
+        new Error("Discord bot token secret is missing.")
+      );
       return;
     }
 
@@ -233,22 +245,36 @@ async function pollChannel(
 ): Promise<void> {
   const initialWatermark = readChannelWatermark(config, bridgeId, channelId);
 
-  // Pagination loop. Discord's REST `after` cursor returns the NEWEST
-  // FETCH_BATCH_LIMIT messages above the cursor, NOT the oldest N. A
+  // Pagination loop. Discord's `after=X&limit=N` returns the NEWEST N
+  // messages with id > X (sorted newest-first), NOT the oldest N. A
   // burst of >FETCH_BATCH_LIMIT messages between polls would silently
-  // drop the older ones without this catch-up loop (the watermark
-  // advances to the newest in the batch, and the next tick's `after`
-  // skips everything below it). discord.py's _after_strategy uses
-  // the same shape — loop until a partial batch lands or a per-tick
-  // safety cap fires.
+  // drop the older ones if we just re-queried with `after=<newest seen>`
+  // — the newest-seen is already above the gap, so the next call
+  // returns empty. Catching up requires paging BACKWARDS with `before`:
+  //
+  //   page 1: after = initialWatermark   → newest 50 above watermark
+  //   page 2: before = oldest of page 1  → next 50 below page 1's
+  //                                         oldest (still above
+  //                                         initialWatermark)
+  //   page 3: before = oldest of page 2  → and so on
+  //
+  // Loop terminates when a partial batch lands (caught up), the
+  // oldest message in the page is <= initialWatermark (already
+  // processed), or the per-tick safety cap fires. Per-tick cap
+  // bounds a runaway channel from starving sibling channels;
+  // remaining messages land on the next poll tick.
   const collected: DiscordMessage[] = [];
-  let cursor: string | undefined = initialWatermark;
+  let beforeCursor: string | undefined;
   for (let page = 0; page < MAX_PAGES_PER_TICK; page += 1) {
     if (signal.aborted) return;
     let batch: DiscordMessage[];
     try {
       batch = await client.fetchChannelMessages(channelId, {
-        afterId: cursor,
+        // Only the first page uses `after`; subsequent pages page
+        // backwards with `before` to catch the gap.
+        ...(beforeCursor === undefined
+          ? { afterId: initialWatermark }
+          : { beforeId: beforeCursor }),
         limit: FETCH_BATCH_LIMIT,
         signal
       });
@@ -264,29 +290,41 @@ async function pollChannel(
       return;
     }
     if (batch.length === 0) break;
-    collected.push(...batch);
-    // Next page's cursor is the newest snowflake in this batch — see
-    // the comment above; Discord returns NEWEST-N, so to catch up we
-    // pivot on that and re-query for messages strictly above it.
-    let newestSeen = batch[0]!.id;
-    for (const m of batch) {
-      if (snowflakeCompare(m.id, newestSeen) > 0) newestSeen = m.id;
-    }
-    cursor = newestSeen;
+    // Filter out anything at-or-below the initial watermark — the
+    // backward paging can dip into already-processed territory once
+    // we reach the bottom of the new range.
+    const fresh = initialWatermark === undefined
+      ? batch
+      : batch.filter((m) => snowflakeCompare(m.id, initialWatermark) > 0);
+    collected.push(...fresh);
+    // Stop if any of the messages in this page were already
+    // processed (oldest of page <= watermark) — there's nothing
+    // newer below it that we haven't seen.
+    if (fresh.length < batch.length) break;
+    // Stop on a partial batch — there are no more messages in the
+    // gap.
     if (batch.length < FETCH_BATCH_LIMIT) break;
+    // Walk `before` cursor backwards to the OLDEST snowflake we
+    // just saw. Discord returns newest-first, so the oldest is the
+    // last element in the array.
+    let oldestSeen = batch[batch.length - 1]!.id;
+    for (const m of batch) {
+      if (snowflakeCompare(m.id, oldestSeen) < 0) oldestSeen = m.id;
+    }
+    beforeCursor = oldestSeen;
   }
 
   // First-contact seeding. We have to pin a watermark on the very
   // first poll even when the channel is empty — otherwise a user
   // typing between this empty poll and the next non-empty poll lands
   // their first message in the seeding branch, where it would be
-  // consumed as the seed and never routed. The "0" sentinel is
-  // strictly less than every real Discord snowflake (which start at
-  // ~10^18), so the next poll with afterId="0" correctly fetches the
-  // user's message.
+  // consumed as the seed and never routed. EMPTY_CHANNEL_SEED_SNOWFLAKE
+  // is strictly less than every real Discord snowflake (which start
+  // at ~10^18), so the next poll with afterId=<sentinel> correctly
+  // fetches the user's message.
   if (collected.length === 0) {
     if (initialWatermark === undefined) {
-      await advanceWatermark(config, bridgeId, channelId, "0");
+      await advanceWatermark(config, bridgeId, channelId, EMPTY_CHANNEL_SEED_SNOWFLAKE);
     }
     return;
   }
@@ -369,6 +407,12 @@ async function pollChannel(
 // indicator on a ~7s cadence; once the task settles we sync the
 // assistant message into the chat session and dispatch the text back
 // via sendMessagingOutput, which records an outbound MessagingMessageRecord.
+//
+// The reply mirror is decoupled from the typing pulse: if the
+// indicator request errors (revoked channel, network blip), we still
+// keep waiting for the task to settle and dispatch the reply.
+// Tying the two together would let a single typing failure drop the
+// assistant's response entirely.
 async function maintainTypingAndMirrorReply(
   config: RuntimeConfig,
   bridgeId: string,
@@ -379,6 +423,14 @@ async function maintainTypingAndMirrorReply(
   typingRefreshMs: number
 ): Promise<void> {
   await maintainTypingIndicator(config, taskId, channelId, client, signal, typingRefreshMs);
+  if (signal.aborted) return;
+
+  // Whether the typing loop returned because the task settled or
+  // because a transient indicator error halted the pulse, the reply
+  // mirror still has to wait for terminal state before syncing.
+  // Without this poll, syncChatTaskResult would throw "Task is not
+  // ready for chat sync" and the reply would never land.
+  await awaitTerminalTask(config, taskId, signal);
   if (signal.aborted) return;
 
   const session = findDiscordChatSession(config, bridgeId, channelId);
@@ -506,39 +558,23 @@ function snowflakeCompare(a: string, b: string): number {
   return ai < bi ? -1 : ai > bi ? 1 : 0;
 }
 
-// Flip a bridge to "error" so the supervisor reconcile loop drops it
-// from the desired set (shouldRun checks status === "configured"). The
-// user can re-enable the bridge by re-supplying the secret. Always
-// best-effort — a state write failure here is logged but does not
-// propagate further; the worst case is that the supervisor restarts
-// the loop on the next reconcile tick.
-//
-// Critically: only flip a bridge that is still "configured". A
-// concurrent disableMessagingBridge can land while this loop is
-// catching an ENOENT (disable deleted the secret file the loop was
-// about to read), and we must not stamp "error" over the user's
-// explicit "disabled" status.
-async function markBridgeError(
+// Wait for a task to reach a terminal state (completed / failed /
+// cancelled). Used by the reply mirror so it doesn't try to
+// syncChatTaskResult before the task is ready — which would throw
+// "Task is not ready for chat sync" and silently drop the reply.
+// Polls every TASK_POLL_MS until the task settles or the loop's
+// abort signal fires.
+const TASK_POLL_MS = 100;
+async function awaitTerminalTask(
   config: RuntimeConfig,
-  bridgeId: string,
-  error: unknown
+  taskId: string,
+  signal: AbortSignal
 ): Promise<void> {
-  const message = error instanceof Error ? error.message : String(error);
-  appendLog(config.instance, "messaging.discord.token_error", { bridgeId, error: message });
-  try {
-    await mutateState(config.instance, (state) => {
-      const live = state.messagingBridges.find((item) => item.id === bridgeId);
-      if (!live) return;
-      if (live.status !== "configured") return;
-      live.status = "error";
-      live.message = message;
-      live.updatedAt = now();
-    });
-  } catch (err) {
-    appendLog(config.instance, "messaging.discord.mark_error_failed", {
-      bridgeId,
-      error: err instanceof Error ? err.message : String(err)
-    });
+  while (!signal.aborted) {
+    const task = readState(config.instance).tasks.find((t) => t.id === taskId);
+    if (!task) return;
+    if (isTerminalTaskStatus(task.status)) return;
+    await sleepUnlessAborted(TASK_POLL_MS, signal);
   }
 }
 

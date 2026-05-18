@@ -2,6 +2,7 @@ import type { ChatSessionRecord, ConnectorSecretRef, MessagingBridgeRecord, Runt
 import { submitTask } from "../agent";
 import {
   addAudit,
+  appendLog,
   createMessagingBridgeRecord,
   createMessagingMessageRecord,
   findOrCreateDiscordChatSession,
@@ -51,14 +52,11 @@ function assertHeaderSafeToken(kind: string, raw: string): void {
   }
 }
 
-// Strip any "Bot <token>" residue from error strings before they land
-// in state. Belt-and-suspenders defense for the case where some
-// future code path constructs a request with a token that slipped
-// past assertHeaderSafeToken (e.g. test seam injecting raw tokens),
-// and the underlying transport echoes the auth header.
-function sanitizeBridgeError(message: string): string {
-  return message.replace(/Bot\s+\S+/g, "Bot <redacted>");
-}
+// Re-export the shared sanitizer so existing call sites in this file
+// stay readable. The helper covers Discord auth-header tokens,
+// Telegram URL-path tokens, and filesystem paths under <root>/secrets/
+// — see messaging-poller-helpers.ts for the full pattern list.
+import { sanitizeBridgeStatusMessage as sanitizeBridgeError } from "./messaging-poller-helpers";
 
 // Test seam: production code calls Telegram / Discord for real, but tests
 // inject stubbed clients so we can exercise send/health/poll without
@@ -122,17 +120,29 @@ export function readBridgeBotToken(config: RuntimeConfig, bridge: MessagingBridg
   return readSecret(config.instance, ref);
 }
 
-// Read the bot token without surfacing ENOENT — used by the API
-// callers (checkMessagingBridge, sendMessagingOutput) that need to
-// distinguish "no secret on record" (undefined) from "secret on
-// record but unreadable" (still undefined here; the poller's
-// markBridgeError path handles flipping status to "error"). Without
-// this, a missing/corrupt secret file 500s the HTTP endpoint instead
-// of producing a typed bridge error.
+// Read the bot token without 500ing the API on a secret-read
+// failure. Both ENOENT and other read failures (corrupt JSON, AES
+// auth tag mismatch, permission denied) collapse to undefined so
+// the per-kind branches in checkMessagingBridge / sendMessagingOutput
+// produce a typed "missing token" bridge error instead of a stack
+// trace. Non-ENOENT errors get a runtime log entry with the raw
+// (sanitized) message so the underlying cause stays diagnosable
+// from runtime.jsonl even though the API surface shows "missing".
+// The poller path uses the throwing readBridgeBotToken + markBridgeError
+// so it surfaces the real reason on bridge.message directly.
 function readBridgeBotTokenQuiet(config: RuntimeConfig, bridge: MessagingBridgeRecord): string | undefined {
   try {
     return readBridgeBotToken(config, bridge);
-  } catch {
+  } catch (error) {
+    const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+    if (code !== "ENOENT") {
+      const message = error instanceof Error ? error.message : String(error);
+      appendLog(config.instance, "messaging.secret_read_error", {
+        bridgeId: bridge.id,
+        kind: bridge.kind,
+        error: sanitizeBridgeError(message)
+      });
+    }
     return undefined;
   }
 }
@@ -259,8 +269,15 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
     const live = state.messagingBridges.find((item) => item.id === bridge.id);
     if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
     live.lastHealthAt = now();
-    live.status = nextStatus;
-    live.message = nextMessage;
+    // Disable race: a user-initiated disableMessagingBridge can land
+    // while we were awaiting getMe(). Don't stamp the snapshotted
+    // status/message back over "disabled" — preserve the user's
+    // explicit intent. Metadata still merges so any concurrent
+    // poller writes survive regardless.
+    if (live.status !== "disabled") {
+      live.status = nextStatus;
+      live.message = nextMessage;
+    }
     // Merge into the live metadata instead of overwriting from the
     // pre-await snapshot — concurrent poller writes to
     // metadata.lastInboundExternalIds / lastOffset must survive.

@@ -27,15 +27,26 @@ function testConfig(instance: string): RuntimeConfig {
 // cadence has had a chance to run them. sendMessage / typing / getMe
 // are no-ops that capture their inputs so the reply mirror + typing
 // pulse can be observed in assertions.
+//
+// Two stub flavors:
+//   - `enqueue(channelId, messages)` — blind FIFO queue, used by
+//     tests where the order of returned batches doesn't depend on
+//     the `afterId` cursor.
+//   - `installStore(channelId, messages)` — cursor-honoring store
+//     that derives responses from `(afterId, limit)`, mirroring
+//     Discord's actual REST contract. Used by the pagination test
+//     so a broken cursor in production would fail the assertion.
 function programmableClient(): {
   client: DiscordClient;
   enqueue: (channelId: string, messages: DiscordMessage[]) => void;
   failNext: (channelId: string, message: string) => void;
+  installStore: (channelId: string, messages: DiscordMessage[]) => void;
   sendCalls: Array<{ channelId: string; content: string }>;
   typingCalls: string[];
 } {
   type QueueEntry = { kind: "ok"; messages: DiscordMessage[] } | { kind: "err"; message: string };
   const perChannel = new Map<string, QueueEntry[]>();
+  const perChannelStore = new Map<string, DiscordMessage[]>();
   const sendCalls: Array<{ channelId: string; content: string }> = [];
   const typingCalls: string[] = [];
   const client: DiscordClient = {
@@ -56,7 +67,30 @@ function programmableClient(): {
       typingCalls.push(channelId);
       return true as const;
     },
-    async fetchChannelMessages(channelId) {
+    async fetchChannelMessages(channelId, options) {
+      // Cursor-honoring store wins when one is installed for this
+      // channel. The store mirrors Discord's REST contract:
+      //   - with `after=X&limit=N`: NEWEST N messages whose id > X,
+      //     sorted newest-first
+      //   - with `before=X&limit=N`: NEWEST N messages whose id < X,
+      //     sorted newest-first
+      //   - with neither: NEWEST N messages overall, newest-first
+      const store = perChannelStore.get(channelId);
+      if (store) {
+        const limit = options?.limit ?? 50;
+        let filtered = store;
+        if (options?.beforeId !== undefined) {
+          const before = BigInt(options.beforeId);
+          filtered = store.filter((m) => BigInt(m.id) < before);
+        } else if (options?.afterId !== undefined) {
+          const after = BigInt(options.afterId);
+          filtered = store.filter((m) => BigInt(m.id) > after);
+        }
+        const sorted = [...filtered].sort((a, b) =>
+          BigInt(a.id) > BigInt(b.id) ? -1 : BigInt(a.id) < BigInt(b.id) ? 1 : 0
+        );
+        return sorted.slice(0, limit);
+      }
       const queue = perChannel.get(channelId) ?? [];
       const next = queue.shift();
       perChannel.set(channelId, queue);
@@ -76,6 +110,9 @@ function programmableClient(): {
       const queue = perChannel.get(channelId) ?? [];
       queue.push({ kind: "err", message });
       perChannel.set(channelId, queue);
+    },
+    installStore(channelId, messages) {
+      perChannelStore.set(channelId, messages);
     },
     sendCalls,
     typingCalls
@@ -367,9 +404,11 @@ describe("discord poller supervisor", () => {
   });
 
   test("empty channel seeds a sentinel watermark, then routes the next real message", async () => {
-    // Regression for the round-1-confirmed seeding bug: a bridge
-    // attached to an empty channel must NOT consume the first user
-    // message as its seed.
+    // Regression: a bridge attached to an empty channel must NOT
+    // consume the first user message as its seed. Without the "0"
+    // sentinel, an empty first poll bails without seeding, the next
+    // poll finds watermark === undefined, and treats the first real
+    // message as the seed (and never routes it).
     const config = testConfig("disc-empty-seed");
     const { client, enqueue, sendCalls } = programmableClient();
     setMessagingDeps({ discordClientFactory: () => client });
@@ -415,14 +454,20 @@ describe("discord poller supervisor", () => {
   });
 
   test("pagination catches up when more than FETCH_BATCH_LIMIT messages land between polls", async () => {
-    // Regression for the round-2-confirmed pagination drop bug.
     // Discord's REST `after` returns the NEWEST FETCH_BATCH_LIMIT
-    // messages above the cursor (not the oldest), so a single poll
-    // would skip everything below the 50th-newest. The pagination
-    // loop in pollChannel must keep fetching until a partial batch
-    // lands or the per-tick cap fires.
+    // messages above the cursor (not the oldest), so a single fetch
+    // call would skip the older messages in a burst >limit. The
+    // pagination loop in pollChannel must keep advancing the cursor
+    // and re-fetching until a partial batch lands or the per-tick
+    // safety cap fires.
+    //
+    // Strong shape: the stub here is cursor-honoring (installStore),
+    // not a blind FIFO. A user-authored message sits in the OLDER
+    // page of the burst — a broken implementation that pinned the
+    // cursor to the newest of the first 50 would skip the user
+    // message and the final task assertion would fail.
     const config = testConfig("disc-pagination");
-    const { client, enqueue } = programmableClient();
+    const { client, enqueue, installStore, sendCalls } = programmableClient();
     setMessagingDeps({ discordClientFactory: () => client });
 
     const bridge = await addMessagingBridge(config, {
@@ -432,34 +477,25 @@ describe("discord poller supervisor", () => {
       botToken: "TOK"
     });
 
-    // Seed batch + a real "first user" message so the watermark is
-    // pinned and processing kicks in for subsequent batches.
+    // Seed via the blind queue first so the watermark gets pinned
+    // to id "100". After that, swap to the cursor-honoring store
+    // for the actual burst.
     enqueue("chan-1", [makeMessage({ id: "100", content: "older history" })]);
 
-    // Build a 75-message burst, all bot-authored so they're skipped
-    // (but the watermark must still advance through all 75).
+    // Build a 75-message burst. Ids 1000..1074. The user-authored
+    // message sits at id 1010 — well below the 50th-newest cutoff
+    // (1025) so a broken single-fetch poller would drop it.
     const burst: DiscordMessage[] = [];
     for (let i = 0; i < 75; i += 1) {
+      const isUser = i === 10;
       burst.push(makeMessage({
         id: String(1000 + i),
-        content: `burst ${i}`,
-        author: { id: "bot-1", username: "OtherBot", bot: true }
+        content: isUser ? "user-in-older-page" : `bot burst ${i}`,
+        author: isUser
+          ? { id: "user-1", username: "lo", bot: false }
+          : { id: "bot-1", username: "OtherBot", bot: true }
       }));
     }
-    // Simulate Discord's "newest first" REST behavior under `after=100`:
-    // first page returns the newest 50 (ids 1025..1074), with the
-    // OLDEST in the response being id 1025.
-    enqueue("chan-1", burst.slice(25).reverse());
-    // Second pagination call with after=1074: returns the next page
-    // (ids 1075-up). In our 75-message burst there are no messages
-    // newer than 1074, so the second call returns the OLDER 25
-    // (ids 1000-1024). Discord's API in production wouldn't actually
-    // return older messages with `after`, but our stub mirrors the
-    // catch-up shape from discord.py: we keep fetching above the
-    // newest seen until a partial batch returns. Easier to model: the
-    // stub returns the remaining 25 then empty.
-    enqueue("chan-1", burst.slice(0, 25).reverse());
-    enqueue("chan-1", []);
 
     const supervisor = createDiscordPollerSupervisor(config, {
       clientFactory: () => client,
@@ -468,9 +504,34 @@ describe("discord poller supervisor", () => {
     });
 
     await withSupervisor(supervisor, async () => {
+      // First reconcile burns the seed batch + advances watermark
+      // to 100.
       supervisor.reconcile();
-      // After processing, the watermark should reach the newest id
-      // in the burst (1074, the highest snowflake).
+      await waitFor(
+        () => {
+          const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+          const watermark = (live?.metadata?.lastInboundExternalIds as Record<string, string> | undefined)?.["chan-1"];
+          return watermark === "100";
+        },
+        "watermark to land on seed (100) before burst arrives"
+      );
+
+      // Now install the cursor-honoring store with the 75-message
+      // burst. The next poll cycle will paginate through it.
+      installStore("chan-1", burst);
+
+      // The user-authored message at id 1010 must be routed — that
+      // requires the pagination loop to keep going past the first
+      // 50 messages (which are all bot-authored above id 1025).
+      await waitFor(
+        () => readState(config.instance).messagingMessages.some(
+          (m) => m.direction === "inbound" && m.text === "user-in-older-page"
+        ),
+        "user-authored message in the older page to land via pagination catch-up"
+      );
+
+      // And the watermark must reach the newest id in the burst
+      // (1074), not stop at the first page boundary.
       await waitFor(
         () => {
           const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
@@ -479,25 +540,23 @@ describe("discord poller supervisor", () => {
         },
         "watermark to advance to newest of the burst (1074)"
       );
-    });
 
-    // No user-authored messages → no tasks spawned. The burst was
-    // entirely bot-authored; the pagination must still account for
-    // every snowflake.
-    expect(readState(config.instance).tasks).toEqual([]);
+      // Reply mirror runs for the user message — sendCalls captures
+      // the dispatch.
+      await waitFor(() => sendCalls.length >= 1, "reply dispatch for the older-page user message");
+    });
   });
 
-  test("markBridgeError does not overwrite a user-initiated disable", async () => {
-    // Race: user disables the bridge while the loop is mid-tick.
-    // disableMessagingBridge sets status="disabled" and deletes the
-    // secret file. The next loop iter catches ENOENT and calls
-    // markBridgeError — which must NOT flip "disabled" back to
-    // "error", because that would erase the user's explicit intent.
+  test("markBridgeError respects a disable that races with a secret read", async () => {
+    // Direct unit test for the helper: simulate a loop catching
+    // ENOENT after a concurrent disable has flipped the bridge to
+    // "disabled". Calling markBridgeError must NOT overwrite the
+    // user's explicit disable with "error". The previous shape of
+    // this test relied on a reconcile-driven exit path that bypassed
+    // markBridgeError entirely; this version calls the helper
+    // directly so the disable-respect guard is the only thing under
+    // test.
     const config = testConfig("disc-disable-race");
-    const { client } = programmableClient();
-    setMessagingDeps({ discordClientFactory: () => client });
-
-    const { disableMessagingBridge } = await import("./messaging");
 
     const bridge = await addMessagingBridge(config, {
       name: "disc",
@@ -506,22 +565,60 @@ describe("discord poller supervisor", () => {
       botToken: "TOK"
     });
 
-    const supervisor = createDiscordPollerSupervisor(config, {
-      clientFactory: () => client,
-      pollIntervalMs: 20,
-      typingRefreshMs: 20
-    });
+    const { disableMessagingBridge } = await import("./messaging");
+    const { markBridgeError } = await import("./messaging-poller-helpers");
 
-    await withSupervisor(supervisor, async () => {
-      supervisor.reconcile();
-      // Disable while the loop is running. The disable flow deletes
-      // the secret; if the loop catches ENOENT it would call
-      // markBridgeError, which must respect the "disabled" status.
-      await disableMessagingBridge(config, bridge.id);
-      await waitFor(() => supervisor.size() === 0, "loop to exit after disable");
-    });
+    // Step 1: user disables the bridge.
+    await disableMessagingBridge(config, bridge.id);
+    expect(
+      readState(config.instance).messagingBridges.find((b) => b.id === bridge.id)?.status
+    ).toBe("disabled");
+
+    // Step 2: a poll loop, mid-tick when disable landed, catches
+    // its ENOENT and calls markBridgeError. The helper must observe
+    // the now-disabled status and refuse to write.
+    await markBridgeError(
+      config,
+      bridge.id,
+      "messaging.discord.token_error",
+      "messaging.discord.mark_error_failed",
+      new Error("ENOENT: no such file or directory, open '/.../secrets/bridge.bot-token.json'")
+    );
 
     const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
     expect(live?.status).toBe("disabled");
+    // The disable's status message must also be preserved — markBridgeError
+    // didn't overwrite it.
+    expect(live?.message ?? "").not.toContain("ENOENT");
+  });
+
+  test("markBridgeError flips a configured bridge to 'error' and sanitizes the file path", async () => {
+    // Companion test: when the bridge IS still configured, the
+    // helper does flip status to "error", and the persisted
+    // bridge.message scrubs the absolute secret-file path so the
+    // state surface doesn't leak the encrypted-store layout.
+    const config = testConfig("disc-mark-error-sanitized");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    const { markBridgeError } = await import("./messaging-poller-helpers");
+    await markBridgeError(
+      config,
+      bridge.id,
+      "messaging.discord.token_error",
+      "messaging.discord.mark_error_failed",
+      new Error("ENOENT: no such file or directory, open '/tmp/some-instance/secrets/bridge_x.bot-token.json'")
+    );
+
+    const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    expect(live?.status).toBe("error");
+    expect(String(live?.message)).toContain("ENOENT");
+    expect(String(live?.message)).toContain("<secret-path>");
+    expect(String(live?.message)).not.toContain("/tmp/some-instance/secrets/");
   });
 });
