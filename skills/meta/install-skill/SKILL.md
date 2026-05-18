@@ -60,6 +60,11 @@ will need.
    - For each entry, check `GET /api/connectors/providers`.
    - If the provider exists, note whether the user already has a healthy
      connector for it (via `GET /api/connectors`).
+   - If the skill only needs local commands or an already-authenticated CLI
+     and does not need a connector-managed account, credential, remote API,
+     or local integration, remove the connector requirement instead of
+     rewriting it to `generic`. Record command requirements under
+     `metadata.gini.prerequisites.commands`.
    - If the provider does NOT exist in the registry:
      **Default to forward motion.** Rewrite the requirement as
      `provider: generic` and explain the tradeoff to the user:
@@ -126,8 +131,9 @@ will need.
 - Always review the scripts for risk before flipping trust. If you
   can't read the scripts (binary blobs, opaque URLs), refuse the trust
   flip and tell the user why.
-- Default to `provider: generic` for unknown providers; do not stop the
-  install flow to ask permission.
+- Default to `provider: generic` for unknown external providers; do not
+  stop the install flow to ask permission. Do not add `generic` for
+  skills that only need local commands or an already-authenticated CLI.
 - Never embed the user's secret values in the SKILL.md you write.
 - Bundled vendored skills are off-limits to this skill — install only
   user-source records.
