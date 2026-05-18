@@ -20,9 +20,10 @@ Use `gws forms` to create new forms, add questions to them, change publish setti
 
 - `gws` installed and authenticated. If `gws auth login` has never been run on this instance, invoke the `google-workspace-setup` skill first.
 - OAuth scopes the user picked at login must cover the verbs the agent will use:
-  - Create / edit forms: `forms.body`
+  - Create / edit forms (read + write structure): `forms.body`
+  - Read form structure only (e.g. mapping `questionId → title` for summaries): `forms.body.readonly`
   - Read submitted responses: `forms.responses.readonly`
-  - Both: pick both scopes at login time.
+  - Summarize responses by question text: `forms.responses.readonly` AND `forms.body.readonly` (or `forms.body`). `forms.responses.readonly` is NOT on `forms.get`'s authorized scope list — you need a body scope to fetch the structure separately.
 
 ## When to Use
 
@@ -121,7 +122,7 @@ gws forms forms responses list \
   --page-all
 ```
 
-Each response has an `answers` map keyed by `questionId`. Cross-reference against `forms.get` to map question IDs back to titles when summarizing.
+Each response has an `answers` map keyed by `questionId`. Cross-reference against `forms.get` to map question IDs back to titles when summarizing. `forms.get` reads form structure and requires `forms.body.readonly` (or `forms.body`) — `forms.responses.readonly` alone is not on its authorized scope list, so summary workflows need both.
 
 ### Publish settings
 
@@ -151,7 +152,7 @@ Watches deliver to Pub/Sub. For most agent workflows, polling `responses.list` o
 2. Every `forms.create`, `forms.batchUpdate`, and `forms.setPublishSettings` is a write. Confirm form title, item list, and publish state with the user before invoking, even when `gws *` is auto-approved.
 3. `batchUpdate` is atomic across all `requests`. Build the full sequence (createItem, updateItem, deleteItem, …) and send once; do not loop one-request-at-a-time, which doubles round trips and risks half-applied state.
 4. The `responderUri` returned by `forms.get` is a public URL. Anyone with the link who is allowed by the form's access settings can submit. Be explicit when sharing it.
-5. To map answers back to question text, fetch the form structure once with `forms.get` and keep the `questionId → title` map locally — do not refetch the structure on every response.
+5. To map answers back to question text, fetch the form structure once with `forms.get` and keep the `questionId → title` map locally — do not refetch the structure on every response. This requires `forms.body.readonly` (or `forms.body`) in addition to `forms.responses.readonly`; `forms.get` rejects a responses-only scope.
 6. For structured data the user already owns (existing CSV or sheet), Forms is the wrong tool — keep the data in Sheets and use `gws sheets`. Forms is for **collecting** new input, not storing existing data.
 7. Long, branching surveys are better served by dedicated survey tools (Typeform, Qualtrics). Forms supports basic page navigation and required questions but no advanced logic.
 
