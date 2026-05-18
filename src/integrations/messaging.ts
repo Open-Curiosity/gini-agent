@@ -250,22 +250,44 @@ export function findTelegramChatSession(
   );
 }
 
-// Chat allowlist + first-DM pairing.
+// Chat allowlist + explicit enrollment.
 //
 // Telegram bots are addressable by anyone who finds the @username, so
 // without an allowlist a stranger can add the bot to their group and
 // drive the runtime — burning the owner's provider tokens and
 // potentially reaching workspace tools. The bridge stores a list of
 // permitted chat_ids on `metadata.allowedChatIds`; the poller silently
-// drops updates from anyone not on the list. The first private chat
-// to reach an empty allowlist auto-pairs as the bridge owner — that's
-// the convention the user already expects from local-first tooling
-// ("the first thing I do with a fresh bridge is DM it from my own
-// account").
+// drops updates from anyone not on the list. There is NO trust-on-
+// first-use: even the first DM from the bridge owner is denied until
+// they explicitly run `gini messaging allow <bridge> <chat-id>` on
+// their own machine.
+//
+// To make chat-id discovery painless (the owner doesn't typically
+// know their own Telegram user_id off the top of their head), the
+// poller records the last few denied attempts on
+// `metadata.recentDeniedChats`. The owner runs `gini messaging chats
+// <bridge>` and sees both the allowlist and a list of pending
+// attempts, including their own — they pick out the right chat_id and
+// enroll it. The list is bounded so a flood of stranger pings can't
+// blow up the state record.
+
+const MAX_RECENT_DENIED_CHATS = 10;
+
+export interface DeniedChatAttempt {
+  chatId: number;
+  chatType: "private" | "group" | "supergroup" | "channel" | string;
+  // Telegram @handle when available, otherwise first_name. Omitted if
+  // the update carried no `from` field (rare — typically channel posts).
+  sender?: string;
+  // Last time we saw an attempt from this chat. Newer attempts from
+  // the same chat just bump the timestamp instead of stacking entries.
+  lastAttemptAt: string;
+}
 
 export interface ChatAllowlistView {
   allowedChatIds: number[];
   ownerChatId?: number;
+  recentDeniedChats: DeniedChatAttempt[];
 }
 
 function readAllowedChatIds(bridge: MessagingBridgeRecord): number[] {
@@ -283,42 +305,58 @@ export function isChatAllowed(bridge: MessagingBridgeRecord, chatId: number): bo
   return readAllowedChatIds(bridge).includes(chatId);
 }
 
-// Atomically resolve the allow decision for an inbound update. Returns
-// `{ allowed: true, paired: true }` when this call auto-paired the
-// owner; `{ allowed: true }` when the chat was already on the list;
-// `{ allowed: false }` when the update should be dropped. The whole
-// check-and-set runs inside mutateState so two concurrent first-DMs
-// can't both win the owner slot.
+// Atomically check whether an inbound chat is on the bridge's
+// allowlist. Returns `true` when the message should be processed,
+// `false` when the poller should drop it silently. No trust-on-first-
+// use: every chat (including the owner's first DM) starts denied,
+// and the owner enrolls themselves via `gini messaging allow` after
+// finding their chat_id in the recent-denied list.
 export async function authorizeTelegramChat(
   config: RuntimeConfig,
   bridgeId: string,
-  chatId: number,
-  chatType: "private" | "group" | "supergroup" | "channel"
-): Promise<{ allowed: boolean; paired: boolean }> {
-  return mutateState(config.instance, (state) => {
+  chatId: number
+): Promise<boolean> {
+  const bridge = readState(config.instance).messagingBridges.find((b) => b.id === bridgeId);
+  if (!bridge) return false;
+  return isChatAllowed(bridge, chatId);
+}
+
+// Record a denied chat attempt on the bridge so the owner can find
+// their own chat_id via `gini messaging chats <bridge>` without
+// tailing the runtime log. Dedupes by chatId — repeated attempts from
+// the same stranger just refresh the timestamp instead of stacking
+// entries. Bounded at MAX_RECENT_DENIED_CHATS to keep the state record
+// small if a public-known bridge gets pinged at scale.
+export async function recordDeniedChatAttempt(
+  config: RuntimeConfig,
+  bridgeId: string,
+  attempt: { chatId: number; chatType: string; sender?: string }
+): Promise<void> {
+  await mutateState(config.instance, (state) => {
     const live = state.messagingBridges.find((b) => b.id === bridgeId);
-    if (!live) return { allowed: false, paired: false };
-    const allowed = readAllowedChatIds(live);
-    if (allowed.includes(chatId)) return { allowed: true, paired: false };
-    // Auto-pair: empty allowlist + private chat = first DM owns the bot.
-    // Group chats never auto-pair; the owner must explicitly enroll them.
-    if (allowed.length === 0 && chatType === "private") {
-      const meta = { ...(live.metadata ?? {}) };
-      meta.allowedChatIds = [chatId];
-      meta.ownerChatId = chatId;
-      live.metadata = meta;
-      live.updatedAt = now();
-      addAudit(state, {
-        actor: "runtime",
-        action: "messaging.chat.paired",
-        target: live.id,
-        risk: "medium",
-        evidence: { chatId, ownerChatId: chatId }
-      });
-      return { allowed: true, paired: true };
-    }
-    return { allowed: false, paired: false };
+    if (!live) return;
+    const meta = { ...(live.metadata ?? {}) };
+    const existing = readRecentDeniedChats(live).filter((entry) => entry.chatId !== attempt.chatId);
+    const entry: DeniedChatAttempt = {
+      chatId: attempt.chatId,
+      chatType: attempt.chatType,
+      ...(attempt.sender ? { sender: attempt.sender } : {}),
+      lastAttemptAt: now()
+    };
+    // Newest first; cap at MAX so an attacker pinging in a loop can't
+    // bloat the state record.
+    meta.recentDeniedChats = [entry, ...existing].slice(0, MAX_RECENT_DENIED_CHATS);
+    live.metadata = meta;
+    live.updatedAt = entry.lastAttemptAt;
   });
+}
+
+function readRecentDeniedChats(bridge: MessagingBridgeRecord): DeniedChatAttempt[] {
+  const raw = bridge.metadata?.recentDeniedChats;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((entry) => entry as DeniedChatAttempt)
+    .filter((entry) => entry && typeof entry.chatId === "number");
 }
 
 export async function allowChat(config: RuntimeConfig, idOrName: string, chatId: number) {
@@ -330,9 +368,15 @@ export async function allowChat(config: RuntimeConfig, idOrName: string, chatId:
     const allowed = readAllowedChatIds(live);
     if (!allowed.includes(chatId)) allowed.push(chatId);
     meta.allowedChatIds = allowed;
-    // Owner stays whoever it was; if there's no owner yet (manual
-    // enrollment from the CLI before any DM) we leave it unset so the
-    // first private-chat DM still gets pair-recognized.
+    // First enrollment also becomes the recorded owner. After that the
+    // field stays stable — `allow` of additional chats doesn't change
+    // who originally claimed the bridge.
+    if (readOwnerChatId(live) === undefined) {
+      meta.ownerChatId = chatId;
+    }
+    // Drop the enrolled chat from the pending-attempts list so the
+    // owner's view stays clean.
+    meta.recentDeniedChats = readRecentDeniedChats(live).filter((entry) => entry.chatId !== chatId);
     live.metadata = meta;
     live.updatedAt = now();
     addAudit(state, {
@@ -383,7 +427,8 @@ function chatAllowlistView(bridge: MessagingBridgeRecord): ChatAllowlistView {
   const owner = readOwnerChatId(bridge);
   return {
     allowedChatIds: readAllowedChatIds(bridge),
-    ...(owner !== undefined ? { ownerChatId: owner } : {})
+    ...(owner !== undefined ? { ownerChatId: owner } : {}),
+    recentDeniedChats: readRecentDeniedChats(bridge)
   };
 }
 
