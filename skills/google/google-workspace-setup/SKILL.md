@@ -80,24 +80,32 @@ If `gcloud` is not available, fall back to the manual flow:
 
 ### 3. Pick the right scopes per product
 
-Unverified OAuth apps in testing mode are capped at roughly 25 scopes by Google, and the default "recommended" preset is 85+ scopes — it will fail for `@gmail.com` accounts. Pass `-s` to narrow the list at login time:
+Unverified OAuth apps in testing mode are capped at roughly 25 scopes by Google, and the default "recommended" preset is 85+ scopes — it will fail for `@gmail.com` accounts. There are two ways to narrow the list at login time:
 
 ```bash
-# Just the products the user actually needs
+# Pick services by short name (full read-write across each)
 gws auth login -s drive,gmail,calendar,docs,meet,forms
 
-# Read-only Gmail, full Drive
-gws auth login -s "gmail.readonly,drive"
+# Same services, but read-only everywhere — the --readonly flag applies
+# uniformly to every service listed in -s
+gws auth login --readonly -s gmail,drive
+
+# Exact per-scope picks (full URLs, no shortcuts) — use this when you
+# need a mixed shape that -s/--readonly can't express, e.g. read-only
+# Gmail + full Drive in the same login
+gws auth login --scopes "https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/drive"
 ```
 
-Recommended starting scopes per product:
+`-s` takes **service names**, not scope strings — `-s gmail.readonly` is silently dropped because no service named `gmail.readonly` exists. Pair `-s` with `--readonly` for read-only across the listed services, or fall through to `--scopes` with explicit URLs for fine-grained mixes.
 
-- **Gmail**: `gmail.readonly` for triage-only, `gmail.send` for send/reply, `gmail` for full read+write+labels.
-- **Drive**: `drive.file` if the agent should only see files it creates, `drive.readonly` for browsing, `drive` for full access.
-- **Calendar**: `calendar.readonly` for agenda, `calendar.events` for create/update events, `calendar` for full access.
-- **Docs**: `docs` (Docs has no read-only split — pair with `drive.readonly` if the user wants the agent to find docs by title before reading them).
-- **Meet**: `meetings.space.created` for space create/lookup, `meetings.space.readonly` for conference record lookup.
-- **Forms**: `forms.body` to create/edit forms, `forms.responses.readonly` to read responses.
+Recommended starting scopes per product. The first column is the `-s` shorthand (Service column from `gws auth login --help`); the second column is the full URL to pass to `--scopes` when picking a non-uniform mix:
+
+- **Gmail** — `-s gmail` ↔ `https://www.googleapis.com/auth/gmail` (or `.readonly` / `.send` / `.modify` URLs for narrower picks).
+- **Drive** — `-s drive` ↔ `https://www.googleapis.com/auth/drive` (`.file`, `.readonly`, `.metadata.readonly` available as full URLs).
+- **Calendar** — `-s calendar` ↔ `https://www.googleapis.com/auth/calendar` (`.events`, `.readonly`, `.freebusy` available as full URLs).
+- **Docs** — `-s docs` ↔ `https://www.googleapis.com/auth/documents` (`.readonly` available as a full URL when the agent only needs to read).
+- **Meet** — `-s meet` ↔ `https://www.googleapis.com/auth/meetings.space.created` (`.readonly` available as a full URL).
+- **Forms** — `-s forms` ↔ `https://www.googleapis.com/auth/forms.body` (`.body.readonly`, `.responses.readonly` available as full URLs).
 
 ### 4. Add `gws` to autoApproveCommands
 
@@ -148,7 +156,7 @@ If that returns JSON without an auth error, the setup is complete and the per-pr
 2. Narrow OAuth scopes to what the user actually asked for. Do not silently expand from read-only to write.
 3. When the user is on a personal `@gmail.com` account, never request the full `recommended` scope preset — it will fail because the app is unverified. Use a comma-separated `-s` list.
 4. Encourage `gws *` in `autoApproveCommands` only after the user understands every `gws` call still produces an audit row.
-5. Credentials are encrypted at rest under `~/.config/gws/` — never `cat` or copy that directory's contents into chat or logs.
+5. Treat the entire `~/.config/gws/` directory as sensitive — never `cat` or copy its contents into chat or logs. The post-OAuth authorized-user credentials are AES-256-GCM encrypted at rest, with the symmetric key held in the OS keyring (macOS Keychain / Linux Secret Service) or, as a fallback when no keyring is available, written plaintext to a local `.encryption_key` file in that directory. The OAuth client config (`client_secret.json`) is stored as plaintext alongside it. Both artifacts are sensitive: the client secret identifies the app and the encrypted blob (plus its key file) is enough to act as the user.
 6. If the user is in a CI or headless environment, point them at the export flow (`gws auth export --unmasked > credentials.json` on a desktop machine, then `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=…` on the headless one).
 
 For flags not shown here, run `gws auth --help` and `gws --help`.
