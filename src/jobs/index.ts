@@ -834,6 +834,10 @@ export async function removeJob(config: RuntimeConfig, jobId: string) {
   });
 }
 
+export function listJobs(config: RuntimeConfig) {
+  return readState(config.instance).jobs;
+}
+
 export function listJobRuns(config: RuntimeConfig, jobId?: string) {
   const runs = readState(config.instance).jobRuns;
   return jobId ? runs.filter((run) => run.jobId === jobId) : runs;
