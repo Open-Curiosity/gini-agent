@@ -1,0 +1,140 @@
+---
+name: google-calendar
+description: "Google Calendar via gws: list events, create, accept, find free time."
+license: MIT
+compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Calendar scopes."
+metadata:
+  gini:
+    version: 1.0.0
+    author: Gini
+    platforms: [macos, linux]
+    prerequisites:
+      commands: [gws]
+---
+
+# Google Calendar
+
+Use `gws calendar` to list events, create and update events, look up free/busy windows, and manage calendar ACLs. The CLI wraps the Calendar v3 API and produces structured JSON.
+
+## Prerequisites
+
+- `gws` installed and authenticated. If `gws auth login` has never been run on this instance, invoke the `google-workspace-setup` skill first.
+- OAuth scopes the user picked at login must cover the verbs the agent will use:
+  - Read-only agenda / free-busy: `calendar.readonly`
+  - Create, update, delete events: `calendar.events` (or full `calendar`)
+  - Manage calendar lists, ACLs, and secondary calendars: full `calendar`
+
+## When to Use
+
+- The user asks Gini to look at, summarize, or modify their calendar.
+- Scheduling a one-off meeting or a recurring event.
+- Finding a free slot across the user's own calendars or comparing free/busy with another attendee.
+- Adding a Google Meet link to an invite.
+- Pulling today's, tomorrow's, or this-week's agenda.
+
+## When NOT to Use
+
+- Personal to-dos the user wants to see on their iPhone — use `apple-reminders` for time-bound to-dos, not Calendar events.
+- One-off agent alerts ("ping me in an hour") — use the cronjob tool, not a self-invite.
+- Cross-device personal note-taking — use `apple-notes` or `obsidian`.
+- Meeting *content* (agenda doc, shared notes) — use `google-docs` for the doc and attach it to the event with a Drive link.
+- Project task tracking — use the project's issue tracker; Calendar is for time-bound events, not durable to-dos.
+
+## Quick Reference
+
+The Calendar surface is the auto-generated v3 API (`gws calendar events list`, `gws calendar events insert`, `gws calendar freebusy query`, …) plus two curated helpers: `+agenda` for digests and `+insert` for creating events without hand-rolling the JSON body.
+
+### Agenda
+
+```bash
+gws calendar +agenda                              # next ~7 days, all calendars
+gws calendar +agenda --today
+gws calendar +agenda --tomorrow
+gws calendar +agenda --week --format table
+gws calendar +agenda --days 14
+gws calendar +agenda --today --calendar 'Work'
+gws calendar +agenda --today --timezone America/New_York
+```
+
+`+agenda` is read-only and uses the user's Google account timezone by default. Override with `--timezone <IANA>` when the user is travelling.
+
+### Create an event
+
+```bash
+gws calendar +insert \
+  --summary 'Standup' \
+  --start '2026-06-17T09:00:00-07:00' \
+  --end   '2026-06-17T09:30:00-07:00'
+
+# With attendees + Meet link
+gws calendar +insert \
+  --summary 'Design review' \
+  --start '2026-06-17T14:00:00-07:00' \
+  --end   '2026-06-17T15:00:00-07:00' \
+  --attendee alice@example.com \
+  --attendee bob@example.com \
+  --meet \
+  --location 'Room 4' \
+  --description 'Walk through the v2 mocks.'
+```
+
+Times are RFC 3339 / ISO 8601. Always include the offset (`-07:00`, `+02:00`, `Z`) — naked local times round-trip incorrectly across DST.
+
+For natural-language event creation, the API surface also offers `events.quickAdd`:
+
+```bash
+gws calendar events quickAdd \
+  --params '{"calendarId":"primary","text":"Coffee with Pat tomorrow 3pm-3:30pm"}'
+```
+
+### List, get, update, delete events
+
+```bash
+gws calendar events list \
+  --params '{"calendarId":"primary","timeMin":"2026-06-17T00:00:00Z","timeMax":"2026-06-18T00:00:00Z","singleEvents":true,"orderBy":"startTime"}'
+
+gws calendar events get \
+  --params '{"calendarId":"primary","eventId":"<EVENT_ID>"}'
+
+gws calendar events patch \
+  --params '{"calendarId":"primary","eventId":"<EVENT_ID>"}' \
+  --json '{"location":"Room 5"}'
+
+gws calendar events delete \
+  --params '{"calendarId":"primary","eventId":"<EVENT_ID>"}'
+```
+
+### Find free time
+
+```bash
+gws calendar freebusy query --json '{
+  "timeMin": "2026-06-17T09:00:00-07:00",
+  "timeMax": "2026-06-17T18:00:00-07:00",
+  "items": [{"id":"primary"},{"id":"alice@example.com"}]
+}'
+```
+
+The response lists busy windows per calendar; free time is the complement within `[timeMin, timeMax]`.
+
+### Calendar list and ACLs
+
+```bash
+gws calendar calendarList list
+gws calendar calendars insert --json '{"summary":"Side project"}'
+gws calendar acl list --params '{"calendarId":"primary"}'
+gws calendar acl insert --params '{"calendarId":"primary"}' \
+  --json '{"role":"reader","scope":{"type":"user","value":"alice@example.com"}}'
+```
+
+## Rules
+
+1. Calendar events are **time-bound things on a schedule** — meetings, appointments, focus blocks. For personal to-dos that should appear on the user's iPhone, prefer `apple-reminders`. For agent-internal alerts ("remind me in 2 hours"), use the cronjob tool. Confirm intent before deciding which.
+2. Every `events.insert`, `events.patch`, `events.delete`, `+insert` is a write. Confirm summary, start/end (with timezone), attendees, and whether to send notifications before invoking, even when `gws *` is auto-approved.
+3. Use RFC 3339 times with an explicit offset on `+insert` and `events.insert`. Naked local times silently drift across DST boundaries.
+4. Prefer `+insert` over hand-rolling `events.insert --json` when the user just wants a normal event. The helper sets sane defaults (visibility, reminders) without forcing the agent to learn the full body schema.
+5. Adding `--meet` to `+insert` creates a Google Meet space attached to the event — this is the simplest way to give the user a join link. Do not separately call `google-meet` to create a standalone space when an event will exist anyway.
+6. When listing events, set `singleEvents:true` and `orderBy:"startTime"` so recurring events expand into individual instances and arrive in chronological order. Without those, the response is grouped by recurrence master and confusing to summarize.
+7. Free/busy queries are read-only and cheap — prefer them over scraping multiple `events.list` calls when the user only needs availability, not event content.
+8. Respect the calendar's timezone, not just the host's. `+agenda` defaults to the Google account timezone; only override with `--timezone` when the user is travelling.
+
+For flags not shown here, run `gws calendar --help` or `gws calendar <verb> --help` (e.g. `gws calendar +insert --help`).
