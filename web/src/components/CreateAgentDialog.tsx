@@ -46,12 +46,27 @@ export function CreateAgentDialog({
         method: "POST",
         body: JSON.stringify({ name: input.name })
       });
-      await api(`/agents/${encodeURIComponent(created.id)}/use`, { method: "POST" });
-      return created;
+      // The new agent exists server-side from this point on, even if /use
+      // fails below. Refresh caches so it's visible in the dropdown and a
+      // retry doesn't create a duplicate (the API has no name-uniqueness
+      // check).
+      invalidate(["agents", "state", "status", "memory"]);
+      try {
+        await api(`/agents/${encodeURIComponent(created.id)}/use`, { method: "POST" });
+        return { record: created, activated: true as const };
+      } catch (activationErr) {
+        const message = activationErr instanceof Error ? activationErr.message : String(activationErr);
+        return { record: created, activated: false as const, activationError: message };
+      }
     },
-    onSuccess: (record) => {
-      toast.success(`Agent "${record.name}" created`);
-      invalidate(["agents", "state", "status"]);
+    onSuccess: (result) => {
+      if (result.activated) {
+        toast.success(`Agent "${result.record.name}" created`);
+      } else {
+        toast.success(`Agent "${result.record.name}" created`);
+        toast.error(`Could not activate: ${result.activationError}`);
+      }
+      invalidate(["agents", "state", "status", "memory"]);
       onOpenChange(false);
     },
     onError: (err: Error) => {
@@ -60,6 +75,7 @@ export function CreateAgentDialog({
   });
 
   const submit = () => {
+    if (create.isPending) return;
     setError(null);
     const trimmed = name.trim();
     if (!trimmed) {
@@ -87,6 +103,7 @@ export function CreateAgentDialog({
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. research"
               autoFocus
+              disabled={create.isPending}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   e.preventDefault();
