@@ -868,7 +868,11 @@ function testConfig(instance: string): RuntimeConfig {
     provider: { name: "echo", model: "gini-echo-v0" },
     workspaceRoot: "/tmp",
     stateRoot: `${root}/instances/${instance}`,
-    logRoot: `${root}-logs/${instance}`
+    logRoot: `${root}-logs/${instance}`,
+    // These tests predate the approval-mode flip and rely on the
+    // gated path. Force "strict" to keep them honest; new defaults
+    // are exercised in approval-mode.test.ts.
+    approvalMode: "strict"
   };
 }
 

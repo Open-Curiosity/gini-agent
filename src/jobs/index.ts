@@ -167,15 +167,22 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     }
     oneShot = input.oneShot;
   }
-  // Per-job auto-approve envelope. Both fields are optional; reject malformed
+  // Per-job auto-approve envelope. All fields are optional; reject malformed
   // payloads up-front so a typo doesn't silently fall back to legacy behavior.
-  // See ADR dangerously-auto-approve.md ("Per-job scope") for the approval model.
+  // See ADR approval-mode.md ("Per-job scope") for the approval model.
   let dangerouslyAutoApprove: boolean | undefined;
   if (input.dangerouslyAutoApprove !== undefined && input.dangerouslyAutoApprove !== null) {
     if (typeof input.dangerouslyAutoApprove !== "boolean") {
       throw new Error(`Invalid input: dangerouslyAutoApprove must be a boolean (got ${String(input.dangerouslyAutoApprove)})`);
     }
     dangerouslyAutoApprove = input.dangerouslyAutoApprove;
+  }
+  let approvalMode: "strict" | "auto" | "yolo" | undefined;
+  if (input.approvalMode !== undefined && input.approvalMode !== null) {
+    if (input.approvalMode !== "strict" && input.approvalMode !== "auto" && input.approvalMode !== "yolo") {
+      throw new Error(`Invalid input: approvalMode must be one of "strict" | "auto" | "yolo" (got ${String(input.approvalMode)})`);
+    }
+    approvalMode = input.approvalMode;
   }
   let autoApproveCommands: string[] | undefined;
   if (input.autoApproveCommands !== undefined && input.autoApproveCommands !== null) {
@@ -193,6 +200,23 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
       cleaned.push(entry);
     }
     autoApproveCommands = cleaned;
+  }
+  let dangerousTerminalPatterns: string[] | undefined;
+  if (input.dangerousTerminalPatterns !== undefined && input.dangerousTerminalPatterns !== null) {
+    if (!Array.isArray(input.dangerousTerminalPatterns)) {
+      throw new Error(`Invalid input: dangerousTerminalPatterns must be an array of strings (got ${typeof input.dangerousTerminalPatterns})`);
+    }
+    const cleaned: string[] = [];
+    for (const entry of input.dangerousTerminalPatterns) {
+      if (typeof entry !== "string") {
+        throw new Error(`Invalid input: dangerousTerminalPatterns entries must be strings (got ${typeof entry})`);
+      }
+      if (entry.length === 0) {
+        throw new Error(`Invalid input: dangerousTerminalPatterns entries must be non-empty strings`);
+      }
+      cleaned.push(entry);
+    }
+    dangerousTerminalPatterns = cleaned;
   }
   // A parent task that has already transitioned terminal must not
   // create a durable scheduled job. Without this, a `cancelTask`
@@ -251,7 +275,9 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
       chatSessionId: resolvedChatSessionId,
       oneShot,
       dangerouslyAutoApprove,
-      autoApproveCommands
+      approvalMode,
+      autoApproveCommands,
+      dangerousTerminalPatterns
     });
   });
 }
@@ -411,12 +437,21 @@ function buildTaskConfig(config: RuntimeConfig, job: JobRecord): RuntimeConfig {
       ? [...config.autoApproveCommands]
       : undefined
   };
-  if (job.dangerouslyAutoApprove === true) {
-    clone.dangerouslyAutoApprove = true;
+  // approvalMode overlay. The job's explicit `approvalMode` always
+  // wins over the operator instance default. For back-compat, the
+  // legacy `dangerouslyAutoApprove: true` field on a job aliases to
+  // `approvalMode: "yolo"` when no approvalMode is set on the job.
+  if (job.approvalMode) {
+    clone.approvalMode = job.approvalMode;
+  } else if (job.dangerouslyAutoApprove === true) {
+    clone.approvalMode = "yolo";
   }
   if (Array.isArray(job.autoApproveCommands) && job.autoApproveCommands.length > 0) {
     const base = clone.autoApproveCommands ?? [];
     clone.autoApproveCommands = [...base, ...job.autoApproveCommands];
+  }
+  if (Array.isArray(job.dangerousTerminalPatterns)) {
+    clone.dangerousTerminalPatterns = [...job.dangerousTerminalPatterns];
   }
   return clone;
 }

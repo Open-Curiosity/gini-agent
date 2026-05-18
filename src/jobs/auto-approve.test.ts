@@ -41,6 +41,11 @@ function buildConfig(workspaceRoot: string, instance: string, opts: Partial<Runt
     workspaceRoot,
     stateRoot: process.env.GINI_STATE_ROOT ?? "/tmp/gini-job-auto-test",
     logRoot: process.env.GINI_LOG_ROOT ?? "/tmp/gini-job-auto-test-logs",
+    // Pin instance to strict so the per-job envelope is the only
+    // thing that can drive auto-approve in these tests; the new
+    // default-auto policy on the operator config would otherwise
+    // mask the per-job opt-in.
+    approvalMode: "strict",
     ...opts
   };
 }
@@ -237,12 +242,15 @@ describe("per-job auto-approve envelope", () => {
     const approveAudits = stateAfter.audit.filter((a) => a.action === "approval.approved" && a.taskId === taskId);
     expect(approveAudits).toHaveLength(1);
     expect(approveAudits[0]?.actor).toBe("runtime");
-    expect(approveAudits[0]?.evidence?.autoApprovedReason).toBe("dangerouslyAutoApprove");
+    // Legacy `dangerouslyAutoApprove: true` aliases to approval-mode-yolo
+    // at the policy seam, so the stamped reason reflects the canonical
+    // mode name rather than the deprecated field name.
+    expect(approveAudits[0]?.evidence?.autoApprovedReason).toBe("approval-mode-yolo");
 
     // Side-effect audit row stamped too.
     const writeAudits = stateAfter.audit.filter((a) => a.action === "file.write" && a.taskId === taskId);
     expect(writeAudits).toHaveLength(1);
-    expect(writeAudits[0]?.evidence?.autoApprovedReason).toBe("dangerouslyAutoApprove");
+    expect(writeAudits[0]?.evidence?.autoApprovedReason).toBe("approval-mode-yolo");
 
     // The file should land on disk.
     expect(await Bun.file(join(workspaceRoot, "from-job.txt")).text()).toBe("by job");
@@ -387,5 +395,175 @@ describe("createScheduledJob auto-approve validation", () => {
     });
     expect(job.autoApproveCommands).toBeUndefined();
     expect(job.dangerouslyAutoApprove).toBeUndefined();
+    expect(job.approvalMode).toBeUndefined();
+    expect(job.dangerousTerminalPatterns).toBeUndefined();
+  });
+
+  test("persists approvalMode on the JobRecord", async () => {
+    const config = buildConfig("/tmp", "job-validation-mode");
+    const job = await createScheduledJob(config, {
+      name: "with-mode",
+      intervalSeconds: 60,
+      prompt: "x",
+      approvalMode: "yolo"
+    });
+    expect(job.approvalMode).toBe("yolo");
+  });
+
+  test("rejects invalid approvalMode value", async () => {
+    const config = buildConfig("/tmp", "job-validation-bad-mode");
+    await expect(
+      createScheduledJob(config, {
+        name: "bad-mode",
+        intervalSeconds: 60,
+        prompt: "x",
+        approvalMode: "loose" as unknown as "strict"
+      })
+    ).rejects.toThrow(/approvalMode must be one of/);
+  });
+
+  test("persists dangerousTerminalPatterns on the JobRecord", async () => {
+    const config = buildConfig("/tmp", "job-validation-patterns");
+    const job = await createScheduledJob(config, {
+      name: "with-patterns",
+      intervalSeconds: 60,
+      prompt: "x",
+      dangerousTerminalPatterns: ["docker run"]
+    });
+    expect(job.dangerousTerminalPatterns).toEqual(["docker run"]);
+  });
+});
+
+describe("per-job approvalMode at fire-time", () => {
+  let root: string;
+  let prevState: string | undefined;
+  let prevLog: string | undefined;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "gini-job-auto-mode-"));
+    prevState = process.env.GINI_STATE_ROOT;
+    prevLog = process.env.GINI_LOG_ROOT;
+    process.env.GINI_STATE_ROOT = root;
+    process.env.GINI_LOG_ROOT = `${root}-logs`;
+    clearEchoToolCallingResponses();
+  });
+
+  afterEach(() => {
+    if (prevState === undefined) delete process.env.GINI_STATE_ROOT;
+    else process.env.GINI_STATE_ROOT = prevState;
+    if (prevLog === undefined) delete process.env.GINI_LOG_ROOT;
+    else process.env.GINI_LOG_ROOT = prevLog;
+    rmSync(root, { recursive: true, force: true });
+    clearEchoToolCallingResponses();
+  });
+
+  test("job approvalMode: yolo bypasses gates for that job's spawned task", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-job-mode-ws-"));
+    // Instance pinned strict; only the job-level approvalMode should
+    // open the auto-approve path.
+    const config = buildConfig(workspaceRoot, "job-mode-yolo");
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_w", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "by-mode.txt", content: "via-mode" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({ provider, text: "wrote", toolCalls: [], finishReason: "stop" });
+
+    const sessionId = "session_mode_yolo";
+    await mutateState(config.instance, (state) => {
+      state.chatSessions.unshift({
+        id: sessionId,
+        instance: state.instance,
+        title: "Job mode yolo",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messageIds: [],
+        taskIds: [],
+        runIds: []
+      });
+    });
+
+    const job = await createScheduledJob(config, {
+      name: "mode-yolo",
+      intervalSeconds: 60,
+      prompt: "write by-mode.txt",
+      approvalMode: "yolo",
+      chatSessionId: sessionId,
+      oneShot: true
+    });
+    expect(job.approvalMode).toBe("yolo");
+
+    const result = await runJobNow(config, job.id, "manual");
+    const taskId = (result as { taskId: string }).taskId;
+    await waitForTaskSettled(config, taskId);
+
+    const stateAfter = readState(config.instance);
+    const task = stateAfter.tasks.find((t) => t.id === taskId);
+    expect(task?.status).toBe("completed");
+
+    const writeAudits = stateAfter.audit.filter((a) => a.action === "file.write" && a.taskId === taskId);
+    expect(writeAudits[0]?.evidence?.autoApprovedReason).toBe("approval-mode-yolo");
+    // Operator config not mutated.
+    expect(config.approvalMode).toBe("strict");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("job approvalMode wins over the legacy dangerouslyAutoApprove alias when both are set", async () => {
+    // When both fields are set, approvalMode is authoritative. Use
+    // approvalMode: "strict" + dangerouslyAutoApprove: true and verify
+    // the spawned task pauses (strict wins).
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-job-mode-ws-"));
+    const config = buildConfig(workspaceRoot, "job-mode-vs-legacy");
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_w", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "conflict.txt", content: "no" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const sessionId = "session_mode_conflict";
+    await mutateState(config.instance, (state) => {
+      state.chatSessions.unshift({
+        id: sessionId,
+        instance: state.instance,
+        title: "Job conflict",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messageIds: [],
+        taskIds: [],
+        runIds: []
+      });
+    });
+
+    const job = await createScheduledJob(config, {
+      name: "conflict",
+      intervalSeconds: 60,
+      prompt: "do",
+      approvalMode: "strict",
+      dangerouslyAutoApprove: true,
+      chatSessionId: sessionId,
+      oneShot: true
+    });
+
+    const result = await runJobNow(config, job.id, "manual");
+    const taskId = (result as { taskId: string }).taskId;
+    await waitForTaskSettled(config, taskId);
+
+    const stateAfter = readState(config.instance);
+    const task = stateAfter.tasks.find((t) => t.id === taskId);
+    // approvalMode: "strict" wins → task pauses for approval.
+    expect(task?.status).toBe("waiting_approval");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
   });
 });

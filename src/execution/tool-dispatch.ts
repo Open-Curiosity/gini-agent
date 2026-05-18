@@ -27,6 +27,7 @@ import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
+import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob } from "../jobs";
 import { isSkillActive } from "../integrations/connectors";
 import { riskForAction } from "./tool-risk";
@@ -139,15 +140,20 @@ export async function dispatchToolCall(
       // Uploading a workspace file egresses bytes to a remote site —
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
-      return pendingOrAuto(config, () => requestBrowserUpload(config, taskId, toolCallId, args));
+      return pendingOrAuto(config, "browser.upload_file", undefined, () => requestBrowserUpload(config, taskId, toolCallId, args));
     case "file_write":
-      return pendingOrAuto(config, () => requestFileWrite(config, taskId, toolCallId, args));
+      return pendingOrAuto(config, "file.write", undefined, () => requestFileWrite(config, taskId, toolCallId, args));
     case "file_patch":
-      return pendingOrAuto(config, () => requestFilePatch(config, taskId, toolCallId, args));
+      return pendingOrAuto(config, "file.patch", undefined, () => requestFilePatch(config, taskId, toolCallId, args));
     case "terminal_exec":
       return terminalExecDispatch(config, taskId, toolCallId, args);
     case "code_exec":
-      return pendingOrAuto(config, () => requestCodeExec(config, taskId, toolCallId, args));
+      // code_exec compiles to a terminal command. Route through the
+      // policy seam as terminal.exec so dangerous-pattern matching
+      // applies uniformly (a code snippet that shells out to `sudo`
+      // gets gated the same way a terminal_exec would). The
+      // `command` field on the payload is what the policy inspects.
+      return codeExecDispatch(config, taskId, toolCallId, args);
     default:
       throw new Error(`Unknown tool: ${toolName}`);
   }
@@ -1033,15 +1039,14 @@ async function requestFilePatch(
   });
 }
 
-// Routes a terminal command to either:
-//   1. Allowlist fast-path: `RuntimeConfig.autoApproveCommands` matched the
-//      command, so we run it via `runTerminalCommand` without an approval
-//      row. The audit trail records `evidence.autoApproved=true,
-//      autoApprovedReason=<matched pattern>` on the side-effect audit row.
-//   2. Standard flow: create a pending approval and let the chat-task loop
-//      pause. `pendingOrAuto` may immediately resolve it through
-//      `resolveApproval` when `RuntimeConfig.dangerouslyAutoApprove` is on,
-//      in which case the full approval row + audit pair is still produced.
+// Routes a terminal command through the approval-policy seam.
+//
+// The allowlist fast-path stays as a no-approval-row optimization for
+// commands matched by `RuntimeConfig.autoApproveCommands`: those
+// execute directly via `runTerminalCommand` with the matched pattern
+// stamped on the side-effect audit row. Everything else goes through
+// `pendingOrAuto`, which consults `resolveApprovalPolicy` to decide
+// auto-approve vs gate per the active approval mode.
 async function terminalExecDispatch(
   config: RuntimeConfig,
   taskId: string,
@@ -1078,7 +1083,33 @@ async function terminalExecDispatch(
     return { kind: "sync", result: result.summary };
   }
 
-  return pendingOrAuto(config, () => requestTerminalExec(config, taskId, toolCallId, command, timeoutMs, pty));
+  return pendingOrAuto(
+    config,
+    "terminal.exec",
+    { command },
+    () => requestTerminalExec(config, taskId, toolCallId, command, timeoutMs, pty)
+  );
+}
+
+// code_exec compiles a snippet to a shell command. Route through the
+// policy seam as terminal.exec so the dangerous-pattern blocklist and
+// allowlist short-circuit apply uniformly (a snippet that shells out to
+// `sudo` should gate the same way a terminal_exec would).
+async function codeExecDispatch(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  const language = requireString(args, "language");
+  const code = requireString(args, "code");
+  const command = codeExecutionCommand(language, code);
+  return pendingOrAuto(
+    config,
+    "terminal.exec",
+    { command },
+    () => requestCodeExecPrebuilt(config, taskId, toolCallId, language, command)
+  );
 }
 
 async function requestTerminalExec(
@@ -1113,15 +1144,13 @@ async function requestTerminalExec(
   });
 }
 
-async function requestCodeExec(
+async function requestCodeExecPrebuilt(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  language: string,
+  command: string
 ): Promise<string> {
-  const language = requireString(args, "language");
-  const code = requireString(args, "code");
-  const command = codeExecutionCommand(language, code);
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -1157,21 +1186,23 @@ export function approvalToolCallId(payload: Record<string, unknown>): string | u
 
 // ---------------- pendingOrAuto ----------------
 //
-// Single-point wrapper for every approval-gated tool. When
-// `RuntimeConfig.dangerouslyAutoApprove` is off this is a no-op and we
-// return the pending approval as usual so the chat-task loop pauses for
-// the human gate. When on, the freshly-created approval is immediately
-// resolved through the same `resolveApproval` -> `executeApprovedAction`
-// path that user-driven approvals take, so approval creation, the approve
-// audit row, the per-action side-effect audit, and the tool result string
-// all live in one canonical place (agent.ts) instead of being duplicated
-// here per action. Each side effect still emits a fully populated
-// approval row (status=approved, evidence.autoApproved=true,
-// autoApprovedReason="dangerouslyAutoApprove") and audit row, so the
-// reviewer sees an identical trail to a normal flow except for that
-// marker.
+// Single-point wrapper for every approval-gated tool. Consults
+// `resolveApprovalPolicy(config, action, payload)` to decide whether
+// the approval should pause for a human gate (`mode: "gate"`) or
+// auto-resolve through the same
+// `resolveApproval` -> `executeApprovedAction` pipeline a human
+// approval would take (`mode: "auto"`). Approval creation, the
+// approve audit row, the per-action side-effect audit, and the tool
+// result string all live in one canonical place (agent.ts) instead
+// of being duplicated per action. Each auto-resolved side effect
+// still emits a fully populated approval row (status=approved,
+// evidence.autoApproved=true, autoApprovedReason=<policy reason>)
+// and a side-effect audit row, so the reviewer sees an identical
+// trail to a normal flow except for the marker.
 async function pendingOrAuto(
   config: RuntimeConfig,
+  action: PolicyAction,
+  payload: { command: string } | undefined,
   request: () => Promise<string>
 ): Promise<DispatchResult> {
   // The `await request()` MUST live inside a try/catch so a
@@ -1194,12 +1225,13 @@ async function pendingOrAuto(
     }
     throw err;
   }
-  if (!config.dangerouslyAutoApprove) return { kind: "pending", approvalId };
+  const decision = resolveApprovalPolicy(config, action, payload);
+  if (decision.mode === "gate") return { kind: "pending", approvalId };
   try {
     const { approval, toolResult } = await resolveApproval(config, approvalId, {
       actor: "runtime",
       resumeChatTask: false,
-      evidenceExtra: { autoApproved: true, autoApprovedReason: "dangerouslyAutoApprove" }
+      evidenceExtra: { autoApproved: true, autoApprovedReason: decision.reason }
     });
     // `executeApprovedAction`'s guard can flip the approval from
     // `approved` back to `denied` (the
