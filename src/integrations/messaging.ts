@@ -317,15 +317,30 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
       const parseModeRaw = typeof input.parseMode === "string" ? input.parseMode : undefined;
       const useMdv2 = parseModeRaw !== "none";
       const formatted = useMdv2 ? formatTelegramMarkdownV2(text) : text;
+      // Thread the reply onto a specific inbound message when supplied
+      // (group chats use this so the bot's response visually attaches to
+      // the user's question). Telegram silently ignores the field when
+      // the referenced message is gone, so it's safe to forward
+      // unconditionally.
+      const replyToMessageId =
+        typeof input.replyToMessageId === "number" ? input.replyToMessageId : undefined;
       try {
         const client = telegramClientFor(token);
         if (photoSource) {
           await client.sendPhoto(target, photoSource, {
             caption: formatted || undefined,
-            parseMode: useMdv2 && formatted ? "MarkdownV2" : undefined
+            parseMode: useMdv2 && formatted ? "MarkdownV2" : undefined,
+            ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
           });
         } else {
-          await client.sendMessage(target, formatted, useMdv2 ? { parseMode: "MarkdownV2" } : undefined);
+          const sendOpts: import("./telegram").SendMessageOptions = {};
+          if (useMdv2) sendOpts.parseMode = "MarkdownV2";
+          if (replyToMessageId !== undefined) sendOpts.replyToMessageId = replyToMessageId;
+          await client.sendMessage(
+            target,
+            formatted,
+            Object.keys(sendOpts).length > 0 ? sendOpts : undefined
+          );
         }
       } catch (error) {
         status = "failed";

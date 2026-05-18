@@ -277,6 +277,86 @@ describe("telegram poller supervisor", () => {
     await supervisor.stopAll();
   });
 
+  test("group chats prefix sender attribution and pass replyToMessageId through the mirror", async () => {
+    const config = testConfig("poller-group");
+    type Pending = { resolve: (u: import("./telegram").TelegramUpdate[]) => void };
+    const queue: Pending[] = [];
+    const sendCalls: Array<{ chatId: string | number; text: string; opts?: { replyToMessageId?: number } }> = [];
+    const client: TelegramClient = {
+      async getMe() { return { id: 1, is_bot: true, username: "gini_agent_bot" }; },
+      async sendMessage(chatId, text, opts) {
+        sendCalls.push({ chatId, text, opts });
+        return { message_id: 100, date: 0, chat: { id: Number(chatId), type: "supergroup" }, text };
+      },
+      async sendPhoto(chatId) {
+        return { message_id: 101, date: 0, chat: { id: Number(chatId), type: "supergroup" } };
+      },
+      async sendChatAction() { return true as const; },
+      async getFile(fileId) { return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` }; },
+      async downloadFile() { return new Uint8Array().buffer; },
+      getUpdates(_offset, _timeout, signal) {
+        return new Promise((resolve, reject) => {
+          queue.push({ resolve });
+          signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+    // Health probe seeds bridge.metadata.botUsername so the poller can
+    // pass it to extractIncomingPayload for mention stripping.
+    const { checkMessagingBridge } = await import("./messaging");
+    await checkMessagingBridge(config, bridge.id);
+
+    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    supervisor.reconcile();
+
+    queue.shift()?.resolve([
+      {
+        update_id: 50,
+        message: {
+          message_id: 222,
+          date: 0,
+          chat: { id: -987654321, type: "supergroup", title: "team" },
+          text: "@gini_agent_bot ship it please",
+          from: { id: 42, is_bot: false, first_name: "Shelden", username: "shelden" }
+        }
+      }
+    ]);
+
+    await waitFor(
+      () => readState(config.instance).messagingMessages.some((m) => m.bridgeId === bridge.id),
+      "inbound message recorded"
+    );
+
+    // Mention stripped + sender prefix in the task input.
+    const inbound = readState(config.instance).messagingMessages.find((m) => m.bridgeId === bridge.id);
+    expect(inbound?.text).toBe("@shelden: ship it please");
+    expect(inbound?.target).toBe("-987654321");
+
+    // A chat session was created for the group, keyed on the group's
+    // negative chat_id, with the source tag carrying type info.
+    const session = readState(config.instance).chatSessions.find(
+      (s) => s.source?.kind === "telegram" && s.source.chatId === -987654321
+    );
+    expect(session?.source?.target).toBe("-987654321");
+
+    // Wait for the agent's mirror reply to land. The echo provider
+    // makes this fast; the typing-and-mirror loop will fire sendMessage
+    // with reply_to_message_id pointing at the originating update.
+    await waitFor(() => sendCalls.length > 0, "assistant reply mirrored to Telegram", 5000);
+    expect(sendCalls[0]?.chatId).toBe("-987654321");
+    expect(sendCalls[0]?.opts?.replyToMessageId).toBe(222);
+
+    await supervisor.stopAll();
+  });
+
   test("disabled bridges have their loop stopped on next reconcile", async () => {
     const config = testConfig("poller-disable");
     setMessagingDeps({ telegramClientFactory: () => deferredClient().client });
