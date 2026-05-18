@@ -670,6 +670,24 @@ export async function updateJob(
   if (input.timeoutSeconds !== undefined) assertPositiveInt("timeoutSeconds", input.timeoutSeconds);
   if (input.retryLimit !== undefined) assertNonNegativeInt("retryLimit", input.retryLimit);
 
+  // `name` and `prompt` are both string-typed on the JobRecord; throw on
+  // type/empty-string mismatches up-front so a bad patch surfaces as
+  // `Invalid input: …` instead of being silently no-op'd at the
+  // assignment below. Without this, dishonest reporting bugs creep in:
+  // dispatchers built appliedFields from `Object.keys(patch)` and would
+  // claim a name/prompt change happened even when the underlying
+  // assignment was skipped.
+  if (input.name !== undefined) {
+    if (typeof input.name !== "string" || input.name.length === 0) {
+      throw new Error(`Invalid input: name must be a non-empty string (got ${String(input.name)})`);
+    }
+  }
+  if (input.prompt !== undefined) {
+    if (typeof input.prompt !== "string" || input.prompt.length === 0) {
+      throw new Error(`Invalid input: prompt must be a non-empty string (got ${String(input.prompt)})`);
+    }
+  }
+
   // Validate the cron fields' shape (but not the expression semantics yet —
   // that requires the existing job to compute the effective timezone, so we
   // defer to inside mutateState).

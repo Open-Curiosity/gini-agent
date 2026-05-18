@@ -1082,6 +1082,78 @@ describe("cron lifecycle", () => {
     expect(afterClear?.autoApproveCommands).toBeUndefined();
   });
 
+  test("update_job dispatch rejects null prompt", async () => {
+    // `prompt: null` is not a valid clear signal — JobRecord.prompt is
+    // string-typed. Throw `Invalid input` so the agent's follow-up
+    // can't misreport a phantom prompt change.
+    const config = testConfig("jobs-update-tool-null-prompt");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "null-prompt", script: "true", intervalSeconds: 60 })
+    });
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "update_job",
+        "call_null_prompt",
+        JSON.stringify({ jobId: job.id, prompt: null })
+      )
+    ).rejects.toThrow(/Invalid input: prompt must be a non-empty string/);
+  });
+
+  test("update_job dispatch rejects non-string name", async () => {
+    const config = testConfig("jobs-update-tool-numeric-name");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "to-rename", script: "true", intervalSeconds: 60 })
+    });
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "update_job",
+        "call_numeric_name",
+        JSON.stringify({ jobId: job.id, name: 123 })
+      )
+    ).rejects.toThrow(/Invalid input: name must be a non-empty string/);
+  });
+
+  test("update_job dispatch rejects empty-string name", async () => {
+    const config = testConfig("jobs-update-tool-empty-name");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "to-keep", script: "true", intervalSeconds: 60 })
+    });
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "update_job",
+        "call_empty_name",
+        JSON.stringify({ jobId: job.id, name: "" })
+      )
+    ).rejects.toThrow(/Invalid input: name must be a non-empty string/);
+  });
+
   test("update_job dispatch rejects invalid status value", async () => {
     const config = testConfig("jobs-update-tool-bad-status");
     const handler = createHandler(config);
