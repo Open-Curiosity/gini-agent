@@ -4,6 +4,7 @@ import { addAudit, createMessagingBridgeRecord, createMessagingMessageRecord, mu
 import { deleteConnectorSecrets, readSecret, writeSecret } from "../state/secrets";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { createTelegramClient, type TelegramClient, type TelegramClientOptions } from "./telegram";
+import { formatTelegramMarkdownV2 } from "./telegram-format";
 
 // Namespace used when storing per-bridge secrets through the connector
 // secret store. Keeping it stable lets `deleteConnectorSecrets` find every
@@ -200,8 +201,20 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
       status = "failed";
       errorMessage = "Telegram bot token is missing.";
     } else {
+      // Default: render the body as MarkdownV2 so the common agent
+      // outputs (bold, inline code, fenced blocks) survive instead of
+      // arriving as plain text. Callers that already speak Telegram's
+      // dialect (or want a literal payload) can pass `parseMode: "none"`
+      // to skip the converter and send the raw string.
+      const parseModeRaw = typeof input.parseMode === "string" ? input.parseMode : undefined;
+      const useMdv2 = parseModeRaw !== "none";
+      const payload = useMdv2 ? formatTelegramMarkdownV2(text) : text;
       try {
-        await telegramClientFor(token).sendMessage(target, text);
+        await telegramClientFor(token).sendMessage(
+          target,
+          payload,
+          useMdv2 ? { parseMode: "MarkdownV2" } : undefined
+        );
       } catch (error) {
         status = "failed";
         errorMessage = error instanceof Error ? error.message : String(error);

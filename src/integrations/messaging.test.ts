@@ -38,8 +38,8 @@ function stubClient(overrides: Partial<TelegramClient> = {}): { client: Telegram
       calls.push({ method: "getMe", args: [] });
       return { id: 11, is_bot: true, username: "ginibot" };
     },
-    sendMessage: async (chatId, text) => {
-      calls.push({ method: "sendMessage", args: [chatId, text] });
+    sendMessage: async (chatId, text, opts) => {
+      calls.push({ method: "sendMessage", args: [chatId, text, opts] });
       return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
     },
     sendChatAction: async (chatId, action) => {
@@ -132,7 +132,48 @@ describe("messaging telegram wiring", () => {
 
     expect(outbound.status).toBe("sent");
     expect(outbound.target).toBe("42");
-    expect(calls).toEqual([{ method: "sendMessage", args: ["42", "hi from gini"] }]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe("sendMessage");
+    const [chatId, payload, opts] = calls[0]!.args as [string, string, { parseMode?: string } | undefined];
+    expect(chatId).toBe("42");
+    expect(payload).toBe("hi from gini");
+    expect(opts?.parseMode).toBe("MarkdownV2");
+  });
+
+  test("MarkdownV2 transform runs on outbound text by default", async () => {
+    const config = testConfig("telegram-send-mdv2");
+    const { client, calls } = stubClient();
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+    await sendMessagingOutput(config, bridge.id, { text: "see **README.md**!" });
+
+    const [, payload, opts] = calls[0]!.args as [string, string, { parseMode?: string } | undefined];
+    expect(payload).toBe("see *README\\.md*\\!");
+    expect(opts?.parseMode).toBe("MarkdownV2");
+  });
+
+  test("parseMode=\"none\" skips the transform and sends raw text", async () => {
+    const config = testConfig("telegram-send-raw");
+    const { client, calls } = stubClient();
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+    await sendMessagingOutput(config, bridge.id, { text: "ver. 1.2", parseMode: "none" });
+
+    const [, payload, opts] = calls[0]!.args as [string, string, { parseMode?: string } | undefined];
+    expect(payload).toBe("ver. 1.2");
+    expect(opts).toBeUndefined();
   });
 
   test("sendMessagingOutput marks the message failed when Telegram throws", async () => {

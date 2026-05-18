@@ -57,9 +57,16 @@ export type TelegramChatAction =
   | "record_video_note"
   | "upload_video_note";
 
+export type TelegramParseMode = "MarkdownV2" | "Markdown" | "HTML";
+
+export interface SendMessageOptions {
+  parseMode?: TelegramParseMode;
+  disableWebPagePreview?: boolean;
+}
+
 export interface TelegramClient {
   getMe(): Promise<TelegramUser>;
-  sendMessage(chatId: string | number, text: string): Promise<TelegramMessage>;
+  sendMessage(chatId: string | number, text: string, options?: SendMessageOptions): Promise<TelegramMessage>;
   sendChatAction(chatId: string | number, action: TelegramChatAction): Promise<true>;
   getUpdates(offset: number | undefined, longPollSeconds: number, signal?: AbortSignal): Promise<TelegramUpdate[]>;
 }
@@ -101,7 +108,13 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
 
   return {
     getMe: () => call<TelegramUser>("getMe", {}),
-    sendMessage: (chatId, text) => call<TelegramMessage>("sendMessage", { chat_id: chatId, text }),
+    sendMessage: (chatId, text, opts) =>
+      call<TelegramMessage>("sendMessage", {
+        chat_id: chatId,
+        text,
+        ...(opts?.parseMode ? { parse_mode: opts.parseMode } : {}),
+        ...(opts?.disableWebPagePreview ? { disable_web_page_preview: true } : {})
+      }),
     sendChatAction: (chatId, action) => call<true>("sendChatAction", { chat_id: chatId, action }),
     getUpdates: (offset, longPollSeconds, signal) =>
       call<TelegramUpdate[]>(
