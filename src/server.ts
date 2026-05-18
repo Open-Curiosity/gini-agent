@@ -192,12 +192,20 @@ const reprobeDone: Promise<void> = (async function reprobeLoop(): Promise<void> 
   }
 })();
 
+// Messaging inbound supervisor cadence. Shared across every bridge
+// supervisor (Telegram long-poll reconcile + Discord REST-poll
+// reconcile). A bridge added at runtime is picked up within one
+// reconcile interval without restarting the runtime. The
+// GINI_TELEGRAM_RECONCILE_MS env var is kept for backwards
+// compatibility with the original Telegram-only knob.
+const MESSAGING_RECONCILE_INTERVAL_MS = Number(
+  process.env.GINI_MESSAGING_RECONCILE_MS ?? process.env.GINI_TELEGRAM_RECONCILE_MS ?? 5000
+);
+
 // Telegram inbound poller. The supervisor reconciles per-bridge long-poll
-// loops against state every few seconds, so a bridge added or disabled at
-// runtime is picked up without restarting the runtime. Each loop streams
-// updates from api.telegram.org and funnels them through
-// receiveMessagingInput, which submits a task per inbound message.
-const TELEGRAM_RECONCILE_INTERVAL_MS = Number(process.env.GINI_TELEGRAM_RECONCILE_MS ?? 5000);
+// loops against state every few seconds. Each loop streams updates
+// from api.telegram.org and funnels them through receiveMessagingInput,
+// which submits a task per inbound message.
 const telegramSupervisor = createTelegramPollerSupervisor(config);
 let telegramStopped = false;
 const telegramDone: Promise<void> = (async function telegramReconcileLoop(): Promise<void> {
@@ -210,17 +218,14 @@ const telegramDone: Promise<void> = (async function telegramReconcileLoop(): Pro
       });
     }
     if (telegramStopped) break;
-    await Bun.sleep(TELEGRAM_RECONCILE_INTERVAL_MS);
+    await Bun.sleep(MESSAGING_RECONCILE_INTERVAL_MS);
   }
 })();
 
-// Discord inbound poller. Same supervisor shape as Telegram — reconcile
-// per-bridge REST-poll loops against state, drain on SIGTERM. Discord
+// Discord inbound poller. Same supervisor shape as Telegram. Discord
 // has no long-poll, so each loop polls every configured delivery target
 // on a short cadence and advances a per-channel snowflake watermark in
-// bridge.metadata.lastInboundExternalIds. The reconcile cadence is
-// shared with Telegram by default — a bridge added at runtime gets
-// picked up within one reconcile interval without a restart.
+// bridge.metadata.lastInboundExternalIds.
 const discordSupervisor = createDiscordPollerSupervisor(config);
 let discordStopped = false;
 const discordDone: Promise<void> = (async function discordReconcileLoop(): Promise<void> {
@@ -233,7 +238,7 @@ const discordDone: Promise<void> = (async function discordReconcileLoop(): Promi
       });
     }
     if (discordStopped) break;
-    await Bun.sleep(TELEGRAM_RECONCILE_INTERVAL_MS);
+    await Bun.sleep(MESSAGING_RECONCILE_INTERVAL_MS);
   }
 })();
 

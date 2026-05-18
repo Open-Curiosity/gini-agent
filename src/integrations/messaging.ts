@@ -145,12 +145,16 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
   );
   if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
 
-  // Telegram health is a real getMe() round-trip. We do the network call
-  // *outside* mutateState so the lock isn't held for the duration of the
-  // request, then fold the outcome back in.
+  // Per-kind health round-trip. We do the network call *outside*
+  // mutateState so the lock isn't held for the duration of the
+  // request, then fold the outcome back in. Only fields we actually
+  // refresh (botUsername, botId) land in `metadataPatch` — the final
+  // mutateState merges them into the live bridge so concurrent
+  // metadata writes (the inbound poller advancing watermarks, etc.)
+  // don't get clobbered by a stale snapshot.
   let nextStatus: MessagingBridgeRecord["status"] = "configured";
   let nextMessage: string;
-  const nextMetadata: Record<string, unknown> = { ...(bridge.metadata ?? {}) };
+  const metadataPatch: Record<string, unknown> = {};
 
   if (bridge.kind === "telegram") {
     const token = readBridgeBotToken(config, bridge);
@@ -160,8 +164,8 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
     } else {
       try {
         const me = await telegramClientFor(token).getMe();
-        nextMetadata.botUsername = me.username;
-        nextMetadata.botId = me.id;
+        metadataPatch.botUsername = me.username;
+        metadataPatch.botId = me.id;
         nextMessage = me.username
           ? `Connected as @${me.username}.`
           : `Connected as bot ${me.id}.`;
@@ -178,8 +182,8 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
     } else {
       try {
         const me = await discordClientFor(token).getMe();
-        nextMetadata.botUsername = me.username;
-        nextMetadata.botId = me.id;
+        metadataPatch.botUsername = me.username;
+        metadataPatch.botId = me.id;
         // Newer Discord accounts return discriminator "0" and surface
         // the handle via global_name; older bots keep username#discriminator.
         const handle = me.global_name && me.global_name.length > 0
@@ -205,7 +209,10 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
     live.lastHealthAt = now();
     live.status = nextStatus;
     live.message = nextMessage;
-    live.metadata = nextMetadata;
+    // Merge into the live metadata instead of overwriting from the
+    // pre-await snapshot — concurrent poller writes to
+    // metadata.lastInboundExternalIds / lastOffset must survive.
+    live.metadata = { ...(live.metadata ?? {}), ...metadataPatch };
     live.updatedAt = live.lastHealthAt;
     addAudit(state, {
       actor: "runtime",
@@ -230,7 +237,12 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
   const text = String(input.text ?? "").trim();
   const media = parseInboundMedia(input.media);
   if (!text && !media) throw new Error("Inbound message text or media is required.");
-  const target = String(input.target ?? "local");
+
+  // Target validation is per-kind. Don't coerce a missing target to
+  // "local" before the kind branches — that would mask required-target
+  // guards (e.g. Discord's channel id). Each branch decides whether
+  // the target is optional and what default applies.
+  const rawTarget = typeof input.target === "string" ? input.target : "";
 
   // Telegram + Discord inbound run through the chat-task path so each
   // chat / channel gets a persistent conversation — same surface as the
@@ -240,11 +252,13 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
   // tests and CLI parity.
   let taskId: string;
   let sessionId: string | undefined;
+  let target: string;
   if (bridge.kind === "telegram") {
-    const chatId = Number.parseInt(target, 10);
+    const chatId = Number.parseInt(rawTarget, 10);
     if (!Number.isFinite(chatId)) {
-      throw new Error(`Telegram inbound target must be a numeric chat_id (got '${target}').`);
+      throw new Error(`Telegram inbound target must be a numeric chat_id (got '${rawTarget}').`);
     }
+    target = String(chatId);
     const session = await mutateState(config.instance, (state) =>
       findOrCreateTelegramChatSession(state, bridge.id, chatId)
     );
@@ -252,16 +266,19 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
     taskId = result.taskId;
     sessionId = session.id;
   } else if (bridge.kind === "discord") {
-    if (!target) {
+    const channelId = rawTarget.trim();
+    if (!channelId) {
       throw new Error("Discord inbound target (channel id) is required.");
     }
+    target = channelId;
     const session = await mutateState(config.instance, (state) =>
-      findOrCreateDiscordChatSession(state, bridge.id, target)
+      findOrCreateDiscordChatSession(state, bridge.id, channelId)
     );
     const result = await submitChatMessage(config, session.id, { content: text });
     taskId = result.taskId;
     sessionId = session.id;
   } else {
+    target = rawTarget || "local";
     const task = await submitTask(config, text);
     taskId = task.id;
   }

@@ -78,6 +78,12 @@ export function createDiscordPollerSupervisor(
   const pollIntervalMs = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
   const typingRefreshMs = deps.typingRefreshMs ?? TYPING_REFRESH_MS;
   let stopped = false;
+  // Tracks every detached typing+reply worker so stopAll can await
+  // their completion. Without this, a worker still mid-sendMessagingOutput
+  // when the runtime tears down would land its state mutation against
+  // a stale GINI_STATE_ROOT (tests) or after the process has begun
+  // exiting (production) — both are observable as orphaned writes.
+  const detached = new Set<Promise<void>>();
 
   function shouldRun(bridge: MessagingBridgeRecord): boolean {
     if (bridge.kind !== "discord") return false;
@@ -89,7 +95,26 @@ export function createDiscordPollerSupervisor(
   function startLoop(bridgeId: string): void {
     if (loops.has(bridgeId) || stopped) return;
     const controller = new AbortController();
-    const done = runLoop(config, bridgeId, controller.signal, factory, pollIntervalMs, typingRefreshMs).finally(() => {
+    const trackDetached = (work: Promise<void>): void => {
+      detached.add(work);
+      void work.finally(() => detached.delete(work));
+    };
+    const done = runLoop(
+      config,
+      bridgeId,
+      controller.signal,
+      factory,
+      pollIntervalMs,
+      typingRefreshMs,
+      trackDetached
+    ).finally(() => {
+      // Always abort the controller when the loop exits, even for
+      // natural returns (bridge disabled, token rotated, status
+      // flipped). Detached typing pulses + reply mirrors captured
+      // this signal — without an abort here they keep firing
+      // triggerTypingIndicator against the now-orphaned client
+      // until the underlying task settles.
+      controller.abort();
       loops.delete(bridgeId);
     });
     loops.set(bridgeId, { controller, done });
@@ -120,6 +145,12 @@ export function createDiscordPollerSupervisor(
       stopped = true;
       for (const loop of loops.values()) loop.controller.abort();
       await Promise.all(Array.from(loops.values()).map((loop) => loop.done.catch(() => {})));
+      // Wait for any in-flight detached typing+reply workers to
+      // unwind before resolving. The loops aborting above lets these
+      // observe abort and short-circuit; any worker mid-state-write
+      // still gets to finish so the audit trail and outbound record
+      // land before shutdown continues.
+      await Promise.all(Array.from(detached).map((work) => work.catch(() => {})));
     },
     size() {
       return loops.size;
@@ -133,13 +164,32 @@ async function runLoop(
   signal: AbortSignal,
   factory: (token: string) => DiscordClient,
   pollIntervalMs: number,
-  typingRefreshMs: number
+  typingRefreshMs: number,
+  trackDetached: (work: Promise<void>) => void
 ): Promise<void> {
   while (!signal.aborted) {
     const bridge = readState(config.instance).messagingBridges.find((item) => item.id === bridgeId);
     if (!bridge || bridge.kind !== "discord" || bridge.status !== "configured") return;
-    const token = readBridgeBotToken(config, bridge);
-    if (!token) return;
+    // readBridgeBotToken throws ENOENT when the encrypted secret file
+    // is missing under the secretRef path (rotation in progress,
+    // manual deletion, corruption). Without a catch the rejection
+    // propagates out of the loop, the supervisor reconcile sees the
+    // bridge still matches shouldRun (it only checks secretRefs, not
+    // the on-disk file), and restarts the loop every reconcile tick.
+    // Flip the bridge to "error" so shouldRun stops returning true
+    // and the supervisor drops the broken bridge until the user
+    // re-supplies the token.
+    let token: string | undefined;
+    try {
+      token = readBridgeBotToken(config, bridge);
+    } catch (error) {
+      await markBridgeError(config, bridgeId, error);
+      return;
+    }
+    if (!token) {
+      await markBridgeError(config, bridgeId, new Error("Discord bot token secret is missing."));
+      return;
+    }
 
     let client: DiscordClient;
     try {
@@ -155,7 +205,7 @@ async function runLoop(
 
     for (const channelId of bridge.deliveryTargets) {
       if (signal.aborted) return;
-      await pollChannel(config, bridgeId, channelId, client, signal, typingRefreshMs);
+      await pollChannel(config, bridgeId, channelId, client, signal, typingRefreshMs, trackDetached);
     }
 
     await sleepUnlessAborted(pollIntervalMs, signal);
@@ -168,7 +218,8 @@ async function pollChannel(
   channelId: string,
   client: DiscordClient,
   signal: AbortSignal,
-  typingRefreshMs: number
+  typingRefreshMs: number,
+  trackDetached: (work: Promise<void>) => void
 ): Promise<void> {
   const watermark = readChannelWatermark(config, bridgeId, channelId);
 
@@ -190,16 +241,31 @@ async function pollChannel(
     return;
   }
 
-  if (messages.length === 0) return;
+  // First-contact seeding. We have to pin a watermark on the very
+  // first poll even when the channel is empty — otherwise a user
+  // typing between this empty poll and the next non-empty poll lands
+  // their first message in the seeding branch, where it would be
+  // consumed as the seed and never routed. The "0" sentinel is
+  // strictly less than every real Discord snowflake (which start at
+  // ~10^18), so the next poll with afterId="0" correctly fetches the
+  // user's message.
+  if (messages.length === 0) {
+    if (watermark === undefined) {
+      await advanceWatermark(config, bridgeId, channelId, "0");
+    }
+    return;
+  }
 
   // Discord returns newest-first; process oldest-first so the watermark
   // advances monotonically and we don't reply to messages out of order.
-  const ordered = [...messages].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  // Sort by BigInt-comparable snowflake (decimal strings of mixed
+  // length sort wrong lexically — "999" sorts after "1000" — so a
+  // future digit-length boundary would mis-order without this).
+  const ordered = [...messages].sort((a, b) => snowflakeCompare(a.id, b.id));
 
-  // First-contact seeding: a bridge with no watermark yet skips every
-  // existing message and just pins the watermark to the newest. Without
-  // this, adding a new bridge would dump the channel's recent history
-  // into the agent on first start.
+  // Non-empty first poll: pin to the newest existing message and
+  // skip routing so a fresh bridge attaching to an active channel
+  // doesn't backfill history into the agent.
   if (watermark === undefined) {
     const newest = ordered[ordered.length - 1]!;
     await advanceWatermark(config, bridgeId, channelId, newest.id);
@@ -225,8 +291,12 @@ async function pollChannel(
       if (record.taskId) {
         // Typing pulse + reply mirror runs detached so a slow
         // sendMessage call can't stall the next poll cycle. Errors
-        // land on the runtime log; the inbound record stays.
-        void maintainTypingAndMirrorReply(
+        // land on the runtime log; the inbound record stays. The
+        // worker is tracked so stopAll can await it — without that
+        // a worker mid-state-write at shutdown would land its write
+        // against a torn-down runtime (or in tests against a stale
+        // GINI_STATE_ROOT after the next test rebinds it).
+        const work = maintainTypingAndMirrorReply(
           config,
           bridgeId,
           record.taskId,
@@ -240,6 +310,7 @@ async function pollChannel(
             error: error instanceof Error ? error.message : String(error)
           });
         });
+        trackDetached(work);
       }
     } catch (error) {
       appendLog(config.instance, "messaging.discord.receive_error", {
@@ -320,11 +391,20 @@ async function maintainTypingIndicator(
     if (!task) return;
     if (isTerminalTaskStatus(task.status)) return;
     try {
-      await client.triggerTypingIndicator(channelId);
-    } catch {
+      // Pass the loop's signal so a hung typing POST gets cancelled
+      // on bridge disable / shutdown — without this the await could
+      // block the sequential reply mirror indefinitely.
+      await client.triggerTypingIndicator(channelId, signal);
+    } catch (error) {
       // A revoked channel or network blip shouldn't keep us looping
-      // forever — abandon the pulse and let the reply mirror still
-      // attempt to land the eventual message.
+      // forever — log once and abandon the pulse so the reply
+      // mirror still attempts to land the eventual message. Aborts
+      // are expected on shutdown and stay quiet.
+      if (signal.aborted) return;
+      appendLog(config.instance, "messaging.discord.typing_pulse_error", {
+        channelId,
+        error: error instanceof Error ? error.message : String(error)
+      });
       return;
     }
     await sleepUnlessAborted(typingRefreshMs, signal);
@@ -354,18 +434,63 @@ async function advanceWatermark(
     const live = state.messagingBridges.find((item) => item.id === bridgeId);
     if (!live) return;
     const previous = (live.metadata?.lastInboundExternalIds ?? {}) as Record<string, unknown>;
-    // Discord snowflakes are monotonically increasing 64-bit integers
-    // rendered as decimal strings. Use string compare instead of
-    // numeric parsing to avoid the Number-precision cliff at 2^53.
     const current = previous[channelId];
     const currentStr = typeof current === "string" ? current : undefined;
-    if (currentStr && currentStr >= externalId) return;
+    // Snowflake compare via BigInt — decimal strings of different
+    // lengths sort wrong lexically. Today's snowflakes are all 19
+    // digits, but the "0" sentinel used for empty-channel seeding is
+    // length 1, so a naïve string compare would refuse to advance
+    // past it.
+    if (currentStr && snowflakeCompare(currentStr, externalId) >= 0) return;
     live.metadata = {
       ...(live.metadata ?? {}),
       lastInboundExternalIds: { ...previous, [channelId]: externalId }
     };
     live.updatedAt = now();
   });
+}
+
+// Compare two Discord snowflake-shaped decimal strings as integers.
+// Returns negative if a < b, 0 if equal, positive if a > b. Falls
+// back to lexicographic compare for non-decimal inputs so an unknown
+// metadata value can't crash the poller — that branch is dead under
+// normal operation since we only write digit strings.
+function snowflakeCompare(a: string, b: string): number {
+  if (!/^\d+$/.test(a) || !/^\d+$/.test(b)) {
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+  const ai = BigInt(a);
+  const bi = BigInt(b);
+  return ai < bi ? -1 : ai > bi ? 1 : 0;
+}
+
+// Flip a bridge to "error" so the supervisor reconcile loop drops it
+// from the desired set (shouldRun checks status === "configured"). The
+// user can re-enable the bridge by re-supplying the secret. Always
+// best-effort — a state write failure here is logged but does not
+// propagate further; the worst case is that the supervisor restarts
+// the loop on the next reconcile tick.
+async function markBridgeError(
+  config: RuntimeConfig,
+  bridgeId: string,
+  error: unknown
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  appendLog(config.instance, "messaging.discord.token_error", { bridgeId, error: message });
+  try {
+    await mutateState(config.instance, (state) => {
+      const live = state.messagingBridges.find((item) => item.id === bridgeId);
+      if (!live) return;
+      live.status = "error";
+      live.message = message;
+      live.updatedAt = now();
+    });
+  } catch (err) {
+    appendLog(config.instance, "messaging.discord.mark_error_failed", {
+      bridgeId,
+      error: err instanceof Error ? err.message : String(err)
+    });
+  }
 }
 
 async function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {

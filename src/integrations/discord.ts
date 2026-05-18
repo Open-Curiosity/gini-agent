@@ -42,13 +42,6 @@ interface DiscordError {
   code?: number;
 }
 
-export interface SendMessageOptions {
-  // Discord ignores the parseMode concept (its markdown is always on),
-  // but we keep an empty options bag so the call shape matches the
-  // Telegram client and future flags (allowed_mentions, reply_to, ...)
-  // can land here without churning every call site.
-}
-
 export interface FetchChannelMessagesOptions {
   // Snowflake to fetch strictly newer messages than. Omitted on the
   // first poll — the poller seeds the watermark from the channel
@@ -63,11 +56,14 @@ export interface FetchChannelMessagesOptions {
 
 export interface DiscordClient {
   getMe(): Promise<DiscordUser>;
-  sendMessage(channelId: string, content: string, options?: SendMessageOptions): Promise<DiscordMessage>;
+  sendMessage(channelId: string, content: string): Promise<DiscordMessage>;
   // Trigger Discord's typing indicator. The indicator persists for ~10
   // seconds before clearing automatically; the poller refreshes on a
-  // shorter cadence so long-running tasks stay visible.
-  triggerTypingIndicator(channelId: string): Promise<true>;
+  // shorter cadence so long-running tasks stay visible. The optional
+  // signal lets the poller cancel an in-flight typing POST on
+  // shutdown or bridge disable so a hung request doesn't block the
+  // reply mirror it gates.
+  triggerTypingIndicator(channelId: string, signal?: AbortSignal): Promise<true>;
   fetchChannelMessages(channelId: string, options?: FetchChannelMessagesOptions): Promise<DiscordMessage[]>;
 }
 
@@ -149,13 +145,13 @@ export function createDiscordClient(token: string, options: DiscordClientOptions
         { content: trimmed }
       );
     },
-    triggerTypingIndicator: (channelId) => {
+    triggerTypingIndicator: (channelId, signal) => {
       if (!channelId) return Promise.reject(new Error("Discord channel id is required."));
       return call<true>(
         "POST",
         `/channels/${encodeURIComponent(channelId)}/typing`,
         {},
-        undefined,
+        signal,
         true
       );
     },

@@ -273,7 +273,7 @@ describe("discord poller supervisor", () => {
     await supervisor.stopAll();
   });
 
-  test("reconcile stops the loop for a bridge whose status flips to disabled", async () => {
+  test("reconcile aborts the loop for a bridge that no longer matches shouldRun (status disabled)", async () => {
     const config = testConfig("disc-disable");
     const { client } = programmableClient();
     setMessagingDeps({ discordClientFactory: () => client });
@@ -301,9 +301,52 @@ describe("discord poller supervisor", () => {
       if (live) live.status = "disabled";
     });
 
+    // reconcile sees the bridge no longer matches shouldRun and calls
+    // stopLoop → controller.abort(). The loop exits via the abort
+    // path. This test deliberately covers the supervisor-driven path,
+    // not the runLoop self-exit guard — that path is covered below.
     supervisor.reconcile();
-    // The loop self-exits when it next observes status !== "configured".
-    await waitFor(() => supervisor.size() === 0, "loop to self-exit after disable");
+    await waitFor(() => supervisor.size() === 0, "loop to exit after reconcile-driven abort");
+
+    await supervisor.stopAll();
+  });
+
+  test("runLoop self-exits when bridge status flips between poll cycles (no reconcile)", async () => {
+    // Distinct from the reconcile-driven test above: here we never
+    // call reconcile() after the status flip. The loop must observe
+    // the new status on its next iteration and self-exit via the
+    // guard at the top of runLoop. If the guard were removed, the
+    // loop would keep polling against a disabled bridge until
+    // supervisor.stopAll() forces it.
+    const config = testConfig("disc-self-exit");
+    const { client } = programmableClient();
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    const supervisor = createDiscordPollerSupervisor(config, {
+      clientFactory: () => client,
+      pollIntervalMs: 20,
+      typingRefreshMs: 20
+    });
+    supervisor.reconcile();
+    expect(supervisor.size()).toBe(1);
+
+    const { mutateState } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      const live = state.messagingBridges.find((b) => b.id === bridge.id);
+      if (live) live.status = "disabled";
+    });
+
+    // No reconcile() call. The loop should self-exit on its next
+    // iteration when the top-of-loop guard observes status !==
+    // "configured". The supervisor's `.finally` cleans up the map.
+    await waitFor(() => supervisor.size() === 0, "loop to self-exit without reconcile");
 
     await supervisor.stopAll();
   });

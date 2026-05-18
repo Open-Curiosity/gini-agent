@@ -350,11 +350,11 @@ export interface ChatSessionRecord {
   runIds: string[];
   summary?: string;
   // Origin descriptor when the session was created by a non-UI surface.
-  // The web chat omits this; the Telegram bridge sets `kind: "telegram"`
-  // so the runtime can mirror assistant replies back out to the chat the
-  // user started in. The same shape generalizes to future bridges
-  // (Discord, Slack, …) — `target` is the bridge-specific addressing
-  // string passed back to sendMessagingOutput.
+  // The web chat omits this; messaging bridges (Telegram, Discord) set
+  // `kind` to the bridge id so the runtime can mirror assistant
+  // replies back out to the chat / channel the user started in.
+  // `target` is the bridge-specific addressing string passed back to
+  // sendMessagingOutput.
   source?: ChatSessionSource;
 }
 
@@ -468,13 +468,16 @@ export interface MessagingBridgeRecord {
   message?: string;
   createdAt: string;
   updatedAt: string;
-  // Per-bridge encrypted secret refs (e.g. the Telegram bot token). Stored
-  // via the same AES-GCM box as connectorSecrets — the connectorId namespace
-  // we use is `messaging.<bridgeId>` so a bridge delete cleans up its files.
+  // Per-bridge encrypted secret refs (Telegram + Discord both store
+  // their bot token here). Stored via the same AES-GCM box as
+  // connectorSecrets — the connectorId namespace we use is
+  // `messaging.<bridgeId>` so a bridge delete cleans up its files.
   secretRefs?: ConnectorSecretRef[];
-  // Bridge-kind-specific non-secret state. For telegram: { botUsername,
-  // lastOffset }. Kept as a free-form record so each kind can evolve without
-  // forcing a schema migration on the others.
+  // Bridge-kind-specific non-secret state. Kept as a free-form record
+  // so each kind can evolve without forcing a schema migration on the
+  // others. Current shapes:
+  //   telegram: { botUsername, botId, lastOffset }
+  //   discord:  { botUsername, botId, lastInboundExternalIds: Record<channelId, snowflake> }
   metadata?: Record<string, unknown>;
 }
 

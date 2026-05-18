@@ -117,8 +117,24 @@ async function runLoop(
   while (!signal.aborted) {
     const bridge = readState(config.instance).messagingBridges.find((item) => item.id === bridgeId);
     if (!bridge || bridge.kind !== "telegram" || bridge.status !== "configured") return;
-    const token = readBridgeBotToken(config, bridge);
-    if (!token) return;
+    // readBridgeBotToken throws ENOENT if the encrypted secret file is
+    // missing under the secretRef path (rotation, manual deletion,
+    // corruption). Without a catch the rejection propagates out of
+    // the loop and the supervisor reconcile restarts it on every
+    // tick because shouldRun only checks for the secretRef entry,
+    // not the file. Flip the bridge to "error" so the supervisor
+    // drops it until the user re-supplies the token.
+    let token: string | undefined;
+    try {
+      token = readBridgeBotToken(config, bridge);
+    } catch (error) {
+      await markBridgeError(config, bridgeId, error);
+      return;
+    }
+    if (!token) {
+      await markBridgeError(config, bridgeId, new Error("Telegram bot token secret is missing."));
+      return;
+    }
 
     const offset = readLastOffset(bridge);
     let client: TelegramClient;
@@ -335,6 +351,33 @@ function buildTaskInput(incoming: IncomingPayload, savedPath: string | undefined
   if (!savedPath) return incoming.text;
   const header = `[photo: ${savedPath}]`;
   return incoming.text ? `${header}\n${incoming.text}` : header;
+}
+
+// Flip a bridge to "error" so the supervisor reconcile loop drops it
+// from the desired set (shouldRun checks status === "configured").
+// Same shape as the Discord poller — the user re-enables by
+// re-supplying the bot token.
+async function markBridgeError(
+  config: RuntimeConfig,
+  bridgeId: string,
+  error: unknown
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  appendLog(config.instance, "messaging.telegram.token_error", { bridgeId, error: message });
+  try {
+    await mutateState(config.instance, (state) => {
+      const live = state.messagingBridges.find((item) => item.id === bridgeId);
+      if (!live) return;
+      live.status = "error";
+      live.message = message;
+      live.updatedAt = now();
+    });
+  } catch (err) {
+    appendLog(config.instance, "messaging.telegram.mark_error_failed", {
+      bridgeId,
+      error: err instanceof Error ? err.message : String(err)
+    });
+  }
 }
 
 async function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {

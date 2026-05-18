@@ -19,3 +19,4 @@ Each file in this directory captures one architecture decision: the context, the
 - [Connector + Provider Vocabulary, Spec Compliance, And Meta-Skills](connector-provider-spec-compliance.md)
 - [Provider extraBody Escape Hatch And Reserved-Key Denylist](provider-extra-body.md)
 - [Telegram Messaging Bridge](telegram-bridge.md)
+- [Discord Messaging Bridge](discord-bridge.md)

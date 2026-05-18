@@ -1,0 +1,51 @@
+# Discord Messaging Bridge
+
+## Decision
+
+A Discord bridge is a `MessagingBridgeRecord` with `kind: "discord"` and a per-bridge encrypted bot token. The runtime talks to `discord.com/api/v10` directly over `fetch` — no SDK dependency. Outbound (`POST /api/messaging/:id/send`) calls Discord's channel-messages endpoint; inbound is a REST poll over each delivery target's channel history. Bot tokens live in the per-instance secret store under the `messaging.<bridgeId>` namespace and never appear on the bridge record.
+
+The Discord gateway WebSocket, a Discord SDK (`discord.js`), and webhooks are all rejected. They each add either a persistent socket the loopback HTTP server has no use for (gateway), a runtime dependency tree (SDK), or a public-internet surface (webhooks) that the local-first Gini shape does not need.
+
+## Context
+
+This ADR follows `telegram-bridge.md`. Gini's messaging surface already modeled `MessagingBridgeRecord`, `MessagingMessageRecord`, per-bridge encrypted secrets, and the HTTP endpoints on `/api/messaging/*`. The Telegram bridge proved the per-kind dispatch pattern in `src/integrations/messaging.ts` and the per-chat persistent `ChatSessionRecord` shape. The Discord bridge mirrors that shape — adding a second messaging surface without re-litigating the trust boundary, the secret-store contract, or the chat-task routing path.
+
+Discord differs from Telegram in two material ways. First, Discord exposes no long-poll equivalent of `getUpdates`: a runtime that doesn't want a persistent gateway WebSocket has to use REST history (`GET /channels/{id}/messages?after=<snowflake>`) on a short cadence. Second, Discord's REST history returns the channel's stored backlog regardless of when the bot joined — so a fresh bridge attaching to an active channel would dump the visible history into the agent on first start unless the watermark is seeded before the first non-empty poll.
+
+## Required Now
+
+- `POST /api/messaging` with `kind: "discord"` requires a `botToken` field. The token is written through `writeSecret(instance, "messaging.<bridgeId>", "bot-token", value)` and immediately discarded from memory.
+- `POST /api/messaging/:id/health` performs a real `getMe()` round-trip when the bridge is Discord-kind. The bot's `username`, `id`, and (when present) `global_name` land on `bridge.metadata`; failures mark `bridge.status = "error"` with the API description as `bridge.message`. The mutate that lands the result merges into the live `metadata` instead of overwriting from a pre-await snapshot — concurrent poller writes (per-channel watermarks) must survive a health check.
+- `POST /api/messaging/:id/send` dispatches the Discord channel-messages endpoint for Discord-kind bridges. The `target` field is the channel snowflake. Content is truncated client-side at Discord's 2000-character cap before the network call. Photo sends are rejected with a clear error today — multipart attachments are tracked as a follow-up that mirrors the Telegram photo path.
+- `POST /api/messaging/:id/disable` deletes every encrypted file under `messaging.<bridgeId>` and clears `bridge.secretRefs`. Same shape as Telegram — the bridge flips to `"disabled"` before the secret cleanup so a partial failure cannot leave an active token on disk under a configured bridge.
+- The gateway runs a Discord poller supervisor that reconciles per-bridge REST-poll loops against state every `GINI_MESSAGING_RECONCILE_MS` milliseconds (5s default; the legacy `GINI_TELEGRAM_RECONCILE_MS` env var is honored for compatibility). Each loop polls every entry in `bridge.deliveryTargets` on a short cadence with an `after=<snowflake>` cursor and advances the watermark on `bridge.metadata.lastInboundExternalIds[channelId]` after each handled message.
+- First-contact seeding: on the first poll of each (bridge, channel) pair the poller pins the watermark to the newest visible message and skips routing. If the channel is empty on first poll, the watermark is pinned to the sentinel `"0"` — strictly less than every real Discord snowflake — so a user typing between the empty poll and the next poll has their message routed instead of consumed by the seeding branch.
+- Snowflake compare uses `BigInt` for both message ordering and watermark advancement. Real Discord snowflakes are uniformly 19 digits today, so lexicographic compare would happen to work; the `BigInt` path is the correct primitive and also handles the length-1 `"0"` sentinel cleanly.
+- Bot-authored inbound messages advance the watermark without spawning a task — the bot's own reply must not trigger itself. Attachment-only / empty-content messages take the same path (acknowledged via watermark, not routed).
+- Each Discord channel is bound to a persistent `ChatSessionRecord` tagged with `source: { kind: "discord", bridgeId, channelId, target }`. `receiveMessagingInput` looks the session up (or creates it on first contact) and submits the user turn via `submitChatMessage` — the same path the web chat uses — so the agent sees prior turns and the chat-task loop runs with full session history.
+- When the chat-task settles, the poller's per-message worker calls `syncChatTaskResult` to land the assistant message in the chat session and dispatches the assistant text back via `sendMessagingOutput`. `[SILENT]` task summaries suppress the mirror.
+- While an inbound-Discord task is non-terminal, the poller fires `POST /channels/:id/typing` on a ~7-second cadence (Discord chat actions auto-clear after ~10 seconds). The pulse runs detached so a slow `triggerTypingIndicator` does not block the next update batch, threads the loop's AbortSignal so a hung typing POST gets cancelled on shutdown / disable, and halts on the first error so a revoked channel or network blip cannot keep it looping.
+- When the loop exits for any reason (SIGTERM, bridge disable, status flip, missing-secret error), the supervisor's `startLoop` `.finally` calls `controller.abort()` so any detached typing pulse + reply-mirror workers observe abort and unwind — not just on `stopAll`.
+- A missing or unreadable secret file flips the bridge to `status: "error"` and exits the loop. Without this, the supervisor reconcile would keep restarting the loop on every tick because `shouldRun` only checks for the secret-ref entry on the record, not the file's presence.
+- SIGTERM aborts every active poll via `AbortController` so shutdown does not wait out the REST-poll cadence.
+- The Discord HTTP client (`src/integrations/discord.ts`) is mockable via an injected `fetch`; the messaging module exposes `setMessagingDeps` (Telegram already used it) with a Discord-specific `discordClientFactory` so tests can substitute a stub `DiscordClient`. Production callers leave both unset.
+
+## Trust Boundary
+
+- The bot token is a write-only field on the create payload. It is encrypted at rest and never re-emitted — neither on the bridge record, nor in audit evidence, nor on `MessagingMessageRecord`. A bridge owner has no API to read it back; they re-supply it by recreating the bridge.
+- The poller calls `receiveMessagingInput` which submits a chat-task. Task-level approval (per ADR `approval-execution-abort.md`) and the active-agent toolset filters (per `agents-replace-profiles.md`) apply unchanged. The bridge does not bypass them. The reply-mirror dispatches the assistant message back via `sendMessagingOutput`, which honors the messaging-target filter — an agent restricted from a target cannot use the bridge to escape that restriction.
+- The Discord bot's "Message Content Intent" must be enabled in the developer portal for the REST history to include user message content (Discord otherwise returns empty `content` for non-mention user messages to unverified bots). This is a manual one-time toggle per app; the runtime documents it but cannot toggle it automatically.
+
+## Open Questions
+
+- Per-channel allowlist. Today every channel listed in `bridge.deliveryTargets` can submit tasks. A channel-id allowlist on the bridge would let a user restrict the bot to a subset; the data shape already supports it.
+- Attachments. Photos, videos, and files are not surfaced today — empty-content messages are acknowledged via watermark but not routed. Each follows the same pattern as the Telegram photo path (download to `<instanceRoot>/inbound/<bridgeId>/`, prefix the task input with a header pointing at the saved file) but carries its own mime / size semantics worth handling in a focused follow-up.
+- Embeds and rich messages. Outbound dispatch sends `content` only today; Discord supports embeds, components, allowed-mentions controls, and reply references. Each is a future option on the send payload.
+- Gateway-driven inbound. A future bridge variant could use the Discord gateway WebSocket for lower-latency inbound. The supervisor + reply-mirror shape would still apply; only the transport changes. The current REST-poll path is cheaper to operate and matches the local-first runtime shape.
+- Outbound message chunking. Discord caps `content` at 2000 characters; we truncate at the client today. A future change could chunk long assistant summaries on paragraph or sentence boundaries (and possibly attach the long form as a file).
+
+## Verification
+
+- `bun test src/integrations/discord.test.ts` exercises the HTTP client (`getMe`, `sendMessage`, `triggerTypingIndicator`, `fetchChannelMessages`, content truncation, error paths) against an injected `fetch`.
+- `bun test src/integrations/messaging.test.ts` covers the Discord branches in the dispatcher (add/health/send happy + sad paths, identity-shape variant, secret cleanup on disable, target validation).
+- `bun test src/integrations/discord-poller.test.ts` exercises the supervisor's start/stop reconciliation, first-contact seeding (empty channel + non-empty channel), inbound roundtrip with typing pulse + reply mirror, skip-bot-message watermark advancement, and the runLoop self-exit path.

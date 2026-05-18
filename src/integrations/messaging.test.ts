@@ -32,6 +32,32 @@ function testConfig(instance: string): RuntimeConfig {
 
 interface StubCall { method: string; args: unknown[] }
 
+// Wait for a set of task ids to reach a terminal state before
+// returning. Used by tests that spawn real chat tasks through
+// receiveMessagingInput — submitTask runs runTask detached, and a
+// task still in flight when the next test file's testConfig rebinds
+// GINI_STATE_ROOT would land its state write against the wrong
+// instance directory and throw "Task not found".
+async function waitForTaskSettled(
+  config: RuntimeConfig,
+  taskIds: string[],
+  isTerminal: (status: import("../types").TaskStatus) => boolean,
+  timeoutMs = 5000
+): Promise<void> {
+  const { readState } = await import("../state");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const tasks = readState(config.instance).tasks;
+    const allDone = taskIds.every((id) => {
+      const task = tasks.find((t) => t.id === id);
+      return task ? isTerminal(task.status) : false;
+    });
+    if (allDone) return;
+    await Bun.sleep(10);
+  }
+  throw new Error(`Tasks did not settle within ${timeoutMs}ms: ${taskIds.join(", ")}`);
+}
+
 function stubClient(overrides: Partial<TelegramClient> = {}): { client: TelegramClient; calls: StubCall[] } {
   const calls: StubCall[] = [];
   const client: TelegramClient = {
@@ -544,5 +570,84 @@ describe("messaging discord wiring", () => {
     expect(live?.status).toBe("disabled");
     expect(live?.secretRefs ?? []).toEqual([]);
     expect(readBridgeBotToken(config, live!)).toBeUndefined();
+  });
+
+  test("discord inbound runs through a per-channel ChatSession (creates once, reuses on next message)", async () => {
+    const config = testConfig("discord-inbound-chat-session");
+    const { client } = stubDiscordClient();
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const { receiveMessagingInput, findDiscordChatSession } = await import("./messaging");
+    const { isTerminalTaskStatus } = await import("../state");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+
+    const first = await receiveMessagingInput(config, bridge.id, { text: "first", target: "chan-1" });
+    const second = await receiveMessagingInput(config, bridge.id, { text: "second", target: "chan-1" });
+
+    const sessions = readState(config.instance).chatSessions;
+    const discordSessions = sessions.filter(
+      (s) => s.source?.kind === "discord" && s.source.bridgeId === bridge.id && s.source.channelId === "chan-1"
+    );
+    expect(discordSessions).toHaveLength(1);
+    expect(discordSessions[0]?.source).toEqual({
+      kind: "discord",
+      bridgeId: bridge.id,
+      channelId: "chan-1",
+      target: "chan-1"
+    });
+
+    const found = findDiscordChatSession(config, bridge.id, "chan-1");
+    expect(found?.id).toBe(discordSessions[0]!.id);
+
+    const userMessages = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === discordSessions[0]!.id && m.role === "user"
+    );
+    expect(userMessages.map((m) => m.content)).toEqual(["first", "second"]);
+
+    // Wait for the spawned chat tasks to reach a terminal state before
+    // returning. submitTask runs runTask detached (.catch(failTask));
+    // the next test file's testConfig rebinds GINI_STATE_ROOT, so a
+    // task still in flight would resolve its state path against the
+    // new root and throw "Task not found". Awaiting here keeps the
+    // task lifecycle scoped to this test.
+    await waitForTaskSettled(config, [first.taskId!, second.taskId!], isTerminalTaskStatus);
+  });
+
+  test("discord receiveMessagingInput refuses a missing target instead of silently routing to 'local'", async () => {
+    // Pinpointed regression: the shared "local" default used to mask
+    // the Discord guard. Now a missing target throws so the inbound
+    // bug surfaces immediately instead of creating a session keyed
+    // on the literal string "local".
+    const config = testConfig("discord-no-target");
+    setMessagingDeps({ discordClientFactory: () => stubDiscordClient().client });
+
+    const { receiveMessagingInput } = await import("./messaging");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+
+    await expect(
+      receiveMessagingInput(config, bridge.id, { text: "hi" })
+    ).rejects.toThrow(/channel id/);
+
+    await expect(
+      receiveMessagingInput(config, bridge.id, { text: "hi", target: "" })
+    ).rejects.toThrow(/channel id/);
+
+    // No chat session should have been created for the failed calls.
+    const sessions = readState(config.instance).chatSessions.filter(
+      (s) => s.source?.kind === "discord" && s.source.bridgeId === bridge.id
+    );
+    expect(sessions).toEqual([]);
   });
 });
