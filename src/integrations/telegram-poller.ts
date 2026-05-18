@@ -18,7 +18,8 @@ import {
   readBridgeBotToken,
   receiveMessagingInput,
   recordDeniedChatAttempt,
-  sendMessagingOutput
+  sendMessagingOutput,
+  tryClaimPairingCode
 } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
 import {
@@ -162,16 +163,46 @@ async function runLoop(
       if (signal.aborted) return;
       const incoming = extractIncomingPayload(update, { botUsername });
       if (incoming) {
-        // Allowlist gate: every chat — including the owner's first DM
-        // — is denied until explicitly enrolled via `gini messaging
-        // allow`. Denied updates are dropped silently so we don't
-        // acknowledge the bot's presence to a stranger, but we DO
-        // record the attempt on `bridge.metadata.recentDeniedChats`
-        // so the owner can find their own chat_id via `gini messaging
-        // chats <bridge>` without tailing the log. The offset still
-        // advances so the same denied update doesn't get re-fetched.
+        // Allowlist gate: every chat — including the operator's first
+        // DM — is denied until explicitly enrolled. A private chat can
+        // also enroll itself by sending the bridge's pairing code as
+        // its first message; that's the only shortcut around the
+        // explicit `allow` call. Denied updates are dropped silently
+        // (no acknowledgement to strangers), but the attempt lands on
+        // `bridge.metadata.recentDeniedChats` so the operator can
+        // discover their chat_id via `gini messaging chats <bridge>`
+        // without tailing the log. The offset still advances so the
+        // same denied update doesn't get re-fetched on the next poll.
         const allowed = await authorizeTelegramChat(config, bridgeId, incoming.chatId);
         if (!allowed) {
+          const paired = await tryClaimPairingCode(config, bridgeId, {
+            chatId: incoming.chatId,
+            chatType: incoming.chatType,
+            text: incoming.text
+          });
+          if (paired) {
+            appendLog(config.instance, "messaging.telegram.chat_paired", {
+              bridgeId,
+              chatId: incoming.chatId,
+              senderHandle: incoming.senderHandle
+            });
+            // Confirm the pair back to the user. The pairing message
+            // itself is consumed (not turned into a task) so the
+            // operator's first "real" turn comes next.
+            try {
+              await sendMessagingOutput(config, bridgeId, {
+                text: "Paired. You can chat with the bot now.",
+                target: String(incoming.chatId)
+              });
+            } catch (error) {
+              appendLog(config.instance, "messaging.telegram.pair_confirm_error", {
+                bridgeId,
+                error: error instanceof Error ? error.message : String(error)
+              });
+            }
+            await advanceOffset(config, bridgeId, update.update_id);
+            continue;
+          }
           appendLog(config.instance, "messaging.telegram.chat_denied", {
             bridgeId,
             chatId: incoming.chatId,
