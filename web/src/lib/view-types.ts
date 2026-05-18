@@ -25,6 +25,15 @@ import type {
 export type ChatSession = ChatSessionRecord;
 export type ChatMessage = ChatMessageRecord;
 
+// Trimmed agent shape returned by `GET /api/agents`. The runtime
+// `AgentRecord` carries provider/toolsets/messaging detail that the
+// list endpoint doesn't ship; keep this view aligned with the wire.
+export interface AgentRow {
+  id: string;
+  name: string;
+  status: string;
+}
+
 // UI-narrowed snapshot returned by GET /state. The runtime sends the full
 // RuntimeState; the UI only consumes a subset of fields and treats some
 // records as opaque arrays.

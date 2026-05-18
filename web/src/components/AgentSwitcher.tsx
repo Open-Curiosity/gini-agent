@@ -16,7 +16,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger
 } from "@/components/ui/dropdown-menu";
-import type { AgentRow } from "@/app/settings/_components/AgentCard";
+import type { AgentRow } from "@/lib/view-types";
 import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 
 export function AgentSwitcher({ variant = "sidebar" }: { variant?: "sidebar" | "mobile" }) {
