@@ -8,6 +8,7 @@ import {
   AlertTriangle,
   Cog,
   Download,
+  Globe,
   Home,
   Loader2,
   ListTodo,
@@ -31,17 +32,25 @@ import { useStatus } from "@/lib/queries";
 import { AgentSwitcher } from "@/components/AgentSwitcher";
 import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
 
-const NAV = [
-  { href: "/", label: "Home", icon: Home },
-  { href: "/chat", label: "Chat", icon: MessageSquare },
-  { href: "/tasks", label: "Tasks", icon: ListTodo },
-  { href: "/memory", label: "Memory", icon: Sparkles },
-  { href: "/skills", label: "Skills", icon: Wrench },
-  { href: "/subagents", label: "Subagents", icon: Users },
-  { href: "/jobs", label: "Jobs", icon: Timer },
-  { href: "/permissions", label: "Permissions", icon: AlertTriangle },
-  { href: "/activity", label: "Activity", icon: Activity },
-  { href: "/settings", label: "Settings", icon: Cog }
+type NavItem = { href: string; label: string; icon: typeof Home };
+type NavGroup = readonly NavItem[];
+
+const NAV_GROUPS: readonly NavGroup[] = [
+  [{ href: "/", label: "Home", icon: Home }],
+  [
+    { href: "/chat", label: "Chat", icon: MessageSquare },
+    { href: "/tasks", label: "Tasks", icon: ListTodo },
+    { href: "/memory", label: "Memory", icon: Sparkles },
+    { href: "/subagents", label: "Subagents", icon: Users },
+    { href: "/jobs", label: "Jobs", icon: Timer }
+  ],
+  [
+    { href: "/skills", label: "Skills", icon: Wrench },
+    { href: "/permissions", label: "Permissions", icon: AlertTriangle },
+    { href: "/activity", label: "Activity", icon: Activity },
+    { href: "/browser", label: "Browser", icon: Globe },
+    { href: "/settings", label: "Settings", icon: Cog }
+  ]
 ] as const;
 
 function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
@@ -66,26 +75,33 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
         ) : null}
       </div>
       <nav className="flex flex-1 flex-col gap-0.5 px-2 pb-4">
-        {NAV.map((item) => {
-          const Icon = item.icon;
-          const active = pathname === item.href;
-          return (
-            <Link
-              key={item.href}
-              href={item.href}
-              onClick={onNavigate}
-              className={cn(
-                "flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors",
-                active
-                  ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                  : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground"
-              )}
-            >
-              <Icon className="h-4 w-4" />
-              {item.label}
-            </Link>
-          );
-        })}
+        {NAV_GROUPS.map((group, groupIndex) => (
+          <div key={groupIndex} className="flex flex-col gap-0.5">
+            {groupIndex > 0 ? (
+              <div className="my-2 border-t border-sidebar-border" />
+            ) : null}
+            {group.map((item) => {
+              const Icon = item.icon;
+              const active = pathname === item.href;
+              return (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  onClick={onNavigate}
+                  className={cn(
+                    "flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors",
+                    active
+                      ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                      : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground"
+                  )}
+                >
+                  <Icon className="h-4 w-4" />
+                  {item.label}
+                </Link>
+              );
+            })}
+          </div>
+        ))}
       </nav>
       <UpdateReminder />
     </div>
