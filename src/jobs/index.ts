@@ -309,28 +309,25 @@ function advanceNextRunAt(prevNextRunAtMs: number, intervalSeconds: number, nowM
   return { nextRunAtMs: next, missed };
 }
 
-// Cron-driven equivalent of advanceNextRunAt. Walks forward through cron-
-// matched moments starting at the run we just claimed: the first advance
-// consumes that run, each subsequent advance is a missed cron-fire that
-// has already drifted into the past (e.g. the runtime was offline). Mirrors
-// the interval helper's contract — the cron version delegates the "what's
-// the next match?" math to croner so DST transitions, leap years, and
-// month-end edge cases are handled natively. Returns the new nextRunAt
-// (ms) and the count of EXTRA missed cron fires (>= 0).
-function advanceCronNextRunAt(
+// Cron-driven equivalent of advanceNextRunAt. Returns the next cron-matched
+// moment strictly after the run we just claimed, walking past any matches
+// that have already drifted into the past (e.g. the runtime was offline).
+// Delegates the "what's the next match?" math to croner so DST transitions,
+// leap years, and month-end edge cases are handled natively. Returns the
+// new nextRunAt (ms) and the count of EXTRA missed cron fires (>= 0).
+export function advanceCronNextRunAt(
   cronExpression: string,
   cronTimezone: string,
   prevNextRunAtMs: number,
   nowMs: number
 ): { nextRunAtMs: number; missed: number } {
   const cron = new Cron(cronExpression, { timezone: cronTimezone });
-  // Mirror the interval helper's contract: starting from the run we just
-  // claimed (`prevNextRunAtMs`), `consume` is the first cron-matched
-  // moment strictly after that — analogous to `prev + step` for intervals.
-  // The loop then walks subsequent matches and counts each that's still
-  // in the past as a missed fire.
-  const consume = cron.nextRun(new Date(prevNextRunAtMs));
-  if (!consume) {
+  // `cron.nextRun(prev)` returns the first cron-matched moment strictly
+  // after `prev`, so it already IS the next scheduled fire — no extra
+  // "consume" step needed. The loop then walks subsequent matches and
+  // counts each that's still in the past as a missed fire.
+  let next = cron.nextRun(new Date(prevNextRunAtMs));
+  if (!next) {
     // Defensive: a pathological pattern that returns null. We treat it
     // as a fallback to "stay where we are" so the scheduler doesn't
     // crash. createScheduledJob's validation already rejected unfire-able
@@ -338,13 +335,7 @@ function advanceCronNextRunAt(
     // skew or a truly degenerate edge.
     return { nextRunAtMs: prevNextRunAtMs, missed: 0 };
   }
-  let next = cron.nextRun(consume);
   let missed = 0;
-  if (!next) {
-    // Same defensive fallback — but `consume` is a valid future-ish
-    // anchor, so use it as the new nextRunAt.
-    return { nextRunAtMs: consume.getTime(), missed: 0 };
-  }
   while (next.getTime() <= nowMs) {
     const after = cron.nextRun(next);
     if (!after) break;
