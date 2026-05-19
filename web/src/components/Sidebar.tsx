@@ -9,7 +9,6 @@ import {
   Boxes,
   Cog,
   Download,
-  Globe,
   Home,
   Loader2,
   ListTodo,
@@ -25,7 +24,7 @@ import {
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
-import { useEffect, useState } from "react";
+import { useState, useSyncExternalStore } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
@@ -40,7 +39,6 @@ const NAV = [
   { href: "/skills", label: "Skills", icon: Wrench },
   { href: "/subagents", label: "Subagents", icon: Users },
   { href: "/jobs", label: "Jobs", icon: Timer },
-  { href: "/browser", label: "Browser", icon: Globe },
   { href: "/permissions", label: "Permissions", icon: AlertTriangle },
   { href: "/activity", label: "Activity", icon: Activity },
   { href: "/settings", label: "Settings", icon: Cog }
@@ -49,8 +47,7 @@ const NAV = [
 function SidebarBody({ instance, onNavigate }: { instance: string; onNavigate?: () => void }) {
   const pathname = usePathname();
   const { theme, setTheme } = useTheme();
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
+  const mounted = useMounted();
 
   return (
     <div className="flex h-full flex-col bg-sidebar text-sidebar-foreground">
@@ -103,6 +100,14 @@ function SidebarBody({ instance, onNavigate }: { instance: string; onNavigate?: 
   );
 }
 
+function useMounted() {
+  return useSyncExternalStore(
+    () => () => undefined,
+    () => true,
+    () => false
+  );
+}
+
 function UpdateReminder() {
   const status = useStatus();
   const qc = useQueryClient();
@@ -122,10 +127,14 @@ function UpdateReminder() {
       if (result.upToDate) {
         toast.success("Gini is already current");
         qc.invalidateQueries({ queryKey: ["status"] });
+        qc.invalidateQueries({ queryKey: ["version", "check"] });
         return;
       }
       toast.success("Gini updated. Restarting...");
-      setTimeout(() => qc.invalidateQueries({ queryKey: ["status"] }), 4000);
+      setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ["status"] });
+        qc.invalidateQueries({ queryKey: ["version", "check"] });
+      }, 4000);
     },
     onError: (error: Error) => toast.error(error.message)
   });

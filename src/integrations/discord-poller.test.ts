@@ -3,7 +3,13 @@ import { rmSync } from "node:fs";
 import type { RuntimeConfig } from "../types";
 import { readState } from "../state";
 import { addMessagingBridge, resetMessagingDeps, setMessagingDeps } from "./messaging";
-import { createDiscordPollerSupervisor } from "./discord-poller";
+import { createDiscordPollerSupervisor, __internalsForTests as discordInternals } from "./discord-poller";
+import { setMaxTaskWaitMsForTests } from "./messaging-poller-helpers";
+import { mutateState } from "../state";
+import type { ChatSessionRecord } from "../types";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { logDir } from "../paths";
 import type { DiscordClient, DiscordMessage } from "./discord";
 
 function testConfig(instance: string): RuntimeConfig {
@@ -590,6 +596,104 @@ describe("discord poller supervisor", () => {
     // The disable's status message must also be preserved — markBridgeError
     // didn't overwrite it.
     expect(live?.message ?? "").not.toContain("ENOENT");
+  });
+
+  test("reply mirror logs reply_skip_non_terminal and tears down the typing pulse when the task wait cap fires", async () => {
+    // Direct exercise of maintainTypingAndMirrorReply: pre-populate a
+    // stuck task + chat session, run the mirror with a 50ms cap, and
+    // confirm that
+    //   1. the skip log fires (previously unreachable because
+    //      `await typingDone` blocked forever on a task whose typing
+    //      kept succeeding); and
+    //   2. typing calls stop the moment the cap fires (no further
+    //      triggerTypingIndicator calls after the function returns).
+    const config = testConfig("disc-skip-non-terminal");
+    const { client, typingCalls } = programmableClient();
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    // Plant a non-terminal task and a chat session matching the
+    // (bridge, channel) the mirror will look up.
+    await mutateState(config.instance, (state) => {
+      state.tasks.push({
+        id: "task_stuck",
+        instance: config.instance,
+        title: "t",
+        input: "t",
+        status: "running",
+        createdAt: "",
+        updatedAt: "",
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        memoryIds: [],
+        skillIds: []
+      });
+      const session: ChatSessionRecord = {
+        id: "session_stuck",
+        instance: config.instance,
+        title: "t",
+        createdAt: "",
+        updatedAt: "",
+        messageIds: [],
+        taskIds: [],
+        runIds: [],
+        source: { kind: "discord", bridgeId: bridge.id, channelId: "chan-1", target: "chan-1" }
+      };
+      state.chatSessions.push(session);
+    });
+
+    setMaxTaskWaitMsForTests(50);
+    try {
+      const controller = new AbortController();
+      await discordInternals.maintainTypingAndMirrorReply(
+        config,
+        bridge.id,
+        "task_stuck",
+        "chan-1",
+        client,
+        controller.signal,
+        20
+      );
+
+      // The skip log must fire because the task never reached terminal
+      // state. Read the runtime log file directly so the test makes no
+      // assumptions about reverse-lookup helpers.
+      const logPath = join(logDir(config.instance), "runtime.jsonl");
+      expect(existsSync(logPath)).toBe(true);
+      const lines = readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean);
+      const entries = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      // Filter by bridgeId so this test is robust against any
+      // accumulated log entries from earlier runs that share the
+      // log root.
+      const skip = entries.find(
+        (entry) =>
+          entry.message === "messaging.discord.reply_skip_non_terminal" &&
+          (entry.data as Record<string, unknown> | undefined)?.bridgeId === bridge.id
+      );
+      expect(skip).toBeDefined();
+      const data = skip?.data as Record<string, unknown> | undefined;
+      expect(data?.bridgeId).toBe(bridge.id);
+      expect(data?.taskId).toBe("task_stuck");
+      expect(data?.status).toBe("running");
+
+      // Capture how many typing calls fired by the time the mirror
+      // returned, then wait a couple of typing-refresh cycles. The
+      // count must NOT grow — proving the typing controller's abort
+      // shut the pulse down rather than leaking past the function
+      // boundary.
+      const settledCount = typingCalls.length;
+      await Bun.sleep(80);
+      expect(typingCalls.length).toBe(settledCount);
+    } finally {
+      setMaxTaskWaitMsForTests(undefined);
+    }
   });
 
   test("markBridgeError flips a configured bridge to 'error' and sanitizes the file path", async () => {

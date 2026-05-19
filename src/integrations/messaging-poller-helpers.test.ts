@@ -1,8 +1,25 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type { RuntimeConfig } from "../types";
-import { mutateState, readState } from "../state";
-import { awaitTerminalTask, createDetachedTracker, sanitizeBridgeStatusMessage } from "./messaging-poller-helpers";
+import { mutateState } from "../state";
+import { logDir } from "../paths";
+import {
+  awaitTerminalTask,
+  createDetachedTracker,
+  sanitizeBridgeStatusMessage,
+  setMaxTaskWaitMsForTests
+} from "./messaging-poller-helpers";
+
+function readRuntimeLog(instance: string): Array<Record<string, unknown>> {
+  const path = join(logDir(instance), "runtime.jsonl");
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
 
 const ROOT = "/tmp/gini-messaging-poller-helpers-tests";
 
@@ -150,6 +167,55 @@ describe("awaitTerminalTask", () => {
     setTimeout(() => controller.abort(), 50);
     const status = await awaitTerminalTask(config, "task_running", controller.signal);
     expect(status).toBeUndefined();
+  });
+
+  test("returns the non-terminal status (and logs) when the wait cap fires", async () => {
+    const config = testConfig("await-terminal-timeout");
+    await mutateState(config.instance, (state) => {
+      state.tasks.push({
+        id: "task_stuck",
+        instance: config.instance,
+        title: "t",
+        input: "t",
+        // Pick a non-terminal status that's NOT just 'running' so the
+        // assertion below can't accidentally pass against a stale
+        // happy-path return.
+        status: "waiting_approval",
+        createdAt: "",
+        updatedAt: "",
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        memoryIds: [],
+        skillIds: []
+      });
+    });
+    // 50ms cap so the test finishes in well under a second, not 10
+    // real minutes. The override is reset in finally so a later test
+    // can't accidentally inherit the shortened cap.
+    setMaxTaskWaitMsForTests(50);
+    try {
+      const controller = new AbortController();
+      const start = Date.now();
+      const status = await awaitTerminalTask(
+        config,
+        "task_stuck",
+        controller.signal,
+        "messaging.test.await_timeout"
+      );
+      const elapsed = Date.now() - start;
+      expect(status).toBe("waiting_approval");
+      expect(elapsed).toBeLessThan(2000);
+      const logs = readRuntimeLog(config.instance);
+      const timeoutEntry = logs.find((entry) => entry.message === "messaging.test.await_timeout");
+      expect(timeoutEntry).toBeDefined();
+      const data = timeoutEntry?.data as Record<string, unknown> | undefined;
+      expect(data?.taskId).toBe("task_stuck");
+      expect(data?.status).toBe("waiting_approval");
+      expect(data?.waited_ms).toBe(50);
+    } finally {
+      setMaxTaskWaitMsForTests(undefined);
+    }
   });
 });
 

@@ -1,6 +1,6 @@
 ---
 name: install-skill
-description: "Install a pasted SKILL.md (or one fetched from a URL or file path) into the user-skill directory, reviewing risk and walking trust."
+description: "Install a pasted SKILL.md (or one fetched from a URL or file path) into the user-skill directory, reviewing risk and connector requirements."
 license: MIT
 compatibility: "Requires the gini gateway and curl. Skills that need extra binaries will fail health checks after install — surface that clearly."
 allowed-tools: "Bash file_write"
@@ -16,9 +16,8 @@ metadata:
 # Install Skill
 
 You install a SKILL.md the user supplied — pasted text, a URL, or a
-file path — into the runtime's user-skills directory. You also walk the
-user through the trust decision and surface the providers the new skill
-will need.
+file path — into the runtime's user-skills directory. You also review risk
+and surface the providers the new skill will need.
 
 ## When To Use
 
@@ -60,6 +59,11 @@ will need.
    - For each entry, check `GET /api/connectors/providers`.
    - If the provider exists, note whether the user already has a healthy
      connector for it (via `GET /api/connectors`).
+   - If the skill only needs local commands or an already-authenticated CLI
+     and does not need a connector-managed account, credential, remote API,
+     or local integration, remove the connector requirement instead of
+     rewriting it to `generic`. Record command requirements under
+     `metadata.gini.prerequisites.commands`.
    - If the provider does NOT exist in the registry:
      **Default to forward motion.** Rewrite the requirement as
      `provider: generic` and explain the tradeoff to the user:
@@ -89,30 +93,9 @@ will need.
    `~/.gini/instances/<instance>/skills/user/<name>/SKILL.md`
    (or under a category folder when the skill declares
    `metadata.gini.category`), triggers a loader reload, and returns the
-   new SkillRecord. New user skills land at `status: draft` so they
-   never auto-run.
+   new enabled SkillRecord.
 
-7. Walk the trust decision. Explain:
-
-   "User-installed skills land as draft. Trust gives them access to
-   your tools through the agent loop. Bundled skills are auto-trusted;
-   user-installed skills need an explicit decision because the SKILL.md
-   was written by someone outside Gini's vendored set."
-
-   Then ask the user if they want to trust now. If yes, flip the status:
-
-   ```bash
-   curl -sS -X PATCH \
-     http://localhost:<runtime-port>/api/skills/<skill-id> \
-     -H "authorization: Bearer $GINI_TOKEN" \
-     -H "content-type: application/json" \
-     -d '{"status":"trusted"}'
-   ```
-
-   The PATCH emits an audit event `skill.trust` so the trail records
-   when trust was granted.
-
-8. If any required connector is missing or unhealthy, tell the user to
+7. If any required connector is missing or unhealthy, tell the user to
    open the Skills page (`/skills`), find the row for the skill they
    just installed, and click the inline `[Set up <Provider>]` button
    next to the missing connector. There is no longer a standalone
@@ -123,11 +106,12 @@ will need.
 ## Rules
 
 - Always validate before writing. Never install an invalid SKILL.md.
-- Always review the scripts for risk before flipping trust. If you
-  can't read the scripts (binary blobs, opaque URLs), refuse the trust
-  flip and tell the user why.
-- Default to `provider: generic` for unknown providers; do not stop the
-  install flow to ask permission.
+- Always review the scripts for risk before installing. If you can't read
+  the scripts (binary blobs, opaque URLs), refuse the install and tell the
+  user why.
+- Default to `provider: generic` for unknown external providers; do not
+  stop the install flow to ask permission. Do not add `generic` for
+  skills that only need local commands or an already-authenticated CLI.
 - Never embed the user's secret values in the SKILL.md you write.
 - Bundled vendored skills are off-limits to this skill — install only
   user-source records.

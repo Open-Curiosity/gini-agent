@@ -189,13 +189,23 @@ function sleep(ms: number): Promise<void> {
 const TASK_TERMINAL_POLL_MS = 100;
 export const MAX_TASK_WAIT_MS = 10 * 60 * 1000;
 
+// Test seam: production never touches this. Tests override the cap so
+// the `reply_skip_non_terminal` path runs in milliseconds instead of
+// ten real minutes; reset to undefined in afterEach to restore prod
+// behavior.
+let maxTaskWaitMsOverride: number | undefined;
+export function setMaxTaskWaitMsForTests(ms: number | undefined): void {
+  maxTaskWaitMsOverride = ms;
+}
+
 export async function awaitTerminalTask(
   config: RuntimeConfig,
   taskId: string,
   signal: AbortSignal,
   timeoutLogEvent = "messaging.task_wait_timeout"
 ): Promise<TaskStatus | undefined> {
-  const deadline = Date.now() + MAX_TASK_WAIT_MS;
+  const cap = maxTaskWaitMsOverride ?? MAX_TASK_WAIT_MS;
+  const deadline = Date.now() + cap;
   while (!signal.aborted) {
     const task = readState(config.instance).tasks.find((t) => t.id === taskId);
     if (!task) return undefined;
@@ -204,7 +214,7 @@ export async function awaitTerminalTask(
       appendLog(config.instance, timeoutLogEvent, {
         taskId,
         status: task.status,
-        waited_ms: MAX_TASK_WAIT_MS
+        waited_ms: cap
       });
       return task.status;
     }

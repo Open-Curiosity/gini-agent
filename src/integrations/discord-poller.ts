@@ -15,7 +15,7 @@
 // cadence so long-running tasks stay visible without piling up
 // requests.
 
-import type { MessagingBridgeRecord, RuntimeConfig } from "../types";
+import type { MessagingBridgeRecord, RuntimeConfig, TaskStatus } from "../types";
 import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { findDiscordChatSession, readBridgeBotToken, receiveMessagingInput, sendMessagingOutput } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
@@ -451,74 +451,120 @@ async function maintainTypingAndMirrorReply(
   // shared MAX_TASK_WAIT_MS deadline. Without this concurrency,
   // awaitTerminalTask was unreachable for any task whose typing
   // calls kept succeeding — the loop would spin forever.
-  const typingDone = maintainTypingIndicator(config, taskId, channelId, client, signal, typingRefreshMs)
-    .catch((error) => {
+  //
+  // The typing pulse runs on a dedicated child controller so we can
+  // stop it the moment awaitTerminalTask returns, even when the task
+  // is still non-terminal (timeout). Without the child controller a
+  // stuck task whose typing keeps succeeding would leave the pulse
+  // running past the cap and the `await typingDone` below would
+  // never resolve — the reply_skip_non_terminal log line would never
+  // fire and the tracked worker would never settle.
+  const typingController = new AbortController();
+  const propagateAbort = () => typingController.abort();
+  if (signal.aborted) typingController.abort();
+  else signal.addEventListener("abort", propagateAbort, { once: true });
+
+  try {
+    const typingDone = maintainTypingIndicator(
+      config,
+      taskId,
+      channelId,
+      client,
+      typingController.signal,
+      typingRefreshMs
+    ).catch((error) => {
       // Errors are already logged inside maintainTypingIndicator;
       // the catch here just prevents an unhandled rejection from
       // the detached await below.
       void error;
     });
 
-  // Gate the reply on the task actually reaching terminal state.
-  // awaitTerminalTask returns the (possibly non-terminal) status on
-  // timeout — if we get a non-terminal status back, the task is
-  // stuck and we skip the sync to avoid a noisy sync_error log row.
-  const terminalStatus = await awaitTerminalTask(config, taskId, signal, "messaging.discord.task_wait_timeout");
-  if (signal.aborted) return;
+    let terminalStatus: TaskStatus | undefined;
+    try {
+      // Gate the reply on the task actually reaching terminal state.
+      // awaitTerminalTask returns the (possibly non-terminal) status
+      // on timeout — if we get a non-terminal status back, the task
+      // is stuck and we skip the sync to avoid a noisy sync_error
+      // log row.
+      terminalStatus = await awaitTerminalTask(
+        config,
+        taskId,
+        signal,
+        "messaging.discord.task_wait_timeout"
+      );
+    } finally {
+      // Always tear down the typing pulse before reaping it. The
+      // pulse exits on its own in the happy path (task observed
+      // terminal); on the timeout path we have to push the abort
+      // through ourselves so the loop bails on its next signal check
+      // (or — for Discord — its in-flight POST cancels because the
+      // typing signal is the same controller that just aborted).
+      typingController.abort();
+      await typingDone;
+    }
 
-  // Reap the typing pulse before continuing. It will have exited
-  // already in the happy path (terminal status triggers its inner
-  // return) but on the timeout path we need to ensure it's done so
-  // the detached-tracker drain doesn't see a phantom worker.
-  await typingDone;
+    if (signal.aborted) return;
 
-  if (terminalStatus === undefined || !isTerminalTaskStatus(terminalStatus)) {
-    appendLog(config.instance, "messaging.discord.reply_skip_non_terminal", {
-      bridgeId,
-      taskId,
-      status: terminalStatus
-    });
-    return;
-  }
+    if (terminalStatus === undefined || !isTerminalTaskStatus(terminalStatus)) {
+      appendLog(config.instance, "messaging.discord.reply_skip_non_terminal", {
+        bridgeId,
+        taskId,
+        status: terminalStatus
+      });
+      return;
+    }
 
-  const session = findDiscordChatSession(config, bridgeId, channelId);
-  if (!session || !session.source || session.source.kind !== "discord") return;
+    const session = findDiscordChatSession(config, bridgeId, channelId);
+    if (!session || !session.source || session.source.kind !== "discord") return;
 
-  let replyText: string | undefined;
-  try {
-    const message = await syncChatTaskResult(config, session.id, taskId);
-    if (message && message.role === "assistant") replyText = message.content;
-  } catch (error) {
-    appendLog(config.instance, "messaging.discord.sync_error", {
-      bridgeId,
-      taskId,
-      error: error instanceof Error ? error.message : String(error)
-    });
-    return;
-  }
+    let replyText: string | undefined;
+    try {
+      const message = await syncChatTaskResult(config, session.id, taskId);
+      if (message && message.role === "assistant") replyText = message.content;
+    } catch (error) {
+      appendLog(config.instance, "messaging.discord.sync_error", {
+        bridgeId,
+        taskId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return;
+    }
 
-  if (!replyText || replyText.trim().length === 0) return;
+    if (!replyText || replyText.trim().length === 0) return;
 
-  // Re-check abort just before dispatch. The signal is also threaded
-  // into sendMessagingOutput so a hung Discord POST gets cancelled on
-  // shutdown — without that, stopAll (which awaits this worker)
-  // would block forever on a stuck send.
-  if (signal.aborted) return;
-  try {
-    await sendMessagingOutput(
-      config,
-      bridgeId,
-      { text: replyText, target: session.source.target },
-      { signal }
-    );
-  } catch (error) {
-    appendLog(config.instance, "messaging.discord.reply_error", {
-      bridgeId,
-      taskId,
-      error: error instanceof Error ? error.message : String(error)
-    });
+    // Re-check abort just before dispatch. The signal is also threaded
+    // into sendMessagingOutput so a hung Discord POST gets cancelled on
+    // shutdown — without that, stopAll (which awaits this worker)
+    // would block forever on a stuck send.
+    if (signal.aborted) return;
+    try {
+      await sendMessagingOutput(
+        config,
+        bridgeId,
+        { text: replyText, target: session.source.target },
+        { signal }
+      );
+    } catch (error) {
+      appendLog(config.instance, "messaging.discord.reply_error", {
+        bridgeId,
+        taskId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  } finally {
+    // Drop the abort listener regardless of how we exited so we don't
+    // leak per-call subscribers onto the supervisor signal across long
+    // sessions.
+    signal.removeEventListener("abort", propagateAbort);
   }
 }
+
+// Test seam: exposes the reply mirror so the timeout + cleanup
+// invariants can be exercised in isolation without spinning up a real
+// chat task. Production callers go through the supervisor path.
+export const __internalsForTests = {
+  maintainTypingAndMirrorReply
+};
 
 async function maintainTypingIndicator(
   config: RuntimeConfig,
