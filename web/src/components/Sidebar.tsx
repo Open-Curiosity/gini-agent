@@ -8,7 +8,6 @@ import {
   AlertTriangle,
   Cog,
   Download,
-  Home,
   Loader2,
   ListTodo,
   Menu,
@@ -20,6 +19,7 @@ import {
   Users,
   Wrench
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
@@ -31,11 +31,10 @@ import { useStatus } from "@/lib/queries";
 import { AgentSwitcher } from "@/components/AgentSwitcher";
 import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
 
-type NavItem = { href: string; label: string; icon: typeof Home };
+type NavItem = { href: string; label: string; icon: LucideIcon };
 type NavGroup = readonly NavItem[];
 
 const NAV_GROUPS: readonly NavGroup[] = [
-  [{ href: "/", label: "Home", icon: Home }],
   [
     { href: "/chat", label: "Chat", icon: MessageSquare },
     { href: "/tasks", label: "Tasks", icon: ListTodo },
