@@ -194,19 +194,21 @@ export function updateAutoApproveSettings(
   }
   if (input.approvalMode !== undefined) {
     config.approvalMode = input.approvalMode;
-    // Keep the deprecated alias coherent: setting approvalMode
-    // explicitly clears the legacy flag's authority. The flag is
-    // only ever the load-time alias source.
-    if (input.approvalMode !== "yolo") {
-      config.dangerouslyAutoApprove = false;
-    } else {
-      config.dangerouslyAutoApprove = true;
-    }
+    // Do NOT mirror to `dangerouslyAutoApprove`. The legacy flag is
+    // the load-time alias source only; writing it back here would
+    // make a fresh PATCH `approvalMode: "yolo"` look like a legacy
+    // on-disk config to the migration shim on the next restart and
+    // emit a spurious `config.migrated` audit row. Clear any
+    // pre-existing legacy field so future restarts also stay clean.
+    delete config.dangerouslyAutoApprove;
   } else if (input.dangerouslyAutoApprove !== undefined) {
     // Legacy alias path: PATCH with only the deprecated flag set.
     // Resolves to approvalMode "yolo" or "auto" (the new default).
+    // The flag itself is intentionally NOT persisted on this path
+    // either — `approvalMode` is the authoritative field going
+    // forward.
     config.approvalMode = input.dangerouslyAutoApprove ? "yolo" : "auto";
-    config.dangerouslyAutoApprove = input.dangerouslyAutoApprove;
+    delete config.dangerouslyAutoApprove;
   }
   if (input.dangerousTerminalPatterns !== undefined) {
     const cleaned = input.dangerousTerminalPatterns

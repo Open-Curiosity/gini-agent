@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { install, migrateLegacyApprovalMode } from "./index";
+import { install, migrateLegacyApprovalMode, updateAutoApproveSettings } from "./index";
 import { configPath, defaultConfig, loadConfig } from "../paths";
 import { readState } from "../state";
 import type { RuntimeConfig } from "../types";
@@ -101,6 +101,37 @@ describe("approval-mode migration shim", () => {
     const state = readState(loaded.instance);
     const migrated = state.audit.filter((event) => event.action === "config.migrated");
     expect(migrated).toHaveLength(1);
+  });
+
+  test("PATCH approvalMode: yolo does NOT trigger a spurious config.migrated audit on next restart", async () => {
+    // Regression: an earlier shape mirrored `approvalMode: "yolo"`
+    // back onto `dangerouslyAutoApprove: true` on PATCH. The
+    // load-time migration then saw both fields on disk and emitted
+    // a fake "migrated from legacy" audit row, claiming the user
+    // had been running with `dangerouslyAutoApprove: true` when in
+    // fact they had explicitly PATCHed the new field.
+    const instance = "patch-yolo-no-migration";
+    const fresh = defaultConfig(instance);
+    writeConfig(instance, fresh);
+
+    let loaded = loadConfig(instance);
+    install(loaded);
+    // User explicitly opts into yolo via the settings API.
+    updateAutoApproveSettings(loaded, { approvalMode: "yolo" });
+
+    // On-disk shape: approvalMode set; legacy flag NOT mirrored.
+    const persisted = JSON.parse(readFileSync(configPath(instance), "utf8")) as RuntimeConfig;
+    expect(persisted.approvalMode).toBe("yolo");
+    expect(persisted.dangerouslyAutoApprove).toBeUndefined();
+
+    // Simulate a restart: load the on-disk config fresh and rerun install.
+    loaded = loadConfig(instance);
+    install(loaded);
+    await migrateLegacyApprovalMode(loaded);
+
+    const state = readState(loaded.instance);
+    const migrated = state.audit.filter((event) => event.action === "config.migrated");
+    expect(migrated).toHaveLength(0);
   });
 
   test("fresh install with no legacy flag does NOT emit config.migrated", async () => {
