@@ -388,16 +388,42 @@ export interface ChatSessionRecord {
   runIds: string[];
   summary?: string;
   // Origin descriptor when the session was created by a non-UI surface.
-  // The web chat omits this; the Telegram bridge sets `kind: "telegram"`
-  // so the runtime can mirror assistant replies back out to the chat the
-  // user started in. The same shape generalizes to future bridges
-  // (Discord, Slack, …) — `target` is the bridge-specific addressing
+  // The web chat omits this; messaging bridges (Telegram, Discord) set
+  // `kind` to the bridge kind ("telegram" | "discord") with the
+  // owning bridge id in a separate `bridgeId` field, so the runtime
+  // can mirror assistant replies back out to the chat / channel the
+  // user started in. `target` is the bridge-specific addressing
   // string passed back to sendMessagingOutput.
+  //
+  // `source` doubles as the routing key for inbound: the poller's
+  // findOrCreate*ChatSession helpers match on (kind, bridgeId,
+  // chatId|channelId), so setting `source` on a session that should
+  // NOT receive inbound (e.g., a dedicated job-spawned session that
+  // only mirrors OUTBOUND back to the originating chat) would cause
+  // the live channel's next inbound to land in the job thread. Use
+  // `outboundMirror` for the outbound-only case.
   source?: ChatSessionSource;
+  // Outbound-only mirror descriptor. Populated on dedicated job
+  // sessions so a scheduled "remind me in 20s" task can dispatch its
+  // reply back through the originating bridge without competing with
+  // the live channel session for inbound routing. finalize.ts reads
+  // `outboundMirror ?? source` so live sessions (where the two are
+  // the same) continue to work unchanged.
+  outboundMirror?: ChatSessionSource;
 }
 
+// `lastInboundMessageId` is the most recent originating-message id the
+// chat session received from the bridge — Telegram's numeric
+// `message_id` (the per-chat id used by `reply_to_message_id`, NOT
+// the update id) or Discord's message snowflake string (used by
+// `message_reference.message_id`). It's what scheduled-job replies
+// use to thread their delayed dispatch onto the original user
+// message. The field is updated by the poller every time a new
+// inbound lands so a long-running session always threads onto the
+// most recent prompt.
 export type ChatSessionSource =
-  | { kind: "telegram"; bridgeId: string; chatId: number; target: string };
+  | { kind: "telegram"; bridgeId: string; chatId: number; target: string; lastInboundMessageId?: number }
+  | { kind: "discord"; bridgeId: string; channelId: string; target: string; lastInboundMessageId?: string };
 
 export interface ChatMessageRecord {
   id: string;
@@ -505,13 +531,26 @@ export interface MessagingBridgeRecord {
   message?: string;
   createdAt: string;
   updatedAt: string;
-  // Per-bridge encrypted secret refs (e.g. the Telegram bot token). Stored
-  // via the same AES-GCM box as connectorSecrets — the connectorId namespace
-  // we use is `messaging.<bridgeId>` so a bridge delete cleans up its files.
+  // Per-bridge encrypted secret refs (Telegram + Discord both store
+  // their bot token here). Stored via the same AES-GCM box as
+  // connectorSecrets — the connectorId namespace we use is
+  // `messaging.<bridgeId>` so a bridge delete cleans up its files.
   secretRefs?: ConnectorSecretRef[];
-  // Bridge-kind-specific non-secret state. For telegram: { botUsername,
-  // lastOffset }. Kept as a free-form record so each kind can evolve without
-  // forcing a schema migration on the others.
+  // Bridge-kind-specific non-secret state. Kept as a free-form record
+  // so each kind can evolve without forcing a schema migration on the
+  // others. Current shapes:
+  //   telegram: {
+  //     botUsername, botId, lastOffset,
+  //     allowedChatIds: number[],           // per-chat allowlist (no TOFU)
+  //     ownerChatId?: number,               // first-enrolled chat for audit history
+  //     recentDeniedChats?: DeniedChatAttempt[],
+  //     pairingCode?: string,               // one-shot enroll-via-DM code
+  //     pairingCodeExpiresAt?: string       // ISO timestamp; 15-minute TTL
+  //   }
+  //   discord: {
+  //     botUsername, botId, globalName?,
+  //     lastInboundExternalIds: Record<channelId, snowflake>  // per-channel watermark
+  //   }
   metadata?: Record<string, unknown>;
 }
 

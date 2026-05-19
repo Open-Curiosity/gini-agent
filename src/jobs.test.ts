@@ -482,6 +482,67 @@ describe("cron lifecycle", () => {
     expect(readState(config.instance).jobs).toHaveLength(0);
   });
 
+  test("dedicated session stores parent's messaging source on outboundMirror so future inbound stays routed to the live session", async () => {
+    // Regression: when a messaging-sourced parent task creates a
+    // dedicated job session, the descriptor must NOT land on the new
+    // session's `source` field. If it did, both sessions would match
+    // findOrCreate{Discord,Telegram}ChatSession's (bridgeId,
+    // channelId|chatId) routing key and the next inbound on that
+    // channel could attach to the job thread instead of the live one.
+    const config = testConfig("jobs-outbound-mirror-no-routing-conflict");
+    const { addMessagingBridge } = await import("./integrations/messaging");
+    const { findOrCreateDiscordChatSession } = await import("./state");
+    const { createScheduledJob } = await import("./jobs");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    // Live session that the poller would have created on first
+    // inbound. Its `source` is the routing key for chan-1.
+    const liveSession = await mutateState(config.instance, (state) =>
+      findOrCreateDiscordChatSession(state, bridge.id, "chan-1")
+    );
+    expect(liveSession.source?.kind).toBe("discord");
+
+    // Parent task associated with the live session, completed.
+    const parentTaskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "parent", undefined, undefined, undefined, undefined);
+      task.status = "completed";
+      upsertTask(state, task);
+      const session = state.chatSessions.find((s) => s.id === liveSession.id);
+      if (session && !session.taskIds.includes(task.id)) session.taskIds.push(task.id);
+      return task.id;
+    });
+
+    await createScheduledJob(config, {
+      name: "reminder",
+      intervalSeconds: 60,
+      prompt: "remind",
+      createDedicatedSession: { title: "Scheduled: reminder" },
+      parentTaskId
+    });
+
+    const sessions = readState(config.instance).chatSessions;
+    const dedicated = sessions.find((s) => s.id !== liveSession.id);
+    expect(dedicated).toBeDefined();
+    // The architectural invariant: dedicated session has
+    // outboundMirror but NO source.
+    expect(dedicated?.source).toBeUndefined();
+    expect(dedicated?.outboundMirror?.kind).toBe("discord");
+    expect((dedicated?.outboundMirror as { channelId?: string } | undefined)?.channelId).toBe("chan-1");
+
+    // Routing key check: a subsequent inbound on chan-1 must return
+    // the live session, not the dedicated job session.
+    const resolved = await mutateState(config.instance, (state) =>
+      findOrCreateDiscordChatSession(state, bridge.id, "chan-1")
+    );
+    expect(resolved.id).toBe(liveSession.id);
+  });
+
   test("create_job dispatch persists the per-job auto-approve envelope", async () => {
     // The agent passes `autoApproveCommands`, `dangerouslyAutoApprove`, and
     // `timeoutSeconds` through the tool spec to schedule an unattended job.
@@ -1626,6 +1687,125 @@ describe("cron lifecycle", () => {
     );
     expect(assistantMessages).toHaveLength(1);
     expect(assistantMessages[0]?.content).toBe("[SILENT] with extra");
+  });
+
+  test("dispatchJobReplyToBridge suppresses ONLY exact '[SILENT]'; any prefix-only match still dispatches", async () => {
+    // Mirror invariant of the syncChatTaskResult test above, but for
+    // the bridge dispatch path. Earlier code used `startsWith` here
+    // which would have silently dropped a legitimate reply like
+    // "[SILENT] but here's an update" while syncChatTaskResult
+    // (correctly) delivered it to chat — meaning a scheduled job
+    // would land in chat UI but never reach Telegram/Discord.
+    const config = testConfig("jobs-silent-dispatch-strict");
+    const { addMessagingBridge, setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { findOrCreateDiscordChatSession } = await import("./state");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ channelId: string; content: string }> = [];
+    setMessagingDeps({
+      discordClientFactory: () => ({
+        async getMe() {
+          return { id: "100", username: "Gini", discriminator: "0000", bot: true };
+        },
+        async sendMessage(channelId, content) {
+          sendCalls.push({ channelId, content });
+          return { id: "reply", channel_id: channelId, content, timestamp: "", author: { id: "100", username: "Gini", bot: true } };
+        },
+        async triggerTypingIndicator() {
+          return true as const;
+        },
+        async fetchChannelMessages() {
+          return [];
+        }
+      })
+    });
+
+    try {
+      const bridge = await addMessagingBridge(config, {
+        name: "disc",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "TOK"
+      });
+      const sessionId = await mutateState(config.instance, (state) => {
+        const session = findOrCreateDiscordChatSession(state, bridge.id, "chan-1");
+        return session.id;
+      });
+
+      // "[SILENT] but here's an update" — must NOT be suppressed.
+      const taskA = await mutateState(config.instance, (state) => {
+        const t = createTask(state.instance, "scheduled", undefined, undefined, undefined, undefined);
+        t.status = "completed";
+        t.summary = "[SILENT] but here's an update";
+        t.jobId = "job_x";
+        upsertTask(state, t);
+        const session = state.chatSessions.find((s) => s.id === sessionId)!;
+        session.taskIds.push(t.id);
+        state.jobs.push({
+          id: "job_x",
+          instance: state.instance,
+          name: "x",
+          status: "active",
+          prompt: "p",
+          deliveryTargets: [],
+          context: [],
+          retryLimit: 0,
+          timeoutSeconds: 600,
+          chatSessionId: sessionId,
+          runIds: [],
+          taskIds: [],
+          runCount: 0,
+          missedRuns: 0,
+          nextRunAt: new Date().toISOString(),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        state.jobRuns.push({
+          id: "run_x",
+          instance: state.instance,
+          jobId: "job_x",
+          status: "running",
+          taskId: t.id,
+          attempt: 1,
+          trigger: "schedule",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        return t.id;
+      });
+      const taskAObj = readState(config.instance).tasks.find((t) => t.id === taskA)!;
+      await finalizeJobRunFromTask(config, taskAObj);
+      expect(sendCalls.length).toBe(1);
+      expect(sendCalls[0]?.content).toContain("but here's an update");
+
+      // Exact "[SILENT]" — must be suppressed.
+      sendCalls.length = 0;
+      const taskB = await mutateState(config.instance, (state) => {
+        const t = createTask(state.instance, "scheduled-silent", undefined, undefined, undefined, undefined);
+        t.status = "completed";
+        t.summary = "[SILENT]";
+        t.jobId = "job_x";
+        upsertTask(state, t);
+        const session = state.chatSessions.find((s) => s.id === sessionId)!;
+        session.taskIds.push(t.id);
+        state.jobRuns.push({
+          id: "run_y",
+          instance: state.instance,
+          jobId: "job_x",
+          status: "running",
+          taskId: t.id,
+          attempt: 1,
+          trigger: "schedule",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        return t.id;
+      });
+      const taskBObj = readState(config.instance).tasks.find((t) => t.id === taskB)!;
+      await finalizeJobRunFromTask(config, taskBObj);
+      expect(sendCalls.length).toBe(0);
+    } finally {
+      resetMessagingDeps();
+    }
   });
 });
 

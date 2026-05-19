@@ -7,10 +7,12 @@ import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
 import { appendLog, mutateState, readState } from "./state";
+import { applyLegacyTelegramPairingMigration } from "./state/store";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
 import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
+import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
 
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
@@ -63,6 +65,23 @@ setBrowserInstance(config.instance);
       });
   }
 }
+
+// One-shot migration for legacy telegram bridges (pre-allowlist). Runs
+// once per server start; the migration helper is idempotent so a
+// second run is a no-op. Done inside mutateState so the minted
+// pairing code lands on disk immediately — minting in a read-only
+// path (normalizeState) would create ephemeral codes on every
+// inspection.
+void mutateState(config.instance, (state) => {
+  const migrated = applyLegacyTelegramPairingMigration(state);
+  if (migrated) {
+    appendLog(config.instance, "messaging.pairing.migrated.applied", { instance: config.instance });
+  }
+}).catch((error) => {
+  appendLog(config.instance, "messaging.pairing.migration.error", {
+    error: error instanceof Error ? error.message : String(error)
+  });
+});
 
 // Hindsight phase 6: opportunistic legacy migration. Runs once per server
 // start; subsequent starts are no-ops because each migrated record carries
@@ -191,12 +210,20 @@ const reprobeDone: Promise<void> = (async function reprobeLoop(): Promise<void> 
   }
 })();
 
+// Messaging inbound supervisor cadence. Shared across every bridge
+// supervisor (Telegram long-poll reconcile + Discord REST-poll
+// reconcile). A bridge added at runtime is picked up within one
+// reconcile interval without restarting the runtime. The
+// GINI_TELEGRAM_RECONCILE_MS env var is kept for backwards
+// compatibility with the original Telegram-only knob.
+const MESSAGING_RECONCILE_INTERVAL_MS = Number(
+  process.env.GINI_MESSAGING_RECONCILE_MS ?? process.env.GINI_TELEGRAM_RECONCILE_MS ?? 5000
+);
+
 // Telegram inbound poller. The supervisor reconciles per-bridge long-poll
-// loops against state every few seconds, so a bridge added or disabled at
-// runtime is picked up without restarting the runtime. Each loop streams
-// updates from api.telegram.org and funnels them through
-// receiveMessagingInput, which submits a task per inbound message.
-const TELEGRAM_RECONCILE_INTERVAL_MS = Number(process.env.GINI_TELEGRAM_RECONCILE_MS ?? 5000);
+// loops against state every few seconds. Each loop streams updates
+// from api.telegram.org and funnels them through receiveMessagingInput,
+// which submits a task per inbound message.
 const telegramSupervisor = createTelegramPollerSupervisor(config);
 let telegramStopped = false;
 const telegramDone: Promise<void> = (async function telegramReconcileLoop(): Promise<void> {
@@ -209,7 +236,27 @@ const telegramDone: Promise<void> = (async function telegramReconcileLoop(): Pro
       });
     }
     if (telegramStopped) break;
-    await Bun.sleep(TELEGRAM_RECONCILE_INTERVAL_MS);
+    await Bun.sleep(MESSAGING_RECONCILE_INTERVAL_MS);
+  }
+})();
+
+// Discord inbound poller. Same supervisor shape as Telegram. Discord
+// has no long-poll, so each loop polls every configured delivery target
+// on a short cadence and advances a per-channel snowflake watermark in
+// bridge.metadata.lastInboundExternalIds.
+const discordSupervisor = createDiscordPollerSupervisor(config);
+let discordStopped = false;
+const discordDone: Promise<void> = (async function discordReconcileLoop(): Promise<void> {
+  while (!discordStopped) {
+    try {
+      discordSupervisor.reconcile();
+    } catch (error) {
+      appendLog(config.instance, "messaging.discord.supervisor_error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+    if (discordStopped) break;
+    await Bun.sleep(MESSAGING_RECONCILE_INTERVAL_MS);
   }
 })();
 
@@ -229,10 +276,13 @@ process.on("SIGTERM", async () => {
   schedulerStopped = true;
   reprobeStopped = true;
   telegramStopped = true;
+  discordStopped = true;
   // Abort all in-flight Telegram long-polls so they don't keep us alive
-  // waiting out their 25s timeout. The .catch below swallows the abort
-  // rejection — it's expected.
+  // waiting out their 25s timeout, and abort every Discord poll cycle
+  // so the runtime exits promptly even if a fetch is in-flight. The
+  // .catch below swallows the abort rejection — it's expected.
   void telegramSupervisor.stopAll().catch(() => {});
+  void discordSupervisor.stopAll().catch(() => {});
   // Drain in-flight HTTP responses BEFORE we start tearing the process
   // down. `server.stop(false)` returns a promise that resolves when
   // active requests have completed writing — without this, a setup POST
@@ -277,6 +327,8 @@ process.on("SIGTERM", async () => {
       reprobeDone.catch(() => {}),
       telegramDone.catch(() => {}),
       telegramSupervisor.stopAll().catch(() => {}),
+      discordDone.catch(() => {}),
+      discordSupervisor.stopAll().catch(() => {}),
       // Close any live headless browser contexts so Chromium child
       // processes exit cleanly with the runtime instead of being reaped
       // by the OS at the very end. Errors are swallowed — a stuck

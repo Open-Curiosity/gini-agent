@@ -89,9 +89,13 @@ export interface SendMessageOptions {
   disableWebPagePreview?: boolean;
   // Thread the outbound reply onto a specific inbound message. Useful in
   // group chats so the bot's response visually attaches to the user's
-  // question. Telegram silently ignores this if the referenced message
-  // was deleted, so it's safe to set unconditionally for inbound-mirror
-  // replies.
+  // question. The Bot API does NOT silently ignore a missing referenced
+  // message by default — it returns "Bad Request: message to be replied
+  // not found" instead. So whenever this field is set the call also
+  // emits `allow_sending_without_reply: true`, which makes the API fall
+  // back to an unthreaded send if the user deleted the original message
+  // before the agent's reply landed. Without that flag a deleted-mid-
+  // task message silently drops the assistant's response.
   replyToMessageId?: number;
 }
 
@@ -115,7 +119,12 @@ export interface TelegramClient {
   getMe(): Promise<TelegramUser>;
   sendMessage(chatId: string | number, text: string, options?: SendMessageOptions): Promise<TelegramMessage>;
   sendPhoto(chatId: string | number, source: TelegramPhotoSource, options?: SendPhotoOptions): Promise<TelegramMessage>;
-  sendChatAction(chatId: string | number, action: TelegramChatAction): Promise<true>;
+  // Optional `signal` cancels an in-flight request when the supervisor
+  // aborts (bridge disable, shutdown). Without it the typing-pulse fetch
+  // can hang past the detached-tracker drain window because the call is
+  // already inside fetch() and unobservable from the loop's signal
+  // check.
+  sendChatAction(chatId: string | number, action: TelegramChatAction, signal?: AbortSignal): Promise<true>;
   getFile(fileId: string): Promise<TelegramFile>;
   // Download the bytes for a previously-resolved file path. The path
   // comes from getFile and is server-relative; this method handles the
@@ -182,9 +191,17 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
         text,
         ...(opts?.parseMode ? { parse_mode: opts.parseMode } : {}),
         ...(opts?.disableWebPagePreview ? { disable_web_page_preview: true } : {}),
-        ...(opts?.replyToMessageId !== undefined ? { reply_to_message_id: opts.replyToMessageId } : {})
+        ...(opts?.replyToMessageId !== undefined
+          ? {
+              reply_to_message_id: opts.replyToMessageId,
+              // Required so a deleted-mid-task original message doesn't
+              // make the whole send fail; see SendMessageOptions doc.
+              allow_sending_without_reply: true
+            }
+          : {})
       }),
-    sendChatAction: (chatId, action) => call<true>("sendChatAction", { chat_id: chatId, action }),
+    sendChatAction: (chatId, action, signal) =>
+      call<true>("sendChatAction", { chat_id: chatId, action }, signal),
     getFile: (fileId) => call<TelegramFile>("getFile", { file_id: fileId }),
     downloadFile: async (filePath) => {
       const url = `${base}/file/bot${token}/${filePath}`;
@@ -198,7 +215,12 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
       const captionFields = {
         ...(opts?.caption !== undefined ? { caption: opts.caption } : {}),
         ...(opts?.parseMode ? { parse_mode: opts.parseMode } : {}),
-        ...(opts?.replyToMessageId !== undefined ? { reply_to_message_id: opts.replyToMessageId } : {})
+        ...(opts?.replyToMessageId !== undefined
+          ? {
+              reply_to_message_id: opts.replyToMessageId,
+              allow_sending_without_reply: true
+            }
+          : {})
       };
       if (source.kind === "url") {
         return call<TelegramMessage>("sendPhoto", { chat_id: chatId, photo: source.url, ...captionFields });
@@ -212,6 +234,7 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
       if (captionFields.parse_mode) form.append("parse_mode", captionFields.parse_mode);
       if (captionFields.reply_to_message_id !== undefined) {
         form.append("reply_to_message_id", String(captionFields.reply_to_message_id));
+        form.append("allow_sending_without_reply", "true");
       }
       if (source.kind === "bytes") {
         const blob =

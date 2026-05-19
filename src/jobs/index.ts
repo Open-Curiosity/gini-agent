@@ -250,9 +250,31 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     // a bad parent task state) leaves no orphan chat row. The new
     // session's id replaces any caller-supplied chatSessionId so the job's
     // future fires post into the fresh thread.
+    //
+    // If the parent task came from a messaging-sourced chat session
+    // (Discord, Telegram), copy the source descriptor onto the new
+    // dedicated session AS `outboundMirror` (not `source`) so
+    // finalizeJobRunFromTask can still dispatch the scheduled-fire
+    // reply back to the originating chat. Storing the descriptor as
+    // `source` would make findOrCreate{Discord,Telegram}ChatSession
+    // match the dedicated session for inbound on the same channel —
+    // the very next user message could land in the job thread
+    // instead of the live channel thread. `outboundMirror` is
+    // outbound-only by contract and the findOrCreate helpers
+    // explicitly ignore it.
     let resolvedChatSessionId = chatSessionId;
     if (createDedicatedSessionTitle !== undefined) {
       const session = createChatSession(state, createDedicatedSessionTitle);
+      if (parentTaskId) {
+        const parentSession = state.chatSessions.find((candidate) =>
+          candidate.id !== session.id && candidate.taskIds.includes(parentTaskId)
+        );
+        if (parentSession?.source) {
+          // Clone so a later mutation on the parent session's source
+          // doesn't aliased-mutate the dedicated session's copy.
+          session.outboundMirror = { ...parentSession.source };
+        }
+      }
       resolvedChatSessionId = session.id;
     }
     // Initial nextRunAt: cron-driven jobs anchor to the next cron-matched
