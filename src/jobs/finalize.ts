@@ -159,10 +159,16 @@ async function dispatchJobReplyToBridge(
     .filter((m) => m.sessionId === chatSessionId && m.taskId === task.id && m.role === "assistant")
     .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
   const replyText = assistantMessage?.content?.trim();
-  // `[SILENT]` summaries explicitly suppress the bridge mirror — same
-  // convention the inline reply mirror in the pollers honors.
+  // `[SILENT]` summaries explicitly suppress the bridge mirror. The
+  // canonical match is EXACT (trimmed), not prefix — matching the
+  // suppression contract in src/execution/chat.ts and the system-
+  // prompt instruction at src/jobs/index.ts that tells the LLM to
+  // "respond with exactly [SILENT] and nothing else". A prefix match
+  // here would silently drop a legitimate reply like
+  // `"[SILENT] but here's an update"`, which is the exact failure
+  // mode the chat-side test pins against.
   if (!replyText || replyText.length === 0) return;
-  if (replyText.startsWith("[SILENT]")) return;
+  if (replyText === "[SILENT]") return;
   try {
     const replyToMessageId = dispatchTo.lastInboundMessageId;
     const { sendMessagingOutput } = await import("../integrations/messaging");

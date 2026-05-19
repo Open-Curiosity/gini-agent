@@ -592,13 +592,12 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
 }
 
 // One-shot migration for telegram bridges created before the chat
-// allowlist + pairing-code surface landed (commits f306488 / 8672499 /
-// f268fbc / f6e7884 on main). Without this, a legacy bridge upgrades
-// into `metadata.allowedChatIds === undefined`, the poller's
-// `authorizeTelegramChat` denies every inbound, and the operator sees
-// total silence on a bridge that previously worked. The mint gives
-// them a pairing code they can DM the bot with to re-enroll without
-// recreating the bridge.
+// allowlist + pairing-code surface landed. Without this, a legacy
+// bridge upgrades into `metadata.allowedChatIds === undefined`, the
+// poller's `authorizeTelegramChat` denies every inbound, and the
+// operator sees total silence on a bridge that previously worked.
+// The mint gives them a pairing code they can DM the bot with to
+// re-enroll without recreating the bridge.
 //
 // Idempotent: only fires when the bridge has NO allowlist AND NO
 // pairing code at all (active or expired). After one mint the second

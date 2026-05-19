@@ -1607,6 +1607,117 @@ describe("cron lifecycle", () => {
     expect(assistantMessages).toHaveLength(1);
     expect(assistantMessages[0]?.content).toBe("[SILENT] with extra");
   });
+
+  test("dispatchJobReplyToBridge suppresses ONLY exact '[SILENT]'; any prefix-only match still dispatches", async () => {
+    // Mirror invariant of the syncChatTaskResult test above, but for
+    // the bridge dispatch path. Earlier code used `startsWith` here
+    // which would have silently dropped a legitimate reply like
+    // "[SILENT] but here's an update" while syncChatTaskResult
+    // (correctly) delivered it to chat — meaning a scheduled job
+    // would land in chat UI but never reach Telegram/Discord.
+    const config = testConfig("jobs-silent-dispatch-strict");
+    const { addMessagingBridge, setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { findOrCreateDiscordChatSession } = await import("./state");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ channelId: string; content: string }> = [];
+    setMessagingDeps({
+      discordClientFactory: () => ({
+        async getMe() {
+          return { id: "100", username: "Gini", discriminator: "0000", bot: true };
+        },
+        async sendMessage(channelId, content) {
+          sendCalls.push({ channelId, content });
+          return { id: "reply", channel_id: channelId, content, timestamp: "", author: { id: "100", username: "Gini", bot: true } };
+        },
+        async triggerTypingIndicator() {
+          return true as const;
+        },
+        async fetchChannelMessages() {
+          return [];
+        }
+      })
+    });
+
+    try {
+      const bridge = await addMessagingBridge(config, {
+        name: "disc",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "TOK"
+      });
+      const sessionId = await mutateState(config.instance, (state) => {
+        const session = findOrCreateDiscordChatSession(state, bridge.id, "chan-1");
+        return session.id;
+      });
+
+      // "[SILENT] but here's an update" — must NOT be suppressed.
+      const taskA = await mutateState(config.instance, (state) => {
+        const t = createTask(state.instance, "scheduled", undefined, undefined, undefined, undefined);
+        t.status = "completed";
+        t.summary = "[SILENT] but here's an update";
+        t.jobId = "job_x";
+        upsertTask(state, t);
+        const session = state.chatSessions.find((s) => s.id === sessionId)!;
+        session.taskIds.push(t.id);
+        state.jobs.push({
+          id: "job_x",
+          instance: state.instance,
+          name: "x",
+          status: "active",
+          prompt: "p",
+          deliveryTargets: [],
+          context: [],
+          retryLimit: 0,
+          timeoutSeconds: 600,
+          chatSessionId: sessionId,
+          runIds: [],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        state.jobRuns.push({
+          id: "run_x",
+          instance: state.instance,
+          jobId: "job_x",
+          status: "running",
+          taskId: t.id,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        return t.id;
+      });
+      const taskAObj = readState(config.instance).tasks.find((t) => t.id === taskA)!;
+      await finalizeJobRunFromTask(config, taskAObj);
+      expect(sendCalls.length).toBe(1);
+      expect(sendCalls[0]?.content).toContain("but here's an update");
+
+      // Exact "[SILENT]" — must be suppressed.
+      sendCalls.length = 0;
+      const taskB = await mutateState(config.instance, (state) => {
+        const t = createTask(state.instance, "scheduled-silent", undefined, undefined, undefined, undefined);
+        t.status = "completed";
+        t.summary = "[SILENT]";
+        t.jobId = "job_x";
+        upsertTask(state, t);
+        const session = state.chatSessions.find((s) => s.id === sessionId)!;
+        session.taskIds.push(t.id);
+        state.jobRuns.push({
+          id: "run_y",
+          instance: state.instance,
+          jobId: "job_x",
+          status: "running",
+          taskId: t.id,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        return t.id;
+      });
+      const taskBObj = readState(config.instance).tasks.find((t) => t.id === taskB)!;
+      await finalizeJobRunFromTask(config, taskBObj);
+      expect(sendCalls.length).toBe(0);
+    } finally {
+      resetMessagingDeps();
+    }
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

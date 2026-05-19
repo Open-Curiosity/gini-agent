@@ -481,7 +481,11 @@ function parseChatIdStrict(raw: unknown): number {
     const parsed = Number.parseInt(raw, 10);
     if (Number.isFinite(parsed) && Number.isSafeInteger(parsed)) return parsed;
   }
-  throw new Error(`chatId must be a finite integer (got ${JSON.stringify(raw)}).`);
+  // Use the "Invalid input:" prefix so statusFromErrorMessage maps
+  // this to a 400 instead of a catch-all 500. Without the prefix, a
+  // malformed allow/deny payload would surface as "internal error"
+  // even though the caller's input is what's broken.
+  throw new Error(`Invalid input: chatId must be a finite integer (got ${JSON.stringify(raw)}).`);
 }
 
 async function body(request: Request): Promise<Record<string, unknown>> {

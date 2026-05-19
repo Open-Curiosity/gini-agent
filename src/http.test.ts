@@ -828,6 +828,34 @@ describe("runtime api", () => {
     const body = await response.json();
     expect(body.error).toMatch(/Could not reach CDP endpoint/);
   }, 30_000);
+
+  test("POST /api/messaging/:id/allow with a malformed chatId returns 400 (not 500)", async () => {
+    // parseChatIdStrict throws "Invalid input: chatId must be ..." so
+    // statusFromErrorMessage maps it to 400. Without the prefix, a
+    // caller who PUTs `null` or `""` would see "internal error" 500.
+    const config = testConfig("messaging-allow-bad-chatid");
+    const handler = createHandler(config);
+    const { addMessagingBridge } = await import("./integrations/messaging");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+    const badPayloads: Array<unknown> = [null, "", "123abc", "abc", 1.5];
+    for (const chatId of badPayloads) {
+      const response = await rawCall(
+        handler,
+        config,
+        `/api/messaging/${bridge.id}/allow`,
+        { method: "POST", body: JSON.stringify({ chatId }) },
+        config.token
+      );
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.error).toMatch(/chatId must be a finite integer/);
+    }
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
