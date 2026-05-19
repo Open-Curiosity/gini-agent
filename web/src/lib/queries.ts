@@ -41,9 +41,10 @@ export function useState_(options?: Partial<UseQueryOptions<RuntimeStateSnapshot
   });
 }
 
-// Active agent for scoping per-agent listings. Falls back to the agents
-// query's activeAgentId if status hasn't loaded yet. Returns undefined when
-// nothing's known so callers fetch the unfiltered list while bootstrapping.
+// Active agent for scoping per-agent listings. Reads /status; returns
+// undefined until /status resolves. Consumers below gate their fetches on
+// this being defined (`enabled: Boolean(agentId)`) so the unfiltered list
+// never lands in the cache during bootstrapping.
 function useActiveAgentId(): string | undefined {
   const status = useStatus();
   return status.data?.activeAgent?.id;

@@ -70,14 +70,20 @@ export default function ActivityPage() {
   // modes fire immediately because their target is known up-front.
   const ready =
     agentFilter !== AGENT_FILTER_ACTIVE || activeAgentId !== undefined;
+  // Keep the filter mode in the cache key so the "All agents" slot (mode
+  // ALL, effectiveAgentId=undefined) doesn't share storage with the
+  // brief unresolved-active-agent state (mode ACTIVE,
+  // effectiveAgentId=undefined). Without the mode segment React Query
+  // would serve the all-agents payload to a user who'd selected
+  // "Active agent" during the first paint window.
   const events = useQuery<RuntimeEvent[]>({
-    queryKey: ["events", effectiveAgentId ?? null],
+    queryKey: ["events", agentFilter, effectiveAgentId ?? null],
     queryFn: () => api<RuntimeEvent[]>(eventsPath),
     refetchInterval: 60_000,
     enabled: ready
   });
   const audit = useQuery<AuditEvent[]>({
-    queryKey: ["audit", effectiveAgentId ?? null],
+    queryKey: ["audit", agentFilter, effectiveAgentId ?? null],
     queryFn: () => api<AuditEvent[]>(auditPath),
     refetchInterval: 60_000,
     enabled: ready
