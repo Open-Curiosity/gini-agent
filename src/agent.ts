@@ -1914,8 +1914,11 @@ async function runApprovedAction(
         // richer browser.connect audit row below (with the user-facing
         // `reason` and the `approvalId`); letting the capability also
         // write its own row would double-count the action and leave a
-        // reasonless row in the activity log.
-        const status = await connectBrowser(config, { mode: "managed", skipAudit: true });
+        // reasonless row in the activity log. `skipAudit` lives on the
+        // third (internal) argument — NOT on the public `ConnectInput` —
+        // so an HTTP caller hitting `POST /api/browser/connect` with body
+        // `{"skipAudit": true}` cannot suppress its own audit row.
+        const status = await connectBrowser(config, { mode: "managed" }, { skipAudit: true });
         succeeded = status.connected;
         mode = status.record?.mode;
         dataDir = status.record?.dataDir;

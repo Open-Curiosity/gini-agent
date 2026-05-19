@@ -179,7 +179,15 @@ function validateCdpUrl(raw: string): { ok: true; url: string } | { ok: false; e
   return { ok: true, url: parsed.toString() };
 }
 
-interface ConnectInput {
+// PUBLIC input shape — accepted directly from authenticated callers (HTTP
+// POST /api/browser/connect body, CLI). Keep this surface minimal and
+// auditable. Fields that affect audit / trust semantics MUST NOT live here,
+// because the HTTP route hands the parsed body straight to connectBrowser
+// without filtering — declaring those fields on this type would let an
+// authenticated client suppress its own audit trail by setting them in the
+// POST body. Such fields belong in `InternalConnectOptions` (third arg),
+// reachable only from in-process call sites.
+export interface ConnectInput {
   cdpUrl?: unknown;
   // When set to "managed", an existing record that is NOT managed (i.e. a
   // `cdp`-mode record that may be headless or owned by a different Chrome)
@@ -191,15 +199,17 @@ interface ConnectInput {
   // approval card the user just consented to) promises a visible Chrome
   // window; silently handing back a stale CDP session would violate that.
   mode?: "managed";
-  // When true, the capability does NOT write its own `browser.connect`
-  // audit row. Internal flag for callers (the `browser_connect` tool
-  // dispatch) whose approval flow already records the action — including
-  // the load-bearing `reason` + `approvalId` evidence — via the runtime's
-  // per-action audit row. Without this, the chat-task path would emit two
-  // audit rows for one logical action: the capability's row (no reason,
-  // no approvalId) and the dispatch's row (with both). Other callers
-  // (`gini browser connect` CLI, POST /api/browser/connect) leave this
-  // unset and continue to get the capability-owned audit row.
+}
+
+// INTERNAL options — never plumbed from network input. Lives as a separate
+// third argument to `connectBrowser` so it can't be smuggled in through
+// `POST /api/browser/connect`'s JSON body. The HTTP route omits this arg,
+// so `skipAudit` always defaults to false on that path and the capability
+// always writes its `browser.connect` audit row. Only the in-process
+// tool-dispatch caller (which writes its own richer audit row with the
+// approval `reason` + `approvalId`) sets `skipAudit: true` to avoid a
+// duplicate, reasonless row.
+interface InternalConnectOptions {
   skipAudit?: boolean;
 }
 
@@ -221,17 +231,31 @@ let pendingDisconnect: Promise<Status> | null = null;
 // Idempotent connect. Mode is decided by whether the caller supplied a
 // cdpUrl. We re-probe an existing record before returning it so a crashed
 // Chrome doesn't appear as still-connected.
-export function connectBrowser(config: RuntimeConfig, input: ConnectInput): Promise<Status> {
+//
+// The third `internal` argument is OFF-LIMITS to network callers (the HTTP
+// route omits it). It carries flags that affect audit / trust semantics
+// (`skipAudit`); putting them on `ConnectInput` would let any authenticated
+// HTTP client set `{"skipAudit": true}` in the POST body and suppress the
+// capability's own audit row, breaking the tamper-resistance contract.
+export function connectBrowser(
+  config: RuntimeConfig,
+  input: ConnectInput,
+  internal: InternalConnectOptions = {}
+): Promise<Status> {
   if (pendingConnect) return pendingConnect;
   pendingConnect = (async () => {
-    return await connectBrowserInner(config, input);
+    return await connectBrowserInner(config, input, internal);
   })().finally(() => {
     pendingConnect = null;
   });
   return pendingConnect;
 }
 
-async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): Promise<Status> {
+async function connectBrowserInner(
+  config: RuntimeConfig,
+  input: ConnectInput,
+  internal: InternalConnectOptions
+): Promise<Status> {
   // Validate caller input BEFORE we touch any existing state. A bad cdpUrl
   // (malformed, blocked SSRF target, unsupported protocol) must surface as
   // a 400 to the caller without tearing down the user's already-managed
@@ -321,7 +345,11 @@ async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): 
   // headless-handle ambiguity — the next browser_* call reuses the live
   // managed context. For the cdp path we still drop any cached headless
   // handle so ensureShared rebuilds via the CDP branch on the next call.
-  const skipAudit = input.skipAudit === true;
+  // `skipAudit` is read from the in-process `internal` arg ONLY. Reading it
+  // from `input` (which we hand the HTTP body to verbatim) would let any
+  // authenticated caller post `{"skipAudit": true}` and silence their own
+  // audit row.
+  const skipAudit = internal.skipAudit === true;
   if (validatedCallerCdp) {
     const result = await connectExisting(config, validatedCallerCdp, { skipAudit });
     await disconnectSharedBrowser();

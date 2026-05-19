@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { __test, connectBrowser, disconnectBrowser, getBrowserConnection } from "./browser-connect";
+import { __test, connectBrowser, disconnectBrowser, getBrowserConnection, type ConnectInput } from "./browser-connect";
 import { readState } from "../state";
 import type { RuntimeConfig } from "../types";
 
@@ -843,6 +843,56 @@ describe("browser-connect strict managed mode", () => {
       expect(persisted?.cdpUrl).toBe(__test.MANAGED_CDP_SENTINEL);
     } finally {
       server?.stop(true);
+      mock.restore();
+      browserMod.__test.uninstallFakeBrowserForTest();
+      browserMod.__test.clearFakeSessionsForTest();
+      browserMod.__test.resetChromiumImportForTest();
+    }
+  });
+});
+
+// Defense-in-depth: even if an authenticated HTTP caller sends
+// `{"skipAudit": true}` in the POST /api/browser/connect body, the
+// capability MUST still write its browser.connect audit row. The HTTP
+// route hands the body straight to connectBrowser without filtering, so
+// the field-level guarantee is that `skipAudit` does not exist on the
+// public `ConnectInput` type — only the in-process `internal` (third) arg
+// reads it. A regression that re-introduced `skipAudit` on `ConnectInput`
+// would let any token-holding client silently suppress its own audit
+// trail, breaking the tamper-resistance contract.
+describe("browser-connect audit row cannot be suppressed via input", () => {
+  test("smuggled skipAudit in input is ignored — capability still writes its audit row", async () => {
+    const config = testConfig("input-skip-audit-defense");
+    const browserMod = await import("../tools/browser");
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async () => ({
+          browser: () => ({ process: () => ({ pid: 9090 }) }),
+          close: async () => undefined
+        })
+      }
+    }));
+    browserMod.__test.resetChromiumImportForTest();
+    try {
+      // Cast to any so we can simulate a malicious HTTP body that includes
+      // an unknown `skipAudit` key. TypeScript would reject this at the
+      // public boundary now that `ConnectInput` does not declare the
+      // field, but the JSON body parser doesn't — only our type contract
+      // (and the fact that we don't read `input.skipAudit` anywhere) does.
+      const status = await connectBrowser(
+        config,
+        { mode: "managed", skipAudit: true } as unknown as ConnectInput
+      );
+      expect(status.connected).toBe(true);
+      expect(status.record?.mode).toBe("managed");
+      // The audit row MUST have landed despite the smuggled flag.
+      const auditRows = readState(config.instance).audit.filter(
+        (row) => row.action === "browser.connect"
+      );
+      expect(auditRows.length).toBe(1);
+      expect(auditRows[0]!.evidence).toMatchObject({ mode: "managed" });
+    } finally {
       mock.restore();
       browserMod.__test.uninstallFakeBrowserForTest();
       browserMod.__test.clearFakeSessionsForTest();
