@@ -16,7 +16,7 @@ import { describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { createHandler } from "./http";
 import { runDueJobs, runJobNow } from "./jobs";
-import { updateJob } from "./jobs/index";
+import { advanceCronNextRunAt, updateJob } from "./jobs/index";
 import { createTask, mutateState, readState, upsertTask } from "./state";
 import { dispatchToolCall } from "./execution/tool-dispatch";
 import { syncChatTaskResult } from "./execution/chat";
@@ -1626,6 +1626,45 @@ describe("cron lifecycle", () => {
     );
     expect(assistantMessages).toHaveLength(1);
     expect(assistantMessages[0]?.content).toBe("[SILENT] with extra");
+  });
+});
+
+describe("advanceCronNextRunAt", () => {
+  test("hourly cron without missed fires returns the immediate next match", () => {
+    // Regression: previously the helper called cron.nextRun twice and
+    // skipped one occurrence per advance, so a 09:00 prev + 09:01 now
+    // would jump to 11:00 instead of 10:00.
+    const prev = Date.UTC(2026, 0, 1, 9, 0, 0);
+    const now = Date.UTC(2026, 0, 1, 9, 1, 0);
+    const result = advanceCronNextRunAt("0 * * * *", "UTC", prev, now);
+    expect(result.nextRunAtMs).toBe(Date.UTC(2026, 0, 1, 10, 0, 0));
+    expect(result.missed).toBe(0);
+  });
+
+  test("hourly cron catches up after a 3h offline gap", () => {
+    const prev = Date.UTC(2026, 0, 1, 9, 0, 0);
+    const now = Date.UTC(2026, 0, 1, 12, 30, 0);
+    const result = advanceCronNextRunAt("0 * * * *", "UTC", prev, now);
+    // 10:00, 11:00, 12:00 are all in the past; 13:00 is the new fire.
+    expect(result.nextRunAtMs).toBe(Date.UTC(2026, 0, 1, 13, 0, 0));
+    expect(result.missed).toBe(3);
+  });
+
+  test("DST spring-forward in America/Los_Angeles still lands on the configured hour", () => {
+    // 2026-03-08 is the US spring-forward day: clocks jump 02:00 -> 03:00 LA.
+    const prev = Date.UTC(2026, 2, 7, 10, 0, 0); // 2026-03-07 02:00 LA (PST, UTC-8)
+    const now = Date.UTC(2026, 2, 9, 0, 0, 0); // well past the DST transition
+    const result = advanceCronNextRunAt("0 2 * * *", "America/Los_Angeles", prev, now);
+    expect(result.nextRunAtMs).toBeGreaterThan(now);
+    expect(result.missed).toBeGreaterThanOrEqual(0);
+    const hourInLA = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Los_Angeles",
+      hour: "numeric",
+      hour12: false
+    }).format(new Date(result.nextRunAtMs));
+    // Intl can render midnight as "24"; normalize before comparing.
+    const hourNumber = Number(hourInLA) % 24;
+    expect(hourNumber).toBe(2);
   });
 });
 
