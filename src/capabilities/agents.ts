@@ -39,7 +39,7 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
         : defaultAgent?.model,
       toolsets: Array.isArray(input.toolsets)
         ? input.toolsets.map(String)
-        : (defaultAgent?.toolsets ?? ["file", "terminal", "memory", "session_search"]),
+        : (defaultAgent?.toolsets ?? ["file", "terminal", "memory", "session_search", "browser"]),
       messagingTargets: Array.isArray(input.messagingTargets)
         ? input.messagingTargets.map(String)
         : (defaultAgent?.messagingTargets ?? [])
