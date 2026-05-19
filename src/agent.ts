@@ -52,6 +52,7 @@ import { approvalToolCallId } from "./execution/tool-dispatch";
 import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserUploadFileApproved } from "./tools/browser";
+import { connectBrowser } from "./capabilities/browser-connect";
 import {
   abortApprovalsForTask,
   claimApproval,
@@ -1019,7 +1020,7 @@ export function mapApprovalToPolicyAction(
     if (payload && typeof payload.source === "string") return "code.exec";
     return "terminal.exec";
   }
-  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
+  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file" || action === "browser.connect") {
     return action;
   }
   if (action === "messaging.send") {
@@ -1880,6 +1881,83 @@ async function runApprovedAction(
       await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);
     }
     return resultStr;
+  }
+
+  if (approval.action === "browser.connect") {
+    // Reason is captured at request time so the audit row preserves
+    // WHY the user was asked to consent (e.g. "Sign in to Google
+    // Cloud Console"). The actual side effect — spawning a managed
+    // Chrome — runs through the same `connectBrowser` capability
+    // a `gini browser connect` CLI call uses, so the lifecycle is
+    // identical from the runtime's perspective.
+    const reason = typeof approval.payload.reason === "string" ? approval.payload.reason : "(no reason given)";
+    let result: string;
+    let succeeded = false;
+    let mode: string | undefined;
+    let dataDir: string | null | undefined;
+    try {
+      if (signal.aborted) {
+        result = JSON.stringify({ success: false, aborted: true, error: "Browser connect aborted: task was cancelled." });
+      } else {
+        // connectBrowser is idempotent — if the user already has a
+        // managed Chrome attached, it returns the existing record
+        // without relaunching. That's the right shape for an agent
+        // calling this after an earlier connect.
+        const status = await connectBrowser(config, {});
+        succeeded = status.connected;
+        mode = status.record?.mode;
+        dataDir = status.record?.dataDir;
+        result = JSON.stringify({
+          success: succeeded,
+          connected: status.connected,
+          mode,
+          dataDir
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      result = JSON.stringify({ success: false, error: message });
+    }
+    const task = await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "browser.connect",
+          target: reason,
+          risk: "medium",
+          taskId: approval.taskId,
+          runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+          approvalId: approval.id,
+          // Spread caller markers FIRST so canonical runtime fields can't
+          // be overwritten by smuggled keys. The side-effect audit
+          // mirrors the per-action shape of file.write / browser.upload_file.
+          evidence: { ...extraEvidence, reason, success: succeeded, mode, dataDir }
+        },
+        approvalAgentContext(approval)
+      );
+      if (approval.taskId && !chatToolCallId) {
+        completeApprovedTask(
+          state,
+          approval.taskId,
+          succeeded ? "Browser connect completed." : "Browser connect failed.",
+          succeeded ? undefined : "Browser connect failed."
+        );
+      }
+      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
+    });
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: succeeded ? "tool" : "error",
+        message: "Browser connect approved",
+        data: { reason, success: succeeded, mode }
+      });
+    }
+    if (task) await updateRunFromTask(config, task);
+    if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
+    }
+    return result;
   }
 
   return undefined;

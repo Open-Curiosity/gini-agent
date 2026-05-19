@@ -420,6 +420,21 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     toolset: "browser",
     type: "function",
     function: {
+      name: "browser_connect",
+      description: "Spawn a visible managed Chrome window so the user can sign in to a third-party service (Google Cloud Console, Slack, etc). The user is prompted to approve. Use this BEFORE browser_navigate when the user needs to interact with a sign-in / OAuth page — Google blocks automated sign-in and a headless window cannot accept credentials. Requires `reason`: one short user-facing sentence shown on the approval card so the user knows why a browser is opening.",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Google Cloud Console')." }
+        },
+        required: ["reason"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
       name: "browser_vision",
       description: "Screenshot the current page and ask the configured vision model a question about what's visible. Returns the model's text answer. Use when the accessibility snapshot can't capture what you need (charts, image-only content, visual layout, captchas-by-description). One image per call.",
       parameters: {

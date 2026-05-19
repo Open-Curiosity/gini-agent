@@ -177,6 +177,15 @@ export async function dispatchToolCall(
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
       return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
+    case "browser_connect":
+      // Spawning a managed Chrome surfaces a desktop window and
+      // creates a persistent per-instance profile dir — the
+      // trust-establishment moment that gates every subsequent
+      // browser action. Route through the approval gate so the
+      // user sees an explicit "open a browser window for X" card.
+      // The policy seam falls through to `{ mode: "gate" }` for
+      // this action under "auto" mode (yolo still auto-approves).
+      return pendingOrAuto(config, "browser.connect", undefined, (reason) => requestBrowserConnect(config, taskId, toolCallId, args, reason));
     case "file_write":
       return pendingOrAuto(config, "file.write", undefined, (reason) => requestFileWrite(config, taskId, toolCallId, args, reason));
     case "file_patch":
@@ -1884,6 +1893,47 @@ async function requestBrowserUpload(
       type: "approval",
       message: "Approval requested for browser upload (chat-task)",
       data: { approvalId: approval.id, target: resolved.displayPath, ref, toolCallId, destination: currentUrl }
+    });
+    return approval.id;
+  });
+}
+
+// Approval-gated browser_connect. Spawns a visible managed Chrome
+// after user consent. The reason flows onto the approval row's
+// evidence so the UI can render a friendlier label ("Open a browser
+// window — <reason>") instead of the generic terminal-exec card.
+// The actual connectBrowser() call runs in agent.executeApprovedAction's
+// "browser.connect" branch.
+async function requestBrowserConnect(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>,
+  reasonOverride?: string
+): Promise<string> {
+  const reason = requireString(args, "reason");
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createApproval(state, {
+      taskId: item.id,
+      action: "browser.connect",
+      // Use the reason as the target so the approval card surfaces
+      // it prominently. The web UI also reads evidence.reason for
+      // the body when rendering a browser.connect card.
+      target: reason,
+      risk: "medium",
+      reason: reasonOverride ?? "Opening a managed browser window requires explicit approval.",
+      payload: { reason, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for browser connect (chat-task)",
+      data: { approvalId: approval.id, reason, toolCallId }
     });
     return approval.id;
   });

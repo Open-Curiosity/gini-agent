@@ -102,7 +102,8 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
         "browser.select_option",
         "browser.wait_for",
         "browser.tabs",
-        "browser.upload_file"
+        "browser.upload_file",
+        "browser.connect"
       ],
       scopes: ["task", "job", "skill", "subagent"],
       createdAt: at,

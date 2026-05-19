@@ -1840,6 +1840,96 @@ describe("dispatchToolCall(browser_upload_file)", () => {
   });
 });
 
+// browser_connect dispatched through the chat-task tool dispatcher must
+// route through the approval gate (spawning a visible Chrome with a
+// per-instance profile is a trust-establishment moment that always
+// warrants explicit user consent under "auto" mode; only "yolo" auto-
+// approves and "strict" gates everything).
+describe("dispatchToolCall(browser_connect)", () => {
+  const ROOT = "/tmp/gini-browser-connect-dispatch-tests";
+  const WORKSPACE = join(ROOT, "workspace");
+
+  function dispatchConfig(instance: string): RuntimeConfig {
+    process.env.GINI_STATE_ROOT = ROOT;
+    process.env.GINI_LOG_ROOT = `${ROOT}-logs`;
+    rmSync(`${ROOT}/instances/${instance}`, { recursive: true, force: true });
+    return {
+      instance,
+      port: 7339,
+      token: "test-token",
+      provider: { name: "echo", model: "gini-echo-v0" },
+      workspaceRoot: WORKSPACE,
+      stateRoot: `${ROOT}/instances/${instance}`,
+      logRoot: `${ROOT}-logs/${instance}`,
+      // Default ("auto") mode is the user-facing default. The policy
+      // seam routes browser.connect through gate under auto, so this
+      // is the expected production shape — no override needed.
+      approvalMode: "auto"
+    };
+  }
+
+  test("returns kind:'pending' with an approval row at risk 'medium' and action 'browser.connect'", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_connect_1",
+      JSON.stringify({ reason: "Sign in to Google Cloud Console" })
+    );
+    expect(result.kind).toBe("pending");
+
+    const state = readState(config.instance);
+    const approval = state.approvals.find((a) =>
+      result.kind === "pending" && a.id === result.approvalId
+    );
+    expect(approval).toBeDefined();
+    expect(approval!.risk).toBe("medium");
+    expect(approval!.action).toBe("browser.connect");
+    // The reason flows onto the approval target so the UI surfaces it
+    // prominently in the approval card.
+    expect(approval!.target).toBe("Sign in to Google Cloud Console");
+    expect(approval!.payload.reason).toBe("Sign in to Google Cloud Console");
+    expect(approval!.payload.toolCallId).toBe("call_connect_1");
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  test("missing reason rejects without creating an approval row", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-missing-reason");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect missing reason", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "browser_connect",
+        "call_connect_missing_1",
+        JSON.stringify({})
+      )
+    ).rejects.toThrow(/reason/);
+    // No approval row should exist.
+    const state = readState(config.instance);
+    expect(state.approvals.length).toBe(0);
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+});
+
 // dispatchToolCall(browser_vision) must accumulate the vision provider's
 // token spend into task.cost so the chat UI's running total reflects
 // out-of-band side calls. The browserVision tool returns the cost in its
