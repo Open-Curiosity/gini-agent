@@ -64,15 +64,23 @@ export default function ActivityPage() {
   const auditPath = effectiveAgentId
     ? `/audit?agentId=${encodeURIComponent(effectiveAgentId)}`
     : "/audit";
+  // In "Active agent" mode the filter depends on /status resolving the
+  // active agent. Defer the fetch in that case so the unfiltered payload
+  // doesn't briefly appear on first paint. "All agents" and pinned-agent
+  // modes fire immediately because their target is known up-front.
+  const ready =
+    agentFilter !== AGENT_FILTER_ACTIVE || activeAgentId !== undefined;
   const events = useQuery<RuntimeEvent[]>({
     queryKey: ["events", effectiveAgentId ?? null],
     queryFn: () => api<RuntimeEvent[]>(eventsPath),
-    refetchInterval: 60_000
+    refetchInterval: 60_000,
+    enabled: ready
   });
   const audit = useQuery<AuditEvent[]>({
     queryKey: ["audit", effectiveAgentId ?? null],
     queryFn: () => api<AuditEvent[]>(auditPath),
-    refetchInterval: 60_000
+    refetchInterval: 60_000,
+    enabled: ready
   });
   const [search, setSearch] = useState("");
   const [liveCount, setLiveCount] = useState(0);

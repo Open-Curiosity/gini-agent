@@ -57,11 +57,17 @@ function scopedPath(path: string, agentId: string | undefined): string {
 
 export function useTasks(options?: Partial<UseQueryOptions<Task[]>>) {
   const agentId = useActiveAgentId();
+  const { enabled: callerEnabled, ...rest } = options ?? {};
   return useQuery<Task[]>({
     queryKey: ["tasks", agentId ?? null],
     queryFn: () => api<Task[]>(scopedPath("/tasks", agentId)),
     refetchInterval: 60_000,
-    ...options
+    // Defer the first fetch until /status resolves the active agent so the
+    // unfiltered payload doesn't briefly land in the cache under the `null`
+    // key during bootstrapping. The Activity page can still opt into the
+    // "all agents" view by passing the filter through its own useQuery.
+    enabled: Boolean(agentId) && (callerEnabled ?? true),
+    ...rest
   });
 }
 
@@ -117,7 +123,8 @@ export function useSubagents() {
   return useQuery<SubagentRecord[]>({
     queryKey: ["subagents", agentId ?? null],
     queryFn: () => api<SubagentRecord[]>(scopedPath("/subagents", agentId)),
-    refetchInterval: 60_000
+    refetchInterval: 60_000,
+    enabled: Boolean(agentId)
   });
 }
 
@@ -135,7 +142,8 @@ export function useJobs() {
   return useQuery<JobRecord[]>({
     queryKey: ["jobs", agentId ?? null],
     queryFn: () => api<JobRecord[]>(scopedPath("/jobs", agentId)),
-    refetchInterval: 60_000
+    refetchInterval: 60_000,
+    enabled: Boolean(agentId)
   });
 }
 
@@ -146,7 +154,8 @@ export function useJobRuns(jobId?: string) {
     queryFn: () => api<JobRunRecord[]>(
       scopedPath(jobId ? `/jobs/${jobId}/runs` : "/job-runs", agentId)
     ),
-    refetchInterval: 60_000
+    refetchInterval: 60_000,
+    enabled: Boolean(agentId)
   });
 }
 
@@ -208,7 +217,8 @@ export function useChatSessions() {
   return useQuery<ChatSession[]>({
     queryKey: ["chat", agentId ?? null],
     queryFn: () => api<ChatSession[]>(scopedPath("/chat", agentId)),
-    refetchInterval: 60_000
+    refetchInterval: 60_000,
+    enabled: Boolean(agentId)
   });
 }
 
