@@ -29,6 +29,17 @@ import {
   readState,
   upsertTask
 } from "./state";
+import type { AgentContext } from "./state/audit";
+
+// Helper: resolve the AgentContext for an approval row. Approvals carry
+// either a taskId (then the task owns attribution) or an agentId (when
+// the approval was minted outside a task context); fall back to system
+// only if both are absent, which only happens for legacy rows.
+function approvalAgentContext(approval: Approval): AgentContext {
+  if (approval.taskId) return { taskId: approval.taskId, agentId: approval.agentId };
+  if (approval.agentId) return { agentId: approval.agentId };
+  return { system: true };
+}
 import { generateTaskSummary } from "./provider";
 import { listFiles, readFile, requestFilePatch, requestFileWrite, searchFiles } from "./tools/file";
 import { fetchWeb } from "./tools/web";
@@ -131,15 +142,19 @@ export async function submitTask(
       }
     }
     upsertTask(state, created);
-    const audit = addAudit(state, {
-      actor: options.jobId ? "runtime" : "user",
-      action: "task.submitted",
-      target: created.id,
-      risk: "low",
-      taskId: created.id,
-      runId: options.runId,
-      evidence: { input, jobId: options.jobId, parentTaskId: options.parentTaskId, subagentId: options.subagentId, runId: options.runId, mode: options.mode }
-    });
+    const audit = addAudit(
+      state,
+      {
+        actor: options.jobId ? "runtime" : "user",
+        action: "task.submitted",
+        target: created.id,
+        risk: "low",
+        taskId: created.id,
+        runId: options.runId,
+        evidence: { input, jobId: options.jobId, parentTaskId: options.parentTaskId, subagentId: options.subagentId, runId: options.runId, mode: options.mode }
+      },
+      { taskId: created.id, agentId: created.agentId }
+    );
     created.auditIds.push(audit.id);
   });
   await updateRunFromTask(config, created);
@@ -162,15 +177,19 @@ export async function retryTask(config: RuntimeConfig, taskId: string): Promise<
       existing.chatSessionId
     );
     upsertTask(state, retry);
-    addAudit(state, {
-      actor: "user",
-      action: "task.retry",
-      target: retry.id,
-      risk: "low",
-      taskId: retry.id,
-      runId: retry.runId,
-      evidence: { retriedTaskId: taskId }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "task.retry",
+        target: retry.id,
+        risk: "low",
+        taskId: retry.id,
+        runId: retry.runId,
+        evidence: { retriedTaskId: taskId }
+      },
+      { taskId: retry.id, agentId: retry.agentId }
+    );
     return retry;
   });
   runTask(config, task.id).catch((error) => failTask(config, task.id, error));
@@ -184,14 +203,18 @@ export async function cancelTask(config: RuntimeConfig, taskId: string): Promise
     task.status = "cancelled";
     task.currentStep = "Cancelled";
     task.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: "task.cancelled",
-      target: taskId,
-      risk: "low",
-      taskId,
-      runId: task.runId
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "task.cancelled",
+        target: taskId,
+        risk: "low",
+        taskId,
+        runId: task.runId
+      },
+      { taskId }
+    );
     // Halt-siblings fix: cancelling a task that's waiting on multiple
     // pending approvals must also tear down those approvals so a later
     // approve doesn't run a tool against a cancelled task. Clear the
@@ -237,15 +260,19 @@ function recordInFlightAborted(
 ): void {
   const aborted = abortApprovalsForTask(instance, task.id, reason);
   if (aborted.length === 0) return;
-  addAudit(state, {
-    actor: "runtime",
-    action: "approval.in_flight_aborted",
-    target: task.id,
-    risk: "low",
-    taskId: task.id,
-    runId: task.runId,
-    evidence: { reason, approvalIds: aborted, ...(extraEvidence ?? {}) }
-  });
+  addAudit(
+    state,
+    {
+      actor: "runtime",
+      action: "approval.in_flight_aborted",
+      target: task.id,
+      risk: "low",
+      taskId: task.id,
+      runId: task.runId,
+      evidence: { reason, approvalIds: aborted, ...(extraEvidence ?? {}) }
+    },
+    { taskId: task.id }
+  );
 }
 
 // Mark every other pending approval that targets the given task as denied,
@@ -266,18 +293,22 @@ function cancelPendingTaskApprovals(
     if (excludeApprovalId && sibling.id === excludeApprovalId) continue;
     sibling.status = "denied";
     sibling.updatedAt = now();
-    addAudit(state, {
-      actor: "runtime",
-      action: reason === "sibling.denied"
-        ? "approval.cancelled_sibling_denial"
-        : "approval.cancelled_task_cancelled",
-      target: sibling.target,
-      risk: sibling.risk,
-      taskId: sibling.taskId,
-      runId: state.tasks.find((task) => task.id === sibling.taskId)?.runId,
-      approvalId: sibling.id,
-      evidence: { reason, originatingApprovalId: excludeApprovalId }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: reason === "sibling.denied"
+          ? "approval.cancelled_sibling_denial"
+          : "approval.cancelled_task_cancelled",
+        target: sibling.target,
+        risk: sibling.risk,
+        taskId: sibling.taskId,
+        runId: state.tasks.find((task) => task.id === sibling.taskId)?.runId,
+        approvalId: sibling.id,
+        evidence: { reason, originatingApprovalId: excludeApprovalId }
+      },
+      { taskId }
+    );
   }
 }
 
@@ -324,7 +355,11 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     item.currentStep = "Thinking";
     item.updatedAt = now();
     upsertTask(state, item);
-    appendEvent(state, { kind: "task", action: "task.running", target: item.id, taskId: item.id, risk: "low", summary: "task.running" });
+    appendEvent(
+      state,
+      { kind: "task", action: "task.running", target: item.id, taskId: item.id, risk: "low", summary: "task.running" },
+      { taskId: item.id }
+    );
     return item;
   });
   if (isTerminalTaskStatus(task.status)) {
@@ -519,14 +554,18 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
         provenance: `Proposed from task ${item.id}`
       });
       item.memoryIds.push(memory.id);
-      addAudit(state, {
-        actor: "agent",
-        action: "memory.proposed",
-        target: memory.id,
-        risk: "medium",
-        taskId: item.id,
-        evidence: { content }
-      });
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "memory.proposed",
+          target: memory.id,
+          risk: "medium",
+          taskId: item.id,
+          evidence: { content }
+        },
+        { taskId: item.id }
+      );
       appendTrace(config.instance, taskId, { type: "memory", message: "Memory proposed", data: { memoryId: memory.id } });
     }
     item.status = "completed";
@@ -535,7 +574,11 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     item.cost = providerResult.cost;
     item.updatedAt = now();
     upsertTask(state, item);
-    appendEvent(state, { kind: "task", action: "task.completed", target: item.id, taskId: item.id, risk: "low", summary: "task.completed" });
+    appendEvent(
+      state,
+      { kind: "task", action: "task.completed", target: item.id, taskId: item.id, risk: "low", summary: "task.completed" },
+      { taskId: item.id }
+    );
     return item;
   });
   if (isTerminalTaskStatus(task.status) && task.status !== "completed") {
@@ -644,15 +687,19 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
     task.error = message;
     task.currentStep = "Failed";
     task.updatedAt = now();
-    addAudit(state, {
-      actor: "runtime",
-      action: "task.failed",
-      target: taskId,
-      risk: "low",
-      taskId,
-      runId: task.runId,
-      evidence: { error: message }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "task.failed",
+        target: taskId,
+        risk: "low",
+        taskId,
+        runId: task.runId,
+        evidence: { error: message }
+      },
+      { taskId }
+    );
     // A runtime-driven failure (e.g. a side-effect throw post-
     // approval) must also abort any other in-flight approved
     // actions for the same task. Without this, a sibling tool call
@@ -695,14 +742,18 @@ export async function completeLowRiskToolTask(
     // audit row so the operator sees what the tool produced before
     // the cancel — but don't overwrite the cancelled verdict with
     // `completed`.
-    addAudit(state, {
-      actor: "runtime",
-      action,
-      target,
-      risk: "low",
-      taskId,
-      evidence
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action,
+        target,
+        risk: "low",
+        taskId,
+        evidence
+      },
+      { taskId }
+    );
     if (isTerminalTaskStatus(task.status)) {
       return task;
     }
@@ -752,15 +803,23 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
     if (item.status !== "pending") throw new Error(`Approval is already ${item.status}`);
     item.status = "denied";
     item.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: "approval.denied",
-      target: item.target,
-      risk: item.risk,
-      taskId: item.taskId,
-      runId: item.taskId ? state.tasks.find((task) => task.id === item.taskId)?.runId : undefined,
-      approvalId: item.id
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "approval.denied",
+        target: item.target,
+        risk: item.risk,
+        taskId: item.taskId,
+        runId: item.taskId ? state.tasks.find((task) => task.id === item.taskId)?.runId : undefined,
+        approvalId: item.id
+      },
+      item.taskId
+        ? { taskId: item.taskId, agentId: item.agentId }
+        : item.agentId
+          ? { agentId: item.agentId }
+          : { system: true }
+    );
     // Halt-siblings fix (Review P1 #2): when a single LLM turn emits
     // multiple approval-gated tool calls, denying one must immediately
     // tear down the other pending approvals on the same task and clear
@@ -796,15 +855,19 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
         task.currentStep = "Failed";
         task.error = message;
         task.updatedAt = item.updatedAt;
-        addAudit(state, {
-          actor: "runtime",
-          action: "task.failed",
-          target: task.id,
-          risk: "low",
-          taskId: task.id,
-          runId: task.runId,
-          evidence: { error: message, viaApprovalDenied: item.id }
-        });
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "task.failed",
+            target: task.id,
+            risk: "low",
+            taskId: task.id,
+            runId: task.runId,
+            evidence: { error: message, viaApprovalDenied: item.id }
+          },
+          { taskId: task.id }
+        );
         // A sibling denial that flips the task to failed must also
         // abort any in-flight approved-action executor on the same
         // task. Without this, an approval that won the claim race
@@ -939,16 +1002,20 @@ export async function resolveApproval(
     if (item.status !== "pending") throw new ApprovalRaceLostError(approvalId, item.status);
     item.status = "approved";
     item.updatedAt = now();
-    addAudit(state, {
-      actor,
-      action: "approval.approved",
-      target: item.target,
-      risk: item.risk,
-      taskId: item.taskId,
-      runId: item.taskId ? state.tasks.find((task) => task.id === item.taskId)?.runId : undefined,
-      approvalId: item.id,
-      evidence: opts.evidenceExtra ? { ...opts.evidenceExtra } : undefined
-    });
+    addAudit(
+      state,
+      {
+        actor,
+        action: "approval.approved",
+        target: item.target,
+        risk: item.risk,
+        taskId: item.taskId,
+        runId: item.taskId ? state.tasks.find((task) => task.id === item.taskId)?.runId : undefined,
+        approvalId: item.id,
+        evidence: opts.evidenceExtra ? { ...opts.evidenceExtra } : undefined
+      },
+      approvalAgentContext(item)
+    );
     return item;
   });
 
@@ -1068,16 +1135,24 @@ async function executeApprovedAction(
         if (item && item.status === "approved") {
           item.status = "denied";
           item.updatedAt = now();
-          addAudit(state, {
-            actor: "runtime",
-            action: "approval.cancelled_task_terminal",
-            target: item.target,
-            risk: item.risk,
-            taskId: item.taskId,
-            runId: taskNow.runId,
-            approvalId: item.id,
-            evidence: { taskStatus: taskNow.status }
-          });
+          addAudit(
+            state,
+            {
+              actor: "runtime",
+              action: "approval.cancelled_task_terminal",
+              target: item.target,
+              risk: item.risk,
+              taskId: item.taskId,
+              runId: taskNow.runId,
+              approvalId: item.id,
+              evidence: { taskStatus: taskNow.status }
+            },
+            item.taskId
+              ? { taskId: item.taskId, agentId: item.agentId }
+              : item.agentId
+                ? { agentId: item.agentId }
+                : { system: true }
+          );
         }
         return { ok: false as const, taskStatus: taskNow.status };
       }
@@ -1167,19 +1242,23 @@ async function runApprovedAction(
       const before = existsSync(target) ? readFileSync(target, "utf8") : "";
       mkdirSync(dirname(target), { recursive: true });
       writeFileSync(target, String(approval.payload.content));
-      addAudit(state, {
-        actor: "runtime",
-        action: "file.write",
-        target: path,
-        risk: "high",
-        taskId: approval.taskId,
-        runId: approval.taskId ? state.tasks.find((task) => task.id === approval.taskId)?.runId : undefined,
-        approvalId: approval.id,
-        // Spread caller markers FIRST so the runtime-owned canonical
-        // fields (beforeBytes/afterBytes/etc.) cannot be overwritten by
-        // an `as any` cast smuggling extra keys past AutoApproveMarkers.
-        evidence: { ...extraEvidence, beforeBytes: before.length, afterBytes: String(approval.payload.content).length }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "file.write",
+          target: path,
+          risk: "high",
+          taskId: approval.taskId,
+          runId: approval.taskId ? state.tasks.find((task) => task.id === approval.taskId)?.runId : undefined,
+          approvalId: approval.id,
+          // Spread caller markers FIRST so the runtime-owned canonical
+          // fields (beforeBytes/afterBytes/etc.) cannot be overwritten by
+          // an `as any` cast smuggling extra keys past AutoApproveMarkers.
+          evidence: { ...extraEvidence, beforeBytes: before.length, afterBytes: String(approval.payload.content).length }
+        },
+        approvalAgentContext(approval)
+      );
       if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, "File write completed.");
       return {
         kind: "ok" as const,
@@ -1222,16 +1301,20 @@ async function runApprovedAction(
       if (!before.includes(oldText)) throw new Error(`Patch target text no longer exists: ${path}`);
       const after = before.replace(oldText, newText);
       writeFileSync(target, after);
-      addAudit(state, {
-        actor: "runtime",
-        action: "file.patch",
-        target: path,
-        risk: "high",
-        taskId: approval.taskId,
-        runId: approval.taskId ? state.tasks.find((task) => task.id === approval.taskId)?.runId : undefined,
-        approvalId: approval.id,
-        evidence: { ...extraEvidence, diff: approval.payload.diff, beforeBytes: before.length, afterBytes: after.length }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "file.patch",
+          target: path,
+          risk: "high",
+          taskId: approval.taskId,
+          runId: approval.taskId ? state.tasks.find((task) => task.id === approval.taskId)?.runId : undefined,
+          approvalId: approval.id,
+          evidence: { ...extraEvidence, diff: approval.payload.diff, beforeBytes: before.length, afterBytes: after.length }
+        },
+        approvalAgentContext(approval)
+      );
       if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, "File patch completed.");
       return {
         kind: "ok" as const,
@@ -1355,30 +1438,34 @@ async function runApprovedAction(
     // happened.
     if (winner === "aborted") {
       const task = await mutateState(config.instance, (state) => {
-        addAudit(state, {
-          actor: "runtime",
-          action: "terminal.exec_aborted",
-          target: command,
-          risk: "high",
-          taskId: approval.taskId,
-          runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
-          approvalId: approval.id,
-          evidence: {
-            ...extraEvidence,
-            aborted: true,
-            abortReason: abortReason ?? "task.cancelled",
-            exitCode,
-            stdout: stdout.slice(0, 4000),
-            stderr: stderr.slice(0, 4000),
-            stdoutBytes: stdout.length,
-            stderrBytes: stderr.length,
-            stdoutTruncated: stdout.length > 4000,
-            stderrTruncated: stderr.length > 4000,
-            artifactPath: artifact?.path,
-            artifactRelPath: artifact?.relPath,
-            pty: usePty
-          }
-        });
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "terminal.exec_aborted",
+            target: command,
+            risk: "high",
+            taskId: approval.taskId,
+            runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+            approvalId: approval.id,
+            evidence: {
+              ...extraEvidence,
+              aborted: true,
+              abortReason: abortReason ?? "task.cancelled",
+              exitCode,
+              stdout: stdout.slice(0, 4000),
+              stderr: stderr.slice(0, 4000),
+              stdoutBytes: stdout.length,
+              stderrBytes: stderr.length,
+              stdoutTruncated: stdout.length > 4000,
+              stderrTruncated: stderr.length > 4000,
+              artifactPath: artifact?.path,
+              artifactRelPath: artifact?.relPath,
+              pty: usePty
+            }
+          },
+          approvalAgentContext(approval)
+        );
         return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
       });
       if (approval.taskId) {
@@ -1395,28 +1482,32 @@ async function runApprovedAction(
       return `Command aborted: task was cancelled (exit ${exitCode}).`;
     }
     const task = await mutateState(config.instance, (state) => {
-      addAudit(state, {
-        actor: "runtime",
-        action: "terminal.exec",
-        target: command,
-        risk: "high",
-        taskId: approval.taskId,
-        runId: approval.taskId ? state.tasks.find((task) => task.id === approval.taskId)?.runId : undefined,
-        approvalId: approval.id,
-        evidence: {
-          ...extraEvidence,
-          exitCode,
-          stdout: stdout.slice(0, 4000),
-          stderr: stderr.slice(0, 4000),
-          stdoutBytes: stdout.length,
-          stderrBytes: stderr.length,
-          stdoutTruncated: stdout.length > 4000,
-          stderrTruncated: stderr.length > 4000,
-          artifactPath: artifact?.path,
-          artifactRelPath: artifact?.relPath,
-          pty: usePty
-        }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "terminal.exec",
+          target: command,
+          risk: "high",
+          taskId: approval.taskId,
+          runId: approval.taskId ? state.tasks.find((task) => task.id === approval.taskId)?.runId : undefined,
+          approvalId: approval.id,
+          evidence: {
+            ...extraEvidence,
+            exitCode,
+            stdout: stdout.slice(0, 4000),
+            stderr: stderr.slice(0, 4000),
+            stdoutBytes: stdout.length,
+            stderrBytes: stderr.length,
+            stdoutTruncated: stdout.length > 4000,
+            stderrTruncated: stderr.length > 4000,
+            artifactPath: artifact?.path,
+            artifactRelPath: artifact?.relPath,
+            pty: usePty
+          }
+        },
+        approvalAgentContext(approval)
+      );
       if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, exitCode === 0 ? "Command completed." : "Command failed.", exitCode === 0 ? undefined : stderr);
       return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
     });
@@ -1462,16 +1553,20 @@ async function runApprovedAction(
     if (!approval.taskId) {
       const result = JSON.stringify({ success: false, error: "Browser upload approval missing taskId." });
       await mutateState(config.instance, (state) => {
-        addAudit(state, {
-          actor: "runtime",
-          action: "browser.upload_file",
-          target: displayPath,
-          risk: "high",
-          taskId: undefined,
-          runId: undefined,
-          approvalId: approval.id,
-          evidence: { ...extraEvidence, ref, path: displayPath, success: false, error: "Browser upload approval missing taskId." }
-        });
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "browser.upload_file",
+            target: displayPath,
+            risk: "high",
+            taskId: undefined,
+            runId: undefined,
+            approvalId: approval.id,
+            evidence: { ...extraEvidence, ref, path: displayPath, success: false, error: "Browser upload approval missing taskId." }
+          },
+          approvalAgentContext(approval)
+        );
       });
       return result;
     }
@@ -1494,21 +1589,25 @@ async function runApprovedAction(
       const reason = readSignalReason(signal) ?? "task.cancelled";
       const abortedResult = JSON.stringify({ success: false, aborted: true, error: "Browser upload aborted: task was cancelled." });
       const task = await mutateState(config.instance, (state) => {
-        addAudit(state, {
-          actor: "runtime",
-          action: "browser.upload_file_aborted",
-          target: displayPath,
-          risk: "high",
-          taskId: approval.taskId,
-          runId: state.tasks.find((t) => t.id === approval.taskId)?.runId,
-          approvalId: approval.id,
-          // The audit acknowledges what the runtime knew at abort
-          // time. The browser may still commit the upload as a
-          // background side effect; the followup audit row written
-          // by the `outcome.detached` observer below records the
-          // ACTUAL outcome once the detached promise settles.
-          evidence: { ...extraEvidence, ref, path: displayPath, aborted: true, abortReason: reason }
-        });
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "browser.upload_file_aborted",
+            target: displayPath,
+            risk: "high",
+            taskId: approval.taskId,
+            runId: state.tasks.find((t) => t.id === approval.taskId)?.runId,
+            approvalId: approval.id,
+            // The audit acknowledges what the runtime knew at abort
+            // time. The browser may still commit the upload as a
+            // background side effect; the followup audit row written
+            // by the `outcome.detached` observer below records the
+            // ACTUAL outcome once the detached promise settles.
+            evidence: { ...extraEvidence, ref, path: displayPath, aborted: true, abortReason: reason }
+          },
+          approvalAgentContext(approval)
+        );
         return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
       });
       // Emit a follow-up audit row when the detached upload promise
@@ -1546,16 +1645,20 @@ async function runApprovedAction(
       parsed = { success: true };
     }
     const task = await mutateState(config.instance, (state) => {
-      addAudit(state, {
-        actor: "runtime",
-        action: "browser.upload_file",
-        target: displayPath,
-        risk: "high",
-        taskId: approval.taskId,
-        runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
-        approvalId: approval.id,
-        evidence: { ...extraEvidence, ref, path: displayPath, success: parsed.success !== false, error: parsed.error ?? null }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "browser.upload_file",
+          target: displayPath,
+          risk: "high",
+          taskId: approval.taskId,
+          runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+          approvalId: approval.id,
+          evidence: { ...extraEvidence, ref, path: displayPath, success: parsed.success !== false, error: parsed.error ?? null }
+        },
+        approvalAgentContext(approval)
+      );
       if (approval.taskId && !chatToolCallId) {
         completeApprovedTask(
           state,
@@ -1629,24 +1732,28 @@ function observeBrowserUploadLateCompletion(input: ObserveLateCompletionInput): 
     }
     try {
       await mutateState(config.instance, (state) => {
-        addAudit(state, {
-          actor: "runtime",
-          action: "browser.upload_file_late_completion",
-          target: displayPath,
-          risk: "high",
-          taskId: observedTaskId,
-          runId: state.tasks.find((t) => t.id === observedTaskId)?.runId,
-          approvalId: approval.id,
-          evidence: {
-            ...extraEvidence,
-            ref,
-            path: displayPath,
-            afterAbort: true,
-            detachedSettled: settled.resolved,
-            success: settled.resolved ? parsedLate.success !== false : false,
-            error: settled.resolved ? (parsedLate.error ?? null) : (settled.error instanceof Error ? settled.error.message : String(settled.error))
-          }
-        });
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "browser.upload_file_late_completion",
+            target: displayPath,
+            risk: "high",
+            taskId: observedTaskId,
+            runId: state.tasks.find((t) => t.id === observedTaskId)?.runId,
+            approvalId: approval.id,
+            evidence: {
+              ...extraEvidence,
+              ref,
+              path: displayPath,
+              afterAbort: true,
+              detachedSettled: settled.resolved,
+              success: settled.resolved ? parsedLate.success !== false : false,
+              error: settled.resolved ? (parsedLate.error ?? null) : (settled.error instanceof Error ? settled.error.message : String(settled.error))
+            }
+          },
+          approvalAgentContext(approval)
+        );
       });
     } catch {
       // Late observer write failed — instance may have been torn down
@@ -1675,16 +1782,20 @@ function emitFileActionAbortedSync(
   signal: AbortSignal
 ): { kind: "aborted"; task: Task | undefined } {
   const path = String(approval.payload.path);
-  addAudit(state, {
-    actor: "runtime",
-    action,
-    target: path,
-    risk: "high",
-    taskId: approval.taskId,
-    runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
-    approvalId: approval.id,
-    evidence: { ...extraEvidence, aborted: true, abortReason: readSignalReason(signal) ?? "task.cancelled" }
-  });
+  addAudit(
+    state,
+    {
+      actor: "runtime",
+      action,
+      target: path,
+      risk: "high",
+      taskId: approval.taskId,
+      runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+      approvalId: approval.id,
+      evidence: { ...extraEvidence, aborted: true, abortReason: readSignalReason(signal) ?? "task.cancelled" }
+    },
+    approvalAgentContext(approval)
+  );
   return {
     kind: "aborted",
     task: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId) : undefined
@@ -1701,16 +1812,20 @@ async function emitTerminalAborted(
   meta: { command: string; usePty: boolean; signal: AbortSignal }
 ): Promise<string> {
   const task = await mutateState(config.instance, (state) => {
-    addAudit(state, {
-      actor: "runtime",
-      action: "terminal.exec_aborted",
-      target: meta.command,
-      risk: "high",
-      taskId: approval.taskId,
-      runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
-      approvalId: approval.id,
-      evidence: { ...extraEvidence, aborted: true, abortReason: readSignalReason(meta.signal) ?? "task.cancelled", pty: meta.usePty, spawnSkipped: true }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "terminal.exec_aborted",
+        target: meta.command,
+        risk: "high",
+        taskId: approval.taskId,
+        runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+        approvalId: approval.id,
+        evidence: { ...extraEvidence, aborted: true, abortReason: readSignalReason(meta.signal) ?? "task.cancelled", pty: meta.usePty, spawnSkipped: true }
+      },
+      approvalAgentContext(approval)
+    );
     return approval.taskId ? state.tasks.find((t) => t.id === approval.taskId) : undefined;
   });
   if (approval.taskId) {
@@ -1873,28 +1988,32 @@ async function runTerminalCommandClaimed(
     : writeTerminalArtifact(config.instance, taskId, syntheticApprovalId, { stdout, stderr });
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
-    addAudit(state, {
-      actor: "runtime",
-      action: winner === "aborted" ? "terminal.exec_aborted" : "terminal.exec",
-      target: command,
-      risk: "high",
-      taskId,
-      runId: item.runId,
-      evidence: {
-        ...options.evidenceExtra,
-        ...(winner === "aborted" ? { aborted: true, abortReason: abortReason ?? "task.cancelled" } : {}),
-        exitCode,
-        stdout: stdout.slice(0, 4000),
-        stderr: stderr.slice(0, 4000),
-        stdoutBytes: stdout.length,
-        stderrBytes: stderr.length,
-        stdoutTruncated: stdout.length > 4000,
-        stderrTruncated: stderr.length > 4000,
-        artifactPath: artifact?.path,
-        artifactRelPath: artifact?.relPath,
-        pty: usePty
-      }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: winner === "aborted" ? "terminal.exec_aborted" : "terminal.exec",
+        target: command,
+        risk: "high",
+        taskId,
+        runId: item.runId,
+        evidence: {
+          ...options.evidenceExtra,
+          ...(winner === "aborted" ? { aborted: true, abortReason: abortReason ?? "task.cancelled" } : {}),
+          exitCode,
+          stdout: stdout.slice(0, 4000),
+          stderr: stderr.slice(0, 4000),
+          stdoutBytes: stdout.length,
+          stderrBytes: stderr.length,
+          stdoutTruncated: stdout.length > 4000,
+          stderrTruncated: stderr.length > 4000,
+          artifactPath: artifact?.path,
+          artifactRelPath: artifact?.relPath,
+          pty: usePty
+        }
+      },
+      { taskId }
+    );
     item.updatedAt = now();
   });
   appendTrace(config.instance, taskId, {
