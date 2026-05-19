@@ -191,6 +191,16 @@ interface ConnectInput {
   // approval card the user just consented to) promises a visible Chrome
   // window; silently handing back a stale CDP session would violate that.
   mode?: "managed";
+  // When true, the capability does NOT write its own `browser.connect`
+  // audit row. Internal flag for callers (the `browser_connect` tool
+  // dispatch) whose approval flow already records the action — including
+  // the load-bearing `reason` + `approvalId` evidence — via the runtime's
+  // per-action audit row. Without this, the chat-task path would emit two
+  // audit rows for one logical action: the capability's row (no reason,
+  // no approvalId) and the dispatch's row (with both). Other callers
+  // (`gini browser connect` CLI, POST /api/browser/connect) leave this
+  // unset and continue to get the capability-owned audit row.
+  skipAudit?: boolean;
 }
 
 // Serializes concurrent /api/browser/connect calls. The browser-connect
@@ -311,12 +321,13 @@ async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): 
   // headless-handle ambiguity — the next browser_* call reuses the live
   // managed context. For the cdp path we still drop any cached headless
   // handle so ensureShared rebuilds via the CDP branch on the next call.
+  const skipAudit = input.skipAudit === true;
   if (validatedCallerCdp) {
-    const result = await connectExisting(config, validatedCallerCdp);
+    const result = await connectExisting(config, validatedCallerCdp, { skipAudit });
     await disconnectSharedBrowser();
     return result;
   }
-  return await launchManaged(config);
+  return await launchManaged(config, { skipAudit });
 }
 
 // Full teardown of an existing connection record. Sends SIGTERM to the
@@ -384,7 +395,11 @@ function targetsExistingRecord(
 // connectBrowserInner (validateCdpUrl + safetyCheck against the http
 // form). We re-derive the http form here for the probe rather than
 // threading both representations through the call site.
-async function connectExisting(config: RuntimeConfig, validatedUrl: string): Promise<Status> {
+async function connectExisting(
+  config: RuntimeConfig,
+  validatedUrl: string,
+  opts: { skipAudit?: boolean } = {}
+): Promise<Status> {
   const httpForm = cdpHttpForm(validatedUrl);
   const probe = await probeCdp(httpForm, PROBE_TIMEOUT_MS);
   if (!probe) {
@@ -404,22 +419,31 @@ async function connectExisting(config: RuntimeConfig, validatedUrl: string): Pro
   };
   await mutateState(config.instance, (state) => {
     state.browser = record;
-    addAudit(
-      state,
-      {
-        actor: "user",
-        action: "browser.connect",
-        target: redactUrlCredentials(record.cdpUrl),
-        risk: "medium",
-        evidence: { mode: "cdp", browser: probe.Browser ?? null }
-      },
-      { system: true }
-    );
+    // When the caller is the runtime's tool-dispatch path (skipAudit), it
+    // already writes a richer browser.connect audit row carrying the
+    // approval reason and approvalId — emitting a second row here would
+    // double-count the action.
+    if (!opts.skipAudit) {
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "browser.connect",
+          target: redactUrlCredentials(record.cdpUrl),
+          risk: "medium",
+          evidence: { mode: "cdp", browser: probe.Browser ?? null }
+        },
+        { system: true }
+      );
+    }
   });
   return { connected: true, record };
 }
 
-async function launchManaged(config: RuntimeConfig): Promise<Status> {
+async function launchManaged(
+  config: RuntimeConfig,
+  opts: { skipAudit?: boolean } = {}
+): Promise<Status> {
   // findChromePath honors GINI_CHROME_PATH first, then falls back to
   // Playwright's bundled Chromium, then system browsers. For the
   // launchPersistentContext path we pass the resolved path through to
@@ -534,17 +558,23 @@ async function launchManaged(config: RuntimeConfig): Promise<Status> {
   };
   await mutateState(config.instance, (state) => {
     state.browser = record;
-    addAudit(
-      state,
-      {
-        actor: "user",
-        action: "browser.connect",
-        target: dataDir,
-        risk: "medium",
-        evidence: { mode: "managed", pid }
-      },
-      { system: true }
-    );
+    // When the caller is the runtime's tool-dispatch path (skipAudit), it
+    // already writes a richer browser.connect audit row carrying the
+    // approval reason and approvalId — emitting a second row here would
+    // double-count the action.
+    if (!opts.skipAudit) {
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "browser.connect",
+          target: dataDir,
+          risk: "medium",
+          evidence: { mode: "managed", pid }
+        },
+        { system: true }
+      );
+    }
   });
   return { connected: true, record };
 }

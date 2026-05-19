@@ -1909,7 +1909,13 @@ async function runApprovedAction(
         // CDP-mode record (which may be headless or attached to a
         // browser the user can't see) must be torn down and replaced
         // with a fresh managed launch — never silently returned as-is.
-        const status = await connectBrowser(config, { mode: "managed" });
+        //
+        // `skipAudit: true` because this dispatch already records a
+        // richer browser.connect audit row below (with the user-facing
+        // `reason` and the `approvalId`); letting the capability also
+        // write its own row would double-count the action and leave a
+        // reasonless row in the activity log.
+        const status = await connectBrowser(config, { mode: "managed", skipAudit: true });
         succeeded = status.connected;
         mode = status.record?.mode;
         dataDir = status.record?.dataDir;

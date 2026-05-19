@@ -2008,6 +2008,18 @@ describe("dispatchToolCall(browser_connect)", () => {
       // Persisted record matches.
       const persisted = readState(config.instance).browser;
       expect(persisted?.mode).toBe("managed");
+      // Exactly one browser.connect audit row — the dispatch path passes
+      // skipAudit: true so the capability does not write its own row.
+      // Two rows would mean the capability's reasonless row leaked
+      // alongside the dispatch's richer row (round-9 finding 2).
+      const connectRows = readState(config.instance).audit.filter(
+        (row) => row.action === "browser.connect"
+      );
+      expect(connectRows.length).toBe(1);
+      // The single row is the dispatch's row — carries the user-facing
+      // reason and the approval id.
+      expect(connectRows[0]!.approvalId).toBe(result.approvalId);
+      expect(connectRows[0]!.target).toBe("Sign in to Google Cloud Console");
     } finally {
       mock.restore();
       browserMod.__test.uninstallFakeBrowserForTest();
