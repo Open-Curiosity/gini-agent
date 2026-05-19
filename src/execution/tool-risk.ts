@@ -34,7 +34,12 @@ export function riskForAction(action: string): RiskLevel {
 // ".new"/".switch", while tool names are the underlying catalog identifiers.
 // Listing both maps explicitly is clearer than deriving one from the other.
 export const TOOL_RISK: ReadonlyMap<string, RiskLevel> = new Map<string, RiskLevel>([
-  ["browser.upload_file", "high"]
+  ["browser.upload_file", "high"],
+  // Mirror the medium classification ACTION_RISK gives to browser.connect
+  // so the persisted tool row in state.json carries the right risk
+  // label. Without this entry the substring heuristic in
+  // riskForTool below would default this to "low".
+  ["browser.connect", "medium"]
   // Everything else falls out of the substring heuristic in defaults.ts.
 ]);
 
