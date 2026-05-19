@@ -1365,7 +1365,7 @@ async function runApprovedAction(
     if (signal.aborted) {
       return await emitTerminalAborted(config, approval, extraEvidence, { command, usePty, signal });
     }
-    const skillEnv = await resolveActiveSkillsEnv(config);
+    const skillEnv = await resolveActiveSkillsEnv(config, approval.taskId);
     const proc = spawn(spawnArgs, {
       cwd: config.workspaceRoot,
       stdout: "pipe",
@@ -1953,7 +1953,7 @@ async function runTerminalCommandClaimed(
     winner = "aborted";
     abortReason = readSignalReason(signal);
   } else {
-    const skillEnv = await resolveActiveSkillsEnv(config);
+    const skillEnv = await resolveActiveSkillsEnv(config, taskId);
     const proc = spawn(spawnArgs, {
       cwd: config.workspaceRoot,
       stdout: "pipe",

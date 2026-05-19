@@ -191,10 +191,14 @@ export async function deleteConnector(config: RuntimeConfig, connectorId: string
 // that records the purpose and whether resolution succeeded — never the
 // value itself. Callers that need to pass a secret into a subprocess
 // should fetch it through here so the audit trail is consistent.
+// When `taskId` is supplied, the resolution audit attributes to the
+// owning agent of that task; callers without a task context (health
+// probes, management UI) fall through to a system-level audit.
 export async function resolveConnectorSecret(
   config: RuntimeConfig,
   connectorId: string,
-  purpose: string
+  purpose: string,
+  taskId?: string
 ): Promise<string | undefined> {
   const state = readState(config.instance);
   const connector = state.connectors.find((candidate) => candidate.id === connectorId);
@@ -209,11 +213,6 @@ export async function resolveConnectorSecret(
     }
   } finally {
     await mutateState(config.instance, (mutating) => {
-      // resolveConnectorSecret runs from many call sites including
-      // terminal_exec spawns (where the calling task IS known but not
-      // threaded down here yet) and connector health probes (instance-
-      // level). Until the call sites carry a context plumbed through, we
-      // stamp these as system-level.
       addAudit(
         mutating,
         {
@@ -221,9 +220,10 @@ export async function resolveConnectorSecret(
           action: "connector.secret.use",
           target: connectorId,
           risk: "low",
+          taskId,
           evidence: { provider: connector.provider, purpose, resolved: ok }
         },
-        { system: true }
+        taskId ? { taskId } : { system: true }
       );
     });
   }
@@ -346,20 +346,26 @@ function envBindingsForProviders(providers: string[]): Record<string, { provider
 // Aggregate env bindings across every enabled, active skill. Called at
 // terminal_exec spawn time so a skill's scripts pick up declared
 // credentials regardless of which skill the model chose to follow.
-export async function resolveActiveSkillsEnv(config: RuntimeConfig): Promise<Record<string, string>> {
+// `taskId` is threaded so the per-secret resolution audits attribute to
+// the agent that owns the spawning task.
+export async function resolveActiveSkillsEnv(
+  config: RuntimeConfig,
+  taskId?: string
+): Promise<Record<string, string>> {
   const state = readState(config.instance);
   const out: Record<string, string> = {};
   for (const skill of state.skills) {
     if (skill.status !== "enabled") continue;
     if (!isSkillActive(state, skill)) continue;
-    Object.assign(out, await resolveSkillEnv(config, skill));
+    Object.assign(out, await resolveSkillEnv(config, skill, taskId));
   }
   return out;
 }
 
 export async function resolveSkillEnv(
   config: RuntimeConfig,
-  skill: SkillRecord
+  skill: SkillRecord,
+  taskId?: string
 ): Promise<Record<string, string>> {
   const envNames = skill.prerequisites?.env ?? [];
   if (envNames.length === 0) return {};
@@ -382,7 +388,7 @@ export async function resolveSkillEnv(
         && candidate.health === "healthy"
     );
     if (!connector) continue;
-    const value = await resolveConnectorSecret(config, connector.id, binding.purpose);
+    const value = await resolveConnectorSecret(config, connector.id, binding.purpose, taskId);
     if (value) out[envName] = value;
   }
   return out;
