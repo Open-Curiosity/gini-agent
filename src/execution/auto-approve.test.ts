@@ -152,6 +152,30 @@ describe("matchDangerousTerminal", () => {
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "/usr/bin/rm -rf /etc")).toBe("rm-rf-dangerous-target");
   });
 
+  test("blocks rm -rf against quoted / brace-expanded $HOME spellings", () => {
+    // Common shell-quoting and brace-expansion noise around $HOME
+    // shouldn't bypass the dangerous-target check — they all expand
+    // to the same path the shell ultimately deletes from.
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, `rm -rf "$HOME"/.cache`)).toBe("rm-rf-dangerous-target");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, `rm -rf '$HOME'/.cache`)).toBe("rm-rf-dangerous-target");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -rf ${HOME}/.cache")).toBe("rm-rf-dangerous-target");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, 'rm -rf "${HOME}"/.cache')).toBe("rm-rf-dangerous-target");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, `rm -rf "~"/foo`)).toBe("rm-rf-dangerous-target");
+  });
+
+  test("blocks rm -rf against wildcard targets", () => {
+    // Glob expansion happens shell-side; `./*` and `*` walk the
+    // current dir, `**` recurses through subtrees, `node_modules/*`
+    // wipes every immediate child of node_modules. The literal
+    // command the operator reads is far from the set of paths
+    // actually touched, which is exactly the case the human gate
+    // exists to catch.
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -rf ./*")).toBe("rm-rf-dangerous-target");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -rf *")).toBe("rm-rf-dangerous-target");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -rf **")).toBe("rm-rf-dangerous-target");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -rf node_modules/*")).toBe("rm-rf-dangerous-target");
+  });
+
   test("blocks rm -rf with uppercase recursive flag and non-system absolute targets", () => {
     // Uppercase R is the BSD/macOS spelling of recursive.
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -fRr /tmp/x")).toBe("rm-rf-dangerous-target");

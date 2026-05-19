@@ -95,9 +95,10 @@ const BOUNDARY = "(?:^|[\\s;&|`(\\[,])";
 // r/R for the recursive flag) followed by a dangerous target argument.
 // The `rm` token can be bare (`rm`), backslash-escaped to bypass a
 // shell alias (`\rm`), or an absolute path (`/bin/rm`,
-// `/usr/bin/rm`). Dangerous targets are any absolute path, a glob
-// `*`, the current directory `.`, `~`, `$HOME`, or anything under
-// `~`/`$HOME`. The bias is intentional — recursive force-delete
+// `/usr/bin/rm`). Dangerous targets are any absolute path, a token
+// containing a glob (`*`), the current directory `.`, `~`, `$HOME`
+// (in any common shell-quoted / braced spelling), or anything under
+// those prefixes. The bias is intentional — recursive force-delete
 // against ANY real filesystem target deserves the human gate. Local
 // names like `node_modules` or `./dist` still pass through.
 function testDangerousRm(command: string): boolean {
@@ -118,20 +119,35 @@ function testDangerousRm(command: string): boolean {
     /(?:^|\s)-(?:[a-zA-Z]*f[a-zA-Z]*)(?=\s|$)/.test(tail) ||
     /(?:^|\s)--force\b/.test(tail);
   if (!hasRecursive || !hasForce) return false;
-  // Dangerous target detection: a token that is an absolute path, a
-  // glob, the current directory, `~`, `$HOME`, or anything under
-  // `~/`/`$HOME/`. We split on whitespace and check each token to
-  // avoid matching `/etc` as a substring of an innocent path like
-  // `./etc-helper`.
+  // Dangerous target detection: a token that is an absolute path,
+  // contains a glob, is the current directory, `~`, `$HOME`, or
+  // anything under those prefixes. We split on whitespace and check
+  // each token to avoid matching `/etc` as a substring of an
+  // innocent path like `./etc-helper`.
   const tokens = tail.split(/\s+/).filter(Boolean);
   for (const raw of tokens) {
     // Skip flag-shaped tokens — `--recursive`, `-rf`, etc. should not
     // count as a dangerous target.
     if (raw.startsWith("-")) continue;
-    // Strip surrounding single/double quotes once for the comparison.
-    const t = raw.replace(/^["']|["']$/g, "");
+    // Normalize common shell-quote / brace-expansion noise that
+    // surrounds the dangerous prefix without changing what the shell
+    // ultimately expands to. Examples that all resolve to $HOME/.cache:
+    //   "$HOME"/.cache    ${HOME}/.cache    "${HOME}"/.cache
+    //   '$HOME'/.cache    "~"/.cache        ~"/.cache"
+    // The cleanup is intentionally narrow: drop quotes (single /
+    // double) and brace-expansion wrappers `${...}` so the prefix
+    // checks below see the canonical `$HOME` / `~` / `/abs/path`
+    // form regardless of how the shell snippet quoted it.
+    const t = raw.replace(/["']/g, "").replace(/\$\{([^}]+)\}/g, "$$$1");
     if (t.length === 0) continue;
-    if (t === "*" || t === ".") return true;
+    // Wildcard targets: any token containing `*` is dangerous.
+    // `rm -rf ./*` recursively walks the current dir; `rm -rf *`
+    // is the canonical wipe-everything-in-cwd footgun;
+    // `rm -rf node_modules/*` is a per-package wipe but still warrants
+    // the gate because the glob expansion lands far from the literal
+    // command the operator reads.
+    if (t.includes("*")) return true;
+    if (t === ".") return true;
     if (t === "~" || t === "$HOME") return true;
     if (t.startsWith("~/") || t.startsWith("$HOME/")) return true;
     if (t.startsWith("/")) return true;
