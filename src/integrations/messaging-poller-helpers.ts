@@ -131,8 +131,13 @@ export function createDetachedTracker(
   const detached = new Set<Promise<void>>();
   return {
     track(work) {
-      detached.add(work);
-      void work.finally(() => detached.delete(work));
+      // Defensive `.catch` so a caller that forgets to swallow
+      // rejections cannot turn the tracker into a source of
+      // unhandled-rejection process warnings; the tracked promise
+      // here is purely lifecycle bookkeeping, not result delivery.
+      const tracked = work.catch(() => {});
+      detached.add(tracked);
+      void tracked.finally(() => detached.delete(tracked));
     },
     async drain() {
       if (detached.size === 0) return;

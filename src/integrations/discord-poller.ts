@@ -327,12 +327,25 @@ async function pollChannel(
     // messages older than the oldest-collected snowflake. Processing
     // continues with the collected newest window; the older range
     // is a known-limitation drop documented in the Discord-bridge
-    // ADR.
+    // ADR. The richer payload (initialWatermark + oldest/newest of
+    // collected) tells the operator the exact range the bridge
+    // landed and the lower bound of what was missed, so a backfill
+    // tool could re-query [initialWatermark, oldestCollected) to
+    // recover the dropped window.
+    let oldestCollected: string | undefined;
+    let newestCollected: string | undefined;
+    for (const m of collected) {
+      if (!oldestCollected || snowflakeCompare(m.id, oldestCollected) < 0) oldestCollected = m.id;
+      if (!newestCollected || snowflakeCompare(m.id, newestCollected) > 0) newestCollected = m.id;
+    }
     appendLog(config.instance, "messaging.discord.pagination_cap_fired", {
       bridgeId,
       channelId,
       pages: MAX_PAGES_PER_TICK,
-      collected: collected.length
+      collected: collected.length,
+      initialWatermark,
+      oldestCollected,
+      newestCollected
     });
   }
 
