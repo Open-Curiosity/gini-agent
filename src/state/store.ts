@@ -618,8 +618,15 @@ export function applyLegacyTelegramPairingMigration(state: RuntimeState): boolea
   for (const bridge of state.messagingBridges ?? []) {
     if (bridge.kind !== "telegram") continue;
     const meta = (bridge.metadata ?? {}) as Record<string, unknown>;
+    // Treat ANY present allowlist array as "already migrated", even if
+    // it's empty. An explicit `allowedChatIds: []` is the operator
+    // saying "I disabled every chat on purpose" (via `gini messaging
+    // deny` on each one). Reopening the pairing window on such a
+    // bridge would surprise the operator and could undo a deliberate
+    // lockout. Only a fully-absent `allowedChatIds` indicates the
+    // pre-allowlist schema we're migrating from.
     const allowed = meta.allowedChatIds;
-    const hasAllowlist = Array.isArray(allowed) && allowed.length > 0;
+    const hasAllowlist = Array.isArray(allowed);
     const hasAnyCode = typeof meta.pairingCode === "string";
     if (hasAllowlist || hasAnyCode) continue;
     // The migration only targets bridges that ACTUALLY polled before

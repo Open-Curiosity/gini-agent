@@ -532,6 +532,23 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Could not reach CDP endpoint")) return 400;
   if (message.startsWith("Could not locate")) return 400;
   if (message.startsWith("Web update is only available")) return 400;
+  // Messaging-bridge surface throws plain Error strings rather than the
+  // "Invalid input:" prefix the rest of the codebase uses. Map the
+  // expected user-error shapes to 400 / 404 so the HTTP layer doesn't
+  // collapse them to a misleading 500.
+  if (message.startsWith("Messaging bridge not found")) return 404;
+  if (message.startsWith("Messaging bridge is not configured")) return 400;
+  if (message.startsWith("Messaging bridge name is required")) return 400;
+  if (/^(Telegram|Discord) bridges require a botToken/.test(message)) return 400;
+  if (/^(Telegram|Discord) bot token contains invalid characters/.test(message)) return 400;
+  if (message.startsWith("Inbound message text or media is required")) return 400;
+  if (message.startsWith("Telegram inbound target must be")) return 400;
+  if (message.startsWith("Discord inbound target")) return 400;
+  if (message.startsWith("Outbound message requires")) return 400;
+  if (message.startsWith("Pairing codes only apply")) return 400;
+  if (message.startsWith("Chat allowlist only applies")) return 400;
+  if (message.startsWith("chatId must be")) return 400;
+  if (/^Target '.+' not permitted by active agent/.test(message)) return 400;
   return 500;
 }
 
