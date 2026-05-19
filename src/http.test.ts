@@ -1063,7 +1063,10 @@ describe("runtime api", () => {
       method: "POST",
       body: JSON.stringify({ name: "scout" })
     });
-    // Create the job under the default agent.
+    // Create the job under the default agent. Use a read tool so the
+    // spawned task can settle into a terminal state inside the test window
+    // — keeps the runtime from logging a "Task not found" against a stale
+    // state file after the next test cleans up.
     const job = await call(handler, config, "/api/jobs", {
       method: "POST",
       body: JSON.stringify({ name: "owner-test", prompt: "read README.md", intervalSeconds: 3600 })
@@ -1072,19 +1075,15 @@ describe("runtime api", () => {
     // Switch the active agent *before* the job fires.
     await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
     // Fire the job manually (the dispatch path is shared with the scheduler).
-    await call(handler, config, `/api/jobs/${job.id}/run`, { method: "POST" });
-    // Allow the task to settle. The task gets stamped at submitTask time;
-    // we don't need full completion, just any state where the task exists.
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      const tasks = await call(handler, config, "/api/tasks");
-      const owned = tasks.find((t: { jobId?: string; agentId?: string; status: string }) => t.jobId === job.id);
-      if (owned) {
-        expect(owned.agentId).toBe(defaultAgentId);
-        return;
-      }
-      await Bun.sleep(10);
-    }
-    throw new Error("job task did not appear in the tasks listing");
+    const fired = await call(handler, config, `/api/jobs/${job.id}/run`, { method: "POST" });
+    expect(fired.taskId).toBeString();
+    // Wait for the resulting task to settle so its async tail doesn't
+    // outlive the test and trip a "Task not found" failure on a later
+    // test's state-file cleanup.
+    await waitForTask(handler, config, fired.taskId);
+    const detail = await call(handler, config, `/api/tasks/${fired.taskId}`);
+    expect(detail.task.agentId).toBe(defaultAgentId);
+    expect(detail.task.jobId).toBe(job.id);
   });
 });
 
