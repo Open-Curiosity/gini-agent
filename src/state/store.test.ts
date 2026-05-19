@@ -178,6 +178,70 @@ describe("normalizeState toolset/tool backfill", () => {
     expect(intervalJob?.intervalSeconds).toBe(60);
   });
 
+  test("unions new default toolsets into existing agent_default without touching user-authored agents", () => {
+    // Simulate an instance whose `agent_default` row was persisted before
+    // `browser` joined the default toolsets list, alongside a
+    // user-authored agent with an explicit narrow toolset pick.
+    const state = createEmptyState("test-instance-agent-migrate");
+    const defaultAgentRecord = state.agents.find((agent) => agent.id === "agent_default");
+    expect(defaultAgentRecord).toBeDefined();
+    // Pre-Phase-2 default toolsets list (no browser, no delegation).
+    defaultAgentRecord!.toolsets = ["file", "terminal", "memory", "session_search"];
+    const originalUpdatedAt = defaultAgentRecord!.updatedAt;
+    // Pin updatedAt back in time so we can verify the migration bumped it.
+    defaultAgentRecord!.updatedAt = "2025-01-01T00:00:00.000Z";
+    // Add a user-authored agent with a deliberately narrow toolset.
+    state.agents.push({
+      id: "agent_user_custom",
+      instance: "test-instance-agent-migrate",
+      name: "user-custom",
+      status: "inactive",
+      providerName: undefined,
+      model: undefined,
+      toolsets: ["file"],
+      messagingTargets: [],
+      createdAt: originalUpdatedAt,
+      updatedAt: originalUpdatedAt
+    });
+    // Add a legacy `profile_default` row to confirm the migration also
+    // covers the legacy id.
+    state.agents.push({
+      id: "profile_default",
+      instance: "test-instance-agent-migrate",
+      name: "legacy-default",
+      status: "inactive",
+      providerName: undefined,
+      model: undefined,
+      toolsets: ["file", "terminal"],
+      messagingTargets: [],
+      createdAt: originalUpdatedAt,
+      updatedAt: "2025-01-01T00:00:00.000Z"
+    });
+
+    const normalized = normalizeState("test-instance-agent-migrate", state);
+
+    const migratedDefault = normalized.agents.find((agent) => agent.id === "agent_default")!;
+    // Browser (and any other current default) is unioned in; pre-existing
+    // entries are preserved in order.
+    expect(migratedDefault.toolsets).toContain("file");
+    expect(migratedDefault.toolsets).toContain("terminal");
+    expect(migratedDefault.toolsets).toContain("memory");
+    expect(migratedDefault.toolsets).toContain("session_search");
+    expect(migratedDefault.toolsets).toContain("delegation");
+    expect(migratedDefault.toolsets).toContain("browser");
+    expect(migratedDefault.updatedAt).not.toBe("2025-01-01T00:00:00.000Z");
+
+    const migratedLegacy = normalized.agents.find((agent) => agent.id === "profile_default")!;
+    expect(migratedLegacy.toolsets).toContain("browser");
+    expect(migratedLegacy.toolsets).toContain("delegation");
+    expect(migratedLegacy.updatedAt).not.toBe("2025-01-01T00:00:00.000Z");
+
+    // User-authored agent is untouched.
+    const userCustom = normalized.agents.find((agent) => agent.id === "agent_user_custom")!;
+    expect(userCustom.toolsets).toEqual(["file"]);
+    expect(userCustom.updatedAt).toBe(originalUpdatedAt);
+  });
+
   test("backfilled tool rows for a DISABLED toolset stay disabled", () => {
     const state = createEmptyState("test-instance-6");
     const browser = state.toolsets.find((ts) => ts.name === "browser");
