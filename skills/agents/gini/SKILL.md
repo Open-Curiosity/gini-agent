@@ -26,6 +26,22 @@ you need a structured response to act on; the CLI is for human-facing
 operations. Do not read `~/.gini/instances/<inst>/*.json` directly — hit
 `/api/status` and friends.
 
+## Where State Lives
+
+Runtime state belongs to `/api/*`; reach for the paths below only when a
+user-facing answer requires naming the on-disk location (where sign-ins
+persist, where a skill ends up).
+
+- `~/.gini/instances/<inst>/chrome-profile/` — Playwright Chromium
+  profile; persistent browser sign-ins land here.
+- `~/.gini/instances/<inst>/skills/<category>/<name>/` — user-installed
+  skills (the agent's own writable skill dir).
+- `skills/<category>/<name>/` (repo root) — built-in skills shipped with
+  Gini.
+- `~/.gini/instances/<inst>/workspace/` — default workspace root for
+  `file.*` tools; `file.write` lands here unless `GINI_WORKSPACE`
+  overrides it.
+
 ## Browser
 
 The runtime drives Playwright Chromium against a per-instance profile at
@@ -38,14 +54,21 @@ backs both modes:
   user can sign in once. The next tool call after disconnect goes back to
   headless against the now-authenticated profile.
 
-Tool surface: `browser.navigate`, `browser.snapshot`, `browser.click`,
-`browser.type`, `browser.press`, `browser.hover`, `browser.drag`,
-`browser.select_option`, `browser.scroll`, `browser.back`,
-`browser.console`, `browser.wait_for`, `browser.tabs.{list,new,switch,close}`,
-`browser.vision`, `browser.close`, and the approval-gated
-`browser.upload_file`. Side-effecting actions skip the approval gate
-because the snapshot itself is the trace evidence; uploads are gated
-because they egress local bytes.
+Tool surface, grouped by role:
+
+- **Navigation**: `browser.navigate`, `browser.back`,
+  `browser.tabs.{list,new,switch,close}`.
+- **Interaction**: `browser.click`, `browser.type`, `browser.press`,
+  `browser.hover`, `browser.drag`, `browser.select_option`,
+  `browser.scroll`.
+- **Inspection**: `browser.snapshot`, `browser.wait_for`,
+  `browser.console`, `browser.vision`.
+- **Side-effecting (approval-gated)**: `browser.upload_file`. Plus
+  `browser.close` to tear down the session.
+
+Interactive actions skip the approval gate because the snapshot itself
+is the trace evidence; uploads are gated because they egress local
+bytes.
 
 ### Recipe — authenticated workflow on a new site
 
