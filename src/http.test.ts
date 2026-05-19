@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createHandler } from "./http";
-import { appendEvent, mutateState, readState, readTrace } from "./state";
+import { addAudit, appendEvent, mutateState, readState, readTrace } from "./state";
 import type { RuntimeConfig } from "./types";
 
 describe("runtime api", () => {
@@ -1177,6 +1177,178 @@ describe("runtime api", () => {
     );
     expect(lifecycle.length).toBeGreaterThanOrEqual(4);
     expect(lifecycle.every((a) => a.agentId === defaultAgentId)).toBe(true);
+  });
+
+  test("chat message under a session keeps the session's agent across all emitted events", async () => {
+    // Regression: createRun and createPlanStep previously emitted events
+    // without an agentId. With the session bound to agent A, sending a
+    // message after switching the active agent to B would mis-stamp the
+    // run/step events to B even though the task itself inherits A.
+    const config = testConfig("records-agentid-chat-message");
+    config.workspaceRoot = process.cwd();
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "owned by default" })
+    });
+    expect(session.agentId).toBe(defaultAgentId);
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    const submitted = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "read README.md" })
+    });
+    await waitForTask(handler, config, submitted.taskId);
+    const task = (await call(handler, config, `/api/tasks/${submitted.taskId}`)).task;
+    expect(task.agentId).toBe(defaultAgentId);
+    // Every event for this run should carry the original session's agent —
+    // not the now-active scout agent.
+    const state = readState(config.instance);
+    const runEvents = state.events.filter((e) => e.runId === submitted.runId);
+    expect(runEvents.length).toBeGreaterThan(0);
+    expect(runEvents.every((e) => e.agentId === defaultAgentId)).toBe(true);
+    // The run.created and run.step.created events should specifically be
+    // present and tagged.
+    expect(runEvents.some((e) => e.action === "run.created")).toBe(true);
+    expect(runEvents.some((e) => e.action === "run.step.created")).toBe(true);
+  });
+
+  test("chat session lifecycle events carry the session's agent", async () => {
+    // Regression: createChatSession / deleteChatSession / renameChatSession
+    // emitted lifecycle events without an agentId. A session created /
+    // renamed / deleted while a different agent was active would attribute
+    // the event to the active agent rather than the session's owner.
+    const config = testConfig("records-agentid-chat-lifecycle");
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    // Create the session under default.
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "lifecycle" })
+    });
+    expect(session.agentId).toBe(defaultAgentId);
+    // Switch active to scout, then rename and delete the default-owned
+    // session — both events should still carry the default's id.
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    await call(handler, config, `/api/chat/${session.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title: "renamed" })
+    });
+    await call(handler, config, `/api/chat/${session.id}`, { method: "DELETE" });
+    const state = readState(config.instance);
+    const targeted = state.events.filter((e) => e.target === session.id);
+    const created = targeted.find((e) => e.action === "chat.session.created");
+    const renamed = targeted.find((e) => e.action === "chat.session.renamed");
+    const deleted = targeted.find((e) => e.action === "chat.session.deleted");
+    expect(created?.agentId).toBe(defaultAgentId);
+    expect(renamed?.agentId).toBe(defaultAgentId);
+    expect(deleted?.agentId).toBe(defaultAgentId);
+  });
+
+  test("addAudit infers agentId from jobId when neither agentId nor taskId is provided", async () => {
+    // Regression: inferAgentId's jobId fallback only fires when the caller
+    // threads `jobId` (or appendEvent's persisted `jobId`) through. This
+    // test pins that an audit row created with just jobId resolves to the
+    // owning job's agent — without it the row would fall back to
+    // state.activeAgentId after a switch.
+    const config = testConfig("records-agentid-job-fallback");
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "fallback-job", prompt: "hi", intervalSeconds: 3600 })
+    });
+    // Switch the active agent before emitting the audit.
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    await mutateState(config.instance, (state) => {
+      addAudit(state, {
+        actor: "runtime",
+        action: "test.job.fallback",
+        target: job.id,
+        risk: "low",
+        jobId: job.id,
+        evidence: { jobId: job.id }
+      });
+    });
+    const state = readState(config.instance);
+    const audit = state.audit.find((a) => a.action === "test.job.fallback");
+    expect(audit?.agentId).toBe(defaultAgentId);
+    const paired = state.events.find((e) => e.action === "test.job.fallback");
+    expect(paired?.agentId).toBe(defaultAgentId);
+  });
+
+  test("migrateRecordAgentIds re-stamps rows pointing at a deleted agent", async () => {
+    // Regression: the migration's predicate previously only re-stamped
+    // rows where agentId was missing. A row carrying the id of a deleted
+    // agent stayed stranded under an unselectable bucket. Now stale ids
+    // are treated the same as missing.
+    const config = testConfig("records-agentid-stale");
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    // Seed records pointing at a ghost agent that doesn't exist in
+    // state.agents. The next read triggers normalizeState ->
+    // migrateRecordAgentIds and should re-stamp them with the first
+    // existing agent (the default).
+    await mutateState(config.instance, (state) => {
+      const at = new Date().toISOString();
+      state.tasks.unshift({
+        id: "task_ghost",
+        title: "ghost",
+        input: "ghost task",
+        status: "completed",
+        instance: state.instance,
+        agentId: "agent_ghost",
+        createdAt: at,
+        updatedAt: at,
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        memoryIds: [],
+        skillIds: []
+      });
+      state.memories.unshift({
+        id: "mem_ghost",
+        instance: state.instance,
+        agentId: "agent_ghost",
+        content: "ghost",
+        status: "active",
+        confidence: 1,
+        sensitivity: "normal",
+        provenance: "test",
+        createdAt: at,
+        updatedAt: at
+      });
+    });
+    // Trigger the migration via a fresh read.
+    await call(handler, config, "/api/tasks");
+    const stamped = readState(config.instance);
+    const ghostTask = stamped.tasks.find((t) => t.id === "task_ghost");
+    const ghostMemory = stamped.memories.find((m) => m.id === "mem_ghost");
+    expect(ghostTask?.agentId).toBe(defaultAgentId);
+    expect(ghostMemory?.agentId).toBe(defaultAgentId);
+    // Re-reading should be idempotent — no further backfill row beyond
+    // what the first migration produced.
+    await call(handler, config, "/api/tasks");
+    await call(handler, config, "/api/tasks");
+    const audit = await call(handler, config, "/api/audit");
+    const backfills = audit.filter((row: { action: string }) => row.action === "records.agentid.backfill");
+    expect(backfills.length).toBe(1);
   });
 });
 
