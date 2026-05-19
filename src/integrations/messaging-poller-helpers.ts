@@ -176,11 +176,18 @@ function sleep(ms: number): Promise<void> {
 //
 // Bounded by a max wait + the abort signal:
 //   - signal.aborted = supervisor shutdown / bridge disable → exit
+//     (returns undefined)
 //   - max wait elapsed = task is stuck (e.g. waiting_approval
-//     indefinitely) → log + exit, so the detached worker doesn't
-//     hold a tracker entry forever
+//     indefinitely) → log + exit (returns the non-terminal status)
+//   - terminal status reached → returns the terminal status
+//
+// Callers must distinguish the terminal vs non-terminal return:
+// invoking syncChatTaskResult on a non-terminal status throws
+// "Task is not ready for chat sync" and produces a spurious
+// sync_error log row. The helper exists precisely so the caller
+// can skip sync cleanly when the wait timed out.
 const TASK_TERMINAL_POLL_MS = 100;
-const TASK_TERMINAL_MAX_WAIT_MS = 10 * 60 * 1000;
+export const MAX_TASK_WAIT_MS = 10 * 60 * 1000;
 
 export async function awaitTerminalTask(
   config: RuntimeConfig,
@@ -188,7 +195,7 @@ export async function awaitTerminalTask(
   signal: AbortSignal,
   timeoutLogEvent = "messaging.task_wait_timeout"
 ): Promise<TaskStatus | undefined> {
-  const deadline = Date.now() + TASK_TERMINAL_MAX_WAIT_MS;
+  const deadline = Date.now() + MAX_TASK_WAIT_MS;
   while (!signal.aborted) {
     const task = readState(config.instance).tasks.find((t) => t.id === taskId);
     if (!task) return undefined;
@@ -197,7 +204,7 @@ export async function awaitTerminalTask(
       appendLog(config.instance, timeoutLogEvent, {
         taskId,
         status: task.status,
-        waited_ms: TASK_TERMINAL_MAX_WAIT_MS
+        waited_ms: MAX_TASK_WAIT_MS
       });
       return task.status;
     }

@@ -279,17 +279,29 @@ async function maintainTypingAndMirrorReply(
   client: TelegramClient,
   signal: AbortSignal
 ): Promise<void> {
-  await maintainTypingIndicator(config, taskId, chatId, client, signal);
-  if (signal.aborted) return;
+  // Typing pulse runs concurrent with the terminal-wait so a typing
+  // failure doesn't gate the reply, and a non-terminal task can't
+  // keep the pulse alive past the shared deadline.
+  const typingDone = maintainTypingIndicator(config, taskId, chatId, client, signal)
+    .catch((error) => {
+      // Errors are already logged inside maintainTypingIndicator;
+      // the catch here just prevents an unhandled rejection.
+      void error;
+    });
 
-  // Decoupled from the typing pulse: if maintainTypingIndicator
-  // returned early because of a transient sendChatAction error, the
-  // task may still be running. Wait for terminal state before
-  // syncing — without this, syncChatTaskResult would throw "Task
-  // is not ready for chat sync" and the assistant reply would be
-  // permanently dropped on a single typing failure.
-  await awaitTerminalTask(config, taskId, signal);
+  // Gate the reply on terminal state — on timeout we get a
+  // non-terminal status back and skip the sync cleanly.
+  const terminalStatus = await awaitTerminalTask(config, taskId, signal, "messaging.telegram.task_wait_timeout");
   if (signal.aborted) return;
+  await typingDone;
+  if (terminalStatus === undefined || !isTerminalTaskStatus(terminalStatus)) {
+    appendLog(config.instance, "messaging.telegram.reply_skip_non_terminal", {
+      bridgeId,
+      taskId,
+      status: terminalStatus
+    });
+    return;
+  }
 
   // Resolve the chat session for this (bridge, chat) so we can land
   // the assistant message and look up the dispatch target. The session

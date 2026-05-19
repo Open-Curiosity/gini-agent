@@ -351,10 +351,11 @@ export interface ChatSessionRecord {
   summary?: string;
   // Origin descriptor when the session was created by a non-UI surface.
   // The web chat omits this; messaging bridges (Telegram, Discord) set
-  // `kind` to the bridge id so the runtime can mirror assistant
-  // replies back out to the chat / channel the user started in.
-  // `target` is the bridge-specific addressing string passed back to
-  // sendMessagingOutput.
+  // `kind` to the bridge kind ("telegram" | "discord") with the
+  // owning bridge id in a separate `bridgeId` field, so the runtime
+  // can mirror assistant replies back out to the chat / channel the
+  // user started in. `target` is the bridge-specific addressing
+  // string passed back to sendMessagingOutput.
   source?: ChatSessionSource;
 }
 

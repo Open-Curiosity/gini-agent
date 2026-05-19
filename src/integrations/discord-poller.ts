@@ -445,16 +445,41 @@ async function maintainTypingAndMirrorReply(
   signal: AbortSignal,
   typingRefreshMs: number
 ): Promise<void> {
-  await maintainTypingIndicator(config, taskId, channelId, client, signal, typingRefreshMs);
+  // Typing pulse runs concurrent with the terminal-wait so a typing
+  // failure (revoked channel, network blip) doesn't gate the reply,
+  // and a non-terminal task can't keep the pulse alive past the
+  // shared MAX_TASK_WAIT_MS deadline. Without this concurrency,
+  // awaitTerminalTask was unreachable for any task whose typing
+  // calls kept succeeding — the loop would spin forever.
+  const typingDone = maintainTypingIndicator(config, taskId, channelId, client, signal, typingRefreshMs)
+    .catch((error) => {
+      // Errors are already logged inside maintainTypingIndicator;
+      // the catch here just prevents an unhandled rejection from
+      // the detached await below.
+      void error;
+    });
+
+  // Gate the reply on the task actually reaching terminal state.
+  // awaitTerminalTask returns the (possibly non-terminal) status on
+  // timeout — if we get a non-terminal status back, the task is
+  // stuck and we skip the sync to avoid a noisy sync_error log row.
+  const terminalStatus = await awaitTerminalTask(config, taskId, signal, "messaging.discord.task_wait_timeout");
   if (signal.aborted) return;
 
-  // Whether the typing loop returned because the task settled or
-  // because a transient indicator error halted the pulse, the reply
-  // mirror still has to wait for terminal state before syncing.
-  // Without this poll, syncChatTaskResult would throw "Task is not
-  // ready for chat sync" and the reply would never land.
-  await awaitTerminalTask(config, taskId, signal);
-  if (signal.aborted) return;
+  // Reap the typing pulse before continuing. It will have exited
+  // already in the happy path (terminal status triggers its inner
+  // return) but on the timeout path we need to ensure it's done so
+  // the detached-tracker drain doesn't see a phantom worker.
+  await typingDone;
+
+  if (terminalStatus === undefined || !isTerminalTaskStatus(terminalStatus)) {
+    appendLog(config.instance, "messaging.discord.reply_skip_non_terminal", {
+      bridgeId,
+      taskId,
+      status: terminalStatus
+    });
+    return;
+  }
 
   const session = findDiscordChatSession(config, bridgeId, channelId);
   if (!session || !session.source || session.source.kind !== "discord") return;
