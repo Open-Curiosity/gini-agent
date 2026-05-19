@@ -68,6 +68,8 @@ rg -n "v0|v1|v2|v3|lane|v1-readiness|single HTML|src/state\\.ts|src/api" README.
 
 The compatibility command/API name `readiness v1` and `/api/readiness/v1` may still appear, but they should not drive product planning language.
 
+After a UI-related change or new feature, exercise it in a real browser before declaring the task done. Drive the affected screen end-to-end (the Playwright MCP browser tools are the default path) and confirm the change actually renders and behaves as intended — typecheck and unit tests don't catch broken layouts, missing handlers, or regressed flows.
+
 ## Logs
 
 Spawned child stdio is appended under:
