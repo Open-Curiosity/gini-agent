@@ -34,18 +34,27 @@ path. Forgetting to thread `agentId` is a TypeScript compile error.
 
 ## Context
 
-Across Phase 2 review rounds (3, 4, 5) of the per-agent webapp work,
-nearly every round found another emitter that lost `agentId`. The
-pattern was always the same: a record (job, chat session, subagent,
-approval) carries an `agentId`, but the event or audit emitter at some
-later moment ignored it and let `inferAgentId` fall back to
-`state.activeAgentId` — which had changed in between because the user
-or a scheduler tick activated a different agent.
+When per-agent scoping landed in the webapp, the runtime gained an
+`agentId` field on most record kinds (tasks, jobs, chat sessions,
+subagents, approvals) and a corresponding inference helper that emitted
+events and audits used to stamp the persisted row. The helper preferred
+an explicit `agentId`, then walked a source id (`taskId`, `jobId`,
+etc.) to its record, and ultimately fell back to `state.activeAgentId`
+if nothing else was available.
 
-Each round added one more `agentId: foo.agentId` keyword argument at
-one more call site. There was no structural reason the next reviewer
-wouldn't find another. The bug class — silent attribution leak after
-an active-agent switch — was systemic.
+That last fallback was a foot-gun. A record carrying an `agentId` could
+be attributed correctly at creation time, but a later event or audit
+emitter that didn't thread the source id would fall through to
+`state.activeAgentId` — which had changed in between because the user
+or a scheduler tick activated a different agent. The resulting row
+silently mis-attributed activity to whichever agent was active at the
+moment of emit rather than the agent that owned the source record.
+
+Each newly-discovered miss could be fixed by adding one more keyword
+argument at one more call site, but the pattern was open-ended: the
+runtime has ~120 emitter sites, and there was no structural reason the
+next reader wouldn't find another. The bug class — silent attribution
+leak after an active-agent switch — needed a structural fix.
 
 ## Required Now
 
@@ -116,5 +125,7 @@ Con:
   type level.
 - Resolution tests in `src/http.test.ts` cover every branch of the
   `AgentContext` union and the missing-source case.
-- The Round-3 regression — a scheduled job fired after an agent switch
-  must attribute to the originating job's agent — continues to pass.
+- The active-agent-switch regression — a scheduled job fired after an
+  agent switch must attribute to the originating job's agent rather
+  than whichever agent is active at the moment the run fires —
+  continues to pass.
