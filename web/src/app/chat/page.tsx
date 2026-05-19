@@ -109,7 +109,12 @@ export default function ChatPage() {
   }, [selectedSession?.id, selectedActivityAt, selectedSession, markRead]);
 
   useEffect(() => {
-    if (!selected && orderedSessions.length > 0) setSelected(orderedSessions[0]!.id);
+    if (selected || orderedSessions.length === 0) return;
+    // Prefer the newest non-job session so opening the chat page doesn't
+    // immediately auto-mark a freshly-spawned job chat as read. Fall back
+    // to the newest job session only if that's all that exists.
+    const target = orderedSessions.find((s) => s.origin !== "job") ?? orderedSessions[0]!;
+    setSelected(target.id);
   }, [selected, orderedSessions, setSelected]);
 
   useEffect(() => {

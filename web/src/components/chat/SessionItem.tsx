@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { X } from "lucide-react";
+import { Bot, X } from "lucide-react";
 import type { ChatSession } from "@/lib/view-types";
 import { cn } from "@/lib/utils";
 import { formatRelativeTime } from "./relative-time";
@@ -89,13 +89,27 @@ export function SessionItem({
             onClick={onSelect}
             onDoubleClick={startEdit}
             className="flex min-w-0 flex-1 items-center gap-2 truncate text-left"
-            aria-label={isUnread ? `${label} (unread)` : label}
+            aria-label={(() => {
+              const suffixes: string[] = [];
+              if (isUnread) suffixes.push("unread");
+              if (session.origin === "job") suffixes.push("created by a job");
+              return suffixes.length > 0 ? `${label} (${suffixes.join(", ")})` : label;
+            })()}
           >
             {isUnread ? (
               <span
                 aria-hidden="true"
                 className="size-1.5 shrink-0 rounded-full bg-primary"
               />
+            ) : null}
+            {session.origin === "job" ? (
+              <span
+                title="Created by a job"
+                aria-hidden="true"
+                className="flex shrink-0 items-center"
+              >
+                <Bot className="size-3.5 text-muted-foreground" />
+              </span>
             ) : null}
             <span className={cn("truncate", isUnread && "font-semibold")}>
               {label}
