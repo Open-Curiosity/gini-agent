@@ -16,6 +16,7 @@ import {
   authorizeTelegramChat,
   findTelegramChatSession,
   hasActivePairingCode,
+  isBotTokenRef,
   readBridgeBotToken,
   receiveMessagingInput,
   recordDeniedChatAttempt,
@@ -85,7 +86,7 @@ export function createTelegramPollerSupervisor(
   function shouldRun(bridge: MessagingBridgeRecord): boolean {
     if (bridge.kind !== "telegram") return false;
     if (bridge.status !== "configured") return false;
-    return Boolean(bridge.secretRefs?.some((ref) => ref.purpose === "bot-token"));
+    return Boolean(bridge.secretRefs?.some(isBotTokenRef));
   }
 
   function startLoop(bridgeId: string): void {

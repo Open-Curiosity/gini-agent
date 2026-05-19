@@ -17,7 +17,7 @@
 
 import type { MessagingBridgeRecord, RuntimeConfig, TaskStatus } from "../types";
 import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
-import { findDiscordChatSession, readBridgeBotToken, receiveMessagingInput, sendMessagingOutput } from "./messaging";
+import { findDiscordChatSession, isBotTokenRef, readBridgeBotToken, receiveMessagingInput, sendMessagingOutput } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
 import {
   awaitTerminalTask,
@@ -111,7 +111,7 @@ export function createDiscordPollerSupervisor(
     if (bridge.kind !== "discord") return false;
     if (bridge.status !== "configured") return false;
     if (bridge.deliveryTargets.length === 0) return false;
-    return Boolean(bridge.secretRefs?.some((ref) => ref.purpose === "bot-token"));
+    return Boolean(bridge.secretRefs?.some(isBotTokenRef));
   }
 
   function startLoop(bridgeId: string): void {

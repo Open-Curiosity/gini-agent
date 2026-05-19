@@ -115,8 +115,18 @@ function mediaRecordForOutbound(source: TelegramPhotoSource | undefined): Messag
   return { kind: "photo" };
 }
 
+// The bot-token secret used to be stored under purpose "token" before a
+// rename to "bot-token". Existing on-disk state from older bridges still
+// references the old purpose string; the encrypted file lives under
+// secrets/<bridge>.token.json. Accept either purpose so a bridge created
+// pre-rename keeps polling without forcing the operator to recreate it.
+const BOT_TOKEN_PURPOSES = ["bot-token", "token"] as const;
+export function isBotTokenRef(ref: { purpose: string }): boolean {
+  return (BOT_TOKEN_PURPOSES as readonly string[]).includes(ref.purpose);
+}
+
 export function readBridgeBotToken(config: RuntimeConfig, bridge: MessagingBridgeRecord): string | undefined {
-  const ref = bridge.secretRefs?.find((candidate) => candidate.purpose === "bot-token");
+  const ref = bridge.secretRefs?.find(isBotTokenRef);
   if (!ref) return undefined;
   return readSecret(config.instance, ref);
 }
