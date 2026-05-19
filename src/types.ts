@@ -359,9 +359,15 @@ export interface ChatSessionRecord {
   source?: ChatSessionSource;
 }
 
+// `lastInboundMessageId` is the most recent originating-message id the
+// chat session received from the bridge — Telegram's numeric update id
+// or Discord's snowflake string. It's what scheduled-job replies use to
+// thread their delayed dispatch onto the original user message. The
+// field is updated by the poller every time a new inbound lands so a
+// long-running session always threads onto the most recent prompt.
 export type ChatSessionSource =
-  | { kind: "telegram"; bridgeId: string; chatId: number; target: string }
-  | { kind: "discord"; bridgeId: string; channelId: string; target: string };
+  | { kind: "telegram"; bridgeId: string; chatId: number; target: string; lastInboundMessageId?: number }
+  | { kind: "discord"; bridgeId: string; channelId: string; target: string; lastInboundMessageId?: string };
 
 export interface ChatMessageRecord {
   id: string;

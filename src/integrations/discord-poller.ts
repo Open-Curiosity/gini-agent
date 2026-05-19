@@ -31,6 +31,7 @@ import {
   type DiscordClient,
   type DiscordMessage
 } from "./discord";
+import { connectDiscordGateway, type DiscordGatewayHandle } from "./discord-gateway";
 
 // Cadence for the per-target REST poll. Discord's global rate limit is
 // generous (~50 req/s), but per-channel limits are tighter; 3s leaves
@@ -80,6 +81,11 @@ export interface PollerDeps {
   // 7s production default keeps the indicator continuous; tests crank
   // it down to verify the pulse fires while the task is running.
   typingRefreshMs?: number;
+  // Override the gateway connector for tests. Production leaves it
+  // undefined and we open a real WebSocket to gateway.discord.gg;
+  // tests pass a no-op so they don't spawn live sockets every time
+  // they bring up a supervisor.
+  gatewayConnector?: (options: { token: string; instance: string; bridgeId: string }) => DiscordGatewayHandle;
 }
 
 interface RunningLoop {
@@ -101,6 +107,7 @@ export function createDiscordPollerSupervisor(
   const factory = deps.clientFactory ?? ((token: string) => createDiscordClient(token));
   const pollIntervalMs = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
   const typingRefreshMs = deps.typingRefreshMs ?? TYPING_REFRESH_MS;
+  const gatewayConnector = deps.gatewayConnector ?? ((options) => connectDiscordGateway(options));
   let stopped = false;
   // Shared detached-worker tracker. See messaging-poller-helpers.ts:
   // workers are stopAll-awaited with a bounded timeout so a hung
@@ -124,7 +131,8 @@ export function createDiscordPollerSupervisor(
       factory,
       pollIntervalMs,
       typingRefreshMs,
-      detached.track
+      detached.track,
+      gatewayConnector
     ).finally(() => {
       // Always abort the controller when the loop exits, even for
       // natural returns (bridge disabled, token rotated, status
@@ -180,62 +188,95 @@ async function runLoop(
   factory: (token: string) => DiscordClient,
   pollIntervalMs: number,
   typingRefreshMs: number,
-  trackDetached: (work: Promise<void>) => void
+  trackDetached: (work: Promise<void>) => void,
+  gatewayConnector: (options: { token: string; instance: string; bridgeId: string }) => DiscordGatewayHandle
 ): Promise<void> {
-  while (!signal.aborted) {
-    const bridge = readState(config.instance).messagingBridges.find((item) => item.id === bridgeId);
-    if (!bridge || bridge.kind !== "discord" || bridge.status !== "configured") return;
-    // readBridgeBotToken throws ENOENT when the encrypted secret file
-    // is missing under the secretRef path (rotation in progress,
-    // manual deletion, corruption). Without a catch the rejection
-    // propagates out of the loop, the supervisor reconcile sees the
-    // bridge still matches shouldRun (it only checks secretRefs, not
-    // the on-disk file), and restarts the loop every reconcile tick.
-    // Flip the bridge to "error" so shouldRun stops returning true
-    // and the supervisor drops the broken bridge until the user
-    // re-supplies the token.
-    let token: string | undefined;
-    try {
-      token = readBridgeBotToken(config, bridge);
-    } catch (error) {
-      await markBridgeError(
-        config,
-        bridgeId,
-        "messaging.discord.token_error",
-        "messaging.discord.mark_error_failed",
-        error
-      );
-      return;
-    }
-    if (!token) {
-      await markBridgeError(
-        config,
-        bridgeId,
-        "messaging.discord.token_error",
-        "messaging.discord.mark_error_failed",
-        new Error("Discord bot token secret is missing.")
-      );
-      return;
-    }
+  // The Gateway connection runs alongside the REST poll loop for the
+  // sole purpose of making the bot show up as "Online" in Discord's
+  // UI. It outlives a single poll tick (we don't reconnect on every
+  // iteration) and is torn down in `finally` when the loop exits —
+  // SIGTERM, bridge disable, status flip, missing-secret error all
+  // funnel through this finally so the gateway drops cleanly instead
+  // of holding the bot Online after the bridge is supposed to be
+  // gone.
+  let gateway: DiscordGatewayHandle | undefined;
+  let gatewayToken: string | undefined;
+  try {
+    while (!signal.aborted) {
+      const bridge = readState(config.instance).messagingBridges.find((item) => item.id === bridgeId);
+      if (!bridge || bridge.kind !== "discord" || bridge.status !== "configured") return;
+      // readBridgeBotToken throws ENOENT when the encrypted secret file
+      // is missing under the secretRef path (rotation in progress,
+      // manual deletion, corruption). Without a catch the rejection
+      // propagates out of the loop, the supervisor reconcile sees the
+      // bridge still matches shouldRun (it only checks secretRefs, not
+      // the on-disk file), and restarts the loop every reconcile tick.
+      // Flip the bridge to "error" so shouldRun stops returning true
+      // and the supervisor drops the broken bridge until the user
+      // re-supplies the token.
+      let token: string | undefined;
+      try {
+        token = readBridgeBotToken(config, bridge);
+      } catch (error) {
+        await markBridgeError(
+          config,
+          bridgeId,
+          "messaging.discord.token_error",
+          "messaging.discord.mark_error_failed",
+          error
+        );
+        return;
+      }
+      if (!token) {
+        await markBridgeError(
+          config,
+          bridgeId,
+          "messaging.discord.token_error",
+          "messaging.discord.mark_error_failed",
+          new Error("Discord bot token secret is missing.")
+        );
+        return;
+      }
 
-    let client: DiscordClient;
-    try {
-      client = factory(token);
-    } catch (error) {
-      appendLog(config.instance, "messaging.discord.client_error", {
-        bridgeId,
-        error: error instanceof Error ? error.message : String(error)
-      });
-      await sleepUnlessAborted(ERROR_BACKOFF_MS, signal);
-      continue;
-    }
+      // Start (or rotate) the Gateway presence connection. Re-use the
+      // existing connection unless the token rotated — token rotation
+      // is rare (operator recreates the bridge or pastes a new secret)
+      // and reconnecting on rotation is cheaper than tearing down on
+      // every tick.
+      if (!gateway || gatewayToken !== token) {
+        if (gateway) gateway.close();
+        gatewayToken = token;
+        gateway = gatewayConnector({
+          token,
+          instance: config.instance,
+          bridgeId
+        });
+      }
 
-    for (const channelId of bridge.deliveryTargets) {
-      if (signal.aborted) return;
-      await pollChannel(config, bridgeId, channelId, client, signal, typingRefreshMs, trackDetached);
-    }
+      let client: DiscordClient;
+      try {
+        client = factory(token);
+      } catch (error) {
+        appendLog(config.instance, "messaging.discord.client_error", {
+          bridgeId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        await sleepUnlessAborted(ERROR_BACKOFF_MS, signal);
+        continue;
+      }
 
-    await sleepUnlessAborted(pollIntervalMs, signal);
+      for (const channelId of bridge.deliveryTargets) {
+        if (signal.aborted) return;
+        await pollChannel(config, bridgeId, channelId, client, signal, typingRefreshMs, trackDetached);
+      }
+
+      await sleepUnlessAborted(pollIntervalMs, signal);
+    }
+  } finally {
+    // Always reap the gateway, even on a thrown exception out of the
+    // loop body. Without this an unexpected throw would leave the
+    // bot Online forever even though the loop is gone.
+    if (gateway) gateway.close();
   }
 }
 
@@ -400,7 +441,11 @@ async function pollChannel(
     try {
       const record = await receiveMessagingInput(config, bridgeId, {
         text: incoming.text,
-        target: incoming.channelId
+        target: incoming.channelId,
+        // Stamp the inbound snowflake on the chat session source so
+        // scheduled-job replies that fire later can thread back onto
+        // this message via Discord's message_reference object.
+        messageId: raw.id
       });
       if (record.taskId) {
         // Typing pulse + reply mirror runs detached so a slow

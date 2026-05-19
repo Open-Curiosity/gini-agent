@@ -4,7 +4,7 @@
 
 A Discord bridge is a `MessagingBridgeRecord` with `kind: "discord"` and a per-bridge encrypted bot token. The runtime talks to `discord.com/api/v10` directly over `fetch` — no SDK dependency. Outbound (`POST /api/messaging/:id/send`) calls Discord's channel-messages endpoint; inbound is a REST poll over each delivery target's channel history. Bot tokens live in the per-instance secret store under the `messaging.<bridgeId>` namespace and never appear on the bridge record.
 
-The Discord gateway WebSocket, a Discord SDK (`discord.js`), and webhooks are all rejected. They each add either a persistent socket the loopback HTTP server has no use for (gateway), a runtime dependency tree (SDK), or a public-internet surface (webhooks) that the local-first Gini shape does not need.
+Alongside the REST poll loop the runtime opens a **presence-only Gateway WebSocket** to `gateway.discord.gg` (v10, JSON). The connection identifies with `intents: 0` — Discord delivers no event dispatches beyond READY — so the bridge stays REST-driven for messages and uses the Gateway only to flip the bot's "Online" badge in Discord's UI. Without this connection the bot would stay grey-dotted even while polling and replying, which made it hard for the operator to tell whether the runtime was actually alive. A Discord SDK (`discord.js`) and webhooks are still rejected — the former adds a runtime dependency tree we don't need now that the Gateway connection is a single ~250-line client, the latter adds a public-internet surface the local-first Gini shape doesn't need.
 
 ## Context
 
@@ -31,6 +31,7 @@ Discord differs from Telegram in two material ways. First, Discord exposes no lo
 - A missing or unreadable secret file flips the bridge to `status: "error"` and exits the loop. Without this, the supervisor reconcile would keep restarting the loop on every tick because `shouldRun` only checks for the secret-ref entry on the record, not the file's presence.
 - SIGTERM aborts every active poll via `AbortController` so shutdown does not wait out the REST-poll cadence.
 - The Discord HTTP client (`src/integrations/discord.ts`) is mockable via an injected `fetch`; the messaging module exposes `setMessagingDeps` (Telegram already used it) with a Discord-specific `discordClientFactory` so tests can substitute a stub `DiscordClient`. Production callers leave both unset.
+- Gateway presence client (`src/integrations/discord-gateway.ts`): a per-bridge WebSocket to `wss://gateway.discord.gg/?v=10&encoding=json`. The runLoop spawns it once a valid bot token is read, rotates it only when the token changes, and tears it down in a `finally` block when the loop exits for any reason (SIGTERM, bridge disable, status flip, missing-secret error). IDENTIFY pins `intents: 0` so Discord delivers no event dispatches we'd have to act on; the presence object sets `status: online` with a "gini agent" custom activity line. Heartbeats are scheduled off the HELLO interval (~41s in production). Server-initiated closes (op 7 RECONNECT, op 9 INVALID_SESSION, or a transport-level drop) trigger an exponential-backoff reconnect (1s..30s), so a flapping or rotated Gateway endpoint can't leave the bot grey-dotted for the rest of the runtime's lifetime. The poller supervisor accepts a `gatewayConnector` test seam so unit tests don't spawn live sockets.
 
 ## Trust Boundary
 

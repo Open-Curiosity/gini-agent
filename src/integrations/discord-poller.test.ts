@@ -4,6 +4,17 @@ import type { RuntimeConfig } from "../types";
 import { readState } from "../state";
 import { addMessagingBridge, resetMessagingDeps, setMessagingDeps } from "./messaging";
 import { createDiscordPollerSupervisor, __internalsForTests as discordInternals } from "./discord-poller";
+import type { DiscordGatewayHandle } from "./discord-gateway";
+
+// No-op Gateway connector for tests so the supervisor doesn't open a
+// live WebSocket to gateway.discord.gg on every test bring-up. The
+// production code's gateway lifecycle (close on loop exit, reconnect
+// on close) is covered by discord-gateway.test.ts in isolation; the
+// poller tests just need a `close()`-able handle.
+function stubGateway(): DiscordGatewayHandle {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  return { done: promise, close: () => resolve() };
+}
 import { setMaxTaskWaitMsForTests } from "./messaging-poller-helpers";
 import { mutateState } from "../state";
 import type { ChatSessionRecord } from "../types";
@@ -183,6 +194,7 @@ describe("discord poller supervisor", () => {
 
     const supervisor = createDiscordPollerSupervisor(config, {
       clientFactory: () => client,
+      gatewayConnector: stubGateway,
       pollIntervalMs: 20,
       typingRefreshMs: 20
     });
@@ -215,6 +227,7 @@ describe("discord poller supervisor", () => {
 
     const supervisor = createDiscordPollerSupervisor(config, {
       clientFactory: () => client,
+      gatewayConnector: stubGateway,
       pollIntervalMs: 20,
       typingRefreshMs: 20
     });
@@ -261,6 +274,7 @@ describe("discord poller supervisor", () => {
 
     const supervisor = createDiscordPollerSupervisor(config, {
       clientFactory: () => client,
+      gatewayConnector: stubGateway,
       pollIntervalMs: 20,
       typingRefreshMs: 20
     });
@@ -317,6 +331,7 @@ describe("discord poller supervisor", () => {
 
     const supervisor = createDiscordPollerSupervisor(config, {
       clientFactory: () => client,
+      gatewayConnector: stubGateway,
       pollIntervalMs: 20,
       typingRefreshMs: 20
     });
@@ -351,6 +366,7 @@ describe("discord poller supervisor", () => {
 
     const supervisor = createDiscordPollerSupervisor(config, {
       clientFactory: () => client,
+      gatewayConnector: stubGateway,
       pollIntervalMs: 20,
       typingRefreshMs: 20
     });
@@ -395,6 +411,7 @@ describe("discord poller supervisor", () => {
 
     const supervisor = createDiscordPollerSupervisor(config, {
       clientFactory: () => client,
+      gatewayConnector: stubGateway,
       pollIntervalMs: 20,
       typingRefreshMs: 20
     });
@@ -442,6 +459,7 @@ describe("discord poller supervisor", () => {
 
     const supervisor = createDiscordPollerSupervisor(config, {
       clientFactory: () => client,
+      gatewayConnector: stubGateway,
       pollIntervalMs: 20,
       typingRefreshMs: 20
     });
@@ -511,6 +529,7 @@ describe("discord poller supervisor", () => {
 
     const supervisor = createDiscordPollerSupervisor(config, {
       clientFactory: () => client,
+      gatewayConnector: stubGateway,
       pollIntervalMs: 20,
       typingRefreshMs: 20
     });

@@ -369,9 +369,21 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
       throw new Error(`Telegram inbound target must be a numeric chat_id (got '${rawTarget}').`);
     }
     target = String(chatId);
-    const session = await mutateState(config.instance, (state) =>
-      findOrCreateTelegramChatSession(state, bridge.id, chatId)
-    );
+    const inboundMessageId = typeof input.messageId === "number" && Number.isFinite(input.messageId)
+      ? (input.messageId as number)
+      : undefined;
+    const session = await mutateState(config.instance, (state) => {
+      const sess = findOrCreateTelegramChatSession(state, bridge.id, chatId);
+      // Stamp the originating message id on the source so scheduled-job
+      // replies that fire later (after the inbound poll cycle moves on)
+      // can thread back onto the original message via Telegram's
+      // reply_to_message_id. Only stamp when the poller supplied one
+      // so the HTTP /receive path doesn't blank it out.
+      if (sess.source?.kind === "telegram" && inboundMessageId !== undefined) {
+        sess.source.lastInboundMessageId = inboundMessageId;
+      }
+      return sess;
+    });
     const result = await submitChatMessage(config, session.id, { content: text });
     taskId = result.taskId;
     sessionId = session.id;
@@ -381,9 +393,18 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
       throw new Error("Discord inbound target (channel id) is required.");
     }
     target = channelId;
-    const session = await mutateState(config.instance, (state) =>
-      findOrCreateDiscordChatSession(state, bridge.id, channelId)
-    );
+    const inboundMessageId = typeof input.messageId === "string" && input.messageId.length > 0
+      ? input.messageId
+      : undefined;
+    const session = await mutateState(config.instance, (state) => {
+      const sess = findOrCreateDiscordChatSession(state, bridge.id, channelId);
+      // See Telegram branch — same rationale for the source-level
+      // message id stamp.
+      if (sess.source?.kind === "discord" && inboundMessageId !== undefined) {
+        sess.source.lastInboundMessageId = inboundMessageId;
+      }
+      return sess;
+    });
     const result = await submitChatMessage(config, session.id, { content: text });
     taskId = result.taskId;
     sessionId = session.id;

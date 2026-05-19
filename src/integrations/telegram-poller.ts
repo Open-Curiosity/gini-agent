@@ -309,7 +309,11 @@ async function runLoop(
           const record = await receiveMessagingInput(config, bridgeId, {
             text: taskInput,
             target: String(incoming.chatId),
-            media: downloaded?.media
+            media: downloaded?.media,
+            // Stamp the inbound message id on the chat session source
+            // so scheduled-job replies that fire later can thread back
+            // onto this message via Telegram's reply_to_message_id.
+            messageId: incoming.messageId
           });
           // Surface a "typing…" indicator while the agent works, and
           // once the task settles mirror the assistant reply back to

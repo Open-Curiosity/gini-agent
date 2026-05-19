@@ -12,8 +12,9 @@
 // Idempotent: if the run is already terminal, this is a no-op.
 
 import type { RuntimeConfig, Task } from "../types";
-import { addAudit, appendEvent, appendLog, isTerminalTaskStatus, mutateState, now } from "../state";
+import { addAudit, appendEvent, appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { syncChatTaskResult } from "../execution/chat";
+import { sendMessagingOutput } from "../integrations/messaging";
 
 export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task): Promise<void> {
   if (!task.jobId) return;
@@ -106,5 +107,56 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
         error: error instanceof Error ? error.message : String(error)
       });
     }
+    // When the chat session was opened by a messaging bridge (Discord
+    // or Telegram), mirror the freshly-synced assistant reply out to
+    // the originating chat. Without this, a "remind me in 20s" job
+    // would settle quietly in the chat session record but never reach
+    // Discord/Telegram — the agent's promise to follow up would
+    // silently break. We thread onto `lastInboundMessageId` so the
+    // delayed reply lands as a reply to the user's original prompt
+    // (Discord message_reference / Telegram reply_to_message_id);
+    // bridges without a thread anchor still send unthreaded.
+    if (task.status === "completed") {
+      await dispatchJobReplyToBridge(config, chatSessionIdToSync, task);
+    }
+  }
+}
+
+async function dispatchJobReplyToBridge(
+  config: RuntimeConfig,
+  chatSessionId: string,
+  task: Task
+): Promise<void> {
+  const state = readState(config.instance);
+  const session = state.chatSessions.find((candidate) => candidate.id === chatSessionId);
+  if (!session || !session.source) return;
+  const source = session.source;
+  // The synced assistant message is the most recent one on the
+  // session keyed to this task; pick it up from chatMessages so we
+  // never accidentally re-dispatch an older turn.
+  const assistantMessage = state.chatMessages
+    .filter((m) => m.sessionId === chatSessionId && m.taskId === task.id && m.role === "assistant")
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+  const replyText = assistantMessage?.content?.trim();
+  // `[SILENT]` summaries explicitly suppress the bridge mirror — same
+  // convention the inline reply mirror in the pollers honors.
+  if (!replyText || replyText.length === 0) return;
+  if (replyText.startsWith("[SILENT]")) return;
+  try {
+    const replyToMessageId = source.lastInboundMessageId;
+    await sendMessagingOutput(config, source.bridgeId, {
+      text: replyText,
+      target: source.target,
+      ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
+    });
+  } catch (error) {
+    appendLog(config.instance, "job.messaging.dispatch.error", {
+      jobId: task.jobId,
+      taskId: task.id,
+      sessionId: chatSessionId,
+      bridgeId: source.bridgeId,
+      kind: source.kind,
+      error: error instanceof Error ? error.message : String(error)
+    });
   }
 }
