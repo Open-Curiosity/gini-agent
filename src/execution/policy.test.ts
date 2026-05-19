@@ -196,6 +196,51 @@ describe("resolveApprovalPolicy - auto mode (default)", () => {
     expect(decision).toEqual({ mode: "auto", reason: "approval-mode-auto" });
   });
 
+  test("code.exec ignores dangerous tokens that appear only inside comments", () => {
+    // The wrapper embeds the source as a heredoc, so a substring scan
+    // of the wrapper would see the literal `sudo` inside the comment
+    // and gate — defeating the comment-strip pass in
+    // matchDangerousSource. Source-only scanning preserves the
+    // comment-strip contract for both Python and JS/TS.
+    const pythonWrapper = `python3 - <<'PY'\n# subprocess.run(["sudo", "apt"])\nprint("hi")\nPY`;
+    const pythonDecision = resolveApprovalPolicy(config, "code.exec", {
+      command: pythonWrapper,
+      source: `# subprocess.run(["sudo", "apt"])\nprint("hi")`,
+      language: "python"
+    });
+    expect(pythonDecision).toEqual({ mode: "auto", reason: "approval-mode-auto" });
+
+    const jsWrapper = `bun -e ${JSON.stringify(`// Bun.spawn(["sudo", "apt"])\nconsole.log("hi")`)}`;
+    const jsDecision = resolveApprovalPolicy(config, "code.exec", {
+      command: jsWrapper,
+      source: `// Bun.spawn(["sudo", "apt"])\nconsole.log("hi")`,
+      language: "js"
+    });
+    expect(jsDecision).toEqual({ mode: "auto", reason: "approval-mode-auto" });
+  });
+
+  test("code.exec gates string-form os.system / subprocess shell=True", () => {
+    // String-form invocations were previously caught by the wrapper
+    // substring scan. matchDangerousSource must catch them via the
+    // exec-call-site first-arg extraction so removing the wrapper
+    // scan does not regress coverage.
+    const osSystem = resolveApprovalPolicy(config, "code.exec", {
+      command: `python3 - <<'PY'\nos.system("sudo apt update")\nPY`,
+      source: `os.system("sudo apt update")`,
+      language: "python"
+    });
+    expect(osSystem.mode).toBe("gate");
+    expect(osSystem.reason).toContain("sudo");
+
+    const subprocessShell = resolveApprovalPolicy(config, "code.exec", {
+      command: `python3 - <<'PY'\nsubprocess.run("sudo apt", shell=True)\nPY`,
+      source: `subprocess.run("sudo apt", shell=True)`,
+      language: "python"
+    });
+    expect(subprocessShell.mode).toBe("gate");
+    expect(subprocessShell.reason).toContain("sudo");
+  });
+
   test("terminal.exec with no command payload routes through the safe branch", () => {
     // Missing payload → command is empty string → no dangerous match →
     // auto-approve. Pinning this so a refactor doesn't accidentally

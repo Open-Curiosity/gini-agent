@@ -142,26 +142,26 @@ export function resolveApprovalPolicy(
       return { mode: "auto", reason: allowMatch };
     }
 
-    // Match against BOTH the wrapper command AND the raw source.
+    // Source-only structural detection.
     //
-    // - Wrapper scan uses the regular `matchDangerousTerminal` set
-    //   (built-ins + user patterns) — the wrapper is a real shell
-    //   command line, so substring-style matching is correct here.
-    //   `os.system("sudo apt update")` is caught at this stage
-    //   because the heredoc-wrapped source flows through the
-    //   wrapper.
-    // - Source scan uses `matchDangerousSource`, which extracts
-    //   argv-like segments structurally (first element of array
-    //   literals, first arg to known exec functions) before applying
-    //   the built-in matcher set. This closes the argv-style
-    //   `Bun.spawn(["sudo", "apt"])` hole without false-positiving
-    //   comments (`# using sudo`) or incidental string literals
-    //   (`print("using sudo for X")`). User-supplied
-    //   `dangerousTerminalPatterns` are intentionally not applied at
-    //   source level — see auto-approve.ts for the rationale.
-    const patterns = effectiveDangerousPatterns(config);
-    const dangerous =
-      matchDangerousTerminal(patterns, wrapper) ?? matchDangerousSource(source, language);
+    // We intentionally do NOT scan the wrapper command for code.exec.
+    // The wrapper embeds the raw source as a heredoc (e.g.
+    // `python3 - <<'PY' ... PY`), so a substring scan of the wrapper
+    // sees the same text the source scan sees — but without comment
+    // stripping. That made a commented `# subprocess.run(["sudo", ...])`
+    // gate via the wrapper even though `matchDangerousSource` already
+    // stripped it. Source-only scanning preserves the comment-strip
+    // contract while still catching every dangerous shape:
+    //   - argv-style: `Bun.spawn(["sudo", ...])` →
+    //     extractArgvSegments picks up the array literal
+    //   - string-form: `os.system("sudo apt")`,
+    //     `subprocess.run("sudo apt", shell=True)` →
+    //     extractArgvSegments reads the first quoted arg
+    // User-supplied `dangerousTerminalPatterns` are intentionally not
+    // applied at source level — see auto-approve.ts for the rationale.
+    // Operators who want to gate a specific source shape can write
+    // their rule for the terminal.exec path.
+    const dangerous = matchDangerousSource(source, language);
     if (dangerous) {
       return { mode: "gate", reason: `dangerous-pattern: ${dangerous}` };
     }
