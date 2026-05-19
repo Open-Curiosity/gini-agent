@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 1.2.2
+    version: 1.3.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -91,27 +91,24 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:<port>/api/browser
 
 Decision rule on the JSON response:
 
-- `{ "connected": true, "record": { "mode": "managed", ... } }` → a visible Chrome that Gini itself spawned via `gini browser connect` (with no `--url`). This is the only state that guarantees a window the user can see. Proceed to Milestone A.
+- `{ "connected": true, "record": { "mode": "managed", ... } }` → a visible Chrome that Gini itself spawned. This is the only state that guarantees a window the user can see. Proceed to Milestone A.
 - `{ "connected": true, "record": { "mode": "cdp", ... } }` → the agent is attached to a user-supplied Chrome via the Chrome DevTools Protocol. That endpoint *might* be a headed window the user can drive, or it might be a headless Chrome the user happens to have running — `GET /api/browser` only checks that the CDP endpoint exists, not whether it has a visible window. Ask the user explicitly in chat:
   > Looks like you're connected via CDP. Is your Chrome window visible on screen right now? Reply **"yes"** if you can see it — I need to be able to hand sign-in off to you.
 
   Wait for their answer. If they reply yes, proceed to Milestone A. If they reply no, are unsure, or ask to defer, treat the state as "no visible window" (next bullet) — fall through to the auto-spawn path below.
-- `{ "connected": false }` (or `connected: true` with no `record`, or the CDP path above fell through) → no visible window. **Spawn a managed Chrome on the user's behalf — do NOT ask the user to run a CLI command or navigate to a webapp page.** Tell them what's about to happen, then invoke the connect API directly via `terminal_exec`:
+- `{ "connected": false }` (or `connected: true` with no `record`, or the CDP path above fell through) → no visible window. **Spawn a managed Chrome on the user's behalf via the dedicated `browser_connect` tool — do NOT ask the user to run a CLI command, navigate to a webapp page, or call the connect HTTP endpoint via `terminal_exec`.**
 
-  > I'll open a visible Chrome window so you can sign in to Google in the next step. Approve the terminal command when prompted.
+  Call the tool directly:
 
-  Then call `terminal_exec` with:
-
-  ```bash
-  curl -s -X POST -H "Authorization: Bearer $TOKEN" \
-    http://127.0.0.1:$PORT/api/browser/connect
+  ```text
+  browser_connect { reason: "Sign in to Google Cloud Console" }
   ```
 
-  Read `$TOKEN` and `$PORT` from `~/.gini/instances/<instance>/config.json` (`apiToken` and `port` fields). An empty POST body triggers **managed** mode — the runtime spawns a visible Chrome with a per-instance profile dir. The user approves the terminal command once; Chrome pops up; no further user action needed before Milestone A.
+  The user sees an approval card titled **"Open a browser window"** with the reason as the body. Once they approve, the runtime spawns a visible Chrome with a per-instance profile dir and the tool returns `{ success: true, mode: "managed", ... }`. No further user action is required before Milestone A.
 
-  After the POST returns, re-check `GET /api/browser` once. Expect `connected: true` with `record.mode === "managed"`, then proceed to Milestone A.
+  Pass a short, user-facing `reason` that explains *what* the window is for ("Sign in to Google Cloud Console" — not "spawn managed Chrome" or any other internal phrasing). The reason is the only body text the user sees on the approval card.
 
-  If the POST fails (non-2xx, network error, or the re-check still shows `connected: false`), THEN fall back to the manual path: "Open `/browser` in the Gini webapp and click **Connect**, then reply 'done'." Only surface this fallback after the automated path has failed — do not lead with it.
+  If the tool call itself errors (network failure, runtime error — not the user declining), THEN fall back to the manual path: "Open `/browser` in the Gini webapp and click **Connect**, then reply 'done'." Only surface this fallback after the automated path has failed — do not lead with it. If the user declines the approval, respect that and stop — they may want to handle setup manually.
 
 Do **not** start `browser_navigate` against a headless context — the user has no window to act on and the milestone below will stall.
 
