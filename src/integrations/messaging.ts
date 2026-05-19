@@ -821,6 +821,19 @@ export async function sendMessagingOutput(
     (item) => item.id === idOrName || item.name === idOrName
   );
   if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
+  // Reject sends against disabled / errored bridges up front instead
+  // of doing the photo-parse + agent-filter work and then hitting a
+  // missing-secret failure (or worse: completing a send on the
+  // already-disabled bridge's last cached token). This is the
+  // outbound counterpart of the supervisor's shouldRun gate on the
+  // poll loop; it closes most of the disable-vs-send race window
+  // (the tiny gap between this check and the actual fetch is
+  // unavoidable without bridge-level abort, but the check rejects
+  // every case where disable has already landed by the time the
+  // dispatcher fires).
+  if (bridge.status !== "configured") {
+    throw new Error(`Invalid input: Messaging bridge '${idOrName}' is not configured (status: ${bridge.status}).`);
+  }
 
   // Photo input variants. Callers supply at most one of url/fileId/path
   // on `input.photo`. When present, `text` becomes the optional caption;

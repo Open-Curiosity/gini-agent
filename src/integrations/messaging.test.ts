@@ -656,6 +656,30 @@ describe("messaging telegram wiring", () => {
     // returns undefined for a bridge with no refs.
     expect(readBridgeBotToken(config, live!)).toBeUndefined();
   });
+
+  test("sendMessagingOutput rejects a disabled bridge up front (closes the disable-vs-send race)", async () => {
+    // Without the status guard, sendMessagingOutput would proceed
+    // to the photo-parse + agent-filter work and ultimately fail
+    // with a "missing token" once it hit the (now-empty) secret
+    // store. Worse, if the in-process token was cached anywhere,
+    // a send could complete on a freshly-disabled bridge. The
+    // guard rejects the call up front with a 400-mapped error.
+    const config = testConfig("telegram-send-after-disable");
+    const stub = stubClient();
+    setMessagingDeps({ telegramClientFactory: () => stub.client });
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+    await disableMessagingBridge(config, bridge.id);
+    await expect(
+      sendMessagingOutput(config, bridge.id, { text: "should not send", target: "1" })
+    ).rejects.toThrow(/Invalid input: Messaging bridge .* is not configured/);
+    // And the underlying client was never called.
+    expect(stub.calls.filter((c) => c.method === "sendMessage")).toHaveLength(0);
+  });
 });
 
 interface DiscordStubCall { method: string; args: unknown[] }
