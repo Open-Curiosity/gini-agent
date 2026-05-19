@@ -1357,6 +1357,156 @@ describe("runtime api", () => {
     const backfills = audit.filter((row: { action: string }) => row.action === "records.agentid.backfill");
     expect(backfills.length).toBe(1);
   });
+
+  test("AgentContext resolves each source-id branch deterministically", async () => {
+    // Pin the AgentContext contract: each branch in the union resolves to
+    // the agent its source record carries, never to state.activeAgentId.
+    // We exercise every branch from a single test instance so the
+    // resolution matrix lives in one place.
+    const config = testConfig("agent-context-branches");
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    // Seed a task, job, session, and memory under the default agent.
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "branch-test" })
+    });
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "branch-job", prompt: "hi", intervalSeconds: 3600 })
+    });
+    const memory = await call(handler, config, "/api/memory", {
+      method: "POST",
+      body: JSON.stringify({ content: "branch-mem", status: "active" })
+    });
+    await mutateState(config.instance, (state) => {
+      state.tasks.unshift({
+        id: "task_branch",
+        title: "branch",
+        input: "branch task",
+        status: "completed",
+        instance: state.instance,
+        agentId: defaultAgentId,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        memoryIds: [],
+        skillIds: []
+      });
+    });
+    // Switch the active agent so any silent fallback would attribute to
+    // scout rather than the source record's owner.
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    await mutateState(config.instance, (state) => {
+      // explicit agentId branch
+      addAudit(
+        state,
+        { actor: "runtime", action: "test.branch.agentId", target: "explicit", risk: "low" },
+        { agentId: defaultAgentId }
+      );
+      // taskId branch
+      addAudit(
+        state,
+        { actor: "runtime", action: "test.branch.taskId", target: "from-task", risk: "low" },
+        { taskId: "task_branch" }
+      );
+      // jobId branch
+      addAudit(
+        state,
+        { actor: "runtime", action: "test.branch.jobId", target: "from-job", risk: "low" },
+        { jobId: job.id }
+      );
+      // sessionId branch
+      addAudit(
+        state,
+        { actor: "runtime", action: "test.branch.sessionId", target: "from-session", risk: "low" },
+        { sessionId: session.id }
+      );
+      // memoryId branch
+      addAudit(
+        state,
+        { actor: "runtime", action: "test.branch.memoryId", target: "from-memory", risk: "low" },
+        { memoryId: memory.id }
+      );
+      // system: true branch
+      addAudit(
+        state,
+        { actor: "runtime", action: "test.branch.system", target: "system", risk: "low" },
+        { system: true }
+      );
+    });
+    const audit = readState(config.instance).audit;
+    expect(audit.find((a) => a.action === "test.branch.agentId")?.agentId).toBe(defaultAgentId);
+    expect(audit.find((a) => a.action === "test.branch.taskId")?.agentId).toBe(defaultAgentId);
+    expect(audit.find((a) => a.action === "test.branch.jobId")?.agentId).toBe(defaultAgentId);
+    expect(audit.find((a) => a.action === "test.branch.sessionId")?.agentId).toBe(defaultAgentId);
+    expect(audit.find((a) => a.action === "test.branch.memoryId")?.agentId).toBe(defaultAgentId);
+    expect(audit.find((a) => a.action === "test.branch.system")?.agentId).toBeUndefined();
+  });
+
+  test("AgentContext is required at the type level for every emitter", () => {
+    // Pin the type-level invariant: calling appendEvent or addAudit
+    // without an AgentContext is a compile error, not a silent
+    // active-agent fallback. The `@ts-expect-error` directives below
+    // force tsc to confirm the missing third argument is rejected.
+    // If these comments stop catching an error, someone reintroduced a
+    // two-argument overload and the whole point of this refactor is
+    // undone.
+    //
+    // We never actually invoke these — the type check is the assertion.
+    // Wrapping in a `false &&` keeps tsc inspecting the call signature
+    // while keeping the runtime tree-shake-eligible.
+    if (false as boolean) {
+      const state = readState("agent-context-typecheck");
+      // @ts-expect-error appendEvent requires an AgentContext as the third argument.
+      appendEvent(state, { kind: "runtime", action: "no-context", target: "x", risk: "low", summary: "x" });
+      // @ts-expect-error addAudit requires an AgentContext as the third argument.
+      addAudit(state, { actor: "runtime", action: "no-context", target: "x", risk: "low" });
+    }
+    expect(true).toBe(true);
+  });
+
+  test("AgentContext returns undefined when the source record was deleted", async () => {
+    // The contract says: if a sourceId is provided but the record doesn't
+    // exist (deleted, race), resolveAgentId returns undefined. It must NOT
+    // silently fall back to the active agent.
+    const config = testConfig("agent-context-missing-source");
+    const handler = createHandler(config);
+    await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        { actor: "runtime", action: "test.missing.task", target: "x", risk: "low" },
+        { taskId: "task_does_not_exist" }
+      );
+      addAudit(
+        state,
+        { actor: "runtime", action: "test.missing.job", target: "x", risk: "low" },
+        { jobId: "job_does_not_exist" }
+      );
+      addAudit(
+        state,
+        { actor: "runtime", action: "test.missing.session", target: "x", risk: "low" },
+        { sessionId: "chat_does_not_exist" }
+      );
+      addAudit(
+        state,
+        { actor: "runtime", action: "test.missing.memory", target: "x", risk: "low" },
+        { memoryId: "mem_does_not_exist" }
+      );
+    });
+    const audit = readState(config.instance).audit;
+    expect(audit.find((a) => a.action === "test.missing.task")?.agentId).toBeUndefined();
+    expect(audit.find((a) => a.action === "test.missing.job")?.agentId).toBeUndefined();
+    expect(audit.find((a) => a.action === "test.missing.session")?.agentId).toBeUndefined();
+    expect(audit.find((a) => a.action === "test.missing.memory")?.agentId).toBeUndefined();
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
