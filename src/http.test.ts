@@ -876,6 +876,216 @@ describe("runtime api", () => {
     const empty = await call(handler, config, "/api/tasks?agentId=");
     expect(empty.length).toBe(all.length);
   });
+
+  test("stamps the active agent on chat sessions and filters by agentId", async () => {
+    const config = testConfig("records-agentid-chat");
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    const sessionA = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "under default" })
+    });
+    expect(sessionA.agentId).toBe(defaultAgentId);
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    const sessionB = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "under scout" })
+    });
+    expect(sessionB.agentId).toBe(second.id);
+    const scopedDefault = await call(handler, config, `/api/chat?agentId=${encodeURIComponent(defaultAgentId)}`);
+    expect(scopedDefault.some((s: { id: string }) => s.id === sessionA.id)).toBe(true);
+    expect(scopedDefault.some((s: { id: string }) => s.id === sessionB.id)).toBe(false);
+    const scopedScout = await call(handler, config, `/api/chat?agentId=${encodeURIComponent(second.id)}`);
+    expect(scopedScout.some((s: { id: string }) => s.id === sessionB.id)).toBe(true);
+    expect(scopedScout.some((s: { id: string }) => s.id === sessionA.id)).toBe(false);
+  });
+
+  test("stamps the active agent on jobs and filters job listings", async () => {
+    const config = testConfig("records-agentid-jobs");
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    const jobA = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "default-job", prompt: "hello", intervalSeconds: 3600 })
+    });
+    expect(jobA.agentId).toBe(defaultAgentId);
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    const jobB = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout-job", prompt: "hi", intervalSeconds: 3600 })
+    });
+    expect(jobB.agentId).toBe(second.id);
+    const scoped = await call(handler, config, `/api/jobs?agentId=${encodeURIComponent(defaultAgentId)}`);
+    expect(scoped.every((j: { agentId?: string }) => j.agentId === defaultAgentId)).toBe(true);
+    expect(scoped.some((j: { id: string }) => j.id === jobA.id)).toBe(true);
+    expect(scoped.some((j: { id: string }) => j.id === jobB.id)).toBe(false);
+  });
+
+  test("stamps the active agent on subagents and filters by agentId", async () => {
+    const config = testConfig("records-agentid-subagents");
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    const subA = await call(handler, config, "/api/subagents", {
+      method: "POST",
+      body: JSON.stringify({ name: "child-default", prompt: "report" })
+    });
+    expect(subA.agentId).toBe(defaultAgentId);
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    const subB = await call(handler, config, "/api/subagents", {
+      method: "POST",
+      body: JSON.stringify({ name: "child-scout", prompt: "report" })
+    });
+    expect(subB.agentId).toBe(second.id);
+    const scoped = await call(handler, config, `/api/subagents?agentId=${encodeURIComponent(second.id)}`);
+    expect(scoped.every((s: { agentId?: string }) => s.agentId === second.id)).toBe(true);
+    expect(scoped.some((s: { id: string }) => s.id === subB.id)).toBe(true);
+    expect(scoped.some((s: { id: string }) => s.id === subA.id)).toBe(false);
+  });
+
+  test("stamps the active agent on approvals and filters by agentId", async () => {
+    const config = testConfig("records-agentid-approvals");
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    // Seed an approval owned by the default agent. A bare approval row is
+    // enough — the filter inherits agentId from the originating task; here
+    // we set it explicitly to the agent we're testing.
+    await mutateState(config.instance, (state) => {
+      state.approvals.unshift({
+        id: "approval_default_one",
+        instance: state.instance,
+        agentId: defaultAgentId,
+        status: "pending",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        action: "file.write",
+        target: "/tmp/x",
+        risk: "low",
+        reason: "test",
+        payload: {}
+      });
+      state.approvals.unshift({
+        id: "approval_scout_one",
+        instance: state.instance,
+        agentId: second.id,
+        status: "pending",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        action: "file.write",
+        target: "/tmp/y",
+        risk: "low",
+        reason: "test",
+        payload: {}
+      });
+    });
+    const scoped = await call(handler, config, `/api/approvals?agentId=${encodeURIComponent(defaultAgentId)}`);
+    expect(scoped.some((a: { id: string }) => a.id === "approval_default_one")).toBe(true);
+    expect(scoped.some((a: { id: string }) => a.id === "approval_scout_one")).toBe(false);
+  });
+
+  test("stamps the active agent on events and audit and filters listings", async () => {
+    const config = testConfig("records-agentid-events");
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    // The agent.activated audit/event for the second agent should be tagged
+    // with its id — the runtime stamps the active agent via inferAgentId.
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    const events = await call(handler, config, `/api/events?agentId=${encodeURIComponent(second.id)}`);
+    expect(events.every((e: { agentId?: string }) => e.agentId === second.id)).toBe(true);
+    expect(events.some((e: { action: string }) => e.action === "agent.activated")).toBe(true);
+    const defaultEvents = await call(handler, config, `/api/events?agentId=${encodeURIComponent(defaultAgentId)}`);
+    expect(defaultEvents.every((e: { agentId?: string }) => e.agentId === defaultAgentId)).toBe(true);
+    const audit = await call(handler, config, `/api/audit?agentId=${encodeURIComponent(second.id)}`);
+    expect(audit.every((a: { agentId?: string }) => a.agentId === second.id)).toBe(true);
+  });
+
+  test("migrateRecordAgentIds is idempotent across repeated reads", async () => {
+    const config = testConfig("records-agentid-idempotent");
+    const handler = createHandler(config);
+    // Seed an unstamped task to force a backfill on the first read.
+    await mutateState(config.instance, (state) => {
+      state.tasks.unshift({
+        id: "task_legacy_one",
+        title: "legacy",
+        input: "legacy task",
+        status: "completed",
+        instance: state.instance,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        memoryIds: [],
+        skillIds: []
+      });
+    });
+    // Trigger reads to run normalizeState multiple times.
+    await call(handler, config, "/api/tasks");
+    await call(handler, config, "/api/tasks");
+    await call(handler, config, "/api/tasks");
+    const audit = await call(handler, config, "/api/audit");
+    const backfills = audit.filter((row: { action: string }) => row.action === "records.agentid.backfill");
+    // Exactly one backfill row should exist regardless of how many reads.
+    expect(backfills.length).toBe(1);
+  });
+
+  test("scheduled job fired after agent switch attributes the task to the originating agent", async () => {
+    const config = testConfig("records-agentid-job-fire");
+    const handler = createHandler(config);
+    config.workspaceRoot = process.cwd();
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    // Create the job under the default agent.
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "owner-test", prompt: "read README.md", intervalSeconds: 3600 })
+    });
+    expect(job.agentId).toBe(defaultAgentId);
+    // Switch the active agent *before* the job fires.
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    // Fire the job manually (the dispatch path is shared with the scheduler).
+    await call(handler, config, `/api/jobs/${job.id}/run`, { method: "POST" });
+    // Allow the task to settle. The task gets stamped at submitTask time;
+    // we don't need full completion, just any state where the task exists.
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const tasks = await call(handler, config, "/api/tasks");
+      const owned = tasks.find((t: { jobId?: string; agentId?: string; status: string }) => t.jobId === job.id);
+      if (owned) {
+        expect(owned.agentId).toBe(defaultAgentId);
+        return;
+      }
+      await Bun.sleep(10);
+    }
+    throw new Error("job task did not appear in the tasks listing");
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
