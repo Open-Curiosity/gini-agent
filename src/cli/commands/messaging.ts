@@ -42,11 +42,23 @@ export async function messaging(ctx: CliContext): Promise<void> {
     return;
   }
   if (sub === "receive" || sub === "send") {
-    const [id, ...textParts] = restAfter(cliArgs, sub);
-    if (!id || textParts.length === 0) throw new Error(`Usage: gini messaging ${sub} <bridge-id-or-name> <text>`);
+    // CLI parses positional args plus a `--target <id>` flag. The
+    // target defaults to "local" for demo bridges; Telegram and
+    // Discord callers need to pass the real chat / channel id
+    // because the receive/send pipelines validate it per-kind and
+    // a literal "local" string would produce a "Telegram inbound
+    // target must be a numeric chat_id (got 'local')" or
+    // "Discord inbound target (channel id) is required" error.
+    const tail = restAfter(cliArgs, sub);
+    const parsed = parseSubArgs(tail, new Set(["--target"]));
+    const [id, ...textParts] = parsed.positional;
+    if (!id || textParts.length === 0) {
+      throw new Error(`Usage: gini messaging ${sub} <bridge-id-or-name> <text> [--target <id>]`);
+    }
+    const target = parsed.flags["--target"] ?? "local";
     print(await api(config, `/api/messaging/${encodeURIComponent(id)}/${sub}`, {
       method: "POST",
-      body: JSON.stringify({ text: textParts.join(" "), target: "local" })
+      body: JSON.stringify({ text: textParts.join(" "), target })
     }));
     return;
   }

@@ -9,13 +9,13 @@
 
 import { mkdirSync } from "node:fs";
 import { extname, join } from "node:path";
-import type { MessagingBridgeRecord, MessagingMessageMedia, RuntimeConfig } from "../types";
+import type { MessagingBridgeRecord, MessagingMessageMedia, RuntimeConfig, TaskStatus } from "../types";
 import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
-import { instanceRoot } from "../paths";
 import {
   authorizeTelegramChat,
   findTelegramChatSession,
   hasActivePairingCode,
+  isBotTokenRef,
   readBridgeBotToken,
   receiveMessagingInput,
   recordDeniedChatAttempt,
@@ -23,6 +23,12 @@ import {
   tryClaimPairingCode
 } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
+import {
+  awaitTerminalTask,
+  createDetachedTracker,
+  markBridgeError,
+  sleepUnlessAborted
+} from "./messaging-poller-helpers";
 import {
   createTelegramClient,
   extractIncomingPayload,
@@ -69,17 +75,28 @@ export function createTelegramPollerSupervisor(
   const loops = new Map<string, RunningLoop>();
   const factory = deps.clientFactory ?? ((token: string) => createTelegramClient(token));
   let stopped = false;
+  // Shared detached-worker tracker. The drain has a bounded timeout
+  // so a hung Telegram send can't deadlock shutdown. `sendChatAction`
+  // now threads AbortSignal so typing-pulse fetches cancel in-flight;
+  // `sendMessage` / `sendPhoto` still don't, so the drain cap remains
+  // the upper bound on shutdown latency.
+  const detached = createDetachedTracker(config, "messaging.telegram.detached_drain_timeout");
 
   function shouldRun(bridge: MessagingBridgeRecord): boolean {
     if (bridge.kind !== "telegram") return false;
     if (bridge.status !== "configured") return false;
-    return Boolean(bridge.secretRefs?.some((ref) => ref.purpose === "bot-token"));
+    return Boolean(bridge.secretRefs?.some(isBotTokenRef));
   }
 
   function startLoop(bridgeId: string): void {
     if (loops.has(bridgeId) || stopped) return;
     const controller = new AbortController();
-    const done = runLoop(config, bridgeId, controller.signal, factory).finally(() => {
+    const done = runLoop(config, bridgeId, controller.signal, factory, detached.track).finally(() => {
+      // Always abort the controller when the loop exits, so detached
+      // children captured this signal observe abort and unwind on
+      // natural returns (status flip, missing secret) as well as on
+      // stopAll-driven aborts.
+      controller.abort();
       loops.delete(bridgeId);
     });
     loops.set(bridgeId, { controller, done });
@@ -110,6 +127,12 @@ export function createTelegramPollerSupervisor(
       stopped = true;
       for (const loop of loops.values()) loop.controller.abort();
       await Promise.all(Array.from(loops.values()).map((loop) => loop.done.catch(() => {})));
+      // Drain detached workers with a bounded timeout. The Telegram
+      // client now threads AbortSignal into sendChatAction, but
+      // sendMessage / sendPhoto still don't accept one — a hung send
+      // on those would otherwise keep stopAll pending forever, so the
+      // drain cap is the upper bound on shutdown latency.
+      await detached.drain();
     },
     size() {
       return loops.size;
@@ -121,13 +144,42 @@ async function runLoop(
   config: RuntimeConfig,
   bridgeId: string,
   signal: AbortSignal,
-  factory: (token: string) => TelegramClient
+  factory: (token: string) => TelegramClient,
+  trackDetached: (work: Promise<void>) => void
 ): Promise<void> {
   while (!signal.aborted) {
     const bridge = readState(config.instance).messagingBridges.find((item) => item.id === bridgeId);
     if (!bridge || bridge.kind !== "telegram" || bridge.status !== "configured") return;
-    const token = readBridgeBotToken(config, bridge);
-    if (!token) return;
+    // readBridgeBotToken throws ENOENT if the encrypted secret file is
+    // missing under the secretRef path (rotation, manual deletion,
+    // corruption). Without a catch the rejection propagates out of
+    // the loop and the supervisor reconcile restarts it on every
+    // tick because shouldRun only checks for the secretRef entry,
+    // not the file. Flip the bridge to "error" so the supervisor
+    // drops it until the user re-supplies the token.
+    let token: string | undefined;
+    try {
+      token = readBridgeBotToken(config, bridge);
+    } catch (error) {
+      await markBridgeError(
+        config,
+        bridgeId,
+        "messaging.telegram.token_error",
+        "messaging.telegram.mark_error_failed",
+        error
+      );
+      return;
+    }
+    if (!token) {
+      await markBridgeError(
+        config,
+        bridgeId,
+        "messaging.telegram.token_error",
+        "messaging.telegram.mark_error_failed",
+        new Error("Telegram bot token secret is missing.")
+      );
+      return;
+    }
 
     const offset = readLastOffset(bridge);
     let client: TelegramClient;
@@ -256,15 +308,21 @@ async function runLoop(
           const record = await receiveMessagingInput(config, bridgeId, {
             text: taskInput,
             target: String(incoming.chatId),
-            media: downloaded?.media
+            media: downloaded?.media,
+            // Stamp the inbound message id on the chat session source
+            // so scheduled-job replies that fire later can thread back
+            // onto this message via Telegram's reply_to_message_id.
+            messageId: incoming.messageId
           });
           // Surface a "typing…" indicator while the agent works, and
           // once the task settles mirror the assistant reply back to
           // the originating chat. The pulse is best-effort and runs
           // detached so a slow chat_action call doesn't block the
-          // next update.
+          // next update. Tracked via trackDetached so stopAll awaits
+          // the in-flight state writes — see the matching shape in
+          // src/integrations/discord-poller.ts.
           if (record.taskId) {
-            void maintainTypingAndMirrorReply(
+            const work = maintainTypingAndMirrorReply(
               config,
               bridgeId,
               record.taskId,
@@ -278,6 +336,7 @@ async function runLoop(
                 error: error instanceof Error ? error.message : String(error)
               });
             });
+            trackDetached(work);
           }
         } catch (error) {
           appendLog(config.instance, "messaging.telegram.receive_error", {
@@ -324,50 +383,114 @@ async function maintainTypingAndMirrorReply(
   signal: AbortSignal,
   replyToMessageId?: number
 ): Promise<void> {
-  await maintainTypingIndicator(config, taskId, chatId, client, signal);
-  if (signal.aborted) return;
-
-  // Resolve the chat session for this (bridge, chat) so we can land
-  // the assistant message and look up the dispatch target. The session
-  // exists because receiveMessagingInput went through the chat path.
-  const session = findTelegramChatSession(config, bridgeId, chatId);
-  if (!session || !session.source || session.source.kind !== "telegram") return;
-
-  let replyText: string | undefined;
-  try {
-    const message = await syncChatTaskResult(config, session.id, taskId);
-    if (message && message.role === "assistant") replyText = message.content;
-  } catch (error) {
-    appendLog(config.instance, "messaging.telegram.sync_error", {
-      bridgeId,
-      taskId,
-      error: error instanceof Error ? error.message : String(error)
-    });
-    return;
-  }
-
-  // Empty replies or [SILENT]-suppressed messages produce nothing to
-  // dispatch — leave the inbound record in place but stay quiet.
-  if (!replyText || replyText.trim().length === 0) return;
+  // Typing pulse runs concurrent with the terminal-wait so a typing
+  // failure doesn't gate the reply, and a non-terminal task can't
+  // keep the pulse alive past the shared deadline.
+  //
+  // The pulse runs on a child controller derived from the supervisor
+  // signal. We trip the child the moment awaitTerminalTask returns
+  // (terminal or not), so:
+  //   1. a stuck task whose typing keeps succeeding can't pin the
+  //      `await typingDone` below — without this, reply_skip_non_terminal
+  //      would never fire and the worker would never settle;
+  //   2. the typing fetch itself observes the abort via the threaded
+  //      signal on sendChatAction, so it cancels in-flight instead
+  //      of dangling past the detached-tracker drain window.
+  const typingController = new AbortController();
+  const propagateAbort = () => typingController.abort();
+  if (signal.aborted) typingController.abort();
+  else signal.addEventListener("abort", propagateAbort, { once: true });
 
   try {
-    // Thread the originating taskId so the outbound row and its
-    // messaging.sent audit attribute back to the owning agent rather
-    // than landing unattributed at the bridge level.
-    await sendMessagingOutput(config, bridgeId, {
-      text: replyText,
-      target: session.source.target,
+    const typingDone = maintainTypingIndicator(
+      config,
       taskId,
-      ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
+      chatId,
+      client,
+      typingController.signal
+    ).catch((error) => {
+      // Errors are already logged inside maintainTypingIndicator;
+      // the catch here just prevents an unhandled rejection.
+      void error;
     });
-  } catch (error) {
-    appendLog(config.instance, "messaging.telegram.reply_error", {
-      bridgeId,
-      taskId,
-      error: error instanceof Error ? error.message : String(error)
-    });
+
+    let terminalStatus: TaskStatus | undefined;
+    try {
+      // Gate the reply on terminal state — on timeout we get a
+      // non-terminal status back and skip the sync cleanly.
+      terminalStatus = await awaitTerminalTask(
+        config,
+        taskId,
+        signal,
+        "messaging.telegram.task_wait_timeout"
+      );
+    } finally {
+      typingController.abort();
+      await typingDone;
+    }
+
+    if (signal.aborted) return;
+    if (terminalStatus === undefined || !isTerminalTaskStatus(terminalStatus)) {
+      appendLog(config.instance, "messaging.telegram.reply_skip_non_terminal", {
+        bridgeId,
+        taskId,
+        status: terminalStatus
+      });
+      return;
+    }
+
+    // Resolve the chat session for this (bridge, chat) so we can land
+    // the assistant message and look up the dispatch target. The
+    // session exists because receiveMessagingInput went through the
+    // chat path.
+    const session = findTelegramChatSession(config, bridgeId, chatId);
+    if (!session || !session.source || session.source.kind !== "telegram") return;
+
+    let replyText: string | undefined;
+    try {
+      const message = await syncChatTaskResult(config, session.id, taskId);
+      if (message && message.role === "assistant") replyText = message.content;
+    } catch (error) {
+      appendLog(config.instance, "messaging.telegram.sync_error", {
+        bridgeId,
+        taskId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return;
+    }
+
+    // Empty replies or [SILENT]-suppressed messages produce nothing to
+    // dispatch — leave the inbound record in place but stay quiet.
+    if (!replyText || replyText.trim().length === 0) return;
+
+    try {
+      // Thread the originating taskId so the outbound row and its
+      // messaging.sent audit attribute back to the owning agent rather
+      // than landing unattributed at the bridge level.
+      await sendMessagingOutput(config, bridgeId, {
+        text: replyText,
+        target: session.source.target,
+        taskId,
+        ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
+      });
+    } catch (error) {
+      appendLog(config.instance, "messaging.telegram.reply_error", {
+        bridgeId,
+        taskId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  } finally {
+    signal.removeEventListener("abort", propagateAbort);
   }
 }
+
+// Test seam: exposes the reply mirror so the timeout + cleanup
+// invariants can be exercised in isolation. Production callers go
+// through the supervisor path.
+export const __internalsForTests = {
+  maintainTypingAndMirrorReply
+};
 
 // Refresh sendChatAction("typing") on a ~4s cadence for as long as the
 // originating task is in a non-terminal state. The first action fires
@@ -386,19 +509,34 @@ async function maintainTypingIndicator(
     if (!task) return;
     if (isTerminalTaskStatus(task.status)) return;
     try {
-      await client.sendChatAction(chatId, "typing");
-    } catch {
+      // Thread the typing controller's signal so a hung fetch
+      // observes abort instead of leaving a worker pinned past the
+      // detached-tracker drain window.
+      await client.sendChatAction(chatId, "typing", signal);
+    } catch (error) {
+      // Match Discord's typing loop: aborts during shutdown / disable
+      // stay quiet, anything else lands a single log row so an
+      // operator can see why the indicator stopped. The pulse still
+      // abandons after one error — the reply mirror is decoupled and
+      // will land the assistant message when the task settles.
+      if (signal.aborted) return;
+      appendLog(config.instance, "messaging.telegram.typing_pulse_error", {
+        chatId,
+        error: error instanceof Error ? error.message : String(error)
+      });
       return;
     }
     await sleepUnlessAborted(TYPING_REFRESH_MS, signal);
   }
 }
 
-// Resolve an inbound photo's file_id to a local path under the instance
-// inbound directory. The path is stable across restarts (keyed on
+// Resolve an inbound photo's file_id to a local path under the workspace's
+// .gini/inbound/ directory. The path is stable across restarts (keyed on
 // bridge + update_id + file_id), and the media descriptor records both
 // the local path and the Telegram file_id so the agent can re-fetch via
-// sendPhoto if it needs to echo the image back.
+// sendPhoto if it needs to echo the image back. Landing under
+// workspaceRoot keeps the file inside the agent's file-tool boundary so
+// `[photo: <path>]` in the task input is actually readable.
 async function downloadIncomingPhoto(
   config: RuntimeConfig,
   bridgeId: string,
@@ -413,7 +551,7 @@ async function downloadIncomingPhoto(
   }
   const bytes = await client.downloadFile(file.file_path);
   const ext = (extname(file.file_path) || ".jpg").toLowerCase();
-  const dir = join(instanceRoot(config.instance), "inbound", bridgeId);
+  const dir = join(config.workspaceRoot, ".gini", "inbound", bridgeId);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `${updateId}-${incoming.photo.file_id}${ext}`);
   await Bun.write(path, bytes);
@@ -441,20 +579,4 @@ function buildTaskInput(incoming: IncomingPayload, savedPath: string | undefined
     : incoming.text;
   if (body) parts.push(body);
   return parts.join("\n");
-}
-
-async function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return;
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
 }

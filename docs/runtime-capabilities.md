@@ -36,14 +36,14 @@ bun run gini evidence
 | Search | `gini search <query>`, `/api/search` with task, trace, memory, skill, and audit citations |
 | Jobs | `gini jobs list/add/run/pause/resume/remove/runs/replay`, prompt jobs, and script jobs |
 | File tools | task inputs: `read`, `list`, `find`, `write`, `patch` |
-| Terminal/code tools | task inputs: `shell`, `code js|python :: ...`, approval gated (see `dangerouslyAutoApprove` in `docs/operations.md` and ADR dangerously-auto-approve.md for the opt-in global bypass) |
-| Approval settings | `GET/PATCH /api/settings/auto-approve` for `autoApproveCommands` (shell-glob allowlist for `terminal_exec`) and `dangerouslyAutoApprove` (global bypass for every approval-gated tool) |
+| Terminal/code tools | task inputs: `shell`, `code js|python :: ...`, approval gated under `approvalMode: "strict"`; under the default `"auto"` mode safe commands auto-run and dangerous shapes still gate (see ADR approval-mode.md) |
+| Approval settings | `GET/PATCH /api/settings/auto-approve` for `approvalMode` (`strict`/`auto`/`yolo`), `autoApproveCommands` (shell-glob allowlist for `terminal_exec`), and `dangerousTerminalPatterns` (operator extension to the built-in blocklist) |
 | Toolsets | `gini toolsets list/enable/disable`, `/api/toolsets` |
 | Providers | `gini provider show/catalog/set`, Codex OAuth, OpenAI, OpenRouter-compatible records, echo |
 | Runtime updates | `gini update`, `/api/version`, `/api/update/check`, `/api/update`; installer-managed web runtimes show the current package/git version and can trigger an update |
 | Delegation records | `gini subagents list/spawn`, `/api/subagents` |
 | MCP/plugin records | `gini mcp list/add/health/invoke/disable` |
-| Messaging bridge records | `gini messaging list/add/health/receive/send/messages/disable`; inbound messages create tasks |
+| Messaging bridge records | `gini messaging list/add/health/receive/send/messages/disable`; inbound messages create tasks. Telegram bridges support per-chat enrollment via `gini messaging pair/allow/deny/chats` (no trust-on-first-use; every chat denied until enrolled or pairing-code claimed). Discord uses channel-as-auth — every non-bot poster in a configured `deliveryTargets` channel can submit, see [Discord bridge ADR](adr/discord-bridge.md) for the Message Content Intent setup step |
 | Agents/config | `gini agents list/create/use/delete`, instance-aware config |
 | Import inspection | `gini import inspect openclaw <path>`, read-only by default |
 | Self-improvement proposals | `gini improvements propose/approve/reject`, trace-backed application |

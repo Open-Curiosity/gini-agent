@@ -1,5 +1,5 @@
 import { writeFileSync } from "node:fs";
-import type { RuntimeConfig } from "./types";
+import type { ApprovalMode, RuntimeConfig } from "./types";
 import { cancelTask, decideApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import { readState, readTrace } from "./state";
@@ -25,7 +25,7 @@ import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
 import { resolveEffectiveContext } from "./execution/effective-context";
-import { connectBrowser, disconnectBrowser, getBrowserConnection, wipeBrowserProfile } from "./capabilities/browser-connect";
+import { connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { getSetupStatus, setSetupProvider } from "./runtime/setup-api";
@@ -52,20 +52,58 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
     // Settings: auto-approve controls.
     //   - `patterns`: shell-glob allowlist for terminal_exec only.
-    //   - `dangerouslyAutoApprove`: global bypass for every
-    //     approval-gated tool in the chat-task dispatcher (also the
-    //     legacy imperative path; see RuntimeConfig.dangerouslyAutoApprove
-    //     for scope).
-    // PATCH accepts either field individually or both together; omitted
-    // keys are left at their current value.
-    ["GET", /^\/api\/settings\/auto-approve$/, () => json({
-      patterns: config.autoApproveCommands ?? [],
-      dangerouslyAutoApprove: Boolean(config.dangerouslyAutoApprove),
-    })],
+    //     Allowlist match short-circuits the dangerous-pattern blocklist.
+    //   - `approvalMode`: "strict" | "auto" | "yolo". See ADR
+    //     approval-mode.md for the contract. Fresh instances default
+    //     to "auto".
+    //   - `dangerousTerminalPatterns`: optional operator overlay for
+    //     the built-in dangerous-pattern blocklist; only consulted when
+    //     `approvalMode === "auto"`.
+    //   - `dangerouslyAutoApprove`: deprecated read alias for
+    //     `approvalMode === "yolo"`. Accepted as a write alias too —
+    //     setting it true is equivalent to `approvalMode: "yolo"`.
+    // PATCH accepts any subset of fields together; omitted keys are
+    // left at their current value.
+    ["GET", /^\/api\/settings\/auto-approve$/, () => {
+      const approvalMode = config.approvalMode ?? (config.dangerouslyAutoApprove ? "yolo" : "auto");
+      return json({
+        patterns: config.autoApproveCommands ?? [],
+        approvalMode,
+        dangerousTerminalPatterns: config.dangerousTerminalPatterns ?? [],
+        // Derived read-only alias kept for legacy clients.
+        dangerouslyAutoApprove: approvalMode === "yolo",
+      });
+    }],
     ["PATCH", /^\/api\/settings\/auto-approve$/, async (request) => {
       const payload = await body(request);
+      // Validate strictly. Previously an out-of-union value was mapped
+      // to undefined and the PATCH silently no-op'd that field while
+      // returning 200 — the client thought it succeeded. Job-level
+      // approvalMode validation already rejects unknown values; mirror
+      // that contract at the HTTP boundary too.
+      let approvalMode: ApprovalMode | undefined;
+      if (payload.approvalMode !== undefined && payload.approvalMode !== null) {
+        if (
+          payload.approvalMode !== "strict" &&
+          payload.approvalMode !== "auto" &&
+          payload.approvalMode !== "yolo"
+        ) {
+          return json(
+            {
+              error: `approvalMode must be one of "strict" | "auto" | "yolo" (got ${JSON.stringify(payload.approvalMode)})`,
+              validValues: ["strict", "auto", "yolo"]
+            },
+            400
+          );
+        }
+        approvalMode = payload.approvalMode;
+      }
       return json(updateAutoApproveSettings(config, {
         patterns: Array.isArray(payload.patterns) ? payload.patterns.map(String) : undefined,
+        approvalMode,
+        dangerousTerminalPatterns: Array.isArray(payload.dangerousTerminalPatterns)
+          ? payload.dangerousTerminalPatterns.map(String)
+          : undefined,
         dangerouslyAutoApprove: typeof payload.dangerouslyAutoApprove === "boolean" ? payload.dangerouslyAutoApprove : undefined
       }));
     }],
@@ -393,7 +431,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(await connectBrowser(config, payload), 201);
     }],
     ["POST", /^\/api\/browser\/disconnect$/, async () => json(await disconnectBrowser(config))],
-    ["POST", /^\/api\/browser\/wipe-profile$/, async () => json(await wipeBrowserProfile(config))],
     ["GET", /^\/api\/toolsets$/, () => json(listToolsets(config))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/enable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "enabled"))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "disabled"))],
@@ -424,11 +461,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/messaging\/([^/]+)\/chats$/, (_request, params) => json(listAllowedChats(config, params[0]))],
     ["POST", /^\/api\/messaging\/([^/]+)\/allow$/, async (request, params) => {
       const payload = await body(request);
-      return json(await allowChat(config, params[0], Number(payload.chatId)));
+      const chatId = parseChatIdStrict(payload.chatId);
+      return json(await allowChat(config, params[0], chatId));
     }],
     ["POST", /^\/api\/messaging\/([^/]+)\/deny$/, async (request, params) => {
       const payload = await body(request);
-      return json(await denyChat(config, params[0], Number(payload.chatId)));
+      const chatId = parseChatIdStrict(payload.chatId);
+      return json(await denyChat(config, params[0], chatId));
     }],
     ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],
     // Browser-driven onboarding endpoints. The webapp's /setup route polls
@@ -502,6 +541,26 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   };
 }
 
+// Strict parse for Telegram chat_id values on the allow/deny endpoints.
+// `Number(null)` / `Number("")` / `Number(undefined)` all coerce to 0 (or
+// NaN), so without this guard a malformed payload would either enroll
+// chat 0 (which is the JSON sentinel allowed-everyone, NOT what the
+// caller intended) or throw deep in mutateState — neither is what an
+// API caller should get back. Accept only finite safe integers
+// (including negatives — Telegram group chat_ids are negative).
+function parseChatIdStrict(raw: unknown): number {
+  if (typeof raw === "number" && Number.isFinite(raw) && Number.isSafeInteger(raw)) return raw;
+  if (typeof raw === "string" && /^-?\d+$/.test(raw)) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && Number.isSafeInteger(parsed)) return parsed;
+  }
+  // Use the "Invalid input:" prefix so statusFromErrorMessage maps
+  // this to a 400 instead of a catch-all 500. Without the prefix, a
+  // malformed allow/deny payload would surface as "internal error"
+  // even though the caller's input is what's broken.
+  throw new Error(`Invalid input: chatId must be a finite integer (got ${JSON.stringify(raw)}).`);
+}
+
 async function body(request: Request): Promise<Record<string, unknown>> {
   if (!request.body) return {};
   return (await request.json()) as Record<string, unknown>;
@@ -556,6 +615,23 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Could not reach CDP endpoint")) return 400;
   if (message.startsWith("Could not locate")) return 400;
   if (message.startsWith("Web update is only available")) return 400;
+  // Messaging-bridge surface throws plain Error strings rather than the
+  // "Invalid input:" prefix the rest of the codebase uses. Map the
+  // expected user-error shapes to 400 / 404 so the HTTP layer doesn't
+  // collapse them to a misleading 500.
+  if (message.startsWith("Messaging bridge not found")) return 404;
+  if (message.startsWith("Messaging bridge is not configured")) return 400;
+  if (message.startsWith("Messaging bridge name is required")) return 400;
+  if (/^(Telegram|Discord) bridges require a botToken/.test(message)) return 400;
+  if (/^(Telegram|Discord) bot token contains invalid characters/.test(message)) return 400;
+  if (message.startsWith("Inbound message text or media is required")) return 400;
+  if (message.startsWith("Telegram inbound target must be")) return 400;
+  if (message.startsWith("Discord inbound target")) return 400;
+  if (message.startsWith("Outbound message requires")) return 400;
+  if (message.startsWith("Pairing codes only apply")) return 400;
+  if (message.startsWith("Chat allowlist only applies")) return 400;
+  if (message.startsWith("chatId must be")) return 400;
+  if (/^Target '.+' not permitted by active agent/.test(message)) return 400;
   return 500;
 }
 

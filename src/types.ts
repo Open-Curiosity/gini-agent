@@ -133,6 +133,31 @@ export interface ProviderConfig {
   extraBody?: Record<string, unknown>;
 }
 
+// Approval policy mode for the per-instance runtime and per-job overlay.
+//
+// - "strict" — every approval-eligible action creates a pending approval
+//   row and pauses the task for a human decision. Matches the legacy
+//   pre-flip default.
+// - "auto" — the new default. Auto-approve `file.write`, `file.patch`,
+//   and `browser.upload_file` unconditionally. For `terminal.exec` and
+//   `code_exec`, auto-approve unless the command (or, for `code_exec`,
+//   either the shell wrapper OR the raw source — see
+//   `matchDangerousSource`) matches a dangerous-pattern entry (see
+//   `dangerousTerminalPatterns` + `DEFAULT_DANGEROUS_TERMINAL_PATTERNS`
+//   in src/execution/auto-approve.ts). `autoApproveCommands` allowlist
+//   always short-circuits any blocklist match — explicit operator opt-in
+//   beats a heuristic blocklist hit.
+// - "yolo" — full bypass for every approval-gated tool. Same audit
+//   contract as the legacy `dangerouslyAutoApprove: true`: each call
+//   still produces an approval row (status="approved") and matching
+//   audit rows stamped `evidence.autoApproved=true` plus
+//   `evidence.autoApprovedReason="approval-mode-yolo"`.
+//
+// See ADR approval-mode.md for the full audit contract and the
+// migration shim that aliases legacy `dangerouslyAutoApprove: true` to
+// `approvalMode: "yolo"` on load.
+export type ApprovalMode = "strict" | "auto" | "yolo";
+
 export interface RuntimeConfig {
   instance: Instance;
   port: number;
@@ -147,18 +172,31 @@ export interface RuntimeConfig {
   // executions still write a `terminal.exec` audit row with
   // evidence.autoApproved=true plus the matched pattern, so the activity
   // trail stays intact. Empty / undefined means no auto-approval.
+  // The allowlist always short-circuits the `auto`-mode dangerous-pattern
+  // blocklist below — explicit operator opt-in wins over the heuristic.
   autoApproveCommands?: string[];
-  // When true, bypass the approval gate for every approval-gated tool —
-  // chat-task (file_write, file_patch, terminal_exec, code_exec,
-  // browser_upload_file) AND the legacy imperative dispatch path
-  // (`POST /api/tasks` / `gini task submit "write …"`). Each call
-  // still produces an approval row (status="approved") and matching
-  // audit rows (approval.approved and the per-action side-effect row)
-  // carry `evidence.autoApproved=true` plus
-  // `evidence.autoApprovedReason="dangerouslyAutoApprove"`, so the
-  // trail stays inspectable — only the human gate is skipped.
-  // Intended for operator-controlled dev-mode use only. See ADR dangerously-auto-approve.md for the
-  // full audit contract.
+  // Approval-policy mode. Drives `resolveApprovalPolicy`. Fresh instances
+  // default to "auto" via `defaultConfig`. Legacy config files that carry
+  // `dangerouslyAutoApprove: true` without an `approvalMode` set are
+  // migrated to "yolo" at load time and emit a one-time `config.migrated`
+  // audit row. See ADR approval-mode.md.
+  approvalMode?: ApprovalMode;
+  // Optional operator-supplied list of substring patterns that should
+  // GATE a `terminal.exec` call even under `approvalMode: "auto"`. Each
+  // entry is matched as a literal substring against the full command
+  // string (see `userDangerousPatterns` in
+  // `src/execution/auto-approve.ts`). When omitted, only the built-in
+  // `DEFAULT_DANGEROUS_TERMINAL_PATTERNS` apply. The
+  // `autoApproveCommands` allowlist still short-circuits this list — an
+  // explicit allow beats the blocklist.
+  dangerousTerminalPatterns?: string[];
+  // Deprecated alias for `approvalMode === "yolo"`. Kept on the config
+  // shape because (a) older `config.json` files on disk reference it,
+  // (b) tests and the `create_job` tool spec accept it, and (c) the
+  // `/api/settings/auto-approve` GET response surfaces it as a derived
+  // boolean so legacy clients still work. Writes via PATCH are accepted
+  // as an alias for `approvalMode: "yolo"`. New code should read
+  // `approvalMode` instead. Will be removed in a future release.
   dangerouslyAutoApprove?: boolean;
   // Power-user agent budget knobs. Lives under a nested `agent` namespace so
   // future budgets (token cap, wall-clock cap, etc.) can hang off the same
@@ -371,16 +409,42 @@ export interface ChatSessionRecord {
   runIds: string[];
   summary?: string;
   // Origin descriptor when the session was created by a non-UI surface.
-  // The web chat omits this; the Telegram bridge sets `kind: "telegram"`
-  // so the runtime can mirror assistant replies back out to the chat the
-  // user started in. The same shape generalizes to future bridges
-  // (Discord, Slack, …) — `target` is the bridge-specific addressing
+  // The web chat omits this; messaging bridges (Telegram, Discord) set
+  // `kind` to the bridge kind ("telegram" | "discord") with the
+  // owning bridge id in a separate `bridgeId` field, so the runtime
+  // can mirror assistant replies back out to the chat / channel the
+  // user started in. `target` is the bridge-specific addressing
   // string passed back to sendMessagingOutput.
+  //
+  // `source` doubles as the routing key for inbound: the poller's
+  // findOrCreate*ChatSession helpers match on (kind, bridgeId,
+  // chatId|channelId), so setting `source` on a session that should
+  // NOT receive inbound (e.g., a dedicated job-spawned session that
+  // only mirrors OUTBOUND back to the originating chat) would cause
+  // the live channel's next inbound to land in the job thread. Use
+  // `outboundMirror` for the outbound-only case.
   source?: ChatSessionSource;
+  // Outbound-only mirror descriptor. Populated on dedicated job
+  // sessions so a scheduled "remind me in 20s" task can dispatch its
+  // reply back through the originating bridge without competing with
+  // the live channel session for inbound routing. finalize.ts reads
+  // `outboundMirror ?? source` so live sessions (where the two are
+  // the same) continue to work unchanged.
+  outboundMirror?: ChatSessionSource;
 }
 
+// `lastInboundMessageId` is the most recent originating-message id the
+// chat session received from the bridge — Telegram's numeric
+// `message_id` (the per-chat id used by `reply_to_message_id`, NOT
+// the update id) or Discord's message snowflake string (used by
+// `message_reference.message_id`). It's what scheduled-job replies
+// use to thread their delayed dispatch onto the original user
+// message. The field is updated by the poller every time a new
+// inbound lands so a long-running session always threads onto the
+// most recent prompt.
 export type ChatSessionSource =
-  | { kind: "telegram"; bridgeId: string; chatId: number; target: string };
+  | { kind: "telegram"; bridgeId: string; chatId: number; target: string; lastInboundMessageId?: number }
+  | { kind: "discord"; bridgeId: string; channelId: string; target: string; lastInboundMessageId?: string };
 
 export interface ChatMessageRecord {
   id: string;
@@ -490,13 +554,26 @@ export interface MessagingBridgeRecord {
   message?: string;
   createdAt: string;
   updatedAt: string;
-  // Per-bridge encrypted secret refs (e.g. the Telegram bot token). Stored
-  // via the same AES-GCM box as connectorSecrets — the connectorId namespace
-  // we use is `messaging.<bridgeId>` so a bridge delete cleans up its files.
+  // Per-bridge encrypted secret refs (Telegram + Discord both store
+  // their bot token here). Stored via the same AES-GCM box as
+  // connectorSecrets — the connectorId namespace we use is
+  // `messaging.<bridgeId>` so a bridge delete cleans up its files.
   secretRefs?: ConnectorSecretRef[];
-  // Bridge-kind-specific non-secret state. For telegram: { botUsername,
-  // lastOffset }. Kept as a free-form record so each kind can evolve without
-  // forcing a schema migration on the others.
+  // Bridge-kind-specific non-secret state. Kept as a free-form record
+  // so each kind can evolve without forcing a schema migration on the
+  // others. Current shapes:
+  //   telegram: {
+  //     botUsername, botId, lastOffset,
+  //     allowedChatIds: number[],           // per-chat allowlist (no TOFU)
+  //     ownerChatId?: number,               // first-enrolled chat for audit history
+  //     recentDeniedChats?: DeniedChatAttempt[],
+  //     pairingCode?: string,               // one-shot enroll-via-DM code
+  //     pairingCodeExpiresAt?: string       // ISO timestamp; 15-minute TTL
+  //   }
+  //   discord: {
+  //     botUsername, botId, globalName?,
+  //     lastInboundExternalIds: Record<channelId, snowflake>  // per-channel watermark
+  //   }
   metadata?: Record<string, unknown>;
 }
 
@@ -782,22 +859,30 @@ export interface JobRecord {
   // first terminal run (success or fail). The user can resume manually
   // through /jobs. Defaults to undefined/false (recurring behavior).
   oneShot?: boolean;
-  // Per-job auto-approve envelope (see ADR dangerously-auto-approve.md, "Per-job
-  // scope"). When the agent's `create_job` tool schedules an unattended job,
-  // it can opt into approval-bypass for just that job's spawned tasks
-  // without touching the operator's global RuntimeConfig. Both fields are
-  // optional and default to absent, in which case the job inherits the
-  // current per-instance RuntimeConfig behavior (i.e. the legacy default).
+  // Per-job auto-approve envelope (see ADR approval-mode.md, "Per-job
+  // scope"). When the agent's `create_job` tool schedules an unattended
+  // job, it can opt into approval-bypass for just that job's spawned
+  // tasks without touching the operator's global RuntimeConfig. All
+  // three fields are optional; absent means the job inherits the
+  // per-instance RuntimeConfig behavior at fire-time.
   //
   // - `autoApproveCommands` are merged onto the cloned RuntimeConfig at
   //   job-fire time and matched against terminal commands via the same
-  //   `matchAutoApprove` allowlist path. Each match produces an audit row
-  //   with `evidence.autoApproved=true, autoApprovedReason=<matched pattern>`.
-  // - `dangerouslyAutoApprove`, when true, sets the same flag on the cloned
-  //   RuntimeConfig so EVERY approval-gated tool the spawned task issues
-  //   bypasses the human gate. Audit rows carry
-  //   `autoApprovedReason="dangerouslyAutoApprove"` (job-scoped, not global).
+  //   `matchAutoApprove` allowlist path. Each match produces an audit
+  //   row with `evidence.autoApproved=true, autoApprovedReason=<matched
+  //   pattern>`.
+  // - `approvalMode`, when set, replaces the cloned config's mode for
+  //   this job's spawned task only. `"yolo"` is the equivalent of the
+  //   legacy `dangerouslyAutoApprove: true`.
+  // - `dangerouslyAutoApprove`, when true, is a deprecated alias for
+  //   `approvalMode: "yolo"`. Accepted on both create and at fire-time
+  //   for back-compat with persisted job records and the `create_job`
+  //   tool spec.
+  // - `dangerousTerminalPatterns`, when set, overlays onto the cloned
+  //   config's blocklist for this job's spawned task only.
   autoApproveCommands?: string[];
+  approvalMode?: ApprovalMode;
+  dangerousTerminalPatterns?: string[];
   dangerouslyAutoApprove?: boolean;
   // Wall-clock scheduling: when set, this 5-field Unix cron expression
   // drives the job's nextRunAt instead of `intervalSeconds`. Exactly one

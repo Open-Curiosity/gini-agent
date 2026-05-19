@@ -188,15 +188,22 @@ export async function createScheduledJob(
     }
     oneShot = input.oneShot;
   }
-  // Per-job auto-approve envelope. Both fields are optional; reject malformed
+  // Per-job auto-approve envelope. All fields are optional; reject malformed
   // payloads up-front so a typo doesn't silently fall back to legacy behavior.
-  // See ADR dangerously-auto-approve.md ("Per-job scope") for the approval model.
+  // See ADR approval-mode.md ("Per-job scope") for the approval model.
   let dangerouslyAutoApprove: boolean | undefined;
   if (input.dangerouslyAutoApprove !== undefined && input.dangerouslyAutoApprove !== null) {
     if (typeof input.dangerouslyAutoApprove !== "boolean") {
       throw new Error(`Invalid input: dangerouslyAutoApprove must be a boolean (got ${String(input.dangerouslyAutoApprove)})`);
     }
     dangerouslyAutoApprove = input.dangerouslyAutoApprove;
+  }
+  let approvalMode: "strict" | "auto" | "yolo" | undefined;
+  if (input.approvalMode !== undefined && input.approvalMode !== null) {
+    if (input.approvalMode !== "strict" && input.approvalMode !== "auto" && input.approvalMode !== "yolo") {
+      throw new Error(`Invalid input: approvalMode must be one of "strict" | "auto" | "yolo" (got ${String(input.approvalMode)})`);
+    }
+    approvalMode = input.approvalMode;
   }
   let autoApproveCommands: string[] | undefined;
   if (input.autoApproveCommands !== undefined && input.autoApproveCommands !== null) {
@@ -214,6 +221,29 @@ export async function createScheduledJob(
       cleaned.push(entry);
     }
     autoApproveCommands = cleaned;
+  }
+  let dangerousTerminalPatterns: string[] | undefined;
+  if (input.dangerousTerminalPatterns !== undefined && input.dangerousTerminalPatterns !== null) {
+    if (!Array.isArray(input.dangerousTerminalPatterns)) {
+      throw new Error(`Invalid input: dangerousTerminalPatterns must be an array of strings (got ${typeof input.dangerousTerminalPatterns})`);
+    }
+    const cleaned: string[] = [];
+    for (const entry of input.dangerousTerminalPatterns) {
+      if (typeof entry !== "string") {
+        throw new Error(`Invalid input: dangerousTerminalPatterns entries must be strings (got ${typeof entry})`);
+      }
+      // Trim before persisting so a padded entry like " docker run "
+      // is stored as "docker run". The matcher uses substring
+      // semantics, so a padded entry would never match a real command
+      // — silently disabling the rule the operator thought they
+      // added.
+      const trimmed = entry.trim();
+      if (trimmed.length === 0) {
+        throw new Error(`Invalid input: dangerousTerminalPatterns entries must be non-empty strings`);
+      }
+      cleaned.push(trimmed);
+    }
+    dangerousTerminalPatterns = cleaned;
   }
   // A parent task that has already transitioned terminal must not
   // create a durable scheduled job. Without this, a `cancelTask`
@@ -250,9 +280,31 @@ export async function createScheduledJob(
     // see the input-sanitization guard at the top of the function for
     // why we can't read `agentId` off the caller-supplied payload.
     const owningAgentId = options.originatingAgentId ?? effective.agentId;
+    //
+    // If the parent task came from a messaging-sourced chat session
+    // (Discord, Telegram), copy the source descriptor onto the new
+    // dedicated session AS `outboundMirror` (not `source`) so
+    // finalizeJobRunFromTask can still dispatch the scheduled-fire
+    // reply back to the originating chat. Storing the descriptor as
+    // `source` would make findOrCreate{Discord,Telegram}ChatSession
+    // match the dedicated session for inbound on the same channel —
+    // the very next user message could land in the job thread
+    // instead of the live channel thread. `outboundMirror` is
+    // outbound-only by contract and the findOrCreate helpers
+    // explicitly ignore it.
     let resolvedChatSessionId = chatSessionId;
     if (createDedicatedSessionTitle !== undefined) {
       const session = createChatSession(state, createDedicatedSessionTitle, undefined, owningAgentId);
+      if (parentTaskId) {
+        const parentSession = state.chatSessions.find((candidate) =>
+          candidate.id !== session.id && candidate.taskIds.includes(parentTaskId)
+        );
+        if (parentSession?.source) {
+          // Clone so a later mutation on the parent session's source
+          // doesn't aliased-mutate the dedicated session's copy.
+          session.outboundMirror = { ...parentSession.source };
+        }
+      }
       resolvedChatSessionId = session.id;
     }
     // Initial nextRunAt: cron-driven jobs anchor to the next cron-matched
@@ -281,7 +333,9 @@ export async function createScheduledJob(
       chatSessionId: resolvedChatSessionId,
       oneShot,
       dangerouslyAutoApprove,
+      approvalMode,
       autoApproveCommands,
+      dangerousTerminalPatterns,
       agentId: owningAgentId
     });
   });
@@ -308,28 +362,25 @@ function advanceNextRunAt(prevNextRunAtMs: number, intervalSeconds: number, nowM
   return { nextRunAtMs: next, missed };
 }
 
-// Cron-driven equivalent of advanceNextRunAt. Walks forward through cron-
-// matched moments starting at the run we just claimed: the first advance
-// consumes that run, each subsequent advance is a missed cron-fire that
-// has already drifted into the past (e.g. the runtime was offline). Mirrors
-// the interval helper's contract — the cron version delegates the "what's
-// the next match?" math to croner so DST transitions, leap years, and
-// month-end edge cases are handled natively. Returns the new nextRunAt
-// (ms) and the count of EXTRA missed cron fires (>= 0).
-function advanceCronNextRunAt(
+// Cron-driven equivalent of advanceNextRunAt. Returns the next cron-matched
+// moment strictly after the run we just claimed, walking past any matches
+// that have already drifted into the past (e.g. the runtime was offline).
+// Delegates the "what's the next match?" math to croner so DST transitions,
+// leap years, and month-end edge cases are handled natively. Returns the
+// new nextRunAt (ms) and the count of EXTRA missed cron fires (>= 0).
+export function advanceCronNextRunAt(
   cronExpression: string,
   cronTimezone: string,
   prevNextRunAtMs: number,
   nowMs: number
 ): { nextRunAtMs: number; missed: number } {
   const cron = new Cron(cronExpression, { timezone: cronTimezone });
-  // Mirror the interval helper's contract: starting from the run we just
-  // claimed (`prevNextRunAtMs`), `consume` is the first cron-matched
-  // moment strictly after that — analogous to `prev + step` for intervals.
-  // The loop then walks subsequent matches and counts each that's still
-  // in the past as a missed fire.
-  const consume = cron.nextRun(new Date(prevNextRunAtMs));
-  if (!consume) {
+  // `cron.nextRun(prev)` returns the first cron-matched moment strictly
+  // after `prev`, so it already IS the next scheduled fire — no extra
+  // "consume" step needed. The loop then walks subsequent matches and
+  // counts each that's still in the past as a missed fire.
+  let next = cron.nextRun(new Date(prevNextRunAtMs));
+  if (!next) {
     // Defensive: a pathological pattern that returns null. We treat it
     // as a fallback to "stay where we are" so the scheduler doesn't
     // crash. createScheduledJob's validation already rejected unfire-able
@@ -337,13 +388,7 @@ function advanceCronNextRunAt(
     // skew or a truly degenerate edge.
     return { nextRunAtMs: prevNextRunAtMs, missed: 0 };
   }
-  let next = cron.nextRun(consume);
   let missed = 0;
-  if (!next) {
-    // Same defensive fallback — but `consume` is a valid future-ish
-    // anchor, so use it as the new nextRunAt.
-    return { nextRunAtMs: consume.getTime(), missed: 0 };
-  }
   while (next.getTime() <= nowMs) {
     const after = cron.nextRun(next);
     if (!after) break;
@@ -427,14 +472,16 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
 // operator's global config object. When the job carries no per-job
 // envelope, the clone is byte-identical to the input and the spawned task
 // inherits current behavior. When the job opts in, we overlay:
-//   - `dangerouslyAutoApprove=true` (full bypass for this job only)
+//   - `approvalMode` (per-job override of the operator default)
 //   - `autoApproveCommands` merged onto the cloned array (operator's
 //     allowlist still applies; the job widens it for its own task)
-// Audit rows on the spawned task's side effects automatically pick up the
-// usual `autoApprovedReason` markers (matched pattern, or
-// "dangerouslyAutoApprove") via the existing tool-dispatch path — the
-// only thing that changes per-job is which config object the spawned
-// task sees.
+//   - `dangerousTerminalPatterns` for the per-job blocklist
+// Audit rows on the spawned task's side effects automatically pick up
+// the usual `autoApprovedReason` markers (matched pattern,
+// "approval-mode-auto", or "approval-mode-yolo") via the existing
+// tool-dispatch path — the only thing that changes per-job is which
+// config object the spawned task sees. See ADR approval-mode.md
+// ("Per-Job Scope").
 function buildTaskConfig(config: RuntimeConfig, job: JobRecord): RuntimeConfig {
   const clone: RuntimeConfig = {
     ...config,
@@ -442,12 +489,21 @@ function buildTaskConfig(config: RuntimeConfig, job: JobRecord): RuntimeConfig {
       ? [...config.autoApproveCommands]
       : undefined
   };
-  if (job.dangerouslyAutoApprove === true) {
-    clone.dangerouslyAutoApprove = true;
+  // approvalMode overlay. The job's explicit `approvalMode` always
+  // wins over the operator instance default. For back-compat, the
+  // legacy `dangerouslyAutoApprove: true` field on a job aliases to
+  // `approvalMode: "yolo"` when no approvalMode is set on the job.
+  if (job.approvalMode) {
+    clone.approvalMode = job.approvalMode;
+  } else if (job.dangerouslyAutoApprove === true) {
+    clone.approvalMode = "yolo";
   }
   if (Array.isArray(job.autoApproveCommands) && job.autoApproveCommands.length > 0) {
     const base = clone.autoApproveCommands ?? [];
     clone.autoApproveCommands = [...base, ...job.autoApproveCommands];
+  }
+  if (Array.isArray(job.dangerousTerminalPatterns)) {
+    clone.dangerousTerminalPatterns = [...job.dangerousTerminalPatterns];
   }
   return clone;
 }
@@ -474,12 +530,12 @@ async function dispatchPromptRun(
   trigger: "schedule" | "manual" | "replay"
 ): Promise<{ jobId: string; runId: string; taskId: string }> {
   const prompt = withCronHint(job.prompt, job.context);
-  // Per-job auto-approve envelope: clone the RuntimeConfig (NEVER mutate the
+  // Per-job approval envelope: clone the RuntimeConfig (NEVER mutate the
   // original — it's the per-instance runtime-wide config) and overlay the
   // job's opt-in fields before handing it to submitTask. The spawned task
   // and every approval-gated dispatch inside it see the cloned config; the
   // operator's global RuntimeConfig stays untouched. See ADR
-  // dangerously-auto-approve.md ("Per-job scope") for the approval model.
+  // approval-mode.md ("Per-Job Scope") for the approval model.
   const taskConfig: RuntimeConfig = buildTaskConfig(config, job);
 
   // Resolve session linkage up-front. If the job points at a session that
@@ -654,8 +710,24 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
   return dispatchPromptRun(config, job, run, trigger);
 }
 
-export async function updateJobStatus(config: RuntimeConfig, jobId: string, statusValue: "active" | "paused") {
+export async function updateJobStatus(
+  config: RuntimeConfig,
+  jobId: string,
+  statusValue: "active" | "paused",
+  parentTaskId?: string
+) {
   return mutateState(config.instance, (state) => {
+    // When invoked from the agent tool path with a `parentTaskId`, refuse
+    // to mutate if the parent task has gone terminal. The lock-free
+    // pre-check in the tool handler is the fast path; this serialized
+    // re-check is the authoritative guard against a `cancelTask` landing
+    // between the pre-check and our write.
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot update job status: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
     job.status = statusValue;
@@ -674,7 +746,12 @@ export async function updateJobStatus(config: RuntimeConfig, jobId: string, stat
   });
 }
 
-export async function updateJob(config: RuntimeConfig, jobId: string, input: Record<string, unknown>) {
+export async function updateJob(
+  config: RuntimeConfig,
+  jobId: string,
+  input: Record<string, unknown>,
+  parentTaskId?: string
+) {
   // Validate up-front so 400-class errors come back as `Invalid input: ...`
   // before we open a mutateState write. Only validate fields the caller
   // actually supplied.
@@ -702,6 +779,24 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
   if (input.timeoutSeconds !== undefined) assertPositiveInt("timeoutSeconds", input.timeoutSeconds);
   if (input.retryLimit !== undefined) assertNonNegativeInt("retryLimit", input.retryLimit);
 
+  // `name` and `prompt` are both string-typed on the JobRecord; throw on
+  // type/empty-string mismatches up-front so a bad patch surfaces as
+  // `Invalid input: …` instead of being silently no-op'd at the
+  // assignment below. Without this, dishonest reporting bugs creep in:
+  // dispatchers built appliedFields from `Object.keys(patch)` and would
+  // claim a name/prompt change happened even when the underlying
+  // assignment was skipped.
+  if (input.name !== undefined) {
+    if (typeof input.name !== "string" || input.name.length === 0) {
+      throw new Error(`Invalid input: name must be a non-empty string (got ${String(input.name)})`);
+    }
+  }
+  if (input.prompt !== undefined) {
+    if (typeof input.prompt !== "string" || input.prompt.length === 0) {
+      throw new Error(`Invalid input: prompt must be a non-empty string (got ${String(input.prompt)})`);
+    }
+  }
+
   // Validate the cron fields' shape (but not the expression semantics yet —
   // that requires the existing job to compute the effective timezone, so we
   // defer to inside mutateState).
@@ -722,7 +817,61 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
     cronTimezonePatch = input.cronTimezone;
   }
 
+  // Per-job auto-approve envelope. Same validation shape as
+  // `createScheduledJob` above. `undefined` means "no change"; an empty
+  // array on `autoApproveCommands` means "clear the list"; explicit
+  // `null` on either field also means "clear" so callers can drop the
+  // override entirely. See ADR dangerously-auto-approve.md.
+  let dangerouslyAutoApprovePatch: boolean | undefined;
+  let clearDangerouslyAutoApprove = false;
+  if (input.dangerouslyAutoApprove === null) {
+    clearDangerouslyAutoApprove = true;
+  } else if (input.dangerouslyAutoApprove !== undefined) {
+    if (typeof input.dangerouslyAutoApprove !== "boolean") {
+      throw new Error(`Invalid input: dangerouslyAutoApprove must be a boolean (got ${String(input.dangerouslyAutoApprove)})`);
+    }
+    dangerouslyAutoApprovePatch = input.dangerouslyAutoApprove;
+  }
+  let autoApproveCommandsPatch: string[] | undefined;
+  let clearAutoApproveCommands = false;
+  if (input.autoApproveCommands === null) {
+    clearAutoApproveCommands = true;
+  } else if (input.autoApproveCommands !== undefined) {
+    if (!Array.isArray(input.autoApproveCommands)) {
+      throw new Error(`Invalid input: autoApproveCommands must be an array of strings (got ${typeof input.autoApproveCommands})`);
+    }
+    const cleaned: string[] = [];
+    for (const entry of input.autoApproveCommands) {
+      if (typeof entry !== "string") {
+        throw new Error(`Invalid input: autoApproveCommands entries must be strings (got ${typeof entry})`);
+      }
+      if (entry.length === 0) {
+        throw new Error(`Invalid input: autoApproveCommands entries must be non-empty strings`);
+      }
+      cleaned.push(entry);
+    }
+    if (cleaned.length === 0) {
+      // Empty array is a "clear" signal (same as null) — leaving an empty
+      // array on the JobRecord would be functionally equivalent but
+      // misleading next time the job is read.
+      clearAutoApproveCommands = true;
+    } else {
+      autoApproveCommandsPatch = cleaned;
+    }
+  }
+
   return mutateState(config.instance, (state) => {
+    // When invoked from the agent tool path with a `parentTaskId`, refuse
+    // to mutate if the parent task has gone terminal. The lock-free
+    // pre-check in the tool handler is the fast path; this serialized
+    // re-check is the authoritative guard against a `cancelTask` landing
+    // between the pre-check and our write.
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot update job: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
     if (typeof input.name === "string") job.name = input.name;
@@ -855,6 +1004,20 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
     job.cronExpression = newCronExpression;
     job.cronTimezone = newCronTimezone;
     job.intervalSeconds = newIntervalSeconds;
+
+    // Apply auto-approve patch fields. `clear*` is "drop the override
+    // entirely" so the job falls back to the runtime/agent default.
+    if (clearDangerouslyAutoApprove) {
+      job.dangerouslyAutoApprove = undefined;
+    } else if (dangerouslyAutoApprovePatch !== undefined) {
+      job.dangerouslyAutoApprove = dangerouslyAutoApprovePatch;
+    }
+    if (clearAutoApproveCommands) {
+      job.autoApproveCommands = undefined;
+    } else if (autoApproveCommandsPatch !== undefined) {
+      job.autoApproveCommands = autoApproveCommandsPatch;
+    }
+
     job.updatedAt = now();
     addAudit(
       state,
@@ -870,8 +1033,19 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
   });
 }
 
-export async function removeJob(config: RuntimeConfig, jobId: string) {
+export async function removeJob(config: RuntimeConfig, jobId: string, parentTaskId?: string) {
   return mutateState(config.instance, (state) => {
+    // When invoked from the agent tool path with a `parentTaskId`, refuse
+    // to delete if the parent task has gone terminal. The lock-free
+    // pre-check in the tool handler is the fast path; this serialized
+    // re-check is the authoritative guard against a `cancelTask` landing
+    // between the pre-check and our write.
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot delete job: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
     const index = state.jobs.findIndex((candidate) => candidate.id === jobId);
     if (index < 0) throw new Error(`Job not found: ${jobId}`);
     const [job] = state.jobs.splice(index, 1);
@@ -898,6 +1072,10 @@ export async function removeJob(config: RuntimeConfig, jobId: string) {
     );
     return job;
   });
+}
+
+export function listJobs(config: RuntimeConfig) {
+  return readState(config.instance).jobs;
 }
 
 export function listJobRuns(config: RuntimeConfig, jobId?: string) {

@@ -27,7 +27,8 @@ import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
-import { createScheduledJob } from "../jobs";
+import { resolveApprovalPolicy, type PolicyAction } from "./policy";
+import { createScheduledJob, listJobs, removeJob, updateJob, updateJobStatus } from "../jobs";
 import { isSkillActive } from "../integrations/connectors";
 import { riskForAction } from "./tool-risk";
 import {
@@ -86,6 +87,12 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await spawnSubagentTool(config, taskId, args) };
     case "create_job":
       return { kind: "sync", result: await createJobTool(config, taskId, args) };
+    case "list_jobs":
+      return { kind: "sync", result: await listJobsTool(config, taskId, args) };
+    case "update_job":
+      return { kind: "sync", result: await updateJobTool(config, taskId, args) };
+    case "delete_job":
+      return { kind: "sync", result: await deleteJobTool(config, taskId, args) };
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -139,15 +146,20 @@ export async function dispatchToolCall(
       // Uploading a workspace file egresses bytes to a remote site —
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
-      return pendingOrAuto(config, () => requestBrowserUpload(config, taskId, toolCallId, args));
+      return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
     case "file_write":
-      return pendingOrAuto(config, () => requestFileWrite(config, taskId, toolCallId, args));
+      return pendingOrAuto(config, "file.write", undefined, (reason) => requestFileWrite(config, taskId, toolCallId, args, reason));
     case "file_patch":
-      return pendingOrAuto(config, () => requestFilePatch(config, taskId, toolCallId, args));
+      return pendingOrAuto(config, "file.patch", undefined, (reason) => requestFilePatch(config, taskId, toolCallId, args, reason));
     case "terminal_exec":
       return terminalExecDispatch(config, taskId, toolCallId, args);
     case "code_exec":
-      return pendingOrAuto(config, () => requestCodeExec(config, taskId, toolCallId, args));
+      // code_exec compiles to a terminal command. Route through the
+      // policy seam as terminal.exec so dangerous-pattern matching
+      // applies uniformly (a code snippet that shells out to `sudo`
+      // gets gated the same way a terminal_exec would). The
+      // `command` field on the payload is what the policy inspects.
+      return codeExecDispatch(config, taskId, toolCallId, args);
     default:
       throw new Error(`Unknown tool: ${toolName}`);
   }
@@ -667,6 +679,13 @@ async function createJobTool(
     }
     dangerouslyAutoApprove = args.dangerouslyAutoApprove;
   }
+  let approvalMode: "strict" | "auto" | "yolo" | undefined;
+  if (args.approvalMode !== undefined && args.approvalMode !== null) {
+    if (args.approvalMode !== "strict" && args.approvalMode !== "auto" && args.approvalMode !== "yolo") {
+      throw new Error("Invalid input: approvalMode must be one of \"strict\" | \"auto\" | \"yolo\".");
+    }
+    approvalMode = args.approvalMode;
+  }
   let autoApproveCommands: string[] | undefined;
   if (args.autoApproveCommands !== undefined && args.autoApproveCommands !== null) {
     if (!Array.isArray(args.autoApproveCommands)) {
@@ -683,6 +702,23 @@ async function createJobTool(
       cleaned.push(entry);
     }
     autoApproveCommands = cleaned;
+  }
+  let dangerousTerminalPatterns: string[] | undefined;
+  if (args.dangerousTerminalPatterns !== undefined && args.dangerousTerminalPatterns !== null) {
+    if (!Array.isArray(args.dangerousTerminalPatterns)) {
+      throw new Error("Invalid input: dangerousTerminalPatterns must be an array of strings.");
+    }
+    const cleaned: string[] = [];
+    for (const entry of args.dangerousTerminalPatterns) {
+      if (typeof entry !== "string") {
+        throw new Error("Invalid input: dangerousTerminalPatterns entries must be strings.");
+      }
+      if (entry.length === 0) {
+        throw new Error("Invalid input: dangerousTerminalPatterns entries must be non-empty strings.");
+      }
+      cleaned.push(entry);
+    }
+    dangerousTerminalPatterns = cleaned;
   }
   let timeoutSeconds: number | undefined;
   if (args.timeoutSeconds !== undefined && args.timeoutSeconds !== null) {
@@ -749,7 +785,9 @@ async function createJobTool(
       oneShot,
       parentTaskId: taskId,
       dangerouslyAutoApprove,
+      approvalMode,
       autoApproveCommands,
+      dangerousTerminalPatterns,
       timeoutSeconds
     }, {
       // Inherit the originating task's owning agent so a scheduler tick
@@ -788,7 +826,9 @@ async function createJobTool(
           chatSessionId,
           jobId: job.id,
           dangerouslyAutoApprove,
+          approvalMode,
           autoApproveCommands,
+          dangerousTerminalPatterns,
           timeoutSeconds
         }
       },
@@ -808,7 +848,9 @@ async function createJobTool(
       oneShot,
       chatSessionId,
       dangerouslyAutoApprove,
+      approvalMode,
       autoApproveCommands,
+      dangerousTerminalPatterns,
       timeoutSeconds
     }
   });
@@ -826,6 +868,318 @@ async function createJobTool(
   // Imperative/CLI invocations skip this suffix — there's no chat to point at.
   const sessionSuffix = chatSessionId ? ` into ${chatSessionId}` : "";
   return `Created job ${job.id} (\"${name}\"): ${cadence}, fires at ${job.nextRunAt}${sessionSuffix}.`;
+}
+
+// Read-only listing of scheduled jobs. Cheap, low-risk: just walks
+// `state.jobs` and returns a compact summary the agent can reason about
+// without spending tokens on internal-only fields. The agent uses this to
+// resolve "this job" / "my reminder" to a real job id before calling
+// update_job or delete_job.
+async function listJobsTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  let nameContains: string | undefined;
+  if (args.nameContains !== undefined && args.nameContains !== null) {
+    if (typeof args.nameContains !== "string") {
+      throw new Error("Invalid input: nameContains must be a string.");
+    }
+    nameContains = args.nameContains.toLowerCase();
+  }
+  let fullPrompt = false;
+  if (args.fullPrompt !== undefined && args.fullPrompt !== null) {
+    if (typeof args.fullPrompt !== "boolean") {
+      throw new Error("Invalid input: fullPrompt must be a boolean.");
+    }
+    fullPrompt = args.fullPrompt;
+  }
+  const all = listJobs(config);
+  const filtered = nameContains
+    ? all.filter((job) => job.name.toLowerCase().includes(nameContains!))
+    : all;
+  // Compact summary: only the fields an agent needs to identify and
+  // describe a job. Prompts default to a 200-char truncation so a
+  // long-prompt job doesn't blow up the tool-result context. When the
+  // caller passes `fullPrompt: true` we return verbatim prompts — the
+  // agent needs this when it intends to edit a prompt (append /
+  // search-and-replace), since update_job's prompt field is REPLACE-only.
+  // Schedule fields are reported as-is (cronExpression+cronTimezone for
+  // cron jobs, intervalSeconds for interval-driven jobs) so the agent
+  // can echo the user's vocabulary.
+  const summary = filtered.map((job) => ({
+    id: job.id,
+    name: job.name,
+    status: job.status,
+    cronExpression: job.cronExpression,
+    cronTimezone: job.cronTimezone,
+    intervalSeconds: job.intervalSeconds,
+    oneShot: job.oneShot === true,
+    nextRunAt: job.nextRunAt,
+    lastRunAt: job.lastRunAt,
+    chatSessionId: job.chatSessionId,
+    prompt: fullPrompt
+      ? job.prompt
+      : job.prompt.length > 200
+        ? `${job.prompt.slice(0, 200)}…`
+        : job.prompt
+  }));
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Listed jobs",
+    data: { total: all.length, returned: summary.length, nameContains, fullPrompt }
+  });
+  await recordLowRiskAudit(config, taskId, "job.listed", "jobs", {
+    total: all.length,
+    returned: summary.length,
+    nameContains,
+    fullPrompt
+  });
+  return JSON.stringify({ count: summary.length, jobs: summary });
+}
+
+// Patch an existing job in place. Preferred over delete+create for
+// schedule/prompt/status changes — preserves job id, dedicated chat
+// thread, and run history. Validation lives in `updateJob` (typed
+// `Invalid input: …` errors surface back as tool-result errors).
+async function updateJobTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const jobId = requireString(args, "jobId");
+
+  // Pre-side-effect terminal check. Mirrors the guard pattern in
+  // `create_job`: refuse when the parent task is already terminal so a
+  // late cancel doesn't leak a mutation past the cancellation. The
+  // serialized re-check inside `updateJob` / `updateJobStatus` (via
+  // `parentTaskId`) is the authoritative guard; this early-exit avoids
+  // touching the lock for the common case.
+  {
+    const state = readState(config.instance);
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (task && isTerminalTaskStatus(task.status)) {
+      return `Error: update_job skipped because task is already ${task.status}.`;
+    }
+  }
+
+  // Collect status separately — `updateJob` handles every other field but
+  // status lives in `updateJobStatus` (different audit action vocabulary).
+  let statusPatch: "active" | "paused" | undefined;
+  if (args.status !== undefined && args.status !== null) {
+    if (args.status !== "active" && args.status !== "paused") {
+      throw new Error("Invalid input: status must be 'active' or 'paused'.");
+    }
+    statusPatch = args.status;
+  }
+
+  // Build the patch payload for `updateJob` — pass only the keys the
+  // caller explicitly supplied so we don't accidentally clear fields with
+  // undefined. `null` is meaningful (it's the "clear this field" signal
+  // for cronExpression / cronTimezone / intervalSeconds) so we preserve
+  // it.
+  const patch: Record<string, unknown> = {};
+  const passthrough = [
+    "name",
+    "prompt",
+    "intervalSeconds",
+    "cronExpression",
+    "cronTimezone",
+    "timeoutSeconds",
+    "autoApproveCommands",
+    "dangerouslyAutoApprove"
+  ] as const;
+  for (const key of passthrough) {
+    if (key in args) patch[key] = args[key];
+  }
+  // oneShot lives on the JobRecord but isn't part of `updateJob`'s patch
+  // contract — apply it directly inside the same mutateState so the audit
+  // row reflects every field the agent touched. We forward it via
+  // `mutateState` below after `updateJob` returns. Validate up-front so
+  // we fail before any persistence happens.
+  let oneShotPatch: boolean | undefined;
+  if (args.oneShot !== undefined && args.oneShot !== null) {
+    if (typeof args.oneShot !== "boolean") {
+      throw new Error("Invalid input: oneShot must be a boolean.");
+    }
+    oneShotPatch = args.oneShot;
+  }
+
+  const hasFieldPatch =
+    Object.keys(patch).length > 0 || oneShotPatch !== undefined;
+  if (!hasFieldPatch && statusPatch === undefined) {
+    throw new Error("Invalid input: update_job requires at least one field to change.");
+  }
+
+  // Capture the previous schedule shape for the audit evidence BEFORE we
+  // mutate. The audit row pins the prior fields so the change is
+  // reconstructable from the log alone.
+  const before = listJobs(config).find((candidate) => candidate.id === jobId);
+  if (!before) throw new Error(`Job not found: ${jobId}`);
+  const previousSchedule = {
+    cronExpression: before.cronExpression,
+    cronTimezone: before.cronTimezone,
+    intervalSeconds: before.intervalSeconds,
+    oneShot: before.oneShot === true,
+    status: before.status
+  };
+
+  // Forward `taskId` as `parentTaskId` so each mutator's own
+  // `mutateState` callback can re-check terminal status atomically. The
+  // earlier lock-free `readState` pre-check is kept as a fast path /
+  // error-message-quality improvement; this is the authoritative
+  // serialization point.
+  if (hasFieldPatch && Object.keys(patch).length > 0) {
+    await updateJob(config, jobId, patch, taskId);
+  }
+  if (oneShotPatch !== undefined) {
+    // The inline oneShot mutation has no shared mutator function, so we
+    // do the same atomic parent-task re-check inline.
+    await mutateState(config.instance, (state) => {
+      const parent = state.tasks.find((t) => t.id === taskId);
+      // Match the narrower predicate used by the shared job mutators in
+      // src/jobs/index.ts (createScheduledJob, updateJob, updateJobStatus,
+      // removeJob): refuse only on `cancelled`/`failed`. `completed`
+      // parents are permitted to manage jobs (e.g. a completed task's
+      // final action may be a job cleanup or follow-up). Using the wider
+      // `isTerminalTaskStatus` predicate here would diverge from the
+      // sibling patches in this same update_job call and silently reject
+      // the oneShot field while the schedule/name/prompt patch landed.
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot update job: parent task ${taskId} is already ${parent.status}.`);
+      }
+      const job = state.jobs.find((candidate) => candidate.id === jobId);
+      if (!job) throw new Error(`Job not found: ${jobId}`);
+      job.oneShot = oneShotPatch;
+      job.updatedAt = now();
+    });
+  }
+  if (statusPatch !== undefined) {
+    await updateJobStatus(config, jobId, statusPatch, taskId);
+  }
+
+  const after = listJobs(config).find((candidate) => candidate.id === jobId);
+  if (!after) throw new Error(`Job not found after update: ${jobId}`);
+
+  // Compose evidence describing exactly which fields were touched. We
+  // record only the patch keys the caller supplied (plus `status` and
+  // `oneShot` if present) so the audit row mirrors the agent's intent.
+  const appliedFields = [
+    ...Object.keys(patch),
+    ...(oneShotPatch !== undefined ? ["oneShot"] : []),
+    ...(statusPatch !== undefined ? ["status"] : [])
+  ];
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "job.updated",
+        target: jobId,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: {
+          jobId,
+          appliedFields,
+          patch: { ...patch, ...(oneShotPatch !== undefined ? { oneShot: oneShotPatch } : {}), ...(statusPatch !== undefined ? { status: statusPatch } : {}) },
+          previousSchedule
+        }
+      },
+      { taskId: item.id }
+    );
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "job",
+    message: "Updated scheduled job",
+    data: { jobId, appliedFields }
+  });
+
+  const cadence = after.cronExpression
+    ? `cron \"${after.cronExpression}\" (${after.cronTimezone ?? "UTC"})`
+    : after.intervalSeconds
+      ? `every ${after.intervalSeconds}s`
+      : "no schedule";
+  // Only an active job has a meaningful next-fire moment. A paused job's
+  // `nextRunAt` may still be populated (the scheduler simply skips it
+  // while paused), but stating "next fires at ..." would lie to the
+  // caller. Likewise, guard against an unexpectedly absent nextRunAt on
+  // active jobs so the message doesn't read "next fires at undefined".
+  const firingClause =
+    after.status === "paused"
+      ? "will not fire until resumed"
+      : after.nextRunAt
+        ? `next fires at ${after.nextRunAt}`
+        : "next-fire moment pending";
+  return `Updated job ${after.id} (\"${after.name}\"): ${appliedFields.join(", ")}. Now ${after.status}, ${cadence}, ${firingClause}.`;
+}
+
+// Delete a job and cascade-remove its run history. Low-risk for symmetry
+// with create_job: the user can always re-create. The audit row pins
+// the prior schedule shape so the deleted job is reconstructable from
+// the log alone.
+async function deleteJobTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const jobId = requireString(args, "jobId");
+
+  // Pre-side-effect terminal check. Mirrors the guard pattern in
+  // `create_job`: refuse when the parent task is already terminal so a
+  // late cancel doesn't leak a mutation past the cancellation. The
+  // serialized re-check inside `removeJob` (via `parentTaskId`) is the
+  // authoritative guard; this early-exit avoids touching the lock for
+  // the common case.
+  {
+    const state = readState(config.instance);
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (task && isTerminalTaskStatus(task.status)) {
+      return `Error: delete_job skipped because task is already ${task.status}.`;
+    }
+  }
+
+  const before = listJobs(config).find((candidate) => candidate.id === jobId);
+  if (!before) throw new Error(`Job not found: ${jobId}`);
+  const previousSchedule = {
+    name: before.name,
+    cronExpression: before.cronExpression,
+    cronTimezone: before.cronTimezone,
+    intervalSeconds: before.intervalSeconds,
+    oneShot: before.oneShot === true,
+    status: before.status,
+    chatSessionId: before.chatSessionId
+  };
+  const removed = await removeJob(config, jobId, taskId);
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "job.deleted",
+        target: jobId,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: {
+          jobId,
+          name: removed.name,
+          previousSchedule
+        }
+      },
+      { taskId: item.id }
+    );
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "job",
+    message: "Deleted scheduled job",
+    data: { jobId, name: removed.name }
+  });
+  return `Deleted job ${removed.id} (\"${removed.name}\").`;
 }
 
 // Poll the subagent record until its child task reaches a terminal state,
@@ -910,7 +1264,8 @@ async function requestFileWrite(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  reasonOverride?: string
 ): Promise<string> {
   const target = requireString(args, "path");
   const content = requireString(args, "content");
@@ -931,7 +1286,7 @@ async function requestFileWrite(
       action: "file.write",
       target,
       risk: "high",
-      reason: "File writes are side effects and require explicit approval.",
+      reason: reasonOverride ?? "File writes are side effects and require explicit approval.",
       payload: { path: target, content, toolCallId }
     });
     item.approvalIds.push(approval.id);
@@ -955,7 +1310,8 @@ async function requestBrowserUpload(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  reasonOverride?: string
 ): Promise<string> {
   const ref = requireString(args, "ref");
   const userPath = requireString(args, "path");
@@ -980,7 +1336,7 @@ async function requestBrowserUpload(
       action: "browser.upload_file",
       target: resolved.displayPath,
       risk: "high",
-      reason: "Uploading a workspace file to a remote site is a side effect and requires explicit approval.",
+      reason: reasonOverride ?? "Uploading a workspace file to a remote site is a side effect and requires explicit approval.",
       payload: {
         ref,
         path: userPath,
@@ -1004,7 +1360,8 @@ async function requestFilePatch(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  reasonOverride?: string
 ): Promise<string> {
   const target = requireString(args, "path");
   const oldText = requireString(args, "oldText");
@@ -1024,7 +1381,7 @@ async function requestFilePatch(
       action: "file.patch",
       target,
       risk: "high",
-      reason: "File patches are side effects and require explicit approval.",
+      reason: reasonOverride ?? "File patches are side effects and require explicit approval.",
       payload: {
         path: target,
         oldText,
@@ -1046,15 +1403,14 @@ async function requestFilePatch(
   });
 }
 
-// Routes a terminal command to either:
-//   1. Allowlist fast-path: `RuntimeConfig.autoApproveCommands` matched the
-//      command, so we run it via `runTerminalCommand` without an approval
-//      row. The audit trail records `evidence.autoApproved=true,
-//      autoApprovedReason=<matched pattern>` on the side-effect audit row.
-//   2. Standard flow: create a pending approval and let the chat-task loop
-//      pause. `pendingOrAuto` may immediately resolve it through
-//      `resolveApproval` when `RuntimeConfig.dangerouslyAutoApprove` is on,
-//      in which case the full approval row + audit pair is still produced.
+// Routes a terminal command through the approval-policy seam.
+//
+// The allowlist fast-path stays as a no-approval-row optimization for
+// commands matched by `RuntimeConfig.autoApproveCommands`: those
+// execute directly via `runTerminalCommand` with the matched pattern
+// stamped on the side-effect audit row. Everything else goes through
+// `pendingOrAuto`, which consults `resolveApprovalPolicy` to decide
+// auto-approve vs gate per the active approval mode.
 async function terminalExecDispatch(
   config: RuntimeConfig,
   taskId: string,
@@ -1091,7 +1447,38 @@ async function terminalExecDispatch(
     return { kind: "sync", result: result.summary };
   }
 
-  return pendingOrAuto(config, () => requestTerminalExec(config, taskId, toolCallId, command, timeoutMs, pty));
+  return pendingOrAuto(
+    config,
+    "terminal.exec",
+    { command },
+    (reason) => requestTerminalExec(config, taskId, toolCallId, command, timeoutMs, pty, reason)
+  );
+}
+
+// code_exec compiles a snippet to a shell command. Route through the
+// policy seam as `code.exec` so the dangerous-pattern blocklist runs
+// against BOTH the wrapper command AND the raw source. An argv-style
+// payload like `Bun.spawn(["sudo", "apt"])` is invisible to a
+// substring check against the wrapper alone (the wrapper contains
+// `"sudo"` without the trailing space the literal substring needed);
+// checking the source directly closes the hole. The persisted
+// approval row's action stays `terminal.exec` (it really runs as one)
+// — only the policy decision branches separately.
+async function codeExecDispatch(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  const language = requireString(args, "language");
+  const code = requireString(args, "code");
+  const command = codeExecutionCommand(language, code);
+  return pendingOrAuto(
+    config,
+    "code.exec",
+    { command, source: code, language },
+    (reason) => requestCodeExecPrebuilt(config, taskId, toolCallId, language, command, code, reason)
+  );
 }
 
 async function requestTerminalExec(
@@ -1100,7 +1487,8 @@ async function requestTerminalExec(
   toolCallId: string,
   command: string,
   timeoutMs: number,
-  pty: boolean
+  pty: boolean,
+  reasonOverride?: string
 ): Promise<string> {
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
@@ -1112,7 +1500,7 @@ async function requestTerminalExec(
       action: "terminal.exec",
       target: command,
       risk: "high",
-      reason: "Terminal execution can change the system and requires explicit approval.",
+      reason: reasonOverride ?? "Terminal execution can change the system and requires explicit approval.",
       payload: { command, timeoutMs, pty, toolCallId }
     });
     item.approvalIds.push(approval.id);
@@ -1126,15 +1514,15 @@ async function requestTerminalExec(
   });
 }
 
-async function requestCodeExec(
+async function requestCodeExecPrebuilt(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  language: string,
+  command: string,
+  source: string,
+  reasonOverride?: string
 ): Promise<string> {
-  const language = requireString(args, "language");
-  const code = requireString(args, "code");
-  const command = codeExecutionCommand(language, code);
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -1145,8 +1533,12 @@ async function requestCodeExec(
       action: "terminal.exec",
       target: `code.${language}`,
       risk: "high",
-      reason: "Code execution can change the system and requires explicit approval.",
-      payload: { command, timeoutMs: 10_000, toolCallId, language }
+      reason: reasonOverride ?? "Code execution can change the system and requires explicit approval.",
+      // `source` on the payload is the contract that lets the
+      // policy seam (re-)resolve this as code.exec instead of
+      // terminal.exec — the matcher then scans the raw source so
+      // argv-style payloads can't slip past a wrapper-only check.
+      payload: { command, timeoutMs: 10_000, toolCallId, language, source }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
@@ -1170,23 +1562,34 @@ export function approvalToolCallId(payload: Record<string, unknown>): string | u
 
 // ---------------- pendingOrAuto ----------------
 //
-// Single-point wrapper for every approval-gated tool. When
-// `RuntimeConfig.dangerouslyAutoApprove` is off this is a no-op and we
-// return the pending approval as usual so the chat-task loop pauses for
-// the human gate. When on, the freshly-created approval is immediately
-// resolved through the same `resolveApproval` -> `executeApprovedAction`
-// path that user-driven approvals take, so approval creation, the approve
-// audit row, the per-action side-effect audit, and the tool result string
-// all live in one canonical place (agent.ts) instead of being duplicated
-// here per action. Each side effect still emits a fully populated
-// approval row (status=approved, evidence.autoApproved=true,
-// autoApprovedReason="dangerouslyAutoApprove") and audit row, so the
-// reviewer sees an identical trail to a normal flow except for that
-// marker.
+// Single-point wrapper for every approval-gated tool. Consults
+// `resolveApprovalPolicy(config, action, payload)` to decide whether
+// the approval should pause for a human gate (`mode: "gate"`) or
+// auto-resolve through the same
+// `resolveApproval` -> `executeApprovedAction` pipeline a human
+// approval would take (`mode: "auto"`). Approval creation, the
+// approve audit row, the per-action side-effect audit, and the tool
+// result string all live in one canonical place (agent.ts) instead
+// of being duplicated per action. Each auto-resolved side effect
+// still emits a fully populated approval row (status=approved,
+// evidence.autoApproved=true, autoApprovedReason=<policy reason>)
+// and a side-effect audit row, so the reviewer sees an identical
+// trail to a normal flow except for the marker.
 async function pendingOrAuto(
   config: RuntimeConfig,
-  request: () => Promise<string>
+  action: PolicyAction,
+  payload: { command: string; source?: string; language?: string } | undefined,
+  request: (reasonOverride?: string) => Promise<string>
 ): Promise<DispatchResult> {
+  // Compute the policy decision BEFORE creating the approval so the
+  // gate reason (`dangerous-pattern: <id>`) can flow into the
+  // approval row's `reason` field. Without this, operators see only
+  // the generic per-action copy ("Terminal execution can change the
+  // system...") on the approval card and lose the matched-pattern
+  // signal entirely.
+  const decision = resolveApprovalPolicy(config, action, payload);
+  const reasonOverride = decision.mode === "gate" ? decision.reason : undefined;
+
   // The `await request()` MUST live inside a try/catch so a
   // `TaskAlreadyTerminalError` raised by the request helper
   // (request* helpers refuse to create an approval against an
@@ -1197,7 +1600,7 @@ async function pendingOrAuto(
   // — request* helpers throw the task-terminal variant instead.
   let approvalId: string;
   try {
-    approvalId = await request();
+    approvalId = await request(reasonOverride);
   } catch (err) {
     if (err instanceof TaskAlreadyTerminalError) {
       return { kind: "sync", result: `Action skipped: task was already ${err.status} when the request reached the runtime.` };
@@ -1207,12 +1610,12 @@ async function pendingOrAuto(
     }
     throw err;
   }
-  if (!config.dangerouslyAutoApprove) return { kind: "pending", approvalId };
+  if (decision.mode === "gate") return { kind: "pending", approvalId };
   try {
     const { approval, toolResult } = await resolveApproval(config, approvalId, {
       actor: "runtime",
       resumeChatTask: false,
-      evidenceExtra: { autoApproved: true, autoApprovedReason: "dangerouslyAutoApprove" }
+      evidenceExtra: { autoApproved: true, autoApprovedReason: decision.reason }
     });
     // `executeApprovedAction`'s guard can flip the approval from
     // `approved` back to `denied` (the

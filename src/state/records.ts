@@ -255,6 +255,29 @@ export function findOrCreateTelegramChatSession(
   }, state.activeAgentId);
 }
 
+// Discord channels map 1:1 to chat sessions. We key on (bridgeId,
+// channelId) so re-creating the bridge starts a fresh conversation —
+// same mental model as Telegram. The target is the channel snowflake
+// the dispatcher hands back to sendMessagingOutput.
+export function findOrCreateDiscordChatSession(
+  state: RuntimeState,
+  bridgeId: string,
+  channelId: string
+): ChatSessionRecord {
+  const existing = state.chatSessions.find((session) =>
+    session.source?.kind === "discord" &&
+    session.source.bridgeId === bridgeId &&
+    session.source.channelId === channelId
+  );
+  if (existing) return existing;
+  return createChatSession(state, `Discord channel ${channelId}`, {
+    kind: "discord",
+    bridgeId,
+    channelId,
+    target: channelId
+  });
+}
+
 export function deleteChatSession(state: RuntimeState, id: string): ChatSessionRecord {
   const index = state.chatSessions.findIndex((item) => item.id === id);
   if (index < 0) throw new Error(`Chat session not found: ${id}`);

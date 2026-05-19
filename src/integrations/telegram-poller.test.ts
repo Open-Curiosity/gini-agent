@@ -1,9 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
-import type { RuntimeConfig } from "../types";
-import { readState } from "../state";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import type { ChatSessionRecord, RuntimeConfig } from "../types";
+import { assertInsideWorkspace, mutateState, readState } from "../state";
+import { logDir } from "../paths";
 import { addMessagingBridge, resetMessagingDeps, setMessagingDeps } from "./messaging";
-import { createTelegramPollerSupervisor } from "./telegram-poller";
+import {
+  createTelegramPollerSupervisor,
+  __internalsForTests as telegramInternals
+} from "./telegram-poller";
+import { setMaxTaskWaitMsForTests } from "./messaging-poller-helpers";
 import type { TelegramClient, TelegramUpdate } from "./telegram";
 
 function testConfig(instance: string): RuntimeConfig {
@@ -84,7 +90,13 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 2000
 }
 
 describe("telegram poller supervisor", () => {
-  afterEach(() => resetMessagingDeps());
+  afterEach(() => {
+    resetMessagingDeps();
+    // Belt-and-suspenders reset: if a test crashes mid-flight or a
+    // future change moves to `bun test --concurrent`, a process-global
+    // wait-cap override could otherwise leak into the next test.
+    setMaxTaskWaitMsForTests(undefined);
+  });
 
   test("reconcile starts a loop for a configured telegram bridge and stopAll cancels it", async () => {
     const config = testConfig("poller-start-stop");
@@ -207,6 +219,15 @@ describe("telegram poller supervisor", () => {
 
   test("inbound photo updates are downloaded to disk and the saved path is folded into the task input", async () => {
     const config = testConfig("poller-photo");
+    // Pin workspaceRoot to a narrow per-test directory (NOT /tmp) so the
+    // photo path's containment check matches production semantics. In
+    // production, workspaceRoot is <instanceRoot>/workspace and the
+    // legacy <instanceRoot>/inbound/ path was a sibling outside the
+    // workspace — that's what made the file-read tool reject it. See
+    // issue #69.
+    const isolatedWorkspace = `/tmp/gini-telegram-poller-tests/instances/poller-photo/workspace`;
+    rmSync(isolatedWorkspace, { recursive: true, force: true });
+    config.workspaceRoot = isolatedWorkspace;
     const downloadedBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
     type Pending = { resolve: (u: import("./telegram").TelegramUpdate[]) => void };
     const queue: Pending[] = [];
@@ -273,7 +294,10 @@ describe("telegram poller supervisor", () => {
     expect(downloadedPaths).toEqual(["photos/BIG.jpg"]);
     expect(record?.media?.kind).toBe("photo");
     expect(record?.media?.fileId).toBe("BIG");
-    expect(String(record?.media?.path ?? "")).toContain("inbound");
+    // Must land under workspaceRoot/.gini/inbound/<bridgeId>/ so the
+    // agent's file-read tool (workspace-containment-gated) can pick the
+    // attachment up via the [photo: <path>] task-input prefix.
+    expect(String(record?.media?.path ?? "")).toContain(`${config.workspaceRoot}/.gini/inbound/${bridge.id}/`);
     expect(String(record?.media?.path ?? "")).toContain("BIG.jpg");
     expect(record?.text ?? "").toContain("[photo:");
     expect(record?.text ?? "").toContain("look at this");
@@ -281,6 +305,17 @@ describe("telegram poller supervisor", () => {
     // The bytes really landed on disk.
     const onDisk = await Bun.file(record!.media!.path!).arrayBuffer();
     expect(new Uint8Array(onDisk)).toEqual(downloadedBytes);
+
+    // The injected `[photo: <path>]` prefix must survive the file-read
+    // tool's workspace-containment gate (issue #69). Parse the path out
+    // of the task input the same way the agent would, then run it
+    // through `assertInsideWorkspace` — the exact check `fileRead`
+    // performs before reading bytes.
+    const photoMatch = /\[photo: ([^\]]+)\]/.exec(record!.text ?? "");
+    expect(photoMatch).not.toBeNull();
+    const injectedPath = photoMatch![1];
+    expect(injectedPath).toBe(record!.media!.path!);
+    expect(() => assertInsideWorkspace(config.workspaceRoot, injectedPath)).not.toThrow();
 
     await supervisor.stopAll();
   });
@@ -582,6 +617,132 @@ describe("telegram poller supervisor", () => {
     )).toBe(false);
 
     await supervisor.stopAll();
+  });
+
+  test("reply mirror logs reply_skip_non_terminal and threads abort into sendChatAction when the task wait cap fires", async () => {
+    // Pre-populate a stuck task + chat session, run the mirror with a
+    // 50ms cap, and confirm
+    //   1. the skip log fires (without the typingController + finally
+    //      pattern, `await typingDone` would block forever on a task
+    //      whose typing kept succeeding);
+    //   2. the typing pulse stops the moment the cap fires;
+    //   3. sendChatAction observed the abort signal end-to-end, so a
+    //      hung Telegram fetch could be cancelled.
+    const config = testConfig("tg-skip-non-terminal");
+    const typingCalls: Array<{ chatId: string | number; signaled: boolean }> = [];
+    let observedAbort = false;
+    const client: TelegramClient = {
+      async getMe() {
+        return { id: 1, is_bot: true, username: "ginibot" };
+      },
+      async sendMessage(chatId, text) {
+        return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendChatAction(chatId, _action, signal) {
+        typingCalls.push({ chatId, signaled: signal !== undefined });
+        if (signal?.aborted) observedAbort = true;
+        signal?.addEventListener(
+          "abort",
+          () => {
+            observedAbort = true;
+          },
+          { once: true }
+        );
+        return true as const;
+      },
+      async sendPhoto(chatId) {
+        return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
+      },
+      async getFile(fileId) {
+        return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` };
+      },
+      async downloadFile() {
+        return new Uint8Array().buffer;
+      },
+      async getUpdates() {
+        return [];
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["42"],
+      botToken: "TOK"
+    });
+
+    await mutateState(config.instance, (state) => {
+      state.tasks.push({
+        id: "task_stuck_tg",
+        instance: config.instance,
+        title: "t",
+        input: "t",
+        status: "running",
+        createdAt: "",
+        updatedAt: "",
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        memoryIds: [],
+        skillIds: []
+      });
+      const session: ChatSessionRecord = {
+        id: "session_stuck_tg",
+        instance: config.instance,
+        title: "t",
+        createdAt: "",
+        updatedAt: "",
+        messageIds: [],
+        taskIds: [],
+        runIds: [],
+        source: { kind: "telegram", bridgeId: bridge.id, chatId: 42, target: "42" }
+      };
+      state.chatSessions.push(session);
+    });
+
+    setMaxTaskWaitMsForTests(50);
+    try {
+      const controller = new AbortController();
+      await telegramInternals.maintainTypingAndMirrorReply(
+        config,
+        bridge.id,
+        "task_stuck_tg",
+        42,
+        client,
+        controller.signal
+      );
+
+      const logPath = join(logDir(config.instance), "runtime.jsonl");
+      expect(existsSync(logPath)).toBe(true);
+      const lines = readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean);
+      const entries = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const skip = entries.find(
+        (entry) =>
+          entry.message === "messaging.telegram.reply_skip_non_terminal" &&
+          (entry.data as Record<string, unknown> | undefined)?.bridgeId === bridge.id
+      );
+      expect(skip).toBeDefined();
+      const data = skip?.data as Record<string, unknown> | undefined;
+      expect(data?.bridgeId).toBe(bridge.id);
+      expect(data?.taskId).toBe("task_stuck_tg");
+      expect(data?.status).toBe("running");
+
+      // Every typing call must have received a signal — proves the
+      // poller now threads abort into the Telegram client.
+      expect(typingCalls.length).toBeGreaterThanOrEqual(1);
+      expect(typingCalls.every((c) => c.signaled)).toBe(true);
+      // The mirror's finally block aborts the typing controller before
+      // returning, so the abort listener should have fired even
+      // though the supervisor signal never aborted.
+      expect(observedAbort).toBe(true);
+
+      const settledCount = typingCalls.length;
+      await Bun.sleep(80);
+      expect(typingCalls.length).toBe(settledCount);
+    } finally {
+      setMaxTaskWaitMsForTests(undefined);
+    }
   });
 
   test("disabled bridges have their loop stopped on next reconcile", async () => {
