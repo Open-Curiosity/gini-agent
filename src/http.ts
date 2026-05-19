@@ -25,7 +25,7 @@ import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
 import { resolveEffectiveContext } from "./execution/effective-context";
-import { connectBrowser, disconnectBrowser, getBrowserConnection, wipeBrowserProfile } from "./capabilities/browser-connect";
+import { connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { getSetupStatus, setSetupProvider } from "./runtime/setup-api";
@@ -399,7 +399,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(await connectBrowser(config, payload), 201);
     }],
     ["POST", /^\/api\/browser\/disconnect$/, async () => json(await disconnectBrowser(config))],
-    ["POST", /^\/api\/browser\/wipe-profile$/, async () => json(await wipeBrowserProfile(config))],
     ["GET", /^\/api\/toolsets$/, () => json(listToolsets(config))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/enable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "enabled"))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "disabled"))],
