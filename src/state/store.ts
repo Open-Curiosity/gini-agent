@@ -387,8 +387,9 @@ function migrateTaskChatSessionId(state: RuntimeState): void {
 // Stamp the active-at-migration-time agent onto records that pre-date the
 // per-agent isolation field. Mirrors migrateMemoryAgentId — idempotent and
 // audit-emitting. Covers Task, ChatSessionRecord, JobRecord, JobRunRecord,
-// SubagentRecord, Approval, RuntimeEvent, AuditEvent in one pass so the
-// backfill audit doesn't fan out into eight separate rows.
+// SubagentRecord, Approval in one pass so the backfill audit doesn't fan
+// out into six separate rows. RuntimeEvent and AuditEvent are deliberately
+// excluded — see the comment at the stamp loop below.
 function migrateRecordAgentIds(state: RuntimeState): void {
   // When the state file has no agents at all (e.g. a hand-edited or
   // partially-restored file that lost both the seed pass and the

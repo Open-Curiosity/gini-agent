@@ -308,9 +308,11 @@ export interface RuntimeEvent {
   risk: RiskLevel;
   summary: string;
   data?: Record<string, unknown>;
-  // Originating agent. Optional — system events (no active agent at
-  // emit time) and legacy events leave it undefined. normalizeState
-  // backfills missing ids on already-persisted events.
+  // Originating agent. Optional and meaningful: when undefined, the
+  // event is "system-attributed" (instance boot, instance-level config,
+  // legacy rows from before agent stamping). Events are never
+  // back-filled — missing agentId is preserved as a first-class signal
+  // that the row is system-attributed.
   agentId?: string;
 }
 
@@ -623,8 +625,11 @@ export interface AuditEvent {
   runId?: string;
   approvalId?: string;
   evidence?: Record<string, unknown>;
-  // Originating agent. Optional — system audits without an active agent
-  // and legacy entries leave it undefined.
+  // Originating agent. Optional and meaningful: when undefined, the
+  // audit is "system-attributed" (instance-level config, integration
+  // health, legacy entries). Audits are never back-filled — missing
+  // agentId is preserved as a first-class signal that the row is
+  // system-attributed.
   agentId?: string;
 }
 

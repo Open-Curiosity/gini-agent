@@ -55,10 +55,12 @@ an active-agent switch — was systemic.
   event input.
 - The inference helper does not read `state.activeAgentId` anywhere.
 - The `system: true` escape hatch is reserved for events that genuinely
-  have no agent owner: instance boot, instance config changes, agent
-  CRUD (the agent IS the subject), instance-level integration
-  configuration (MCP servers, messaging bridges, relays, browser
-  connections, snapshots).
+  have no agent owner: instance boot, instance config changes,
+  instance-level integration configuration (MCP servers, messaging
+  bridges, relays, browser connections, snapshots). Agent lifecycle
+  audits (`agent.created`, `agent.activated`, `agent.deleted`) attribute
+  to the subject agent itself rather than `system: true`, so the new
+  agent's own inbox carries its provenance.
 - `migrateRecordAgentIds` no longer backfills events or audits. A
   missing `agentId` on those rows is now a first-class signal that the
   row is system-attributed; stamping legacy rows with the migration-
