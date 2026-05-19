@@ -177,6 +177,28 @@ describe("approvalMode dispatch matrix", () => {
 
       rmSync(workspaceRoot, { recursive: true, force: true });
     });
+
+    test("browser_upload_file pauses for approval", async () => {
+      const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
+      writeFileSync(join(workspaceRoot, "u.txt"), "u");
+      const config = buildConfig(workspaceRoot, "strict-upload", { approvalMode: "strict" });
+      const provider = normalizeProvider(config.provider);
+
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: "call_u", type: "function", function: { name: "browser_upload_file", arguments: JSON.stringify({ ref: "stub-ref", path: "u.txt" }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+
+      const task = await submitTask(config, "upload", { mode: "chat" });
+      const paused = await waitForTerminal(config, task.id);
+      expect(paused.status).toBe("waiting_approval");
+
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    });
   });
 
   // ---------------- auto ----------------
@@ -369,6 +391,126 @@ describe("approvalMode dispatch matrix", () => {
 
       rmSync(workspaceRoot, { recursive: true, force: true });
     });
+
+    test("code_exec gates argv-style dangerous source (Bun.spawn sudo)", async () => {
+      // Argv-style payload is invisible to a substring check against
+      // the wrapper alone (the wrapper contains "sudo" without the
+      // trailing space). The policy seam must check the raw source
+      // too and gate.
+      const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
+      const config = buildConfig(workspaceRoot, "auto-code-argv-sudo", { approvalMode: "auto" });
+      const provider = normalizeProvider(config.provider);
+
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: "call_c", type: "function", function: { name: "code_exec", arguments: JSON.stringify({ language: "js", code: `Bun.spawn(["sudo", "apt", "update"])` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+
+      const task = await submitTask(config, "spawn sudo", { mode: "chat" });
+      const paused = await waitForTerminal(config, task.id);
+      expect(paused.status).toBe("waiting_approval");
+
+      // The approval row's reason should carry the matched-pattern id,
+      // not the generic per-action copy.
+      const state = readState(config.instance);
+      const approvals = state.approvals.filter((a) => a.taskId === task.id);
+      expect(approvals[0]?.reason).toContain("dangerous-pattern:");
+      expect(approvals[0]?.reason).toContain("sudo");
+
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    });
+
+    test("code_exec gates argv-style dangerous source (python subprocess sudo)", async () => {
+      const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
+      const config = buildConfig(workspaceRoot, "auto-code-argv-py", { approvalMode: "auto" });
+      const provider = normalizeProvider(config.provider);
+
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: "call_c", type: "function", function: { name: "code_exec", arguments: JSON.stringify({ language: "python", code: `import subprocess\nsubprocess.run(["sudo", "apt", "update"])` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+
+      const task = await submitTask(config, "subprocess sudo", { mode: "chat" });
+      const paused = await waitForTerminal(config, task.id);
+      expect(paused.status).toBe("waiting_approval");
+
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    });
+
+    test("approval row reason carries the matched dangerous-pattern id", async () => {
+      // Pin Fix 4 directly on the dispatch-level surface: the policy
+      // decision must flow into the persisted approval row's reason
+      // field so the operator sees WHY they're being asked rather
+      // than the generic per-action copy.
+      const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
+      const config = buildConfig(workspaceRoot, "auto-reason-on-row", { approvalMode: "auto" });
+      const provider = normalizeProvider(config.provider);
+
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: "call_t", type: "function", function: { name: "terminal_exec", arguments: JSON.stringify({ command: "rm -rf /" }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+
+      const task = await submitTask(config, "wipe", { mode: "chat" });
+      const paused = await waitForTerminal(config, task.id);
+      expect(paused.status).toBe("waiting_approval");
+
+      const state = readState(config.instance);
+      const approvals = state.approvals.filter((a) => a.taskId === task.id);
+      expect(approvals[0]?.reason).toContain("dangerous-pattern:");
+      expect(approvals[0]?.reason).toContain("rm-rf-dangerous-target");
+
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    });
+
+    test("browser_upload_file auto-approves under auto mode", async () => {
+      const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
+      writeFileSync(join(workspaceRoot, "upload.txt"), "upload payload");
+      const config = buildConfig(workspaceRoot, "auto-upload", { approvalMode: "auto" });
+      const provider = normalizeProvider(config.provider);
+
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: "call_u", type: "function", function: { name: "browser_upload_file", arguments: JSON.stringify({ ref: "stub-ref", path: "upload.txt" }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+      // The browser ref won't actually fulfill — we only care that
+      // the policy auto-approved and the side-effect tried to run.
+      // Whether it succeeds (no live page) or fails is downstream of
+      // the gate decision the test is pinning.
+      setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+
+      const task = await submitTask(config, "upload it", { mode: "chat" });
+      const finished = await waitForTerminal(config, task.id);
+      // The upload itself fails because no live browser session
+      // exists, but the policy auto-approved (we only assert the
+      // approval-row state, not the task outcome).
+      expect(["completed", "failed"]).toContain(finished.status);
+
+      const state = readState(config.instance);
+      const approvals = state.approvals.filter((a) => a.taskId === task.id);
+      expect(approvals).toHaveLength(1);
+      expect(approvals[0]?.status).toBe("approved");
+      const approveAudits = state.audit.filter((a) => a.action === "approval.approved" && a.approvalId === approvals[0]?.id);
+      expect(approveAudits[0]?.evidence?.autoApprovedReason).toBe("approval-mode-auto");
+
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    });
   });
 
   // ---------------- yolo ----------------
@@ -453,6 +595,70 @@ describe("approvalMode dispatch matrix", () => {
       const state = readState(config.instance);
       const execAudits = state.audit.filter((a) => a.action === "terminal.exec" && a.taskId === task.id);
       expect(execAudits[0]?.evidence?.autoApprovedReason).toBe("approval-mode-yolo");
+
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    });
+
+    test("code_exec auto-approves argv-style dangerous source under yolo", async () => {
+      // Yolo mode bypasses the dangerous-source check: the operator
+      // explicitly opted into "run everything." The approval row
+      // still records the bypass reason.
+      const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
+      const config = buildConfig(workspaceRoot, "yolo-code-argv-sudo", { approvalMode: "yolo" });
+      const provider = normalizeProvider(config.provider);
+
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: "call_c", type: "function", function: { name: "code_exec", arguments: JSON.stringify({ language: "js", code: `Bun.spawn(["sudo", "apt", "update"])` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+      setEchoToolCallingResponse({ provider, text: "ran", toolCalls: [], finishReason: "stop" });
+
+      const task = await submitTask(config, "spawn sudo yolo", { mode: "chat" });
+      const finished = await waitForTerminal(config, task.id);
+      // Yolo auto-approves the policy decision. The actual `sudo apt
+      // update` exec almost certainly fails in CI (no sudo /
+      // network), but the gate behavior is what we're pinning.
+      expect(["completed", "failed"]).toContain(finished.status);
+
+      const state = readState(config.instance);
+      const approvals = state.approvals.filter((a) => a.taskId === task.id);
+      expect(approvals[0]?.status).toBe("approved");
+      const approveAudits = state.audit.filter((a) => a.action === "approval.approved" && a.approvalId === approvals[0]?.id);
+      expect(approveAudits[0]?.evidence?.autoApprovedReason).toBe("approval-mode-yolo");
+
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    });
+
+    test("browser_upload_file auto-approves under yolo", async () => {
+      const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
+      writeFileSync(join(workspaceRoot, "y.txt"), "y");
+      const config = buildConfig(workspaceRoot, "yolo-upload", { approvalMode: "yolo" });
+      const provider = normalizeProvider(config.provider);
+
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: "call_u", type: "function", function: { name: "browser_upload_file", arguments: JSON.stringify({ ref: "stub-ref", path: "y.txt" }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+      setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+
+      const task = await submitTask(config, "upload yolo", { mode: "chat" });
+      const finished = await waitForTerminal(config, task.id);
+      expect(["completed", "failed"]).toContain(finished.status);
+
+      const state = readState(config.instance);
+      const approvals = state.approvals.filter((a) => a.taskId === task.id);
+      expect(approvals).toHaveLength(1);
+      expect(approvals[0]?.status).toBe("approved");
+      const approveAudits = state.audit.filter((a) => a.action === "approval.approved" && a.approvalId === approvals[0]?.id);
+      expect(approveAudits[0]?.evidence?.autoApprovedReason).toBe("approval-mode-yolo");
 
       rmSync(workspaceRoot, { recursive: true, force: true });
     });

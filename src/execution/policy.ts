@@ -25,26 +25,42 @@ import {
   userDangerousPatterns
 } from "./auto-approve";
 
-// Actions the policy seam knows about. These map 1:1 onto the
+// Actions the policy seam knows about. Mostly 1:1 onto the
 // approval-eligible tool surface in `tool-dispatch.ts`:
-//   - file.write       → file_write
-//   - file.patch       → file_patch
-//   - terminal.exec    → terminal_exec AND code_exec (code_exec routes
-//                        through terminal.exec internally)
-//   - browser.upload   → browser_upload_file
-// Use the same action label `createApproval` will eventually persist so
-// callers don't translate names twice.
+//   - file.write          → file_write
+//   - file.patch          → file_patch
+//   - terminal.exec       → terminal_exec
+//   - code.exec           → code_exec (compiled into a wrapper shell
+//                            command; matcher runs against BOTH the
+//                            wrapper and the raw source)
+//   - browser.upload_file → browser_upload_file
+// The approval row's persisted action stays `terminal.exec` for
+// code_exec (it really runs as one) — only the POLICY decision
+// branches separately so the matcher sees the raw `Bun.spawn(["sudo",
+// ...])` source the wrapper would otherwise hide.
 export type PolicyAction =
   | "file.write"
   | "file.patch"
   | "terminal.exec"
+  | "code.exec"
   | "browser.upload_file";
 
 export interface TerminalExecPayload {
   command: string;
 }
 
-export type PolicyPayload = TerminalExecPayload | Record<string, unknown> | undefined;
+// Used by `code.exec` policy decisions. `source` is the raw snippet
+// the model emitted; `command` is the shell-wrapper that wraps it.
+// Both are tested against the dangerous-pattern set since the wrapper
+// (e.g. `bun -e "..."` or a python heredoc) hides argv-style payloads
+// like `Bun.spawn(["sudo", "apt"])` from a substring-on-command check.
+export interface CodeExecPayload {
+  command: string;
+  source: string;
+  language?: string;
+}
+
+export type PolicyPayload = TerminalExecPayload | CodeExecPayload | Record<string, unknown> | undefined;
 
 export type ApprovalPolicyDecision =
   | { mode: "auto"; reason: string }
@@ -102,18 +118,39 @@ export function resolveApprovalPolicy(
       return { mode: "auto", reason: allowMatch };
     }
 
-    // Built-in defaults always apply. Operator-supplied
-    // `dangerousTerminalPatterns` EXTEND the defaults rather than
-    // replacing them — a GET → PATCH round-trip that loses the field,
-    // or an operator who only wants to add `docker run`, must not
-    // silently strip `rm -rf /` protection. User-supplied entries are
-    // appended so a custom substring rule fires alongside the
-    // regex-based built-ins.
-    const effectivePatterns = [
-      ...DEFAULT_DANGEROUS_TERMINAL_PATTERNS,
-      ...userDangerousPatterns(config.dangerousTerminalPatterns)
-    ];
-    const dangerous = matchDangerousTerminal(effectivePatterns, command);
+    const dangerous = matchDangerousTerminal(effectiveDangerousPatterns(config), command);
+    if (dangerous) {
+      return { mode: "gate", reason: `dangerous-pattern: ${dangerous}` };
+    }
+
+    return { mode: "auto", reason: "approval-mode-auto" };
+  }
+
+  if (action === "code.exec") {
+    const code = payload as CodeExecPayload | undefined;
+    const wrapper = typeof code?.command === "string" ? code.command : "";
+    const source = typeof code?.source === "string" ? code.source : "";
+
+    // Allowlist applies to the wrapper command only — that's the
+    // shape the operator listed when they wrote the allowlist
+    // pattern. Source-level allowlisting would require a separate
+    // (language-aware) matcher.
+    const allowMatch = matchAutoApprove(config.autoApproveCommands, wrapper);
+    if (allowMatch) {
+      return { mode: "auto", reason: allowMatch };
+    }
+
+    // Match against BOTH the wrapper and the raw source. Argv-style
+    // payloads like `Bun.spawn(["sudo", "apt"])` don't contain the
+    // literal `sudo ` substring (no trailing space after `sudo`
+    // before the quote) once wrapped, so a wrapper-only check lets
+    // them slip past every dangerous matcher. Checking the source
+    // directly closes that hole. First-match-wins; wrapper is
+    // checked first since allowlisting / shell-level patterns are
+    // more likely to fire there.
+    const patterns = effectiveDangerousPatterns(config);
+    const dangerous =
+      matchDangerousTerminal(patterns, wrapper) ?? matchDangerousTerminal(patterns, source);
     if (dangerous) {
       return { mode: "gate", reason: `dangerous-pattern: ${dangerous}` };
     }
@@ -124,4 +161,14 @@ export function resolveApprovalPolicy(
   // Unknown action — default to gate so a new tool added without
   // updating this function doesn't silently auto-approve.
   return { mode: "gate" };
+}
+
+// Built-ins always apply; operator-supplied patterns extend rather
+// than replace them. Pulled into a helper because both terminal.exec
+// and code.exec consult the same set.
+function effectiveDangerousPatterns(config: RuntimeConfig) {
+  return [
+    ...DEFAULT_DANGEROUS_TERMINAL_PATTERNS,
+    ...userDangerousPatterns(config.dangerousTerminalPatterns)
+  ];
 }

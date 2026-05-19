@@ -173,6 +173,29 @@ describe("resolveApprovalPolicy - auto mode (default)", () => {
     expect(builtinStillHits.reason).toContain("rm-rf-dangerous-target");
   });
 
+  test("code.exec gates dangerous source even when wrapper hides it (argv sudo)", () => {
+    // The wrapper command `bun -e "Bun.spawn([\"sudo\", ...])"` does
+    // NOT contain a literal `sudo ` substring (no trailing space
+    // before the closing quote). Substring-on-command would miss it
+    // entirely; the policy seam must also inspect the source.
+    const decision = resolveApprovalPolicy(config, "code.exec", {
+      command: `bun -e ${JSON.stringify(`Bun.spawn(["sudo", "apt", "update"])`)}`,
+      source: `Bun.spawn(["sudo", "apt", "update"])`,
+      language: "js"
+    });
+    expect(decision.mode).toBe("gate");
+    expect(decision.reason).toContain("sudo");
+  });
+
+  test("code.exec auto-approves a safe snippet", () => {
+    const decision = resolveApprovalPolicy(config, "code.exec", {
+      command: `bun -e "console.log(1+1)"`,
+      source: `console.log(1+1)`,
+      language: "js"
+    });
+    expect(decision).toEqual({ mode: "auto", reason: "approval-mode-auto" });
+  });
+
   test("terminal.exec with no command payload routes through the safe branch", () => {
     // Missing payload → command is empty string → no dangerous match →
     // auto-approve. Pinning this so a refactor doesn't accidentally

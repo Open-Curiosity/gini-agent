@@ -3,11 +3,19 @@
 import type { RuntimeConfig, RuntimeState, Task } from "../types";
 import { appendTrace, createApproval, isTerminalTaskStatus, mutateState, now } from "../state";
 import { findTask } from "../agent";
+import { resolveApprovalPolicy } from "../execution/policy";
 
 export async function requestCodeExecution(config: RuntimeConfig, task: Task): Promise<Task> {
   const match = task.input.match(/^code\s+(\w+)\s*::\s*([\s\S]+)$/i);
   if (!match) throw new Error("Use: code js|python :: <code>");
   const [, language, code] = match;
+  const command = codeExecutionCommand(language, code);
+  // Consult the policy seam UP FRONT so a `dangerous-pattern: <id>`
+  // gate reason flows onto the approval row's reason field. Match
+  // shape: the chat-task code_exec dispatcher uses `code.exec` so
+  // the matcher sees both wrapper + source — mirror it here.
+  const decision = resolveApprovalPolicy(config, "code.exec", { command, source: code, language });
+  const reasonOverride = decision.mode === "gate" ? decision.reason : undefined;
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, task.id);
     // Respect a prior terminal status — see requestShell for the
@@ -18,8 +26,8 @@ export async function requestCodeExecution(config: RuntimeConfig, task: Task): P
       action: "terminal.exec",
       target: `code.${language}`,
       risk: "high",
-      reason: "Code execution can change the system and requires explicit approval.",
-      payload: { command: codeExecutionCommand(language, code), timeoutMs: 10_000 }
+      reason: reasonOverride ?? "Code execution can change the system and requires explicit approval.",
+      payload: { command, timeoutMs: 10_000 }
     });
     item.status = "waiting_approval";
     item.currentStep = "Waiting for approval";

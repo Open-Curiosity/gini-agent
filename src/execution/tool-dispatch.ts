@@ -140,11 +140,11 @@ export async function dispatchToolCall(
       // Uploading a workspace file egresses bytes to a remote site —
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
-      return pendingOrAuto(config, "browser.upload_file", undefined, () => requestBrowserUpload(config, taskId, toolCallId, args));
+      return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
     case "file_write":
-      return pendingOrAuto(config, "file.write", undefined, () => requestFileWrite(config, taskId, toolCallId, args));
+      return pendingOrAuto(config, "file.write", undefined, (reason) => requestFileWrite(config, taskId, toolCallId, args, reason));
     case "file_patch":
-      return pendingOrAuto(config, "file.patch", undefined, () => requestFilePatch(config, taskId, toolCallId, args));
+      return pendingOrAuto(config, "file.patch", undefined, (reason) => requestFilePatch(config, taskId, toolCallId, args, reason));
     case "terminal_exec":
       return terminalExecDispatch(config, taskId, toolCallId, args);
     case "code_exec":
@@ -933,7 +933,8 @@ async function requestFileWrite(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  reasonOverride?: string
 ): Promise<string> {
   const target = requireString(args, "path");
   const content = requireString(args, "content");
@@ -954,7 +955,7 @@ async function requestFileWrite(
       action: "file.write",
       target,
       risk: "high",
-      reason: "File writes are side effects and require explicit approval.",
+      reason: reasonOverride ?? "File writes are side effects and require explicit approval.",
       payload: { path: target, content, toolCallId }
     });
     item.approvalIds.push(approval.id);
@@ -978,7 +979,8 @@ async function requestBrowserUpload(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  reasonOverride?: string
 ): Promise<string> {
   const ref = requireString(args, "ref");
   const userPath = requireString(args, "path");
@@ -1003,7 +1005,7 @@ async function requestBrowserUpload(
       action: "browser.upload_file",
       target: resolved.displayPath,
       risk: "high",
-      reason: "Uploading a workspace file to a remote site is a side effect and requires explicit approval.",
+      reason: reasonOverride ?? "Uploading a workspace file to a remote site is a side effect and requires explicit approval.",
       payload: {
         ref,
         path: userPath,
@@ -1027,7 +1029,8 @@ async function requestFilePatch(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  reasonOverride?: string
 ): Promise<string> {
   const target = requireString(args, "path");
   const oldText = requireString(args, "oldText");
@@ -1047,7 +1050,7 @@ async function requestFilePatch(
       action: "file.patch",
       target,
       risk: "high",
-      reason: "File patches are side effects and require explicit approval.",
+      reason: reasonOverride ?? "File patches are side effects and require explicit approval.",
       payload: {
         path: target,
         oldText,
@@ -1117,14 +1120,19 @@ async function terminalExecDispatch(
     config,
     "terminal.exec",
     { command },
-    () => requestTerminalExec(config, taskId, toolCallId, command, timeoutMs, pty)
+    (reason) => requestTerminalExec(config, taskId, toolCallId, command, timeoutMs, pty, reason)
   );
 }
 
 // code_exec compiles a snippet to a shell command. Route through the
-// policy seam as terminal.exec so the dangerous-pattern blocklist and
-// allowlist short-circuit apply uniformly (a snippet that shells out to
-// `sudo` should gate the same way a terminal_exec would).
+// policy seam as `code.exec` so the dangerous-pattern blocklist runs
+// against BOTH the wrapper command AND the raw source. An argv-style
+// payload like `Bun.spawn(["sudo", "apt"])` is invisible to a
+// substring check against the wrapper alone (the wrapper contains
+// `"sudo"` without the trailing space the literal substring needed);
+// checking the source directly closes the hole. The persisted
+// approval row's action stays `terminal.exec` (it really runs as one)
+// — only the policy decision branches separately.
 async function codeExecDispatch(
   config: RuntimeConfig,
   taskId: string,
@@ -1136,9 +1144,9 @@ async function codeExecDispatch(
   const command = codeExecutionCommand(language, code);
   return pendingOrAuto(
     config,
-    "terminal.exec",
-    { command },
-    () => requestCodeExecPrebuilt(config, taskId, toolCallId, language, command)
+    "code.exec",
+    { command, source: code, language },
+    (reason) => requestCodeExecPrebuilt(config, taskId, toolCallId, language, command, reason)
   );
 }
 
@@ -1148,7 +1156,8 @@ async function requestTerminalExec(
   toolCallId: string,
   command: string,
   timeoutMs: number,
-  pty: boolean
+  pty: boolean,
+  reasonOverride?: string
 ): Promise<string> {
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
@@ -1160,7 +1169,7 @@ async function requestTerminalExec(
       action: "terminal.exec",
       target: command,
       risk: "high",
-      reason: "Terminal execution can change the system and requires explicit approval.",
+      reason: reasonOverride ?? "Terminal execution can change the system and requires explicit approval.",
       payload: { command, timeoutMs, pty, toolCallId }
     });
     item.approvalIds.push(approval.id);
@@ -1179,7 +1188,8 @@ async function requestCodeExecPrebuilt(
   taskId: string,
   toolCallId: string,
   language: string,
-  command: string
+  command: string,
+  reasonOverride?: string
 ): Promise<string> {
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
@@ -1191,7 +1201,7 @@ async function requestCodeExecPrebuilt(
       action: "terminal.exec",
       target: `code.${language}`,
       risk: "high",
-      reason: "Code execution can change the system and requires explicit approval.",
+      reason: reasonOverride ?? "Code execution can change the system and requires explicit approval.",
       payload: { command, timeoutMs: 10_000, toolCallId, language }
     });
     item.approvalIds.push(approval.id);
@@ -1232,9 +1242,18 @@ export function approvalToolCallId(payload: Record<string, unknown>): string | u
 async function pendingOrAuto(
   config: RuntimeConfig,
   action: PolicyAction,
-  payload: { command: string } | undefined,
-  request: () => Promise<string>
+  payload: { command: string; source?: string; language?: string } | undefined,
+  request: (reasonOverride?: string) => Promise<string>
 ): Promise<DispatchResult> {
+  // Compute the policy decision BEFORE creating the approval so the
+  // gate reason (`dangerous-pattern: <id>`) can flow into the
+  // approval row's `reason` field. Without this, operators see only
+  // the generic per-action copy ("Terminal execution can change the
+  // system...") on the approval card and lose the matched-pattern
+  // signal entirely.
+  const decision = resolveApprovalPolicy(config, action, payload);
+  const reasonOverride = decision.mode === "gate" ? decision.reason : undefined;
+
   // The `await request()` MUST live inside a try/catch so a
   // `TaskAlreadyTerminalError` raised by the request helper
   // (request* helpers refuse to create an approval against an
@@ -1245,7 +1264,7 @@ async function pendingOrAuto(
   // — request* helpers throw the task-terminal variant instead.
   let approvalId: string;
   try {
-    approvalId = await request();
+    approvalId = await request(reasonOverride);
   } catch (err) {
     if (err instanceof TaskAlreadyTerminalError) {
       return { kind: "sync", result: `Action skipped: task was already ${err.status} when the request reached the runtime.` };
@@ -1255,7 +1274,6 @@ async function pendingOrAuto(
     }
     throw err;
   }
-  const decision = resolveApprovalPolicy(config, action, payload);
   if (decision.mode === "gate") return { kind: "pending", approvalId };
   try {
     const { approval, toolResult } = await resolveApproval(config, approvalId, {

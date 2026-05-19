@@ -83,10 +83,12 @@ export type DangerousPattern = {
   test: (command: string) => boolean;
 };
 
-// Tokens commonly used as command boundaries in shells. Used by the
-// `sudo` matcher and friends so a literal substring match doesn't fire
-// on e.g. `sudoers`.
-const BOUNDARY = "(?:^|[\\s;&|`(])";
+// Tokens commonly used as command boundaries in shells (and as
+// surrounding punctuation in code_exec argv-style payloads). Used by
+// the `sudo` matcher and friends so a literal substring match doesn't
+// fire on e.g. `sudoers`. `[` and `,` cover the argv-array shape
+// `["sudo", ...]`.
+const BOUNDARY = "(?:^|[\\s;&|`(\\[,])";
 
 // Detects `rm -rf` / `rm -fr` / `rm -r -f` / `rm --recursive --force`
 // shapes (flags in any order, combined or split) followed by a
@@ -135,8 +137,11 @@ export const DEFAULT_DANGEROUS_TERMINAL_PATTERNS: readonly DangerousPattern[] = 
     id: "sudo",
     description: "sudo invocation",
     // Boundary-tokenized so `sudoers` / `pseudo` don't match; whitespace
-    // tolerant (tabs, newlines, leading pipes / semicolons).
-    test: (command) => new RegExp(`${BOUNDARY}sudo(?:\\s|$)`).test(command)
+    // tolerant (tabs, newlines, leading pipes / semicolons). Also
+    // catches argv-style `["sudo", ...]` payloads inside code_exec
+    // sources, where the trailing boundary is a closing quote rather
+    // than whitespace.
+    test: (command) => new RegExp(`${BOUNDARY}["']?sudo["']?(?:\\s|[,)\\]]|$)`).test(command)
   },
   {
     id: "pipe-to-shell",

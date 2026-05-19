@@ -79,6 +79,10 @@ describe("matchDangerousTerminal", () => {
     // missed both. The regex matcher catches them.
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "sudo\tapt update")).toBe("sudo");
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "echo go; sudo whoami")).toBe("sudo");
+    // Argv-style payloads inside code_exec sources. Substring `"sudo "`
+    // doesn't fire here (no trailing space after `sudo` before `"`).
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, `Bun.spawn(["sudo", "apt", "update"])`)).toBe("sudo");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, `subprocess.run(["sudo", "apt", "update"])`)).toBe("sudo");
   });
 
   test("blocks pipe-to-shell across shells and full paths", () => {
