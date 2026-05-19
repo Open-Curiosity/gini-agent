@@ -425,8 +425,29 @@ async function launchManaged(config: RuntimeConfig): Promise<Status> {
   //
   // Dynamically import playwright-core so tests can mock it via
   // mock.module without forcing every test that imports this module to
-  // pull in the full browser SDK at module-init time.
-  const playwright = (await import("playwright-core")) as typeof import("playwright-core");
+  // pull in the full browser SDK at module-init time. Catch the
+  // module-not-found case explicitly so users see a friendly install
+  // hint instead of the bare Node module-resolution error — this
+  // happens when the runtime was started before `bun install` resolved
+  // the dep, or in a slim install that intentionally omitted browser
+  // tooling.
+  let playwright: typeof import("playwright-core");
+  try {
+    playwright = (await import("playwright-core")) as typeof import("playwright-core");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const isMissing =
+      (error as { code?: string } | undefined)?.code === "MODULE_NOT_FOUND" ||
+      (error as { code?: string } | undefined)?.code === "ERR_MODULE_NOT_FOUND" ||
+      message.includes("Cannot find package 'playwright-core'") ||
+      message.includes("Cannot find module 'playwright-core'");
+    if (isMissing) {
+      throw new Error(
+        "Browser runtime is missing. Run `bun install` in the gini-agent checkout, then restart the runtime."
+      );
+    }
+    throw error;
+  }
   const chromium = playwright.chromium;
 
   // withTeardownLock holds the admission gate CLOSED for the entire
