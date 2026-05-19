@@ -437,6 +437,20 @@ describe("createScheduledJob auto-approve validation", () => {
     });
     expect(job.dangerousTerminalPatterns).toEqual(["docker run"]);
   });
+
+  test("trims dangerousTerminalPatterns entries before persisting", async () => {
+    // Substring-match semantics — a padded entry would never match a
+    // real command. Trim before persist so " docker run " stored on the
+    // JobRecord actually fires against `docker run something`.
+    const config = buildConfig("/tmp", "job-validation-trim-patterns");
+    const job = await createScheduledJob(config, {
+      name: "with-padded-patterns",
+      intervalSeconds: 60,
+      prompt: "x",
+      dangerousTerminalPatterns: [" docker run ", "\tkubectl delete\n"]
+    });
+    expect(job.dangerousTerminalPatterns).toEqual(["docker run", "kubectl delete"]);
+  });
 });
 
 describe("per-job approvalMode at fire-time", () => {

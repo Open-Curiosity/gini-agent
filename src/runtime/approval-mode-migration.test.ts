@@ -241,4 +241,19 @@ describe("fresh-instance default approval mode", () => {
     const persisted = JSON.parse(readFileSync(configPath(instance), "utf8")) as RuntimeConfig;
     expect(persisted.approvalMode).toBe("auto");
   });
+
+  test("updateAutoApproveSettings trims dangerousTerminalPatterns entries before persisting", () => {
+    // The matcher uses substring semantics. A padded entry like
+    // " docker run " would never match a real command (which doesn't
+    // include the surrounding whitespace), silently disabling the
+    // rule the operator thought they added. Trim before persist.
+    const instance = "trim-patterns";
+    const loaded = loadConfig(instance);
+    updateAutoApproveSettings(loaded, {
+      dangerousTerminalPatterns: [" docker run ", "  ", "\tkubectl delete\n"]
+    });
+    expect(loaded.dangerousTerminalPatterns).toEqual(["docker run", "kubectl delete"]);
+    const persisted = JSON.parse(readFileSync(configPath(instance), "utf8")) as RuntimeConfig;
+    expect(persisted.dangerousTerminalPatterns).toEqual(["docker run", "kubectl delete"]);
+  });
 });

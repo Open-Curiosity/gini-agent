@@ -211,10 +211,16 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
       if (typeof entry !== "string") {
         throw new Error(`Invalid input: dangerousTerminalPatterns entries must be strings (got ${typeof entry})`);
       }
-      if (entry.length === 0) {
+      // Trim before persisting so a padded entry like " docker run "
+      // is stored as "docker run". The matcher uses substring
+      // semantics, so a padded entry would never match a real command
+      // — silently disabling the rule the operator thought they
+      // added.
+      const trimmed = entry.trim();
+      if (trimmed.length === 0) {
         throw new Error(`Invalid input: dangerousTerminalPatterns entries must be non-empty strings`);
       }
-      cleaned.push(entry);
+      cleaned.push(trimmed);
     }
     dangerousTerminalPatterns = cleaned;
   }

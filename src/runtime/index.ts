@@ -217,9 +217,14 @@ export function updateAutoApproveSettings(
     delete config.dangerouslyAutoApprove;
   }
   if (input.dangerousTerminalPatterns !== undefined) {
+    // Trim before persisting so a padded entry like " docker run " is
+    // stored as "docker run". The matcher uses substring semantics —
+    // a padded entry would never match a real command (which doesn't
+    // include the surrounding whitespace), silently disabling the
+    // rule the operator thought they added.
     const cleaned = input.dangerousTerminalPatterns
-      .map((p) => (typeof p === "string" ? p : ""))
-      .filter((p) => p.trim().length > 0);
+      .map((p) => (typeof p === "string" ? p.trim() : ""))
+      .filter((p) => p.length > 0);
     config.dangerousTerminalPatterns = cleaned;
   }
   ensureDir(instanceRoot(config.instance));
