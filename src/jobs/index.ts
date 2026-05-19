@@ -422,14 +422,16 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
 // operator's global config object. When the job carries no per-job
 // envelope, the clone is byte-identical to the input and the spawned task
 // inherits current behavior. When the job opts in, we overlay:
-//   - `dangerouslyAutoApprove=true` (full bypass for this job only)
+//   - `approvalMode` (per-job override of the operator default)
 //   - `autoApproveCommands` merged onto the cloned array (operator's
 //     allowlist still applies; the job widens it for its own task)
-// Audit rows on the spawned task's side effects automatically pick up the
-// usual `autoApprovedReason` markers (matched pattern, or
-// "dangerouslyAutoApprove") via the existing tool-dispatch path — the
-// only thing that changes per-job is which config object the spawned
-// task sees.
+//   - `dangerousTerminalPatterns` for the per-job blocklist
+// Audit rows on the spawned task's side effects automatically pick up
+// the usual `autoApprovedReason` markers (matched pattern,
+// "approval-mode-auto", or "approval-mode-yolo") via the existing
+// tool-dispatch path — the only thing that changes per-job is which
+// config object the spawned task sees. See ADR approval-mode.md
+// ("Per-Job Scope").
 function buildTaskConfig(config: RuntimeConfig, job: JobRecord): RuntimeConfig {
   const clone: RuntimeConfig = {
     ...config,
@@ -478,12 +480,12 @@ async function dispatchPromptRun(
   trigger: "schedule" | "manual" | "replay"
 ): Promise<{ jobId: string; runId: string; taskId: string }> {
   const prompt = withCronHint(job.prompt, job.context);
-  // Per-job auto-approve envelope: clone the RuntimeConfig (NEVER mutate the
+  // Per-job approval envelope: clone the RuntimeConfig (NEVER mutate the
   // original — it's the per-instance runtime-wide config) and overlay the
   // job's opt-in fields before handing it to submitTask. The spawned task
   // and every approval-gated dispatch inside it see the cloned config; the
   // operator's global RuntimeConfig stays untouched. See ADR
-  // dangerously-auto-approve.md ("Per-job scope") for the approval model.
+  // approval-mode.md ("Per-Job Scope") for the approval model.
   const taskConfig: RuntimeConfig = buildTaskConfig(config, job);
 
   // Resolve session linkage up-front. If the job points at a session that

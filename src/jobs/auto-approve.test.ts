@@ -1,23 +1,28 @@
-// Per-job auto-approve envelope tests. See ADR dangerously-auto-approve.md
-// ("Per-job scope"). A scheduled job may opt into approval bypass for just
-// its own spawned tasks via two optional JobRecord fields:
-//   - autoApproveCommands: regex patterns matched against terminal commands.
-//   - dangerouslyAutoApprove: full bypass for every approval-gated tool.
-// At fire-time `dispatchPromptRun` clones the RuntimeConfig, overlays the
-// envelope onto the clone, and submits the spawned task with the clone — so
-// the operator's global config object never mutates.
+// Per-job approval envelope tests. See ADR approval-mode.md
+// ("Per-Job Scope"). A scheduled job may overlay approval policy for
+// just its own spawned tasks via optional JobRecord fields:
+//   - approvalMode: "strict" | "auto" | "yolo" overrides the operator
+//     instance default for this job only.
+//   - autoApproveCommands: shell-glob patterns matched against terminal
+//     commands (operator's global allowlist still applies).
+//   - dangerousTerminalPatterns: per-job blocklist additions.
+//   - dangerouslyAutoApprove (deprecated): aliases to approvalMode:
+//     "yolo" when no approvalMode is set on the job.
+// At fire-time `dispatchPromptRun` clones the RuntimeConfig, overlays
+// the envelope onto the clone, and submits the spawned task with the
+// clone — so the operator's global config object never mutates.
 //
 // These tests verify:
 //   1. autoApproveCommands on a job lets a terminal_exec fire-and-complete
 //      without an approval row (allowlist fast-path; audit row carries the
 //      matched pattern as autoApprovedReason).
-//   2. dangerouslyAutoApprove on a job covers non-terminal tools too
-//      (file_write through pendingOrAuto -> resolveApproval; approval row
-//      written + immediately resolved; audit row carries
-//      autoApprovedReason="dangerouslyAutoApprove").
-//   3. Without the envelope, a job-spawned terminal_exec stalls in
-//      waiting_approval (regression guard so the per-job opt-in stays
-//      opt-in).
+//   2. dangerouslyAutoApprove (legacy alias) on a job covers non-terminal
+//      tools too (file_write through pendingOrAuto -> resolveApproval;
+//      approval row written + immediately resolved; audit row carries
+//      autoApprovedReason="approval-mode-yolo").
+//   3. Under the operator's strict default with no per-job overlay, a
+//      job-spawned terminal_exec stalls in waiting_approval (regression
+//      guard so the per-job opt-in stays opt-in).
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";

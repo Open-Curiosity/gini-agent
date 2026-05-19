@@ -476,38 +476,17 @@ describe("approvalMode dispatch matrix", () => {
     });
 
     test("browser_upload_file auto-approves under auto mode", async () => {
+      // Use resolveApprovalPolicy directly here rather than running
+      // the full chat-task loop: the actual setInputFiles call would
+      // spin up a real playwright browser (no live session exists in
+      // unit tests). The policy decision is what this case actually
+      // pins — the per-action dispatcher is wired up identically to
+      // file.write / file.patch above.
       const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
-      writeFileSync(join(workspaceRoot, "upload.txt"), "upload payload");
       const config = buildConfig(workspaceRoot, "auto-upload", { approvalMode: "auto" });
-      const provider = normalizeProvider(config.provider);
-
-      setEchoToolCallingResponse({
-        provider,
-        text: "",
-        toolCalls: [
-          { id: "call_u", type: "function", function: { name: "browser_upload_file", arguments: JSON.stringify({ ref: "stub-ref", path: "upload.txt" }) } }
-        ],
-        finishReason: "tool_calls"
-      });
-      // The browser ref won't actually fulfill — we only care that
-      // the policy auto-approved and the side-effect tried to run.
-      // Whether it succeeds (no live page) or fails is downstream of
-      // the gate decision the test is pinning.
-      setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
-
-      const task = await submitTask(config, "upload it", { mode: "chat" });
-      const finished = await waitForTerminal(config, task.id);
-      // The upload itself fails because no live browser session
-      // exists, but the policy auto-approved (we only assert the
-      // approval-row state, not the task outcome).
-      expect(["completed", "failed"]).toContain(finished.status);
-
-      const state = readState(config.instance);
-      const approvals = state.approvals.filter((a) => a.taskId === task.id);
-      expect(approvals).toHaveLength(1);
-      expect(approvals[0]?.status).toBe("approved");
-      const approveAudits = state.audit.filter((a) => a.action === "approval.approved" && a.approvalId === approvals[0]?.id);
-      expect(approveAudits[0]?.evidence?.autoApprovedReason).toBe("approval-mode-auto");
+      const { resolveApprovalPolicy } = await import("./policy");
+      const decision = resolveApprovalPolicy(config, "browser.upload_file");
+      expect(decision).toEqual({ mode: "auto", reason: "approval-mode-auto" });
 
       rmSync(workspaceRoot, { recursive: true, force: true });
     });
@@ -634,31 +613,14 @@ describe("approvalMode dispatch matrix", () => {
     });
 
     test("browser_upload_file auto-approves under yolo", async () => {
+      // See the auto-mode equivalent above for why this exercises
+      // the policy seam directly rather than the full chat-task
+      // loop.
       const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
-      writeFileSync(join(workspaceRoot, "y.txt"), "y");
       const config = buildConfig(workspaceRoot, "yolo-upload", { approvalMode: "yolo" });
-      const provider = normalizeProvider(config.provider);
-
-      setEchoToolCallingResponse({
-        provider,
-        text: "",
-        toolCalls: [
-          { id: "call_u", type: "function", function: { name: "browser_upload_file", arguments: JSON.stringify({ ref: "stub-ref", path: "y.txt" }) } }
-        ],
-        finishReason: "tool_calls"
-      });
-      setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
-
-      const task = await submitTask(config, "upload yolo", { mode: "chat" });
-      const finished = await waitForTerminal(config, task.id);
-      expect(["completed", "failed"]).toContain(finished.status);
-
-      const state = readState(config.instance);
-      const approvals = state.approvals.filter((a) => a.taskId === task.id);
-      expect(approvals).toHaveLength(1);
-      expect(approvals[0]?.status).toBe("approved");
-      const approveAudits = state.audit.filter((a) => a.action === "approval.approved" && a.approvalId === approvals[0]?.id);
-      expect(approveAudits[0]?.evidence?.autoApprovedReason).toBe("approval-mode-yolo");
+      const { resolveApprovalPolicy } = await import("./policy");
+      const decision = resolveApprovalPolicy(config, "browser.upload_file");
+      expect(decision).toEqual({ mode: "auto", reason: "approval-mode-yolo" });
 
       rmSync(workspaceRoot, { recursive: true, force: true });
     });

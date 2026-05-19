@@ -73,7 +73,11 @@ The approval-eligible tool surface is exactly five:
 - `RuntimeConfig.approvalMode?: ApprovalMode` field, defaulting to
   `"auto"` for fresh instances via `paths.defaultConfig`.
 - `RuntimeConfig.dangerousTerminalPatterns?: string[]` operator
-  overlay for the built-in blocklist.
+  overlay for the built-in blocklist. **Extension semantics**: the
+  built-in `DEFAULT_DANGEROUS_TERMINAL_PATTERNS` always apply;
+  operator-supplied patterns are ADDITIONS, not replacements. An
+  empty list or a GET → PATCH round-trip that loses the field keeps
+  the full default protection set in place.
 - `RuntimeConfig.dangerouslyAutoApprove?: boolean` stays present as
   a **deprecated alias** for `approvalMode === "yolo"`. Returned as a
   derived boolean in GET `/api/settings/auto-approve` responses;
