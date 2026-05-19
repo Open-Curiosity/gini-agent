@@ -118,13 +118,25 @@ export function createRun(
     const parent = state.runs.find((candidate) => candidate.id === item.parentRunId);
     if (parent && !parent.childRunIds.includes(item.id)) parent.childRunIds.push(item.id);
   }
+  let sessionAgentId: string | undefined;
   if (item.conversationId) {
     const session = state.chatSessions.find((candidate) => candidate.id === item.conversationId);
-    if (session && !session.runIds.includes(item.id)) {
-      session.runIds.push(item.id);
-      session.updatedAt = at;
+    if (session) {
+      sessionAgentId = session.agentId;
+      if (!session.runIds.includes(item.id)) {
+        session.runIds.push(item.id);
+        session.updatedAt = at;
+      }
     }
   }
+  // Resolve the originating agent so the run.created event lands under the
+  // right inbox even when the run is bound to a chat session or scheduled
+  // job whose owning agent isn't the currently active one. taskId resolves
+  // later (via linkRunToTask), so don't rely on it here.
+  const jobAgentId = item.jobId
+    ? state.jobs.find((candidate) => candidate.id === item.jobId)?.agentId
+    : undefined;
+  const runAgentId = sessionAgentId ?? jobAgentId;
   appendEvent(state, {
     kind: "run",
     action: "run.created",
@@ -132,7 +144,9 @@ export function createRun(
     runId: item.id,
     risk: "low",
     summary: item.title,
-    data: { kind: item.kind, conversationId: item.conversationId, parentRunId: item.parentRunId }
+    data: { kind: item.kind, conversationId: item.conversationId, parentRunId: item.parentRunId },
+    agentId: runAgentId,
+    jobId: item.jobId
   });
   return item;
 }
@@ -153,14 +167,33 @@ export function createPlanStep(
   state.planSteps.unshift(item);
   const run = state.runs.find((candidate) => candidate.id === item.runId);
   if (run && !run.planStepIds.includes(item.id)) run.planStepIds.push(item.id);
+  // Walk the parent run (conversationId -> session, jobId -> job, taskId
+  // -> task) so the step event inherits the same agent attribution that
+  // run.created already resolved. Without this the step would fall back
+  // to state.activeAgentId.
+  let stepAgentId: string | undefined;
+  if (run) {
+    if (run.conversationId) {
+      stepAgentId = state.chatSessions.find((candidate) => candidate.id === run.conversationId)?.agentId;
+    }
+    if (!stepAgentId && run.jobId) {
+      stepAgentId = state.jobs.find((candidate) => candidate.id === run.jobId)?.agentId;
+    }
+    if (!stepAgentId && run.taskId) {
+      stepAgentId = state.tasks.find((candidate) => candidate.id === run.taskId)?.agentId;
+    }
+  }
   appendEvent(state, {
     kind: "run",
     action: "run.step.created",
     target: item.runId,
     runId: item.runId,
+    taskId: item.taskId ?? run?.taskId,
     risk: "low",
     summary: item.title,
-    data: { stepId: item.id }
+    data: { stepId: item.id },
+    agentId: stepAgentId,
+    jobId: run?.jobId
   });
   return item;
 }
