@@ -286,6 +286,12 @@ export function deleteChatSession(state: RuntimeState, id: string): ChatSessionR
   const session = state.chatSessions[index]!;
   state.chatSessions.splice(index, 1);
   state.chatMessages = state.chatMessages.filter((message) => message.sessionId !== id);
+  // Identity snapshots are keyed on conversationId (the chat session id),
+  // so removing the session must drop the matching snapshot or we leak
+  // one IdentitySnapshotRecord per deleted chat forever.
+  if (state.identitySnapshots) {
+    delete state.identitySnapshots[id];
+  }
   // The session record is gone from state.chatSessions; resolve via the
   // captured agentId so the event still attributes to the owner.
   appendEvent(

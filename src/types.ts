@@ -251,6 +251,36 @@ export interface RuntimeState {
   // so authenticated state lives in the user's Chrome profile, not the
   // ephemeral test context. Purely opt-in; legacy state files omit it.
   browser?: BrowserConnectionRecord | null;
+  // Per-conversation snapshot of the runtime identity last shown to the
+  // agent (instance, port, agent, provider, toolsets, namespace). Drives
+  // tell-once-plus-delta system-prompt injection in runChatTask:
+  // the first turn emits the full identity, subsequent turns emit only
+  // changed fields, and every IDENTITY_FULL_REFRESH_INTERVAL turns the
+  // full block is re-emitted to bound the delta-reconstruction depth.
+  // Optional so legacy state files don't need a schema migration.
+  identitySnapshots?: Record<string, IdentitySnapshotRecord>;
+}
+
+// Captured agent-runtime identity surfaced into the system prompt so
+// the model can answer self-introspection questions without a tool call.
+// Stored on RuntimeState.identitySnapshots so subsequent turns can render
+// just the diff instead of the full block on every turn.
+export interface AgentIdentity {
+  instance: string;
+  runtimePort: number;
+  agentName: string;
+  agentId: string;
+  provider: string;
+  toolsets: string[];
+  memoryNamespace: string;
+}
+
+// Per-conversation snapshot of the last-emitted identity plus the turn
+// index when the full block was last sent. The full block re-emits when
+// (currentTurn - lastFullTurn) >= IDENTITY_FULL_REFRESH_INTERVAL.
+export interface IdentitySnapshotRecord {
+  identity: AgentIdentity;
+  lastFullTurn: number;
 }
 
 export type TaskMode = "chat" | "imperative";

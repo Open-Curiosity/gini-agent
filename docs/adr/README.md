@@ -20,3 +20,4 @@ Each file in this directory captures one architecture decision: the context, the
 - [Provider extraBody Escape Hatch And Reserved-Key Denylist](provider-extra-body.md)
 - [Telegram Messaging Bridge](telegram-bridge.md)
 - [Discord Messaging Bridge](discord-bridge.md)
+- [Runtime Identity Injection With Tell-Once + Delta + Periodic Refresh](runtime-identity-injection.md)

@@ -19,14 +19,18 @@ import {
 import { submitTask, decideApproval } from "../agent";
 import {
   createChatSession,
+  createEmptyState,
   createRun,
   createSubagentRecord,
+  deleteChatSession,
   mutateState,
   now,
   readState
 } from "../state";
-import type { JobRecord, RuntimeConfig, Task } from "../types";
+import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
+import { buildAgentIdentity } from "./chat-task";
+import type { EffectiveContext } from "./effective-context";
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
   return {
@@ -1024,5 +1028,322 @@ describe("chat-task loop", () => {
     expect(content).toContain("every 604800s");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("emits the full runtime identity block on the first turn of a chat session", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-identity-first");
+    const provider = normalizeProvider(config.provider);
+
+    const { runId } = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Identity probe");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Identity turn",
+        input: "intro",
+        conversationId: session.id
+      });
+      return { runId: run.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Identity acknowledged.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "what's your setup?", { mode: "chat", runId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBeGreaterThan(0);
+    const system = calls[0]!.find((m) => m.role === "system");
+    const content = String(system?.content ?? "");
+    expect(content).toContain("Your runtime identity:");
+    expect(content).toContain(`- instance: ${config.instance}`);
+    expect(content).toContain(`- runtime port: ${config.port}`);
+    expect(content).toContain("- provider: echo/");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("subagent path skips runtime identity injection", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-identity-subagent");
+    const provider = normalizeProvider(config.provider);
+
+    const SUBAGENT_PROMPT = "You are a narrow research subagent. Stay terse.";
+    const { runId, subagentId } = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Identity subagent probe");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Subagent turn",
+        input: "kick off",
+        conversationId: session.id
+      });
+      const subagent = createSubagentRecord(state, {
+        name: "researcher",
+        prompt: "research subagent",
+        toolsets: ["file"],
+        systemPrompt: SUBAGENT_PROMPT
+      });
+      return { runId: run.id, subagentId: subagent.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "go", { mode: "chat", runId, subagentId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBeGreaterThan(0);
+    const system = calls[0]!.find((m) => m.role === "system");
+    const content = String(system?.content ?? "");
+    expect(content.startsWith(SUBAGENT_PROMPT)).toBe(true);
+    expect(content).not.toContain("Your runtime identity:");
+    expect(content).not.toContain("Runtime identity changes since last turn:");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("omits the identity block on a follow-up turn when nothing changed", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-identity-followup");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Identity follow-up");
+      return session.id;
+    });
+
+    // Two distinct runs in the same conversation — same session id, two
+    // separate user turns. The second turn must not re-emit the identity
+    // block because nothing changed under the K=10 refresh threshold.
+    const firstRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 1",
+        input: "first",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "First.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const firstTask = await submitTask(config, "first question", { mode: "chat", runId: firstRunId });
+    await waitForTerminal(config, firstTask.id);
+
+    const secondRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 2",
+        input: "second",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Second.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const secondTask = await submitTask(config, "second question", { mode: "chat", runId: secondRunId });
+    await waitForTerminal(config, secondTask.id);
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    const firstSystem = String(calls[0]!.find((m) => m.role === "system")?.content ?? "");
+    const secondSystem = String(calls[1]!.find((m) => m.role === "system")?.content ?? "");
+    expect(firstSystem).toContain("Your runtime identity:");
+    expect(secondSystem).not.toContain("Your runtime identity:");
+    expect(secondSystem).not.toContain("Runtime identity changes since last turn:");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("deferred snapshot write skips when the chat session was deleted before the model returned", async () => {
+    // Race: snapshot decision is made up-front in runChatTask, but the
+    // write is deferred to runLoop after the first model call. If the
+    // chat session is deleted during that window, the deferred write
+    // must not recreate an orphan snapshot keyed on a now-deleted
+    // session id. We deterministically simulate the race by deleting
+    // the session before the task ever runs -- the run still exists,
+    // so runChatTask resolves the conversationId, but the deferred
+    // write's session-existence check inside mutateState catches the
+    // deletion and skips the write.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-identity-orphan-guard");
+    const provider = normalizeProvider(config.provider);
+
+    const { runId, sessionId } = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Soon-to-be-deleted");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Orphan probe",
+        input: "go",
+        conversationId: session.id
+      });
+      return { runId: run.id, sessionId: session.id };
+    });
+
+    // Delete the chat session before the task runs. runChatTask will
+    // still build identity from the run.conversationId, but the
+    // deferred write must observe that the session is gone.
+    await mutateState(config.instance, (state) => {
+      deleteChatSession(state, sessionId);
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "anything", { mode: "chat", runId });
+    await waitForTerminal(config, task.id);
+
+    expect(readState(config.instance).identitySnapshots?.[sessionId]).toBeUndefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+});
+
+describe("buildAgentIdentity", () => {
+  function makeToolset(name: string, status: ToolsetRecord["status"] = "enabled"): ToolsetRecord {
+    const at = "2026-05-19T00:00:00.000Z";
+    return {
+      id: `toolset_${name}`,
+      instance: "test-instance",
+      name,
+      description: "",
+      status,
+      toolNames: [],
+      scopes: ["task"],
+      createdAt: at,
+      updatedAt: at
+    };
+  }
+
+  function makeState(toolsets: ToolsetRecord[]): RuntimeState {
+    // Build on top of the canonical empty-state seed so this fixture
+    // automatically inherits any new top-level RuntimeState field
+    // without per-test churn. Override only the slices the
+    // buildAgentIdentity tests actually exercise.
+    const state = createEmptyState("test-instance");
+    state.toolsets = toolsets;
+    state.agents = [{
+      id: "agent_x",
+      instance: "test-instance",
+      name: "alpha",
+      status: "active",
+      toolsets: [],
+      messagingTargets: [],
+      createdAt: "2026-05-19T00:00:00.000Z",
+      updatedAt: "2026-05-19T00:00:00.000Z"
+    }];
+    state.activeAgentId = "agent_x";
+    return state;
+  }
+
+  const baseConfig: RuntimeConfig = {
+    instance: "test-instance",
+    port: 9999,
+    token: "test",
+    provider: { name: "echo", model: "test-model" },
+    workspaceRoot: "/tmp/ws",
+    stateRoot: "/tmp/state",
+    logRoot: "/tmp/logs"
+  };
+
+  test("renders the actual enabled toolset names when the agent imposes no filter", () => {
+    const state = makeState([
+      makeToolset("file"),
+      makeToolset("terminal"),
+      makeToolset("memory"),
+      makeToolset("disabled-thing", "disabled")
+    ]);
+    const effective: EffectiveContext = {
+      agentId: "agent_x",
+      memoryNamespace: "agent_x",
+      provider: { name: "echo", model: "test-model" },
+      providerSource: "agent",
+      warnings: []
+      // no toolsetFilter — unrestricted
+    };
+    const identity: AgentIdentity = buildAgentIdentity(baseConfig, state, effective);
+    // Disabled toolsets must NOT appear; enabled toolsets must be sorted
+    // so the rendered identity is stable across runs.
+    expect(identity.toolsets).toEqual(["file", "memory", "terminal"]);
+  });
+
+  test("renders the filter set when the agent declares a whitelist", () => {
+    const state = makeState([makeToolset("file"), makeToolset("terminal"), makeToolset("memory")]);
+    const effective: EffectiveContext = {
+      agentId: "agent_x",
+      memoryNamespace: "agent_x",
+      provider: { name: "echo", model: "test-model" },
+      providerSource: "agent",
+      toolsetFilter: new Set(["terminal", "file"]),
+      warnings: []
+    };
+    const identity = buildAgentIdentity(baseConfig, state, effective);
+    expect(identity.toolsets).toEqual(["file", "terminal"]);
+  });
+
+  test("drops disabled and unknown toolset names from the filter so the prompt matches the catalog", () => {
+    // effective.toolsetFilter intentionally keeps unknown / disabled
+    // refs (effective-context.ts:9-16) so re-enabling later "just
+    // works"; the identity block must NOT show those as available or
+    // it would tell the model a tool family is callable when in fact
+    // tool-catalog.ts excludes them from the dispatch surface.
+    const state = makeState([
+      makeToolset("file"),
+      makeToolset("terminal"),
+      makeToolset("messaging", "disabled")
+    ]);
+    const effective: EffectiveContext = {
+      agentId: "agent_x",
+      memoryNamespace: "agent_x",
+      provider: { name: "echo", model: "test-model" },
+      providerSource: "agent",
+      // Whitelist includes a disabled-in-state name and an entirely
+      // unknown name; both must be filtered out of the rendered
+      // identity block.
+      toolsetFilter: new Set(["file", "messaging", "phantom"]),
+      warnings: []
+    };
+    const identity = buildAgentIdentity(baseConfig, state, effective);
+    expect(identity.toolsets).toEqual(["file"]);
+  });
+
+  test("yields an empty toolsets list only when state has no enabled toolsets and no filter", () => {
+    const state = makeState([makeToolset("legacy", "disabled")]);
+    const effective: EffectiveContext = {
+      provider: { name: "echo", model: "test-model" },
+      providerSource: "instance",
+      warnings: []
+    };
+    const identity = buildAgentIdentity(baseConfig, state, effective);
+    expect(identity.toolsets).toEqual([]);
+    expect(identity.agentId).toBe("(none)");
+    expect(identity.memoryNamespace).toBe("(none)");
   });
 });
