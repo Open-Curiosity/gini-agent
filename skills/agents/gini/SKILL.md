@@ -1,6 +1,6 @@
 ---
 name: gini
-description: "Configure and extend Gini — set up Telegram and other messaging bridges, MCP servers, connectors, scheduled jobs, browser sessions, skills, and memory. Use when the user asks Gini to set up an integration or operate on its own state."
+description: "Gini's self-knowledge: how Gini configures, extends, and operates on its own state via /api/* and the CLI. Load when the user asks Gini about its own capabilities or asks Gini to modify its own configuration."
 license: MIT
 metadata:
   gini:
