@@ -16,7 +16,11 @@ are clients of the same `/api/*` contract. Anything Gini does at runtime is
 already reachable via API or CLI — this skill is a recipe book for the most
 common configuration tasks.
 
-Load this skill before claiming "I cannot do that" about an integration.
+Load this skill before claiming a limitation. Common false denials to
+inoculate against: the interactive browser (Playwright with persistent
+sign-ins), scheduled jobs (interval or cron), Telegram or other
+messaging bridges, MCP servers, and delegated subagents. All of these
+are wired and reachable via `/api/*`.
 
 ## API vs CLI
 
@@ -225,17 +229,14 @@ instance behind NAT works the same as one on a public host.
    { "text": "Hello from Gini.", "target": "local" }
    ```
 
+Bridge `kind` supports `telegram` and `demo` today; future messengers
+slot into the same `/api/messaging` shape.
+
 ### Inspecting state
 
 CLI: `gini messaging {list|chats|messages|health|disable|deny}`.
 API: `GET /api/messaging`, `GET /api/messaging/<id>/{chats,messages}`,
 `POST /api/messaging/<id>/{health,disable}`.
-
-### Other kinds
-
-The `kind` argument supports `telegram` and `demo` today. Telegram is the
-production-ready path. Future messengers slot into the same
-`/api/messaging` shape — check `gini messaging add --help`.
 
 ## MCP Servers
 
@@ -319,11 +320,16 @@ skill. To draft a new one, use `meta/create-skill`.
 
 ## Approvals
 
-Risky side-effecting tools (`file.write`, `terminal.exec`,
-`browser.upload_file`, etc.) route through the approval queue when
-`approvalMode` is `strict` or `auto` and the action exceeds the auto
-threshold. **The agent should propose these actions and surface them to
-the queue — not refuse them.**
+The runtime gates anything classified `high` risk through the approval
+queue when `approvalMode` is `strict` or `auto`. `high` covers
+`browser.upload_file` (hard-coded) plus any tool whose name contains
+`write`, `exec`, `invoke`, or `send` — so `file.write`, `terminal.exec`,
+MCP `invoke` calls, messaging `send`, and similar all queue by default.
+Browser interactive actions (`browser.click`, `browser.type`,
+`browser.drag`, `browser.select_option`, `browser.tabs.{new,switch,close}`)
+are `medium` and trace via snapshot evidence — they do not block on
+approval. **The agent should propose `high`-risk actions and surface them
+to the queue — not refuse them.**
 
 ```bash
 gini approval list
