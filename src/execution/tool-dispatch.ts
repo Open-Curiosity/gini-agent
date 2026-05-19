@@ -323,10 +323,7 @@ async function browserDispatch(
   });
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
-    state.audit.unshift({
-      id: `audit_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`,
-      instance: state.instance,
-      at: now(),
+    addAudit(state, {
       actor: "agent",
       action,
       target: safeTarget,
@@ -876,13 +873,7 @@ async function recordLowRiskAudit(
 ): Promise<void> {
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
-    // addAudit is imported transitively via createApproval/etc., but the
-    // chat-task path needs a direct audit record here without changing task
-    // status. Use the same shape the legacy completeLowRiskToolTask uses.
-    state.audit.unshift({
-      id: `audit_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`,
-      instance: state.instance,
-      at: now(),
+    addAudit(state, {
       actor: "runtime",
       action,
       target,
