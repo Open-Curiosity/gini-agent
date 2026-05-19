@@ -172,14 +172,18 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
       typeof task.summary === "string" &&
       task.summary.trim() === "[SILENT]"
     ) {
-      addAudit(state, {
-        actor: "runtime",
-        action: "chat.message.suppressed_silent",
-        target: sessionId,
-        taskId,
-        risk: "low",
-        evidence: { runId: task.runId }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "chat.message.suppressed_silent",
+          target: sessionId,
+          taskId,
+          risk: "low",
+          evidence: { runId: task.runId }
+        },
+        { taskId }
+      );
       return null;
     }
     const content = task.status === "completed"

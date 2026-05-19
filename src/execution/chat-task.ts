@@ -613,7 +613,11 @@ async function runLoop(
         // task waits a long time before resuming.
         item.cost = accumulatedCost;
         item.updatedAt = now();
-        appendEvent(state, { kind: "task", action: "task.waiting_approval", target: item.id, taskId: item.id, risk: "medium", summary: "task.waiting_approval" });
+        appendEvent(
+          state,
+          { kind: "task", action: "task.waiting_approval", target: item.id, taskId: item.id, risk: "medium", summary: "task.waiting_approval" },
+          { taskId: item.id }
+        );
         return item;
       });
       appendTrace(config.instance, taskId, {

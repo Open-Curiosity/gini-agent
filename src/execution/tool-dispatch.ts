@@ -323,15 +323,19 @@ async function browserDispatch(
   });
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
-    addAudit(state, {
-      actor: "agent",
-      action,
-      target: safeTarget,
-      risk,
-      taskId: item.id,
-      runId: item.runId,
-      evidence: { args: safeArgs, success: parsed.success !== false, error: safeError }
-    });
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action,
+        target: safeTarget,
+        risk,
+        taskId: item.id,
+        runId: item.runId,
+        evidence: { args: safeArgs, success: parsed.success !== false, error: safeError }
+      },
+      { taskId: item.id }
+    );
     item.updatedAt = now();
   });
   return result;
@@ -508,15 +512,19 @@ async function spawnSubagentTool(
   // model time / spend on a tangent.
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
-    addAudit(state, {
-      actor: "agent",
-      action: "subagent.spawn",
-      target: name,
-      risk: "medium",
-      taskId: item.id,
-      runId: item.runId,
-      evidence: { name, promptBytes: prompt.length, toolsets, skills, depth }
-    });
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "subagent.spawn",
+        target: name,
+        risk: "medium",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: { name, promptBytes: prompt.length, toolsets, skills, depth }
+      },
+      { taskId: item.id }
+    );
     item.updatedAt = now();
   });
   appendTrace(config.instance, taskId, {
@@ -762,26 +770,30 @@ async function createJobTool(
 
   await mutateState(config.instance, (current) => {
     const item = findTask(current, taskId);
-    addAudit(current, {
-      actor: "agent",
-      action: "job.created",
-      target: job.id,
-      risk: "low",
-      taskId: item.id,
-      runId: item.runId,
-      evidence: {
-        name,
-        intervalSeconds,
-        cronExpression,
-        cronTimezone,
-        oneShot,
-        chatSessionId,
-        jobId: job.id,
-        dangerouslyAutoApprove,
-        autoApproveCommands,
-        timeoutSeconds
-      }
-    });
+    addAudit(
+      current,
+      {
+        actor: "agent",
+        action: "job.created",
+        target: job.id,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: {
+          name,
+          intervalSeconds,
+          cronExpression,
+          cronTimezone,
+          oneShot,
+          chatSessionId,
+          jobId: job.id,
+          dangerouslyAutoApprove,
+          autoApproveCommands,
+          timeoutSeconds
+        }
+      },
+      { taskId: item.id }
+    );
     item.updatedAt = now();
   });
   appendTrace(config.instance, taskId, {
@@ -875,15 +887,19 @@ async function recordLowRiskAudit(
 ): Promise<void> {
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
-    addAudit(state, {
-      actor: "runtime",
-      action,
-      target,
-      risk: "low",
-      taskId: item.id,
-      runId: item.runId,
-      evidence
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action,
+        target,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence
+      },
+      { taskId: item.id }
+    );
     item.updatedAt = now();
   });
 }
