@@ -48,65 +48,177 @@ function matchOne(pattern: string, command: string): boolean {
 }
 
 // Built-in dangerous-pattern blocklist. When `approvalMode` is "auto",
-// terminal commands matching any of these patterns are routed through the
-// human approval gate instead of being auto-approved. Operators can
-// extend the list via `RuntimeConfig.dangerousTerminalPatterns`. The
+// terminal commands matching any of these patterns are routed through
+// the human approval gate instead of being auto-approved. Operators can
+// EXTEND the list via `RuntimeConfig.dangerousTerminalPatterns` — the
+// built-ins always apply on top of any user additions. The
 // `autoApproveCommands` allowlist ALWAYS short-circuits the blocklist —
 // an explicit operator allow beats a heuristic block. See ADR
 // approval-mode.md.
 //
 // The patterns aim at irreversible / blast-radius-expanding shapes:
-//   - `rm -rf` / `rm -fr` targeting absolute paths or $HOME
-//   - any `sudo` invocation
-//   - pipe-to-shell (`| sh`, `| bash`) — the canonical
+//   - `rm -rf` / `rm -fr` targeting absolute paths or $HOME / system dirs
+//   - any `sudo` invocation (including via tab / pipe / etc.)
+//   - pipe-to-shell (`| sh`, `| bash`, etc.) — the canonical
 //     fetch-and-execute footgun
 //   - chmod 777 (world-writable bit)
 //   - destructive git pushes / resets
-//   - writes into /etc/, ~/.ssh/, ~/.aws/
+//   - writes into /etc/, ~/.ssh/, ~/.aws/ (any redirect-style or tee)
 //
-// Each entry is a substring matcher (not a glob) — we test whether the
-// command contains the pattern anywhere, which is the right semantics
-// for "does this string contain `sudo `" and friends. The matcher
-// returns the matched pattern (so the audit can record which rule
-// fired) or undefined.
-export const DEFAULT_DANGEROUS_TERMINAL_PATTERNS: readonly string[] = Object.freeze([
-  "rm -rf /",
-  "rm -fr /",
-  "rm -rf $HOME",
-  "rm -fr $HOME",
-  "rm -rf ~",
-  "rm -fr ~",
-  "sudo ",
-  "| sh",
-  "| bash",
-  "chmod 777",
-  "git push -f",
-  "git push --force",
-  "git reset --hard",
-  "> /etc/",
-  ">> /etc/",
-  "> ~/.ssh/",
-  ">> ~/.ssh/",
-  "> ~/.aws/",
-  ">> ~/.aws/"
+// Built-in matchers use regex so trivial reshuffles
+// (`rm -r -f /`, `sudo\tapt`, `curl x| /bin/sh`, `git -C repo reset
+// --hard`) don't slip past a literal substring check. User-supplied
+// patterns continue to use substring semantics (their consequences,
+// they own the rule shape) — they're wrapped into the same matcher
+// shape at the boundary.
+
+export type DangerousPattern = {
+  // Stable id surfaced on audit + approval reason strings. Treat as
+  // public: changing breaks downstream audit consumers that bucket on
+  // it.
+  id: string;
+  // Human-readable description for the approval card / docs.
+  description: string;
+  // Whether the command should gate. Receives the raw command string.
+  test: (command: string) => boolean;
+};
+
+// Tokens commonly used as command boundaries in shells. Used by the
+// `sudo` matcher and friends so a literal substring match doesn't fire
+// on e.g. `sudoers`.
+const BOUNDARY = "(?:^|[\\s;&|`(])";
+
+// Detects `rm -rf` / `rm -fr` / `rm -r -f` / `rm --recursive --force`
+// shapes (flags in any order, combined or split) followed by a
+// dangerous target argument (root, $HOME, ~, /etc, /usr, /var, /bin).
+// The flag detection is permissive on whitespace and order; the target
+// detection looks for the dangerous-root tokens anywhere in the rest of
+// the command line (since `rm -rf foo /` is just as catastrophic as
+// `rm -rf /`).
+function testDangerousRm(command: string): boolean {
+  // Must start with an `rm` invocation (boundary-tokenized so `myrm` /
+  // `librm` don't match).
+  const rmMatch = command.match(/(?:^|[\s;&|`(])rm(\s|$)/);
+  if (!rmMatch) return false;
+  // Pull the argv-ish tail after the `rm` token for flag + target
+  // analysis. Newlines are intentionally allowed since multi-line
+  // shell strings still execute as one command.
+  const tail = command.slice(rmMatch.index! + rmMatch[0].length);
+  const hasRecursive =
+    /(?:^|\s)-(?:[a-zA-Z]*r[a-zA-Z]*)(?=\s|$)/.test(tail) ||
+    /(?:^|\s)--recursive\b/.test(tail);
+  const hasForce =
+    /(?:^|\s)-(?:[a-zA-Z]*f[a-zA-Z]*)(?=\s|$)/.test(tail) ||
+    /(?:^|\s)--force\b/.test(tail);
+  if (!hasRecursive || !hasForce) return false;
+  // Dangerous target detection: a token equal to `/`, `~`, `$HOME`,
+  // `"$HOME"`, `'$HOME'`, or one starting with a system root prefix.
+  // We split on whitespace and check each token to avoid matching
+  // `/etc` as a substring of an innocent path like `./etc`.
+  const tokens = tail.split(/\s+/).filter(Boolean);
+  for (const raw of tokens) {
+    // Strip surrounding single/double quotes once for the comparison.
+    const t = raw.replace(/^["']|["']$/g, "");
+    if (t === "/" || t === "~" || t === "$HOME" || t.startsWith("$HOME/") || t.startsWith("~/")) return true;
+    if (/^\/(etc|usr|var|bin|sbin|lib|boot|root|home|opt)(\/|$)/.test(t)) return true;
+  }
+  return false;
+}
+
+export const DEFAULT_DANGEROUS_TERMINAL_PATTERNS: readonly DangerousPattern[] = Object.freeze([
+  {
+    id: "rm-rf-dangerous-target",
+    description: "rm -rf (or equivalent) against a system root, $HOME, or ~",
+    test: testDangerousRm
+  },
+  {
+    id: "sudo",
+    description: "sudo invocation",
+    // Boundary-tokenized so `sudoers` / `pseudo` don't match; whitespace
+    // tolerant (tabs, newlines, leading pipes / semicolons).
+    test: (command) => new RegExp(`${BOUNDARY}sudo(?:\\s|$)`).test(command)
+  },
+  {
+    id: "pipe-to-shell",
+    description: "pipe to a shell interpreter (sh, bash, zsh, fish, ksh, dash)",
+    // Matches `| sh`, `|sh`, `|  /bin/bash`, `| env bash`-ish wrappers
+    // are NOT caught (intentional — wrap is rare and increases
+    // false-positives). The interpreter binary may be a bare name or a
+    // full path; we accept either.
+    test: (command) => /\|\s*(?:[^\s|]*\/)?(?:sh|bash|zsh|fish|ksh|dash)(?:\s|$)/.test(command)
+  },
+  {
+    id: "chmod-777",
+    description: "chmod with world-writable bits (777 / *777*)",
+    // Tolerates `chmod -R 777`, `chmod a+rwx 0777 foo`, `chmod 777`.
+    // Matches a digit-cluster containing 777 to cover `0777` and
+    // `1777` (sticky) too.
+    test: (command) => /\bchmod\b[^\n]*\b\d*777\d*\b/.test(command)
+  },
+  {
+    id: "git-push-force",
+    description: "git push -f / --force / --force-with-lease",
+    test: (command) =>
+      /\bgit\b[^\n]*\bpush\b[^\n]*(?:\s-f\b|\s--force(?:-with-lease)?\b)/.test(command)
+  },
+  {
+    id: "git-reset-hard",
+    description: "git reset --hard",
+    test: (command) => /\bgit\b[^\n]*\breset\b[^\n]*--hard\b/.test(command)
+  },
+  {
+    id: "write-system-path",
+    description: "redirect or tee to /etc/, ~/.ssh/, ~/.aws/, $HOME/.ssh/, $HOME/.aws/",
+    test: (command) => {
+      // Redirect form (`>` / `>>` with arbitrary whitespace, including
+      // none) into a dangerous path. The target prefix is captured to
+      // cover both `~` and `$HOME` spellings of the home directory.
+      const targets = "(?:/etc/|~/\\.ssh/|~/\\.aws/|\\$HOME/\\.ssh/|\\$HOME/\\.aws/)";
+      if (new RegExp(`>>?\\s*${targets}`).test(command)) return true;
+      // tee variant: `... | tee /etc/hosts` / `... | tee -a ~/.ssh/foo`.
+      if (new RegExp(`\\btee\\b[^\\n]*\\s${targets}`).test(command)) return true;
+      return false;
+    }
+  }
 ]);
 
-// Returns the first dangerous pattern that the command matches (substring),
-// or undefined when none match. Callers should also consult `matchAutoApprove`
-// first so an explicit operator allowlist wins.
+// Wraps a list of user-supplied substring patterns into the same
+// `DangerousPattern` shape the built-ins use. User patterns keep
+// substring semantics — explicit additions where the operator owns
+// the consequences. Whitespace-only entries are skipped (they would
+// match every command).
+export function userDangerousPatterns(patterns: readonly string[] | undefined): DangerousPattern[] {
+  if (!patterns || patterns.length === 0) return [];
+  const out: DangerousPattern[] = [];
+  for (const raw of patterns) {
+    if (typeof raw !== "string") continue;
+    if (raw.trim().length === 0) continue;
+    out.push({
+      id: raw,
+      description: `operator-supplied pattern: ${raw}`,
+      test: (command) => command.includes(raw)
+    });
+  }
+  return out;
+}
+
+// Returns the first dangerous pattern that the command matches, or
+// undefined when none match. The pattern `id` is what callers stamp on
+// audit + approval-reason strings. Callers should also consult
+// `matchAutoApprove` first so an explicit operator allowlist wins.
 export function matchDangerousTerminal(
-  patterns: readonly string[] | undefined,
+  patterns: readonly DangerousPattern[] | undefined,
   command: string
 ): string | undefined {
   if (!patterns || patterns.length === 0) return undefined;
-  for (const raw of patterns) {
-    if (typeof raw !== "string") continue;
-    // Patterns may carry significant trailing whitespace (e.g. "sudo "
-    // requires the trailing space so we don't match a binary literally
-    // named "sudoer"). Reject pure-whitespace entries via a trim check
-    // without mutating the pattern itself.
-    if (raw.trim().length === 0) continue;
-    if (command.includes(raw)) return raw;
+  for (const pattern of patterns) {
+    try {
+      if (pattern.test(command)) return pattern.id;
+    } catch {
+      // Defensive: a bad user-supplied matcher shouldn't break the
+      // whole policy decision. Skip and continue.
+      continue;
+    }
   }
   return undefined;
 }

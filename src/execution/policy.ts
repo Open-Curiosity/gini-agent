@@ -21,7 +21,8 @@ import type { ApprovalMode, RuntimeConfig } from "../types";
 import {
   DEFAULT_DANGEROUS_TERMINAL_PATTERNS,
   matchAutoApprove,
-  matchDangerousTerminal
+  matchDangerousTerminal,
+  userDangerousPatterns
 } from "./auto-approve";
 
 // Actions the policy seam knows about. These map 1:1 onto the
@@ -101,8 +102,18 @@ export function resolveApprovalPolicy(
       return { mode: "auto", reason: allowMatch };
     }
 
-    const patterns = config.dangerousTerminalPatterns ?? DEFAULT_DANGEROUS_TERMINAL_PATTERNS;
-    const dangerous = matchDangerousTerminal(patterns, command);
+    // Built-in defaults always apply. Operator-supplied
+    // `dangerousTerminalPatterns` EXTEND the defaults rather than
+    // replacing them — a GET → PATCH round-trip that loses the field,
+    // or an operator who only wants to add `docker run`, must not
+    // silently strip `rm -rf /` protection. User-supplied entries are
+    // appended so a custom substring rule fires alongside the
+    // regex-based built-ins.
+    const effectivePatterns = [
+      ...DEFAULT_DANGEROUS_TERMINAL_PATTERNS,
+      ...userDangerousPatterns(config.dangerousTerminalPatterns)
+    ];
+    const dangerous = matchDangerousTerminal(effectivePatterns, command);
     if (dangerous) {
       return { mode: "gate", reason: `dangerous-pattern: ${dangerous}` };
     }

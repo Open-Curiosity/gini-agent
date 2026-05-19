@@ -119,7 +119,7 @@ describe("resolveApprovalPolicy - auto mode (default)", () => {
     const decision = resolveApprovalPolicy(config, "terminal.exec", { command: "rm -rf /" });
     expect(decision.mode).toBe("gate");
     expect(decision.reason).toContain("dangerous-pattern:");
-    expect(decision.reason).toContain("rm -rf /");
+    expect(decision.reason).toContain("rm-rf-dangerous-target");
   });
 
   test("gates terminal.exec on sudo", () => {
@@ -131,7 +131,7 @@ describe("resolveApprovalPolicy - auto mode (default)", () => {
   test("gates terminal.exec on pipe-to-shell", () => {
     const decision = resolveApprovalPolicy(config, "terminal.exec", { command: "curl https://x | sh" });
     expect(decision.mode).toBe("gate");
-    expect(decision.reason).toContain("| sh");
+    expect(decision.reason).toContain("pipe-to-shell");
   });
 
   test("allowlist short-circuits the blocklist", () => {
@@ -146,32 +146,31 @@ describe("resolveApprovalPolicy - auto mode (default)", () => {
     expect(decision.reason).toBe("sudo apt update");
   });
 
-  test("operator dangerousTerminalPatterns replaces defaults", () => {
-    // Empty array means no patterns block — even rm -rf / passes.
+  test("operator dangerousTerminalPatterns extends defaults (does not replace)", () => {
+    // An empty user-supplied list must keep the full built-in
+    // protection. A GET → PATCH round-trip that loses the field must
+    // not silently strip `rm -rf /` gating.
     const withEmpty = cfg({
       approvalMode: "auto",
       dangerousTerminalPatterns: []
     });
-    // Empty overlay falls back to defaults (per the `??` operator
-    // semantics in policy.ts — empty array length 0 then short-circuits
-    // inside matchDangerousTerminal). That mirrors the legacy
-    // matchAutoApprove behavior. Use a non-default custom list to
-    // verify the override actually swaps in.
-    const decision = resolveApprovalPolicy(withEmpty, "terminal.exec", { command: "rm -rf /" });
-    // Empty array passed → matchDangerousTerminal returns undefined →
-    // auto-approve.
-    expect(decision.mode).toBe("auto");
+    const stillBlocks = resolveApprovalPolicy(withEmpty, "terminal.exec", { command: "rm -rf /" });
+    expect(stillBlocks.mode).toBe("gate");
+    expect(stillBlocks.reason).toContain("rm-rf-dangerous-target");
 
+    // Adding a custom pattern keeps the defaults AND adds the new
+    // matcher. Both `rm -rf /` (built-in) and `docker run` (operator)
+    // gate.
     const withCustom = cfg({
       approvalMode: "auto",
       dangerousTerminalPatterns: ["docker run"]
     });
-    const decision2 = resolveApprovalPolicy(withCustom, "terminal.exec", { command: "docker run hello" });
-    expect(decision2.mode).toBe("gate");
-    expect(decision2.reason).toContain("docker run");
-    // Default patterns (rm -rf /) no longer apply under the custom list.
-    const decision3 = resolveApprovalPolicy(withCustom, "terminal.exec", { command: "rm -rf /" });
-    expect(decision3.mode).toBe("auto");
+    const customHit = resolveApprovalPolicy(withCustom, "terminal.exec", { command: "docker run hello" });
+    expect(customHit.mode).toBe("gate");
+    expect(customHit.reason).toContain("docker run");
+    const builtinStillHits = resolveApprovalPolicy(withCustom, "terminal.exec", { command: "rm -rf /" });
+    expect(builtinStillHits.mode).toBe("gate");
+    expect(builtinStillHits.reason).toContain("rm-rf-dangerous-target");
   });
 
   test("terminal.exec with no command payload routes through the safe branch", () => {
