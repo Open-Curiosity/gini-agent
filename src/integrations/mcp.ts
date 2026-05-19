@@ -26,13 +26,19 @@ export async function checkMcpServer(config: RuntimeConfig, idOrName: string) {
     server.status = probe.ok ? "configured" : "error";
     server.message = probe.message;
     server.updatedAt = server.lastHealthAt;
-    addAudit(state, {
-      actor: "runtime",
-      action: "mcp.health",
-      target: server.id,
-      risk: "low",
-      evidence: { status: server.status, exposedTools: server.exposedTools, probe }
-    });
+    // MCP servers are instance-level integrations; their health probes
+    // aren't per-agent activity.
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "mcp.health",
+        target: server.id,
+        risk: "low",
+        evidence: { status: server.status, exposedTools: server.exposedTools, probe }
+      },
+      { system: true }
+    );
     return server;
   });
 }
@@ -44,21 +50,32 @@ export async function invokeMcpTool(config: RuntimeConfig, idOrName: string, too
   if (server.exposedTools.length > 0 && !server.exposedTools.includes(toolName)) throw new Error(`MCP tool is not exposed: ${toolName}`);
   const result = await runMcpProbe(config, server.command, [...server.args, JSON.stringify(input)]);
   await mutateState(config.instance, (state) => {
-    addAudit(state, {
-      actor: "runtime",
-      action: "mcp.tool.invoked",
-      target: server.id,
-      risk: "medium",
-      evidence: { toolName, ok: result.ok, stdout: result.stdout?.slice(0, 1000), stderr: result.stderr?.slice(0, 1000) }
-    });
-    appendEvent(state, {
-      kind: "mcp",
-      action: "mcp.tool.invoked",
-      target: server.id,
-      risk: "medium",
-      summary: result.ok ? `MCP tool ${toolName} invoked.` : `MCP tool ${toolName} failed.`,
-      data: { toolName, result }
-    });
+    // The current MCP entry point doesn't carry a task context (HTTP
+    // surface only). Until the agent loop wires MCP through a task-bound
+    // dispatcher, these stay system-attributed.
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "mcp.tool.invoked",
+        target: server.id,
+        risk: "medium",
+        evidence: { toolName, ok: result.ok, stdout: result.stdout?.slice(0, 1000), stderr: result.stderr?.slice(0, 1000) }
+      },
+      { system: true }
+    );
+    appendEvent(
+      state,
+      {
+        kind: "mcp",
+        action: "mcp.tool.invoked",
+        target: server.id,
+        risk: "medium",
+        summary: result.ok ? `MCP tool ${toolName} invoked.` : `MCP tool ${toolName} failed.`,
+        data: { toolName, result }
+      },
+      { system: true }
+    );
   });
   return { serverId: server.id, toolName, ...result };
 }
@@ -69,7 +86,11 @@ export async function removeMcpServer(config: RuntimeConfig, idOrName: string) {
     if (!server) throw new Error(`MCP server not found: ${idOrName}`);
     server.status = "disabled";
     server.updatedAt = now();
-    addAudit(state, { actor: "user", action: "mcp.disabled", target: server.id, risk: "medium" });
+    addAudit(
+      state,
+      { actor: "user", action: "mcp.disabled", target: server.id, risk: "medium" },
+      { system: true }
+    );
     return server;
   });
 }

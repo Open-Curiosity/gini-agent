@@ -351,9 +351,13 @@ async function maintainTypingAndMirrorReply(
   if (!replyText || replyText.trim().length === 0) return;
 
   try {
+    // Thread the originating taskId so the outbound row and its
+    // messaging.sent audit attribute back to the owning agent rather
+    // than landing unattributed at the bridge level.
     await sendMessagingOutput(config, bridgeId, {
       text: replyText,
       target: session.source.target,
+      taskId,
       ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
     });
   } catch (error) {

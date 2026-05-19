@@ -175,13 +175,19 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
     live.message = nextMessage;
     live.metadata = nextMetadata;
     live.updatedAt = live.lastHealthAt;
-    addAudit(state, {
-      actor: "runtime",
-      action: "messaging.health",
-      target: live.id,
-      risk: "low",
-      evidence: { kind: live.kind, status: live.status }
-    });
+    // Bridge health probes are instance-level — the bridge serves every
+    // agent, so the row doesn't belong to any one of them.
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "messaging.health",
+        target: live.id,
+        risk: "low",
+        evidence: { kind: live.kind, status: live.status }
+      },
+      { system: true }
+    );
     return live;
   });
 }
@@ -408,13 +414,17 @@ export async function pairMessagingBridge(config: RuntimeConfig, idOrName: strin
       throw new Error(`Pairing codes only apply to telegram bridges (got '${live.kind}').`);
     }
     const refreshed = regeneratePairingCodeInState(state.messagingBridges, live.id);
-    addAudit(state, {
-      actor: "user",
-      action: "messaging.pairing.minted",
-      target: refreshed.id,
-      risk: "medium",
-      evidence: { expiresAt: refreshed.metadata?.pairingCodeExpiresAt }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "messaging.pairing.minted",
+        target: refreshed.id,
+        risk: "medium",
+        evidence: { expiresAt: refreshed.metadata?.pairingCodeExpiresAt }
+      },
+      { system: true }
+    );
     return refreshed;
   });
 }
@@ -479,13 +489,17 @@ export async function tryClaimPairingCode(
     meta.recentDeniedChats = readRecentDeniedChats(live).filter((entry) => entry.chatId !== payload.chatId);
     live.metadata = meta;
     live.updatedAt = now();
-    addAudit(state, {
-      actor: "runtime",
-      action: "messaging.pairing.claimed",
-      target: live.id,
-      risk: "medium",
-      evidence: { chatId: payload.chatId }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "messaging.pairing.claimed",
+        target: live.id,
+        risk: "medium",
+        evidence: { chatId: payload.chatId }
+      },
+      { system: true }
+    );
     return true;
   });
 }
@@ -517,13 +531,17 @@ export async function allowChat(config: RuntimeConfig, idOrName: string, chatId:
     delete meta.pairingCodeExpiresAt;
     live.metadata = meta;
     live.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: "messaging.chat.allowed",
-      target: live.id,
-      risk: "medium",
-      evidence: { chatId }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "messaging.chat.allowed",
+        target: live.id,
+        risk: "medium",
+        evidence: { chatId }
+      },
+      { system: true }
+    );
     return chatAllowlistView(live);
   });
 }
@@ -542,13 +560,17 @@ export async function denyChat(config: RuntimeConfig, idOrName: string, chatId: 
     // either way because it's no longer on the allowlist.
     live.metadata = meta;
     live.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: "messaging.chat.denied",
-      target: live.id,
-      risk: "medium",
-      evidence: { chatId }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "messaging.chat.denied",
+        target: live.id,
+        risk: "medium",
+        evidence: { chatId }
+      },
+      { system: true }
+    );
     return chatAllowlistView(live);
   });
 }
@@ -671,6 +693,12 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
 
   const media = mediaRecordForOutbound(photoSource);
 
+  // When the caller threads a taskId on the input (e.g. the chat-sync
+  // mirror in src/integrations/telegram-poller.ts) the outbound row and
+  // its audit attribute to the originating task. Otherwise — pairing
+  // confirmations, denial hints, ad-hoc operator pings — the send is
+  // instance-level and unattributed.
+  const taskId = typeof input.taskId === "string" ? input.taskId : undefined;
   return mutateState(config.instance, (live) => {
     const message = createMessagingMessageRecord(live, {
       bridgeId: bridge.id,
@@ -678,17 +706,23 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
       status,
       target,
       text,
+      taskId,
       notificationId: typeof input.notificationId === "string" ? input.notificationId : undefined,
       error: errorMessage,
       media
     });
-    addAudit(live, {
-      actor: "runtime",
-      action: "messaging.sent",
-      target: bridge.id,
-      risk: "low",
-      evidence: { messageId: message.id, status, target }
-    });
+    addAudit(
+      live,
+      {
+        actor: "runtime",
+        action: "messaging.sent",
+        target: bridge.id,
+        risk: "low",
+        taskId,
+        evidence: { messageId: message.id, status, target }
+      },
+      taskId ? { taskId } : { system: true }
+    );
     return message;
   });
 }
@@ -699,7 +733,11 @@ export async function disableMessagingBridge(config: RuntimeConfig, idOrName: st
     if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
     live.status = "disabled";
     live.updatedAt = now();
-    addAudit(state, { actor: "user", action: "messaging.disabled", target: live.id, risk: "medium" });
+    addAudit(
+      state,
+      { actor: "user", action: "messaging.disabled", target: live.id, risk: "medium" },
+      { system: true }
+    );
     return live;
   });
   // Drop the on-disk encrypted secret files. We do this after the state

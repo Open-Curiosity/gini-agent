@@ -68,18 +68,24 @@ export async function createConnector(config: RuntimeConfig, input: CreateConnec
     if (!module.probe) {
       updateConnectorHealth(connector);
     }
-    addAudit(state, {
-      actor: "user",
-      action: "connector.create",
-      target: connector.id,
-      risk: "medium",
-      evidence: {
-        provider: connector.provider,
-        name: connector.name,
-        scopes: connector.scopes,
-        purposes: secretRefs.map((ref) => ref.purpose)
-      }
-    });
+    // Connectors live at the instance level — they're shared across
+    // every agent, so the create row isn't per-agent activity.
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "connector.create",
+        target: connector.id,
+        risk: "medium",
+        evidence: {
+          provider: connector.provider,
+          name: connector.name,
+          scopes: connector.scopes,
+          purposes: secretRefs.map((ref) => ref.purpose)
+        }
+      },
+      { system: true }
+    );
     return connector;
   });
 }
@@ -108,16 +114,20 @@ export async function updateConnector(
       else connector.secretRefs.push(ref);
     }
     connector.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: wroteRefs.length > 0 ? "connector.rotate" : "connector.update",
-      target: connector.id,
-      risk: "medium",
-      evidence: {
-        provider: connector.provider,
-        rotatedPurposes: wroteRefs.map((ref) => ref.purpose)
-      }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: wroteRefs.length > 0 ? "connector.rotate" : "connector.update",
+        target: connector.id,
+        risk: "medium",
+        evidence: {
+          provider: connector.provider,
+          rotatedPurposes: wroteRefs.map((ref) => ref.purpose)
+        }
+      },
+      { system: true }
+    );
     return connector;
   });
 }
@@ -148,23 +158,31 @@ export async function deleteConnector(config: RuntimeConfig, connectorId: string
       connector.health = "unknown";
       connector.message = undefined;
       connector.updatedAt = now();
-      addAudit(state, {
-        actor: "user",
-        action: "connector.disable",
-        target: connectorId,
-        risk: "medium",
-        evidence: { provider: connector.provider, name: connector.name, source: connector.source }
-      });
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "connector.disable",
+          target: connectorId,
+          risk: "medium",
+          evidence: { provider: connector.provider, name: connector.name, source: connector.source }
+        },
+        { system: true }
+      );
       return { id: connectorId, tombstoned: true };
     }
     const [connector] = state.connectors.splice(index, 1);
-    addAudit(state, {
-      actor: "user",
-      action: "connector.delete",
-      target: connectorId,
-      risk: "medium",
-      evidence: { provider: connector?.provider, name: connector?.name }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "connector.delete",
+        target: connectorId,
+        risk: "medium",
+        evidence: { provider: connector?.provider, name: connector?.name }
+      },
+      { system: true }
+    );
     return { id: connectorId };
   });
 }
@@ -191,13 +209,22 @@ export async function resolveConnectorSecret(
     }
   } finally {
     await mutateState(config.instance, (mutating) => {
-      addAudit(mutating, {
-        actor: "runtime",
-        action: "connector.secret.use",
-        target: connectorId,
-        risk: "low",
-        evidence: { provider: connector.provider, purpose, resolved: ok }
-      });
+      // resolveConnectorSecret runs from many call sites including
+      // terminal_exec spawns (where the calling task IS known but not
+      // threaded down here yet) and connector health probes (instance-
+      // level). Until the call sites carry a context plumbed through, we
+      // stamp these as system-level.
+      addAudit(
+        mutating,
+        {
+          actor: "runtime",
+          action: "connector.secret.use",
+          target: connectorId,
+          risk: "low",
+          evidence: { provider: connector.provider, purpose, resolved: ok }
+        },
+        { system: true }
+      );
     });
   }
   return value;
@@ -251,13 +278,17 @@ export async function checkConnector(config: RuntimeConfig, connectorId: string)
     connector.health = probeHealth;
     connector.message = probeMessage;
     connector.updatedAt = now();
-    addAudit(state, {
-      actor: "runtime",
-      action: "connector.health",
-      target: connectorId,
-      risk: "low",
-      evidence: { provider: connector.provider, health: connector.health, probed }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "connector.health",
+        target: connectorId,
+        risk: "low",
+        evidence: { provider: connector.provider, health: connector.health, probed }
+      },
+      { system: true }
+    );
     return connector;
   });
 }
