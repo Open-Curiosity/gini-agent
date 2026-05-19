@@ -367,11 +367,32 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
       if (next.status === "waiting_approval" && next.approvalIds.length > 0) {
         const approvalId = next.approvalIds[next.approvalIds.length - 1]!;
         const approval = readState(config.instance).approvals.find((a) => a.id === approvalId);
-        const policyAction = approval ? mapApprovalToPolicyAction(approval.action) : undefined;
+        const policyAction = approval
+          ? mapApprovalToPolicyAction(approval.action, approval.payload)
+          : undefined;
         if (policyAction) {
-          const payload = approval && typeof approval.payload.command === "string"
-            ? { command: approval.payload.command }
-            : undefined;
+          // Forward the full shape the policy needs. For code.exec we
+          // MUST pass `source` (and `language` for symmetry) so the
+          // matcher scans the raw snippet and an argv-style payload
+          // like `Bun.spawn(["sudo", "apt"])` doesn't slip past the
+          // wrapper-only check. For plain terminal.exec the wrapper
+          // command is the whole shape.
+          const payload =
+            approval && typeof approval.payload.command === "string"
+              ? policyAction === "code.exec"
+                ? {
+                    command: approval.payload.command,
+                    source:
+                      typeof approval.payload.source === "string"
+                        ? approval.payload.source
+                        : "",
+                    language:
+                      typeof approval.payload.language === "string"
+                        ? approval.payload.language
+                        : undefined
+                  }
+                : { command: approval.payload.command }
+              : undefined;
           const decision = resolveApprovalPolicy(config, policyAction, payload);
           if (decision.mode === "auto") {
             try {
@@ -871,8 +892,24 @@ export interface AutoApproveMarkers {
 // audit labels, not policy-gated tools). Imperative dispatch uses
 // this to look up the right policy decision after the request* helper
 // has already created the approval row.
-export function mapApprovalToPolicyAction(action: Approval["action"]): PolicyAction | undefined {
-  if (action === "file.write" || action === "file.patch" || action === "terminal.exec" || action === "browser.upload_file") {
+//
+// code.exec is persisted on the approval row as action:"terminal.exec"
+// (since the eventual side effect is a shell exec), but the POLICY
+// decision must branch on the code.exec rule so the matcher scans
+// BOTH the wrapper command AND the raw source. We disambiguate by
+// looking for `source` on the payload — both request paths
+// (chat-task `requestCodeExecPrebuilt`, imperative
+// `requestCodeExecution`) persist `source` on the payload exactly so
+// this re-resolution can find it.
+export function mapApprovalToPolicyAction(
+  action: Approval["action"],
+  payload?: Record<string, unknown>
+): PolicyAction | undefined {
+  if (action === "terminal.exec") {
+    if (payload && typeof payload.source === "string") return "code.exec";
+    return "terminal.exec";
+  }
+  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
     return action;
   }
   return undefined;

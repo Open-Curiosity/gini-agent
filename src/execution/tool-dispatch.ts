@@ -1146,7 +1146,7 @@ async function codeExecDispatch(
     config,
     "code.exec",
     { command, source: code, language },
-    (reason) => requestCodeExecPrebuilt(config, taskId, toolCallId, language, command, reason)
+    (reason) => requestCodeExecPrebuilt(config, taskId, toolCallId, language, command, code, reason)
   );
 }
 
@@ -1189,6 +1189,7 @@ async function requestCodeExecPrebuilt(
   toolCallId: string,
   language: string,
   command: string,
+  source: string,
   reasonOverride?: string
 ): Promise<string> {
   return mutateState(config.instance, (state: RuntimeState) => {
@@ -1202,7 +1203,11 @@ async function requestCodeExecPrebuilt(
       target: `code.${language}`,
       risk: "high",
       reason: reasonOverride ?? "Code execution can change the system and requires explicit approval.",
-      payload: { command, timeoutMs: 10_000, toolCallId, language }
+      // `source` on the payload is the contract that lets the
+      // policy seam (re-)resolve this as code.exec instead of
+      // terminal.exec — the matcher then scans the raw source so
+      // argv-style payloads can't slip past a wrapper-only check.
+      payload: { command, timeoutMs: 10_000, toolCallId, language, source }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();

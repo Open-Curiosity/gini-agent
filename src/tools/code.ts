@@ -27,7 +27,14 @@ export async function requestCodeExecution(config: RuntimeConfig, task: Task): P
       target: `code.${language}`,
       risk: "high",
       reason: reasonOverride ?? "Code execution can change the system and requires explicit approval.",
-      payload: { command, timeoutMs: 10_000 }
+      // Persist `source` + `language` on the payload so the imperative
+      // re-resolve in agent.ts can recognize this as a code.exec
+      // approval (not a plain terminal.exec) and route the policy
+      // decision through the matcher that scans BOTH the wrapper
+      // command AND the raw source. Without `source` here, an
+      // argv-style payload like `Bun.spawn(["sudo", "apt"])` slips
+      // past the substring-on-wrapper check.
+      payload: { command, timeoutMs: 10_000, source: code, language }
     });
     item.status = "waiting_approval";
     item.currentStep = "Waiting for approval";

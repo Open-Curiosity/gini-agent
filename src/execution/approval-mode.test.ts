@@ -849,6 +849,31 @@ describe("imperative dispatch path", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  test("imperative code under auto mode gates argv-style dangerous source", async () => {
+    // The wrapper command `bun -e "..."` is auto-approve-shaped on
+    // its face — the dangerous bits are inside the quoted JS source.
+    // A wrapper-only policy decision would auto-approve and execute
+    // `sudo apt update`. The persisted approval payload must carry
+    // `source` so the imperative re-resolve recognizes this as
+    // code.exec and scans the raw source for the sudo pattern.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
+    const config = buildConfig(workspaceRoot, "imp-auto-code-argv", { approvalMode: "auto" });
+
+    const task = await submitTask(
+      config,
+      `code js :: Bun.spawn(["sudo", "apt", "update"])`
+    );
+    const paused = await waitForTerminal(config, task.id);
+    expect(paused.status).toBe("waiting_approval");
+
+    const state = readState(config.instance);
+    const approvals = state.approvals.filter((a) => a.taskId === task.id);
+    expect(approvals[0]?.reason).toContain("dangerous-pattern:");
+    expect(approvals[0]?.reason).toContain("sudo");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("legacy dangerouslyAutoApprove flag still drives imperative bypass", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
     const config = buildConfig(workspaceRoot, "imp-legacy-flag", { dangerouslyAutoApprove: true });
