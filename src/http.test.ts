@@ -833,6 +833,19 @@ describe("runtime api", () => {
     expect(config.approvalMode).toBe("strict");
   });
 
+  test("POST /api/browser/wipe-profile is no longer routed", async () => {
+    const config = testConfig("browser-wipe-removed");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/browser/wipe-profile",
+      { method: "POST" },
+      config.token
+    );
+    expect(response.status).toBe(404);
+  });
+
   test("browser connect returns 400 when CDP endpoint is unreachable", async () => {
     const config = testConfig("browser-unreachable");
     const handler = createHandler(config);
