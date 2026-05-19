@@ -321,13 +321,18 @@ async function tearDownExistingConnection(
   // activity log indistinguishable from a user-initiated disconnect.
   await mutateState(config.instance, (state) => {
     state.browser = null;
-    addAudit(state, {
-      actor: "user",
-      action: "browser.disconnect",
-      target: existing.mode === "managed" ? existing.dataDir ?? "managed" : redactUrlCredentials(existing.cdpUrl),
-      risk: "medium",
-      evidence: { mode: existing.mode, pid: existing.pid }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "browser.disconnect",
+        target: existing.mode === "managed" ? existing.dataDir ?? "managed" : redactUrlCredentials(existing.cdpUrl),
+        risk: "medium",
+        evidence: { mode: existing.mode, pid: existing.pid }
+      },
+      // Browser is an instance-shared resource — not bound to any one agent.
+      { system: true }
+    );
   });
   // disconnectSharedBrowser handles every mode correctly: closing the
   // managed BrowserContext terminates the Chromium child Playwright
@@ -384,13 +389,17 @@ async function connectExisting(config: RuntimeConfig, validatedUrl: string): Pro
   };
   await mutateState(config.instance, (state) => {
     state.browser = record;
-    addAudit(state, {
-      actor: "user",
-      action: "browser.connect",
-      target: redactUrlCredentials(record.cdpUrl),
-      risk: "medium",
-      evidence: { mode: "cdp", browser: probe.Browser ?? null }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "browser.connect",
+        target: redactUrlCredentials(record.cdpUrl),
+        risk: "medium",
+        evidence: { mode: "cdp", browser: probe.Browser ?? null }
+      },
+      { system: true }
+    );
   });
   return { connected: true, record };
 }
@@ -489,13 +498,17 @@ async function launchManaged(config: RuntimeConfig): Promise<Status> {
   };
   await mutateState(config.instance, (state) => {
     state.browser = record;
-    addAudit(state, {
-      actor: "user",
-      action: "browser.connect",
-      target: dataDir,
-      risk: "medium",
-      evidence: { mode: "managed", pid }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "browser.connect",
+        target: dataDir,
+        risk: "medium",
+        evidence: { mode: "managed", pid }
+      },
+      { system: true }
+    );
   });
   return { connected: true, record };
 }
@@ -520,13 +533,18 @@ async function disconnectBrowserInner(config: RuntimeConfig): Promise<Status> {
   // reattaching to the soon-to-be-closed visible window.
   await mutateState(config.instance, (state) => {
     state.browser = null;
-    addAudit(state, {
-      actor: "user",
-      action: "browser.disconnect",
-      target: existing.mode === "managed" ? existing.dataDir ?? "managed" : redactUrlCredentials(existing.cdpUrl),
-      risk: "medium",
-      evidence: { mode: existing.mode, pid: existing.pid }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "browser.disconnect",
+        target: existing.mode === "managed" ? existing.dataDir ?? "managed" : redactUrlCredentials(existing.cdpUrl),
+        risk: "medium",
+        evidence: { mode: existing.mode, pid: existing.pid }
+      },
+      // Browser is an instance-shared resource — not bound to any one agent.
+      { system: true }
+    );
   });
 
   // For managed (visible) records: closing the BrowserContext terminates
@@ -576,13 +594,17 @@ export async function wipeBrowserProfile(config: RuntimeConfig): Promise<WipeRes
     await rm(dataDir, { recursive: true, force: true });
   });
   await mutateState(config.instance, (state) => {
-    addAudit(state, {
-      actor: "user",
-      action: "browser.wipe-profile",
-      target: dataDir,
-      risk: "medium",
-      evidence: { dataDir }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "browser.wipe-profile",
+        target: dataDir,
+        risk: "medium",
+        evidence: { dataDir }
+      },
+      { system: true }
+    );
   });
   return { wiped: true, dataDir };
 }

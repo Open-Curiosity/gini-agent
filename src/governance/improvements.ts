@@ -31,13 +31,17 @@ export async function reviewImprovement(config: RuntimeConfig, proposalId: strin
     if (decision === "reject") {
       proposal.status = "rejected";
       proposal.updatedAt = now();
-      addAudit(state, {
-        actor: "user",
-        action: "improvement.rejected",
-        target: proposal.id,
-        risk: "medium",
-        taskId: proposal.sourceTaskId
-      });
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "improvement.rejected",
+          target: proposal.id,
+          risk: "medium",
+          taskId: proposal.sourceTaskId
+        },
+        proposal.sourceTaskId ? { taskId: proposal.sourceTaskId } : { system: true }
+      );
       return proposal;
     }
 
@@ -47,14 +51,18 @@ export async function reviewImprovement(config: RuntimeConfig, proposalId: strin
     proposal.appliedTargetId = appliedTargetId;
     proposal.status = "applied";
     proposal.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: "improvement.applied",
-      target: proposal.id,
-      risk: "medium",
-      taskId: proposal.sourceTaskId,
-      evidence: { kind: proposal.kind, appliedTargetId }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "improvement.applied",
+        target: proposal.id,
+        risk: "medium",
+        taskId: proposal.sourceTaskId,
+        evidence: { kind: proposal.kind, appliedTargetId }
+      },
+      proposal.sourceTaskId ? { taskId: proposal.sourceTaskId } : { system: true }
+    );
     return proposal;
   });
 }

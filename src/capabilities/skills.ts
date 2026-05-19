@@ -159,13 +159,18 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
       const prev = skill.status;
       skill.status = next;
       skill.updatedAt = now();
-      addAudit(state, {
-        actor: "user",
-        action: "skill.status",
-        target: skill.id,
-        risk: "low",
-        evidence: { previousStatus: prev, status: next }
-      });
+      // Skills are instance-level capabilities.
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "skill.status",
+          target: skill.id,
+          risk: "low",
+          evidence: { previousStatus: prev, status: next }
+        },
+        { system: true }
+      );
       return skill;
     }
     skill.previousVersions.unshift({
@@ -186,13 +191,17 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
     if (Array.isArray(input.tests)) skill.tests = input.tests.map(String);
     skill.version += 1;
     skill.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: "skill.updated",
-      target: skill.id,
-      risk: "medium",
-      evidence: { version: skill.version, previousVersions: skill.previousVersions.length }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "skill.updated",
+        target: skill.id,
+        risk: "medium",
+        evidence: { version: skill.version, previousVersions: skill.previousVersions.length }
+      },
+      { system: true }
+    );
     return skill;
   });
 }
@@ -208,12 +217,16 @@ export async function setSkillStatus(config: RuntimeConfig, idOrName: string, st
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
     skill.status = status;
     skill.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: `skill.${status}`,
-      target: skill.id,
-      risk: "low"
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: `skill.${status}`,
+        target: skill.id,
+        risk: "low"
+      },
+      { system: true }
+    );
     return skill;
   });
 }
@@ -240,7 +253,11 @@ export async function rollbackSkill(config: RuntimeConfig, idOrName: string) {
     skill.requiredPermissions = prior.requiredPermissions;
     skill.version += 1;
     skill.updatedAt = now();
-    addAudit(state, { actor: "user", action: "skill.rollback", target: skill.id, risk: "medium", evidence: { restoredVersion: prior.version } });
+    addAudit(
+      state,
+      { actor: "user", action: "skill.rollback", target: skill.id, risk: "medium", evidence: { restoredVersion: prior.version } },
+      { system: true }
+    );
     return skill;
   });
 }
@@ -253,14 +270,18 @@ export async function testSkill(config: RuntimeConfig, idOrName: string) {
     if (failures.length === 0) skill.successCount += 1;
     else skill.failureCount += 1;
     skill.updatedAt = now();
-    appendEvent(state, {
-      kind: "skill",
-      action: "skill.tested",
-      target: skill.id,
-      risk: "low",
-      summary: failures.length === 0 ? "Skill test passed" : "Skill test failed",
-      data: { failures }
-    });
+    appendEvent(
+      state,
+      {
+        kind: "skill",
+        action: "skill.tested",
+        target: skill.id,
+        risk: "low",
+        summary: failures.length === 0 ? "Skill test passed" : "Skill test failed",
+        data: { failures }
+      },
+      { system: true }
+    );
     return { skill, ok: failures.length === 0, failures };
   });
 }

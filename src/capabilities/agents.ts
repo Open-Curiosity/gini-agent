@@ -103,18 +103,25 @@ export async function deleteAgent(
   // hindsight bookkeeping; the agent removal itself is already logged by
   // the state mutation above via state.agents membership change.
   await mutateState(config.instance, (state) => {
-    addAudit(state, {
-      actor: "user",
-      action: "agent.deleted",
-      target: result.id,
-      risk: "medium",
-      evidence: {
-        name: result.name,
-        memoriesArchived: result.memoriesArchived,
-        unitsDeleted,
-        bankDeleted
-      }
-    });
+    // The deleted agent is the subject — attribute the audit to it so the
+    // deletion event lands in that agent's own historical inbox rather
+    // than the currently-active one.
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "agent.deleted",
+        target: result.id,
+        risk: "medium",
+        evidence: {
+          name: result.name,
+          memoriesArchived: result.memoriesArchived,
+          unitsDeleted,
+          bankDeleted
+        }
+      },
+      { agentId: result.id }
+    );
     return result.id;
   });
 
