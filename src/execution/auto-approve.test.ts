@@ -131,6 +131,17 @@ describe("matchDangerousTerminal", () => {
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "echo hi | tee -a ~/.ssh/foo")).toBe("write-system-path");
   });
 
+  test("blocks redirect / tee to dangerous paths even when the target is quoted", () => {
+    // Quoting the target should not bypass the redirect check — the
+    // shell still writes to the same file.
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, `echo y > "/etc/hosts"`)).toBe("write-system-path");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, `echo y >"/etc/hosts"`)).toBe("write-system-path");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, `echo y > '/etc/hosts'`)).toBe("write-system-path");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, `echo k > "~/.ssh/authorized_keys"`)).toBe("write-system-path");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, `echo k > "$HOME/.aws/credentials"`)).toBe("write-system-path");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, `echo hi | tee "/etc/hosts"`)).toBe("write-system-path");
+  });
+
   test("blocks rm -rf via alias-bypass and absolute-path binary forms", () => {
     // Backslash-escape (`\rm`) bypasses any shell alias for `rm` like
     // `alias rm='rm -i'`. Must still gate.

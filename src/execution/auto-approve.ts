@@ -191,12 +191,15 @@ export const DEFAULT_DANGEROUS_TERMINAL_PATTERNS: readonly DangerousPattern[] = 
     description: "redirect or tee to /etc/, ~/.ssh/, ~/.aws/, $HOME/.ssh/, $HOME/.aws/",
     test: (command) => {
       // Redirect form (`>` / `>>` with arbitrary whitespace, including
-      // none) into a dangerous path. The target prefix is captured to
-      // cover both `~` and `$HOME` spellings of the home directory.
+      // none) into a dangerous path. The path may be quoted (single
+      // or double) — `echo y > "/etc/hosts"` is the same write as
+      // `echo y > /etc/hosts`. The target prefix covers both `~` and
+      // `$HOME` spellings of the home directory.
       const targets = "(?:/etc/|~/\\.ssh/|~/\\.aws/|\\$HOME/\\.ssh/|\\$HOME/\\.aws/)";
-      if (new RegExp(`>>?\\s*${targets}`).test(command)) return true;
+      if (new RegExp(`>>?\\s*["']?${targets}`).test(command)) return true;
       // tee variant: `... | tee /etc/hosts` / `... | tee -a ~/.ssh/foo`.
-      if (new RegExp(`\\btee\\b[^\\n]*\\s${targets}`).test(command)) return true;
+      // Also accept a quoted target.
+      if (new RegExp(`\\btee\\b[^\\n]*\\s["']?${targets}`).test(command)) return true;
       return false;
     }
   }
