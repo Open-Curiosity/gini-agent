@@ -348,6 +348,24 @@ function migrateMemoryAgentId(state: RuntimeState): void {
   }
 }
 
+// Backfill Task.chatSessionId from the chatMessages join for records that
+// pre-date the field. The Tasks page reads task.chatSessionId directly so it
+// no longer has to pull /state for the chatMessages list — but state files
+// older than this field must still resolve correctly. Idempotent: only
+// stamps tasks where the field is missing AND a matching user-role message
+// exists. No audit row — this is purely derived data, not a new fact.
+function migrateTaskChatSessionId(state: RuntimeState): void {
+  if (!Array.isArray(state.tasks) || state.tasks.length === 0) return;
+  if (!Array.isArray(state.chatMessages) || state.chatMessages.length === 0) return;
+  for (const task of state.tasks) {
+    if (task.chatSessionId) continue;
+    const message = state.chatMessages.find(
+      (candidate) => candidate.taskId === task.id && candidate.role === "user"
+    );
+    if (message) task.chatSessionId = message.sessionId;
+  }
+}
+
 // Stamp the active-at-migration-time agent onto records that pre-date the
 // per-agent isolation field. Mirrors migrateMemoryAgentId — idempotent and
 // audit-emitting. Covers Task, ChatSessionRecord, JobRecord, JobRunRecord,
@@ -544,6 +562,10 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   // after every list default above so we never touch undefined arrays.
   // Idempotent — only stamps rows missing `agentId`.
   migrateRecordAgentIds(state);
+  // Backfill Task.chatSessionId so the Tasks page can resolve task -> chat
+  // session without a /state round-trip. Runs after chatMessages is
+  // defaulted (above) so the join scan never sees undefined.
+  migrateTaskChatSessionId(state);
   for (const session of state.chatSessions) {
     session.runIds ??= [];
   }

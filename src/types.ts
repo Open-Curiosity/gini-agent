@@ -277,6 +277,13 @@ export interface Task {
   parentTaskId?: string;
   subagentId?: string;
   runId?: string;
+  // Originating chat session, when the task was submitted from a chat
+  // message (web UI or messaging bridge). Lets clients link a task back to
+  // its conversation without fetching the unscoped chatMessages list to
+  // resolve the join. Optional because imperative/CLI tasks don't have a
+  // session. normalizeState backfills missing values from chatMessages
+  // for state files predating this field.
+  chatSessionId?: string;
   cost?: CostRecord;
   // Execution mode. "chat" routes through the tool-calling agent loop in
   // src/execution/chat-task.ts. "imperative" preserves the legacy CLI

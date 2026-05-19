@@ -81,6 +81,10 @@ export interface SubmitTaskOptions {
   // spawns, in-task create_job) so the new task inherits the originating
   // agent rather than whichever agent happens to be active right now.
   agentId?: string;
+  // Originating chat session, when the task was submitted from a chat
+  // message. Stamped on the task so the UI can resolve task -> session
+  // without fetching the unscoped chatMessages list.
+  chatSessionId?: string;
 }
 
 export async function submitTask(
@@ -104,7 +108,8 @@ export async function submitTask(
     options.parentTaskId,
     options.subagentId,
     options.runId,
-    options.agentId ?? effective.agentId
+    options.agentId ?? effective.agentId,
+    options.chatSessionId
   );
   if (options.mode) created.mode = options.mode;
   // When a parentTaskId is set, the upsert + the parent-status
@@ -153,7 +158,8 @@ export async function retryTask(config: RuntimeConfig, taskId: string): Promise<
       existing.parentTaskId,
       existing.subagentId,
       existing.runId,
-      existing.agentId ?? effective.agentId
+      existing.agentId ?? effective.agentId,
+      existing.chatSessionId
     );
     upsertTask(state, retry);
     addAudit(state, {

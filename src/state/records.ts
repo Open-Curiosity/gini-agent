@@ -70,7 +70,8 @@ export function createTask(
   parentTaskId?: string,
   subagentId?: string,
   runId?: string,
-  agentId?: string
+  agentId?: string,
+  chatSessionId?: string
 ): Task {
   const at = now();
   const taskId = id("task");
@@ -91,7 +92,8 @@ export function createTask(
     jobId,
     parentTaskId,
     subagentId,
-    runId
+    runId,
+    chatSessionId
   };
 }
 

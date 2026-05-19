@@ -498,7 +498,13 @@ async function dispatchPromptRun(
   let task;
   try {
     if (chatRunId) {
-      task = await submitTask(taskConfig, prompt, { jobId: job.id, runId: chatRunId, mode: "chat", agentId: job.agentId });
+      task = await submitTask(taskConfig, prompt, {
+        jobId: job.id,
+        runId: chatRunId,
+        mode: "chat",
+        agentId: job.agentId,
+        chatSessionId: job.chatSessionId
+      });
     } else {
       task = await submitTask(taskConfig, prompt, { jobId: job.id, agentId: job.agentId });
     }
