@@ -223,7 +223,8 @@ export function createChatSession(
     action: "chat.session.created",
     target: session.id,
     risk: "low",
-    summary: `Chat session created: ${session.title}`
+    summary: `Chat session created: ${session.title}`,
+    agentId: session.agentId
   });
   return session;
 }
@@ -264,7 +265,8 @@ export function deleteChatSession(state: RuntimeState, id: string): ChatSessionR
     action: "chat.session.deleted",
     target: id,
     risk: "low",
-    summary: `Chat session deleted: ${session.title}`
+    summary: `Chat session deleted: ${session.title}`,
+    agentId: session.agentId
   });
   return session;
 }
@@ -280,7 +282,8 @@ export function renameChatSession(state: RuntimeState, id: string, title: string
     action: "chat.session.renamed",
     target: session.id,
     risk: "low",
-    summary: `Chat session renamed: ${session.title}`
+    summary: `Chat session renamed: ${session.title}`,
+    agentId: session.agentId
   });
   return session;
 }
