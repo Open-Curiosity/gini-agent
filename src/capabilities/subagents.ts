@@ -20,6 +20,7 @@ import {
   now,
   readState
 } from "../state";
+import { resolveEffectiveContext } from "../execution/effective-context";
 
 // Default system prompt for a subagent when the caller doesn't provide one.
 // Keep it short and behavioral: the model gets the user-facing `prompt` as
@@ -113,9 +114,11 @@ export async function spawnSubagent(
   // record (and its subsequent task) running under a cancelled
   // parent. We throw a structured error the dispatcher catches and
   // converts to a "skipped" tool result.
+  let parentAgentId: string | undefined;
   const subagent = await mutateState(config.instance, (state) => {
+    let parent: typeof state.tasks[number] | undefined;
     if (parentTaskId) {
-      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      parent = state.tasks.find((t) => t.id === parentTaskId);
       // Refuse on `cancelled` (operator-initiated cancel race) AND
       // `failed` (sibling approval denial / runtime failure
       // mid-turn). `completed` is intentionally permitted because
@@ -127,6 +130,13 @@ export async function spawnSubagent(
         throw new Error(`Cannot spawn subagent: parent task ${parentTaskId} is already ${parent.status}.`);
       }
     }
+    // Inherit the parent task's owning agent so a switch between the
+    // parent's submission and this spawn doesn't reattribute the child.
+    // Mirrors the retryTask precedent (`existing.agentId ?? effective.agentId`)
+    // — fall back to the active agent only for parentless / unstamped
+    // legacy parents.
+    const effective = resolveEffectiveContext(state, config);
+    parentAgentId = parent?.agentId ?? effective.agentId;
     return createSubagentRecord(state, {
       name,
       prompt,
@@ -134,7 +144,8 @@ export async function spawnSubagent(
       toolsets: advertisedToolsets,
       systemPrompt,
       toolsetIds,
-      skillNames
+      skillNames,
+      agentId: parentAgentId
     });
   });
 
@@ -150,7 +161,8 @@ export async function spawnSubagent(
     task = await submitTask(config, prompt, {
       mode: "chat",
       parentTaskId,
-      subagentId: subagent.id
+      subagentId: subagent.id,
+      agentId: parentAgentId
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

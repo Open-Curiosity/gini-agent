@@ -31,13 +31,17 @@ export async function reviewImprovement(config: RuntimeConfig, proposalId: strin
     if (decision === "reject") {
       proposal.status = "rejected";
       proposal.updatedAt = now();
-      addAudit(state, {
-        actor: "user",
-        action: "improvement.rejected",
-        target: proposal.id,
-        risk: "medium",
-        taskId: proposal.sourceTaskId
-      });
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "improvement.rejected",
+          target: proposal.id,
+          risk: "medium",
+          taskId: proposal.sourceTaskId
+        },
+        proposal.sourceTaskId ? { taskId: proposal.sourceTaskId } : { system: true }
+      );
       return proposal;
     }
 
@@ -47,14 +51,18 @@ export async function reviewImprovement(config: RuntimeConfig, proposalId: strin
     proposal.appliedTargetId = appliedTargetId;
     proposal.status = "applied";
     proposal.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: "improvement.applied",
-      target: proposal.id,
-      risk: "medium",
-      taskId: proposal.sourceTaskId,
-      evidence: { kind: proposal.kind, appliedTargetId }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "improvement.applied",
+        target: proposal.id,
+        risk: "medium",
+        taskId: proposal.sourceTaskId,
+        evidence: { kind: proposal.kind, appliedTargetId }
+      },
+      proposal.sourceTaskId ? { taskId: proposal.sourceTaskId } : { system: true }
+    );
     return proposal;
   });
 }
@@ -86,11 +94,20 @@ function applyImprovement(state: ReturnType<typeof readState>, proposal: Awaited
   }
 
   const intervalSeconds = Math.max(1, Number(proposal.payload.intervalSeconds ?? 3600));
+  // Carry the originating task's owning agent onto the created job so the
+  // first scheduler fire doesn't reattribute it to whatever happens to be
+  // active right now. Falls back to state.activeAgentId when the proposal
+  // pre-dates per-agent stamping.
+  const sourceTask = proposal.sourceTaskId
+    ? state.tasks.find((task) => task.id === proposal.sourceTaskId)
+    : undefined;
+  const agentId = sourceTask?.agentId ?? state.activeAgentId;
   const job = createJob(state, {
     name: String(proposal.payload.name ?? proposal.title),
     prompt: String(proposal.payload.prompt ?? proposal.rationale),
     intervalSeconds,
-    nextRunAt: new Date(Date.now() + intervalSeconds * 1000).toISOString()
+    nextRunAt: new Date(Date.now() + intervalSeconds * 1000).toISOString(),
+    agentId
   });
   return job.id;
 }

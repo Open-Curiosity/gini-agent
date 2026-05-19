@@ -54,13 +54,19 @@ export async function restoreSnapshot(config: RuntimeConfig, snapshotId: string)
   }
   writeState(config.instance, parsed.state);
   await mutateState(config.instance, (state) => {
-    addAudit(state, {
-      actor: "user",
-      action: "snapshot.restored",
-      target: snapshotId,
-      risk: "high",
-      evidence: { path: record.path }
-    });
+    // Snapshot restore rewrites the entire instance — it predates and
+    // overwrites every agent's view, so it cannot belong to one.
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "snapshot.restored",
+        target: snapshotId,
+        risk: "high",
+        evidence: { path: record.path }
+      },
+      { system: true }
+    );
   });
   return { ok: true, restored: snapshotId, instance: config.instance };
 }

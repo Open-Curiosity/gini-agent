@@ -291,6 +291,11 @@ export interface Task {
   input: string;
   status: TaskStatus;
   instance: Instance;
+  // Per-agent isolation key, mirroring MemoryRecord.agentId. Optional because
+  // legacy state files predate this field; normalizeState backfills it by
+  // stamping the active agent at migration time. Stays undefined for tasks
+  // created with no active agent (system-driven flows).
+  agentId?: string;
   createdAt: string;
   updatedAt: string;
   currentStep?: string;
@@ -310,6 +315,13 @@ export interface Task {
   parentTaskId?: string;
   subagentId?: string;
   runId?: string;
+  // Originating chat session, when the task was submitted from a chat
+  // message (web UI or messaging bridge). Lets clients link a task back to
+  // its conversation without fetching the unscoped chatMessages list to
+  // resolve the join. Optional because imperative/CLI tasks don't have a
+  // session. normalizeState backfills missing values from chatMessages
+  // for state files predating this field.
+  chatSessionId?: string;
   cost?: CostRecord;
   // Execution mode. "chat" routes through the tool-calling agent loop in
   // src/execution/chat-task.ts. "imperative" preserves the legacy CLI
@@ -334,6 +346,12 @@ export interface RuntimeEvent {
   risk: RiskLevel;
   summary: string;
   data?: Record<string, unknown>;
+  // Originating agent. Optional and meaningful: when undefined, the
+  // event is "system-attributed" (instance boot, instance-level config,
+  // legacy rows from before agent stamping). Events are never
+  // back-filled — missing agentId is preserved as a first-class signal
+  // that the row is system-attributed.
+  agentId?: string;
 }
 
 export interface RunRecord {
@@ -380,6 +398,9 @@ export interface PlanStepRecord {
 export interface ChatSessionRecord {
   id: string;
   instance: Instance;
+  // Owning agent (same shape as MemoryRecord.agentId). Optional for legacy
+  // sessions; normalizeState backfills with the migration-time active agent.
+  agentId?: string;
   title: string;
   createdAt: string;
   updatedAt: string;
@@ -474,6 +495,8 @@ export interface ToolsetRecord {
 export interface SubagentRecord {
   id: string;
   instance: Instance;
+  // Owning agent. Optional for legacy records; backfilled by normalizeState.
+  agentId?: string;
   name: string;
   prompt: string;
   status: SubagentStatus;
@@ -679,11 +702,20 @@ export interface AuditEvent {
   runId?: string;
   approvalId?: string;
   evidence?: Record<string, unknown>;
+  // Originating agent. Optional and meaningful: when undefined, the
+  // audit is "system-attributed" (instance-level config, integration
+  // health, legacy entries). Audits are never back-filled — missing
+  // agentId is preserved as a first-class signal that the row is
+  // system-attributed.
+  agentId?: string;
 }
 
 export interface Approval {
   id: string;
   instance: Instance;
+  // Requesting agent. Optional — backfilled by normalizeState; system-driven
+  // approvals without an active agent leave it undefined.
+  agentId?: string;
   status: ApprovalStatus;
   createdAt: string;
   updatedAt: string;
@@ -799,6 +831,9 @@ export interface SkillVersion {
 export interface JobRecord {
   id: string;
   instance: Instance;
+  // Owning agent. Optional — legacy state files predate this field;
+  // normalizeState backfills it on load.
+  agentId?: string;
   name: string;
   prompt: string;
   script?: string;
@@ -878,6 +913,9 @@ export interface JobRecord {
 export interface JobRunRecord {
   id: string;
   instance: Instance;
+  // Owning agent. Optional — inherits from the parent job at creation time;
+  // backfilled by normalizeState for legacy state files.
+  agentId?: string;
   jobId: string;
   status: JobRunStatus;
   createdAt: string;

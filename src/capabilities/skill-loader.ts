@@ -575,45 +575,59 @@ export async function loadSkillsFromDisk(config: RuntimeConfig): Promise<SkillLo
           reason: `platforms ${JSON.stringify(parsed.platforms)} excludes ${hostPlatformTag()}`,
           path: entry.manifestPath
         });
-        appendEvent(state, {
-          kind: "skill",
-          action: "skill.skipped",
-          target: parsed.name,
-          risk: "low",
-          summary: `Skipped ${parsed.name}: platform mismatch`,
-          data: { platforms: parsed.platforms, host: hostPlatformTag() }
-        });
+        // Filesystem skill loading is instance-wide startup work — no
+        // agent owns the load pass.
+        appendEvent(
+          state,
+          {
+            kind: "skill",
+            action: "skill.skipped",
+            target: parsed.name,
+            risk: "low",
+            summary: `Skipped ${parsed.name}: platform mismatch`,
+            data: { platforms: parsed.platforms, host: hostPlatformTag() }
+          },
+          { system: true }
+        );
         continue;
       }
       const upsert = upsertSkillFromFile(state, parsed, entry);
       if (upsert.kind === "added") {
         result.added.push(upsert.record);
-        addAudit(state, {
-          actor: "runtime",
-          action: "skill.loaded",
-          target: upsert.record.id,
-          risk: "low",
-          evidence: {
-            name: parsed.name,
-            source: entry.source,
-            manifestPath: entry.manifestPath,
-            initialStatus: upsert.record.status
-          }
-        });
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "skill.loaded",
+            target: upsert.record.id,
+            risk: "low",
+            evidence: {
+              name: parsed.name,
+              source: entry.source,
+              manifestPath: entry.manifestPath,
+              initialStatus: upsert.record.status
+            }
+          },
+          { system: true }
+        );
       } else if (upsert.kind === "updated") {
         result.updated.push(upsert.record);
-        addAudit(state, {
-          actor: "runtime",
-          action: "skill.reloaded",
-          target: upsert.record.id,
-          risk: "low",
-          evidence: {
-            name: parsed.name,
-            source: entry.source,
-            manifestPath: entry.manifestPath,
-            version: upsert.record.version
-          }
-        });
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "skill.reloaded",
+            target: upsert.record.id,
+            risk: "low",
+            evidence: {
+              name: parsed.name,
+              source: entry.source,
+              manifestPath: entry.manifestPath,
+              version: upsert.record.version
+            }
+          },
+          { system: true }
+        );
       }
     }
     return result;

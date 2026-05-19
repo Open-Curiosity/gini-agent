@@ -22,13 +22,19 @@ export async function checkRelay(config: RuntimeConfig, idOrName: string) {
     relay.message = relay.mode === "local-only"
       ? "Local-only relay mode is available; remote reachability is not configured."
       : "Relay record is configured. Hosted transport implementation is deferred.";
-    addAudit(state, {
-      actor: "runtime",
-      action: "relay.health",
-      target: relay.id,
-      risk: "low",
-      evidence: { status: relay.status, mode: relay.mode }
-    });
+    // Relay health is an instance-level probe; the relay endpoint serves
+    // every agent.
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "relay.health",
+        target: relay.id,
+        risk: "low",
+        evidence: { status: relay.status, mode: relay.mode }
+      },
+      { system: true }
+    );
     return relay;
   });
 }
@@ -49,14 +55,18 @@ export async function sendQueuedNotifications(config: RuntimeConfig) {
       notification.status = "sent";
       notification.sentAt = now();
       notification.updatedAt = notification.sentAt;
-      addAudit(state, {
-        actor: "runtime",
-        action: "notification.sent",
-        target: notification.id,
-        risk: "low",
-        taskId: notification.taskId,
-        evidence: { target: notification.target, kind: notification.kind }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "notification.sent",
+          target: notification.id,
+          risk: "low",
+          taskId: notification.taskId,
+          evidence: { target: notification.target, kind: notification.kind }
+        },
+        notification.taskId ? { taskId: notification.taskId } : { system: true }
+      );
     }
     return state.notifications;
   });
@@ -68,7 +78,11 @@ export async function acknowledgeNotification(config: RuntimeConfig, notificatio
     if (!notification) throw new Error(`Notification not found: ${notificationId}`);
     notification.status = "acknowledged";
     notification.updatedAt = now();
-    addAudit(state, { actor: "user", action: "notification.acknowledged", target: notification.id, risk: "low" });
+    addAudit(
+      state,
+      { actor: "user", action: "notification.acknowledged", target: notification.id, risk: "low" },
+      notification.taskId ? { taskId: notification.taskId } : { system: true }
+    );
     return notification;
   });
 }

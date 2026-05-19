@@ -132,20 +132,27 @@ export async function reembedBank(config: RuntimeConfig, input: ReembedInput): P
   // Audit (mutate state so the event hits the audit log + the runtime event
   // stream, matching the invariant that embedding mutations are audited).
   await mutateState(config.instance, (state) => {
-    addAudit(state, {
-      actor: "runtime",
-      action: dryRun ? "embedding.reembed.dry-run" : "embedding.reembed",
-      target: bankId,
-      risk: "low",
-      evidence: {
-        provider: provider.name,
-        model: provider.model,
-        units: units.length,
-        migrated,
-        alreadyOnModel,
-        failed
-      }
-    });
+    // Embedding reembed is an operator-driven maintenance pass over a
+    // bank; the audit row records the model migration rather than any
+    // agent's runtime activity.
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: dryRun ? "embedding.reembed.dry-run" : "embedding.reembed",
+        target: bankId,
+        risk: "low",
+        evidence: {
+          provider: provider.name,
+          model: provider.model,
+          units: units.length,
+          migrated,
+          alreadyOnModel,
+          failed
+        }
+      },
+      { system: true }
+    );
   });
 
   return {

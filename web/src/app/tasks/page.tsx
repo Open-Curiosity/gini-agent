@@ -6,7 +6,7 @@ import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { api } from "@/lib/api";
-import { useChatSessions, useInvalidate, useState_, useStatus, useTask, useTasks } from "@/lib/queries";
+import { useChatSessions, useInvalidate, useStatus, useTask, useTasks } from "@/lib/queries";
 import type { Task, TraceRecord } from "@runtime/types";
 import type { ChatSession } from "@/lib/view-types";
 import { TaskList, type TaskFilter } from "./_components/TaskList";
@@ -105,20 +105,16 @@ function TaskDetailContainer({
   actionPending: boolean;
   onAction: (op: "retry" | "cancel") => void;
 }) {
-  // We need chatMessages + chatSessions to find the originating conversation.
-  // /state already includes both; we don't need a new endpoint. The query is
-  // already polling so this is cheap.
-  const state = useState_();
+  // Resolve task -> chat session via the field stamped at task creation
+  // (and backfilled by normalizeState for legacy state files). Reading
+  // task.chatSessionId directly avoids fetching the unscoped chatMessages
+  // list from /state for the join.
   const chats = useChatSessions();
   const linkedSession = useMemo<ChatSession | null>(() => {
-    const messages = state.data?.chatMessages ?? [];
-    const taskId = data.task.id;
-    // ChatMessageRecord stores singular taskId per message — find the message
-    // whose taskId matches, then resolve to its session via sessionId.
-    const message = messages.find((m) => m.taskId === taskId);
-    if (!message) return null;
-    return (chats.data ?? []).find((s) => s.id === message.sessionId) ?? null;
-  }, [state.data?.chatMessages, chats.data, data.task.id]);
+    const sessionId = data.task.chatSessionId;
+    if (!sessionId) return null;
+    return (chats.data ?? []).find((s) => s.id === sessionId) ?? null;
+  }, [chats.data, data.task.chatSessionId]);
   return (
     <TaskDetail
       data={data}

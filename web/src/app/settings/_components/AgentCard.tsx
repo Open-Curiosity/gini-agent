@@ -4,8 +4,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
-
-export interface AgentRow { id: string; name: string; status: string }
+import type { AgentRow } from "@/lib/view-types";
 
 export function AgentCard({
   agents,

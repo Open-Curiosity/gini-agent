@@ -5,8 +5,9 @@ import { toast } from "sonner";
 import { PageHeader } from "@/components/PageHeader";
 import { api } from "@/lib/api";
 import { useInvalidate, useStatus } from "@/lib/queries";
+import type { AgentRow } from "@/lib/view-types";
 import { ProviderCard, type ProviderCatalogItem } from "./_components/ProviderCard";
-import { AgentCard, type AgentRow } from "./_components/AgentCard";
+import { AgentCard } from "./_components/AgentCard";
 import { ToolsetsCard, type ToolsetRow } from "./_components/ToolsetsCard";
 import { McpCard, MessagingCard, type McpRow, type MessagingRow } from "./_components/McpCard";
 import { DevicesCard, type DeviceRow } from "./_components/DevicesCard";
@@ -43,7 +44,7 @@ export default function SettingsPage() {
 
   const useAgent = useMutation({
     mutationFn: (id: string) => api(`/agents/${encodeURIComponent(id)}/use`, { method: "POST" }),
-    onSuccess: () => { toast.success("Agent activated"); invalidate(["agents", "state"]); },
+    onSuccess: () => { toast.success("Agent activated"); invalidate(["agents", "state", "status", "memory"]); },
     onError: (error: Error) => toast.error(error.message)
   });
 

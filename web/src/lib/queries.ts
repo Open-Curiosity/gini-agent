@@ -41,12 +41,34 @@ export function useState_(options?: Partial<UseQueryOptions<RuntimeStateSnapshot
   });
 }
 
+// Active agent for scoping per-agent listings. Reads /status; returns
+// undefined until /status resolves. Consumers below gate their fetches on
+// this being defined (`enabled: Boolean(agentId)`) so the unfiltered list
+// never lands in the cache during bootstrapping.
+function useActiveAgentId(): string | undefined {
+  const status = useStatus();
+  return status.data?.activeAgent?.id;
+}
+
+function scopedPath(path: string, agentId: string | undefined): string {
+  if (!agentId) return path;
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}agentId=${encodeURIComponent(agentId)}`;
+}
+
 export function useTasks(options?: Partial<UseQueryOptions<Task[]>>) {
+  const agentId = useActiveAgentId();
+  const { enabled: callerEnabled, ...rest } = options ?? {};
   return useQuery<Task[]>({
-    queryKey: ["tasks"],
-    queryFn: () => api<Task[]>("/tasks"),
+    queryKey: ["tasks", agentId ?? null],
+    queryFn: () => api<Task[]>(scopedPath("/tasks", agentId)),
     refetchInterval: 60_000,
-    ...options
+    // Defer the first fetch until /status resolves the active agent so the
+    // unfiltered payload doesn't briefly land in the cache under the `null`
+    // key during bootstrapping. The Activity page can still opt into the
+    // "all agents" view by passing the filter through its own useQuery.
+    enabled: Boolean(agentId) && (callerEnabled ?? true),
+    ...rest
   });
 }
 
@@ -98,10 +120,12 @@ export function useHindsightBanks() {
 }
 
 export function useSubagents() {
+  const agentId = useActiveAgentId();
   return useQuery<SubagentRecord[]>({
-    queryKey: ["subagents"],
-    queryFn: () => api<SubagentRecord[]>("/subagents"),
-    refetchInterval: 60_000
+    queryKey: ["subagents", agentId ?? null],
+    queryFn: () => api<SubagentRecord[]>(scopedPath("/subagents", agentId)),
+    refetchInterval: 60_000,
+    enabled: Boolean(agentId)
   });
 }
 
@@ -115,18 +139,24 @@ export function useSkills(query?: string) {
 }
 
 export function useJobs() {
+  const agentId = useActiveAgentId();
   return useQuery<JobRecord[]>({
-    queryKey: ["jobs"],
-    queryFn: () => api<JobRecord[]>("/jobs"),
-    refetchInterval: 60_000
+    queryKey: ["jobs", agentId ?? null],
+    queryFn: () => api<JobRecord[]>(scopedPath("/jobs", agentId)),
+    refetchInterval: 60_000,
+    enabled: Boolean(agentId)
   });
 }
 
 export function useJobRuns(jobId?: string) {
+  const agentId = useActiveAgentId();
   return useQuery<JobRunRecord[]>({
-    queryKey: ["jobRuns", jobId ?? "all"],
-    queryFn: () => api<JobRunRecord[]>(jobId ? `/jobs/${jobId}/runs` : "/job-runs"),
-    refetchInterval: 60_000
+    queryKey: ["jobRuns", jobId ?? "all", agentId ?? null],
+    queryFn: () => api<JobRunRecord[]>(
+      scopedPath(jobId ? `/jobs/${jobId}/runs` : "/job-runs", agentId)
+    ),
+    refetchInterval: 60_000,
+    enabled: Boolean(agentId)
   });
 }
 
@@ -184,14 +214,16 @@ export function useAudit() {
 }
 
 export function useChatSessions() {
+  const agentId = useActiveAgentId();
   return useQuery<ChatSession[]>({
-    queryKey: ["chat"],
-    queryFn: () => api<ChatSession[]>("/chat"),
+    queryKey: ["chat", agentId ?? null],
+    queryFn: () => api<ChatSession[]>(scopedPath("/chat", agentId)),
     // 3s safety net so the sidebar's read/unread indicator picks up
     // task completions even when an SSE event for the change is missed
     // or arrives without invalidating ["chat"]. SSE is still the
     // primary signal — the interval just bounds the worst case.
-    refetchInterval: 3000
+    refetchInterval: 3000,
+    enabled: Boolean(agentId)
   });
 }
 

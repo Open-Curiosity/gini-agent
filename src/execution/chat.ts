@@ -11,6 +11,7 @@ import {
 } from "../state";
 import type { ChatMessageRecord, RuntimeConfig, TaskStatus } from "../types";
 import { createConversationRun, linkRunToTask } from "./runs";
+import { resolveEffectiveContext } from "./effective-context";
 
 // Statuses where a task is no longer producing partial text. Once a task
 // reaches one of these, the synthesized streaming message is dropped in
@@ -101,7 +102,10 @@ export function getChatSession(config: RuntimeConfig, id: string) {
 }
 
 export async function createChat(config: RuntimeConfig, input: Record<string, unknown>) {
-  return mutateState(config.instance, (state) => createChatSession(state, String(input.title ?? "New chat")));
+  return mutateState(config.instance, (state) => {
+    const effective = resolveEffectiveContext(state, config);
+    return createChatSession(state, String(input.title ?? "New chat"), undefined, effective.agentId);
+  });
 }
 
 export async function deleteChat(config: RuntimeConfig, id: string) {
@@ -123,7 +127,14 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
   // Chat messages run through the tool-calling agent loop. The legacy
   // prefix-dispatch path stays available for the imperative CLI.
-  const task = await submitTask(config, content, { runId: run.id, mode: "chat" });
+  // Inherit the session's owning agent so a switch between the chat's
+  // creation and this message doesn't reattribute the new task.
+  const task = await submitTask(config, content, {
+    runId: run.id,
+    mode: "chat",
+    chatSessionId: sessionId,
+    agentId: session.agentId
+  });
   await linkRunToTask(config, run.id, task);
   await mutateState(config.instance, (current) => {
     const message = createChatMessage(current, { sessionId, role: "user", content, taskId: task.id, runId: run.id });
@@ -170,14 +181,18 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
       typeof task.summary === "string" &&
       task.summary.trim() === "[SILENT]"
     ) {
-      addAudit(state, {
-        actor: "runtime",
-        action: "chat.message.suppressed_silent",
-        target: sessionId,
-        taskId,
-        risk: "low",
-        evidence: { runId: task.runId }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "chat.message.suppressed_silent",
+          target: sessionId,
+          taskId,
+          risk: "low",
+          evidence: { runId: task.runId }
+        },
+        { taskId }
+      );
       return null;
     }
     const content = task.status === "completed"

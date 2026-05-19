@@ -3,7 +3,6 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Providers } from "@/components/providers";
 import { MobileTopBar, Sidebar } from "@/components/Sidebar";
-import { runtimeInstance } from "@/lib/runtime";
 
 export const dynamic = "force-dynamic";
 
@@ -16,15 +15,14 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  const instance = runtimeInstance();
   return (
     <html lang="en" suppressHydrationWarning className={`${geistSans.variable} ${geistMono.variable} h-full`}>
       <body suppressHydrationWarning className="min-h-full bg-background text-foreground">
         <Providers>
           <div className="flex h-screen">
-            <Sidebar instance={instance} />
+            <Sidebar />
             <div className="flex flex-1 flex-col overflow-hidden">
-              <MobileTopBar instance={instance} />
+              <MobileTopBar />
               <main className="flex flex-1 flex-col overflow-hidden">{children}</main>
             </div>
           </div>

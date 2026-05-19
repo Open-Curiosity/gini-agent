@@ -292,17 +292,22 @@ export async function migrateLegacyApprovalMode(config: RuntimeConfig): Promise<
           (event.evidence?.field === "approvalMode")
       );
       if (already) return;
-      addAudit(state, {
-        actor: "runtime",
-        action: "config.migrated",
-        target: config.instance,
-        risk: "low",
-        evidence: {
-          field: "approvalMode",
-          from,
-          to
-        }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "config.migrated",
+          target: config.instance,
+          risk: "low",
+          evidence: {
+            field: "approvalMode",
+            from,
+            to
+          }
+        },
+        // Instance-level config migration — not bound to any one agent.
+        { system: true }
+      );
     });
   } catch {
     // Best-effort posture — startup must not fail on audit

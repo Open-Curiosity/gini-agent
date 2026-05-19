@@ -1,6 +1,7 @@
 import { submitTask } from "../agent";
 import type { JobRecord, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
 import { addAudit, appendEvent, appendLog, appendTrace, createChatSession, createJob, createJobRun, createRun, isTerminalTaskStatus, mutateState, now, readState } from "../state";
+import { resolveEffectiveContext } from "../execution/effective-context";
 import { spawn } from "bun";
 import { Cron } from "croner";
 
@@ -43,7 +44,27 @@ function assertNonNegativeInt(label: string, value: unknown): number {
   return num;
 }
 
-export async function createScheduledJob(config: RuntimeConfig, input: Record<string, unknown>) {
+export interface CreateScheduledJobOptions {
+  // Trusted attribution override. Only internal callers (the in-task
+  // `create_job` tool, `applyImprovement`) thread the originating agent
+  // here so the new job inherits from the record that requested it rather
+  // than whichever agent happens to be active at this exact tick. The HTTP
+  // path never sets this — public clients must not be able to spoof
+  // `agentId` through the request body.
+  originatingAgentId?: string;
+}
+
+export async function createScheduledJob(
+  config: RuntimeConfig,
+  input: Record<string, unknown>,
+  options: CreateScheduledJobOptions = {}
+) {
+  // Strip any `agentId` the caller pasted into the public input bag. Trust
+  // only the typed `options.originatingAgentId` and the runtime's active
+  // agent fallback below.
+  if ("agentId" in input) {
+    delete (input as Record<string, unknown>).agentId;
+  }
   // Cron-vs-interval mutual exclusion. A job is driven by EITHER a 5-field
   // Unix cron expression (wall-clock + per-job IANA timezone) OR an
   // interval-from-now (`intervalSeconds`). Reject payloads that explicitly
@@ -250,6 +271,15 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     // a bad parent task state) leaves no orphan chat row. The new
     // session's id replaces any caller-supplied chatSessionId so the job's
     // future fires post into the fresh thread.
+    const effective = resolveEffectiveContext(state, config);
+    // Callers driven by a record stamped at an earlier moment (e.g. a
+    // running task's `create_job` tool) thread the originating agent
+    // through the trusted `options.originatingAgentId` parameter so the
+    // new job belongs to the originating agent rather than whichever
+    // agent is active at this exact tick. The HTTP path never sets it —
+    // see the input-sanitization guard at the top of the function for
+    // why we can't read `agentId` off the caller-supplied payload.
+    const owningAgentId = options.originatingAgentId ?? effective.agentId;
     //
     // If the parent task came from a messaging-sourced chat session
     // (Discord, Telegram), copy the source descriptor onto the new
@@ -264,7 +294,7 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     // explicitly ignore it.
     let resolvedChatSessionId = chatSessionId;
     if (createDedicatedSessionTitle !== undefined) {
-      const session = createChatSession(state, createDedicatedSessionTitle);
+      const session = createChatSession(state, createDedicatedSessionTitle, undefined, owningAgentId);
       if (parentTaskId) {
         const parentSession = state.chatSessions.find((candidate) =>
           candidate.id !== session.id && candidate.taskIds.includes(parentTaskId)
@@ -305,7 +335,8 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
       dangerouslyAutoApprove,
       approvalMode,
       autoApproveCommands,
-      dangerousTerminalPatterns
+      dangerousTerminalPatterns,
+      agentId: owningAgentId
     });
   });
 }
@@ -403,7 +434,7 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
       job.lastRunAt = now();
       job.runCount += 1;
       job.updatedAt = now();
-      const run = createJobRun(state, { jobId: job.id, trigger: "schedule" });
+      const run = createJobRun(state, { jobId: job.id, trigger: "schedule", agentId: job.agentId });
       job.runIds.unshift(run.id);
       out.push({ job, run });
     }
@@ -515,13 +546,17 @@ async function dispatchPromptRun(
     const sessionRunId = await mutateState(config.instance, (state) => {
       const session = state.chatSessions.find((candidate) => candidate.id === job.chatSessionId);
       if (!session) {
-        addAudit(state, {
-          actor: "runtime",
-          action: "job.session.missing",
-          target: job.id,
-          risk: "low",
-          evidence: { jobId: job.id, runId: run.id, chatSessionId: job.chatSessionId }
-        });
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "job.session.missing",
+            target: job.id,
+            risk: "low",
+            evidence: { jobId: job.id, runId: run.id, chatSessionId: job.chatSessionId }
+          },
+          { jobId: job.id, agentId: job.agentId }
+        );
         return undefined;
       }
       const chatRun = createRun(state, {
@@ -542,9 +577,15 @@ async function dispatchPromptRun(
   let task;
   try {
     if (chatRunId) {
-      task = await submitTask(taskConfig, prompt, { jobId: job.id, runId: chatRunId, mode: "chat" });
+      task = await submitTask(taskConfig, prompt, {
+        jobId: job.id,
+        runId: chatRunId,
+        mode: "chat",
+        agentId: job.agentId,
+        chatSessionId: job.chatSessionId
+      });
     } else {
-      task = await submitTask(taskConfig, prompt, job.id);
+      task = await submitTask(taskConfig, prompt, { jobId: job.id, agentId: job.agentId });
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -564,15 +605,19 @@ async function dispatchPromptRun(
         // failures should leave the configured status untouched.
         if (trigger === "schedule") jobItem.status = "failed";
       }
-      appendEvent(state, {
-        kind: "job",
-        action: "job.run.failed",
-        target: job.id,
-        jobId: job.id,
-        risk: "low",
-        summary: "Prompt job dispatch failed.",
-        data: { runId: run.id, error: message }
-      });
+      appendEvent(
+        state,
+        {
+          kind: "job",
+          action: "job.run.failed",
+          target: job.id,
+          jobId: job.id,
+          risk: "low",
+          summary: "Prompt job dispatch failed.",
+          data: { runId: run.id, error: message }
+        },
+        { jobId: job.id, agentId: job.agentId }
+      );
     });
     throw error;
   }
@@ -608,13 +653,17 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
     // run while another is in-flight. Manual/replay are explicit user
     // actions and may run alongside an in-flight run.
     if (trigger === "schedule" && findRunningRun(state, jobId)) {
-      addAudit(state, {
-        actor: "runtime",
-        action: "job.run.skipped_overlap",
-        target: jobId,
-        risk: "low",
-        evidence: { reason: "previous run still running" }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "job.run.skipped_overlap",
+          target: jobId,
+          risk: "low",
+          evidence: { reason: "previous run still running" }
+        },
+        { jobId, agentId: item.agentId }
+      );
       return undefined;
     }
     item.lastRunAt = now();
@@ -651,7 +700,7 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
       }
     }
     item.updatedAt = now();
-    const run = createJobRun(state, { jobId, trigger });
+    const run = createJobRun(state, { jobId, trigger, agentId: item.agentId });
     item.runIds.unshift(run.id);
     return { job: item, run };
   });
@@ -683,12 +732,16 @@ export async function updateJobStatus(
     if (!job) throw new Error(`Job not found: ${jobId}`);
     job.status = statusValue;
     job.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: `job.${statusValue}`,
-      target: jobId,
-      risk: "low"
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: `job.${statusValue}`,
+        target: jobId,
+        risk: "low"
+      },
+      { jobId, agentId: job.agentId }
+    );
     return job;
   });
 }
@@ -966,7 +1019,16 @@ export async function updateJob(
     }
 
     job.updatedAt = now();
-    addAudit(state, { actor: "user", action: "job.updated", target: job.id, risk: "low" });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "job.updated",
+        target: job.id,
+        risk: "low"
+      },
+      { jobId: job.id, agentId: job.agentId }
+    );
     return job;
   });
 }
@@ -997,13 +1059,17 @@ export async function removeJob(config: RuntimeConfig, jobId: string, parentTask
         removedRuns += 1;
       }
     }
-    addAudit(state, {
-      actor: "user",
-      action: "job.removed",
-      target: job.id,
-      risk: "medium",
-      evidence: { removedRuns }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "job.removed",
+        target: job.id,
+        risk: "medium",
+        evidence: { removedRuns }
+      },
+      { jobId: job.id, agentId: job.agentId }
+    );
     return job;
   });
 }
@@ -1070,22 +1136,30 @@ async function executeScriptJob(
           if (trigger === "schedule") job.status = "failed";
         }
       }
-      appendEvent(state, {
-        kind: "job",
-        action: exitCode === 0 ? "job.run.completed" : "job.run.failed",
-        target: jobId,
-        jobId,
-        risk: "low",
-        summary: exitCode === 0 ? "Script job completed." : "Script job failed.",
-        data: { runId, exitCode, stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 1000) }
-      });
-      addAudit(state, {
-        actor: "runtime",
-        action: "job.script.executed",
-        target: jobId,
-        risk: "medium",
-        evidence: { runId, exitCode, stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 1000) }
-      });
+      appendEvent(
+        state,
+        {
+          kind: "job",
+          action: exitCode === 0 ? "job.run.completed" : "job.run.failed",
+          target: jobId,
+          jobId,
+          risk: "low",
+          summary: exitCode === 0 ? "Script job completed." : "Script job failed.",
+          data: { runId, exitCode, stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 1000) }
+        },
+        { jobId, agentId: job?.agentId ?? run.agentId }
+      );
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "job.script.executed",
+          target: jobId,
+          risk: "medium",
+          evidence: { runId, exitCode, stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 1000) }
+        },
+        { jobId, agentId: job?.agentId ?? run.agentId }
+      );
       return { jobId, runId, exitCode, stdout: stdout.slice(0, 4000), stderr: stderr.slice(0, 4000) };
     });
   } catch (error) {
@@ -1104,15 +1178,19 @@ async function executeScriptJob(
         job.lastError = message;
         if (trigger === "schedule") job.status = "failed";
       }
-      appendEvent(state, {
-        kind: "job",
-        action: "job.run.failed",
-        target: jobId,
-        jobId,
-        risk: "low",
-        summary: "Script job crashed.",
-        data: { runId, error: message }
-      });
+      appendEvent(
+        state,
+        {
+          kind: "job",
+          action: "job.run.failed",
+          target: jobId,
+          jobId,
+          risk: "low",
+          summary: "Script job crashed.",
+          data: { runId, error: message }
+        },
+        { jobId, agentId: job?.agentId ?? run.agentId }
+      );
     });
     return { jobId, runId, exitCode: -1, stdout: "", stderr: message };
   }

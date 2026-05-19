@@ -1,17 +1,27 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue
+} from "@/components/ui/select";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { RiskPill, StatusPill } from "@/components/StatusPill";
 import { cn } from "@/lib/utils";
-import { useAudit, useEvents } from "@/lib/queries";
+import { api } from "@/lib/api";
+import { useStatus } from "@/lib/queries";
 import { useRuntimeStream } from "@/lib/useRuntimeStream";
-import type { RiskLevel, RuntimeEventKind } from "@runtime/types";
+import type { AuditEvent, RiskLevel, RuntimeEvent, RuntimeEventKind } from "@runtime/types";
+import type { AgentRow } from "@/lib/view-types";
 
 const KIND_OPTIONS: RuntimeEventKind[] = [
   "task",
@@ -28,9 +38,56 @@ const KIND_OPTIONS: RuntimeEventKind[] = [
 ];
 const RISK_OPTIONS: RiskLevel[] = ["low", "medium", "high"];
 
+// Sentinel for the "show events from every agent (and unattributable rows)"
+// option in the agent dropdown. "active" follows the runtime's active agent;
+// any concrete agent id pins the filter to that agent.
+const AGENT_FILTER_ALL = "__all__";
+const AGENT_FILTER_ACTIVE = "__active__";
+
 export default function ActivityPage() {
-  const audit = useAudit();
-  const events = useEvents();
+  const status = useStatus();
+  const activeAgentId = status.data?.activeAgent?.id;
+  const agentsQuery = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string }>("/agents")
+  });
+  const [agentFilter, setAgentFilter] = useState<string>(AGENT_FILTER_ACTIVE);
+  const effectiveAgentId =
+    agentFilter === AGENT_FILTER_ALL
+      ? undefined
+      : agentFilter === AGENT_FILTER_ACTIVE
+        ? activeAgentId
+        : agentFilter;
+  const eventsPath = effectiveAgentId
+    ? `/events?agentId=${encodeURIComponent(effectiveAgentId)}`
+    : "/events";
+  const auditPath = effectiveAgentId
+    ? `/audit?agentId=${encodeURIComponent(effectiveAgentId)}`
+    : "/audit";
+  // In "Active agent" mode the filter depends on /status resolving the
+  // active agent. Defer the fetch in that case so the unfiltered payload
+  // doesn't briefly appear on first paint. "All agents" and pinned-agent
+  // modes fire immediately because their target is known up-front.
+  const ready =
+    agentFilter !== AGENT_FILTER_ACTIVE || activeAgentId !== undefined;
+  // Keep the filter mode in the cache key so the "All agents" slot (mode
+  // ALL, effectiveAgentId=undefined) doesn't share storage with the
+  // brief unresolved-active-agent state (mode ACTIVE,
+  // effectiveAgentId=undefined). Without the mode segment React Query
+  // would serve the all-agents payload to a user who'd selected
+  // "Active agent" during the first paint window.
+  const events = useQuery<RuntimeEvent[]>({
+    queryKey: ["events", agentFilter, effectiveAgentId ?? null],
+    queryFn: () => api<RuntimeEvent[]>(eventsPath),
+    refetchInterval: 60_000,
+    enabled: ready
+  });
+  const audit = useQuery<AuditEvent[]>({
+    queryKey: ["audit", agentFilter, effectiveAgentId ?? null],
+    queryFn: () => api<AuditEvent[]>(auditPath),
+    refetchInterval: 60_000,
+    enabled: ready
+  });
   const [search, setSearch] = useState("");
   const [liveCount, setLiveCount] = useState(0);
   const [kindFilter, setKindFilter] = useState<Set<string>>(new Set());
@@ -97,6 +154,20 @@ export default function ActivityPage() {
       <div className="flex flex-1 flex-col gap-3 overflow-hidden p-4 md:p-6">
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center gap-2">
+            <Select value={agentFilter} onValueChange={setAgentFilter}>
+              <SelectTrigger aria-label="Filter by agent" size="sm" className="min-w-[10rem]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={AGENT_FILTER_ACTIVE}>Active agent</SelectItem>
+                <SelectItem value={AGENT_FILTER_ALL}>All agents</SelectItem>
+                {(agentsQuery.data?.agents ?? []).map((agent) => (
+                  <SelectItem key={agent.id} value={agent.id}>
+                    {agent.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <Input
               value={search}
               onChange={(event) => setSearch(event.target.value)}

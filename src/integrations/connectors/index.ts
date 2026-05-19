@@ -68,18 +68,24 @@ export async function createConnector(config: RuntimeConfig, input: CreateConnec
     if (!module.probe) {
       updateConnectorHealth(connector);
     }
-    addAudit(state, {
-      actor: "user",
-      action: "connector.create",
-      target: connector.id,
-      risk: "medium",
-      evidence: {
-        provider: connector.provider,
-        name: connector.name,
-        scopes: connector.scopes,
-        purposes: secretRefs.map((ref) => ref.purpose)
-      }
-    });
+    // Connectors live at the instance level — they're shared across
+    // every agent, so the create row isn't per-agent activity.
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "connector.create",
+        target: connector.id,
+        risk: "medium",
+        evidence: {
+          provider: connector.provider,
+          name: connector.name,
+          scopes: connector.scopes,
+          purposes: secretRefs.map((ref) => ref.purpose)
+        }
+      },
+      { system: true }
+    );
     return connector;
   });
 }
@@ -108,16 +114,20 @@ export async function updateConnector(
       else connector.secretRefs.push(ref);
     }
     connector.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: wroteRefs.length > 0 ? "connector.rotate" : "connector.update",
-      target: connector.id,
-      risk: "medium",
-      evidence: {
-        provider: connector.provider,
-        rotatedPurposes: wroteRefs.map((ref) => ref.purpose)
-      }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: wroteRefs.length > 0 ? "connector.rotate" : "connector.update",
+        target: connector.id,
+        risk: "medium",
+        evidence: {
+          provider: connector.provider,
+          rotatedPurposes: wroteRefs.map((ref) => ref.purpose)
+        }
+      },
+      { system: true }
+    );
     return connector;
   });
 }
@@ -148,23 +158,31 @@ export async function deleteConnector(config: RuntimeConfig, connectorId: string
       connector.health = "unknown";
       connector.message = undefined;
       connector.updatedAt = now();
-      addAudit(state, {
-        actor: "user",
-        action: "connector.disable",
-        target: connectorId,
-        risk: "medium",
-        evidence: { provider: connector.provider, name: connector.name, source: connector.source }
-      });
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "connector.disable",
+          target: connectorId,
+          risk: "medium",
+          evidence: { provider: connector.provider, name: connector.name, source: connector.source }
+        },
+        { system: true }
+      );
       return { id: connectorId, tombstoned: true };
     }
     const [connector] = state.connectors.splice(index, 1);
-    addAudit(state, {
-      actor: "user",
-      action: "connector.delete",
-      target: connectorId,
-      risk: "medium",
-      evidence: { provider: connector?.provider, name: connector?.name }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "connector.delete",
+        target: connectorId,
+        risk: "medium",
+        evidence: { provider: connector?.provider, name: connector?.name }
+      },
+      { system: true }
+    );
     return { id: connectorId };
   });
 }
@@ -173,10 +191,14 @@ export async function deleteConnector(config: RuntimeConfig, connectorId: string
 // that records the purpose and whether resolution succeeded — never the
 // value itself. Callers that need to pass a secret into a subprocess
 // should fetch it through here so the audit trail is consistent.
+// When `taskId` is supplied, the resolution audit attributes to the
+// owning agent of that task; callers without a task context (health
+// probes, management UI) fall through to a system-level audit.
 export async function resolveConnectorSecret(
   config: RuntimeConfig,
   connectorId: string,
-  purpose: string
+  purpose: string,
+  taskId?: string
 ): Promise<string | undefined> {
   const state = readState(config.instance);
   const connector = state.connectors.find((candidate) => candidate.id === connectorId);
@@ -191,13 +213,18 @@ export async function resolveConnectorSecret(
     }
   } finally {
     await mutateState(config.instance, (mutating) => {
-      addAudit(mutating, {
-        actor: "runtime",
-        action: "connector.secret.use",
-        target: connectorId,
-        risk: "low",
-        evidence: { provider: connector.provider, purpose, resolved: ok }
-      });
+      addAudit(
+        mutating,
+        {
+          actor: "runtime",
+          action: "connector.secret.use",
+          target: connectorId,
+          risk: "low",
+          taskId,
+          evidence: { provider: connector.provider, purpose, resolved: ok }
+        },
+        taskId ? { taskId } : { system: true }
+      );
     });
   }
   return value;
@@ -251,13 +278,17 @@ export async function checkConnector(config: RuntimeConfig, connectorId: string)
     connector.health = probeHealth;
     connector.message = probeMessage;
     connector.updatedAt = now();
-    addAudit(state, {
-      actor: "runtime",
-      action: "connector.health",
-      target: connectorId,
-      risk: "low",
-      evidence: { provider: connector.provider, health: connector.health, probed }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "connector.health",
+        target: connectorId,
+        risk: "low",
+        evidence: { provider: connector.provider, health: connector.health, probed }
+      },
+      { system: true }
+    );
     return connector;
   });
 }
@@ -315,20 +346,26 @@ function envBindingsForProviders(providers: string[]): Record<string, { provider
 // Aggregate env bindings across every enabled, active skill. Called at
 // terminal_exec spawn time so a skill's scripts pick up declared
 // credentials regardless of which skill the model chose to follow.
-export async function resolveActiveSkillsEnv(config: RuntimeConfig): Promise<Record<string, string>> {
+// `taskId` is threaded so the per-secret resolution audits attribute to
+// the agent that owns the spawning task.
+export async function resolveActiveSkillsEnv(
+  config: RuntimeConfig,
+  taskId?: string
+): Promise<Record<string, string>> {
   const state = readState(config.instance);
   const out: Record<string, string> = {};
   for (const skill of state.skills) {
     if (skill.status !== "enabled") continue;
     if (!isSkillActive(state, skill)) continue;
-    Object.assign(out, await resolveSkillEnv(config, skill));
+    Object.assign(out, await resolveSkillEnv(config, skill, taskId));
   }
   return out;
 }
 
 export async function resolveSkillEnv(
   config: RuntimeConfig,
-  skill: SkillRecord
+  skill: SkillRecord,
+  taskId?: string
 ): Promise<Record<string, string>> {
   const envNames = skill.prerequisites?.env ?? [];
   if (envNames.length === 0) return {};
@@ -351,7 +388,7 @@ export async function resolveSkillEnv(
         && candidate.health === "healthy"
     );
     if (!connector) continue;
-    const value = await resolveConnectorSecret(config, connector.id, binding.purpose);
+    const value = await resolveConnectorSecret(config, connector.id, binding.purpose, taskId);
     if (value) out[envName] = value;
   }
   return out;

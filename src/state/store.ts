@@ -298,22 +298,31 @@ function migrateDropDeadMemoryFields(state: RuntimeState): void {
     }
   }
   if (scopesStripped > 0) {
-    addAudit(state, {
-      actor: "runtime",
-      action: "memory.scope.dropped",
-      target: "state.memories",
-      risk: "low",
-      evidence: { stripped: scopesStripped }
-    });
+    // Migration housekeeping at instance load — no agent context yet.
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "memory.scope.dropped",
+        target: "state.memories",
+        risk: "low",
+        evidence: { stripped: scopesStripped }
+      },
+      { system: true }
+    );
   }
   if (memoryScopesStripped > 0) {
-    addAudit(state, {
-      actor: "runtime",
-      action: "agent.memoryscopes.dropped",
-      target: "state.agents",
-      risk: "low",
-      evidence: { stripped: memoryScopesStripped }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "agent.memoryscopes.dropped",
+        target: "state.agents",
+        risk: "low",
+        evidence: { stripped: memoryScopesStripped }
+      },
+      { system: true }
+    );
   }
 }
 
@@ -332,20 +341,118 @@ function migrateMemoryAgentId(state: RuntimeState): void {
     ?? state.agents.find((agent) => agent.status === "active")?.id
     ?? state.agents[0]?.id
     ?? "agent_default";
+  // Treat stale agentIds (pointing at a deleted/unknown agent) the same as
+  // missing — leaving them stamped to a dead id strands the memory under
+  // an unselectable bucket in the UI. Mirrors the predicate in
+  // migrateRecordAgentIds.
+  const validAgentIds = new Set(state.agents.map((agent) => agent.id));
   let stamped = 0;
   for (const memory of state.memories) {
-    if (memory.agentId) continue;
+    if (memory.agentId && validAgentIds.has(memory.agentId)) continue;
     memory.agentId = defaultAgentId;
     stamped += 1;
   }
   if (stamped > 0) {
-    addAudit(state, {
-      actor: "runtime",
-      action: "memory.agentid.backfill",
-      target: defaultAgentId,
-      risk: "low",
-      evidence: { stamped, agentId: defaultAgentId }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "memory.agentid.backfill",
+        target: defaultAgentId,
+        risk: "low",
+        evidence: { stamped, agentId: defaultAgentId }
+      },
+      { agentId: defaultAgentId }
+    );
+  }
+}
+
+// Backfill Task.chatSessionId from the chatMessages join for records that
+// pre-date the field. The Tasks page reads task.chatSessionId directly so it
+// no longer has to pull /state for the chatMessages list — but state files
+// older than this field must still resolve correctly. Idempotent: only
+// stamps tasks where the field is missing AND a matching user-role message
+// exists. No audit row — this is purely derived data, not a new fact.
+function migrateTaskChatSessionId(state: RuntimeState): void {
+  if (!Array.isArray(state.tasks) || state.tasks.length === 0) return;
+  if (!Array.isArray(state.chatMessages) || state.chatMessages.length === 0) return;
+  for (const task of state.tasks) {
+    if (task.chatSessionId) continue;
+    const message = state.chatMessages.find(
+      (candidate) => candidate.taskId === task.id && candidate.role === "user"
+    );
+    if (message) task.chatSessionId = message.sessionId;
+  }
+}
+
+// Stamp the active-at-migration-time agent onto records that pre-date the
+// per-agent isolation field. Mirrors migrateMemoryAgentId — idempotent and
+// audit-emitting. Covers Task, ChatSessionRecord, JobRecord, JobRunRecord,
+// SubagentRecord, Approval in one pass so the backfill audit doesn't fan
+// out into six separate rows. RuntimeEvent and AuditEvent are deliberately
+// excluded — see the comment at the stamp loop below.
+function migrateRecordAgentIds(state: RuntimeState): void {
+  // When the state file has no agents at all (e.g. a hand-edited or
+  // partially-restored file that lost both the seed pass and the
+  // pre-seed defaults), skip the backfill entirely. Stamping records
+  // with a literal "agent_default" id that no AgentRecord owns would
+  // leave them attributed to a nonexistent agent. The seeding step in
+  // normalizeState above ensures we never reach this branch in
+  // normal operation. Defense in depth against a stale `activeAgentId`
+  // that the upstream repair missed: only honor it when it points at an
+  // existing agent; otherwise fall back to the first active / first
+  // existing agent rather than the dead id.
+  const knownActive = state.agents.some((agent) => agent.id === state.activeAgentId)
+    ? state.activeAgentId
+    : undefined;
+  const defaultAgentId =
+    knownActive
+    ?? state.agents.find((agent) => agent.status === "active")?.id
+    ?? state.agents[0]?.id;
+  if (!defaultAgentId) return;
+  const validAgentIds = new Set(state.agents.map((agent) => agent.id));
+  const counts: Record<string, number> = {};
+  // Re-stamp rows whose agentId is missing OR points at an agent that no
+  // longer exists (deleted agent, stale id from an old import). The latter
+  // would otherwise leave records stranded under an unselectable id and
+  // invisible to the UI which filters by `state.agents`. Idempotent: once
+  // every row resolves to a valid id, subsequent runs are no-ops.
+  const stamp = <T extends { agentId?: string }>(rows: T[] | undefined, label: string) => {
+    if (!Array.isArray(rows)) return;
+    let n = 0;
+    for (const row of rows) {
+      if (row.agentId && validAgentIds.has(row.agentId)) continue;
+      row.agentId = defaultAgentId;
+      n += 1;
+    }
+    if (n > 0) counts[label] = n;
+  };
+  stamp(state.tasks, "tasks");
+  stamp(state.chatSessions, "chatSessions");
+  stamp(state.jobs, "jobs");
+  stamp(state.jobRuns, "jobRuns");
+  stamp(state.subagents, "subagents");
+  stamp(state.approvals, "approvals");
+  // Events and audits are deliberately NOT backfilled here. After the
+  // AgentContext refactor, a missing agentId on an event/audit is a
+  // first-class signal that the row is system-attributed (instance boot,
+  // agent-lifecycle, instance-level config). Stamping those legacy-style
+  // would erase that distinction and re-pollute every read with a
+  // backfill audit row. Legacy events from before agentId existed simply
+  // stay unattributed — the UI's "All agents" view shows them; per-agent
+  // filters skip them, which matches the system-event contract.
+  if (Object.keys(counts).length > 0) {
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "records.agentid.backfill",
+        target: defaultAgentId,
+        risk: "low",
+        evidence: { stamped: counts, agentId: defaultAgentId }
+      },
+      { agentId: defaultAgentId }
+    );
   }
 }
 
@@ -389,13 +496,17 @@ function migrateHindsightAgentIdColumns(instance: Instance, state: RuntimeState)
       );
     }
     if (stampedUnits > 0 || stampedBanks > 0) {
-      addAudit(state, {
-        actor: "runtime",
-        action: "hindsight.agentid.backfill",
-        target: defaultAgentId,
-        risk: "low",
-        evidence: { units: stampedUnits, banks: stampedBanks, agentId: defaultAgentId }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "hindsight.agentid.backfill",
+          target: defaultAgentId,
+          risk: "low",
+          evidence: { units: stampedUnits, banks: stampedBanks, agentId: defaultAgentId }
+        },
+        { agentId: defaultAgentId }
+      );
     }
   } catch {
     // SQLite open failures are surfaced through `gini doctor`'s probe; the
@@ -481,8 +592,22 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.messagingBridges ??= [];
   state.messagingMessages ??= [];
   state.importReports ??= [];
-  state.agents ??= [defaultAgent(instance, now())];
+  // Seed a default agent when the state file is either missing the field or
+  // carries an empty array. Without the empty-array branch,
+  // migrateRecordAgentIds would fall through its `"agent_default"` literal
+  // and stamp records with an id no AgentRecord actually owns.
+  if (!Array.isArray(state.agents) || state.agents.length === 0) {
+    state.agents = [defaultAgent(instance, now())];
+  }
   state.activeAgentId ??= state.agents.find((item) => item.status === "active")?.id ?? state.agents[0]?.id;
+  // Repair: if `activeAgentId` references an agent the state file no longer
+  // contains (hand-edited file, partial restore, deleted-default edge), it
+  // would propagate the dead id through migrateRecordAgentIds. Re-anchor it
+  // to the first active / first existing agent so downstream readers and
+  // backfills see a real id.
+  if (!state.agents.some((agent) => agent.id === state.activeAgentId)) {
+    state.activeAgentId = state.agents.find((item) => item.status === "active")?.id ?? state.agents[0]?.id;
+  }
   // Phase C — per-agent memory isolation backfill. Runs after agents are
   // present so the migration can stamp the right id. Both helpers are
   // idempotent so a re-read of an already-migrated state file is a no-op.
@@ -500,6 +625,14 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.chatMessages ??= [];
   state.runs ??= [];
   state.planSteps ??= [];
+  // Per-agent isolation backfill for record types other than memory. Runs
+  // after every list default above so we never touch undefined arrays.
+  // Idempotent — only stamps rows missing `agentId`.
+  migrateRecordAgentIds(state);
+  // Backfill Task.chatSessionId so the Tasks page can resolve task -> chat
+  // session without a /state round-trip. Runs after chatMessages is
+  // defaulted (above) so the join scan never sees undefined.
+  migrateTaskChatSessionId(state);
   for (const session of state.chatSessions) {
     session.runIds ??= [];
   }
@@ -647,13 +780,18 @@ export function applyLegacyTelegramPairingMigration(state: RuntimeState): boolea
       pairingCodeExpiresAt: new Date(Date.now() + LEGACY_PAIRING_CODE_TTL_MS).toISOString()
     };
     bridge.updatedAt = now();
-    addAudit(state, {
-      actor: "runtime",
-      action: "messaging.pairing.migrated",
-      target: bridge.id,
-      risk: "low",
-      evidence: { reason: "legacy-bridge-allowlist-backfill" }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "messaging.pairing.migrated",
+        target: bridge.id,
+        risk: "low",
+        evidence: { reason: "legacy-bridge-allowlist-backfill" }
+      },
+      // Messaging bridge is an instance-shared resource — not bound to any agent.
+      { system: true }
+    );
     migrated = true;
   }
   return migrated;

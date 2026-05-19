@@ -16,13 +16,20 @@ export async function setToolsetStatus(config: RuntimeConfig, name: string, stat
       tool.status = status === "enabled" ? "available" : "disabled";
       tool.updatedAt = now();
     }
-    addAudit(state, {
-      actor: "user",
-      action: `toolset.${status}`,
-      target: toolset.name,
-      risk: "medium",
-      evidence: { toolNames: toolset.toolNames, scopes: toolset.scopes }
-    });
+    // Toolsets are instance-wide capability switches; individual agents
+    // can further restrict via their toolset filter but the toggle itself
+    // isn't owned by an agent.
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: `toolset.${status}`,
+        target: toolset.name,
+        risk: "medium",
+        evidence: { toolNames: toolset.toolNames, scopes: toolset.scopes }
+      },
+      { system: true }
+    );
     return toolset;
   });
 }

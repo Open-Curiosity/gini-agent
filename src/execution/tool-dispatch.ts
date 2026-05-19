@@ -335,18 +335,19 @@ async function browserDispatch(
   });
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
-    state.audit.unshift({
-      id: `audit_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`,
-      instance: state.instance,
-      at: now(),
-      actor: "agent",
-      action,
-      target: safeTarget,
-      risk,
-      taskId: item.id,
-      runId: item.runId,
-      evidence: { args: safeArgs, success: parsed.success !== false, error: safeError }
-    });
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action,
+        target: safeTarget,
+        risk,
+        taskId: item.id,
+        runId: item.runId,
+        evidence: { args: safeArgs, success: parsed.success !== false, error: safeError }
+      },
+      { taskId: item.id }
+    );
     item.updatedAt = now();
   });
   return result;
@@ -523,15 +524,19 @@ async function spawnSubagentTool(
   // model time / spend on a tangent.
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
-    addAudit(state, {
-      actor: "agent",
-      action: "subagent.spawn",
-      target: name,
-      risk: "medium",
-      taskId: item.id,
-      runId: item.runId,
-      evidence: { name, promptBytes: prompt.length, toolsets, skills, depth }
-    });
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "subagent.spawn",
+        target: name,
+        risk: "medium",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: { name, promptBytes: prompt.length, toolsets, skills, depth }
+      },
+      { taskId: item.id }
+    );
     item.updatedAt = now();
   });
   appendTrace(config.instance, taskId, {
@@ -784,6 +789,12 @@ async function createJobTool(
       autoApproveCommands,
       dangerousTerminalPatterns,
       timeoutSeconds
+    }, {
+      // Inherit the originating task's owning agent so a scheduler tick
+      // doesn't reattribute the job to whichever agent happens to be
+      // active at fire time. Threaded through the trusted options bag
+      // so a malicious HTTP client can't spoof it via the request body.
+      originatingAgentId: task?.agentId
     });
   } catch (err) {
     if (err instanceof Error && err.message.startsWith("Cannot create scheduled job: parent task ")) {
@@ -797,28 +808,32 @@ async function createJobTool(
 
   await mutateState(config.instance, (current) => {
     const item = findTask(current, taskId);
-    addAudit(current, {
-      actor: "agent",
-      action: "job.created",
-      target: job.id,
-      risk: "low",
-      taskId: item.id,
-      runId: item.runId,
-      evidence: {
-        name,
-        intervalSeconds,
-        cronExpression,
-        cronTimezone,
-        oneShot,
-        chatSessionId,
-        jobId: job.id,
-        dangerouslyAutoApprove,
-        approvalMode,
-        autoApproveCommands,
-        dangerousTerminalPatterns,
-        timeoutSeconds
-      }
-    });
+    addAudit(
+      current,
+      {
+        actor: "agent",
+        action: "job.created",
+        target: job.id,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: {
+          name,
+          intervalSeconds,
+          cronExpression,
+          cronTimezone,
+          oneShot,
+          chatSessionId,
+          jobId: job.id,
+          dangerouslyAutoApprove,
+          approvalMode,
+          autoApproveCommands,
+          dangerousTerminalPatterns,
+          timeoutSeconds
+        }
+      },
+      { taskId: item.id }
+    );
     item.updatedAt = now();
   });
   appendTrace(config.instance, taskId, {
@@ -1056,20 +1071,24 @@ async function updateJobTool(
   ];
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
-    addAudit(state, {
-      actor: "agent",
-      action: "job.updated",
-      target: jobId,
-      risk: "low",
-      taskId: item.id,
-      runId: item.runId,
-      evidence: {
-        jobId,
-        appliedFields,
-        patch: { ...patch, ...(oneShotPatch !== undefined ? { oneShot: oneShotPatch } : {}), ...(statusPatch !== undefined ? { status: statusPatch } : {}) },
-        previousSchedule
-      }
-    });
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "job.updated",
+        target: jobId,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: {
+          jobId,
+          appliedFields,
+          patch: { ...patch, ...(oneShotPatch !== undefined ? { oneShot: oneShotPatch } : {}), ...(statusPatch !== undefined ? { status: statusPatch } : {}) },
+          previousSchedule
+        }
+      },
+      { taskId: item.id }
+    );
     item.updatedAt = now();
   });
   appendTrace(config.instance, taskId, {
@@ -1136,19 +1155,23 @@ async function deleteJobTool(
   const removed = await removeJob(config, jobId, taskId);
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
-    addAudit(state, {
-      actor: "agent",
-      action: "job.deleted",
-      target: jobId,
-      risk: "low",
-      taskId: item.id,
-      runId: item.runId,
-      evidence: {
-        jobId,
-        name: removed.name,
-        previousSchedule
-      }
-    });
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "job.deleted",
+        target: jobId,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: {
+          jobId,
+          name: removed.name,
+          previousSchedule
+        }
+      },
+      { taskId: item.id }
+    );
     item.updatedAt = now();
   });
   appendTrace(config.instance, taskId, {
@@ -1218,21 +1241,19 @@ async function recordLowRiskAudit(
 ): Promise<void> {
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
-    // addAudit is imported transitively via createApproval/etc., but the
-    // chat-task path needs a direct audit record here without changing task
-    // status. Use the same shape the legacy completeLowRiskToolTask uses.
-    state.audit.unshift({
-      id: `audit_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`,
-      instance: state.instance,
-      at: now(),
-      actor: "runtime",
-      action,
-      target,
-      risk: "low",
-      taskId: item.id,
-      runId: item.runId,
-      evidence
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action,
+        target,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence
+      },
+      { taskId: item.id }
+    );
     item.updatedAt = now();
   });
 }
