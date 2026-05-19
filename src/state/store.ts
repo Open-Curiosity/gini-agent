@@ -297,22 +297,31 @@ function migrateDropDeadMemoryFields(state: RuntimeState): void {
     }
   }
   if (scopesStripped > 0) {
-    addAudit(state, {
-      actor: "runtime",
-      action: "memory.scope.dropped",
-      target: "state.memories",
-      risk: "low",
-      evidence: { stripped: scopesStripped }
-    });
+    // Migration housekeeping at instance load — no agent context yet.
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "memory.scope.dropped",
+        target: "state.memories",
+        risk: "low",
+        evidence: { stripped: scopesStripped }
+      },
+      { system: true }
+    );
   }
   if (memoryScopesStripped > 0) {
-    addAudit(state, {
-      actor: "runtime",
-      action: "agent.memoryscopes.dropped",
-      target: "state.agents",
-      risk: "low",
-      evidence: { stripped: memoryScopesStripped }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "agent.memoryscopes.dropped",
+        target: "state.agents",
+        risk: "low",
+        evidence: { stripped: memoryScopesStripped }
+      },
+      { system: true }
+    );
   }
 }
 
@@ -343,13 +352,17 @@ function migrateMemoryAgentId(state: RuntimeState): void {
     stamped += 1;
   }
   if (stamped > 0) {
-    addAudit(state, {
-      actor: "runtime",
-      action: "memory.agentid.backfill",
-      target: defaultAgentId,
-      risk: "low",
-      evidence: { stamped, agentId: defaultAgentId }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "memory.agentid.backfill",
+        target: defaultAgentId,
+        risk: "low",
+        evidence: { stamped, agentId: defaultAgentId }
+      },
+      { agentId: defaultAgentId }
+    );
   }
 }
 
@@ -421,13 +434,17 @@ function migrateRecordAgentIds(state: RuntimeState): void {
   stamp(state.events, "events");
   stamp(state.audit, "audit");
   if (Object.keys(counts).length > 0) {
-    addAudit(state, {
-      actor: "runtime",
-      action: "records.agentid.backfill",
-      target: defaultAgentId,
-      risk: "low",
-      evidence: { stamped: counts, agentId: defaultAgentId }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "records.agentid.backfill",
+        target: defaultAgentId,
+        risk: "low",
+        evidence: { stamped: counts, agentId: defaultAgentId }
+      },
+      { agentId: defaultAgentId }
+    );
   }
 }
 
@@ -471,13 +488,17 @@ function migrateHindsightAgentIdColumns(instance: Instance, state: RuntimeState)
       );
     }
     if (stampedUnits > 0 || stampedBanks > 0) {
-      addAudit(state, {
-        actor: "runtime",
-        action: "hindsight.agentid.backfill",
-        target: defaultAgentId,
-        risk: "low",
-        evidence: { units: stampedUnits, banks: stampedBanks, agentId: defaultAgentId }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "hindsight.agentid.backfill",
+          target: defaultAgentId,
+          risk: "low",
+          evidence: { units: stampedUnits, banks: stampedBanks, agentId: defaultAgentId }
+        },
+        { agentId: defaultAgentId }
+      );
     }
   } catch {
     // SQLite open failures are surfaced through `gini doctor`'s probe; the
