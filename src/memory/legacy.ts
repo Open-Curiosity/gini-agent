@@ -27,13 +27,17 @@ export async function updateMemory(config: RuntimeConfig, memoryId: string, stat
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
     memory.status = statusValue;
     memory.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: `memory.${statusValue === "active" ? "approved" : "rejected"}`,
-      target: memoryId,
-      risk: "medium",
-      taskId: memory.sourceTaskId
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: `memory.${statusValue === "active" ? "approved" : "rejected"}`,
+        target: memoryId,
+        risk: "medium",
+        taskId: memory.sourceTaskId
+      },
+      { memoryId }
+    );
     return memory;
   });
 }
@@ -46,14 +50,18 @@ export async function editMemory(config: RuntimeConfig, memoryId: string, input:
     if (typeof input.confidence === "number") memory.confidence = Math.max(0, Math.min(1, input.confidence));
     if (input.sensitivity === "normal" || input.sensitivity === "sensitive") memory.sensitivity = input.sensitivity;
     memory.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: "memory.edited",
-      target: memoryId,
-      risk: "medium",
-      taskId: memory.sourceTaskId,
-      evidence: { sensitivity: memory.sensitivity }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "memory.edited",
+        target: memoryId,
+        risk: "medium",
+        taskId: memory.sourceTaskId,
+        evidence: { sensitivity: memory.sensitivity }
+      },
+      { memoryId }
+    );
     return memory;
   });
 }
@@ -64,13 +72,17 @@ export async function archiveMemory(config: RuntimeConfig, memoryId: string) {
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
     memory.status = "archived";
     memory.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: "memory.archived",
-      target: memoryId,
-      risk: "medium",
-      taskId: memory.sourceTaskId
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "memory.archived",
+        target: memoryId,
+        risk: "medium",
+        taskId: memory.sourceTaskId
+      },
+      { memoryId }
+    );
     return memory;
   });
 }

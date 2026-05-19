@@ -98,14 +98,20 @@ export async function reflect(config: RuntimeConfig, input: ReflectInput): Promi
 
   // 5. Audit + trace.
   await mutateState(instance, (state) => {
-    addAudit(state, {
-      actor: "runtime",
-      action: "memory.reflect",
-      target: bankId,
-      risk: "low",
-      taskId: input.sourceTaskId,
-      evidence: { query: input.query, opinions: insertedOpinions.length, recalled: recalled.units.length }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "memory.reflect",
+        target: bankId,
+        risk: "low",
+        taskId: input.sourceTaskId,
+        evidence: { query: input.query, opinions: insertedOpinions.length, recalled: recalled.units.length }
+      },
+      input.sourceTaskId
+        ? { taskId: input.sourceTaskId, agentId: input.agentId }
+        : { agentId: input.agentId }
+    );
   });
   if (input.sourceTaskId) {
     appendTrace(instance, input.sourceTaskId, {

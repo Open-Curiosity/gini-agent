@@ -83,12 +83,16 @@ describe("state primitives", () => {
         // microtask tick — this is the worst case for an unserialized RMW.
         Promise.resolve().then(() =>
           mutateState(instance, (state) => {
-            addAudit(state, {
-              actor: "user",
-              action: "store.locking.test",
-              target: `record-${index}`,
-              risk: "low"
-            });
+            addAudit(
+              state,
+              {
+                actor: "user",
+                action: "store.locking.test",
+                target: `record-${index}`,
+                risk: "low"
+              },
+              { system: true }
+            );
           })
         )
       )
@@ -152,7 +156,7 @@ describe("state primitives", () => {
 
       // A subsequent mutation should persist the cleaned shape to disk.
       await mutateState(instance, (state) => {
-        addAudit(state, { actor: "user", action: "post.migration", target: "marker", risk: "low" });
+        addAudit(state, { actor: "user", action: "post.migration", target: "marker", risk: "low" }, { system: true });
       });
       const onDiskRaw = readFileSync(join(dir, "state.json"), "utf8");
       const onDisk = JSON.parse(onDiskRaw);

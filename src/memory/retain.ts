@@ -283,19 +283,25 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
 
   // 9. Audit + trace.
   await mutateState(instance, (state) => {
-    addAudit(state, {
-      actor: "runtime",
-      action: "memory.retain",
-      target: bankId,
-      risk: "low",
-      taskId: input.sourceTaskId,
-      evidence: {
-        units: insertedUnits.length,
-        entitiesCreated: allEntities.length,
-        links: links.length,
-        observations: observationsRegenerated
-      }
-    });
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "memory.retain",
+        target: bankId,
+        risk: "low",
+        taskId: input.sourceTaskId,
+        evidence: {
+          units: insertedUnits.length,
+          entitiesCreated: allEntities.length,
+          links: links.length,
+          observations: observationsRegenerated
+        }
+      },
+      input.sourceTaskId
+        ? { taskId: input.sourceTaskId, agentId: input.agentId }
+        : { agentId: input.agentId }
+    );
   });
   if (input.sourceTaskId) {
     appendTrace(instance, input.sourceTaskId, {

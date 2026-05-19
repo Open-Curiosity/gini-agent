@@ -414,13 +414,17 @@ describe("runtime api", () => {
     // earlier id is guaranteed not to be retained.
     await mutateState(config.instance, (state) => {
       for (let i = 0; i < 1100; i += 1) {
-        appendEvent(state, {
-          kind: "runtime",
-          action: "noop",
-          target: `target-${i}`,
-          risk: "low",
-          summary: `event ${i}`
-        });
+        appendEvent(
+          state,
+          {
+            kind: "runtime",
+            action: "noop",
+            target: `target-${i}`,
+            risk: "low",
+            summary: `event ${i}`
+          },
+          { system: true }
+        );
       }
     });
 
@@ -1276,14 +1280,17 @@ describe("runtime api", () => {
     // Switch the active agent before emitting the audit.
     await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
     await mutateState(config.instance, (state) => {
-      addAudit(state, {
-        actor: "runtime",
-        action: "test.job.fallback",
-        target: job.id,
-        risk: "low",
-        jobId: job.id,
-        evidence: { jobId: job.id }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "test.job.fallback",
+          target: job.id,
+          risk: "low",
+          evidence: { jobId: job.id }
+        },
+        { jobId: job.id }
+      );
     });
     const state = readState(config.instance);
     const audit = state.audit.find((a) => a.action === "test.job.fallback");
