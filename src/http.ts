@@ -52,20 +52,40 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
     // Settings: auto-approve controls.
     //   - `patterns`: shell-glob allowlist for terminal_exec only.
-    //   - `dangerouslyAutoApprove`: global bypass for every
-    //     approval-gated tool in the chat-task dispatcher (also the
-    //     legacy imperative path; see RuntimeConfig.dangerouslyAutoApprove
-    //     for scope).
-    // PATCH accepts either field individually or both together; omitted
-    // keys are left at their current value.
-    ["GET", /^\/api\/settings\/auto-approve$/, () => json({
-      patterns: config.autoApproveCommands ?? [],
-      dangerouslyAutoApprove: Boolean(config.dangerouslyAutoApprove),
-    })],
+    //     Allowlist match short-circuits the dangerous-pattern blocklist.
+    //   - `approvalMode`: "strict" | "auto" | "yolo". See ADR
+    //     approval-mode.md for the contract. Fresh instances default
+    //     to "auto".
+    //   - `dangerousTerminalPatterns`: optional operator overlay for
+    //     the built-in dangerous-pattern blocklist; only consulted when
+    //     `approvalMode === "auto"`.
+    //   - `dangerouslyAutoApprove`: deprecated read alias for
+    //     `approvalMode === "yolo"`. Accepted as a write alias too —
+    //     setting it true is equivalent to `approvalMode: "yolo"`.
+    // PATCH accepts any subset of fields together; omitted keys are
+    // left at their current value.
+    ["GET", /^\/api\/settings\/auto-approve$/, () => {
+      const approvalMode = config.approvalMode ?? (config.dangerouslyAutoApprove ? "yolo" : "auto");
+      return json({
+        patterns: config.autoApproveCommands ?? [],
+        approvalMode,
+        dangerousTerminalPatterns: config.dangerousTerminalPatterns ?? [],
+        // Derived read-only alias kept for legacy clients.
+        dangerouslyAutoApprove: approvalMode === "yolo",
+      });
+    }],
     ["PATCH", /^\/api\/settings\/auto-approve$/, async (request) => {
       const payload = await body(request);
+      const approvalMode =
+        payload.approvalMode === "strict" || payload.approvalMode === "auto" || payload.approvalMode === "yolo"
+          ? payload.approvalMode
+          : undefined;
       return json(updateAutoApproveSettings(config, {
         patterns: Array.isArray(payload.patterns) ? payload.patterns.map(String) : undefined,
+        approvalMode,
+        dangerousTerminalPatterns: Array.isArray(payload.dangerousTerminalPatterns)
+          ? payload.dangerousTerminalPatterns.map(String)
+          : undefined,
         dangerouslyAutoApprove: typeof payload.dangerouslyAutoApprove === "boolean" ? payload.dangerouslyAutoApprove : undefined
       }));
     }],

@@ -262,6 +262,19 @@ export function loadConfig(instance: Instance): RuntimeConfig {
   }
 
   const parsed = JSON.parse(readFileSync(path, "utf8")) as RuntimeConfig;
+  // Don't let the `defaultConfig` spread below stamp `approvalMode:
+  // "auto"` onto a legacy config that carries `dangerouslyAutoApprove:
+  // true` without an explicit `approvalMode`. Leaving the field
+  // undefined here is what lets the install-time migration shim
+  // detect "this is a pre-flip config" and alias it to "yolo".
+  // Synthesizing a `defaultConfig` without `approvalMode` for the
+  // legacy case keeps the legacy detection working without changing
+  // any other default.
+  const defaults = defaultConfig(instance);
+  const isLegacyDangerousFile = parsed.approvalMode === undefined && parsed.dangerouslyAutoApprove === true;
+  if (isLegacyDangerousFile) {
+    delete (defaults as { approvalMode?: unknown }).approvalMode;
+  }
   const persistedRoot = parsed.workspaceRoot ? resolve(parsed.workspaceRoot) : "";
   const repoRoot = projectRoot();
   // Detect persisted paths from any pre-`instances/` layout. Three predecessor
@@ -279,7 +292,7 @@ export function loadConfig(instance: Instance): RuntimeConfig {
   const needsRewrite = persistedIsOldBare || persistedIsOldLanes || persistedIsRepoRoot || !persistedRoot;
   const migratedWorkspaceRoot = needsRewrite ? workspaceDir(instance) : persistedRoot;
   const merged: RuntimeConfig = {
-    ...defaultConfig(instance),
+    ...defaults,
     ...parsed,
     instance,
     workspaceRoot: migratedWorkspaceRoot,

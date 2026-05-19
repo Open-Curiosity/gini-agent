@@ -48,6 +48,24 @@ async function waitForTerminal(config: RuntimeConfig, taskId: string, timeoutMs 
   throw new Error(`Task ${taskId} did not reach terminal state within ${timeoutMs}ms`);
 }
 
+// Variant that waits specifically for a non-waiting_approval terminal
+// state. The imperative auto-resolve path briefly flips the task to
+// `waiting_approval` inside requestShell/requestFileWrite before
+// `resolveApproval` runs and flips it to `completed`; callers that
+// expect the final state need to poll past the intermediate one.
+async function waitForFinalTerminal(config: RuntimeConfig, taskId: string, timeoutMs = 5000): Promise<Task> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = readState(config.instance);
+    const task = state.tasks.find((t) => t.id === taskId);
+    if (task && (task.status === "completed" || task.status === "failed" || task.status === "cancelled")) {
+      return task;
+    }
+    await Bun.sleep(20);
+  }
+  throw new Error(`Task ${taskId} did not reach a final terminal state within ${timeoutMs}ms`);
+}
+
 describe("approvalMode dispatch matrix", () => {
   let root: string;
   let prevState: string | undefined;
@@ -614,7 +632,7 @@ describe("imperative dispatch path", () => {
     const config = buildConfig(workspaceRoot, "imp-auto", { approvalMode: "auto" });
 
     const task = await submitTask(config, "write imp.txt :: from-imperative");
-    const finished = await waitForTerminal(config, task.id);
+    const finished = await waitForFinalTerminal(config, task.id);
     expect(finished.status).toBe("completed");
     expect(await Bun.file(join(workspaceRoot, "imp.txt")).text()).toBe("from-imperative");
 
@@ -657,7 +675,7 @@ describe("imperative dispatch path", () => {
 
     // shapeShell requires a shell-like token; -l flag satisfies it.
     const task = await submitTask(config, "shell echo -n hello");
-    const finished = await waitForTerminal(config, task.id);
+    const finished = await waitForFinalTerminal(config, task.id);
     expect(finished.status).toBe("completed");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
@@ -668,7 +686,7 @@ describe("imperative dispatch path", () => {
     const config = buildConfig(workspaceRoot, "imp-legacy-flag", { dangerouslyAutoApprove: true });
 
     const task = await submitTask(config, "write legacy-imp.txt :: from-legacy");
-    const finished = await waitForTerminal(config, task.id);
+    const finished = await waitForFinalTerminal(config, task.id);
     expect(finished.status).toBe("completed");
     expect(await Bun.file(join(workspaceRoot, "legacy-imp.txt")).text()).toBe("from-legacy");
 

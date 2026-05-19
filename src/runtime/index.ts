@@ -1,7 +1,8 @@
 import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import type { Instance, RuntimeConfig } from "../types";
+import type { ApprovalMode, Instance, RuntimeConfig } from "../types";
 import { configPath, ensureDir, instanceRoot, instancesRoot } from "../paths";
-import { readState, seedDefaultAgentFromRuntimeConfig, taskCounts } from "../state";
+import { mutateState, readState, seedDefaultAgentFromRuntimeConfig, taskCounts } from "../state";
+import { addAudit } from "../state/audit";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
 import { providerHealth } from "../provider";
@@ -86,8 +87,19 @@ export function install(config: RuntimeConfig): void {
   // After resetInstance removes the instance root, the directory is gone. Ensure it
   // before writing the config so reinstall is a clean idempotent operation.
   ensureDir(instanceRoot(config.instance));
+  // Approval-mode migration: legacy configs that carry
+  // `dangerouslyAutoApprove: true` without an explicit `approvalMode`
+  // get aliased to `approvalMode: "yolo"`. Patch the in-memory config
+  // BEFORE the initial write so the on-disk shape reflects the upgrade
+  // in a single write. The audit row is async / best-effort.
+  if (config.approvalMode === undefined && config.dangerouslyAutoApprove === true) {
+    config.approvalMode = "yolo";
+  }
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   readState(config.instance);
+  // Audit + side-effects of the migration. Fire-and-forget; the
+  // synchronous patch above is what the policy seam actually consults.
+  void migrateLegacyApprovalMode(config);
   // Seed the default agent's provider fields from the freshly-written
   // config so `gini run --provider X` (or any CLI install) propagates
   // to the active agent. Fire-and-forget: the mutateState write either
@@ -153,27 +165,63 @@ export async function uninstallAll(options: UninstallAllOptions): Promise<Uninst
 }
 
 // Update the auto-approve settings on the live config object and
-// persist to disk in one write. Either or both of `patterns` and
-// `dangerouslyAutoApprove` can be supplied; omitted keys are left
-// alone. Returns the merged effective values so callers can confirm.
-// Patterns are filtered through trim() to drop accidental whitespace
-// and empties from the UI text input.
+// persist to disk in one write. Any subset of fields can be supplied;
+// omitted keys are left alone. Returns the merged effective values so
+// callers can confirm. Patterns are filtered through trim() to drop
+// accidental whitespace and empties from the UI text input.
+//
+// `dangerouslyAutoApprove` is accepted as a deprecated alias for
+// `approvalMode: "yolo"`. When both are supplied in the same PATCH,
+// `approvalMode` is authoritative — the legacy flag is interpreted
+// only if `approvalMode` is undefined in the payload.
 export function updateAutoApproveSettings(
   config: RuntimeConfig,
-  input: { patterns?: string[]; dangerouslyAutoApprove?: boolean }
-): { patterns: string[]; dangerouslyAutoApprove: boolean } {
+  input: {
+    patterns?: string[];
+    dangerouslyAutoApprove?: boolean;
+    approvalMode?: ApprovalMode;
+    dangerousTerminalPatterns?: string[];
+  }
+): {
+  patterns: string[];
+  dangerouslyAutoApprove: boolean;
+  approvalMode: ApprovalMode;
+  dangerousTerminalPatterns: string[];
+} {
   if (input.patterns !== undefined) {
     const cleaned = input.patterns.map((p) => (typeof p === "string" ? p.trim() : "")).filter((p) => p.length > 0);
     config.autoApproveCommands = cleaned;
   }
-  if (input.dangerouslyAutoApprove !== undefined) {
+  if (input.approvalMode !== undefined) {
+    config.approvalMode = input.approvalMode;
+    // Keep the deprecated alias coherent: setting approvalMode
+    // explicitly clears the legacy flag's authority. The flag is
+    // only ever the load-time alias source.
+    if (input.approvalMode !== "yolo") {
+      config.dangerouslyAutoApprove = false;
+    } else {
+      config.dangerouslyAutoApprove = true;
+    }
+  } else if (input.dangerouslyAutoApprove !== undefined) {
+    // Legacy alias path: PATCH with only the deprecated flag set.
+    // Resolves to approvalMode "yolo" or "auto" (the new default).
+    config.approvalMode = input.dangerouslyAutoApprove ? "yolo" : "auto";
     config.dangerouslyAutoApprove = input.dangerouslyAutoApprove;
+  }
+  if (input.dangerousTerminalPatterns !== undefined) {
+    const cleaned = input.dangerousTerminalPatterns
+      .map((p) => (typeof p === "string" ? p : ""))
+      .filter((p) => p.trim().length > 0);
+    config.dangerousTerminalPatterns = cleaned;
   }
   ensureDir(instanceRoot(config.instance));
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  const effectiveMode: ApprovalMode = config.approvalMode ?? (config.dangerouslyAutoApprove ? "yolo" : "auto");
   return {
     patterns: config.autoApproveCommands ?? [],
-    dangerouslyAutoApprove: Boolean(config.dangerouslyAutoApprove)
+    dangerouslyAutoApprove: effectiveMode === "yolo",
+    approvalMode: effectiveMode,
+    dangerousTerminalPatterns: config.dangerousTerminalPatterns ?? []
   };
 }
 
@@ -184,7 +232,55 @@ export function updateAutoApproveCommands(config: RuntimeConfig, patterns: strin
   return updateAutoApproveSettings(config, { patterns }).patterns;
 }
 
-// Back-compat shim for the flag.
+// Back-compat shim for the legacy flag.
 export function updateDangerouslyAutoApprove(config: RuntimeConfig, enabled: boolean): boolean {
   return updateAutoApproveSettings(config, { dangerouslyAutoApprove: enabled }).dangerouslyAutoApprove;
+}
+
+// Load-time migration shim for approval-mode. Detects a legacy
+// config file that carries `dangerouslyAutoApprove: true` aliased
+// (synchronously by `install`) to `approvalMode: "yolo"`, persists
+// the upgraded shape to disk if needed, and emits a one-time
+// `config.migrated` audit row so the trail records the
+// approval-policy change.
+//
+// Idempotent — the audit row is only written once per instance.
+// Failures are swallowed (startup shouldn't crash because of audit
+// persistence), but the in-memory config is already patched
+// synchronously by `install` so the policy seam sees a coherent mode
+// regardless.
+export async function migrateLegacyApprovalMode(config: RuntimeConfig): Promise<void> {
+  // Trigger condition: the in-memory config has approvalMode "yolo"
+  // AND the legacy flag set true. That combination is what `install`
+  // produces when it aliases a legacy config; a fresh "yolo" install
+  // (set explicitly by the user) won't carry the legacy flag.
+  if (config.approvalMode !== "yolo") return;
+  if (config.dangerouslyAutoApprove !== true) return;
+  try {
+    await mutateState(config.instance, (state) => {
+      // De-dupe: if a `config.migrated` audit already exists for this
+      // instance + approvalMode field, skip. Idempotent across restarts.
+      const already = state.audit.find(
+        (event) =>
+          event.action === "config.migrated" &&
+          event.target === config.instance &&
+          (event.evidence?.field === "approvalMode")
+      );
+      if (already) return;
+      addAudit(state, {
+        actor: "runtime",
+        action: "config.migrated",
+        target: config.instance,
+        risk: "low",
+        evidence: {
+          field: "approvalMode",
+          from: "dangerouslyAutoApprove: true",
+          to: "yolo"
+        }
+      });
+    });
+  } catch {
+    // Best-effort posture — startup must not fail on audit
+    // persistence.
+  }
 }
