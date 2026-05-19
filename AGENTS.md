@@ -66,7 +66,7 @@ For docs-only changes, at minimum sweep for stale links and terminology:
 rg -n "v0|v1|v2|v3|lane|v1-readiness|single HTML|src/state\\.ts|src/api" README.md docs
 ```
 
-After a UI-related change or new feature, exercise it in a real browser before declaring the task done. Drive the affected screen end-to-end (the Playwright MCP browser tools are the default path) and confirm the change actually renders and behaves as intended — typecheck and unit tests don't catch broken layouts, missing handlers, or regressed flows.
+After a UI-related change or new feature, exercise it in a real browser before declaring the task done. Drive the affected screen end-to-end and confirm the change actually renders and behaves as intended — typecheck and unit tests don't catch broken layouts, missing handlers, or regressed flows.
 
 ## Logs
 
