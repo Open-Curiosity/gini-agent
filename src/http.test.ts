@@ -841,19 +841,25 @@ describe("runtime api", () => {
       body: JSON.stringify({ name: "scout" })
     });
 
-    // Task under the default agent.
+    // Task under the default agent. We use `read README.md` so runTask
+    // dispatches a real low-risk file tool and the task lands in a terminal
+    // state before the test ends — avoids a background failTask firing
+    // after the test's state file has been cleaned up by the next test.
+    config.workspaceRoot = process.cwd();
     const defaultTask = await call(handler, config, "/api/tasks", {
       method: "POST",
-      body: JSON.stringify({ input: "noop" })
+      body: JSON.stringify({ input: "read README.md" })
     });
     expect(defaultTask.agentId).toBe(defaultAgentId);
+    await waitForTask(handler, config, defaultTask.id);
 
     await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
     const scoutTask = await call(handler, config, "/api/tasks", {
       method: "POST",
-      body: JSON.stringify({ input: "noop" })
+      body: JSON.stringify({ input: "read README.md" })
     });
     expect(scoutTask.agentId).toBe(second.id);
+    await waitForTask(handler, config, scoutTask.id);
 
     // Unfiltered listing includes both rows.
     const all = await call(handler, config, "/api/tasks");
