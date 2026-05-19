@@ -1297,6 +1297,36 @@ describe("runtime api", () => {
     expect(deleted?.agentId).toBe(defaultAgentId);
   });
 
+  test("deleting a chat session also clears the per-conversation identity snapshot", async () => {
+    // Identity snapshots are keyed on conversationId (the chat session id);
+    // without the cleanup in deleteChatSession each deleted chat leaks one
+    // IdentitySnapshotRecord into state forever.
+    const config = testConfig("records-identity-snapshot-cleanup");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "snapshot-cleanup" })
+    });
+    await mutateState(config.instance, (state) => {
+      if (!state.identitySnapshots) state.identitySnapshots = {};
+      state.identitySnapshots[session.id] = {
+        identity: {
+          instance: config.instance,
+          runtimePort: config.port,
+          agentName: "default",
+          agentId: "agent_x",
+          provider: "echo/test",
+          toolsets: ["file"],
+          memoryNamespace: "agent_x"
+        },
+        lastFullTurn: 1
+      };
+    });
+    expect(readState(config.instance).identitySnapshots?.[session.id]).toBeDefined();
+    await call(handler, config, `/api/chat/${session.id}`, { method: "DELETE" });
+    expect(readState(config.instance).identitySnapshots?.[session.id]).toBeUndefined();
+  });
+
   test("addAudit infers agentId from jobId when neither agentId nor taskId is provided", async () => {
     // Regression: inferAgentId's jobId fallback only fires when the caller
     // threads `jobId` (or appendEvent's persisted `jobId`) through. This
