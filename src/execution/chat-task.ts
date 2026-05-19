@@ -716,6 +716,9 @@ async function runLoop(
     await updateRunFromTask(config, exhausted);
     await syncSubagentFromTask(config, exhausted);
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
+    if (exhausted.status === "completed") {
+      void scheduleAutoRetain(config, exhausted);
+    }
     return exhausted;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
