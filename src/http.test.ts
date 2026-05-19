@@ -957,8 +957,8 @@ describe("runtime api", () => {
     expect(scoped.some((s: { id: string }) => s.id === subA.id)).toBe(false);
   });
 
-  test("stamps the active agent on approvals and filters by agentId", async () => {
-    const config = testConfig("records-agentid-approvals");
+  test("subagent inherits the parent task's agent even when the active agent switched", async () => {
+    const config = testConfig("records-agentid-subagent-inherit");
     const handler = createHandler(config);
     const initial = await call(handler, config, "/api/agents");
     const defaultAgentId = initial.activeAgentId as string;
@@ -966,40 +966,66 @@ describe("runtime api", () => {
       method: "POST",
       body: JSON.stringify({ name: "scout" })
     });
-    // Seed an approval owned by the default agent. A bare approval row is
-    // enough — the filter inherits agentId from the originating task; here
-    // we set it explicitly to the agent we're testing.
-    await mutateState(config.instance, (state) => {
-      state.approvals.unshift({
-        id: "approval_default_one",
-        instance: state.instance,
-        agentId: defaultAgentId,
-        status: "pending",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        action: "file.write",
-        target: "/tmp/x",
-        risk: "low",
-        reason: "test",
-        payload: {}
-      });
-      state.approvals.unshift({
-        id: "approval_scout_one",
-        instance: state.instance,
-        agentId: second.id,
-        status: "pending",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        action: "file.write",
-        target: "/tmp/y",
-        risk: "low",
-        reason: "test",
-        payload: {}
-      });
+    // Submit a parent task under the default agent so the resulting parent
+    // task carries agentId=default.
+    const parentTask = await call(handler, config, "/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ input: "echo parent" })
     });
-    const scoped = await call(handler, config, `/api/approvals?agentId=${encodeURIComponent(defaultAgentId)}`);
-    expect(scoped.some((a: { id: string }) => a.id === "approval_default_one")).toBe(true);
-    expect(scoped.some((a: { id: string }) => a.id === "approval_scout_one")).toBe(false);
+    await waitForTask(handler, config, parentTask.id);
+    // Switch the active agent *before* spawning the subagent. The child
+    // should still inherit the parent's agent id (default), not the active
+    // agent (scout). Regression test for the inheritance bug where
+    // spawnSubagent read `resolveEffectiveContext(...).agentId` directly.
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    const child = await call(handler, config, "/api/subagents", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "child",
+        prompt: "echo child",
+        parentTaskId: parentTask.id
+      })
+    });
+    expect(child.agentId).toBe(defaultAgentId);
+    // The child task spawned by the subagent path should also carry the
+    // parent's agent — not the active agent at the moment of spawn.
+    await waitForTask(handler, config, child.taskId);
+    const childDetail = await call(handler, config, `/api/tasks/${child.taskId}`);
+    expect(childDetail.task.agentId).toBe(defaultAgentId);
+  });
+
+  test("approvals inherit agentId from the originating task and filter by agentId", async () => {
+    const config = testConfig("records-agentid-approvals");
+    // The patch flow writes through workspaceRoot; point at the repo so the
+    // pre-image read in `patch README.md ::` succeeds.
+    config.workspaceRoot = process.cwd();
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    // Submit a patch task under the default agent — the agent loop blocks
+    // on file.patch until approval, and createApproval inherits agentId
+    // from the originating task.
+    const task = await call(handler, config, "/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ input: "patch README.md :: Gini => Gini" })
+    });
+    await waitForTask(handler, config, task.id);
+    // Switch the active agent *before* asserting. The approval was already
+    // created under the originating task, so it must carry the default
+    // agent's id regardless of whoever is active now.
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    const approvals = readState(config.instance).approvals.filter((a) => a.taskId === task.id);
+    expect(approvals.length).toBeGreaterThan(0);
+    expect(approvals.every((a) => a.agentId === defaultAgentId)).toBe(true);
+    const scopedDefault = await call(handler, config, `/api/approvals?agentId=${encodeURIComponent(defaultAgentId)}`);
+    expect(scopedDefault.every((a: { agentId?: string }) => a.agentId === defaultAgentId)).toBe(true);
+    expect(scopedDefault.some((a: { taskId?: string }) => a.taskId === task.id)).toBe(true);
+    const scopedScout = await call(handler, config, `/api/approvals?agentId=${encodeURIComponent(second.id)}`);
+    expect(scopedScout.some((a: { taskId?: string }) => a.taskId === task.id)).toBe(false);
   });
 
   test("stamps the active agent on events and audit and filters listings", async () => {
@@ -1084,6 +1110,73 @@ describe("runtime api", () => {
     const detail = await call(handler, config, `/api/tasks/${fired.taskId}`);
     expect(detail.task.agentId).toBe(defaultAgentId);
     expect(detail.task.jobId).toBe(job.id);
+  });
+
+  test("POST /api/jobs ignores agentId in the request body", async () => {
+    // Regression: the public input bag previously honored a caller-supplied
+    // `agentId`, letting a malicious or buggy client attribute new jobs to
+    // any agent. Now the HTTP path strips it and the runtime falls back to
+    // the active agent.
+    const config = testConfig("records-agentid-job-untrusted-input");
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    // While the active agent is still the default, post a job whose body
+    // tries to spoof attribution to the scout agent.
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "spoof-job",
+        prompt: "hello",
+        intervalSeconds: 3600,
+        agentId: second.id
+      })
+    });
+    expect(job.agentId).toBe(defaultAgentId);
+    expect(job.agentId).not.toBe(second.id);
+  });
+
+  test("job lifecycle audits carry the originating job's agent across a switch", async () => {
+    // Regression: addAudit's inferAgentId previously had no jobId fallback
+    // and the lifecycle audit writes in src/jobs/index.ts didn't pass
+    // agentId, so a paused/updated/removed audit after an agent switch
+    // misattributed the row to the new active agent.
+    const config = testConfig("records-agentid-job-audits");
+    const handler = createHandler(config);
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "audit-job", prompt: "hello", intervalSeconds: 3600 })
+    });
+    expect(job.agentId).toBe(defaultAgentId);
+    // Switch the active agent *before* exercising the lifecycle transitions.
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    await call(handler, config, `/api/jobs/${job.id}/pause`, { method: "POST" });
+    await call(handler, config, `/api/jobs/${job.id}/resume`, { method: "POST" });
+    await call(handler, config, `/api/jobs/${job.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ intervalSeconds: 7200 })
+    });
+    await call(handler, config, `/api/jobs/${job.id}`, { method: "DELETE" });
+    const state = readState(config.instance);
+    const targeted = state.audit.filter((a) => a.target === job.id);
+    const lifecycle = targeted.filter((a) =>
+      a.action === "job.paused"
+      || a.action === "job.active"
+      || a.action === "job.updated"
+      || a.action === "job.removed"
+    );
+    expect(lifecycle.length).toBeGreaterThanOrEqual(4);
+    expect(lifecycle.every((a) => a.agentId === defaultAgentId)).toBe(true);
   });
 });
 
