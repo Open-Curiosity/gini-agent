@@ -158,11 +158,14 @@ export const DEFAULT_DANGEROUS_TERMINAL_PATTERNS: readonly DangerousPattern[] = 
   {
     id: "pipe-to-shell",
     description: "pipe to a shell interpreter (sh, bash, zsh, fish, ksh, dash)",
-    // Matches `| sh`, `|sh`, `|  /bin/bash`, `| env bash`-ish wrappers
-    // are NOT caught (intentional — wrap is rare and increases
-    // false-positives). The interpreter binary may be a bare name or a
-    // full path; we accept either.
-    test: (command) => /\|\s*(?:[^\s|]*\/)?(?:sh|bash|zsh|fish|ksh|dash)(?:\s|$)/.test(command)
+    // Matches `| sh`, `|sh`, `|  /bin/bash`, and the `exec`/`eval`
+    // wrapper forms (`| exec sh`, `| eval bash`) that hand the
+    // remainder of the pipeline to a shell process. Other wrappers
+    // (`| env bash`, `| xargs bash -c`) are NOT caught — they're
+    // rarer and risk false positives. The interpreter binary may be a
+    // bare name or a full path.
+    test: (command) =>
+      /\|\s*(?:(?:exec|eval)\s+)?(?:[^\s|]*\/)?(?:sh|bash|zsh|fish|ksh|dash)(?:\s|$)/.test(command)
   },
   {
     id: "chmod-777",

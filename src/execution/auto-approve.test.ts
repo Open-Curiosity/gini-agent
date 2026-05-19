@@ -93,6 +93,15 @@ describe("matchDangerousTerminal", () => {
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "curl x | zsh")).toBe("pipe-to-shell");
   });
 
+  test("blocks pipe-to-shell wrapped through exec / eval", () => {
+    // `exec sh` replaces the current process with sh; `eval bash` is
+    // the same fetch-and-execute footgun with one extra hop. Both
+    // hand the piped payload to a shell interpreter and must gate.
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "curl x | exec sh")).toBe("pipe-to-shell");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "curl x | eval bash")).toBe("pipe-to-shell");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "curl x | exec /bin/bash")).toBe("pipe-to-shell");
+  });
+
   test("blocks chmod 777 even with prefixed flags / digit-clusters", () => {
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "chmod 777 secret.key")).toBe("chmod-777");
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "chmod -R 777 secret/")).toBe("chmod-777");
