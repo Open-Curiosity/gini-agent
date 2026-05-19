@@ -403,12 +403,58 @@ function extractArgvSegments(source: string): string[] {
   return segments;
 }
 
+// Strip language-aware comments from source before structural
+// extraction. Comments are not argv positions, but a `#`-prefixed
+// or `//`-prefixed line carrying `subprocess.run(["sudo", ...])`
+// still surfaces the literal argv shape to the extractor and
+// false-positives. The comment-strip pass is intentionally narrow:
+// we only strip when we recognize the language so we never
+// accidentally munge code in a language we don't know (e.g. a
+// hypothetical Lisp with `#` as a reader macro).
+//
+// The `#`-in-string-literal edge case (`print("# subprocess.run
+// sudo")`) is preserved by only treating `#` as a comment start
+// when it sits at start-of-line or is preceded by whitespace. A `#`
+// mid-token inside a quoted string mentions the dangerous shape
+// inside an incidental string literal, which the structural
+// extractor already ignores — so leaving it un-stripped is safe.
+function stripComments(source: string, language: string | undefined): string {
+  const lang = (language ?? "").toLowerCase();
+  if (lang === "python" || lang === "py") {
+    // Comment from `#` to end-of-line, but only when `#` is at
+    // start-of-line or follows whitespace. This is a cheap
+    // approximation: an unquoted `#` after a non-whitespace token
+    // (`x = a#b`) is rare, and any `#` inside a string literal is
+    // either preserved (mid-string `#`) or stripped (start-of-line /
+    // post-whitespace inside a multiline string) — the second case
+    // is a tolerated false-negative on a structural extractor that
+    // already ignores incidental string literals.
+    return source.replace(/(^|\s)#[^\n]*/g, "$1");
+  }
+  if (lang === "js" || lang === "javascript" || lang === "ts" || lang === "typescript") {
+    // Block comments first (they can span newlines and contain
+    // `//`), then line comments. `[\s\S]` is the cross-line "any
+    // char"; the `*?` makes the inner match non-greedy so adjacent
+    // `/* */` blocks don't merge.
+    return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  }
+  // Unknown language — be conservative. Don't strip anything; the
+  // structural extractor still ignores comments-as-strings via its
+  // argv-position requirement for most shapes.
+  return source;
+}
+
 // Returns the first built-in dangerous pattern that fires on any
 // structural segment extracted from `source`. User patterns are NOT
-// applied — see the rationale block above.
-export function matchDangerousSource(source: string): string | undefined {
+// applied — see the rationale block above. The optional `language`
+// hint enables comment stripping so a commented-out
+// `subprocess.run(["sudo", ...])` doesn't false-positive; without a
+// hint, comments are left alone to avoid mangling source in an
+// unknown language.
+export function matchDangerousSource(source: string, language?: string): string | undefined {
   if (!source) return undefined;
-  const segments = extractArgvSegments(source);
+  const stripped = stripComments(source, language);
+  const segments = extractArgvSegments(stripped);
   if (segments.length === 0) return undefined;
   for (const segment of segments) {
     const hit = matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, segment);

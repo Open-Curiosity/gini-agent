@@ -262,6 +262,53 @@ describe("matchDangerousSource", () => {
     // substring with no argv-like position does not gate.
     expect(matchDangerousSource(`print("docker run hello")`)).toBeUndefined();
   });
+
+  test("ignores commented-out dangerous calls when language is known", () => {
+    // Python: `# ...` line comment. The cheap heuristic strips only
+    // when `#` is at start-of-line or after whitespace so the
+    // mid-string `#` case (test below) is preserved.
+    expect(matchDangerousSource(`# subprocess.run(["sudo", "apt"])`, "python")).toBeUndefined();
+    expect(matchDangerousSource(`  # subprocess.run(["sudo", "apt"])`, "python")).toBeUndefined();
+    // JS / TS line comment.
+    expect(matchDangerousSource(`// Bun.spawn(["sudo", "apt"])`, "js")).toBeUndefined();
+    expect(matchDangerousSource(`// Bun.spawn(["sudo", "apt"])`, "javascript")).toBeUndefined();
+    expect(matchDangerousSource(`// Bun.spawn(["sudo", "apt"])`, "ts")).toBeUndefined();
+    expect(matchDangerousSource(`// Bun.spawn(["sudo", "apt"])`, "typescript")).toBeUndefined();
+    // JS / TS block comment, including multi-line.
+    expect(matchDangerousSource(`/* Bun.spawn(["sudo", "apt"]) */`, "js")).toBeUndefined();
+    expect(matchDangerousSource(`/*\n  Bun.spawn(["sudo", "apt"])\n*/`, "ts")).toBeUndefined();
+  });
+
+  test("still gates real dangerous calls even when a comment with the same shape appears", () => {
+    // Mixing a commented-out and an actually-live dangerous call must
+    // gate — the live one is the one that runs.
+    const python = `# subprocess.run(["sudo", "apt"])\nsubprocess.run(["sudo", "apt"])`;
+    expect(matchDangerousSource(python, "python")).toBe("sudo");
+    const js = `// Bun.spawn(["sudo", "apt"])\nBun.spawn(["sudo", "apt"])`;
+    expect(matchDangerousSource(js, "js")).toBe("sudo");
+  });
+
+  test("'#' mid-string heuristic: preceded-by-non-whitespace `#` is preserved", () => {
+    // Documents the cheap-heuristic boundary. We only treat `#` as
+    // a comment when it sits at start-of-line or right after
+    // whitespace. A `#` immediately after a non-whitespace char
+    // (`"#...`) is kept as-is, so any structural call that follows
+    // in the same source is still extracted and matched.
+    const src = `print("#sudo"); subprocess.run(["sudo", "apt"])`;
+    expect(matchDangerousSource(src, "python")).toBe("sudo");
+  });
+
+  test("leaves source unchanged when language is unknown or unset", () => {
+    // No language hint: the structural extractor already ignores
+    // incidental string literals for most shapes, so the existing
+    // contract (no false positive on `print("...sudo...")`) holds.
+    // What we DON'T do is strip `#` or `//` for unknown languages —
+    // those tokens have different meanings in other languages.
+    expect(matchDangerousSource(`# using sudo for X`)).toBeUndefined();
+    expect(matchDangerousSource(`// note: sudo is required`)).toBeUndefined();
+    // An argv-style call still gates when language is unset.
+    expect(matchDangerousSource(`Bun.spawn(["sudo", "apt"])`)).toBe("sudo");
+  });
 });
 
 describe("userDangerousPatterns", () => {

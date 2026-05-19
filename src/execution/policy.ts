@@ -131,6 +131,7 @@ export function resolveApprovalPolicy(
     const code = payload as CodeExecPayload | undefined;
     const wrapper = typeof code?.command === "string" ? code.command : "";
     const source = typeof code?.source === "string" ? code.source : "";
+    const language = typeof code?.language === "string" ? code.language : undefined;
 
     // Allowlist applies to the wrapper command only — that's the
     // shape the operator listed when they wrote the allowlist
@@ -160,7 +161,7 @@ export function resolveApprovalPolicy(
     //   source level — see auto-approve.ts for the rationale.
     const patterns = effectiveDangerousPatterns(config);
     const dangerous =
-      matchDangerousTerminal(patterns, wrapper) ?? matchDangerousSource(source);
+      matchDangerousTerminal(patterns, wrapper) ?? matchDangerousSource(source, language);
     if (dangerous) {
       return { mode: "gate", reason: `dangerous-pattern: ${dangerous}` };
     }
