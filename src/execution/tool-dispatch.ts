@@ -28,7 +28,7 @@ import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
-import { createScheduledJob, listJobs, removeJob, updateJob, updateJobStatus } from "../jobs";
+import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
 import { isSkillActive } from "../integrations/connectors";
 import { riskForAction } from "./tool-risk";
 import {
@@ -93,6 +93,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await updateJobTool(config, taskId, args) };
     case "delete_job":
       return { kind: "sync", result: await deleteJobTool(config, taskId, args) };
+    case "run_job":
+      return { kind: "sync", result: await runJobTool(config, taskId, args) };
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -1180,6 +1182,81 @@ async function deleteJobTool(
     data: { jobId, name: removed.name }
   });
   return `Deleted job ${removed.id} (\"${removed.name}\").`;
+}
+
+// Manually fire an existing scheduled job. Wraps the same `runJobNow`
+// entrypoint that `POST /api/jobs/<id>/run` calls, with `trigger="manual"`
+// so overlap protection is intentionally skipped (manual runs may execute
+// alongside an in-flight scheduled run). The spawned task itself still
+// flows through the job's configured approval envelope at fire-time.
+async function runJobTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const jobId = requireString(args, "jobId");
+
+  // Pre-side-effect terminal check. Mirrors the guard in delete_job /
+  // update_job: a cancelled or failed parent task must not be able to
+  // spawn fresh work through the agent tool path. `runJobNow` itself has
+  // no `parentTaskId` re-check, so this pre-check is the only guard — but
+  // because the spawned task is a sibling (not a child) of the parent
+  // task, the worst case if a race squeezes through is one extra task
+  // appearing right after cancellation, which `finalizeJobRunFromTask`
+  // will eventually settle just like any other job run.
+  {
+    const state = readState(config.instance);
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (task && isTerminalTaskStatus(task.status)) {
+      return `Error: run_job skipped because task is already ${task.status}.`;
+    }
+  }
+
+  // Resolve the job up-front so we can surface its name in the return
+  // string (and fail fast on an unknown id instead of letting `runJobNow`
+  // throw deep in its mutateState).
+  const before = listJobs(config).find((candidate) => candidate.id === jobId);
+  if (!before) throw new Error(`Job not found: ${jobId}`);
+
+  const result = await runJobNow(config, jobId, "manual");
+  // `runJobNow` only returns undefined on the overlap-skip branch, which
+  // is gated on trigger==="schedule" — so for "manual" it should never
+  // happen in normal operation. Surface a clear error if the contract ever
+  // changes rather than crashing on the destructure below.
+  if (!result) {
+    throw new Error(`run_job for ${jobId} produced no run (overlap skip should not apply to manual triggers).`);
+  }
+  // Script jobs return { jobId, runId, exitCode, stdout, stderr }; prompt
+  // jobs return { jobId, runId, taskId }. The taskId is only meaningful for
+  // prompt jobs — script jobs run synchronously inside `runJobNow` and
+  // never spawn an agent task.
+  const runId = (result as { runId: string }).runId;
+  const spawnedTaskId = (result as { taskId?: string }).taskId;
+
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "job.run.manual",
+        target: jobId,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: { jobId, runId, spawnedTaskId }
+      },
+      { taskId: item.id }
+    );
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "job",
+    message: "Manually triggered job run",
+    data: { jobId, runId, taskId: spawnedTaskId }
+  });
+  const taskSuffix = spawnedTaskId ? `, task ${spawnedTaskId}` : "";
+  return `Triggered job ${jobId} (\"${before.name}\") — run ${runId}${taskSuffix}.`;
 }
 
 // Poll the subagent record until its child task reaches a terminal state,

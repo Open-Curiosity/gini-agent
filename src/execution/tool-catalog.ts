@@ -555,6 +555,28 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
         required: ["jobId"]
       }
     }
+  },
+  {
+    // Manually trigger an existing scheduled job. Wraps the same
+    // `runJobNow` entrypoint that `POST /api/jobs/<id>/run` calls. Low-risk
+    // / no approval: the spawned task itself still flows through the job's
+    // configured `approvalMode` / `autoApproveCommands`, so any side
+    // effects inside the run are gated at their normal granularity. The
+    // tool only fires an EXISTING job — for one-off prompts use create_job
+    // with intervalSeconds + oneShot=true instead.
+    toolset: "jobs",
+    type: "function",
+    function: {
+      name: "run_job",
+      description: "Manually fire an EXISTING scheduled job right now. This is distinct from create_job: run_job triggers a job that has already been scheduled, while create_job defines a new one. Use this when the user says 'test this job now', 'fire the reminder', or 'run job X off-schedule'. Spawns a real task in the job's dedicated chat thread (if it has one) using the job's configured approvalMode / autoApproveCommands at fire-time. Overlap protection only applies to scheduled triggers; a manual run CAN run alongside an in-flight scheduled run. Returns the new run id and the spawned task id so you can reference them in your reply. Call list_jobs first if you don't already know the jobId.",
+      parameters: {
+        type: "object",
+        properties: {
+          jobId: { type: "string", description: "Id of the job to fire (e.g. 'job_a3aa6707'). Get this from list_jobs." }
+        },
+        required: ["jobId"]
+      }
+    }
   }
 ];
 
@@ -576,8 +598,8 @@ export function allTools(): ToolCatalogTool[] {
 // names). When set, it intersects with the enabled-toolset filter — a tool
 // passes only if its owning toolset is BOTH globally enabled AND in the
 // agent's whitelist. Always-on tools (web_fetch, read_skill,
-// spawn_subagent, create_job, list_jobs, update_job, delete_job) bypass
-// both filters.
+// spawn_subagent, create_job, list_jobs, update_job, delete_job, run_job)
+// bypass both filters.
 export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<string>): ToolCatalogTool[] {
   const enabled = new Set(state.toolsets.filter((t) => t.status === "enabled").map((t) => t.name));
   return allTools().filter((tool) => {
@@ -593,17 +615,19 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // instances. Subagent path itself is depth-capped and audited.
     if (tool.function.name === "spawn_subagent") return true;
     // Always expose the full scheduled-job tool surface (create / list /
-    // update / delete). The "jobs" toolset isn't part of the legacy
+    // update / delete / run). The "jobs" toolset isn't part of the legacy
     // defaults; gating on enable would silently hide scheduling (and the
-    // chat-reminder delivery loop) on fresh instances. Exposing all four
+    // chat-reminder delivery loop) on fresh instances. Exposing the set
     // together also keeps composition coherent — without list_jobs the
-    // agent can't see existing jobs to pick the right id for update or
-    // delete, and that's how duplicates get created. Low-risk by design:
-    // the user can pause/delete any job from /jobs.
+    // agent can't see existing jobs to pick the right id for update,
+    // delete, or run, and that's how duplicates get created. Low-risk by
+    // design: the user can pause/delete any job from /jobs, and manual
+    // runs inherit the job's existing approval envelope.
     if (tool.function.name === "create_job") return true;
     if (tool.function.name === "list_jobs") return true;
     if (tool.function.name === "update_job") return true;
     if (tool.function.name === "delete_job") return true;
+    if (tool.function.name === "run_job") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;

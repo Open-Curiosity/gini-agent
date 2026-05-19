@@ -3,9 +3,10 @@
 // state.toolsets (enabled set) is the global "this toolset is on" filter.
 // agentToolsetFilter narrows that further to an active-agent whitelist.
 // Always-on tools (web_fetch, read_skill, spawn_subagent, create_job,
-// list_jobs, update_job, delete_job) bypass both filters so freshly
-// cloned instances and tightly scoped agents can still schedule, list,
-// update, and delete reminders, read skills, and delegate.
+// list_jobs, update_job, delete_job, run_job) bypass both filters so
+// freshly cloned instances and tightly scoped agents can still schedule,
+// list, update, delete, and manually fire reminders, read skills, and
+// delegate.
 
 import { describe, expect, test } from "bun:test";
 import { buildToolCatalog } from "./tool-catalog";
@@ -48,7 +49,8 @@ const ALWAYS_ON = new Set([
   "create_job",
   "list_jobs",
   "update_job",
-  "delete_job"
+  "delete_job",
+  "run_job"
 ]);
 
 describe("buildToolCatalog", () => {
@@ -67,6 +69,7 @@ describe("buildToolCatalog", () => {
     expect(names.has("list_jobs")).toBe(true);
     expect(names.has("update_job")).toBe(true);
     expect(names.has("delete_job")).toBe(true);
+    expect(names.has("run_job")).toBe(true);
   });
 
   test("agent toolset filter narrows the catalog to file + always-on", () => {
@@ -88,6 +91,16 @@ describe("buildToolCatalog", () => {
     expect(names.has("list_jobs")).toBe(true);
     expect(names.has("update_job")).toBe(true);
     expect(names.has("delete_job")).toBe(true);
+    expect(names.has("run_job")).toBe(true);
+  });
+
+  test("run_job is always-on with toolset 'jobs' and requires jobId", () => {
+    const state = stateWithToolsets([]);
+    const catalog = buildToolCatalog(state);
+    const tool = catalog.find((t) => t.function.name === "run_job");
+    expect(tool).toBeDefined();
+    expect(tool?.toolset).toBe("jobs");
+    expect(tool?.function.parameters.required).toEqual(["jobId"]);
   });
 
   test("agent filter for a globally-disabled toolset still produces an empty (non-always-on) catalog", () => {
