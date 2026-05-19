@@ -712,6 +712,45 @@ describe("messaging discord wiring", () => {
     expect(readBridgeBotToken(config, bridge)).toBe("SECRET-TOKEN");
   });
 
+  test("addMessagingBridge does NOT mint a Telegram pairing code for discord bridges", async () => {
+    // Discord uses channel-as-auth (per ADR discord-bridge.md) — minting a
+    // pairing code would surface a misleading CLI hint suggesting the
+    // operator DM the bot on Telegram, and would write Telegram-flavored
+    // metadata onto a Discord record.
+    const config = testConfig("discord-no-pairing");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["999"],
+      botToken: "TOK"
+    });
+
+    expect(bridge.kind).toBe("discord");
+    expect(bridge.metadata?.pairingCode).toBeUndefined();
+    expect(bridge.metadata?.pairingCodeExpiresAt).toBeUndefined();
+  });
+
+  test("allowChat / denyChat / listAllowedChats reject non-telegram bridges", async () => {
+    // Allowlist + pairing surface is Telegram-only; calling it on a
+    // Discord bridge with a stray chat-id argument must fail loudly
+    // instead of silently writing Telegram metadata onto the Discord
+    // record (or, worse, silently succeeding and confusing the operator).
+    const config = testConfig("discord-allowlist-rejects");
+    const { allowChat, denyChat, listAllowedChats } = await import("./messaging");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["999"],
+      botToken: "TOK"
+    });
+
+    await expect(allowChat(config, bridge.id, 1)).rejects.toThrow(/only applies to telegram/);
+    await expect(denyChat(config, bridge.id, 1)).rejects.toThrow(/only applies to telegram/);
+    expect(() => listAllowedChats(config, bridge.id)).toThrow(/only applies to telegram/);
+  });
+
   test("checkMessagingBridge round-trips getMe and stores the bot identity on metadata", async () => {
     const config = testConfig("discord-health");
     const { client, calls } = stubDiscordClient();

@@ -112,10 +112,12 @@ function scrubSecretPaths(input: string): string {
 // tests lands writes against the next test's GINI_STATE_ROOT and in
 // production strands writes mid-shutdown.
 //
-// stopAll-with-timeout: a hung send on a provider that doesn't thread
-// abort (Telegram today) would otherwise keep stopAll pending
-// forever. The drain bounds the wait so shutdown stays prompt; any
-// worker still in flight after the timeout is logged and abandoned.
+// stopAll-with-timeout: the Telegram client threads AbortSignal
+// through sendChatAction (typing pulses), but its sendMessage and
+// sendPhoto paths still don't accept one. A hung send on those would
+// otherwise keep stopAll pending forever, so the drain bounds the
+// wait — any worker still in flight after the timeout is logged and
+// abandoned.
 const DETACHED_DRAIN_TIMEOUT_MS = 5000;
 
 export interface DetachedTracker {

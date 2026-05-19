@@ -180,11 +180,20 @@ export async function addMessagingBridge(config: RuntimeConfig, input: Record<st
   if (requiresToken) {
     const ref = writeSecret(config.instance, bridgeSecretNamespace(bridge.id), "bot-token", botToken);
     await mutateState(config.instance, (state) => attachSecretRef(state.messagingBridges, bridge.id, ref));
-    // Auto-mint a pairing code so the operator can DM the bot and
-    // enroll their chat in one paste, without ever needing to look up
-    // their own chat_id. The whitelist remains the source of truth —
-    // pairing just consumes a one-shot token to populate it.
-    return mutateState(config.instance, (state) => regeneratePairingCodeInState(state.messagingBridges, bridge.id));
+    if (kind === "telegram") {
+      // Auto-mint a pairing code so the operator can DM the bot and
+      // enroll their chat in one paste, without ever needing to look
+      // up their own chat_id. The whitelist remains the source of
+      // truth — pairing just consumes a one-shot token to populate
+      // it. Telegram-only: Discord uses channel-as-auth (see ADR
+      // discord-bridge.md) and has no pairing flow to feed.
+      return mutateState(config.instance, (state) => regeneratePairingCodeInState(state.messagingBridges, bridge.id));
+    }
+    // Discord bridges need the token but skip pairing — the bridge
+    // record returned from createMessagingBridgeRecord already carries
+    // the secretRef attachment via the mutate above.
+    const refreshed = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    return refreshed ?? bridge;
   }
 
   return bridge;
@@ -662,6 +671,9 @@ export async function allowChat(config: RuntimeConfig, idOrName: string, chatId:
   return mutateState(config.instance, (state) => {
     const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
     if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
+    if (live.kind !== "telegram") {
+      throw new Error(`Chat allowlist only applies to telegram bridges (got '${live.kind}').`);
+    }
     const meta = { ...(live.metadata ?? {}) };
     const allowed = readAllowedChatIds(live);
     if (!allowed.includes(chatId)) allowed.push(chatId);
@@ -700,6 +712,9 @@ export async function denyChat(config: RuntimeConfig, idOrName: string, chatId: 
   return mutateState(config.instance, (state) => {
     const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
     if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
+    if (live.kind !== "telegram") {
+      throw new Error(`Chat allowlist only applies to telegram bridges (got '${live.kind}').`);
+    }
     const meta = { ...(live.metadata ?? {}) };
     const allowed = readAllowedChatIds(live).filter((id) => id !== chatId);
     meta.allowedChatIds = allowed;
@@ -725,6 +740,9 @@ export function listAllowedChats(config: RuntimeConfig, idOrName: string): ChatA
     (b) => b.id === idOrName || b.name === idOrName
   );
   if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
+  if (bridge.kind !== "telegram") {
+    throw new Error(`Chat allowlist only applies to telegram bridges (got '${bridge.kind}').`);
+  }
   return chatAllowlistView(bridge);
 }
 
