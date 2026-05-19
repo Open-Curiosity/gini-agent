@@ -203,6 +203,11 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
     (item) => item.id === idOrName || item.name === idOrName
   );
   if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
+  // Disabled bridges short-circuit the entire health check — no
+  // network call, no metadata mutation, no audit row. The user
+  // explicitly turned this bridge off; a health probe shouldn't
+  // touch its state at all.
+  if (bridge.status === "disabled") return bridge;
 
   // Per-kind health round-trip. We do the network call *outside*
   // mutateState so the lock isn't held for the duration of the
@@ -243,9 +248,13 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
         const me = await discordClientFor(token).getMe();
         metadataPatch.botUsername = me.username;
         metadataPatch.botId = me.id;
-        if (typeof me.global_name === "string" && me.global_name.length > 0) {
-          metadataPatch.globalName = me.global_name;
-        }
+        // Set explicitly to null when the API returns no
+        // global_name (older bots, removed display name), so the
+        // metadata merge clears any stale value instead of
+        // preserving it indefinitely.
+        metadataPatch.globalName = typeof me.global_name === "string" && me.global_name.length > 0
+          ? me.global_name
+          : null;
         // Newer Discord accounts return discriminator "0" and surface
         // the handle via global_name; older bots keep username#discriminator.
         const handle = me.global_name && me.global_name.length > 0

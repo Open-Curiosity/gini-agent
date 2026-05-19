@@ -155,7 +155,17 @@ export function createDiscordClient(token: string, options: DiscordClientOptions
       return call<DiscordMessage>(
         "POST",
         `/channels/${encodeURIComponent(channelId)}/messages`,
-        { content: trimmed },
+        {
+          content: trimmed,
+          // Block @everyone / @here / role / user mentions by default.
+          // The agent's output is untrusted input from a chat-task
+          // model; without this, an "@everyone please help" inside a
+          // summary would notify every server member. Callers that
+          // legitimately need a mention can lift this restriction
+          // explicitly when the runtime grows a mention-aware send
+          // path.
+          allowed_mentions: { parse: [] }
+        },
         options?.signal
       );
     },

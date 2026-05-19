@@ -4,8 +4,8 @@
 // place — both pollers grew identical copies of these patterns and
 // drift between them is now load-bearing for correctness.
 
-import type { MessagingBridgeStatus, RuntimeConfig } from "../types";
-import { appendLog, mutateState, now } from "../state";
+import type { MessagingBridgeStatus, RuntimeConfig, TaskStatus } from "../types";
+import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 
 // Flip a bridge to "error" so the supervisor's reconcile drops it
 // from the desired set (shouldRun checks status === "configured").
@@ -56,15 +56,53 @@ export async function markBridgeError(
 // markBridgeError (state writes) and by sendMessagingOutput's error
 // persistence (sanitizeBridgeError import). Pure function, easy to
 // unit-test in isolation.
+//
+// Secret-path scrubbing uses a non-greedy anchor on the `/secrets/`
+// substring and bounded character classes on both sides; a naive
+// pattern like /\S*\/secrets\/\S+/ backtracks badly on slash-heavy
+// input that doesn't actually contain `/secrets/` (empirically
+// observed: 160k chars → 17s with the prior shape). Splitting the
+// scan into "find secrets segment" then "replace bounded
+// neighbours" keeps it linear.
 export function sanitizeBridgeStatusMessage(message: string): string {
-  return message
-    // Discord auth header echo: "Bot abc.def.ghi"
-    .replace(/Bot\s+\S+/g, "Bot <redacted>")
-    // Telegram URL-path token: "/bot123:abc/getMe"
-    .replace(/\/bot[A-Za-z0-9:_-]+/g, "/bot<redacted>")
-    // Absolute paths to the secrets directory (helpful for ENOENT
-    // messages that include the missing file's full path).
-    .replace(/(['"]?)\/[^\s'"]*\/secrets\/[^\s'"]+\1/g, "<secret-path>");
+  return scrubSecretPaths(
+    message
+      // Discord auth header echo: "Bot abc.def.ghi"
+      .replace(/Bot\s+\S+/g, "Bot <redacted>")
+      // Telegram URL-path token: "/bot123:abc/getMe"
+      .replace(/\/bot[A-Za-z0-9:_-]+/g, "/bot<redacted>")
+  );
+}
+
+// Replace any "<dir>/secrets/<file>" substring with "<secret-path>".
+// Linear-time scan: split on "/secrets/", then on each split point
+// trim the surrounding non-separator bytes (anything that isn't
+// whitespace, quote, comma, or semicolon) to recover the full path
+// boundary on either side. The greedy character class is bounded by
+// a small alphabet, so no catastrophic backtracking is possible.
+const SECRET_SEGMENT = "/secrets/";
+function scrubSecretPaths(input: string): string {
+  if (!input.includes(SECRET_SEGMENT)) return input;
+  const SEPARATORS = /[\s'",;]/;
+  let out = "";
+  let cursor = 0;
+  while (cursor < input.length) {
+    const hit = input.indexOf(SECRET_SEGMENT, cursor);
+    if (hit < 0) {
+      out += input.slice(cursor);
+      break;
+    }
+    // Walk left from `hit` until we find a separator or the path
+    // start. Walk right from after the segment until we find a
+    // separator. Bounded by line length, never re-scans.
+    let left = hit;
+    while (left > cursor && !SEPARATORS.test(input[left - 1]!)) left -= 1;
+    let right = hit + SECRET_SEGMENT.length;
+    while (right < input.length && !SEPARATORS.test(input[right]!)) right += 1;
+    out += input.slice(cursor, left) + "<secret-path>";
+    cursor = right;
+  }
+  return out;
 }
 
 // Create a detached-worker tracker for a supervisor. The pollers
@@ -100,13 +138,24 @@ export function createDetachedTracker(
       if (detached.size === 0) return;
       const snapshot = Array.from(detached).map((work) => work.catch(() => {}));
       const drained = Promise.all(snapshot).then(() => true as const);
-      const timer = sleep(DETACHED_DRAIN_TIMEOUT_MS).then(() => false as const);
-      const finished = await Promise.race([drained, timer]);
-      if (!finished) {
-        appendLog(config.instance, timeoutLogEvent, {
-          remaining: detached.size,
-          waited_ms: DETACHED_DRAIN_TIMEOUT_MS
-        });
+      // Cancellable timer so a fast drain doesn't pin the event loop
+      // open for DETACHED_DRAIN_TIMEOUT_MS waiting for the timeout
+      // promise to resolve — observable in tests as a 5s "hang" at
+      // the end of a fast supervisor shutdown.
+      let timerHandle: ReturnType<typeof setTimeout> | undefined;
+      const timer = new Promise<false>((resolve) => {
+        timerHandle = setTimeout(() => resolve(false), DETACHED_DRAIN_TIMEOUT_MS);
+      });
+      try {
+        const finished = await Promise.race([drained, timer]);
+        if (!finished) {
+          appendLog(config.instance, timeoutLogEvent, {
+            remaining: detached.size,
+            waited_ms: DETACHED_DRAIN_TIMEOUT_MS
+          });
+        }
+      } finally {
+        if (timerHandle) clearTimeout(timerHandle);
       }
     },
     size() {
@@ -117,4 +166,42 @@ export function createDetachedTracker(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Wait for a task to reach a terminal state (completed / failed /
+// cancelled). Used by reply mirrors in both pollers so they don't
+// invoke syncChatTaskResult before the task is ready — that throws
+// "Task is not ready for chat sync" and would silently drop the
+// assistant's reply.
+//
+// Bounded by a max wait + the abort signal:
+//   - signal.aborted = supervisor shutdown / bridge disable → exit
+//   - max wait elapsed = task is stuck (e.g. waiting_approval
+//     indefinitely) → log + exit, so the detached worker doesn't
+//     hold a tracker entry forever
+const TASK_TERMINAL_POLL_MS = 100;
+const TASK_TERMINAL_MAX_WAIT_MS = 10 * 60 * 1000;
+
+export async function awaitTerminalTask(
+  config: RuntimeConfig,
+  taskId: string,
+  signal: AbortSignal,
+  timeoutLogEvent = "messaging.task_wait_timeout"
+): Promise<TaskStatus | undefined> {
+  const deadline = Date.now() + TASK_TERMINAL_MAX_WAIT_MS;
+  while (!signal.aborted) {
+    const task = readState(config.instance).tasks.find((t) => t.id === taskId);
+    if (!task) return undefined;
+    if (isTerminalTaskStatus(task.status)) return task.status;
+    if (Date.now() >= deadline) {
+      appendLog(config.instance, timeoutLogEvent, {
+        taskId,
+        status: task.status,
+        waited_ms: TASK_TERMINAL_MAX_WAIT_MS
+      });
+      return task.status;
+    }
+    await sleep(TASK_TERMINAL_POLL_MS);
+  }
+  return undefined;
 }

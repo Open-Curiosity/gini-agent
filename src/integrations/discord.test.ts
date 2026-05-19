@@ -43,8 +43,23 @@ describe("discord client", () => {
     });
     const msg = await client.sendMessage("999", "hi");
     expect(observedUrl).toContain("/channels/999/messages");
-    expect(payload).toEqual({ content: "hi" });
+    expect(payload).toEqual({ content: "hi", allowed_mentions: { parse: [] } });
     expect(msg.id).toBe("200");
+  });
+
+  test("sendMessage pins allowed_mentions: { parse: [] } so agent output cannot @everyone", async () => {
+    let body: Record<string, unknown> = {};
+    const client = createDiscordClient("TOK", {
+      fetchImpl: stubFetch((_url, init) => {
+        body = JSON.parse(String(init.body));
+        return { id: "201", channel_id: "999", content: body.content };
+      })
+    });
+    await client.sendMessage("999", "@everyone please help");
+    expect(body.allowed_mentions).toEqual({ parse: [] });
+    // Content still goes through verbatim — Discord just won't
+    // resolve the @everyone into a notification.
+    expect(body.content).toBe("@everyone please help");
   });
 
   test("sendMessage truncates content past Discord's 2000-char ceiling", async () => {
@@ -84,6 +99,19 @@ describe("discord client", () => {
     expect(observedUrl).toContain("/channels/999/messages");
     expect(observedUrl).toContain("limit=25");
     expect(observedUrl).toContain("after=msg-9");
+  });
+
+  test("fetchChannelMessages prefers `before` when both are supplied (Discord forbids combining)", async () => {
+    let observedUrl = "";
+    const client = createDiscordClient("TOK", {
+      fetchImpl: stubFetch((url) => {
+        observedUrl = url;
+        return [];
+      })
+    });
+    await client.fetchChannelMessages("999", { beforeId: "msg-50", afterId: "msg-9", limit: 25 });
+    expect(observedUrl).toContain("before=msg-50");
+    expect(observedUrl).not.toContain("after=");
   });
 
   test("fetchChannelMessages omits `after` on first poll", async () => {

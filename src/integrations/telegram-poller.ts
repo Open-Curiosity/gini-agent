@@ -14,7 +14,7 @@ import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "..
 import { instanceRoot } from "../paths";
 import { findTelegramChatSession, readBridgeBotToken, receiveMessagingInput, sendMessagingOutput } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
-import { createDetachedTracker, markBridgeError } from "./messaging-poller-helpers";
+import { awaitTerminalTask, createDetachedTracker, markBridgeError } from "./messaging-poller-helpers";
 import {
   createTelegramClient,
   extractIncomingPayload,
@@ -280,6 +280,15 @@ async function maintainTypingAndMirrorReply(
   signal: AbortSignal
 ): Promise<void> {
   await maintainTypingIndicator(config, taskId, chatId, client, signal);
+  if (signal.aborted) return;
+
+  // Decoupled from the typing pulse: if maintainTypingIndicator
+  // returned early because of a transient sendChatAction error, the
+  // task may still be running. Wait for terminal state before
+  // syncing — without this, syncChatTaskResult would throw "Task
+  // is not ready for chat sync" and the assistant reply would be
+  // permanently dropped on a single typing failure.
+  await awaitTerminalTask(config, taskId, signal);
   if (signal.aborted) return;
 
   // Resolve the chat session for this (bridge, chat) so we can land

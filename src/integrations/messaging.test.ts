@@ -681,6 +681,46 @@ describe("messaging discord wiring", () => {
     expect(String(checked.message)).toContain("Bot <redacted>");
   });
 
+  test("checkMessagingBridge short-circuits on a disabled bridge — no network call, no metadata mutation", async () => {
+    // A disabled bridge is one the user explicitly turned off; a
+    // health probe must not touch its state or hit the API. Without
+    // the short-circuit, the health flow would still merge a
+    // metadata patch and emit a health audit row even though the
+    // status guard correctly preserves "disabled".
+    const config = testConfig("discord-disabled-noop");
+    let getMeCalls = 0;
+    const { client } = stubDiscordClient({
+      getMe: async () => {
+        getMeCalls += 1;
+        return { id: "100", username: "Gini", bot: true };
+      }
+    });
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const { disableMessagingBridge } = await import("./messaging");
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "valid-prefix"
+    });
+
+    await disableMessagingBridge(config, bridge.id);
+
+    const before = readState(config.instance);
+    const auditBefore = before.audit.length;
+    const liveBefore = before.messagingBridges.find((b) => b.id === bridge.id)!;
+    const checked = await checkMessagingBridge(config, bridge.id);
+    const after = readState(config.instance);
+    const liveAfter = after.messagingBridges.find((b) => b.id === bridge.id)!;
+
+    expect(checked.status).toBe("disabled");
+    expect(getMeCalls).toBe(0);
+    expect(after.audit.length).toBe(auditBefore);
+    // updatedAt didn't move because no mutation happened.
+    expect(liveAfter.updatedAt).toBe(liveBefore.updatedAt);
+  });
+
   test("checkMessagingBridge marks status='error' on a missing secret file instead of 500ing the API", async () => {
     // Before the readBridgeBotTokenQuiet fix, a missing on-disk
     // secret would throw ENOENT out of checkMessagingBridge, causing
@@ -710,10 +750,9 @@ describe("messaging discord wiring", () => {
   });
 
   test("discord receiveMessagingInput refuses a missing target instead of silently routing to 'local'", async () => {
-    // Pinpointed regression: the shared "local" default used to mask
-    // the Discord guard. Now a missing target throws so the inbound
-    // bug surfaces immediately instead of creating a session keyed
-    // on the literal string "local".
+    // A missing Discord inbound target must throw, not silently
+    // create a chat session keyed on the literal string "local"
+    // via the demo/generic bridge default.
     const config = testConfig("discord-no-target");
     setMessagingDeps({ discordClientFactory: () => stubDiscordClient().client });
 

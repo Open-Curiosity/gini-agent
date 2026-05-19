@@ -37,4 +37,26 @@ describe("sanitizeBridgeStatusMessage", () => {
     expect(out).not.toContain("789:xyz");
     expect(out).not.toContain("/tmp/x/secrets/");
   });
+
+  test("runs in linear time on slash-heavy input without a /secrets/ segment (no ReDoS)", () => {
+    // Pathological input: tens of thousands of slashes, no
+    // "/secrets/" anywhere. The prior regex backtracked
+    // catastrophically here (160k chars → 17s). Linear scan
+    // should finish in milliseconds.
+    const evil = "/".repeat(80_000);
+    const start = Date.now();
+    const out = sanitizeBridgeStatusMessage(evil);
+    const elapsed = Date.now() - start;
+    expect(out).toBe(evil);
+    // 200ms gives plenty of headroom on slow CI; the actual
+    // linear pass is well under 10ms locally.
+    expect(elapsed).toBeLessThan(200);
+  });
+
+  test("scrubs a /secrets/ segment in slash-heavy input", () => {
+    const raw = "/".repeat(1000) + "/Users/x/.gini/instances/dev/secrets/bridge.bot-token.json" + "/".repeat(1000);
+    const out = sanitizeBridgeStatusMessage(raw);
+    expect(out).toContain("<secret-path>");
+    expect(out).not.toContain("/.gini/instances/dev/secrets/");
+  });
 });

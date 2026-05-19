@@ -19,7 +19,7 @@ import type { MessagingBridgeRecord, RuntimeConfig } from "../types";
 import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { findDiscordChatSession, readBridgeBotToken, receiveMessagingInput, sendMessagingOutput } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
-import { createDetachedTracker, markBridgeError } from "./messaging-poller-helpers";
+import { awaitTerminalTask, createDetachedTracker, markBridgeError } from "./messaging-poller-helpers";
 import {
   createDiscordClient,
   extractIncomingPayload,
@@ -60,9 +60,9 @@ const MAX_PAGES_PER_TICK = 10;
 // Sentinel watermark for an empty channel on first contact. Discord
 // snowflakes start at ~10^18 (the epoch is 2015-01-01), so any
 // single-digit decimal string is strictly less than every real
-// snowflake. Using a named constant — rather than a literal "0" —
-// keeps the intent visible at the call site and makes a future
-// digit-length boundary impossible to miss in code review.
+// snowflake. The named constant keeps the intent visible at the
+// call site and surfaces the digit-length assumption if a future
+// boundary ever shifts.
 const EMPTY_CHANNEL_SEED_SNOWFLAKE = "0";
 
 export interface PollerDeps {
@@ -259,13 +259,21 @@ async function pollChannel(
   //   page 3: before = oldest of page 2  → and so on
   //
   // Loop terminates when a partial batch lands (caught up), the
-  // oldest message in the page is <= initialWatermark (already
-  // processed), or the per-tick safety cap fires. Per-tick cap
-  // bounds a runaway channel from starving sibling channels;
-  // remaining messages land on the next poll tick.
+  // oldest message in a page is <= initialWatermark (already
+  // processed), or the per-tick safety cap fires. The cap exists to
+  // bound a runaway channel from starving sibling channels on the
+  // same bridge — when it fires we emit a `pagination_cap_fired`
+  // log row and STILL process the collected newest window so the
+  // bridge keeps making forward progress. Messages older than the
+  // oldest-collected (i.e. between initialWatermark and beforeCursor)
+  // are dropped on a sustained flood — a documented limitation in
+  // the Discord-bridge ADR. A future change can layer a backfill
+  // secondary cursor to recover those without duplicating the
+  // happy-path processing.
   const collected: DiscordMessage[] = [];
   let beforeCursor: string | undefined;
-  for (let page = 0; page < MAX_PAGES_PER_TICK; page += 1) {
+  let page = 0;
+  for (; page < MAX_PAGES_PER_TICK; page += 1) {
     if (signal.aborted) return;
     let batch: DiscordMessage[];
     try {
@@ -313,6 +321,20 @@ async function pollChannel(
     }
     beforeCursor = oldestSeen;
   }
+  if (page >= MAX_PAGES_PER_TICK) {
+    // The cap fired and the inner `break` never tripped — sustained
+    // flood. Log a visible row so operators can see they're missing
+    // messages older than the oldest-collected snowflake. Processing
+    // continues with the collected newest window; the older range
+    // is a known-limitation drop documented in the Discord-bridge
+    // ADR.
+    appendLog(config.instance, "messaging.discord.pagination_cap_fired", {
+      bridgeId,
+      channelId,
+      pages: MAX_PAGES_PER_TICK,
+      collected: collected.length
+    });
+  }
 
   // First-contact seeding. We have to pin a watermark on the very
   // first poll even when the channel is empty — otherwise a user
@@ -328,6 +350,7 @@ async function pollChannel(
     }
     return;
   }
+
 
   // Process oldest-first so the watermark advances monotonically and
   // we don't reply to messages out of order. Sort by BigInt-comparable
@@ -556,26 +579,6 @@ function snowflakeCompare(a: string, b: string): number {
   const ai = BigInt(a);
   const bi = BigInt(b);
   return ai < bi ? -1 : ai > bi ? 1 : 0;
-}
-
-// Wait for a task to reach a terminal state (completed / failed /
-// cancelled). Used by the reply mirror so it doesn't try to
-// syncChatTaskResult before the task is ready — which would throw
-// "Task is not ready for chat sync" and silently drop the reply.
-// Polls every TASK_POLL_MS until the task settles or the loop's
-// abort signal fires.
-const TASK_POLL_MS = 100;
-async function awaitTerminalTask(
-  config: RuntimeConfig,
-  taskId: string,
-  signal: AbortSignal
-): Promise<void> {
-  while (!signal.aborted) {
-    const task = readState(config.instance).tasks.find((t) => t.id === taskId);
-    if (!task) return;
-    if (isTerminalTaskStatus(task.status)) return;
-    await sleepUnlessAborted(TASK_POLL_MS, signal);
-  }
 }
 
 async function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
