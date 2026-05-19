@@ -527,7 +527,8 @@ async function dispatchPromptRun(
         jobId: job.id,
         risk: "low",
         summary: "Prompt job dispatch failed.",
-        data: { runId: run.id, error: message }
+        data: { runId: run.id, error: message },
+        agentId: job.agentId
       });
     });
     throw error;
@@ -911,14 +912,16 @@ async function executeScriptJob(
         jobId,
         risk: "low",
         summary: exitCode === 0 ? "Script job completed." : "Script job failed.",
-        data: { runId, exitCode, stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 1000) }
+        data: { runId, exitCode, stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 1000) },
+        agentId: job?.agentId ?? run.agentId
       });
       addAudit(state, {
         actor: "runtime",
         action: "job.script.executed",
         target: jobId,
         risk: "medium",
-        evidence: { runId, exitCode, stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 1000) }
+        evidence: { runId, exitCode, stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 1000) },
+        agentId: job?.agentId ?? run.agentId
       });
       return { jobId, runId, exitCode, stdout: stdout.slice(0, 4000), stderr: stderr.slice(0, 4000) };
     });
@@ -945,7 +948,8 @@ async function executeScriptJob(
         jobId,
         risk: "low",
         summary: "Script job crashed.",
-        data: { runId, error: message }
+        data: { runId, error: message },
+        agentId: job?.agentId ?? run.agentId
       });
     });
     return { jobId, runId, exitCode: -1, stdout: "", stderr: message };

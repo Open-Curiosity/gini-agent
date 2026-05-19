@@ -390,7 +390,8 @@ export function createJobRun(
     jobId: run.jobId,
     risk: "low",
     summary: `Job run started for ${run.jobId}`,
-    data: { runId: item.id, trigger: item.trigger }
+    data: { runId: item.id, trigger: item.trigger },
+    agentId: run.agentId
   });
   return item;
 }

@@ -2,18 +2,28 @@ import type { AuditEvent, RuntimeEvent, RuntimeState } from "../types";
 import { id, now } from "./ids";
 
 // Infer the originating agent from a record linked to the event/audit row.
-// Order of fallback: explicit caller value -> task.agentId -> the runtime's
-// currently active agent. Returns undefined when no source resolves, which
-// preserves the "system / unattributable" case.
+// Order of fallback: explicit caller value -> task.agentId -> job.agentId ->
+// the runtime's currently active agent. Returns undefined when no source
+// resolves, which preserves the "system / unattributable" case.
+//
+// The jobId fallback matters because scheduler-driven job lifecycle events
+// run outside the active-agent context (a scheduled fire after the user
+// switches agents would otherwise be misattributed). The owning job carries
+// the stamp; this fallback honors it without each call site re-resolving.
 function inferAgentId(
   state: RuntimeState,
   explicit: string | undefined,
-  taskId: string | undefined
+  taskId: string | undefined,
+  jobId: string | undefined
 ): string | undefined {
   if (explicit) return explicit;
   if (taskId) {
     const task = state.tasks.find((candidate) => candidate.id === taskId);
     if (task?.agentId) return task.agentId;
+  }
+  if (jobId) {
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    if (job?.agentId) return job.agentId;
   }
   return state.activeAgentId;
 }
@@ -27,7 +37,7 @@ export function appendEvent(
     instance: state.instance,
     at: now(),
     ...event,
-    agentId: inferAgentId(state, event.agentId, event.taskId)
+    agentId: inferAgentId(state, event.agentId, event.taskId, event.jobId)
   };
   state.events.unshift(item);
   state.events = state.events.slice(0, 1000);
@@ -43,7 +53,7 @@ export function addAudit(
     instance: state.instance,
     at: now(),
     ...event,
-    agentId: inferAgentId(state, event.agentId, event.taskId)
+    agentId: inferAgentId(state, event.agentId, event.taskId, undefined)
   };
   state.audit.unshift(audit);
   appendEvent(state, {
