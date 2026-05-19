@@ -41,10 +41,25 @@ export function useState_(options?: Partial<UseQueryOptions<RuntimeStateSnapshot
   });
 }
 
+// Active agent for scoping per-agent listings. Falls back to the agents
+// query's activeAgentId if status hasn't loaded yet. Returns undefined when
+// nothing's known so callers fetch the unfiltered list while bootstrapping.
+function useActiveAgentId(): string | undefined {
+  const status = useStatus();
+  return status.data?.activeAgent?.id;
+}
+
+function scopedPath(path: string, agentId: string | undefined): string {
+  if (!agentId) return path;
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}agentId=${encodeURIComponent(agentId)}`;
+}
+
 export function useTasks(options?: Partial<UseQueryOptions<Task[]>>) {
+  const agentId = useActiveAgentId();
   return useQuery<Task[]>({
-    queryKey: ["tasks"],
-    queryFn: () => api<Task[]>("/tasks"),
+    queryKey: ["tasks", agentId ?? null],
+    queryFn: () => api<Task[]>(scopedPath("/tasks", agentId)),
     refetchInterval: 60_000,
     ...options
   });
@@ -98,9 +113,10 @@ export function useHindsightBanks() {
 }
 
 export function useSubagents() {
+  const agentId = useActiveAgentId();
   return useQuery<SubagentRecord[]>({
-    queryKey: ["subagents"],
-    queryFn: () => api<SubagentRecord[]>("/subagents"),
+    queryKey: ["subagents", agentId ?? null],
+    queryFn: () => api<SubagentRecord[]>(scopedPath("/subagents", agentId)),
     refetchInterval: 60_000
   });
 }
@@ -115,17 +131,21 @@ export function useSkills(query?: string) {
 }
 
 export function useJobs() {
+  const agentId = useActiveAgentId();
   return useQuery<JobRecord[]>({
-    queryKey: ["jobs"],
-    queryFn: () => api<JobRecord[]>("/jobs"),
+    queryKey: ["jobs", agentId ?? null],
+    queryFn: () => api<JobRecord[]>(scopedPath("/jobs", agentId)),
     refetchInterval: 60_000
   });
 }
 
 export function useJobRuns(jobId?: string) {
+  const agentId = useActiveAgentId();
   return useQuery<JobRunRecord[]>({
-    queryKey: ["jobRuns", jobId ?? "all"],
-    queryFn: () => api<JobRunRecord[]>(jobId ? `/jobs/${jobId}/runs` : "/job-runs"),
+    queryKey: ["jobRuns", jobId ?? "all", agentId ?? null],
+    queryFn: () => api<JobRunRecord[]>(
+      scopedPath(jobId ? `/jobs/${jobId}/runs` : "/job-runs", agentId)
+    ),
     refetchInterval: 60_000
   });
 }
@@ -184,9 +204,10 @@ export function useAudit() {
 }
 
 export function useChatSessions() {
+  const agentId = useActiveAgentId();
   return useQuery<ChatSession[]>({
-    queryKey: ["chat"],
-    queryFn: () => api<ChatSession[]>("/chat"),
+    queryKey: ["chat", agentId ?? null],
+    queryFn: () => api<ChatSession[]>(scopedPath("/chat", agentId)),
     refetchInterval: 60_000
   });
 }
