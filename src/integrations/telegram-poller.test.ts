@@ -90,7 +90,13 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 2000
 }
 
 describe("telegram poller supervisor", () => {
-  afterEach(() => resetMessagingDeps());
+  afterEach(() => {
+    resetMessagingDeps();
+    // Belt-and-suspenders reset: if a test crashes mid-flight or a
+    // future change moves to `bun test --concurrent`, a process-global
+    // wait-cap override could otherwise leak into the next test.
+    setMaxTaskWaitMsForTests(undefined);
+  });
 
   test("reconcile starts a loop for a configured telegram bridge and stopAll cancels it", async () => {
     const config = testConfig("poller-start-stop");

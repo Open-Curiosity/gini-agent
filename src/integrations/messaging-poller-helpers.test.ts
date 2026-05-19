@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { RuntimeConfig } from "../types";
@@ -47,6 +47,12 @@ afterAll(() => {
   rmSync(ROOT, { recursive: true, force: true });
   rmSync(`${ROOT}-logs`, { recursive: true, force: true });
 });
+
+// Belt-and-suspenders: clear the process-global wait-cap override after
+// every test so a future move to `bun test --concurrent` (or a hard
+// abort that skips the in-test finally) cannot leak the 50ms cap into
+// a later test.
+afterEach(() => setMaxTaskWaitMsForTests(undefined));
 
 describe("sanitizeBridgeStatusMessage", () => {
   test("scrubs Discord 'Bot <token>' auth-header echoes", () => {
