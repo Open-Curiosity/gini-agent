@@ -70,7 +70,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }));
     }],
     ["GET", /^\/api\/mobile\/bootstrap$/, () => json(mobileBootstrap(config))],
-    ["GET", /^\/api\/chat$/, () => json(listChatSessions(config))],
+    ["GET", /^\/api\/chat$/, (request) => {
+      const agentId = agentIdFilter(request);
+      const sessions = listChatSessions(config);
+      return json(agentId ? sessions.filter((s) => s.agentId === agentId) : sessions);
+    }],
     ["POST", /^\/api\/chat$/, async (request) => json(await createChat(config, await body(request)), 201)],
     ["GET", /^\/api\/chat\/([^/]+)$/, (_request, params) => json(getChatSession(config, params[0]))],
     ["DELETE", /^\/api\/chat\/([^/]+)$/, async (_request, params) => { await deleteChat(config, params[0]); return json({ ok: true }); }],
@@ -79,7 +83,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
-    ["GET", /^\/api\/tasks$/, () => json(readState(config.instance).tasks)],
+    ["GET", /^\/api\/tasks$/, (request) => {
+      const agentId = agentIdFilter(request);
+      const tasks = readState(config.instance).tasks;
+      return json(agentId ? tasks.filter((task) => task.agentId === agentId) : tasks);
+    }],
     ["POST", /^\/api\/tasks$/, async (request) => json(await submitTask(config, String((await body(request)).input ?? "")), 201)],
     ["GET", /^\/api\/search$/, (_request) => json(searchSessions(config, new URL(_request.url).searchParams.get("q") ?? "", Number(new URL(_request.url).searchParams.get("limit") ?? 20)))],
     ["GET", /^\/api\/tasks\/([^/]+)$/, (_request, params) => {
@@ -90,11 +98,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }],
     ["POST", /^\/api\/tasks\/([^/]+)\/retry$/, async (_request, params) => json(await retryTask(config, params[0]))],
     ["POST", /^\/api\/tasks\/([^/]+)\/cancel$/, async (_request, params) => json(await cancelTask(config, params[0]))],
-    ["GET", /^\/api\/approvals$/, () => json(readState(config.instance).approvals)],
+    ["GET", /^\/api\/approvals$/, (request) => {
+      const agentId = agentIdFilter(request);
+      const approvals = readState(config.instance).approvals;
+      return json(agentId ? approvals.filter((a) => a.agentId === agentId) : approvals);
+    }],
     ["POST", /^\/api\/approvals\/([^/]+)\/approve$/, async (_request, params) => json(await decideApproval(config, params[0], "approve"))],
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
-    ["GET", /^\/api\/audit$/, () => json(readState(config.instance).audit)],
-    ["GET", /^\/api\/events$/, () => json(readState(config.instance).events)],
+    ["GET", /^\/api\/audit$/, (request) => {
+      const agentId = agentIdFilter(request);
+      const audit = readState(config.instance).audit;
+      return json(agentId ? audit.filter((entry) => entry.agentId === agentId) : audit);
+    }],
+    ["GET", /^\/api\/events$/, (request) => {
+      const agentId = agentIdFilter(request);
+      const events = readState(config.instance).events;
+      return json(agentId ? events.filter((event) => event.agentId === agentId) : events);
+    }],
     ["GET", /^\/api\/events\/stream$/, (request) => eventStream(config, request)],
     ["GET", /^\/api\/memory$/, () => {
       // Phase C — MemoryRecord listings are scoped to the active agent so
@@ -281,14 +301,26 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/skills\/([^/]+)\/enable$/, async (_request, params) => json(await setSkillStatus(config, params[0], "enabled"))],
     ["POST", /^\/api\/skills\/([^/]+)\/disable$/, async (_request, params) => json(await setSkillStatus(config, params[0], "disabled"))],
     ["POST", /^\/api\/skills\/([^/]+)\/rollback$/, async (_request, params) => json(await rollbackSkill(config, params[0]))],
-    ["GET", /^\/api\/jobs$/, () => json(readState(config.instance).jobs)],
+    ["GET", /^\/api\/jobs$/, (request) => {
+      const agentId = agentIdFilter(request);
+      const jobs = readState(config.instance).jobs;
+      return json(agentId ? jobs.filter((job) => job.agentId === agentId) : jobs);
+    }],
     ["POST", /^\/api\/jobs$/, async (request) => {
       return json(await createScheduledJob(config, await body(request)), 201);
     }],
     ["PATCH", /^\/api\/jobs\/([^/]+)$/, async (request, params) => json(await updateJob(config, params[0], await body(request)))],
     ["DELETE", /^\/api\/jobs\/([^/]+)$/, async (_request, params) => json(await removeJob(config, params[0]))],
-    ["GET", /^\/api\/job-runs$/, () => json(listJobRuns(config))],
-    ["GET", /^\/api\/jobs\/([^/]+)\/runs$/, (_request, params) => json(listJobRuns(config, params[0]))],
+    ["GET", /^\/api\/job-runs$/, (request) => {
+      const agentId = agentIdFilter(request);
+      const runs = listJobRuns(config);
+      return json(agentId ? runs.filter((run) => run.agentId === agentId) : runs);
+    }],
+    ["GET", /^\/api\/jobs\/([^/]+)\/runs$/, (request, params) => {
+      const agentId = agentIdFilter(request);
+      const runs = listJobRuns(config, params[0]);
+      return json(agentId ? runs.filter((run) => run.agentId === agentId) : runs);
+    }],
     ["POST", /^\/api\/jobs\/([^/]+)\/run$/, async (_request, params) => json(await runJobNow(config, params[0]))],
     ["POST", /^\/api\/job-runs\/([^/]+)\/replay$/, async (_request, params) => json(await replayJobRun(config, params[0]))],
     ["POST", /^\/api\/jobs\/([^/]+)\/pause$/, async (_request, params) => json(await updateJobStatus(config, params[0], "paused"))],
@@ -365,7 +397,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/toolsets$/, () => json(listToolsets(config))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/enable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "enabled"))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "disabled"))],
-    ["GET", /^\/api\/subagents$/, async () => json(await listSubagents(config))],
+    ["GET", /^\/api\/subagents$/, async (request) => {
+      const agentId = agentIdFilter(request);
+      const subagents = await listSubagents(config);
+      return json(agentId ? subagents.filter((sub) => sub.agentId === agentId) : subagents);
+    }],
     ["POST", /^\/api\/subagents$/, async (request) => json(await spawnSubagent(config, await body(request)), 201)],
     ["POST", /^\/api\/subagents\/([^/]+)\/cancel$/, async (_request, params) => json(await cancelSubagent(config, params[0]))],
     ["GET", /^\/api\/mcp$/, () => json(readState(config.instance).mcpServers)],
@@ -480,6 +516,16 @@ async function authorized(request: Request, config: RuntimeConfig): Promise<bool
 
 function json(value: unknown, statusCode = 200): Response {
   return Response.json(value, { status: statusCode });
+}
+
+// Parse the `?agentId=` filter shared by GET endpoints that return per-agent
+// record types. Returns undefined for absent or empty values so the caller
+// preserves the legacy "no filter" semantics.
+function agentIdFilter(request: Request): string | undefined {
+  const raw = new URL(request.url).searchParams.get("agentId");
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 // Maps a thrown Error.message to an HTTP status code. Job-layer code throws

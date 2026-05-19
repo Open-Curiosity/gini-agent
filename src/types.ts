@@ -253,6 +253,11 @@ export interface Task {
   input: string;
   status: TaskStatus;
   instance: Instance;
+  // Per-agent isolation key, mirroring MemoryRecord.agentId. Optional because
+  // legacy state files predate this field; normalizeState backfills it by
+  // stamping the active agent at migration time. Stays undefined for tasks
+  // created with no active agent (system-driven flows).
+  agentId?: string;
   createdAt: string;
   updatedAt: string;
   currentStep?: string;
@@ -296,6 +301,10 @@ export interface RuntimeEvent {
   risk: RiskLevel;
   summary: string;
   data?: Record<string, unknown>;
+  // Originating agent. Optional — system events (no active agent at
+  // emit time) and legacy events leave it undefined. normalizeState
+  // backfills missing ids on already-persisted events.
+  agentId?: string;
 }
 
 export interface RunRecord {
@@ -342,6 +351,9 @@ export interface PlanStepRecord {
 export interface ChatSessionRecord {
   id: string;
   instance: Instance;
+  // Owning agent (same shape as MemoryRecord.agentId). Optional for legacy
+  // sessions; normalizeState backfills with the migration-time active agent.
+  agentId?: string;
   title: string;
   createdAt: string;
   updatedAt: string;
@@ -410,6 +422,8 @@ export interface ToolsetRecord {
 export interface SubagentRecord {
   id: string;
   instance: Instance;
+  // Owning agent. Optional for legacy records; backfilled by normalizeState.
+  agentId?: string;
   name: string;
   prompt: string;
   status: SubagentStatus;
@@ -602,11 +616,17 @@ export interface AuditEvent {
   runId?: string;
   approvalId?: string;
   evidence?: Record<string, unknown>;
+  // Originating agent. Optional — system audits without an active agent
+  // and legacy entries leave it undefined.
+  agentId?: string;
 }
 
 export interface Approval {
   id: string;
   instance: Instance;
+  // Requesting agent. Optional — backfilled by normalizeState; system-driven
+  // approvals without an active agent leave it undefined.
+  agentId?: string;
   status: ApprovalStatus;
   createdAt: string;
   updatedAt: string;
@@ -722,6 +742,9 @@ export interface SkillVersion {
 export interface JobRecord {
   id: string;
   instance: Instance;
+  // Owning agent. Optional — legacy state files predate this field;
+  // normalizeState backfills it on load.
+  agentId?: string;
   name: string;
   prompt: string;
   script?: string;
@@ -793,6 +816,9 @@ export interface JobRecord {
 export interface JobRunRecord {
   id: string;
   instance: Instance;
+  // Owning agent. Optional — inherits from the parent job at creation time;
+  // backfilled by normalizeState for legacy state files.
+  agentId?: string;
   jobId: string;
   status: JobRunStatus;
   createdAt: string;

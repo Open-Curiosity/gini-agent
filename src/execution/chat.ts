@@ -11,6 +11,7 @@ import {
 } from "../state";
 import type { ChatMessageRecord, RuntimeConfig, TaskStatus } from "../types";
 import { createConversationRun, linkRunToTask } from "./runs";
+import { resolveEffectiveContext } from "./effective-context";
 
 // Statuses where a task is no longer producing partial text. Once a task
 // reaches one of these, the synthesized streaming message is dropped in
@@ -101,7 +102,10 @@ export function getChatSession(config: RuntimeConfig, id: string) {
 }
 
 export async function createChat(config: RuntimeConfig, input: Record<string, unknown>) {
-  return mutateState(config.instance, (state) => createChatSession(state, String(input.title ?? "New chat")));
+  return mutateState(config.instance, (state) => {
+    const effective = resolveEffectiveContext(state, config);
+    return createChatSession(state, String(input.title ?? "New chat"), undefined, effective.agentId);
+  });
 }
 
 export async function deleteChat(config: RuntimeConfig, id: string) {

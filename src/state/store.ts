@@ -348,6 +348,47 @@ function migrateMemoryAgentId(state: RuntimeState): void {
   }
 }
 
+// Stamp the active-at-migration-time agent onto records that pre-date the
+// per-agent isolation field. Mirrors migrateMemoryAgentId — idempotent and
+// audit-emitting. Covers Task, ChatSessionRecord, JobRecord, JobRunRecord,
+// SubagentRecord, Approval, RuntimeEvent, AuditEvent in one pass so the
+// backfill audit doesn't fan out into eight separate rows.
+function migrateRecordAgentIds(state: RuntimeState): void {
+  const defaultAgentId =
+    state.activeAgentId
+    ?? state.agents.find((agent) => agent.status === "active")?.id
+    ?? state.agents[0]?.id
+    ?? "agent_default";
+  const counts: Record<string, number> = {};
+  const stamp = <T extends { agentId?: string }>(rows: T[] | undefined, label: string) => {
+    if (!Array.isArray(rows)) return;
+    let n = 0;
+    for (const row of rows) {
+      if (row.agentId) continue;
+      row.agentId = defaultAgentId;
+      n += 1;
+    }
+    if (n > 0) counts[label] = n;
+  };
+  stamp(state.tasks, "tasks");
+  stamp(state.chatSessions, "chatSessions");
+  stamp(state.jobs, "jobs");
+  stamp(state.jobRuns, "jobRuns");
+  stamp(state.subagents, "subagents");
+  stamp(state.approvals, "approvals");
+  stamp(state.events, "events");
+  stamp(state.audit, "audit");
+  if (Object.keys(counts).length > 0) {
+    addAudit(state, {
+      actor: "runtime",
+      action: "records.agentid.backfill",
+      target: defaultAgentId,
+      risk: "low",
+      evidence: { stamped: counts, agentId: defaultAgentId }
+    });
+  }
+}
+
 // Phase C — per-agent backfill on the SQLite hindsight store. Pre-Phase-C
 // rows have a NULL agent_id (default value from the ALTER TABLE). Walk the
 // DB once and stamp them with the migration-time active agent, mirroring
@@ -499,6 +540,10 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.chatMessages ??= [];
   state.runs ??= [];
   state.planSteps ??= [];
+  // Per-agent isolation backfill for record types other than memory. Runs
+  // after every list default above so we never touch undefined arrays.
+  // Idempotent — only stamps rows missing `agentId`.
+  migrateRecordAgentIds(state);
   for (const session of state.chatSessions) {
     session.runIds ??= [];
   }

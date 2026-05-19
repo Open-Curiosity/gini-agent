@@ -69,7 +69,8 @@ export function createTask(
   jobId?: string,
   parentTaskId?: string,
   subagentId?: string,
-  runId?: string
+  runId?: string,
+  agentId?: string
 ): Task {
   const at = now();
   const taskId = id("task");
@@ -79,6 +80,7 @@ export function createTask(
     input,
     status: "queued",
     instance,
+    agentId,
     createdAt: at,
     updatedAt: at,
     tracePath: tracePath(instance, taskId),
@@ -164,12 +166,14 @@ export function createPlanStep(
 export function createChatSession(
   state: RuntimeState,
   title: string,
-  source?: ChatSessionRecord["source"]
+  source?: ChatSessionRecord["source"],
+  agentId?: string
 ): ChatSessionRecord {
   const at = now();
   const session: ChatSessionRecord = {
     id: id("chat"),
     instance: state.instance,
+    agentId,
     title: title.slice(0, 80) || "Untitled chat",
     createdAt: at,
     updatedAt: at,
@@ -211,7 +215,7 @@ export function findOrCreateTelegramChatSession(
     bridgeId,
     chatId,
     target
-  });
+  }, state.activeAgentId);
 }
 
 export function deleteChatSession(state: RuntimeState, id: string): ChatSessionRecord {
@@ -273,13 +277,20 @@ export function createApproval(
   approval: Omit<Approval, "id" | "instance" | "status" | "createdAt" | "updatedAt">
 ): Approval {
   const at = now();
+  // Inherit agentId from the originating task when the caller didn't supply
+  // one. Approvals follow the task that requested them — that's the agent
+  // whose inbox the row should land in.
+  const taskAgentId = approval.taskId
+    ? state.tasks.find((task) => task.id === approval.taskId)?.agentId
+    : undefined;
   const item: Approval = {
     id: id("approval"),
     instance: state.instance,
     status: "pending",
     createdAt: at,
     updatedAt: at,
-    ...approval
+    ...approval,
+    agentId: approval.agentId ?? taskAgentId
   };
   state.approvals.unshift(item);
   addAudit(state, {

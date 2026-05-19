@@ -1,6 +1,7 @@
 import { submitTask } from "../agent";
 import type { JobRecord, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
 import { addAudit, appendEvent, appendLog, appendTrace, createChatSession, createJob, createJobRun, createRun, isTerminalTaskStatus, mutateState, now, readState } from "../state";
+import { resolveEffectiveContext } from "../execution/effective-context";
 import { spawn } from "bun";
 import { Cron } from "croner";
 
@@ -220,9 +221,10 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     // a bad parent task state) leaves no orphan chat row. The new
     // session's id replaces any caller-supplied chatSessionId so the job's
     // future fires post into the fresh thread.
+    const effective = resolveEffectiveContext(state, config);
     let resolvedChatSessionId = chatSessionId;
     if (createDedicatedSessionTitle !== undefined) {
-      const session = createChatSession(state, createDedicatedSessionTitle);
+      const session = createChatSession(state, createDedicatedSessionTitle, undefined, effective.agentId);
       resolvedChatSessionId = session.id;
     }
     // Initial nextRunAt: cron-driven jobs anchor to the next cron-matched
@@ -251,7 +253,8 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
       chatSessionId: resolvedChatSessionId,
       oneShot,
       dangerouslyAutoApprove,
-      autoApproveCommands
+      autoApproveCommands,
+      agentId: effective.agentId
     });
   });
 }
@@ -358,7 +361,7 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
       job.lastRunAt = now();
       job.runCount += 1;
       job.updatedAt = now();
-      const run = createJobRun(state, { jobId: job.id, trigger: "schedule" });
+      const run = createJobRun(state, { jobId: job.id, trigger: "schedule", agentId: job.agentId });
       job.runIds.unshift(run.id);
       out.push({ job, run });
     }
@@ -595,7 +598,7 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
       }
     }
     item.updatedAt = now();
-    const run = createJobRun(state, { jobId, trigger });
+    const run = createJobRun(state, { jobId, trigger, agentId: item.agentId });
     item.runIds.unshift(run.id);
     return { job: item, run };
   });

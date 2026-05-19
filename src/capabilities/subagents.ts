@@ -20,6 +20,7 @@ import {
   now,
   readState
 } from "../state";
+import { resolveEffectiveContext } from "../execution/effective-context";
 
 // Default system prompt for a subagent when the caller doesn't provide one.
 // Keep it short and behavioral: the model gets the user-facing `prompt` as
@@ -127,6 +128,7 @@ export async function spawnSubagent(
         throw new Error(`Cannot spawn subagent: parent task ${parentTaskId} is already ${parent.status}.`);
       }
     }
+    const effective = resolveEffectiveContext(state, config);
     return createSubagentRecord(state, {
       name,
       prompt,
@@ -134,7 +136,8 @@ export async function spawnSubagent(
       toolsets: advertisedToolsets,
       systemPrompt,
       toolsetIds,
-      skillNames
+      skillNames,
+      agentId: effective.agentId
     });
   });
 

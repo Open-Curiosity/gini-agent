@@ -90,7 +90,16 @@ export async function submitTask(
   const options: SubmitTaskOptions = typeof jobIdOrOptions === "object" && jobIdOrOptions !== null
     ? jobIdOrOptions
     : { jobId: jobIdOrOptions, parentTaskId, subagentId, runId };
-  const created = createTask(config.instance, input, options.jobId, options.parentTaskId, options.subagentId, options.runId);
+  const effective = resolveEffectiveContext(readState(config.instance), config);
+  const created = createTask(
+    config.instance,
+    input,
+    options.jobId,
+    options.parentTaskId,
+    options.subagentId,
+    options.runId,
+    effective.agentId
+  );
   if (options.mode) created.mode = options.mode;
   // When a parentTaskId is set, the upsert + the parent-status
   // check must serialize together. Without this, `spawnSubagent`'s
@@ -130,7 +139,16 @@ export async function submitTask(
 export async function retryTask(config: RuntimeConfig, taskId: string): Promise<Task> {
   const task = await mutateState(config.instance, (state) => {
     const existing = findTask(state, taskId);
-    const retry = createTask(config.instance, existing.input, existing.jobId, existing.parentTaskId, existing.subagentId, existing.runId);
+    const effective = resolveEffectiveContext(state, config);
+    const retry = createTask(
+      config.instance,
+      existing.input,
+      existing.jobId,
+      existing.parentTaskId,
+      existing.subagentId,
+      existing.runId,
+      existing.agentId ?? effective.agentId
+    );
     upsertTask(state, retry);
     addAudit(state, {
       actor: "user",
