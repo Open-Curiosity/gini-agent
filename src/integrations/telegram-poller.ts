@@ -575,4 +575,3 @@ function buildTaskInput(incoming: IncomingPayload, savedPath: string | undefined
   if (body) parts.push(body);
   return parts.join("\n");
 }
-

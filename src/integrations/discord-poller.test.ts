@@ -216,7 +216,14 @@ describe("discord poller supervisor", () => {
     expect(supervisor.size()).toBe(0);
   });
 
-  test("first contact seeds the watermark from the newest message without spawning a task", async () => {
+  test("first contact on a non-empty channel seeds the watermark from wall-clock NOW, NOT from the newest observed snowflake (closes mid-fetch race)", async () => {
+    // The naive "seed to newest observed" path had a real race: if a
+    // user posted a message during the very first fetch's request
+    // window, that message would be included in the response, pinned
+    // as the seed, and silently dropped (the next poll with
+    // afterId=<their_id> finds nothing). Seeding to a wall-clock
+    // snowflake closes the window — any real-time message is strictly
+    // newer than (now - 5s) so it routes on the next poll.
     const config = testConfig("disc-seed");
     const { client, enqueue, sendCalls } = programmableClient();
     setMessagingDeps({ discordClientFactory: () => client });
@@ -228,8 +235,9 @@ describe("discord poller supervisor", () => {
       botToken: "TOK"
     });
 
-    // History returned newest-first by Discord; the poller flips and
-    // pins the watermark to the newest snowflake (string "300").
+    // History returned newest-first by Discord. Historical snowflakes
+    // are tiny ("300" etc.) compared to a real now-derived snowflake
+    // (which is ~10^18 today).
     enqueue("chan-1", [
       makeMessage({ id: "300", content: "old c" }),
       makeMessage({ id: "200", content: "old b" }),
@@ -248,16 +256,99 @@ describe("discord poller supervisor", () => {
       () => {
         const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
         const watermark = (live?.metadata?.lastInboundExternalIds as Record<string, string> | undefined)?.["chan-1"];
-        return watermark === "300";
+        return Boolean(watermark);
       },
-      "watermark to advance to newest existing message"
+      "watermark to advance"
     );
 
-    // No history messages should have been routed — every one is older
-    // than the seeded watermark, so the agent stays quiet on a fresh
-    // bridge attaching to a busy channel.
+    // The watermark must NOT be the newest historical snowflake — that's
+    // the OLD buggy behavior the race fix replaced. It must be a
+    // wall-clock-derived snowflake (BigInt orders of magnitude larger
+    // than any historical id in this fixture).
+    const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    const watermark = (live?.metadata?.lastInboundExternalIds as Record<string, string> | undefined)?.["chan-1"];
+    expect(watermark).toBeDefined();
+    expect(watermark).not.toBe("300");
+    expect(BigInt(watermark!)).toBeGreaterThan(BigInt("1000000000000000")); // 10^15, much larger than historical "300"
+    // Sanity: a snowflake derived from wall-clock NOW should be less
+    // than a snowflake derived from NOW + 1 day. This pins that the
+    // seed is in the present, not some far-future sentinel.
+    const oneDayFromNow = (BigInt(Date.now() + 24 * 60 * 60 * 1000) - 1420070400000n) << 22n;
+    expect(BigInt(watermark!)).toBeLessThan(oneDayFromNow);
+
+    // No history messages should have been routed.
     expect(sendCalls).toEqual([]);
     expect(readState(config.instance).tasks).toEqual([]);
+
+    await supervisor.stopAll();
+  });
+
+  test("a user message arriving during the first fetch window is NOT consumed as the seed and routes on the next poll (mid-fetch race)", async () => {
+    // Exact regression test for the race the wall-clock seed fix
+    // closes. Scenario: bridge attaches, fires first fetch. Discord's
+    // response includes a real user message (simulating a user who
+    // typed during the request window). The old code would have
+    // pinned that message's snowflake as the seed and dropped it.
+    // The new code seeds to wall-clock NOW (which is larger than any
+    // realistic real-time snowflake from this moment), so the user's
+    // message is strictly NEWER than the seed and routes on the next
+    // poll. We use a synthetic snowflake = (now-1s) so it's older than
+    // the seed; routing therefore depends on the next poll picking it
+    // up via afterId. To make that work we enqueue it again on the
+    // second batch (simulating Discord returning the same message
+    // when re-queried with afterId<that_snowflake>).
+    //
+    // Without the fix, this test would deadlock waiting for the
+    // routing because the first-contact seed would have already
+    // pinned the user's snowflake as the watermark and the second
+    // poll would find nothing newer.
+    const config = testConfig("disc-mid-fetch-race");
+    const { client, enqueue, sendCalls } = programmableClient();
+    setMessagingDeps({ discordClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    // Build a "real-time" snowflake (~now): timestamp 1s in the past,
+    // shifted into snowflake position. This is the snowflake Discord
+    // would assign to a message arriving during our first fetch.
+    const realtimeSnowflake = ((BigInt(Date.now() - 1000) - 1420070400000n) << 22n).toString();
+
+    // First fetch returns the user's message (the mid-fetch arrival).
+    enqueue("chan-1", [
+      makeMessage({
+        id: realtimeSnowflake,
+        content: "user typed during the fetch",
+        author: { id: "user-1", username: "lo", bot: false }
+      })
+    ]);
+    // Second fetch returns the same message again (afterId=<seed> will
+    // be older than the user's snowflake, so Discord re-includes it).
+    enqueue("chan-1", [
+      makeMessage({
+        id: realtimeSnowflake,
+        content: "user typed during the fetch",
+        author: { id: "user-1", username: "lo", bot: false }
+      })
+    ]);
+
+    const supervisor = createDiscordPollerSupervisor(config, {
+      clientFactory: () => client,
+      gatewayConnector: stubGateway,
+      pollIntervalMs: 20,
+      typingRefreshMs: 20
+    });
+    supervisor.reconcile();
+
+    // The fix means the user's message survives the first-contact
+    // seed and gets routed on the second poll. Without the fix this
+    // wait would time out.
+    await waitFor(() => sendCalls.length >= 1, "mid-fetch user message to route despite first-contact seeding");
+    void bridge;
 
     await supervisor.stopAll();
   });
@@ -274,11 +365,14 @@ describe("discord poller supervisor", () => {
       botToken: "TOK"
     });
 
-    // First batch seeds the watermark (any existing message will do —
-    // first-contact pins to the newest and skips routing so a busy
-    // channel doesn't backfill). Subsequent batch carries the real
-    // user message we expect the agent to act on.
-    enqueue("chan-1", [makeMessage({ id: "100", content: "older history" })]);
+    // Empty first batch → seeds to the "0" sentinel (empty-channel
+    // branch). Subsequent batch carries the real user message; any
+    // snowflake > "0" routes normally. The other "non-empty first
+    // contact" branch uses wall-clock seeding, so a small synthetic
+    // id like "500" would be filtered out as "older than NOW" — we
+    // explicitly use the empty seeding path here to keep the test
+    // independent of wall-clock math.
+    enqueue("chan-1", []);
     enqueue("chan-1", [
       makeMessage({ id: "500", content: "hi gini", author: { id: "user-1", username: "lo", bot: false } })
     ]);
@@ -333,9 +427,10 @@ describe("discord poller supervisor", () => {
       botToken: "TOK"
     });
 
-    // Seed batch (any message), then a bot-authored message that the
-    // poller must skip while still advancing the watermark.
-    enqueue("chan-1", [makeMessage({ id: "300", content: "older history" })]);
+    // Empty first batch → "0" sentinel seed (see other tests). Then a
+    // bot-authored message that the poller must skip while still
+    // advancing the watermark.
+    enqueue("chan-1", []);
     enqueue("chan-1", [
       makeMessage({ id: "700", content: "i am a bot", author: { id: "100", username: "Gini", bot: true } })
     ]);
@@ -518,10 +613,9 @@ describe("discord poller supervisor", () => {
       botToken: "TOK"
     });
 
-    // Seed via the blind queue first so the watermark gets pinned
-    // to id "100". After that, swap to the cursor-honoring store
-    // for the actual burst.
-    enqueue("chan-1", [makeMessage({ id: "100", content: "older history" })]);
+    // Empty first batch → "0" sentinel seed. Subsequent polls walk the
+    // cursor-honoring store; every message id > "0" routes normally.
+    enqueue("chan-1", []);
 
     // Build a 75-message burst. Ids 1000..1074. The user-authored
     // message sits at id 1010 — well below the 50th-newest cutoff
@@ -546,16 +640,15 @@ describe("discord poller supervisor", () => {
     });
 
     await withSupervisor(supervisor, async () => {
-      // First reconcile burns the seed batch + advances watermark
-      // to 100.
+      // First reconcile burns the empty seed batch → watermark "0".
       supervisor.reconcile();
       await waitFor(
         () => {
           const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
           const watermark = (live?.metadata?.lastInboundExternalIds as Record<string, string> | undefined)?.["chan-1"];
-          return watermark === "100";
+          return watermark === "0";
         },
-        "watermark to land on seed (100) before burst arrives"
+        "watermark to land on '0' sentinel before burst arrives"
       );
 
       // Now install the cursor-honoring store with the 75-message
@@ -759,7 +852,7 @@ describe("discord poller supervisor", () => {
 
     // Seed batch (so first-contact pins the watermark and the next
     // poll routes real messages).
-    enqueue("chan-1", [makeMessage({ id: "100", content: "older history" })]);
+    enqueue("chan-1", []);
     supervisor.reconcile();
     await waitFor(
       () => Boolean(readState(config.instance).messagingBridges.find((b) => b.id === bridge.id)?.metadata?.lastInboundExternalIds),
@@ -801,7 +894,7 @@ describe("discord poller supervisor", () => {
       pollIntervalMs: 5000,
       typingRefreshMs: 20
     });
-    enqueue("chan-1", [makeMessage({ id: "100", content: "older history" })]);
+    enqueue("chan-1", []);
     supervisor.reconcile();
     await waitFor(() => slot.fire !== undefined, "gateway connector captured the callback");
 

@@ -14,7 +14,15 @@
 import type { RuntimeConfig, Task } from "../types";
 import { addAudit, appendEvent, appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { syncChatTaskResult } from "../execution/chat";
-import { sendMessagingOutput } from "../integrations/messaging";
+// `sendMessagingOutput` is imported lazily inside dispatchJobReplyToBridge
+// to avoid closing a static import cycle. The runtime graph would be:
+//   agent.ts -> jobs/finalize.ts -> integrations/messaging.ts -> agent.ts
+// (messaging.ts imports submitTask from agent.ts). A static cycle here
+// would defeat the deliberate split between agent.ts and jobs/finalize.ts —
+// see the leaf-module comment at src/agent.ts:51-55 — so we defer the
+// messaging import until call time. Module-init cost is unchanged; the
+// dynamic import resolves to the already-loaded module the first time
+// dispatchJobReplyToBridge runs.
 
 export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task): Promise<void> {
   if (!task.jobId) return;
@@ -157,6 +165,7 @@ async function dispatchJobReplyToBridge(
   if (replyText.startsWith("[SILENT]")) return;
   try {
     const replyToMessageId = dispatchTo.lastInboundMessageId;
+    const { sendMessagingOutput } = await import("../integrations/messaging");
     await sendMessagingOutput(config, dispatchTo.bridgeId, {
       text: replyText,
       target: dispatchTo.target,

@@ -72,6 +72,25 @@ const MAX_PAGES_PER_TICK = 10;
 // boundary ever shifts.
 const EMPTY_CHANNEL_SEED_SNOWFLAKE = "0";
 
+// Discord snowflake encoding: `((ms_since_epoch) - DISCORD_EPOCH) << 22`
+// where DISCORD_EPOCH is 2015-01-01 00:00:00 UTC. We synthesize a
+// "snowflake as of now-minus-margin" for first-contact seeding on a
+// non-empty channel so we don't seize a mid-fetch user message as the
+// watermark (the previous "seed to newest observed" path had a race
+// where a message arriving during the first poll's request window
+// landed in the response, got pinned as the seed, and was never
+// routed). The 5s safety margin absorbs typical clock skew between
+// the local box and Discord's servers — any real "now" message is
+// strictly newer than (now - 5s) so it routes on the next poll, and
+// any historical message older than 5s before bridge start stays
+// uncodified as history.
+const DISCORD_EPOCH_MS = 1420070400000n;
+const FIRST_CONTACT_SAFETY_MARGIN_MS = 5000n;
+function snowflakeFromNow(): string {
+  const ms = BigInt(Date.now()) - FIRST_CONTACT_SAFETY_MARGIN_MS - DISCORD_EPOCH_MS;
+  return (ms << 22n).toString();
+}
+
 export interface PollerDeps {
   clientFactory?: (token: string) => DiscordClient;
   // Per-target polling cadence override (ms). Production leaves this
@@ -465,12 +484,19 @@ async function pollChannel(
   // would mis-order without this).
   const ordered = [...collected].sort((a, b) => snowflakeCompare(a.id, b.id));
 
-  // Non-empty first poll: pin to the newest existing message and
-  // skip routing so a fresh bridge attaching to an active channel
-  // doesn't backfill history into the agent.
+  // Non-empty first poll: pin the watermark to a snowflake derived
+  // from wall-clock NOW (minus a small safety margin) so a fresh
+  // bridge attaching to an active channel doesn't backfill history
+  // AND doesn't accidentally consume a message that arrived during
+  // this very fetch. Seeding to the newest observed snowflake was
+  // racy: a user who posted during the fetch window would have
+  // their message included in the response, get pinned as the seed,
+  // and never get routed (the next poll with afterId=<their_id>
+  // would find nothing). Using a wall-clock seed makes any real
+  // "now" message strictly newer than the watermark, so it routes
+  // on the next poll instead of being seized as the seed.
   if (initialWatermark === undefined) {
-    const newest = ordered[ordered.length - 1]!;
-    await advanceWatermark(config, bridgeId, channelId, newest.id);
+    await advanceWatermark(config, bridgeId, channelId, snowflakeFromNow());
     return;
   }
 
@@ -774,4 +800,3 @@ function snowflakeCompare(a: string, b: string): number {
   const bi = BigInt(b);
   return ai < bi ? -1 : ai > bi ? 1 : 0;
 }
-
