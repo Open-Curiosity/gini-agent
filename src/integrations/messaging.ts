@@ -820,9 +820,10 @@ export async function sendMessagingOutput(
       const formatted = useMdv2 ? formatTelegramMarkdownV2(text) : text;
       // Thread the reply onto a specific inbound message when supplied
       // (group chats use this so the bot's response visually attaches to
-      // the user's question). Telegram silently ignores the field when
-      // the referenced message is gone, so it's safe to forward
-      // unconditionally.
+      // the user's question). The Telegram client pairs the field with
+      // `allow_sending_without_reply: true` whenever it's set, so a
+      // deleted-mid-task original silently falls back to an unthreaded
+      // send instead of failing the whole call.
       const replyToMessageId =
         typeof input.replyToMessageId === "number" ? input.replyToMessageId : undefined;
       try {

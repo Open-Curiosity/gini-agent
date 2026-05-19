@@ -19,7 +19,12 @@ import type { MessagingBridgeRecord, RuntimeConfig, TaskStatus } from "../types"
 import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { findDiscordChatSession, readBridgeBotToken, receiveMessagingInput, sendMessagingOutput } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
-import { awaitTerminalTask, createDetachedTracker, markBridgeError } from "./messaging-poller-helpers";
+import {
+  awaitTerminalTask,
+  createDetachedTracker,
+  markBridgeError,
+  sleepUnlessAborted
+} from "./messaging-poller-helpers";
 import {
   createDiscordClient,
   extractIncomingPayload,
@@ -593,8 +598,11 @@ async function maintainTypingIndicator(
     if (isTerminalTaskStatus(task.status)) return;
     try {
       // Pass the loop's signal so a hung typing POST gets cancelled
-      // on bridge disable / shutdown — without this the await could
-      // block the sequential reply mirror indefinitely.
+      // on bridge disable / shutdown and on the per-call
+      // typingController abort that the reply mirror raises before
+      // returning — without this thread the await could keep the
+      // detached pulse worker pinned past the supervisor drain
+      // window even after the mirror has already returned.
       await client.triggerTypingIndicator(channelId, signal);
     } catch (error) {
       // A revoked channel or network blip shouldn't keep us looping
@@ -665,18 +673,3 @@ function snowflakeCompare(a: string, b: string): number {
   return ai < bi ? -1 : ai > bi ? 1 : 0;
 }
 
-async function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return;
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-}

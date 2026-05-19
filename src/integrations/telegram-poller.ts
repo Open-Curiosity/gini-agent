@@ -23,7 +23,12 @@ import {
   tryClaimPairingCode
 } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
-import { awaitTerminalTask, createDetachedTracker, markBridgeError } from "./messaging-poller-helpers";
+import {
+  awaitTerminalTask,
+  createDetachedTracker,
+  markBridgeError,
+  sleepUnlessAborted
+} from "./messaging-poller-helpers";
 import {
   createTelegramClient,
   extractIncomingPayload,
@@ -71,8 +76,10 @@ export function createTelegramPollerSupervisor(
   const factory = deps.clientFactory ?? ((token: string) => createTelegramClient(token));
   let stopped = false;
   // Shared detached-worker tracker. The drain has a bounded timeout
-  // so a hung Telegram send (the Telegram client doesn't thread
-  // AbortSignal) can't deadlock shutdown.
+  // so a hung Telegram send can't deadlock shutdown. `sendChatAction`
+  // now threads AbortSignal so typing-pulse fetches cancel in-flight;
+  // `sendMessage` / `sendPhoto` still don't, so the drain cap remains
+  // the upper bound on shutdown latency.
   const detached = createDetachedTracker(config, "messaging.telegram.detached_drain_timeout");
 
   function shouldRun(bridge: MessagingBridgeRecord): boolean {
@@ -120,10 +127,11 @@ export function createTelegramPollerSupervisor(
       stopped = true;
       for (const loop of loops.values()) loop.controller.abort();
       await Promise.all(Array.from(loops.values()).map((loop) => loop.done.catch(() => {})));
-      // Drain detached workers with a bounded timeout. Telegram's
-      // client API doesn't accept AbortSignal today, so a hung
-      // sendMessage/sendChatAction would otherwise keep stopAll
-      // pending forever.
+      // Drain detached workers with a bounded timeout. The Telegram
+      // client now threads AbortSignal into sendChatAction, but
+      // sendMessage / sendPhoto still don't accept one — a hung send
+      // on those would otherwise keep stopAll pending forever, so the
+      // drain cap is the upper bound on shutdown latency.
       await detached.drain();
     },
     size() {
@@ -497,7 +505,17 @@ async function maintainTypingIndicator(
       // observes abort instead of leaving a worker pinned past the
       // detached-tracker drain window.
       await client.sendChatAction(chatId, "typing", signal);
-    } catch {
+    } catch (error) {
+      // Match Discord's typing loop: aborts during shutdown / disable
+      // stay quiet, anything else lands a single log row so an
+      // operator can see why the indicator stopped. The pulse still
+      // abandons after one error — the reply mirror is decoupled and
+      // will land the assistant message when the task settles.
+      if (signal.aborted) return;
+      appendLog(config.instance, "messaging.telegram.typing_pulse_error", {
+        chatId,
+        error: error instanceof Error ? error.message : String(error)
+      });
       return;
     }
     await sleepUnlessAborted(TYPING_REFRESH_MS, signal);
@@ -553,18 +571,3 @@ function buildTaskInput(incoming: IncomingPayload, savedPath: string | undefined
   return parts.join("\n");
 }
 
-async function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return;
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-}

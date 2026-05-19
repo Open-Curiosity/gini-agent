@@ -173,6 +173,26 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Abortable sleep used by both poller loops (per-tick cadence and
+// error-backoff) and by their typing pulses. Extracted from the two
+// pollers, which previously held byte-identical copies — kept in one
+// place so a future tweak to the abort semantics (e.g. swap to
+// `setTimeout`'s own AbortSignal support) lands once.
+export function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const onAbort = () => {
+    clearTimeout(timer);
+    resolve();
+  };
+  const timer = setTimeout(() => {
+    signal.removeEventListener("abort", onAbort);
+    resolve();
+  }, ms);
+  signal.addEventListener("abort", onAbort, { once: true });
+  return promise;
+}
+
 // Wait for a task to reach a terminal state (completed / failed /
 // cancelled). Used by reply mirrors in both pollers so they don't
 // invoke syncChatTaskResult before the task is ready — that throws
