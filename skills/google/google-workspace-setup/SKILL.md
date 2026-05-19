@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 1.1.0
+    version: 1.2.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -26,6 +26,7 @@ Run this skill the first time any Workspace skill is invoked. It is idempotent �
 - A Google Cloud project for OAuth credentials. The step-by-step flow below creates one through the browser tools; no `gcloud` CLI required.
 - Node.js 18+ on `$PATH` if installing via npm. Homebrew and prebuilt-binary installs do not need Node.
 - The `browser` toolset enabled on the active agent. The default agent ships with it on; if `/api/status` shows `toolsetFilter` without `browser`, ask the user to enable the toolset before continuing.
+- A **visible, managed browser session** so the user can complete sign-in. Headless mode is the default; without an explicit connect the user has no window to type credentials into. Confirm before the Cloud Console flow — see Step 0 below.
 
 ## When to Use
 
@@ -74,6 +75,36 @@ Two rules apply to **every** browser interaction in this section:
 
 - **Snapshot before you click.** Element refs (`@e3`, etc.) are valid only against the most recent snapshot. After `browser_navigate`, `browser_click`, `browser_type`, or `browser_wait_for`, the returned snapshot is the only thing you can address. Never reuse a ref from a previous turn.
 - **Address by accessible label, not by ref.** The Cloud Console UI is rearranged often. When you need to click "Create" or fill the "App name" field, find that label in the latest snapshot and use that snapshot's ref. Do not hardcode refs into the plan.
+
+#### Step 0 — Connect a visible browser (preflight)
+
+`browser_navigate` opens a **headless** Chromium by default — there is no window the user can interact with, so the Cloud Console sign-in step below will fail (Google rejects automated sign-in, and the user can't type into a window they can't see). Before driving any of the milestones below, confirm the agent is attached to a **visible** browser session.
+
+Check the connection state via the runtime API:
+
+```bash
+# Read $TOKEN from ~/.gini/instances/<instance>/config.json (the `apiToken`
+# field) or `gini status`. <port> defaults to 7373 in dev — read it from
+# the same config file.
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:<port>/api/browser
+```
+
+Decision rule on the JSON response:
+
+- `{ "connected": true, "record": { "mode": "managed", ... } }` → a visible managed Chrome is already attached. Proceed to Milestone A.
+- `{ "connected": true, "record": { "mode": "cdp", ... } }` → the agent is attached to a user-supplied Chrome via CDP. That window is the user's, and they can drive sign-in there. Proceed.
+- `{ "connected": false }` (or `connected: true` with no `record`) → no visible window. Stop and ask the user to connect one (next paragraph), then re-check before continuing.
+
+When not connected, tell the user, in chat:
+
+> Before I drive the Google Cloud Console, I need a visible Chrome window — Google blocks automated sign-in, so you'll need to sign in yourself. Pick one of these:
+>
+> 1. In another terminal: `gini browser connect`
+> 2. Or in the Gini webapp, open `/browser` and click **Connect**.
+>
+> Either path will pop a Chrome window. Reply **"done"** once it's open.
+
+Wait for the user to confirm. Re-run the `GET /api/browser` check; only proceed when the response shows `connected: true` with a `record`. Do **not** start `browser_navigate` against a headless context — the user has no window to act on and the milestone below will stall.
 
 #### Milestone A — Sign in to Cloud Console (user handover)
 
