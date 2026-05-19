@@ -116,8 +116,9 @@ export async function spawnSubagent(
   // converts to a "skipped" tool result.
   let parentAgentId: string | undefined;
   const subagent = await mutateState(config.instance, (state) => {
+    let parent: typeof state.tasks[number] | undefined;
     if (parentTaskId) {
-      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      parent = state.tasks.find((t) => t.id === parentTaskId);
       // Refuse on `cancelled` (operator-initiated cancel race) AND
       // `failed` (sibling approval denial / runtime failure
       // mid-turn). `completed` is intentionally permitted because
@@ -129,8 +130,13 @@ export async function spawnSubagent(
         throw new Error(`Cannot spawn subagent: parent task ${parentTaskId} is already ${parent.status}.`);
       }
     }
+    // Inherit the parent task's owning agent so a switch between the
+    // parent's submission and this spawn doesn't reattribute the child.
+    // Mirrors the retryTask precedent (`existing.agentId ?? effective.agentId`)
+    // — fall back to the active agent only for parentless / unstamped
+    // legacy parents.
     const effective = resolveEffectiveContext(state, config);
-    parentAgentId = effective.agentId;
+    parentAgentId = parent?.agentId ?? effective.agentId;
     return createSubagentRecord(state, {
       name,
       prompt,
@@ -139,7 +145,7 @@ export async function spawnSubagent(
       systemPrompt,
       toolsetIds,
       skillNames,
-      agentId: effective.agentId
+      agentId: parentAgentId
     });
   });
 
