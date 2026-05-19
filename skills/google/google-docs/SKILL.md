@@ -18,8 +18,11 @@ Use `gws docs` to create blank documents, read existing document content, append
 
 ## Prerequisites
 
-- `gws` installed and authenticated. If `gws` is not on PATH, or `gws auth status` reports no authenticated user, call `read_skill` with name `google-workspace-setup` and walk the user through onboarding before doing anything else.
-- If any `gws docs ...` call fails with `command not found` / ENOENT, or an auth-related error (HTTP 401, "no credentials", "scope required"), STOP — do NOT report failure to the user. Instead call `read_skill` with `google-workspace-setup` and run that skill's onboarding flow. Only report failure if the setup skill itself blocks.
+- `gws` installed and authenticated. If `gws` is not on PATH OR `gws auth status` reports no authenticated user, do NOT silently call setup. Instead, in a single short reply to the user:
+  1. State plainly what's missing — e.g. "Google Workspace access isn't set up on this machine yet" or "your Google sign-in has expired."
+  2. Ask one sentence: "Want me to walk you through setting it up?" Wait for the user's answer.
+  3. If they say yes, call `read_skill` with name `google-workspace-setup` and run that skill's onboarding flow turn-by-turn. If they say no or ask to defer, acknowledge briefly and stop — do not retry the original request.
+- Apply the same flow when any `gws docs ...` call fails mid-task with `command not found` / ENOENT, HTTP 401, "no credentials", or "scope required". Don't report the failure as a dead end — surface the missing prerequisite and ask if the user wants to set it up before moving on.
 - OAuth scopes the user picked at login must cover the verbs the agent will use:
   - Read and edit Docs: `docs`
   - Find docs by title (or list recent docs) before reading: pair with `drive.readonly`
