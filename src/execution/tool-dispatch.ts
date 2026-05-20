@@ -31,6 +31,7 @@ import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
 import { createMemoryFromInput, editMemory, recall } from "../memory";
 import { resolveEffectiveContext } from "./effective-context";
+import { searchSessions } from "./search";
 import { isSkillActive } from "../integrations/connectors";
 import { riskForAction } from "./tool-risk";
 import {
@@ -103,6 +104,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await addMemoryTool(config, taskId, args) };
     case "update_memory":
       return { kind: "sync", result: await updateMemoryTool(config, taskId, args) };
+    case "search_history":
+      return { kind: "sync", result: await searchHistoryTool(config, taskId, args) };
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -1475,6 +1478,45 @@ async function updateMemoryTool(
     data: { memoryId, appliedFields: Object.keys(input) }
   });
   return `Updated memory ${memory.id}: ${Object.keys(input).join(", ")}.`;
+}
+
+// Cross-session lookup wrapping `searchSessions`. Returns up to `limit`
+// (default 20, capped at 100) snippets matching the query. Low-risk;
+// read-only.
+async function searchHistoryTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const query = requireString(args, "query");
+  let limit = 20;
+  if (args.limit !== undefined && args.limit !== null) {
+    if (typeof args.limit !== "number" || !Number.isFinite(args.limit) || args.limit <= 0) {
+      throw new Error("Invalid input: limit must be a positive number.");
+    }
+    limit = Math.min(100, Math.floor(args.limit));
+  }
+  const results = searchSessions(config, query, limit);
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Searched session history",
+    data: { query, limit, hits: results.length }
+  });
+  await recordLowRiskAudit(config, taskId, "history.searched", query, {
+    limit,
+    hits: results.length
+  });
+  return JSON.stringify({
+    count: results.length,
+    results: results.map((r) => ({
+      kind: r.kind,
+      title: r.title,
+      excerpt: r.excerpt,
+      taskId: r.taskId,
+      source: r.source,
+      score: r.score
+    }))
+  });
 }
 
 // Poll the subagent record until its child task reaches a terminal state,

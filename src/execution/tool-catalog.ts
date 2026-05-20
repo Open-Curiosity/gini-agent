@@ -557,6 +557,24 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
+    // Cross-session lookup. Scans past tasks, traces, memories, skills,
+    // and audit rows for a substring match. Low-risk; read-only.
+    toolset: "session_search",
+    type: "function",
+    function: {
+      name: "search_history",
+      description: "Search past chat sessions, task traces, stored memories, skill text, and audit events for a substring. Use when the user references something they did before ('did I ever ask about X?', 'find that conversation about Y'). Returns up to `limit` snippets ordered by score, each with kind (task/trace/memory/skill/audit), title, excerpt, and taskId when applicable.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Substring to search for (case-insensitive)." },
+          limit: { type: "number", description: "Maximum number of snippets to return. Defaults to 20, capped at 100." }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  {
     // Explicit on-demand memory query. Distinct from the automatic
     // embedding recall that runs per chat task — this is the tool the
     // model reaches for when the user asks about something specific
