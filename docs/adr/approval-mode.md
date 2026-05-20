@@ -13,8 +13,8 @@ Replace the binary `dangerouslyAutoApprove` flag with a three-state
   approval row and pauses the task for a human decision. Matches the
   legacy pre-flip default.
 - `"auto"` — **new instance default**. Auto-approve `file.write`,
-  `file.patch`, `browser.upload_file`, `messaging.send`, and
-  `mcp.invoke` unconditionally. For
+  `file.patch`, `browser.upload_file`, and `messaging.send`
+  unconditionally. For
   `terminal.exec` and `code_exec`, auto-approve unless the command
   (or, for `code_exec`, either the wrapper command OR the raw
   source — see `matchDangerousSource`) matches a dangerous-pattern
@@ -68,12 +68,11 @@ The two original Plan corrections worth noting:
   same way a `terminal_exec` of `sudo *` would be.
 
 The approval-eligible tool surface is `file_write`, `file_patch`,
-`terminal_exec`, `code_exec`, `browser_upload_file`, `send_message`,
-and `invoke_mcp`. The last two egress data / run external code and
-were folded into the same policy seam after the initial five so the
-mode contract applies uniformly. Under `auto` mode `send_message`
-and `invoke_mcp` auto-approve (the agent can drive normal
-automations); `strict` still gates each call.
+`terminal_exec`, `code_exec`, `browser_upload_file`, and
+`send_message`. `send_message` egresses data and was folded into the
+same policy seam after the initial five so the mode contract applies
+uniformly. Under `auto` mode `send_message` auto-approves (the agent
+can drive normal automations); `strict` still gates each call.
 
 ## Required Now
 
@@ -177,8 +176,8 @@ about "was this auto").
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` are
   green; `src/execution/approval-mode.test.ts` covers the
   `{strict, auto, yolo}` × `{file_write, file_patch, terminal_exec
-  safe + dangerous, code_exec, browser_upload_file, send_message,
-  invoke_mcp}` matrix, plus
+  safe + dangerous, code_exec, browser_upload_file, send_message}`
+  matrix, plus
   the legacy alias, the symlink-escape rejection, side-effect
   failure propagation, and the human (decideApproval) path.
 

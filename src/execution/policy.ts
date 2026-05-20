@@ -2,7 +2,7 @@
 //
 // Every approval-eligible tool call (file.write, file.patch,
 // terminal.exec, code.exec via terminal.exec, browser.upload_file,
-// messaging.send, mcp.invoke) goes through `resolveApprovalPolicy`
+// messaging.send) goes through `resolveApprovalPolicy`
 // before deciding whether to gate or auto-approve. Keeping the
 // decision in one module is the load-bearing invariant — duplicating
 // the policy across dispatchers / agent paths would silently drift
@@ -46,8 +46,7 @@ export type PolicyAction =
   | "terminal.exec"
   | "code.exec"
   | "browser.upload_file"
-  | "messaging.send"
-  | "mcp.invoke";
+  | "messaging.send";
 
 export interface TerminalExecPayload {
   command: string;
@@ -106,12 +105,11 @@ export function resolveApprovalPolicy(
     return { mode: "auto", reason: "approval-mode-auto" };
   }
 
-  // messaging.send and mcp.invoke egress data / run external code. In
-  // "auto" mode we let them through so the agent can drive normal
-  // automations (a Telegram reply, an MCP fetch) without prompting;
-  // "strict" still gates each call. Operators who want stricter
-  // messaging/MCP control can flip to "strict" globally.
-  if (action === "messaging.send" || action === "mcp.invoke") {
+  // messaging.send egresses data. In "auto" mode we let it through so
+  // the agent can drive normal automations (a Telegram reply) without
+  // prompting; "strict" still gates each call. Operators who want
+  // stricter messaging control can flip to "strict" globally.
+  if (action === "messaging.send") {
     return { mode: "auto", reason: "approval-mode-auto" };
   }
 

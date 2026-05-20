@@ -36,6 +36,7 @@ interface SessionLike {
   createdAt: string;
   updatedAt: string;
   runs?: SessionLikeRun[];
+  origin?: "job";
 }
 
 function activityAt(session: SessionLike): string {
@@ -131,6 +132,10 @@ export function useChatReadState(sessions: ChatSession[] | undefined) {
     if (current.initialized) return;
     const map: ReadMap = { ...current.map };
     for (const s of sessions) {
+      // Job-originated sessions stay unread until the user opens them —
+      // skip seeding so they fall through to the `!seen` branch below
+      // and surface as new on first load after the feature ships.
+      if (s.origin === "job") continue;
       if (!map[s.id]) map[s.id] = activityAt(s as SessionLike);
     }
     setState({ map, initialized: true });

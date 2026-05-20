@@ -460,11 +460,11 @@ function migrateRecordAgentIds(state: RuntimeState): void {
 // whitelist when the agent still carries the prior default set exactly
 // (`["file","terminal","memory","session_search","delegation"]`). Without
 // this, an instance created before the messaging+mcp toolsets joined the
-// default whitelist keeps gating `send_message` / `invoke_mcp` out via
-// the per-agent intersection even after the operator enables those
-// toolsets. The exact-match heuristic catches the common case (the user
-// never customized the list) without overriding intentional removals —
-// any customization (added or removed entries) leaves the agent alone.
+// default whitelist keeps gating `send_message` out via the per-agent
+// intersection even after the operator enables those toolsets. The
+// exact-match heuristic catches the common case (the user never
+// customized the list) without overriding intentional removals — any
+// customization (added or removed entries) leaves the agent alone.
 // Idempotent: a state file already on the new shape (the union already
 // includes both names, OR the user has customized the list) is a no-op.
 const PRIOR_DEFAULT_AGENT_TOOLSETS = [

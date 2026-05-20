@@ -22,16 +22,23 @@ import {
   readState,
   readTrace
 } from "../state";
-import { ApprovedActionFailedError, findTask } from "../agent";
+import { ApprovedActionFailedError, findTask, scheduleAutoRetain } from "../agent";
 import { recall } from "../memory";
 import {
   generateToolCallingResponse,
   type ToolCallingMessage,
   type ToolCall
 } from "../provider";
-import { buildAgentSystemContext, buildBoundJobsBlock } from "../system-prompt";
+import {
+  buildAgentSystemContext,
+  buildBoundJobsBlock,
+  decideIdentityEmission,
+  renderFullIdentity
+} from "../system-prompt";
 import type {
+  AgentIdentity,
   CostRecord,
+  IdentitySnapshotRecord,
   JobRecord,
   PendingToolCall,
   RuntimeConfig,
@@ -41,6 +48,7 @@ import type {
   Task,
   TaskToolCallState
 } from "../types";
+import type { EffectiveContext } from "./effective-context";
 import { updateRunFromTask } from "./runs";
 import { buildToolCatalog, hashCatalog, toProviderTools } from "./tool-catalog";
 import { dispatchToolCall } from "./tool-dispatch";
@@ -183,11 +191,52 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // subagent's own system prompt and filter the enabled-skills block by the
   // subagent's skill whitelist (when set).
   const subagent = getSubagentForTask(state, task);
+  // Tell-once-plus-delta identity injection (only for the non-subagent
+  // parent path — subagents get their own override prompt and short-lived
+  // context). The decision function returns either the full block, just
+  // the changed fields, or "" when nothing changed. Compute the would-be
+  // snapshot here but DEFER the write to inside runLoop so that the
+  // snapshot only advances after the prompt actually reaches the
+  // provider; otherwise a cancellation between runChatTask's exit
+  // and runLoop's first model call would mark identity as "emitted"
+  // when the model never saw it, leaving the next turn's delta
+  // referencing a baseline the model has no memory of.
+  let identityBlock: string | undefined;
+  let pendingIdentitySnapshot: { conversationId: string; snapshot: IdentitySnapshotRecord } | undefined;
+  if (!subagent) {
+    const identity = buildAgentIdentity(config, state, effectiveForAgent);
+    const conversationId = task.runId
+      ? state.runs.find((r) => r.id === task.runId)?.conversationId
+      : undefined;
+    if (conversationId) {
+      const snapshot = state.identitySnapshots?.[conversationId];
+      const turnCount = state.runs.filter((r) => r.conversationId === conversationId).length;
+      const decision = decideIdentityEmission(identity, snapshot, turnCount);
+      identityBlock = decision.content;
+      if (decision.nextSnapshot) {
+        pendingIdentitySnapshot = { conversationId, snapshot: decision.nextSnapshot };
+      }
+    } else {
+      // No chat session (e.g. CLI/imperative entry that still routes
+      // through runChatTask): emit full identity every time. No
+      // snapshot persistence because there's no conversation to key on.
+      identityBlock = renderFullIdentity(identity);
+    }
+  }
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt
-    : buildAgentSystemContext(activeMemory, recalledContext);
-  const visibleSkills = filterSkillsForSubagent(state.skills, subagent).filter((skill) => isSkillActive(state, skill));
+    : buildAgentSystemContext(activeMemory, recalledContext, identityBlock);
+  const filteredSkills = filterSkillsForSubagent(state.skills, subagent);
+  const visibleSkills = filteredSkills.filter((skill) => isSkillActive(state, skill));
   const skillsBlock = buildEnabledSkillsBlock(visibleSkills);
+  // Inactive-but-available skills (enabled, but a required connector is
+  // missing). Surfaced so the model knows it can call request_connector
+  // to ask the user to wire things up instead of erroring out or
+  // hallucinating an answer.
+  const inactiveSkills = filteredSkills.filter(
+    (skill) => skill.status === "enabled" && !isSkillActive(state, skill)
+  );
+  const inactiveSkillsBlock = buildInactiveSkillsBlock(inactiveSkills);
   // Bound-jobs block: if this chat session has one or more JobRecords whose
   // chatSessionId matches, surface them in the system prompt so the model
   // can act on "this job" / "the reminder" without first calling list_jobs.
@@ -195,8 +244,15 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // the binding is a property of the chat session, not the prompt source.
   const boundJobs = findBoundJobsForTask(state, task);
   const boundJobsBlock = buildBoundJobsBlock(boundJobs);
+  // Advertise configured http MCP servers so the model knows mcp_call is
+  // wired up against this server and can locate the matching skill before
+  // invoking. Only "configured" status surfaces; disabled/error servers
+  // stay hidden the same way disabled skills do.
+  const mcpServersBlock = buildMcpServersBlock(state);
   const sections = [baseSystem];
   if (skillsBlock) sections.push(skillsBlock);
+  if (inactiveSkillsBlock) sections.push(inactiveSkillsBlock);
+  if (mcpServersBlock) sections.push(mcpServersBlock);
   if (boundJobsBlock) sections.push(boundJobsBlock);
   const systemContext = sections.join("\n\n");
 
@@ -215,7 +271,52 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
     data: { hindsightUnitsRecalled, priorMessages: prior.length }
   });
 
-  return runLoop(config, taskId, messages, 0);
+  return runLoop(config, taskId, messages, 0, pendingIdentitySnapshot, effectiveForAgent);
+}
+
+// Capture the runtime identity exposed to the model via the system
+// prompt. Pulled from the same data sources gini status reads so the
+// agent's self-report stays consistent with the CLI's view of the
+// instance. Returns "(none)" placeholders for the optional agent fields
+// when state has no active agent (system-driven flows).
+export function buildAgentIdentity(
+  config: RuntimeConfig,
+  state: RuntimeState,
+  effective: EffectiveContext
+): AgentIdentity {
+  const agent = effective.agentId
+    ? state.agents.find((a) => a.id === effective.agentId)
+    : undefined;
+  // An undefined `effective.toolsetFilter` does NOT mean "zero toolsets".
+  // Per src/execution/effective-context.ts, an undefined filter means the
+  // agent imposes no restriction, so every enabled toolset is exposed by
+  // src/execution/tool-catalog.ts. Render the actual ground truth — the
+  // names of every enabled toolset in state — so the identity block does
+  // not falsely tell the model `(none)` when in fact every tool is live.
+  //
+  // When the filter IS set, intersect against the same enabled-toolset
+  // set buildToolCatalog uses to compose the actual catalog. Otherwise
+  // the identity block would advertise disabled-in-state or unknown
+  // toolset names that the agent declared in its whitelist but that the
+  // catalog filters out at dispatch — telling the model a tool family
+  // is available when it cannot actually call any of those tools. The
+  // EffectiveContext.warnings field already exists to surface the drift
+  // to operators; the prompt block reports ground truth.
+  const enabledToolsetNames = new Set(
+    state.toolsets.filter((toolset) => toolset.status === "enabled").map((toolset) => toolset.name)
+  );
+  const toolsets = effective.toolsetFilter
+    ? Array.from(effective.toolsetFilter).filter((name) => enabledToolsetNames.has(name)).sort()
+    : Array.from(enabledToolsetNames).sort();
+  return {
+    instance: config.instance,
+    runtimePort: config.port,
+    agentName: agent?.name ?? "default",
+    agentId: effective.agentId ?? "(none)",
+    provider: `${effective.provider.name}/${effective.provider.model}`,
+    toolsets,
+    memoryNamespace: effective.memoryNamespace ?? "(none)"
+  };
 }
 
 // Resolve the chat session id behind this task and scan state.jobs for
@@ -319,17 +420,109 @@ function buildEnabledSkillsBlock(skills: SkillRecord[]): string {
   ].join("\n");
 }
 
+// Inactive-but-enabled skills block. Distinct from buildEnabledSkillsBlock:
+// these skills are turned on but unusable because a required connector is
+// missing. We tell the model exactly which provider needs connecting so it
+// can call `request_connector` instead of refusing or hallucinating.
+//
+// Skills with `requiredConnectors` undefined / empty are skipped: those are
+// inactive for some other reason (validation status, etc.) and there's no
+// connector affordance to offer.
+function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
+  const candidates = skills.filter(
+    (skill) => skill.status === "enabled" && (skill.requiredConnectors?.length ?? 0) > 0
+  );
+  if (candidates.length === 0) return "";
+  // Same dedupe rule as buildEnabledSkillsBlock so the same skill name
+  // doesn't show up twice when bundled + user copies coexist.
+  const byName = new Map<string, SkillRecord>();
+  for (const skill of candidates) {
+    const existing = byName.get(skill.name);
+    if (!existing) {
+      byName.set(skill.name, skill);
+      continue;
+    }
+    const existingSource = existing.source ?? "user";
+    const candidateSource = skill.source ?? "user";
+    if (existingSource !== "bundled" && candidateSource === "bundled") {
+      byName.set(skill.name, skill);
+    }
+  }
+  const lines = Array.from(byName.values())
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((s) => {
+      const desc = s.description.trim() || "(no description)";
+      const providers = (s.requiredConnectors ?? []).map((r) => r.provider).join(", ");
+      return `- ${s.name}: ${desc} — needs connector: ${providers}.`;
+    });
+  return [
+    "Available skills that need connection (call `request_connector` with the provider id to ask the user to connect):",
+    ...lines
+  ].join("\n");
+}
+
+// Advertise configured http MCP servers in the system prompt. The model
+// reads this block to know which servers are available to mcp_call and
+// which skill body to load for the per-server tool reference. Stdio
+// servers are intentionally omitted — the v0 stdio path is a stub and
+// surfacing it would invite the model to call something that can't
+// actually serve MCP traffic.
+function buildMcpServersBlock(state: RuntimeState): string {
+  const servers = state.mcpServers.filter(
+    (s) => s.status === "configured" && s.transport === "http"
+  );
+  if (servers.length === 0) return "";
+  const lines = servers
+    .slice()
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((s) => {
+      const count = s.tools?.length ?? 0;
+      const suffix = count > 0 ? ` (${count} tool${count === 1 ? "" : "s"})` : "";
+      return `- ${s.name}${suffix} — call read_skill name='${s.name}' for the curated tool reference.`;
+    });
+  return [
+    "Configured MCP servers (use the `mcp_call` tool to invoke):",
+    ...lines
+  ].join("\n");
+}
+
 // Inner loop. Calls the model, dispatches tool calls, and either completes
 // the task with the final text or pauses the task waiting for approvals.
 //
 // The `iterationsSoFar` argument lets resumeChatTask continue counting
 // across approval pauses (so a single conversation can't bypass the cap by
 // chaining approvals).
+//
+// `pendingIdentitySnapshot` is forwarded from runChatTask on fresh
+// task entry. It is the would-be identity snapshot for this conversation
+// turn, deferred from runChatTask so that the snapshot only commits
+// to state AFTER the first model call returns successfully. This closes
+// the cancel-before-send window: a task cancelled between runChatTask
+// and runLoop's first iteration leaves state.identitySnapshots intact, so
+// the model's view of identity stays consistent with the snapshot the
+// next turn computes its delta against. resumeChatTask never sets this
+// argument because the originating turn already either committed or
+// abandoned its snapshot.
+//
+// `inheritedEffective` carries the EffectiveContext that runChatTask
+// already resolved when building the identity block, so the tool
+// catalog, toolset filter, and provider override fired here all stay
+// consistent with what the identity block told the model. Without this
+// inheritance, a `gini agents use <other>` (or any other mutation that
+// flips the active agent / its provider / its toolsets) landing in the
+// async window between runChatTask's resolve and this one would
+// desynchronize the identity block from the actual model call.
+// resumeChatTask deliberately omits it: an approval resume is a
+// separate logical entry and is allowed to pick up agent changes since
+// the originating turn (matching the existing comment at "toolset
+// mid-pause we'll pick up the change on resume").
 async function runLoop(
   config: RuntimeConfig,
   taskId: string,
   messages: ToolCallingMessage[],
-  iterationsSoFar: number
+  iterationsSoFar: number,
+  pendingIdentitySnapshot?: { conversationId: string; snapshot: IdentitySnapshotRecord },
+  inheritedEffective?: EffectiveContext
 ): Promise<Task> {
   // Build the tool catalog once per loop entry. If the user toggles a
   // toolset mid-pause we'll pick up the change on resume — that's a
@@ -341,8 +534,10 @@ async function runLoop(
   // Resolve the active-agent overrides (provider, toolset filter, etc.).
   // Provider override flows into generateToolCallingResponse below; the
   // toolset filter narrows buildToolCatalog before the subagent filter
-  // narrows further (state → agent → subagent composition).
-  const effective = resolveEffectiveContext(state0, config);
+  // narrows further (state → agent → subagent composition). On fresh
+  // entry runChatTask hands us the already-resolved EffectiveContext;
+  // resumeChatTask omits it so the resume picks up any agent change.
+  const effective = inheritedEffective ?? resolveEffectiveContext(state0, config);
   const tools = filterToolsForSubagent(buildToolCatalog(state0, effective.toolsetFilter), subagent0);
   const providerTools = toProviderTools(tools);
   const toolsHash = hashCatalog(tools);
@@ -457,6 +652,31 @@ async function runLoop(
     await flush();
     accumulatedCost = addCost(accumulatedCost, result.cost);
 
+    // First successful provider call in this runLoop entry: commit the
+    // deferred identity snapshot. We only persist once per fresh
+    // runChatTask entry; subsequent iterations within the same
+    // tool-calling loop reuse the same system prompt the model already
+    // ingested, so the snapshot must not advance on each iteration. By
+    // landing the write here we guarantee state.identitySnapshots only
+    // records identity that genuinely reached the provider.
+    //
+    // Skip the write if the chat session was deleted between the
+    // snapshot decision (in runChatTask) and now -- otherwise the
+    // deferred write would recreate the orphan entry that
+    // deleteChatSession just cleared. The mutateState lock serializes
+    // with deleteChatSession, so the existence check here is decisive.
+    if (pendingIdentitySnapshot) {
+      const pending = pendingIdentitySnapshot;
+      pendingIdentitySnapshot = undefined;
+      await mutateState(config.instance, (st) => {
+        if (!st.chatSessions.some((session) => session.id === pending.conversationId)) {
+          return;
+        }
+        if (!st.identitySnapshots) st.identitySnapshots = {};
+        st.identitySnapshots[pending.conversationId] = pending.snapshot;
+      });
+    }
+
     appendTrace(config.instance, taskId, {
       type: "model",
       message: `${result.provider.name} provider replied (iteration ${iterations})`,
@@ -504,6 +724,15 @@ async function runLoop(
       // the JobRunRecord stays stuck in `running` and the chat-session
       // delivery never fires. Idempotent — no-op for tasks without jobId.
       if (finished.jobId) await finalizeJobRunFromTask(config, finished);
+      // Hindsight phase 5: auto-retain on chat-task completion. Without
+      // this, anything the user says in chat ("my name is X") never lands
+      // in the per-agent memory bank, so cross-chat recall surfaces
+      // nothing. Fire-and-forget — mirror the legacy `runTask` site. Guard
+      // with the post-mutateState status so a cancel that landed during
+      // the model's text stream doesn't retain a cancelled output.
+      if (finished.status === "completed") {
+        void scheduleAutoRetain(config, finished);
+      }
       return finished;
     }
 
@@ -707,6 +936,9 @@ async function runLoop(
     await updateRunFromTask(config, exhausted);
     await syncSubagentFromTask(config, exhausted);
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
+    if (exhausted.status === "completed") {
+      void scheduleAutoRetain(config, exhausted);
+    }
     return exhausted;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

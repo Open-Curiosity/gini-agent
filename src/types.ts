@@ -251,6 +251,36 @@ export interface RuntimeState {
   // so authenticated state lives in the user's Chrome profile, not the
   // ephemeral test context. Purely opt-in; legacy state files omit it.
   browser?: BrowserConnectionRecord | null;
+  // Per-conversation snapshot of the runtime identity last shown to the
+  // agent (instance, port, agent, provider, toolsets, namespace). Drives
+  // tell-once-plus-delta system-prompt injection in runChatTask:
+  // the first turn emits the full identity, subsequent turns emit only
+  // changed fields, and every IDENTITY_FULL_REFRESH_INTERVAL turns the
+  // full block is re-emitted to bound the delta-reconstruction depth.
+  // Optional so legacy state files don't need a schema migration.
+  identitySnapshots?: Record<string, IdentitySnapshotRecord>;
+}
+
+// Captured agent-runtime identity surfaced into the system prompt so
+// the model can answer self-introspection questions without a tool call.
+// Stored on RuntimeState.identitySnapshots so subsequent turns can render
+// just the diff instead of the full block on every turn.
+export interface AgentIdentity {
+  instance: string;
+  runtimePort: number;
+  agentName: string;
+  agentId: string;
+  provider: string;
+  toolsets: string[];
+  memoryNamespace: string;
+}
+
+// Per-conversation snapshot of the last-emitted identity plus the turn
+// index when the full block was last sent. The full block re-emits when
+// (currentTurn - lastFullTurn) >= IDENTITY_FULL_REFRESH_INTERVAL.
+export interface IdentitySnapshotRecord {
+  identity: AgentIdentity;
+  lastFullTurn: number;
 }
 
 export type TaskMode = "chat" | "imperative";
@@ -431,6 +461,11 @@ export interface ChatSessionRecord {
   // `outboundMirror ?? source` so live sessions (where the two are
   // the same) continue to work unchanged.
   outboundMirror?: ChatSessionSource;
+  // Marks how the session was created. `"job"` indicates a dedicated
+  // session spawned by a scheduled/cron job; the UI uses this to
+  // render a job indicator and to keep these chats unread until a
+  // human opens them.
+  origin?: "job";
 }
 
 // `lastInboundMessageId` is the most recent originating-message id the
@@ -528,6 +563,15 @@ export interface SubagentRecord {
   resultError?: string;
 }
 
+// Cached `tools/list` entry from an HTTP MCP server. Populated on the
+// health probe so the agent loop and the /mcp page can surface what tools
+// each server exposes without re-querying on every call.
+export interface McpToolSpec {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+}
+
 export interface McpServerRecord {
   id: string;
   instance: Instance;
@@ -541,6 +585,20 @@ export interface McpServerRecord {
   message?: string;
   createdAt: string;
   updatedAt: string;
+  // Transport selector. Defaults to "stdio" when omitted to keep the
+  // pre-existing CLI-spawn behavior intact for older records. "http"
+  // routes invocations through src/integrations/mcp-http.ts.
+  transport?: "stdio" | "http";
+  // Required when transport === "http". The server's MCP streamable-HTTP
+  // endpoint (e.g. https://mcp.linear.app/mcp).
+  url?: string;
+  // Static or `${ENV}`-placeholder header map applied to each HTTP MCP
+  // request. Placeholders are resolved at invoke time against the
+  // active-skill env binding map so connector tokens stay encrypted at rest.
+  headers?: Record<string, string>;
+  // Cached tools/list result from the last successful health probe. Empty
+  // until the server has been health-checked.
+  tools?: McpToolSpec[];
 }
 
 export interface MessagingBridgeRecord {
@@ -720,7 +778,7 @@ export interface Approval {
   createdAt: string;
   updatedAt: string;
   taskId?: string;
-  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.enable" | "connector.enable" | "browser.upload_file" | "messaging.send" | "mcp.invoke";
+  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.enable" | "connector.enable" | "connector.request" | "browser.upload_file" | "messaging.send";
   target: string;
   risk: RiskLevel;
   reason: string;

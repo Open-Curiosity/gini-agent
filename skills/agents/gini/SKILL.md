@@ -274,10 +274,11 @@ Listing: `GET /api/mcp`.
 `exposedTools` defaults to `[]`, which exposes everything the server
 advertises.
 
-The agent's tool for calling registered MCP tools is `invoke_mcp`.
-`mcp.invoke` is high-risk by classification and flows through the same
-approval seam as the other high-risk actions — see the Approvals section
-below for the three-mode contract.
+The agent's tool for calling registered MCP tools is `mcp_call`
+(args: `server`, `tool`, `arguments`). It auto-executes — invocations
+are NOT gated through the approval queue (the MCP server itself is
+operator-registered so the agent can't reach arbitrary code). Each
+call writes a `mcp.tool.invoked` audit row.
 
 Human-operator CLI mirror:
 
@@ -380,9 +381,9 @@ To draft a new SKILL.md interactively, use `meta/create-skill`.
 ## Approvals
 
 The runtime classifies `browser.upload_file` (hard-coded) plus any tool
-whose name contains `write`, `exec`, `invoke`, or `send` as `high` risk.
-`file.write`, `terminal.exec`, `mcp.invoke`, `messaging.send`, and
-similar all run through the approval seam. Browser interactive actions
+whose name contains `write`, `exec`, or `send` as `high` risk.
+`file.write`, `terminal.exec`, `messaging.send`, and similar all run
+through the approval seam. Browser interactive actions
 (`browser.click`, `browser.type`, `browser.drag`, `browser.select_option`,
 `browser.tabs.{new,switch,close}`) are `medium` and trace via snapshot
 evidence — they do not block on approval. **The agent should propose

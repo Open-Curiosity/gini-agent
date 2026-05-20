@@ -61,7 +61,6 @@ import {
 import { syncSubagentFromTask } from "./capabilities/subagents";
 import { resolveActiveSkillsEnv } from "./integrations/connectors";
 import { sendMessagingOutput } from "./integrations/messaging";
-import { invokeMcpTool } from "./integrations/mcp";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
 // the cycle that runs through submitTask. The finalizer flips the linked
 // JobRunRecord from "running" to a terminal status when a Task with a
@@ -688,7 +687,7 @@ function shouldAutoRetain(task: Task): boolean {
   return true;
 }
 
-function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
+export function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
   if (!shouldAutoRetain(task)) return;
   // Phase C — resolve the active agent at retain time so the new units
   // land in the right pool. If no agent is active (degenerate state), skip
@@ -1023,7 +1022,7 @@ export function mapApprovalToPolicyAction(
   if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
     return action;
   }
-  if (action === "messaging.send" || action === "mcp.invoke") {
+  if (action === "messaging.send") {
     return action;
   }
   return undefined;
@@ -1319,6 +1318,35 @@ async function runApprovedAction(
   ctx: RunApprovedActionContext
 ): Promise<string | undefined> {
   const { shouldResumeChat, extraEvidence, chatToolCallId } = ctx;
+
+  if (approval.action === "connector.request") {
+    // The side effect (createConnector + checkConnector) already ran
+    // inside POST /api/approvals/<id>/connect — that endpoint only
+    // resolves the approval after the connector probes healthy. There's
+    // nothing for us to do here except feed back a synthesized tool
+    // result that tells the chat-task loop to resume from the
+    // request_connector tool call. `extraEvidence` is intentionally
+    // dropped: the auto-approve path never reaches this branch (the
+    // connect endpoint is the only resolver), so there's no marker to
+    // stamp on a side-effect audit row that doesn't exist.
+    void extraEvidence;
+    const providerLabel =
+      typeof approval.payload.providerLabel === "string"
+        ? approval.payload.providerLabel
+        : String(approval.payload.provider ?? "provider");
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: "tool",
+        message: "Connector connected via connect endpoint",
+        data: { provider: approval.payload.provider, approvalId: approval.id }
+      });
+    }
+    const result = `Connected to ${providerLabel}. Proceed with the original request.`;
+    if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
+    }
+    return result;
+  }
 
   if (approval.action === "file.write") {
     // Do the abort check, path validation, file I/O, and audit-row
@@ -1844,80 +1872,6 @@ async function runApprovedAction(
         type: "tool",
         message: "messaging.send completed",
         data: { bridgeId, target, ok: resultPayload.ok, messageId: resultPayload.messageId, error: resultPayload.error }
-      });
-    }
-    if (task) await updateRunFromTask(config, task);
-    const resultStr = JSON.stringify(resultPayload);
-    if (shouldResumeChat && chatToolCallId && approval.taskId) {
-      await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);
-    }
-    return resultStr;
-  }
-
-  if (approval.action === "mcp.invoke") {
-    const serverId = String(approval.payload.serverId ?? "");
-    const toolName = String(approval.payload.toolName ?? "");
-    const input = (approval.payload.input && typeof approval.payload.input === "object")
-      ? approval.payload.input as Record<string, unknown>
-      : {};
-    if (signal.aborted) {
-      const aborted = JSON.stringify({ success: false, aborted: true, error: "mcp.invoke aborted: task was cancelled." });
-      if (approval.taskId) {
-        appendTrace(config.instance, approval.taskId, {
-          type: "tool",
-          message: "mcp.invoke aborted by task cancellation",
-          data: { serverId, toolName, aborted: true }
-        });
-      }
-      return aborted;
-    }
-    let resultPayload: { ok: boolean; exitCode?: number; stdout?: string; stderr?: string; message?: string; error?: string };
-    try {
-      // Thread the task's abort signal through so a cancel that races
-      // in after approval but before the MCP subprocess exits tears
-      // it down (best-effort kill via runMcpProbe's abort hook).
-      // invokeMcpTool also refuses up-front when signal.aborted is
-      // already true.
-      const invoke = await invokeMcpTool(config, serverId, toolName, input, { signal });
-      resultPayload = {
-        ok: invoke.ok,
-        exitCode: invoke.exitCode,
-        stdout: invoke.stdout?.slice(0, 4000),
-        stderr: invoke.stderr?.slice(0, 4000),
-        message: invoke.message
-      };
-    } catch (error) {
-      resultPayload = { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-    const task = await mutateState(config.instance, (state) => {
-      addAudit(
-        state,
-        {
-          actor: "agent",
-          action: "mcp.invoke",
-          target: serverId,
-          risk: "high",
-          taskId: approval.taskId,
-          runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
-          approvalId: approval.id,
-          evidence: {
-            ...extraEvidence,
-            serverId,
-            toolName,
-            ok: resultPayload.ok,
-            exitCode: resultPayload.exitCode,
-            error: resultPayload.error ?? null
-          }
-        },
-        approvalAgentContext(approval)
-      );
-      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
-    });
-    if (approval.taskId) {
-      appendTrace(config.instance, approval.taskId, {
-        type: "tool",
-        message: "mcp.invoke completed",
-        data: { serverId, toolName, ok: resultPayload.ok, exitCode: resultPayload.exitCode, error: resultPayload.error }
       });
     }
     if (task) await updateRunFromTask(config, task);

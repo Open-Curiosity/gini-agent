@@ -50,7 +50,7 @@ through the same loop. So the loop comes first.
   tools (`file_read`, `file_list`, `file_search`, `web_fetch`) execute
   synchronously and return a string; high-risk tools (`file_write`,
   `file_patch`, `terminal_exec`, `code_exec`, `browser_upload_file`,
-  `send_message`, `invoke_mcp`) create an `Approval` with
+  `send_message`) create an `Approval` with
   the originating `tool_call_id` on `payload.toolCallId`.
 - The loop snapshots the conversation on `Task.toolCallState` when at
   least one approval is pending, transitions the task to
@@ -74,7 +74,7 @@ through the same loop. So the loop comes first.
       `evidence.autoApprovedReason`.
     - Under `approvalMode: "auto"` (the default), safe actions
       (file_write, file_patch, code_exec, browser_upload_file,
-      send_message, invoke_mcp) and non-dangerous terminal commands
+      send_message) and non-dangerous terminal commands
       still create an approval row, but `resolveApprovalPolicy`
       auto-resolves it through the same `resolveApproval` ->
       `executeApprovedAction` pipeline a human would take. The

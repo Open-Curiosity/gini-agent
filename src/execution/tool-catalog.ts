@@ -433,6 +433,54 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
+    // Connector-request affordance. When a skill is enabled but inactive
+    // because its required connector is missing, the model calls this tool
+    // to surface a "Connect <provider>" card in chat. The task pauses on
+    // the resulting approval and resumes automatically once the user
+    // completes the secret entry. Always-on (like read_skill / mcp_call):
+    // the model needs this path even on a fresh instance with no toolsets
+    // toggled.
+    toolset: "connectors",
+    type: "function",
+    function: {
+      name: "request_connector",
+      description: "Ask the user to connect an external provider (e.g. linear, github). Use this when a skill is available but inactive because the required connector is not configured. The user sees a Connect button in the chat; the task pauses until they finish the setup, then resumes automatically.",
+      parameters: {
+        type: "object",
+        properties: {
+          provider: { type: "string", description: "Provider id (e.g. 'linear'). Must match a registered provider module." },
+          reason: { type: "string", description: "One sentence explaining why this connection is needed for the current request." }
+        },
+        required: ["provider", "reason"]
+      }
+    }
+  },
+  {
+    // Generic MCP tool invocation. The agent loop sees this as a single
+    // tool entry; the dispatcher routes (server, tool, arguments) to the
+    // matching McpServerRecord via src/integrations/mcp.ts. Each
+    // configured http MCP server is advertised separately in the system
+    // prompt so the model knows which tools belong to which server.
+    // TODO: gate side-effecting MCP tools through the approval policy
+    // based on the tool's `annotations.destructiveHint`; for v0 every call
+    // auto-executes.
+    toolset: "mcp",
+    type: "function",
+    function: {
+      name: "mcp_call",
+      description: "Invoke a tool on a configured MCP server. Use list_skills/read_skill first to discover what tools each MCP server exposes (e.g. read_skill name='linear' for Linear).",
+      parameters: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server name (e.g. 'linear')." },
+          tool: { type: "string", description: "Tool name as advertised by the MCP server (e.g. 'list_issues')." },
+          arguments: { type: "object", description: "Arguments object the MCP tool expects. Shape varies per tool — read the skill for details.", additionalProperties: true }
+        },
+        required: ["server", "tool"]
+      }
+    }
+  },
+  {
     // Schedule a real cron/job. The job's output is delivered as an
     // assistant message back into the originating chat session when it
     // fires. Low-risk: no approval gate — the user can pause/delete the
@@ -648,28 +696,6 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
-    // Invoke a tool exposed by a registered MCP server. High-risk:
-    // contains "invoke" → routed through the approval queue. The MCP
-    // server itself is operator-registered (so the agent can't reach
-    // arbitrary code), and per-call approval gives the user visibility
-    // into the specific tool + args being invoked.
-    toolset: "mcp",
-    type: "function",
-    function: {
-      name: "invoke_mcp",
-      description: "Invoke a tool on a registered MCP server. Approval-gated by default — the operator's approvalMode decides whether each invocation auto-approves or queues. Use only when the user asks for an MCP-backed action and the server has been registered ahead of time. Returns the MCP tool's stdout/stderr/exitCode.",
-      parameters: {
-        type: "object",
-        properties: {
-          serverId: { type: "string", description: "Id or name of the MCP server (e.g. 'mcp_abc123' or 'fs-mcp')." },
-          toolName: { type: "string", description: "Name of the tool the MCP server exposes." },
-          input: { type: "object", description: "Optional JSON arguments to pass through to the MCP tool. Default: {}.", additionalProperties: true }
-        },
-        required: ["serverId", "toolName"]
-      }
-    }
-  },
-  {
     // Outbound messaging via a configured bridge. High-risk: contains
     // "send" → routed through the approval queue. In "auto" mode the
     // policy seam auto-approves; "strict" gates every call. The user
@@ -816,13 +842,13 @@ export function allTools(): ToolCatalogTool[] {
 // passes only if its owning toolset is BOTH globally enabled AND in the
 // agent's whitelist. Always-on tools bypass both filters: web_fetch,
 // read_skill, spawn_subagent, the scheduled-job surface (create_job,
-// list_jobs, update_job, delete_job, run_job), and the core
-// agent-capability meta-tools that have no separate toolset to gate them
-// (cancel_task — sibling to spawn_subagent; install_skill / enable_skill /
-// disable_skill — siblings to read_skill). The surface-gateway tools
-// `send_message` (toolset `messaging`) and `invoke_mcp` (toolset `mcp`)
-// stay subject to the toolset enable/disable kill switch — operators
-// disable those toolsets to hide outbound messaging or MCP entirely.
+// list_jobs, update_job, delete_job, run_job), mcp_call, request_connector,
+// and the core agent-capability meta-tools that have no separate toolset
+// to gate them (cancel_task — sibling to spawn_subagent; install_skill /
+// enable_skill / disable_skill — siblings to read_skill). The surface-
+// gateway tool `send_message` (toolset `messaging`) stays subject to the
+// toolset enable/disable kill switch — operators disable that toolset to
+// hide outbound messaging entirely.
 export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<string>): ToolCatalogTool[] {
   const enabled = new Set(state.toolsets.filter((t) => t.status === "enabled").map((t) => t.name));
   return allTools().filter((tool) => {
@@ -851,6 +877,18 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (tool.function.name === "update_job") return true;
     if (tool.function.name === "delete_job") return true;
     if (tool.function.name === "run_job") return true;
+    // mcp_call is a runtime capability not bound to a legacy toolset row.
+    // Gating it on the "mcp" toolset would silently hide MCP usage on
+    // fresh instances even when a user has configured a server, so it
+    // mirrors read_skill / spawn_subagent's always-on stance.
+    if (tool.function.name === "mcp_call") return true;
+    // request_connector is the in-chat affordance that lets the agent
+    // ask the user to wire up a missing connector. Same always-on
+    // rationale: a fresh instance with no toolsets toggled still needs
+    // to be able to surface "connect linear" when the linear skill is
+    // inactive — gating on a legacy toolset would silently disable the
+    // onboarding path.
+    if (tool.function.name === "request_connector") return true;
     // Always expose the core agent-capability meta-tools whose owning
     // toolsets aren't in the legacy defaults (`skills`, `subagents`).
     // Gating these on a toolset toggle would mean a fresh instance
@@ -861,11 +899,10 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // read_skill). When the underlying resource isn't configured the
     // tool handler surfaces a clear error — that's the correct UX, not
     // "tool didn't exist". Note: `send_message` (toolset `messaging`)
-    // and `invoke_mcp` (toolset `mcp`) are deliberately NOT in this
-    // bypass — they're surface-gateway tools (outbound messaging,
-    // arbitrary MCP code execution) where the operator's toolset
-    // kill switch must work. Their toolsets default disabled; flipping
-    // the toolset to enabled is how the operator turns them on.
+    // is deliberately NOT in this bypass — it's a surface-gateway tool
+    // (outbound messaging) where the operator's toolset kill switch
+    // must work. Its toolset defaults disabled; flipping the toolset
+    // to enabled is how the operator turns it on.
     if (tool.function.name === "cancel_task") return true;
     if (tool.function.name === "install_skill") return true;
     if (tool.function.name === "enable_skill") return true;
