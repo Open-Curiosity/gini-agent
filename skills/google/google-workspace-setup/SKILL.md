@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 1.5.1
+    version: 1.6.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -203,6 +203,17 @@ browser_snapshot {}
 
 Verify the snapshot shows a signed-in state: the project picker at the top of the page, an account avatar in the top-right, or a "Welcome" landing card naming the user. If none of those are present, ask the user to confirm once more rather than guessing.
 
+#### Milestone A.5 — Disconnect visible Chrome, reconnect headless
+
+The user has signed in. The cookies are persisted to the per-instance profile dir, so the rest of the Cloud Console work can run invisibly without re-prompting for sign-in. Close the visible window and relaunch headless:
+
+1. `browser_close {}` — closes the visible Chrome the user was just using. Profile dir stays on disk; cookies persist.
+2. `browser_connect { reason: "Continue Cloud Console setup invisibly", headless: true }` — relaunches Chrome headless using the same profile dir. The user sees the approval card briefly, approves, and the new connection is invisible.
+
+After both steps succeed, continue to Milestone B. The user no longer sees a Chrome window; Gini drives Cloud Console behind the scenes.
+
+Google Cloud Console runs bot-detection. Headless Chrome may be flagged — Console could refuse to render some pages or show a captcha. If after Milestone A.5 you `browser_snapshot` and see a captcha challenge, an "unusual activity" warning, or Console refuses to load past a blank state, fall back to the headed mode: call `browser_close` then `browser_connect { reason: "Re-open Chrome (bot detection tripped headless)" }` (no `headless` flag — defaults to visible). Continue Milestones B-F in the visible window. Apologize once in chat: "Console flagged my headless session — I'll do the rest in the visible window so it doesn't get blocked."
+
 #### Milestone B — Create or pick a Cloud project
 
 Ask the user (one sentence) whether they want to use an existing project or create a new one. Default to creating one named `gini-workspace` if they don't care.
@@ -317,11 +328,9 @@ ls -la ~/.config/gws/client_secret.json
 
 If the file is missing (the glob expanded to nothing), the user may be on an older Gini build that didn't route downloads to the instance dir — fall back to `~/Downloads/client_secret_*.apps.googleusercontent.com.json` and tell the user once that they're on an older runtime.
 
-Close the browser session:
+#### Cleanup — close the browser
 
-```text
-browser_close {}
-```
+Setup is complete. Call `browser_close {}` to tear down the headless Chrome. The user's signed-in cookies stay on disk for any future `browser_connect` (managed or headless).
 
 ### 3. Run OAuth
 
