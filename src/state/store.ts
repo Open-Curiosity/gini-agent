@@ -475,32 +475,39 @@ const PRIOR_DEFAULT_AGENT_TOOLSETS = [
   "delegation"
 ] as const;
 function backfillDefaultAgentToolsets(state: RuntimeState): void {
-  const agent = state.agents.find((candidate) => candidate.id === "agent_default");
-  if (!agent) return;
-  const current = agent.toolsets ?? [];
-  // Order-insensitive exact match against the prior default. A set
-  // comparison catches reorders and matches the "user never customized"
-  // signal without depending on the historical write order.
-  if (current.length !== PRIOR_DEFAULT_AGENT_TOOLSETS.length) return;
-  const currentSet = new Set(current);
-  for (const name of PRIOR_DEFAULT_AGENT_TOOLSETS) {
-    if (!currentSet.has(name)) return;
+  // Defensive: iterate every agent_default row in case a corrupt state
+  // file ended up with duplicates. The id uniqueness invariant should
+  // hold, but if it doesn't, migrating one and leaving the rest stale
+  // would be the worst outcome.
+  const candidates = state.agents.filter((candidate) => candidate.id === "agent_default");
+  for (const agent of candidates) {
+    const current = agent.toolsets ?? [];
+    // Order-insensitive exact match against the prior default. A set
+    // comparison catches reorders and matches the "user never customized"
+    // signal without depending on the historical write order.
+    if (current.length !== PRIOR_DEFAULT_AGENT_TOOLSETS.length) continue;
+    const currentSet = new Set(current);
+    let matches = true;
+    for (const name of PRIOR_DEFAULT_AGENT_TOOLSETS) {
+      if (!currentSet.has(name)) { matches = false; break; }
+    }
+    if (!matches) continue;
+    // Match. Union in `messaging` and `mcp` so the operator's later
+    // toolset-enable lands at a fully-resolved per-agent whitelist.
+    agent.toolsets = [...current, "messaging", "mcp"];
+    agent.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "agent.toolsets.backfilled",
+        target: agent.id,
+        risk: "low",
+        evidence: { added: ["messaging", "mcp"], agentId: agent.id }
+      },
+      { agentId: agent.id }
+    );
   }
-  // Match. Union in `messaging` and `mcp` so the operator's later
-  // toolset-enable lands at a fully-resolved per-agent whitelist.
-  agent.toolsets = [...current, "messaging", "mcp"];
-  agent.updatedAt = now();
-  addAudit(
-    state,
-    {
-      actor: "runtime",
-      action: "agent.toolsets.backfilled",
-      target: agent.id,
-      risk: "low",
-      evidence: { added: ["messaging", "mcp"], agentId: agent.id }
-    },
-    { agentId: agent.id }
-  );
 }
 
 // Phase C — per-agent backfill on the SQLite hindsight store. Pre-Phase-C

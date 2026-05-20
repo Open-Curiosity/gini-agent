@@ -2176,10 +2176,11 @@ export function approvalToolCallId(payload: Record<string, unknown>): string | u
 // approve audit row, the per-action side-effect audit, and the tool
 // result string all live in one canonical place (agent.ts) instead
 // of being duplicated per action. Each auto-resolved side effect
-// still emits a fully populated approval row (status=approved,
-// evidence.autoApproved=true, autoApprovedReason=<policy reason>)
-// and a side-effect audit row, so the reviewer sees an identical
-// trail to a normal flow except for the marker.
+// creates an Approval row (status transitions pending -> approved
+// through resolveApproval, same as a human approval) and writes the
+// `autoApproved=true` + `autoApprovedReason=<policy reason>` markers
+// onto the resolution audit rows. The reviewer sees an identical
+// trail to a normal flow except for the marker on the audit row.
 async function pendingOrAuto(
   config: RuntimeConfig,
   action: PolicyAction,
