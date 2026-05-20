@@ -125,7 +125,14 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
               <span className="font-mono text-xs text-foreground">
                 {isBrowserConnect ? "Open a browser window" : approval.action}
               </span>
-              <RiskPill value={approval.risk} />
+              {/*
+                Suppress the MEDIUM-RISK badge for `browser.connect`. The
+                action is still gated (the user still gives explicit consent
+                before we spawn a window) but the visual framing is softer
+                because this is a benign sign-in step, not a destructive
+                action. All other approvals keep the badge.
+              */}
+              {isBrowserConnect ? null : <RiskPill value={approval.risk} />}
               {isBrowserConnect ? null : (
                 <button
                   type="button"
@@ -180,7 +187,7 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
                     disabled={decide.isPending}
                     onClick={() => decide.mutate({ id: approval.id, op: "approve" })}
                   >
-                    Approve
+                    {isBrowserConnect ? "Connect" : "Approve"}
                   </Button>
                   <Button
                     size="sm"
@@ -188,7 +195,7 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
                     disabled={decide.isPending}
                     onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
                   >
-                    Deny
+                    {isBrowserConnect ? "Cancel" : "Deny"}
                   </Button>
                 </>
               )}

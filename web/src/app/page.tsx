@@ -176,7 +176,15 @@ export default function HomePage() {
                         <span className="font-mono text-[11px]">
                           {isBrowserConnect ? "Open a browser window" : approval.action}
                         </span>
-                        <RiskPill value={approval.risk} />
+                        {/*
+                          Suppress the MEDIUM-RISK badge for `browser.connect`.
+                          The action is still gated (the user still has to
+                          click Connect to consent) but the visual framing is
+                          softer because this is a benign sign-in step, not a
+                          destructive action. All other approvals keep the
+                          badge.
+                        */}
+                        {isBrowserConnect ? null : <RiskPill value={approval.risk} />}
                       </div>
                       {isBrowserConnect ? null : (
                         <p className="truncate font-mono text-[11px] text-muted-foreground">{approval.target}</p>
@@ -191,7 +199,7 @@ export default function HomePage() {
                         disabled={decide.isPending}
                         onClick={() => decide.mutate({ id: approval.id, op: "approve" })}
                       >
-                        Approve
+                        {isBrowserConnect ? "Connect" : "Approve"}
                       </Button>
                       <Button
                         size="sm"
@@ -199,7 +207,7 @@ export default function HomePage() {
                         disabled={decide.isPending}
                         onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
                       >
-                        Deny
+                        {isBrowserConnect ? "Cancel" : "Deny"}
                       </Button>
                     </div>
                   </li>

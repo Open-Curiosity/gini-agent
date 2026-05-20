@@ -129,7 +129,14 @@ function ApprovalCard({
                 {agentLabel}
               </span>
             ) : null}
-            <RiskPill value={approval.risk} />
+            {/*
+              Suppress the MEDIUM-RISK badge for `browser.connect`. The action
+              is still gated (the user still has to click Connect to consent)
+              but the visual framing is softer because this is a benign
+              sign-in step, not a destructive action. All other approvals
+              keep the badge.
+            */}
+            {isBrowserConnect ? null : <RiskPill value={approval.risk} />}
             <StatusPill value={approval.status} />
           </div>
         </div>
@@ -153,8 +160,12 @@ function ApprovalCard({
         )}
         {onDecide ? (
           <div className="flex gap-2">
-            <Button size="sm" disabled={pending} onClick={() => onDecide("approve")}>Approve</Button>
-            <Button size="sm" variant="outline" disabled={pending} onClick={() => onDecide("deny")}>Deny</Button>
+            <Button size="sm" disabled={pending} onClick={() => onDecide("approve")}>
+              {isBrowserConnect ? "Connect" : "Approve"}
+            </Button>
+            <Button size="sm" variant="outline" disabled={pending} onClick={() => onDecide("deny")}>
+              {isBrowserConnect ? "Cancel" : "Deny"}
+            </Button>
           </div>
         ) : null}
         <p className="font-mono text-[10px] text-muted-foreground">
