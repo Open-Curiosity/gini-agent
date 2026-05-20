@@ -1799,7 +1799,17 @@ async function runApprovedAction(
     }
     let resultPayload: { ok: boolean; messageId?: string; status?: string; error?: string };
     try {
-      const message = await sendMessagingOutput(config, bridgeId, { text, target, taskId: approval.taskId });
+      // Thread the task's abort signal through so a cancel that races
+      // in after approval but before the Telegram/Discord POST completes
+      // tears the request down instead of egressing the message. The
+      // bridge's outbound HTTP path already wires the signal into
+      // fetch(); this is the seam that hands it across.
+      const message = await sendMessagingOutput(
+        config,
+        bridgeId,
+        { text, target, taskId: approval.taskId },
+        { signal }
+      );
       resultPayload = { ok: message.status === "sent", messageId: message.id, status: message.status, error: message.error ?? undefined };
     } catch (error) {
       resultPayload = { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -1863,7 +1873,12 @@ async function runApprovedAction(
     }
     let resultPayload: { ok: boolean; exitCode?: number; stdout?: string; stderr?: string; message?: string; error?: string };
     try {
-      const invoke = await invokeMcpTool(config, serverId, toolName, input);
+      // Thread the task's abort signal through so a cancel that races
+      // in after approval but before the MCP subprocess exits tears
+      // it down (best-effort kill via runMcpProbe's abort hook).
+      // invokeMcpTool also refuses up-front when signal.aborted is
+      // already true.
+      const invoke = await invokeMcpTool(config, serverId, toolName, input, { signal });
       resultPayload = {
         ok: invoke.ok,
         exitCode: invoke.exitCode,

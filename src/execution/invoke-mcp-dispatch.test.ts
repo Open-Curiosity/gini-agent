@@ -7,7 +7,7 @@ import { rmSync } from "node:fs";
 import { dispatchToolCall } from "./tool-dispatch";
 import { buildToolCatalog } from "./tool-catalog";
 import { createTask, mutateState, readState, upsertTask } from "../state";
-import { addMcpServer } from "../integrations/mcp";
+import { addMcpServer, invokeMcpTool } from "../integrations/mcp";
 import { riskForTool } from "./tool-risk";
 import type { RuntimeConfig, RuntimeState, ToolsetRecord } from "../types";
 
@@ -180,5 +180,30 @@ describe("invoke_mcp dispatch", () => {
         JSON.stringify({ serverId: server.id, toolName: "other" })
       )
     ).rejects.toThrow(/MCP tool is not exposed/);
+  });
+
+  test("invokeMcpTool refuses when the caller's signal is already aborted", async () => {
+    // Direct unit coverage for the abort-honoring wrapper. The agent
+    // loop threads its task's AbortSignal through to invokeMcpTool so
+    // a cancel that races in between approval and exec doesn't fire
+    // the subprocess. Spawning a real MCP probe and racing it against
+    // a mid-flight cancel is timing-brittle; the pre-aborted check is
+    // the seam we can pin reliably without spawning at all.
+    const config = makeConfig("invoke-mcp-aborted");
+    const server = await addMcpServer(config, {
+      name: "test-mcp",
+      command: "/bin/echo",
+      args: [],
+      exposedTools: ["do_thing"]
+    });
+    await mutateState(config.instance, (state) => {
+      const live = state.mcpServers.find((s) => s.id === server.id);
+      if (live) live.status = "configured";
+    });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      invokeMcpTool(config, server.id, "do_thing", { foo: 1 }, { signal: controller.signal })
+    ).rejects.toThrow(/aborted/i);
   });
 });
