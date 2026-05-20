@@ -1573,8 +1573,9 @@ describe("cron lifecycle", () => {
   test("run_job dispatch refuses to mutate when parent task is terminal", async () => {
     // Same defense-in-depth as update_job / delete_job: a cancelled
     // parent task must not be able to fire a fresh job run through the
-    // agent tool path. runJobNow itself has no parentTaskId re-check, so
-    // the pre-check inside the tool handler is the only guard.
+    // agent tool path. The tool handler does a lock-free pre-check and
+    // `runJobNow` re-checks inside its serialized `mutateState` block; this
+    // test exercises the pre-check path.
     const config = testConfig("jobs-run-tool-terminal");
     const handler = createHandler(config);
     const job = await call(handler, config, "/api/jobs", {

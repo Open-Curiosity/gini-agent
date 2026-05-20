@@ -653,11 +653,14 @@ export async function runJobNow(
 ) {
   const claim = await mutateState(config.instance, (state) => {
     // When invoked from the agent tool path with a `parentTaskId`, refuse
-    // to fire if the parent task has gone terminal. The lock-free
-    // pre-check in the tool handler is the fast path; this serialized
-    // re-check is the authoritative guard against a `cancelTask` landing
-    // between the pre-check and our write. Mirrors `updateJob`,
-    // `updateJobStatus`, and `removeJob`.
+    // to fire if the parent task has been cancelled or failed. The
+    // lock-free pre-check in the tool handler is the fast path; this
+    // serialized re-check is the authoritative guard against a
+    // `cancelTask` landing between the pre-check and our write. Matches
+    // the module-wide pattern (`createScheduledJob`, `updateJob`,
+    // `updateJobStatus`, `removeJob`): `completed` is treated as a
+    // non-blocking status for job mutations, only `cancelled` / `failed`
+    // block.
     if (parentTaskId) {
       const parent = state.tasks.find((t) => t.id === parentTaskId);
       if (parent && (parent.status === "cancelled" || parent.status === "failed")) {

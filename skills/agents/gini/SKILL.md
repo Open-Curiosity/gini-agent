@@ -389,16 +389,16 @@ only use it when the user has explicitly asked for that risk profile.
 
 ## Troubleshooting
 
-**Telegram bridge stuck in `error` after health probe** — inspect
-`bridge.message` on the bridge record returned by
-`GET /api/messaging/<id>` (or via `POST /api/messaging/<id>/health` to
-re-probe). `Telegram bot token is missing — recreate the bridge with a
-botToken.` means the token never landed; recreate the bridge with the
-real token via `POST /api/messaging` (`{ name, type: "telegram",
-config: { botToken: "<BOT_TOKEN>" } }`). Any other message is the raw
-Telegram error from `getMe()`; the most common is `Unauthorized` from a
-bad or revoked token — re-copy the token from BotFather and recreate the
-bridge. (Human-operator CLI mirror: `gini messaging health`, then
+**Telegram bridge stuck in `error` after health probe** — re-probe via
+`POST /api/messaging/<id>/health`; the response is the updated bridge
+record with its `message` field set. `Telegram bot token is missing —
+recreate the bridge with a botToken.` means the token never landed;
+recreate the bridge with the real token via `POST /api/messaging`
+(`{ name, kind: "telegram", deliveryTargets: [], botToken: "<BOT_TOKEN>" }`).
+Any other message is the raw Telegram error from `getMe()`; the most
+common is `Unauthorized` from a bad or revoked token — re-copy the token
+from BotFather and recreate the bridge. (Human-operator CLI mirror:
+`gini messaging health`, then
 `gini messaging add my-bot telegram --bot-token <BOT_TOKEN>`.)
 
 **Headless browser launch fails with "Failed to launch Chromium"** — the
