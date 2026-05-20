@@ -557,6 +557,27 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
+    // Cancel a task. Pairs with spawn_subagent for parent-side control
+    // of a runaway child. Low-risk; the underlying `cancelTask` already
+    // refuses on already-terminal tasks and cascades to child subagents.
+    // The self-cancel guard lives in the dispatcher (the current task
+    // cannot cancel itself — that would terminate the running
+    // conversation).
+    toolset: "subagents",
+    type: "function",
+    function: {
+      name: "cancel_task",
+      description: "Cancel a running task. Use for runaway subagents the user wants to abort, or to clean up an unrelated task. Refuses to cancel the CURRENT chat task — call cancellation never makes sense from inside the task it would terminate. Already-terminal tasks (completed / failed / cancelled) are returned as-is by the underlying handler.",
+      parameters: {
+        type: "object",
+        properties: {
+          taskId: { type: "string", description: "Id of the task to cancel (e.g. 'task_abc123')." }
+        },
+        required: ["taskId"]
+      }
+    }
+  },
+  {
     // Invoke a tool exposed by a registered MCP server. High-risk:
     // contains "invoke" → routed through the approval queue. The MCP
     // server itself is operator-registered (so the agent can't reach

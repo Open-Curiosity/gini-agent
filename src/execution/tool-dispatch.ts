@@ -22,7 +22,7 @@ import {
   now,
   readState
 } from "../state";
-import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, findTask, resolveApproval, runTerminalCommand } from "../agent";
+import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveApproval, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
@@ -110,6 +110,8 @@ export async function dispatchToolCall(
       return pendingOrAuto(config, "messaging.send", undefined, (reason) => requestSendMessage(config, taskId, toolCallId, args, reason));
     case "invoke_mcp":
       return pendingOrAuto(config, "mcp.invoke", undefined, (reason) => requestInvokeMcp(config, taskId, toolCallId, args, reason));
+    case "cancel_task":
+      return { kind: "sync", result: await cancelTaskTool(config, taskId, args) };
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -1521,6 +1523,50 @@ async function searchHistoryTool(
       score: r.score
     }))
   });
+}
+
+// Cancel a task. Refuses to cancel the CURRENT task — that would
+// terminate the running conversation. Wraps `cancelTask`, which already
+// refuses on already-terminal tasks and cascades to child subagents.
+async function cancelTaskTool(
+  config: RuntimeConfig,
+  callerTaskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const targetTaskId = requireString(args, "taskId");
+  if (targetTaskId === callerTaskId) {
+    return `Error: cannot cancel the current task — that would terminate the running conversation. Use this only for child subagents or unrelated tasks.`;
+  }
+  const stateNow = readState(config.instance);
+  const target = stateNow.tasks.find((t) => t.id === targetTaskId);
+  if (!target) throw new Error(`Task not found: ${targetTaskId}`);
+  if (isTerminalTaskStatus(target.status)) {
+    return `Task ${targetTaskId} is already ${target.status}; no action taken.`;
+  }
+  const cancelled = await cancelTask(config, targetTaskId);
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, callerTaskId);
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "task.cancel.requested",
+        target: targetTaskId,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: { targetTaskId, previousStatus: target.status, newStatus: cancelled.status }
+      },
+      { taskId: item.id }
+    );
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, callerTaskId, {
+    type: "task",
+    message: "Requested task cancellation",
+    data: { targetTaskId, previousStatus: target.status, newStatus: cancelled.status }
+  });
+  return `Cancelled task ${targetTaskId} (was ${target.status}, now ${cancelled.status}).`;
 }
 
 // Poll the subagent record until its child task reaches a terminal state,
