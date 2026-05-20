@@ -161,10 +161,14 @@ export default function HomePage() {
                   // engine's internal "why this needs approval" text)
                   // because the chat-side ApprovalActions card shows the
                   // user-facing reason — the home pending list should match.
+                  // `||` (not `??`) so an empty-string reason also falls
+                  // back to the approval target. `??` only fires for
+                  // null/undefined; a payload that carried `reason: ""`
+                  // would otherwise render a blank card body.
                   const browserConnectBody =
-                    (typeof approval.payload.reason === "string"
+                    (typeof approval.payload.reason === "string" && approval.payload.reason.length > 0
                       ? approval.payload.reason
-                      : undefined) ?? approval.target;
+                      : undefined) || approval.target;
                   return (
                   <li key={approval.id} className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
                     <div className="min-w-0 flex-1 space-y-1">

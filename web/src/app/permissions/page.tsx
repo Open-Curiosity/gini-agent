@@ -101,9 +101,13 @@ function ApprovalCard({
   // audit, so render a friendlier label and use the reason as the
   // description instead of leaking the connect-endpoint internals.
   const isBrowserConnect = approval.action === "browser.connect";
+  // `||` (not `??`) so an empty-string reason also falls back to the
+  // approval target. `??` only fires for null/undefined; a payload that
+  // carried `reason: ""` would otherwise render a blank card body.
   const reasonText =
-    (typeof approval.payload?.reason === "string" ? approval.payload.reason : undefined) ??
-    approval.target;
+    (typeof approval.payload?.reason === "string" && approval.payload.reason.length > 0
+      ? approval.payload.reason
+      : undefined) || approval.target;
   return (
     <Card>
       <CardHeader>

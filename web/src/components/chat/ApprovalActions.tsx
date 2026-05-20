@@ -108,9 +108,14 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
         // and use the reason (carried on the approval's target /
         // payload.reason) as the body.
         const isBrowserConnect = approval.action === "browser.connect";
+        // `||` (not `??`) so an empty-string reason also falls back to
+        // the approval target. `??` only fires for null/undefined; a
+        // payload that carried `reason: ""` would otherwise render a
+        // blank card body.
         const reasonText =
-          (typeof approval.payload.reason === "string" ? approval.payload.reason : undefined) ??
-          approval.target;
+          (typeof approval.payload.reason === "string" && approval.payload.reason.length > 0
+            ? approval.payload.reason
+            : undefined) || approval.target;
         return (
           <div
             key={approval.id}
