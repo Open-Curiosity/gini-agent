@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 1.4.0
+    version: 1.5.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -94,9 +94,46 @@ Branch on the answer:
   ```
 
   Run all three through `terminal_exec`. Interpret the output:
-  - `OK: Desktop client` → copy in place, **skip Step 2 entirely**, jump to Step 3 (`gws auth login`).
+  - `OK: Desktop client` → copy in place, **skip Step 2 entirely**, then run the API-verification sub-step below before jumping to Step 3 (`gws auth login`).
   - `WRONG TYPE: ...` → the file is a Web OAuth client, which won't work with the `gws` CLI's localhost-loopback redirect. Tell the user: "That's a Web OAuth client — `gws` needs a Desktop client. Want me to drive Cloud Console for a new Desktop client (~5 minutes)?" If yes, fall through to Step 2.
   - `INVALID: ...` or `MISSING: ...` → tell the user what's wrong and ask whether they want to re-paste a different path or have Gini drive Cloud Console.
+
+  **Verify the user's existing project has all six Workspace APIs enabled.** A `client_secret.json` from another project is only half the story — the project that issued it may have Gmail enabled but not Calendar, Drive, etc. Setup is one-time and comprehensive, so we verify (and enable, if needed) all six APIs now. That way later product asks only need `gws auth login --scopes <scope>`, never another trip through Cloud Console.
+
+  1. Parse the project ID from the JSON via `terminal_exec`:
+
+     ```bash
+     # Prefer jq; fall back to python if jq isn't installed.
+     jq -r '.installed.project_id' ~/.config/gws/client_secret.json 2>/dev/null \
+       || python3 -c "import json; print(json.load(open('$HOME/.config/gws/client_secret.json'))['installed']['project_id'])"
+     ```
+
+     Capture the printed project ID as `<project_id>`.
+
+  2. Tell the user, in chat: "I'm going to verify that Gmail, Calendar, Drive, Docs, Forms, and Meet APIs are enabled in your project `<project_id>`. This requires a visible browser session."
+
+  3. Run the Step 0 preflight (see Step 2 below) to make sure a visible browser is attached:
+
+     ```text
+     browser_connect { reason: "Verify Workspace APIs in your GCP project <project_id>" }
+     ```
+
+     (Skip the call if `GET /api/browser` already shows `connected: true` in managed mode, or in CDP mode after the user confirms the window is visible — same decision rule as Step 0.)
+
+  4. Hand off to the user for sign-in if they aren't signed in yet — same handover pattern as Milestone A in Step 2. Navigate to the API library *scoped to the user's existing project*:
+
+     ```text
+     browser_navigate { url: "https://console.cloud.google.com/apis/library?project=<project_id>" }
+     browser_snapshot {}
+     ```
+
+  5. Run the same enablement loop from Milestone C below, in order: Gmail API, Google Calendar API, Google Drive API, Google Docs API, Google Forms API, Google Meet API. For each one: search the API name, click the result, then:
+     - If the API detail page shows **Manage** (instead of **Enable**), it's already on — skip the click and move on.
+     - Otherwise click **Enable** and wait for the "API enabled" banner.
+
+  6. After all six are verified or enabled, summarize in chat: "Verified Gmail, Calendar, Drive, Docs, Forms, and Meet APIs in project `<project_id>`. Moving on to OAuth login." Close the browser session (`browser_close {}`) and jump to Step 3.
+
+  If the user objects to this verification step ("I know they're all enabled, just continue"), respect that and proceed straight to Step 3 — but warn them once: "OK, skipping verification. If a future product ask fails with a 403 'API not enabled' error, the fix is to enable that API in Cloud Console at https://console.cloud.google.com/apis/library?project=`<project_id>`."
 
 - **User says no, doesn't have one, or asks Gini to do it.** Fall through to Step 2.
 
@@ -186,6 +223,8 @@ To create:
 Summarize the milestone to the user: "Project `<name>` is selected. Moving on to enable the Workspace APIs."
 
 #### Milestone C — Enable Workspace APIs
+
+> **Enable all six APIs even if the user's current ask only needs one.** Setup is a one-time, comprehensive operation. The user just asked Gini to do something in (e.g.) Calendar today, but they'll later ask about Gmail, Drive, etc. Enabling all six APIs now means none of those future asks require re-touching the project — a later product ask should only need `gws auth login --scopes <scope>`, no project edits, no API toggling, no OAuth client changes. The user does not pay for enabled-but-unused APIs.
 
 For each of the six APIs Gini's product skills depend on, run the same loop. The canonical pattern (the body repeats per API; do **not** unroll it into six separate plans — read the pattern once and apply it to each name):
 
