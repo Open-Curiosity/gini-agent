@@ -1,11 +1,12 @@
 // Central approval-policy seam.
 //
 // Every approval-eligible tool call (file.write, file.patch,
-// terminal.exec, code_exec via terminal.exec, browser.upload_file) goes
-// through `resolveApprovalPolicy` before deciding whether to gate or
-// auto-approve. Keeping the decision in one module is the load-bearing
-// invariant — duplicating the policy across dispatchers / agent paths
-// would silently drift "auto" / "yolo" / "strict" semantics over time.
+// terminal.exec, code.exec via terminal.exec, browser.upload_file,
+// messaging.send, mcp.invoke) goes through `resolveApprovalPolicy`
+// before deciding whether to gate or auto-approve. Keeping the
+// decision in one module is the load-bearing invariant — duplicating
+// the policy across dispatchers / agent paths would silently drift
+// "auto" / "yolo" / "strict" semantics over time.
 //
 // See ADR approval-mode.md for the user-facing contract.
 //

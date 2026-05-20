@@ -394,15 +394,19 @@ treats each `high`-risk call: `strict | auto | yolo`. Set via
 
 - **strict** — the side effect blocks until a human approves the row
   via `POST /api/approvals/<id>/approve` (or denies it).
-- **auto** — the approval row is still created, then immediately
-  auto-resolved as approved and the side effect runs without waiting
-  for a human. The audit trail is complete: the row exists, marked
-  `autoApproved: true`. Default.
-- **yolo** — the approval row is still written (created already
-  approved, with `autoApproved: true` evidence) but the gate is skipped
-  unconditionally — no per-action policy check. The audit trail stays
-  complete; only the wait disappears. Use only when the user has
-  explicitly asked for that risk profile.
+- **auto** — the approval row is created with `status: "pending"`,
+  then the runtime auto-resolves it (`status: "approved"`) and runs
+  the side effect without waiting for a human. The audit trail is
+  complete: the resolution audit row carries
+  `evidence.autoApproved: true` plus `autoApprovedReason:
+  "approval-mode-auto"`. Default.
+- **yolo** — the approval row is still written and resolved
+  through the same auto-approve path, but the policy seam skips its
+  per-action gate check entirely. The resolution audit row carries
+  `evidence.autoApproved: true` plus `autoApprovedReason:
+  "approval-mode-yolo"`, so the audit trail stays complete; only the
+  wait disappears. Use only when the user has explicitly asked for
+  that risk profile.
 
 ```http
 GET  /api/approvals

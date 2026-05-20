@@ -72,12 +72,13 @@ through the same loop. So the loop comes first.
       matched pattern on the `terminal.exec` audit row's
       `evidence.autoApprovedReason`.
     - Under `approvalMode: "auto"` (the default), safe actions
-      (file_write, file_patch, code_exec, browser_upload_file) and
-      non-dangerous terminal commands still create an approval row,
-      but `resolveApprovalPolicy` auto-resolves it through the same
-      `resolveApproval` -> `executeApprovedAction` pipeline a human
-      would take. The `approval.approved` and per-action audit rows
-      carry `evidence.autoApprovedReason="approval-mode-auto"`.
+      (file_write, file_patch, code_exec, browser_upload_file,
+      messaging_send, mcp_invoke) and non-dangerous terminal commands
+      still create an approval row, but `resolveApprovalPolicy`
+      auto-resolves it through the same `resolveApproval` ->
+      `executeApprovedAction` pipeline a human would take. The
+      `approval.approved` and per-action audit rows carry
+      `evidence.autoApprovedReason="approval-mode-auto"`.
     - Under `approvalMode: "yolo"`, every approval-eligible action
       auto-resolves with `evidence.autoApprovedReason="approval-mode-yolo"`.
     - Dangerous-pattern hits under `"auto"` still gate; the matched

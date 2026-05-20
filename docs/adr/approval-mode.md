@@ -66,9 +66,13 @@ The two original Plan corrections worth noting:
   automatically — a snippet that shells out to `sudo` is gated the
   same way a `terminal_exec` of `sudo *` would be.
 
-The approval-eligible tool surface is exactly five:
-`file_write`, `file_patch`, `terminal_exec`, `code_exec`,
-`browser_upload_file`.
+The approval-eligible tool surface is `file_write`, `file_patch`,
+`terminal_exec`, `code_exec`, `browser_upload_file`, `messaging_send`,
+and `mcp_invoke`. The last two egress data / run external code and
+were folded into the same policy seam after the initial five so the
+mode contract applies uniformly. Under `auto` mode `messaging_send`
+and `mcp_invoke` auto-approve (the agent can drive normal
+automations); `strict` still gates each call.
 
 ## Required Now
 

@@ -163,11 +163,12 @@ Controls live behind a single endpoint (`/api/settings/auto-approve`):
 - **`approvalMode`** — `"strict" | "auto" | "yolo"`. New instances
   default to `"auto"`. `strict` gates every approval-eligible action
   (`file_write`, `file_patch`, `terminal_exec`, `code_exec`,
-  `browser_upload_file`) for a human decision. `auto` auto-approves
-  the safe set and gates `terminal_exec` / `code_exec` only when the
-  command matches a dangerous-pattern entry. `yolo` bypasses every
-  gate. See [ADR approval-mode.md](adr/approval-mode.md) for the
-  full contract.
+  `browser_upload_file`, `messaging_send`, `mcp_invoke`) for a human
+  decision. `auto` auto-approves the safe set (including
+  `messaging_send` and `mcp_invoke`) and gates `terminal_exec` /
+  `code_exec` only when the command matches a dangerous-pattern entry.
+  `yolo` bypasses every gate. See
+  [ADR approval-mode.md](adr/approval-mode.md) for the full contract.
 
 - **`autoApproveCommands` (shell-glob allowlist for `terminal_exec`).**
   Skip the human gate for specific shell commands the agent runs.
