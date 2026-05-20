@@ -1,11 +1,13 @@
 // Tests for the cancel_task dispatch surface. Exercises tool
-// registration, the self-cancel guard, cancellation of a sibling task,
-// and the error paths (unknown taskId, already-terminal target).
+// registration, the self-cancel guard (lock-free + serialized in-lock),
+// cancellation of a sibling task, and the error paths (unknown taskId,
+// already-terminal target).
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { dispatchToolCall } from "./tool-dispatch";
 import { buildToolCatalog } from "./tool-catalog";
+import { cancelTask } from "../agent";
 import { createTask, mutateState, readState, upsertTask } from "../state";
 import type { RuntimeConfig, RuntimeState, ToolsetRecord } from "../types";
 
@@ -168,5 +170,22 @@ describe("cancel_task dispatch", () => {
     await expect(
       dispatchToolCall(config, callerId, "cancel_task", "call_no_id", JSON.stringify({}))
     ).rejects.toThrow(/taskId/);
+  });
+
+  test("serialized in-lock self-cancel guard refuses when caller===target", async () => {
+    // The lock-free pre-check inside cancelTaskTool is the fast path —
+    // this exercises the authoritative serialized guard inside
+    // cancelTask's mutateState callback by invoking cancelTask directly
+    // with parentTaskId === taskId. A request that races past the
+    // lock-free pre-check (or any other caller that supplies its own
+    // parentTaskId) is still refused before any state change lands.
+    const config = makeConfig("cancel-task-serialized");
+    const taskId = await seedTask(config);
+    await expect(cancelTask(config, taskId, taskId)).rejects.toThrow(
+      /cannot cancel the current task/i
+    );
+    // Task should still be queued — guard fired before any mutation.
+    const tasks = readState(config.instance).tasks;
+    expect(tasks.find((t) => t.id === taskId)?.status).toBe("queued");
   });
 });

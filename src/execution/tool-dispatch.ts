@@ -1517,6 +1517,11 @@ async function searchHistoryTool(
 // Cancel a task. Refuses to cancel the CURRENT task — that would
 // terminate the running conversation. Wraps `cancelTask`, which already
 // refuses on already-terminal tasks and cascades to child subagents.
+// Self-cancel is guarded twice: the lock-free pre-check below is the
+// fast path that lets the model see a friendly message instead of an
+// error, and `cancelTask(..., callerTaskId)` re-checks inside its
+// serialized mutateState callback so a request that slips between the
+// pre-check and the mutation still throws before any state change.
 async function cancelTaskTool(
   config: RuntimeConfig,
   callerTaskId: string,
@@ -1532,7 +1537,7 @@ async function cancelTaskTool(
   if (isTerminalTaskStatus(target.status)) {
     return `Task ${targetTaskId} is already ${target.status}; no action taken.`;
   }
-  const cancelled = await cancelTask(config, targetTaskId);
+  const cancelled = await cancelTask(config, targetTaskId, callerTaskId);
   await mutateState(config.instance, (state) => {
     const item = findTask(state, callerTaskId);
     addAudit(

@@ -199,9 +199,25 @@ export async function retryTask(config: RuntimeConfig, taskId: string): Promise<
   return task;
 }
 
-export async function cancelTask(config: RuntimeConfig, taskId: string): Promise<Task> {
+export async function cancelTask(
+  config: RuntimeConfig,
+  taskId: string,
+  // Optional parent-task guard. When set and equal to `taskId`, refuse
+  // inside the serialized mutateState callback BEFORE any state change.
+  // Mirrors the pattern run_job uses to close the race window between a
+  // lock-free pre-check and the mutation: callers that need a strict
+  // self-cancel guard pass their own taskId here. cancel_task does that.
+  // Callers without that requirement (HTTP `/api/tasks/:id/cancel`)
+  // omit the arg and keep their original behavior.
+  parentTaskId?: string
+): Promise<Task> {
   const task = await mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
+    if (parentTaskId !== undefined && parentTaskId === taskId) {
+      throw new Error(
+        "Cannot cancel the current task — that would terminate the running conversation."
+      );
+    }
     if (isTerminalTaskStatus(task.status)) return task;
     task.status = "cancelled";
     task.currentStep = "Cancelled";
