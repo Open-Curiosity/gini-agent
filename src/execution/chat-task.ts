@@ -235,8 +235,14 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // the binding is a property of the chat session, not the prompt source.
   const boundJobs = findBoundJobsForTask(state, task);
   const boundJobsBlock = buildBoundJobsBlock(boundJobs);
+  // Advertise configured http MCP servers so the model knows mcp_call is
+  // wired up against this server and can locate the matching skill before
+  // invoking. Only "configured" status surfaces; disabled/error servers
+  // stay hidden the same way disabled skills do.
+  const mcpServersBlock = buildMcpServersBlock(state);
   const sections = [baseSystem];
   if (skillsBlock) sections.push(skillsBlock);
+  if (mcpServersBlock) sections.push(mcpServersBlock);
   if (boundJobsBlock) sections.push(boundJobsBlock);
   const systemContext = sections.join("\n\n");
 
@@ -400,6 +406,31 @@ function buildEnabledSkillsBlock(skills: SkillRecord[]): string {
     });
   return [
     "Available skills (call read_skill with the skill name to load full instructions):",
+    ...lines
+  ].join("\n");
+}
+
+// Advertise configured http MCP servers in the system prompt. The model
+// reads this block to know which servers are available to mcp_call and
+// which skill body to load for the per-server tool reference. Stdio
+// servers are intentionally omitted — the v0 stdio path is a stub and
+// surfacing it would invite the model to call something that can't
+// actually serve MCP traffic.
+function buildMcpServersBlock(state: RuntimeState): string {
+  const servers = state.mcpServers.filter(
+    (s) => s.status === "configured" && s.transport === "http"
+  );
+  if (servers.length === 0) return "";
+  const lines = servers
+    .slice()
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((s) => {
+      const count = s.tools?.length ?? 0;
+      const suffix = count > 0 ? ` (${count} tool${count === 1 ? "" : "s"})` : "";
+      return `- ${s.name}${suffix} — call read_skill name='${s.name}' for the curated tool reference.`;
+    });
+  return [
+    "Configured MCP servers (use the `mcp_call` tool to invoke):",
     ...lines
   ].join("\n");
 }

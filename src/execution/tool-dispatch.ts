@@ -30,6 +30,7 @@ import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, updateJob, updateJobStatus } from "../jobs";
 import { isSkillActive } from "../integrations/connectors";
+import { invokeMcpTool } from "../integrations/mcp";
 import { riskForAction } from "./tool-risk";
 import {
   browserBack,
@@ -93,6 +94,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await updateJobTool(config, taskId, args) };
     case "delete_job":
       return { kind: "sync", result: await deleteJobTool(config, taskId, args) };
+    case "mcp_call":
+      return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -469,6 +472,59 @@ async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record
     allowedTools: skill.allowedTools
   });
   return skill.body || "(skill body is empty)";
+}
+
+// Generic MCP tool dispatch. Routes (server, tool, arguments) to the
+// matching McpServerRecord and returns the flattened text content the
+// tool produced. Errors come back as a JSON envelope rather than thrown
+// exceptions so the model can read the failure and recover (e.g. retry
+// with corrected arguments) instead of seeing a generic tool-error.
+//
+// Result text is capped at 12000 chars to bound prompt growth; Linear's
+// list_issues can return many pages of issue blobs.
+async function mcpCallTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const serverName = requireString(args, "server");
+  const toolName = requireString(args, "tool");
+  const toolArgs = (args.arguments && typeof args.arguments === "object" && !Array.isArray(args.arguments))
+    ? args.arguments as Record<string, unknown>
+    : {};
+  const state = readState(config.instance);
+  const server = state.mcpServers.find(
+    (item) => item.name.toLowerCase() === serverName.toLowerCase() || item.id === serverName
+  );
+  if (!server) {
+    return JSON.stringify({ ok: false, error: `Unknown MCP server: ${serverName}. Configured servers: ${state.mcpServers.map((s) => s.name).join(", ") || "(none)"}` });
+  }
+  if (server.status !== "configured") {
+    return JSON.stringify({ ok: false, error: `MCP server ${server.name} is not configured (status: ${server.status}). Ask the user to run 'gini mcp health ${server.name}' or re-add credentials.` });
+  }
+  if (server.transport === "http" && !server.url) {
+    return JSON.stringify({ ok: false, error: `MCP server ${server.name} is http transport but has no url.` });
+  }
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: `MCP tool ${server.name}/${toolName}`,
+    data: { server: server.name, tool: toolName, argBytes: JSON.stringify(toolArgs).length }
+  });
+  let result: { ok: boolean; stdout?: string; message?: string };
+  try {
+    result = await invokeMcpTool(config, server.id, toolName, toolArgs, { taskId });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+  if (!result.ok) {
+    return JSON.stringify({ ok: false, error: result.message ?? "MCP tool failed.", content: truncate(result.stdout ?? "", 12_000) });
+  }
+  return truncate(result.stdout ?? "", 12_000);
+}
+
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}\n... (truncated)`;
 }
 
 // Spawn a constrained subagent and wait for its terminal state. The model

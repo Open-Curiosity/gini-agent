@@ -433,6 +433,31 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
+    // Generic MCP tool invocation. The agent loop sees this as a single
+    // tool entry; the dispatcher routes (server, tool, arguments) to the
+    // matching McpServerRecord via src/integrations/mcp.ts. Each
+    // configured http MCP server is advertised separately in the system
+    // prompt so the model knows which tools belong to which server.
+    // TODO: gate side-effecting MCP tools through the approval policy
+    // based on the tool's `annotations.destructiveHint`; for v0 every call
+    // auto-executes.
+    toolset: "mcp",
+    type: "function",
+    function: {
+      name: "mcp_call",
+      description: "Invoke a tool on a configured MCP server. Use list_skills/read_skill first to discover what tools each MCP server exposes (e.g. read_skill name='linear' for Linear).",
+      parameters: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server name (e.g. 'linear')." },
+          tool: { type: "string", description: "Tool name as advertised by the MCP server (e.g. 'list_issues')." },
+          arguments: { type: "object", description: "Arguments object the MCP tool expects. Shape varies per tool — read the skill for details.", additionalProperties: true }
+        },
+        required: ["server", "tool"]
+      }
+    }
+  },
+  {
     // Schedule a real cron/job. The job's output is delivered as an
     // assistant message back into the originating chat session when it
     // fires. Low-risk: no approval gate — the user can pause/delete the
@@ -604,6 +629,11 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (tool.function.name === "list_jobs") return true;
     if (tool.function.name === "update_job") return true;
     if (tool.function.name === "delete_job") return true;
+    // mcp_call is a runtime capability not bound to a legacy toolset row.
+    // Gating it on the "mcp" toolset would silently hide MCP usage on
+    // fresh instances even when a user has configured a server, so it
+    // mirrors read_skill / spawn_subagent's always-on stance.
+    if (tool.function.name === "mcp_call") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;
