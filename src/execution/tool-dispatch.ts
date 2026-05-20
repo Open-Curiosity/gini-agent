@@ -22,13 +22,17 @@ import {
   now,
   readState
 } from "../state";
-import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, findTask, resolveApproval, runTerminalCommand } from "../agent";
+import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveApproval, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
-import { createScheduledJob, listJobs, removeJob, updateJob, updateJobStatus } from "../jobs";
+import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
+import { createMemoryFromInput, editMemory, recall } from "../memory";
+import { resolveEffectiveContext } from "./effective-context";
+import { searchSessions } from "./search";
+import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { invokeMcpTool } from "../integrations/mcp";
@@ -95,6 +99,26 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await updateJobTool(config, taskId, args) };
     case "delete_job":
       return { kind: "sync", result: await deleteJobTool(config, taskId, args) };
+    case "run_job":
+      return { kind: "sync", result: await runJobTool(config, taskId, args) };
+    case "recall_memory":
+      return { kind: "sync", result: await recallMemoryTool(config, taskId, args) };
+    case "add_memory":
+      return { kind: "sync", result: await addMemoryTool(config, taskId, args) };
+    case "update_memory":
+      return { kind: "sync", result: await updateMemoryTool(config, taskId, args) };
+    case "search_history":
+      return { kind: "sync", result: await searchHistoryTool(config, taskId, args) };
+    case "send_message":
+      return pendingOrAuto(config, "messaging.send", undefined, (reason) => requestSendMessage(config, taskId, toolCallId, args, reason));
+    case "cancel_task":
+      return { kind: "sync", result: await cancelTaskTool(config, taskId, args) };
+    case "install_skill":
+      return { kind: "sync", result: await installSkillTool(config, taskId, args) };
+    case "enable_skill":
+      return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "enabled") };
+    case "disable_skill":
+      return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "disabled") };
     case "mcp_call":
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
     case "request_connector":
@@ -1241,6 +1265,456 @@ async function deleteJobTool(
   return `Deleted job ${removed.id} (\"${removed.name}\").`;
 }
 
+// Manually fire an existing scheduled job. Wraps the same `runJobNow`
+// entrypoint that `POST /api/jobs/<id>/run` calls, with `trigger="manual"`
+// so overlap protection is intentionally skipped (manual runs may execute
+// alongside an in-flight scheduled run). The spawned task itself still
+// flows through the job's configured approval envelope at fire-time.
+async function runJobTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const jobId = requireString(args, "jobId");
+
+  // Pre-side-effect terminal check. Lock-free fast path: avoid touching
+  // the state lock when the parent task is already terminal. The
+  // serialized re-check inside `runJobNow` (via `parentTaskId`) is the
+  // authoritative guard against a `cancelTask` landing between this
+  // pre-check and our write.
+  {
+    const state = readState(config.instance);
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (task && isTerminalTaskStatus(task.status)) {
+      return `Error: run_job skipped because task is already ${task.status}.`;
+    }
+  }
+
+  // Resolve the job up-front so we can surface its name in the return
+  // string (and fail fast on an unknown id instead of letting `runJobNow`
+  // throw deep in its mutateState).
+  const before = listJobs(config).find((candidate) => candidate.id === jobId);
+  if (!before) throw new Error(`Job not found: ${jobId}`);
+
+  const result = await runJobNow(config, jobId, "manual", taskId);
+  // `runJobNow` only returns undefined on the overlap-skip branch, which
+  // is gated on trigger==="schedule" — so for "manual" it should never
+  // happen in normal operation. Surface a clear error if the contract ever
+  // changes rather than crashing on the destructure below.
+  if (!result) {
+    throw new Error(`run_job for ${jobId} produced no run (overlap skip should not apply to manual triggers).`);
+  }
+  // Script jobs return { jobId, runId, exitCode, stdout, stderr }; prompt
+  // jobs return { jobId, runId, taskId }. The taskId is only meaningful for
+  // prompt jobs — script jobs run synchronously inside `runJobNow` and
+  // never spawn an agent task. Discriminate on shape.
+  const runId = (result as { runId: string }).runId;
+  const isScriptResult = Object.prototype.hasOwnProperty.call(result, "exitCode");
+  const exitCode = isScriptResult ? (result as { exitCode: number }).exitCode : undefined;
+  const stderr = isScriptResult ? (result as { stderr?: string }).stderr ?? "" : "";
+  const spawnedTaskId = isScriptResult ? undefined : (result as { taskId?: string }).taskId;
+
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "job.run.manual",
+        target: jobId,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: isScriptResult
+          ? { jobId, runId, exitCode }
+          : { jobId, runId, spawnedTaskId }
+      },
+      { taskId: item.id }
+    );
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "job",
+    message: isScriptResult ? "Manually executed script job" : "Manually triggered job run",
+    data: isScriptResult
+      ? { jobId, runId, exitCode }
+      : { jobId, runId, taskId: spawnedTaskId }
+  });
+
+  if (isScriptResult) {
+    // Script jobs run synchronously inside `runJobNow`, so by the time we
+    // return here the run is already complete. Report the result rather
+    // than "Triggered" so the model can see success/failure without
+    // chasing the JobRun record.
+    if (exitCode === 0) {
+      return `Script job ${jobId} (\"${before.name}\") completed — run ${runId}, exit 0.`;
+    }
+    // On failure include a truncated tail of stderr so the model can see
+    // what went wrong without overwhelming context. Skip stdout — script
+    // jobs are typically side-effect-driven and the audit/trace already
+    // captures both streams.
+    const stderrTail = stderr.length > 500 ? stderr.slice(stderr.length - 500) : stderr;
+    const stderrSuffix = stderrTail ? ` stderr: ${stderrTail}` : "";
+    return `Script job ${jobId} (\"${before.name}\") failed — run ${runId}, exit ${exitCode}.${stderrSuffix}`;
+  }
+
+  const taskSuffix = spawnedTaskId ? `, task ${spawnedTaskId}` : "";
+  return `Triggered job ${jobId} (\"${before.name}\") — run ${runId}${taskSuffix}.`;
+}
+
+// Explicit on-demand memory recall. Wraps the same `recall()` entrypoint
+// that the chat-task loop runs automatically at the start of each task,
+// but exposes it to the model so it can fetch additional memory mid-
+// conversation when the user references prior context. Returns a compact
+// JSON-serialized summary so the model can decide whether to dig deeper.
+// Low-risk / read-only.
+async function recallMemoryTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const query = requireString(args, "query");
+  let tokenBudget: number | undefined;
+  if (args.tokenBudget !== undefined && args.tokenBudget !== null) {
+    if (typeof args.tokenBudget !== "number" || !Number.isFinite(args.tokenBudget) || args.tokenBudget <= 0) {
+      throw new Error("Invalid input: tokenBudget must be a positive number.");
+    }
+    tokenBudget = args.tokenBudget;
+  }
+  let bankId: string | undefined;
+  if (args.bankId !== undefined && args.bankId !== null) {
+    if (typeof args.bankId !== "string" || args.bankId.length === 0) {
+      throw new Error("Invalid input: bankId must be a non-empty string.");
+    }
+    bankId = args.bankId;
+  }
+  const state = readState(config.instance);
+  const effective = resolveEffectiveContext(state, config);
+  if (!effective.agentId) {
+    throw new Error("Cannot recall memory: no active agent.");
+  }
+  const result = await recall(config, {
+    agentId: effective.agentId,
+    query,
+    tokenBudget,
+    bankId,
+    sourceTaskId: taskId
+  });
+  const excerpts = result.units.map((entry) => ({
+    id: entry.unit.id,
+    content: entry.unit.text.length > 200 ? `${entry.unit.text.slice(0, 200)}…` : entry.unit.text,
+    score: Number(entry.score.toFixed(4))
+  }));
+  await recordLowRiskAudit(config, taskId, "memory.recalled", query, {
+    units: result.units.length,
+    totalTokens: result.totalTokens,
+    tokenBudget,
+    bankId: bankId ?? null
+  });
+  return JSON.stringify({
+    units: result.units.length,
+    totalTokens: result.totalTokens,
+    excerpts
+  });
+}
+
+// Propose a new memory item. Always lands as `status: "proposed"` —
+// the agent does not pin its own memory active. The user reviews via
+// the existing memory approval flow (`POST /api/memory/<id>/approve`).
+async function addMemoryTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const content = requireString(args, "content");
+  let confidence = 1;
+  if (args.confidence !== undefined && args.confidence !== null) {
+    if (typeof args.confidence !== "number" || !Number.isFinite(args.confidence)) {
+      throw new Error("Invalid input: confidence must be a number.");
+    }
+    confidence = Math.max(0, Math.min(1, args.confidence));
+  }
+  let sensitivity: "normal" | "sensitive" = "normal";
+  if (args.sensitivity !== undefined && args.sensitivity !== null) {
+    if (args.sensitivity !== "normal" && args.sensitivity !== "sensitive") {
+      throw new Error("Invalid input: sensitivity must be 'normal' or 'sensitive'.");
+    }
+    sensitivity = args.sensitivity;
+  }
+  let provenance = "Proposed by agent";
+  if (args.provenance !== undefined && args.provenance !== null) {
+    if (typeof args.provenance !== "string") {
+      throw new Error("Invalid input: provenance must be a string.");
+    }
+    provenance = args.provenance;
+  }
+  // Agent-proposed memory ALWAYS starts proposed — the user reviews
+  // before pinning. We deliberately don't honor an inbound `status`
+  // override; the catalog signature reflects that.
+  const memory = await createMemoryFromInput(config, {
+    content,
+    confidence,
+    sensitivity,
+    provenance,
+    status: "proposed"
+  });
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "memory.added",
+        target: memory.id,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: {
+          memoryId: memory.id,
+          contentExcerpt: content.length > 200 ? `${content.slice(0, 200)}…` : content,
+          status: memory.status,
+          confidence,
+          sensitivity
+        }
+      },
+      { taskId: item.id }
+    );
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "memory",
+    message: "Proposed new memory",
+    data: { memoryId: memory.id, status: memory.status, contentBytes: content.length }
+  });
+  return `Proposed memory ${memory.id} (status: ${memory.status}). Awaiting user approval via /api/memory/${memory.id}/approve.`;
+}
+
+// Edit an existing memory in place. Use sparingly — `add_memory` is the
+// usual path. The audit trail records every edit; the user can archive
+// a bad edit via `DELETE /api/memory/<id>`.
+async function updateMemoryTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const memoryId = requireString(args, "memoryId");
+  const input: Record<string, unknown> = {};
+  if (args.content !== undefined && args.content !== null) {
+    if (typeof args.content !== "string") {
+      throw new Error("Invalid input: content must be a string.");
+    }
+    input.content = args.content;
+  }
+  if (args.confidence !== undefined && args.confidence !== null) {
+    if (typeof args.confidence !== "number" || !Number.isFinite(args.confidence)) {
+      throw new Error("Invalid input: confidence must be a number.");
+    }
+    input.confidence = args.confidence;
+  }
+  if (args.sensitivity !== undefined && args.sensitivity !== null) {
+    if (args.sensitivity !== "normal" && args.sensitivity !== "sensitive") {
+      throw new Error("Invalid input: sensitivity must be 'normal' or 'sensitive'.");
+    }
+    input.sensitivity = args.sensitivity;
+  }
+  if (Object.keys(input).length === 0) {
+    throw new Error("Invalid input: update_memory requires at least one field to change.");
+  }
+  // `editMemory` already writes the canonical `memory.edited` audit row
+  // (medium risk, actor user) — that's the safeguard the memory module
+  // owns. Writing a second row from the tool wrapper would just obscure
+  // the medium-risk gate with low-risk agent noise. The per-task trace
+  // below carries the agent's narrative.
+  const memory = await editMemory(config, memoryId, input);
+  appendTrace(config.instance, taskId, {
+    type: "memory",
+    message: "Edited memory",
+    data: { memoryId, appliedFields: Object.keys(input) }
+  });
+  return `Updated memory ${memory.id}: ${Object.keys(input).join(", ")}.`;
+}
+
+// Cross-session lookup wrapping `searchSessions`. Returns up to `limit`
+// (default 20, capped at 100) snippets matching the query. Low-risk and
+// read-only — no audit row, matching the sibling read-only meta tools
+// (`file_read`, `file_search`, `read_skill`). The per-task trace below
+// is the right narrative seam for "the agent searched X".
+async function searchHistoryTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const query = requireString(args, "query");
+  let limit = 20;
+  if (args.limit !== undefined && args.limit !== null) {
+    if (typeof args.limit !== "number" || !Number.isFinite(args.limit) || args.limit <= 0) {
+      throw new Error("Invalid input: limit must be a positive number.");
+    }
+    limit = Math.min(100, Math.floor(args.limit));
+  }
+  const results = searchSessions(config, query, limit);
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Searched session history",
+    data: { query, limit, hits: results.length }
+  });
+  return JSON.stringify({
+    count: results.length,
+    results: results.map((r) => ({
+      kind: r.kind,
+      title: r.title,
+      excerpt: r.excerpt,
+      taskId: r.taskId,
+      source: r.source,
+      score: r.score
+    }))
+  });
+}
+
+// Cancel a task. Refuses to cancel the CURRENT task — that would
+// terminate the running conversation. Wraps `cancelTask`, which already
+// refuses on already-terminal tasks and cascades to child subagents.
+// Self-cancel is guarded twice: the lock-free pre-check below is the
+// fast path that lets the model see a friendly message instead of an
+// error, and `cancelTask(..., callerTaskId)` re-checks inside its
+// serialized mutateState callback so a request that slips between the
+// pre-check and the mutation still throws before any state change.
+async function cancelTaskTool(
+  config: RuntimeConfig,
+  callerTaskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const targetTaskId = requireString(args, "taskId");
+  if (targetTaskId === callerTaskId) {
+    return `Error: cannot cancel the current task — that would terminate the running conversation. Use this only for child subagents or unrelated tasks.`;
+  }
+  const stateNow = readState(config.instance);
+  const target = stateNow.tasks.find((t) => t.id === targetTaskId);
+  if (!target) throw new Error(`Task not found: ${targetTaskId}`);
+  if (isTerminalTaskStatus(target.status)) {
+    return `Task ${targetTaskId} is already ${target.status}; no action taken.`;
+  }
+  const cancelled = await cancelTask(config, targetTaskId, callerTaskId);
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, callerTaskId);
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "task.cancel.requested",
+        target: targetTaskId,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: { targetTaskId, previousStatus: target.status, newStatus: cancelled.status }
+      },
+      { taskId: item.id }
+    );
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, callerTaskId, {
+    type: "task",
+    message: "Requested task cancellation",
+    data: { targetTaskId, previousStatus: target.status, newStatus: cancelled.status }
+  });
+  return `Cancelled task ${targetTaskId} (was ${target.status}, now ${cancelled.status}).`;
+}
+
+// Install a skill from a raw SKILL.md body. Wraps installSkillFromBody,
+// which validates the manifest, writes it to disk, and reloads the skill
+// registry. Returns the new skill id + name + validation issues so the
+// model can surface a useful confirmation.
+async function installSkillTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const body = requireString(args, "body");
+  let category: string | undefined;
+  if (args.category !== undefined && args.category !== null) {
+    if (typeof args.category !== "string" || args.category.length === 0) {
+      throw new Error("Invalid input: category must be a non-empty string.");
+    }
+    category = args.category;
+  }
+  let files: Array<{ name: string; content: string }> | undefined;
+  if (args.files !== undefined && args.files !== null) {
+    if (!Array.isArray(args.files)) {
+      throw new Error("Invalid input: files must be an array.");
+    }
+    const cleaned: Array<{ name: string; content: string }> = [];
+    for (const entry of args.files) {
+      if (!entry || typeof entry !== "object") {
+        throw new Error("Invalid input: files entries must be objects with name+content.");
+      }
+      const candidate = entry as { name?: unknown; content?: unknown };
+      if (typeof candidate.name !== "string" || candidate.name.length === 0) {
+        throw new Error("Invalid input: files entries require a non-empty name.");
+      }
+      if (typeof candidate.content !== "string") {
+        throw new Error("Invalid input: files entries require a string content.");
+      }
+      cleaned.push({ name: candidate.name, content: candidate.content });
+    }
+    files = cleaned;
+  }
+  const installed = await installSkillFromBody(config, { body, category, files });
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "skill.installed",
+        target: installed.skill.id,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: {
+          skillId: installed.skill.id,
+          name: installed.skill.name,
+          manifestPath: installed.manifestPath,
+          validationIssues: installed.validation.issues
+        }
+      },
+      { taskId: item.id }
+    );
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Installed skill",
+    data: { skillId: installed.skill.id, name: installed.skill.name, manifestPath: installed.manifestPath }
+  });
+  const issuesSuffix = installed.validation.issues.length > 0
+    ? ` Warnings: ${installed.validation.issues.join("; ")}.`
+    : "";
+  return `Installed skill ${installed.skill.id} ("${installed.skill.name}") at ${installed.manifestPath}.${issuesSuffix}`;
+}
+
+// Enable / disable a registered skill. Wraps setSkillStatus, which
+// writes the matching skill.enabled / skill.disabled audit row.
+async function setSkillStatusTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>,
+  status: "enabled" | "disabled"
+): Promise<string> {
+  const skillId = requireString(args, "skillId");
+  const skill = await setSkillStatus(config, skillId, status);
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: status === "enabled" ? "Enabled skill" : "Disabled skill",
+    data: { skillId: skill.id, name: skill.name, status }
+  });
+  await recordLowRiskAudit(config, taskId, status === "enabled" ? "skill.enable.requested" : "skill.disable.requested", skill.id, {
+    skillId: skill.id,
+    name: skill.name,
+    status
+  });
+  return `${status === "enabled" ? "Enabled" : "Disabled"} skill ${skill.id} ("${skill.name}").`;
+}
+
 // Poll the subagent record until its child task reaches a terminal state,
 // or `timeoutMs` elapses. We poll instead of using events because the
 // runtime state mutation queue is the canonical cross-call sync point and
@@ -1457,6 +1931,77 @@ async function requestFilePatch(
       type: "approval",
       message: "Approval requested for file patch (chat-task)",
       data: { approvalId: approval.id, target, diff: approval.payload.diff, toolCallId }
+    });
+    return approval.id;
+  });
+}
+
+// Approval-gated send_message. Validates the bridge id and message body
+// before opening the approval row so the approval card reflects a real
+// target. The actual `sendMessagingOutput` call runs in
+// `agent.executeApprovedAction`'s `messaging.send` branch.
+async function requestSendMessage(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>,
+  reasonOverride?: string
+): Promise<string> {
+  const bridgeId = requireString(args, "bridgeId");
+  const text = requireString(args, "text");
+  let target: string | undefined;
+  if (args.target !== undefined && args.target !== null) {
+    if (typeof args.target !== "string" || args.target.length === 0) {
+      throw new Error("Invalid input: target must be a non-empty string.");
+    }
+    target = args.target;
+  }
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    // Resolve the bridge inside the lock so a concurrent disable can't
+    // sneak between our validation and the approval write.
+    const bridge = state.messagingBridges.find(
+      (candidate) => candidate.id === bridgeId || candidate.name === bridgeId
+    );
+    if (!bridge) throw new Error(`Messaging bridge not found: ${bridgeId}`);
+    // Tool-handler gate for the per-bridge target allow-list. The catalog
+    // description promises this enforcement ("Optional delivery target
+    // (chat id) on the bridge's allow-list"). `sendMessagingOutput` does
+    // its own active-agent target filter, but that's a separate envelope
+    // (the agent's allowed targets, not the bridge's) — without this
+    // check an explicit target the bridge doesn't recognize would land
+    // an approval row and surface as a runtime failure post-approval.
+    // Keeping the check here makes the failure mode loud at tool-call
+    // time so the model can correct itself. When `target` is omitted,
+    // sendMessagingOutput falls back to the first allowed target (see
+    // `bridge.deliveryTargets[0]`), which is the documented behavior.
+    if (target !== undefined && !bridge.deliveryTargets.includes(target)) {
+      throw new Error(
+        `Invalid input: target '${target}' is not on bridge '${bridge.id}' allow-list (delivery targets: ${bridge.deliveryTargets.join(", ") || "<none>"})`
+      );
+    }
+    const approval = createApproval(state, {
+      taskId: item.id,
+      action: "messaging.send",
+      target: bridge.id,
+      risk: "high",
+      reason: reasonOverride ?? "Outbound messaging egresses data and requires explicit approval.",
+      payload: {
+        bridgeId: bridge.id,
+        text,
+        target,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for messaging send (chat-task)",
+      data: { approvalId: approval.id, bridgeId: bridge.id, target, textBytes: text.length, toolCallId }
     });
     return approval.id;
   });
@@ -1706,10 +2251,11 @@ export function approvalToolCallId(payload: Record<string, unknown>): string | u
 // approve audit row, the per-action side-effect audit, and the tool
 // result string all live in one canonical place (agent.ts) instead
 // of being duplicated per action. Each auto-resolved side effect
-// still emits a fully populated approval row (status=approved,
-// evidence.autoApproved=true, autoApprovedReason=<policy reason>)
-// and a side-effect audit row, so the reviewer sees an identical
-// trail to a normal flow except for the marker.
+// creates an Approval row (status transitions pending -> approved
+// through resolveApproval, same as a human approval) and writes the
+// `autoApproved=true` + `autoApprovedReason=<policy reason>` markers
+// onto the resolution audit rows. The reviewer sees an identical
+// trail to a normal flow except for the marker on the audit row.
 async function pendingOrAuto(
   config: RuntimeConfig,
   action: PolicyAction,

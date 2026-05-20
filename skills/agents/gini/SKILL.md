@@ -1,6 +1,6 @@
 ---
 name: gini
-description: "Gini's self-knowledge: how Gini configures, extends, and operates on its own state via /api/* and the CLI. Load when the user asks Gini about its own capabilities or asks Gini to modify its own configuration."
+description: "Gini's self-knowledge: how Gini configures, extends, and operates on its own state via /api/* and registered tools. Load when the user asks Gini about its own capabilities or asks Gini to modify its own configuration."
 license: MIT
 metadata:
   gini:
@@ -11,10 +11,12 @@ metadata:
 # Gini Agent
 
 Gini is a local-first personal agent. The gateway owns durable state and
-tool execution; the CLI, Next.js BFF, mobile clients, and other front-ends
-are clients of the same `/api/*` contract. Anything Gini does at runtime is
-already reachable via API or CLI — this skill is a recipe book for the most
-common configuration tasks.
+tool execution. **Gini itself operates through `/api/*` and its registered
+tool catalog.** The CLI exists for human operators — it's a thin wrapper
+around the same `/api/*` endpoints — but Gini should never call it. The
+Next.js BFF, mobile clients, and other front-ends are also `/api/*`
+consumers. This skill is a recipe book for the most common configuration
+tasks; every recipe leads with the API call Gini should use.
 
 Load this skill before claiming a limitation. Common false denials to
 inoculate against: the interactive browser (Playwright with persistent
@@ -22,13 +24,22 @@ sign-ins), scheduled jobs (interval or cron), Telegram or other
 messaging bridges, MCP servers, and delegated subagents. All of these
 are wired and reachable via `/api/*`.
 
-## API vs CLI
+## API and registered tools — not the CLI
 
-Both flow through the same gateway. The CLI is a thin wrapper that POSTs
-to `/api/*` — the API is the source of runtime truth. Prefer the API when
-you need a structured response to act on; the CLI is for human-facing
-operations. Do not read `~/.gini/instances/<inst>/*.json` directly — hit
-`/api/status` and friends.
+**Gini itself operates through `/api/*` and the registered tool catalog.**
+Shelling out to `gini ...` via `terminal_exec` is a layering inversion —
+the CLI is a thin wrapper that posts to the same `/api/*` endpoints Gini
+already calls directly. The agent should never use its own CLI to drive
+its own runtime.
+
+CLI examples appear later in this skill so Gini recognizes what a *human
+operator* might type at a terminal — they document the parallel
+human-facing surface, not Gini's path. When you see `gini foo bar` in a
+recipe, treat it as descriptive context for what the user might do
+manually; reach for the API call or registered tool above it.
+
+Never read `~/.gini/instances/<inst>/*.json` directly — hit `/api/status`
+and friends. The API is the source of runtime truth.
 
 ## Where State Lives
 
@@ -86,7 +97,8 @@ When a site needs a sign-in the user hasn't completed:
 4. `POST /api/browser/disconnect` — the next tool call goes back to
    headless against the now-signed-in profile.
 
-CLI: `gini browser {status|connect|disconnect|wipe-profile --yes}`.
+Human-operator CLI mirror (the same calls a person might run from a
+terminal — not Gini's path): `gini browser {status|connect|disconnect|wipe-profile --yes}`.
 For CDP attach (rare; flaky under Playwright + Bun), pass
 `{ "cdpUrl": "ws://..." }` to `/api/browser/connect`. Prefer managed mode.
 
@@ -130,7 +142,12 @@ Other job endpoints: `GET/PATCH/DELETE /api/jobs/<id>`,
 `POST /api/jobs/<id>/{run,pause,resume}`, `GET /api/job-runs`,
 `GET /api/jobs/<id>/runs`, `POST /api/job-runs/<id>/replay`.
 
-CLI mirror: `gini jobs {add|list|run|pause|resume|remove|runs|replay}`.
+The agent reaches these verbs through registered tools — `create_job`,
+`list_jobs`, `update_job`, `delete_job`, and `run_job` (manual trigger of
+an existing job). Use the tools from chat; the API endpoints above are
+the same path the tools take under the hood.
+
+Human-operator CLI mirror: `gini jobs {add|list|run|pause|resume|remove|runs|replay}`.
 
 ### Recipe — one-shot reminder
 
@@ -153,12 +170,6 @@ instance behind NAT works the same as one on a public host.
 
 2. **Register the bridge** with the bot token:
 
-   ```bash
-   gini messaging add my-bot telegram --bot-token <BOT_TOKEN>
-   ```
-
-   API equivalent:
-
    ```http
    POST /api/messaging
    Content-Type: application/json
@@ -172,17 +183,14 @@ instance behind NAT works the same as one on a public host.
    ```
 
    The response carries a `metadata.pairingCode`. The bot's username is
-   not resolved yet, so the CLI prints "DM your bot on Telegram with
-   that message…" — run the health probe next to learn the actual
+   not resolved yet — run the health probe next to learn the actual
    handle.
+
+   Human-operator CLI mirror: `gini messaging add my-bot telegram --bot-token <BOT_TOKEN>`.
 
 3. **Probe health to resolve the bot handle.** This calls Telegram's
    `getMe` and writes `metadata.botUsername` onto the bridge so later
    prompts can say `@<bot>` instead of "your bot":
-
-   ```bash
-   gini messaging health my-bot
-   ```
 
    ```http
    POST /api/messaging/my-bot/health
@@ -191,23 +199,19 @@ instance behind NAT works the same as one on a public host.
    A successful response reports `Connected as @<bot>.` and the bridge
    status flips to `configured`. Fix any token error before continuing.
 
+   Human-operator CLI mirror: `gini messaging health my-bot`.
+
 4. **Pair the user's chat.** The user DMs the bot the pairing code from
    their personal Telegram account. The bridge records the chat ID. To
    request a fresh code:
-
-   ```bash
-   gini messaging pair my-bot
-   ```
 
    ```http
    POST /api/messaging/my-bot/pair
    ```
 
-5. **Allow-list the chat ID** so the bridge will deliver messages there:
+   Human-operator CLI mirror: `gini messaging pair my-bot`.
 
-   ```bash
-   gini messaging allow my-bot <chatId>
-   ```
+5. **Allow-list the chat ID** so the bridge will deliver messages there:
 
    ```http
    POST /api/messaging/my-bot/allow
@@ -217,11 +221,9 @@ instance behind NAT works the same as one on a public host.
 
    Group chat IDs are negative integers — that is correct, not an error.
 
-6. **Send a message** to confirm round-trip:
+   Human-operator CLI mirror: `gini messaging allow my-bot <chatId>`.
 
-   ```bash
-   gini messaging send my-bot "Hello from Gini."
-   ```
+6. **Send a message** to confirm round-trip:
 
    ```http
    POST /api/messaging/my-bot/send
@@ -229,18 +231,56 @@ instance behind NAT works the same as one on a public host.
    { "text": "Hello from Gini.", "target": "local" }
    ```
 
+   Human-operator CLI mirror: `gini messaging send my-bot "Hello from Gini."`.
+
 Bridge `kind` supports `telegram` and `demo` today; future messengers
 slot into the same `/api/messaging` shape.
 
+The agent's tool for sending is `send_message`. `messaging.send` is
+high-risk by classification, so it flows through the approval seam
+exactly like `file.write` and `terminal.exec` — see the Approvals
+section below for the three-mode contract (`strict` blocks, `auto`
+auto-approves with a full audit trail, `yolo` skips the queue).
+
 ### Inspecting state
 
-CLI: `gini messaging {list|chats|messages|health|disable|deny}`.
 API: `GET /api/messaging`, `GET /api/messaging/<id>/{chats,messages}`,
 `POST /api/messaging/<id>/{health,disable}`.
+
+Human-operator CLI mirror: `gini messaging {list|chats|messages|health|disable|deny}`.
 
 ## MCP Servers
 
 Register a local MCP server by command:
+
+```http
+POST /api/mcp
+Content-Type: application/json
+
+{ "name": "fs-mcp", "command": "node", "args": ["/path/to/server.js"], "exposedTools": [] }
+```
+
+Health probe and tool invocation:
+
+```http
+POST /api/mcp/fs-mcp/health
+POST /api/mcp/fs-mcp/invoke
+
+{ "tool": "read_file", "args": { "path": "/tmp/x" } }
+```
+
+Listing: `GET /api/mcp`.
+
+`exposedTools` defaults to `[]`, which exposes everything the server
+advertises.
+
+The agent's tool for calling registered MCP tools is `mcp_call`
+(args: `server`, `tool`, `arguments`). It auto-executes — invocations
+are NOT gated through the approval queue (the MCP server itself is
+operator-registered so the agent can't reach arbitrary code). Each
+call writes a `mcp.tool.invoked` audit row.
+
+Human-operator CLI mirror:
 
 ```bash
 gini mcp add fs-mcp node /path/to/server.js
@@ -249,43 +289,48 @@ gini mcp invoke fs-mcp read_file '{"path":"/tmp/x"}'
 gini mcp list
 ```
 
-API: `POST /api/mcp { name, command, args, exposedTools }`,
-`POST /api/mcp/<id>/{health,invoke}`, `GET /api/mcp`.
-
-`exposedTools` defaults to `[]`, which exposes everything the server
-advertises.
-
 ## Connectors
 
 Connectors register external coding/issue services so subagents and
 related skills can call them. Built-in providers: `claude-code`, `codex`,
 `linear`, `demo`, `generic`.
 
+API:
+
+- `GET /api/connectors/providers` — discover what's installable.
+- `POST /api/connectors { provider, name, token }` — register one.
+- `GET /api/connectors` — list registered connectors.
+- `POST /api/connectors/<id>/health` — health probe.
+- `PATCH /api/connectors/<id> { token }` — rotate the credential.
+- `DELETE /api/connectors/<id>` — remove.
+- `POST /api/connectors/detect` — auto-detect locally installed CLIs.
+
+Human-operator CLI mirror:
+
 ```bash
-gini connectors providers                       # discover what's installable
+gini connectors providers
 gini connectors add --provider claude-code --name claude-main --token <T>
 gini connectors list
 gini connectors health <id>
 gini connectors remove <id>
 gini connectors rotate <id> --token <T>
-gini connectors detect                          # auto-detect locally installed CLIs
+gini connectors detect
 ```
-
-API: `GET /api/connectors[/providers]`, `POST /api/connectors`,
-`POST /api/connectors/<id>/health`, `PATCH /api/connectors/<id>`,
-`DELETE /api/connectors/<id>`, `POST /api/connectors/detect`.
 
 ## Subagents (Delegated Coding)
 
 Spawn a registered coder (Claude Code, Codex) to execute a delegated
-prompt:
+prompt. From inside chat the agent should use the `spawn_subagent` tool;
+the same call reaches the API path below.
+
+API: `POST /api/subagents { name, prompt }`, `GET /api/subagents`.
+
+Human-operator CLI mirror:
 
 ```bash
 gini subagents spawn <connector-name> "Implement and commit the fix."
 gini subagents list
 ```
-
-API: `POST /api/subagents { name, prompt }`, `GET /api/subagents`.
 
 For depth on prompting and tmux/PTY patterns, load `skills/agents/claude-code/SKILL.md`
 or `skills/agents/codex/SKILL.md` — those skills cover `--allowedTools`,
@@ -296,10 +341,18 @@ or `skills/agents/codex/SKILL.md` — those skills cover `--allowedTools`,
 Pinned memories ride the system prompt every turn. Long-term memory is
 pulled by embedding recall on each task.
 
-CLI: `gini memory {add|list|edit|delete|recall|reflect}`.
+The agent has three tools for memory: `recall_memory` for explicit
+mid-task lookups (distinct from the automatic recall that runs at task
+start), `add_memory` to propose a new memory, and `update_memory` to
+edit an existing one in place. `add_memory` always lands as `proposed`
+and requires user approval via the memory review flow — same gate as
+the memory reflection pipeline.
+
 API: `POST /api/memory { content, status }`, `GET /api/memory`,
 `PATCH /api/memory/<id>`, `DELETE /api/memory/<id>`,
 `POST /api/memory/<id>/approve`, `POST /api/memory/recall { query, tokenBudget, bankId }`.
+
+Human-operator CLI mirror: `gini memory {add|list|edit|delete|recall|reflect}`.
 
 Keep pinned memories short — every active row costs context every turn.
 
@@ -310,32 +363,51 @@ User-installed skills land at
 `~/.gini/instances/<inst>/skills/<category>/<name>/SKILL.md`. The runtime
 loads both on boot.
 
-CLI: `gini skills {list|show|enable|disable|test|rollback|validate|search}`.
+To load a skill's body from inside chat use the `read_skill` tool —
+that's the agent's path. For lifecycle operations the agent has three
+tools: `install_skill` (lands a raw SKILL.md body), `enable_skill`, and
+`disable_skill`. The `meta/install-skill` skill still drives the full
+install UX (parsing pasted descriptions, drafting frontmatter); these
+tools are the fast path when the SKILL.md text is already in hand.
+
 API: `GET /api/skills[/<id>]`, `POST /api/skills`,
 `POST /api/skills/<id>/{enable,disable,test,rollback}`,
 `PATCH /api/skills/<id>`, `GET /api/skills/validate`.
 
-To install a SKILL.md the user pasted or linked, use the `meta/install-skill`
-skill. To draft a new one, use `meta/create-skill`.
+Human-operator CLI mirror: `gini skills {list|show|enable|disable|test|rollback|validate|search}`.
+
+To draft a new SKILL.md interactively, use `meta/create-skill`.
 
 ## Approvals
 
-The runtime gates anything classified `high` risk through the approval
-queue when `approvalMode` is `strict` or `auto`. `high` covers
-`browser.upload_file` (hard-coded) plus any tool whose name contains
-`write`, `exec`, `invoke`, or `send` — so `file.write`, `terminal.exec`,
-MCP `invoke` calls, messaging `send`, and similar all queue by default.
-Browser interactive actions (`browser.click`, `browser.type`,
-`browser.drag`, `browser.select_option`, `browser.tabs.{new,switch,close}`)
-are `medium` and trace via snapshot evidence — they do not block on
-approval. **The agent should propose `high`-risk actions and surface them
-to the queue — not refuse them.**
+The runtime classifies `browser.upload_file` (hard-coded) plus any tool
+whose name contains `write`, `exec`, or `send` as `high` risk.
+`file.write`, `terminal.exec`, `messaging.send`, and similar all run
+through the approval seam. Browser interactive actions
+(`browser.click`, `browser.type`, `browser.drag`, `browser.select_option`,
+`browser.tabs.{new,switch,close}`) are `medium` and trace via snapshot
+evidence — they do not block on approval. **The agent should propose
+`high`-risk actions and surface them to the queue — not refuse them.**
 
-```bash
-gini approval list
-gini approval approve <id>
-gini approval deny <id>
-```
+`approvalMode` lives on the runtime config and decides how the seam
+treats each `high`-risk call: `strict | auto | yolo`. Set via
+`PATCH /api/settings/auto-approve`.
+
+- **strict** — the side effect blocks until a human approves the row
+  via `POST /api/approvals/<id>/approve` (or denies it).
+- **auto** — the approval row is created with `status: "pending"`,
+  then the runtime auto-resolves it (`status: "approved"`) and runs
+  the side effect without waiting for a human. The audit trail is
+  complete: the resolution audit row carries
+  `evidence.autoApproved: true` plus `autoApprovedReason:
+  "approval-mode-auto"`. Default.
+- **yolo** — the approval row is still written and resolved
+  through the same auto-approve path, but the policy seam skips its
+  per-action gate check entirely. The resolution audit row carries
+  `evidence.autoApproved: true` plus `autoApprovedReason:
+  "approval-mode-yolo"`, so the audit trail stays complete; only the
+  wait disappears. Use only when the user has explicitly asked for
+  that risk profile.
 
 ```http
 GET  /api/approvals
@@ -343,19 +415,27 @@ POST /api/approvals/<id>/approve
 POST /api/approvals/<id>/deny
 ```
 
-`approvalMode` lives on the runtime config: `strict | auto | yolo`. Set
-via `PATCH /api/settings/auto-approve`. `yolo` skips the queue entirely —
-only use it when the user has explicitly asked for that risk profile.
+Human-operator CLI mirror:
+
+```bash
+gini approval list
+gini approval approve <id>
+gini approval deny <id>
+```
 
 ## Troubleshooting
 
-**Telegram bridge stuck in `error` after `gini messaging health`** — check
-`bridge.message`. `Telegram bot token is missing — recreate the bridge
-with a botToken.` means the token never landed; re-run
-`gini messaging add my-bot telegram --bot-token <BOT_TOKEN>` with the real
-token. Any other message is the raw Telegram error from `getMe()`; the
-most common is `Unauthorized` from a bad or revoked token — re-copy the
-token from BotFather and recreate the bridge.
+**Telegram bridge stuck in `error` after health probe** — re-probe via
+`POST /api/messaging/<id>/health`; the response is the updated bridge
+record with its `message` field set. `Telegram bot token is missing —
+recreate the bridge with a botToken.` means the token never landed;
+recreate the bridge with the real token via `POST /api/messaging`
+(`{ name, kind: "telegram", deliveryTargets: [], botToken: "<BOT_TOKEN>" }`).
+Any other message is the raw Telegram error from `getMe()`; the most
+common is `Unauthorized` from a bad or revoked token — re-copy the token
+from BotFather and recreate the bridge. (Human-operator CLI mirror:
+`gini messaging health`, then
+`gini messaging add my-bot telegram --bot-token <BOT_TOKEN>`.)
 
 **Headless browser launch fails with "Failed to launch Chromium"** — the
 error message ends with `Run \`bunx playwright install chromium\` to
@@ -374,16 +454,23 @@ recommends managed mode. Prefer `POST /api/browser/connect` with an empty
 body (managed Chrome window) over passing a `cdpUrl`.
 
 **User says a high-risk action is "stuck"** — it is sitting in the
-approval queue. Run `gini approval list` to see pending items, then
-`approve <id>` or `deny <id>`. The agent should never refuse a high-risk
-action up front — propose it, let it land in the queue, and wait for the
-user's decision.
+approval queue. Fetch `GET /api/approvals` to see pending items, then
+`POST /api/approvals/<id>/approve` or `/deny`. (Human-operator CLI mirror:
+`gini approval list`, then `approve <id>` or `deny <id>`.) The agent
+should never refuse a high-risk action up front — propose it, let it
+land in the queue, and wait for the user's decision.
 
 ## Rules
 
 1. Do not refuse a capability without first checking this skill and the
    approval queue. Propose the action; let the user approve.
-2. Prefer the API for state queries; the CLI is a wrapper.
+2. **Gini operates through `/api/*` and registered tools — never shells
+   out to its own CLI.** Calling `gini ...` via `terminal_exec` is a
+   layering inversion: the CLI is just a wrapper that posts to the same
+   endpoints. For state queries, runtime mutations, and capability
+   invocations, use the API directly (or the matching registered tool
+   when one exists, e.g. `create_job`, `list_jobs`, `update_job`,
+   `delete_job`, `run_job`, `spawn_subagent`, `read_skill`).
 3. Never read `~/.gini/instances/<inst>/*.json` directly — call `/api/*`.
 4. Persistent browser cookies are a feature. For sign-in, open managed
    mode once; do not ask the user to re-authenticate on every run.

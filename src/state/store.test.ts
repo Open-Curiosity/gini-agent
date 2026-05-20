@@ -210,6 +210,109 @@ describe("normalizeState toolset/tool backfill", () => {
   });
 });
 
+describe("backfillDefaultAgentToolsets", () => {
+  test("legacy state with the prior default whitelist gains messaging and mcp", () => {
+    const state = createEmptyState("test-instance-agent-backfill-legacy");
+    const agent = state.agents.find((a) => a.id === "agent_default");
+    expect(agent).toBeDefined();
+    // Simulate an upgraded instance whose default agent still carries
+    // the prior whitelist (pre-messaging/mcp addition).
+    agent!.toolsets = ["file", "terminal", "memory", "session_search", "delegation"];
+
+    const normalized = normalizeState("test-instance-agent-backfill-legacy", state);
+    const after = normalized.agents.find((a) => a.id === "agent_default");
+    expect(after).toBeDefined();
+    expect(after!.toolsets).toContain("messaging");
+    expect(after!.toolsets).toContain("mcp");
+    // Original entries preserved.
+    for (const name of ["file", "terminal", "memory", "session_search", "delegation"]) {
+      expect(after!.toolsets).toContain(name);
+    }
+    // Audit row landed so the backfill is traceable.
+    const audit = normalized.audit.find(
+      (e) => e.action === "agent.toolsets.backfilled" && e.target === "agent_default"
+    );
+    expect(audit).toBeDefined();
+    expect((audit?.evidence as { added?: string[] })?.added).toEqual(["messaging", "mcp"]);
+  });
+
+  test("customized state (user removed terminal) is left untouched", () => {
+    const state = createEmptyState("test-instance-agent-backfill-custom");
+    const agent = state.agents.find((a) => a.id === "agent_default");
+    expect(agent).toBeDefined();
+    // User removed `terminal` — list no longer matches the prior default
+    // exactly, so the migration should leave it alone.
+    agent!.toolsets = ["file", "memory", "session_search", "delegation"];
+
+    const normalized = normalizeState("test-instance-agent-backfill-custom", state);
+    const after = normalized.agents.find((a) => a.id === "agent_default");
+    expect(after).toBeDefined();
+    expect(after!.toolsets).toEqual(["file", "memory", "session_search", "delegation"]);
+    expect(after!.toolsets).not.toContain("messaging");
+    expect(after!.toolsets).not.toContain("mcp");
+    // No backfill audit row written.
+    const audit = normalized.audit.find(
+      (e) => e.action === "agent.toolsets.backfilled" && e.target === "agent_default"
+    );
+    expect(audit).toBeUndefined();
+  });
+
+  test("fresh state without an agent_default row is a no-op", () => {
+    const state = createEmptyState("test-instance-agent-backfill-noagent");
+    // Replace the seeded default with a differently-named agent so the
+    // lookup misses entirely.
+    state.agents = [{
+      id: "agent_other",
+      instance: "test-instance-agent-backfill-noagent",
+      name: "other",
+      status: "active",
+      providerName: undefined,
+      model: undefined,
+      toolsets: ["file", "terminal", "memory", "session_search", "delegation"],
+      messagingTargets: [],
+      createdAt: state.agents[0].createdAt,
+      updatedAt: state.agents[0].updatedAt
+    }];
+    state.activeAgentId = "agent_other";
+
+    const normalized = normalizeState("test-instance-agent-backfill-noagent", state);
+    // The non-default agent is untouched even though its whitelist
+    // matches the prior default set — the migration only targets
+    // `agent_default`.
+    const other = normalized.agents.find((a) => a.id === "agent_other");
+    expect(other!.toolsets).toEqual(["file", "terminal", "memory", "session_search", "delegation"]);
+    const audit = normalized.audit.find(
+      (e) => e.action === "agent.toolsets.backfilled"
+    );
+    expect(audit).toBeUndefined();
+  });
+
+  test("already-migrated state (messaging + mcp present) is idempotent", () => {
+    const state = createEmptyState("test-instance-agent-backfill-idempotent");
+    // createEmptyState seeds the new default which already includes
+    // `messaging` and `mcp`. No backfill should fire.
+    const before = state.agents.find((a) => a.id === "agent_default")!.toolsets.slice();
+    expect(before).toContain("messaging");
+    expect(before).toContain("mcp");
+
+    const normalized = normalizeState("test-instance-agent-backfill-idempotent", state);
+    const after = normalized.agents.find((a) => a.id === "agent_default");
+    expect(after!.toolsets).toEqual(before);
+    const audit = normalized.audit.find(
+      (e) => e.action === "agent.toolsets.backfilled"
+    );
+    expect(audit).toBeUndefined();
+
+    // Running normalizeState a second time on the already-migrated state
+    // is still a no-op — no second audit row appears.
+    const renormalized = normalizeState("test-instance-agent-backfill-idempotent", normalized);
+    const audits = renormalized.audit.filter(
+      (e) => e.action === "agent.toolsets.backfilled"
+    );
+    expect(audits.length).toBe(0);
+  });
+});
+
 describe("applyLegacyTelegramPairingMigration", () => {
   test("mints a pairing code for a legacy telegram bridge that polled before the allowlist landed (lastOffset present, no allowedChatIds, no pairingCode)", () => {
     const state = createEmptyState("test-instance-tg-legacy");

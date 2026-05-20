@@ -231,6 +231,22 @@ describe("messaging telegram wiring", () => {
     expect(opts).toBeUndefined();
   });
 
+  test("sendMessagingOutput threads its AbortSignal into the Telegram client", async () => {
+    const config = testConfig("telegram-send-signal");
+    const { client, calls } = stubClient();
+    setMessagingDeps({ telegramClientFactory: () => client });
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+    const controller = new AbortController();
+    await sendMessagingOutput(config, bridge.id, { text: "hi" }, { signal: controller.signal });
+    const [, , opts] = calls[0]!.args as [string, string, { signal?: AbortSignal } | undefined];
+    expect(opts?.signal).toBe(controller.signal);
+  });
+
   test("sendMessagingOutput marks the message failed when Telegram throws", async () => {
     const config = testConfig("telegram-send-err");
     setMessagingDeps({

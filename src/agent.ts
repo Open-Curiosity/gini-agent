@@ -60,6 +60,7 @@ import {
 } from "./execution/approval-execution";
 import { syncSubagentFromTask } from "./capabilities/subagents";
 import { resolveActiveSkillsEnv } from "./integrations/connectors";
+import { sendMessagingOutput } from "./integrations/messaging";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
 // the cycle that runs through submitTask. The finalizer flips the linked
 // JobRunRecord from "running" to a terminal status when a Task with a
@@ -197,9 +198,25 @@ export async function retryTask(config: RuntimeConfig, taskId: string): Promise<
   return task;
 }
 
-export async function cancelTask(config: RuntimeConfig, taskId: string): Promise<Task> {
+export async function cancelTask(
+  config: RuntimeConfig,
+  taskId: string,
+  // Optional parent-task guard. When set and equal to `taskId`, refuse
+  // inside the serialized mutateState callback BEFORE any state change.
+  // Mirrors the pattern run_job uses to close the race window between a
+  // lock-free pre-check and the mutation: callers that need a strict
+  // self-cancel guard pass their own taskId here. cancel_task does that.
+  // Callers without that requirement (HTTP `/api/tasks/:id/cancel`)
+  // omit the arg and keep their original behavior.
+  parentTaskId?: string
+): Promise<Task> {
   const task = await mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
+    if (parentTaskId !== undefined && parentTaskId === taskId) {
+      throw new Error(
+        "Cannot cancel the current task — that would terminate the running conversation."
+      );
+    }
     if (isTerminalTaskStatus(task.status)) return task;
     task.status = "cancelled";
     task.currentStep = "Cancelled";
@@ -1005,6 +1022,9 @@ export function mapApprovalToPolicyAction(
   if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
     return action;
   }
+  if (action === "messaging.send") {
+    return action;
+  }
   return undefined;
 }
 
@@ -1789,6 +1809,79 @@ async function runApprovedAction(
     }
     return result;
   }
+
+  if (approval.action === "messaging.send") {
+    const bridgeId = String(approval.payload.bridgeId ?? "");
+    const text = String(approval.payload.text ?? "");
+    const target = typeof approval.payload.target === "string" ? approval.payload.target : undefined;
+    if (signal.aborted) {
+      const aborted = JSON.stringify({ success: false, aborted: true, error: "messaging.send aborted: task was cancelled." });
+      if (approval.taskId) {
+        appendTrace(config.instance, approval.taskId, {
+          type: "tool",
+          message: "messaging.send aborted by task cancellation",
+          data: { bridgeId, target, aborted: true }
+        });
+      }
+      return aborted;
+    }
+    let resultPayload: { ok: boolean; messageId?: string; status?: string; error?: string };
+    try {
+      // Thread the task's abort signal through so a cancel that races
+      // in after approval but before the Telegram/Discord POST completes
+      // tears the request down instead of egressing the message. The
+      // bridge's outbound HTTP path already wires the signal into
+      // fetch(); this is the seam that hands it across.
+      const message = await sendMessagingOutput(
+        config,
+        bridgeId,
+        { text, target, taskId: approval.taskId },
+        { signal }
+      );
+      resultPayload = { ok: message.status === "sent", messageId: message.id, status: message.status, error: message.error ?? undefined };
+    } catch (error) {
+      resultPayload = { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    const task = await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "messaging.send",
+          target: bridgeId,
+          risk: "high",
+          taskId: approval.taskId,
+          runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+          approvalId: approval.id,
+          evidence: {
+            ...extraEvidence,
+            bridgeId,
+            target: target ?? null,
+            textBytes: text.length,
+            ok: resultPayload.ok,
+            messageId: resultPayload.messageId ?? null,
+            error: resultPayload.error ?? null
+          }
+        },
+        approvalAgentContext(approval)
+      );
+      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
+    });
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: "tool",
+        message: "messaging.send completed",
+        data: { bridgeId, target, ok: resultPayload.ok, messageId: resultPayload.messageId, error: resultPayload.error }
+      });
+    }
+    if (task) await updateRunFromTask(config, task);
+    const resultStr = JSON.stringify(resultPayload);
+    if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);
+    }
+    return resultStr;
+  }
+
   return undefined;
 }
 

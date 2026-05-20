@@ -456,6 +456,60 @@ function migrateRecordAgentIds(state: RuntimeState): void {
   }
 }
 
+// Backfill `messaging` and `mcp` onto the default agent's toolsets
+// whitelist when the agent still carries the prior default set exactly
+// (`["file","terminal","memory","session_search","delegation"]`). Without
+// this, an instance created before the messaging+mcp toolsets joined the
+// default whitelist keeps gating `send_message` out via the per-agent
+// intersection even after the operator enables those toolsets. The
+// exact-match heuristic catches the common case (the user never
+// customized the list) without overriding intentional removals — any
+// customization (added or removed entries) leaves the agent alone.
+// Idempotent: a state file already on the new shape (the union already
+// includes both names, OR the user has customized the list) is a no-op.
+const PRIOR_DEFAULT_AGENT_TOOLSETS = [
+  "file",
+  "terminal",
+  "memory",
+  "session_search",
+  "delegation"
+] as const;
+function backfillDefaultAgentToolsets(state: RuntimeState): void {
+  // Defensive: iterate every agent_default row in case a corrupt state
+  // file ended up with duplicates. The id uniqueness invariant should
+  // hold, but if it doesn't, migrating one and leaving the rest stale
+  // would be the worst outcome.
+  const candidates = state.agents.filter((candidate) => candidate.id === "agent_default");
+  for (const agent of candidates) {
+    const current = agent.toolsets ?? [];
+    // Order-insensitive exact match against the prior default. A set
+    // comparison catches reorders and matches the "user never customized"
+    // signal without depending on the historical write order.
+    if (current.length !== PRIOR_DEFAULT_AGENT_TOOLSETS.length) continue;
+    const currentSet = new Set(current);
+    let matches = true;
+    for (const name of PRIOR_DEFAULT_AGENT_TOOLSETS) {
+      if (!currentSet.has(name)) { matches = false; break; }
+    }
+    if (!matches) continue;
+    // Match. Union in `messaging` and `mcp` so the operator's later
+    // toolset-enable lands at a fully-resolved per-agent whitelist.
+    agent.toolsets = [...current, "messaging", "mcp"];
+    agent.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "agent.toolsets.backfilled",
+        target: agent.id,
+        risk: "low",
+        evidence: { added: ["messaging", "mcp"], agentId: agent.id }
+      },
+      { agentId: agent.id }
+    );
+  }
+}
+
 // Phase C — per-agent backfill on the SQLite hindsight store. Pre-Phase-C
 // rows have a NULL agent_id (default value from the ALTER TABLE). Walk the
 // DB once and stamp them with the migration-time active agent, mirroring
@@ -608,6 +662,11 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   if (!state.agents.some((agent) => agent.id === state.activeAgentId)) {
     state.activeAgentId = state.agents.find((item) => item.status === "active")?.id ?? state.agents[0]?.id;
   }
+  // Backfill the default agent's toolsets whitelist with `messaging` and
+  // `mcp` when the agent still carries the prior default set exactly.
+  // Runs after the default-agent seed branch above so the migration sees
+  // a real `agent_default` row when one was just synthesized. Idempotent.
+  backfillDefaultAgentToolsets(state);
   // Phase C — per-agent memory isolation backfill. Runs after agents are
   // present so the migration can stamp the right id. Both helpers are
   // idempotent so a re-read of an already-migrated state file is a no-op.

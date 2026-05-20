@@ -1534,6 +1534,222 @@ describe("cron lifecycle", () => {
     expect(after).toBeDefined();
   });
 
+  test("run_job dispatch rejects missing jobId", async () => {
+    const config = testConfig("jobs-run-tool-bad-1");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "run_job",
+        "call_run_bad",
+        JSON.stringify({})
+      )
+    ).rejects.toThrow(/jobId/);
+  });
+
+  test("run_job dispatch rejects unknown jobId", async () => {
+    const config = testConfig("jobs-run-tool-missing");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "run_job",
+        "call_run_unknown",
+        JSON.stringify({ jobId: "job_nope" })
+      )
+    ).rejects.toThrow(/Job not found/);
+  });
+
+  test("run_job dispatch refuses to mutate when parent task is terminal", async () => {
+    // Same defense-in-depth as update_job / delete_job: a cancelled
+    // parent task must not be able to fire a fresh job run through the
+    // agent tool path. The tool handler does a lock-free pre-check and
+    // `runJobNow` re-checks inside its serialized `mutateState` block; this
+    // test exercises the pre-check path.
+    const config = testConfig("jobs-run-tool-terminal");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "to-fire", script: "true", intervalSeconds: 60 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      task.status = "cancelled";
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "run_job",
+      "call_run_terminal",
+      JSON.stringify({ jobId: job.id })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toMatch(/Error: run_job skipped/);
+    }
+    // No new JobRunRecord was created.
+    const runs = readState(config.instance).jobRuns.filter((r) => r.jobId === job.id);
+    expect(runs).toHaveLength(0);
+  });
+
+  test("run_job dispatch fires a prompt job, spawns a task, and writes job.run.manual audit", async () => {
+    const config = testConfig("jobs-run-tool-happy");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "manual-fire",
+        prompt: "ping",
+        intervalSeconds: 3600
+      })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "run_job",
+      "call_run_happy",
+      JSON.stringify({ jobId: job.id })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toContain(job.id);
+      expect(result.result).toContain("manual-fire");
+      expect(result.result).toMatch(/run /);
+      expect(result.result).toMatch(/task /);
+    }
+
+    // A new JobRunRecord exists with a spawned task linked.
+    const runs = readState(config.instance).jobRuns.filter((r) => r.jobId === job.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.trigger).toBe("manual");
+    expect(runs[0]?.taskId).toBeDefined();
+
+    // The audit row uses action "job.run.manual" and points at the
+    // spawned task + new run id.
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.run.manual" && event.target === job.id && event.actor === "agent"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.jobId).toBe(job.id);
+    expect(audit?.evidence?.runId).toBe(runs[0]?.id);
+    expect(audit?.evidence?.spawnedTaskId).toBe(runs[0]?.taskId);
+  });
+
+  test("run_job dispatch reports script-job success with exit 0", async () => {
+    // Script-backed jobs execute synchronously inside `runJobNow`, so by
+    // the time the tool returns the run is already complete. The handler
+    // must report the exit code (not "Triggered ...") and the audit row
+    // must pin exitCode for postmortems.
+    const config = testConfig("jobs-run-tool-script-ok");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "script-ok", script: "true", intervalSeconds: 3600 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "run_job",
+      "call_run_script_ok",
+      JSON.stringify({ jobId: job.id })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toContain(job.id);
+      expect(result.result).toContain("script-ok");
+      expect(result.result).toMatch(/completed/);
+      expect(result.result).toMatch(/exit 0/);
+    }
+
+    const runs = readState(config.instance).jobRuns.filter((r) => r.jobId === job.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.trigger).toBe("manual");
+    // Script jobs don't spawn a task.
+    expect(runs[0]?.taskId).toBeUndefined();
+
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.run.manual" && event.target === job.id && event.actor === "agent"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.jobId).toBe(job.id);
+    expect(audit?.evidence?.runId).toBe(runs[0]?.id);
+    expect(audit?.evidence?.exitCode).toBe(0);
+  });
+
+  test("run_job dispatch reports script-job failure with non-zero exit", async () => {
+    // Failure path: tool return string must say "failed", surface the
+    // non-zero exit, and the audit row must capture exitCode so
+    // postmortems don't have to cross-reference the JobRun record.
+    const config = testConfig("jobs-run-tool-script-fail");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "script-fail", script: "exit 1", intervalSeconds: 3600 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "run_job",
+      "call_run_script_fail",
+      JSON.stringify({ jobId: job.id })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toContain(job.id);
+      expect(result.result).toContain("script-fail");
+      expect(result.result).toMatch(/failed/);
+      expect(result.result).toMatch(/exit 1/);
+    }
+
+    const runs = readState(config.instance).jobRuns.filter((r) => r.jobId === job.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.trigger).toBe("manual");
+    expect(runs[0]?.status).toBe("failed");
+
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.run.manual" && event.target === job.id && event.actor === "agent"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.jobId).toBe(job.id);
+    expect(audit?.evidence?.runId).toBe(runs[0]?.id);
+    expect(audit?.evidence?.exitCode).toBe(1);
+  });
+
   test("scheduled prompt job with chatSessionId delivers an assistant chat message", async () => {
     // End-to-end test: create a job linked to a chat session, force its
     // nextRunAt into the past, let runDueJobs claim + dispatch it, wait

@@ -49,7 +49,8 @@ through the same loop. So the loop comes first.
 - `src/execution/tool-dispatch.ts` is the per-tool handler: low-risk
   tools (`file_read`, `file_list`, `file_search`, `web_fetch`) execute
   synchronously and return a string; high-risk tools (`file_write`,
-  `file_patch`, `terminal_exec`, `code_exec`) create an `Approval` with
+  `file_patch`, `terminal_exec`, `code_exec`, `browser_upload_file`,
+  `send_message`) create an `Approval` with
   the originating `tool_call_id` on `payload.toolCallId`.
 - The loop snapshots the conversation on `Task.toolCallState` when at
   least one approval is pending, transitions the task to
@@ -72,12 +73,13 @@ through the same loop. So the loop comes first.
       matched pattern on the `terminal.exec` audit row's
       `evidence.autoApprovedReason`.
     - Under `approvalMode: "auto"` (the default), safe actions
-      (file_write, file_patch, code_exec, browser_upload_file) and
-      non-dangerous terminal commands still create an approval row,
-      but `resolveApprovalPolicy` auto-resolves it through the same
-      `resolveApproval` -> `executeApprovedAction` pipeline a human
-      would take. The `approval.approved` and per-action audit rows
-      carry `evidence.autoApprovedReason="approval-mode-auto"`.
+      (file_write, file_patch, code_exec, browser_upload_file,
+      send_message) and non-dangerous terminal commands
+      still create an approval row, but `resolveApprovalPolicy`
+      auto-resolves it through the same `resolveApproval` ->
+      `executeApprovedAction` pipeline a human would take. The
+      `approval.approved` and per-action audit rows carry
+      `evidence.autoApprovedReason="approval-mode-auto"`.
     - Under `approvalMode: "yolo"`, every approval-eligible action
       auto-resolves with `evidence.autoApprovedReason="approval-mode-yolo"`.
     - Dangerous-pattern hits under `"auto"` still gate; the matched

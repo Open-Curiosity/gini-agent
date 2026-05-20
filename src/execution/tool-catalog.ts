@@ -603,6 +603,223 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
         required: ["jobId"]
       }
     }
+  },
+  {
+    // Install a skill from a raw SKILL.md body. Companion to the existing
+    // meta/install-skill agent skill (which the agent invokes when the
+    // user shares a skill description inline). This tool is the direct
+    // API path — use it when you already have the SKILL.md text in hand
+    // and just need to land it on the runtime.
+    toolset: "skills",
+    type: "function",
+    function: {
+      name: "install_skill",
+      description: "Install a skill from a raw SKILL.md document. Validates the manifest, writes it under the instance's skills directory, and reloads the skill registry. Use when the user shares a SKILL.md body (or you generated one) and wants it active. Companion to the meta/install-skill agent skill — that skill drives the full UX flow; this tool is the direct API call.",
+      parameters: {
+        type: "object",
+        properties: {
+          body: { type: "string", description: "Full SKILL.md content (YAML frontmatter + markdown body)." },
+          category: { type: "string", description: "Optional category override. Defaults to metadata.gini.category in the frontmatter, then 'user'." },
+          files: {
+            type: "array",
+            description: "Optional named-file payloads written next to SKILL.md (e.g. scripts/linear.sh). Each entry's name is treated as a relative path under the skill folder and must not escape it.",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "Relative path under the skill folder." },
+                content: { type: "string", description: "File contents." }
+              },
+              required: ["name", "content"]
+            }
+          }
+        },
+        required: ["body"]
+      }
+    }
+  },
+  {
+    // Enable a skill so it shows up in the system prompt and read_skill
+    // can fetch its body. Low-risk; the underlying handler runs
+    // `setSkillStatus(config, idOrName, "enabled")` and writes a
+    // skill.enabled audit row.
+    toolset: "skills",
+    type: "function",
+    function: {
+      name: "enable_skill",
+      description: "Enable a registered skill so it appears in the advertised-skills block and the agent can read its body. Use after the user asks to turn a skill on (or after install_skill if the manifest didn't auto-enable). Trivial; no approval gate.",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: { type: "string", description: "Skill id or name (e.g. 'skill_abc123' or 'apple-notes')." }
+        },
+        required: ["skillId"]
+      }
+    }
+  },
+  {
+    // Disable a skill so it stops appearing in the system prompt and
+    // read_skill refuses to fetch its body. Low-risk; underlying handler
+    // writes a skill.disabled audit row.
+    toolset: "skills",
+    type: "function",
+    function: {
+      name: "disable_skill",
+      description: "Disable a registered skill so it stops appearing in the advertised-skills block. Use when the user asks to turn a skill off. Trivial; no approval gate. The skill's manifest stays on disk — re-enable with enable_skill when needed.",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: { type: "string", description: "Skill id or name (e.g. 'skill_abc123' or 'apple-notes')." }
+        },
+        required: ["skillId"]
+      }
+    }
+  },
+  {
+    // Cancel a task. Pairs with spawn_subagent for parent-side control
+    // of a runaway child. Low-risk; the underlying `cancelTask` already
+    // refuses on already-terminal tasks and cascades to child subagents.
+    // The self-cancel guard lives in the dispatcher (the current task
+    // cannot cancel itself — that would terminate the running
+    // conversation).
+    toolset: "subagents",
+    type: "function",
+    function: {
+      name: "cancel_task",
+      description: "Cancel a running task. Use for runaway subagents the user wants to abort, or to clean up an unrelated task. Refuses to cancel the CURRENT chat task — call cancellation never makes sense from inside the task it would terminate. Already-terminal tasks (completed / failed / cancelled) are returned as-is by the underlying handler.",
+      parameters: {
+        type: "object",
+        properties: {
+          taskId: { type: "string", description: "Id of the task to cancel (e.g. 'task_abc123')." }
+        },
+        required: ["taskId"]
+      }
+    }
+  },
+  {
+    // Outbound messaging via a configured bridge. High-risk: contains
+    // "send" → routed through the approval queue. In "auto" mode the
+    // policy seam auto-approves; "strict" gates every call. The user
+    // can pre-approve specific bridges or flip approvalMode at runtime.
+    toolset: "messaging",
+    type: "function",
+    function: {
+      name: "send_message",
+      description: "Send a message through a configured messaging bridge (Telegram, Discord, etc.). Approval-gated by default — the operator's approvalMode controls whether each call is auto-approved or queued. Pass `target` to choose a specific allow-listed chat; omit it to use the bridge's first allowed target. Use sparingly and only when the user has asked the agent to relay something to a chat — don't send a message just because one came in.",
+      parameters: {
+        type: "object",
+        properties: {
+          bridgeId: { type: "string", description: "Id or name of the messaging bridge (e.g. 'msg_abc123' or 'my-bot')." },
+          text: { type: "string", description: "Message body. Keep it concise — Telegram caps inbound text at 4096 chars." },
+          target: { type: "string", description: "Optional delivery target (chat id) on the bridge's allow-list. When omitted the bridge's first allowed target is used." }
+        },
+        required: ["bridgeId", "text"]
+      }
+    }
+  },
+  {
+    // Cross-session lookup. Scans past tasks, traces, memories, skills,
+    // and audit rows for a substring match. Low-risk; read-only.
+    toolset: "session_search",
+    type: "function",
+    function: {
+      name: "search_history",
+      description: "Search past chat sessions, task traces, stored memories, skill text, and audit events for a substring. Use when the user references something they did before ('did I ever ask about X?', 'find that conversation about Y'). Returns up to `limit` snippets ordered by score, each with kind (task/trace/memory/skill/audit), title, excerpt, and taskId when applicable.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Substring to search for (case-insensitive)." },
+          limit: { type: "number", description: "Maximum number of snippets to return. Defaults to 20, capped at 100." }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  {
+    // Explicit on-demand memory query. Distinct from the automatic
+    // embedding recall that runs per chat task — this is the tool the
+    // model reaches for when the user asks about something specific
+    // ("did we discuss X?", "what do you remember about Y?"). Returns a
+    // compact summary so the model can decide whether to dig deeper or
+    // ask the user for clarification. Low-risk / no approval.
+    toolset: "memory",
+    type: "function",
+    function: {
+      name: "recall_memory",
+      description: "Explicit on-demand recall of stored memory. Use when the user references prior context (e.g. 'did we discuss X?', 'what do you remember about Y?'). Distinct from the automatic embedding recall that runs at the start of every task — call this when you need to fetch additional memory mid-conversation. Returns a compact JSON summary: unit count, total tokens, and an excerpt list (id, truncated content, score). Pass `tokenBudget` to cap pack size; pass `bankId` only when you need to query a specific bank (default: the active agent's bank).",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "The phrase to search memory for." },
+          tokenBudget: { type: "number", description: "Maximum tokens worth of memory units to return. Defaults to 2000." },
+          bankId: { type: "string", description: "Optional memory bank id to query. Defaults to the active agent's per-agent bank." }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  {
+    // Add a new memory item. Defaults `status: "proposed"` — the agent
+    // doesn't pin its own memory active; the user reviews via the existing
+    // approval flow (`POST /api/memory/<id>/approve`).
+    toolset: "memory",
+    type: "function",
+    function: {
+      name: "add_memory",
+      description: "Propose a new memory item. Memory items added by the agent start as `proposed` and require user approval via the memory review flow (`POST /api/memory/<id>/approve`). Use when the user shares a stable fact about themselves or their preferences that should ride the system prompt on future tasks. Avoid noting ephemeral context (it's already in the conversation) — propose only things worth remembering across sessions.",
+      parameters: {
+        type: "object",
+        properties: {
+          content: { type: "string", description: "The memory text (1-2 sentences). Keep it concise — pinned memories cost context every turn." },
+          confidence: { type: "number", description: "Confidence in the fact, 0-1. Defaults to 1. Lower for inferred facts." },
+          sensitivity: { type: "string", enum: ["normal", "sensitive"], description: "Mark `sensitive` for items the user wouldn't want surfaced in default UI views. Defaults to `normal`." },
+          provenance: { type: "string", description: "Short note about where the fact came from (e.g. 'User said in chat'). Defaults to 'Proposed by agent'." }
+        },
+        required: ["content"]
+      }
+    }
+  },
+  {
+    // Edit an existing memory in place. Use sparingly — `add_memory` is
+    // the usual path. The audit trail records every edit; the user can
+    // archive a bad edit via `DELETE /api/memory/<id>`.
+    toolset: "memory",
+    type: "function",
+    function: {
+      name: "update_memory",
+      description: "Edit an existing memory item in place (content / confidence / sensitivity). Use sparingly — `add_memory` is the usual path. The audit trail records every edit, and the user can archive a bad edit via `DELETE /api/memory/<id>`. Supply only the fields you want to change.",
+      parameters: {
+        type: "object",
+        properties: {
+          memoryId: { type: "string", description: "Id of the memory to edit (e.g. 'mem_abc123')." },
+          content: { type: "string", description: "Optional new memory text." },
+          confidence: { type: "number", description: "Optional new confidence value, 0-1." },
+          sensitivity: { type: "string", enum: ["normal", "sensitive"], description: "Optional new sensitivity classification." }
+        },
+        required: ["memoryId"]
+      }
+    }
+  },
+  {
+    // Manually trigger an existing scheduled job. Wraps the same
+    // `runJobNow` entrypoint that `POST /api/jobs/<id>/run` calls. Low-risk
+    // / no approval: the spawned task itself still flows through the job's
+    // configured `approvalMode` / `autoApproveCommands`, so any side
+    // effects inside the run are gated at their normal granularity. The
+    // tool only fires an EXISTING job — for one-off prompts use create_job
+    // with intervalSeconds + oneShot=true instead.
+    toolset: "jobs",
+    type: "function",
+    function: {
+      name: "run_job",
+      description: "Manually fire an EXISTING scheduled job right now. This is distinct from create_job: run_job triggers a job that has already been scheduled, while create_job defines a new one. Use this when the user says 'test this job now', 'fire the reminder', or 'run job X off-schedule'. Behavior differs by job kind: prompt-backed jobs spawn an async task — posting into the job's dedicated chat thread when one is configured — using the job's configured approvalMode / autoApproveCommands at fire-time, and the tool returns once the trigger lands (run id and spawned task id included); script-backed jobs (operator-installed only) execute synchronously and the tool returns the exit code, plus a truncated stderr tail on failure. Overlap protection only applies to scheduled triggers; a manual run CAN run alongside an in-flight scheduled run. Call list_jobs first if you don't already know the jobId.",
+      parameters: {
+        type: "object",
+        properties: {
+          jobId: { type: "string", description: "Id of the job to fire (e.g. 'job_a3aa6707'). Get this from list_jobs." }
+        },
+        required: ["jobId"]
+      }
+    }
   }
 ];
 
@@ -623,9 +840,15 @@ export function allTools(): ToolCatalogTool[] {
 // `agentToolsetFilter` is the optional active-agent whitelist (toolset
 // names). When set, it intersects with the enabled-toolset filter — a tool
 // passes only if its owning toolset is BOTH globally enabled AND in the
-// agent's whitelist. Always-on tools (web_fetch, read_skill,
-// spawn_subagent, create_job, list_jobs, update_job, delete_job) bypass
-// both filters.
+// agent's whitelist. Always-on tools bypass both filters: web_fetch,
+// read_skill, spawn_subagent, the scheduled-job surface (create_job,
+// list_jobs, update_job, delete_job, run_job), mcp_call, request_connector,
+// and the core agent-capability meta-tools that have no separate toolset
+// to gate them (cancel_task — sibling to spawn_subagent; install_skill /
+// enable_skill / disable_skill — siblings to read_skill). The surface-
+// gateway tool `send_message` (toolset `messaging`) stays subject to the
+// toolset enable/disable kill switch — operators disable that toolset to
+// hide outbound messaging entirely.
 export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<string>): ToolCatalogTool[] {
   const enabled = new Set(state.toolsets.filter((t) => t.status === "enabled").map((t) => t.name));
   return allTools().filter((tool) => {
@@ -641,17 +864,19 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // instances. Subagent path itself is depth-capped and audited.
     if (tool.function.name === "spawn_subagent") return true;
     // Always expose the full scheduled-job tool surface (create / list /
-    // update / delete). The "jobs" toolset isn't part of the legacy
+    // update / delete / run). The "jobs" toolset isn't part of the legacy
     // defaults; gating on enable would silently hide scheduling (and the
-    // chat-reminder delivery loop) on fresh instances. Exposing all four
+    // chat-reminder delivery loop) on fresh instances. Exposing the set
     // together also keeps composition coherent — without list_jobs the
-    // agent can't see existing jobs to pick the right id for update or
-    // delete, and that's how duplicates get created. Low-risk by design:
-    // the user can pause/delete any job from /jobs.
+    // agent can't see existing jobs to pick the right id for update,
+    // delete, or run, and that's how duplicates get created. Low-risk by
+    // design: the user can pause/delete any job from /jobs, and manual
+    // runs inherit the job's existing approval envelope.
     if (tool.function.name === "create_job") return true;
     if (tool.function.name === "list_jobs") return true;
     if (tool.function.name === "update_job") return true;
     if (tool.function.name === "delete_job") return true;
+    if (tool.function.name === "run_job") return true;
     // mcp_call is a runtime capability not bound to a legacy toolset row.
     // Gating it on the "mcp" toolset would silently hide MCP usage on
     // fresh instances even when a user has configured a server, so it
@@ -664,6 +889,24 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // inactive — gating on a legacy toolset would silently disable the
     // onboarding path.
     if (tool.function.name === "request_connector") return true;
+    // Always expose the core agent-capability meta-tools whose owning
+    // toolsets aren't in the legacy defaults (`skills`, `subagents`).
+    // Gating these on a toolset toggle would mean a fresh instance
+    // literally can't see them, even though they're the right path for
+    // common asks ("cancel that subagent", "install this skill"). They
+    // sit alongside their already-always-on siblings (cancel_task next
+    // to spawn_subagent; install/enable/disable_skill next to
+    // read_skill). When the underlying resource isn't configured the
+    // tool handler surfaces a clear error — that's the correct UX, not
+    // "tool didn't exist". Note: `send_message` (toolset `messaging`)
+    // is deliberately NOT in this bypass — it's a surface-gateway tool
+    // (outbound messaging) where the operator's toolset kill switch
+    // must work. Its toolset defaults disabled; flipping the toolset
+    // to enabled is how the operator turns it on.
+    if (tool.function.name === "cancel_task") return true;
+    if (tool.function.name === "install_skill") return true;
+    if (tool.function.name === "enable_skill") return true;
+    if (tool.function.name === "disable_skill") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;

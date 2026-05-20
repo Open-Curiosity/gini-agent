@@ -1,11 +1,12 @@
 // Central approval-policy seam.
 //
 // Every approval-eligible tool call (file.write, file.patch,
-// terminal.exec, code_exec via terminal.exec, browser.upload_file) goes
-// through `resolveApprovalPolicy` before deciding whether to gate or
-// auto-approve. Keeping the decision in one module is the load-bearing
-// invariant — duplicating the policy across dispatchers / agent paths
-// would silently drift "auto" / "yolo" / "strict" semantics over time.
+// terminal.exec, code.exec via terminal.exec, browser.upload_file,
+// messaging.send) goes through `resolveApprovalPolicy`
+// before deciding whether to gate or auto-approve. Keeping the
+// decision in one module is the load-bearing invariant — duplicating
+// the policy across dispatchers / agent paths would silently drift
+// "auto" / "yolo" / "strict" semantics over time.
 //
 // See ADR approval-mode.md for the user-facing contract.
 //
@@ -44,7 +45,8 @@ export type PolicyAction =
   | "file.patch"
   | "terminal.exec"
   | "code.exec"
-  | "browser.upload_file";
+  | "browser.upload_file"
+  | "messaging.send";
 
 export interface TerminalExecPayload {
   command: string;
@@ -100,6 +102,14 @@ export function resolveApprovalPolicy(
 
   // mode === "auto"
   if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
+    return { mode: "auto", reason: "approval-mode-auto" };
+  }
+
+  // messaging.send egresses data. In "auto" mode we let it through so
+  // the agent can drive normal automations (a Telegram reply) without
+  // prompting; "strict" still gates each call. Operators who want
+  // stricter messaging control can flip to "strict" globally.
+  if (action === "messaging.send") {
     return { mode: "auto", reason: "approval-mode-auto" };
   }
 
