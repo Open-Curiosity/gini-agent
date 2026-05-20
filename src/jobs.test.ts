@@ -1655,6 +1655,100 @@ describe("cron lifecycle", () => {
     expect(audit?.evidence?.spawnedTaskId).toBe(runs[0]?.taskId);
   });
 
+  test("run_job dispatch reports script-job success with exit 0", async () => {
+    // Script-backed jobs execute synchronously inside `runJobNow`, so by
+    // the time the tool returns the run is already complete. The handler
+    // must report the exit code (not "Triggered ...") and the audit row
+    // must pin exitCode for postmortems.
+    const config = testConfig("jobs-run-tool-script-ok");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "script-ok", script: "true", intervalSeconds: 3600 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "run_job",
+      "call_run_script_ok",
+      JSON.stringify({ jobId: job.id })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toContain(job.id);
+      expect(result.result).toContain("script-ok");
+      expect(result.result).toMatch(/completed/);
+      expect(result.result).toMatch(/exit 0/);
+    }
+
+    const runs = readState(config.instance).jobRuns.filter((r) => r.jobId === job.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.trigger).toBe("manual");
+    // Script jobs don't spawn a task.
+    expect(runs[0]?.taskId).toBeUndefined();
+
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.run.manual" && event.target === job.id && event.actor === "agent"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.jobId).toBe(job.id);
+    expect(audit?.evidence?.runId).toBe(runs[0]?.id);
+    expect(audit?.evidence?.exitCode).toBe(0);
+  });
+
+  test("run_job dispatch reports script-job failure with non-zero exit", async () => {
+    // Failure path: tool return string must say "failed", surface the
+    // non-zero exit, and the audit row must capture exitCode so
+    // postmortems don't have to cross-reference the JobRun record.
+    const config = testConfig("jobs-run-tool-script-fail");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "script-fail", script: "exit 1", intervalSeconds: 3600 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "run_job",
+      "call_run_script_fail",
+      JSON.stringify({ jobId: job.id })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toContain(job.id);
+      expect(result.result).toContain("script-fail");
+      expect(result.result).toMatch(/failed/);
+      expect(result.result).toMatch(/exit 1/);
+    }
+
+    const runs = readState(config.instance).jobRuns.filter((r) => r.jobId === job.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.trigger).toBe("manual");
+    expect(runs[0]?.status).toBe("failed");
+
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.run.manual" && event.target === job.id && event.actor === "agent"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.jobId).toBe(job.id);
+    expect(audit?.evidence?.runId).toBe(runs[0]?.id);
+    expect(audit?.evidence?.exitCode).toBe(1);
+  });
+
   test("scheduled prompt job with chatSessionId delivers an assistant chat message", async () => {
     // End-to-end test: create a job linked to a chat session, force its
     // nextRunAt into the past, let runDueJobs claim + dispatch it, wait

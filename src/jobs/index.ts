@@ -645,8 +645,25 @@ async function dispatchPromptRun(
   return { jobId: job.id, runId: run.id, taskId: task.id };
 }
 
-export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "schedule" | "manual" | "replay" = "manual") {
+export async function runJobNow(
+  config: RuntimeConfig,
+  jobId: string,
+  trigger: "schedule" | "manual" | "replay" = "manual",
+  parentTaskId?: string
+) {
   const claim = await mutateState(config.instance, (state) => {
+    // When invoked from the agent tool path with a `parentTaskId`, refuse
+    // to fire if the parent task has gone terminal. The lock-free
+    // pre-check in the tool handler is the fast path; this serialized
+    // re-check is the authoritative guard against a `cancelTask` landing
+    // between the pre-check and our write. Mirrors `updateJob`,
+    // `updateJobStatus`, and `removeJob`.
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot run job: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
     const item = state.jobs.find((candidate) => candidate.id === jobId);
     if (!item) throw new Error(`Job not found: ${jobId}`);
     // Overlap protection for scheduled triggers: refuse to start a second

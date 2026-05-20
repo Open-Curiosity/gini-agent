@@ -1196,14 +1196,11 @@ async function runJobTool(
 ): Promise<string> {
   const jobId = requireString(args, "jobId");
 
-  // Pre-side-effect terminal check. Mirrors the guard in delete_job /
-  // update_job: a cancelled or failed parent task must not be able to
-  // spawn fresh work through the agent tool path. `runJobNow` itself has
-  // no `parentTaskId` re-check, so this pre-check is the only guard — but
-  // because the spawned task is a sibling (not a child) of the parent
-  // task, the worst case if a race squeezes through is one extra task
-  // appearing right after cancellation, which `finalizeJobRunFromTask`
-  // will eventually settle just like any other job run.
+  // Pre-side-effect terminal check. Lock-free fast path: avoid touching
+  // the state lock when the parent task is already terminal. The
+  // serialized re-check inside `runJobNow` (via `parentTaskId`) is the
+  // authoritative guard against a `cancelTask` landing between this
+  // pre-check and our write.
   {
     const state = readState(config.instance);
     const task = state.tasks.find((item) => item.id === taskId);
@@ -1218,7 +1215,7 @@ async function runJobTool(
   const before = listJobs(config).find((candidate) => candidate.id === jobId);
   if (!before) throw new Error(`Job not found: ${jobId}`);
 
-  const result = await runJobNow(config, jobId, "manual");
+  const result = await runJobNow(config, jobId, "manual", taskId);
   // `runJobNow` only returns undefined on the overlap-skip branch, which
   // is gated on trigger==="schedule" — so for "manual" it should never
   // happen in normal operation. Surface a clear error if the contract ever
@@ -1229,9 +1226,12 @@ async function runJobTool(
   // Script jobs return { jobId, runId, exitCode, stdout, stderr }; prompt
   // jobs return { jobId, runId, taskId }. The taskId is only meaningful for
   // prompt jobs — script jobs run synchronously inside `runJobNow` and
-  // never spawn an agent task.
+  // never spawn an agent task. Discriminate on shape.
   const runId = (result as { runId: string }).runId;
-  const spawnedTaskId = (result as { taskId?: string }).taskId;
+  const isScriptResult = Object.prototype.hasOwnProperty.call(result, "exitCode");
+  const exitCode = isScriptResult ? (result as { exitCode: number }).exitCode : undefined;
+  const stderr = isScriptResult ? (result as { stderr?: string }).stderr ?? "" : "";
+  const spawnedTaskId = isScriptResult ? undefined : (result as { taskId?: string }).taskId;
 
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
@@ -1244,7 +1244,9 @@ async function runJobTool(
         risk: "low",
         taskId: item.id,
         runId: item.runId,
-        evidence: { jobId, runId, spawnedTaskId }
+        evidence: isScriptResult
+          ? { jobId, runId, exitCode }
+          : { jobId, runId, spawnedTaskId }
       },
       { taskId: item.id }
     );
@@ -1252,9 +1254,29 @@ async function runJobTool(
   });
   appendTrace(config.instance, taskId, {
     type: "job",
-    message: "Manually triggered job run",
-    data: { jobId, runId, taskId: spawnedTaskId }
+    message: isScriptResult ? "Manually executed script job" : "Manually triggered job run",
+    data: isScriptResult
+      ? { jobId, runId, exitCode }
+      : { jobId, runId, taskId: spawnedTaskId }
   });
+
+  if (isScriptResult) {
+    // Script jobs run synchronously inside `runJobNow`, so by the time we
+    // return here the run is already complete. Report the result rather
+    // than "Triggered" so the model can see success/failure without
+    // chasing the JobRun record.
+    if (exitCode === 0) {
+      return `Script job ${jobId} (\"${before.name}\") completed — run ${runId}, exit 0.`;
+    }
+    // On failure include a truncated tail of stderr so the model can see
+    // what went wrong without overwhelming context. Skip stdout — script
+    // jobs are typically side-effect-driven and the audit/trace already
+    // captures both streams.
+    const stderrTail = stderr.length > 500 ? stderr.slice(stderr.length - 500) : stderr;
+    const stderrSuffix = stderrTail ? ` stderr: ${stderrTail}` : "";
+    return `Script job ${jobId} (\"${before.name}\") failed — run ${runId}, exit ${exitCode}.${stderrSuffix}`;
+  }
+
   const taskSuffix = spawnedTaskId ? `, task ${spawnedTaskId}` : "";
   return `Triggered job ${jobId} (\"${before.name}\") — run ${runId}${taskSuffix}.`;
 }
