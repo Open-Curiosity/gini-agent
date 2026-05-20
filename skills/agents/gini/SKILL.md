@@ -329,6 +329,13 @@ or `skills/agents/codex/SKILL.md` — those skills cover `--allowedTools`,
 Pinned memories ride the system prompt every turn. Long-term memory is
 pulled by embedding recall on each task.
 
+The agent has three tools for memory: `recall_memory` for explicit
+mid-task lookups (distinct from the automatic recall that runs at task
+start), `add_memory` to propose a new memory, and `update_memory` to
+edit an existing one in place. `add_memory` always lands as `proposed`
+and requires user approval via the memory review flow — same gate as
+the memory reflection pipeline.
+
 API: `POST /api/memory { content, status }`, `GET /api/memory`,
 `PATCH /api/memory/<id>`, `DELETE /api/memory/<id>`,
 `POST /api/memory/<id>/approve`, `POST /api/memory/recall { query, tokenBudget, bankId }`.
