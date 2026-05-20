@@ -361,7 +361,11 @@ User-installed skills land at
 loads both on boot.
 
 To load a skill's body from inside chat use the `read_skill` tool —
-that's the agent's path. For lifecycle operations:
+that's the agent's path. For lifecycle operations the agent has three
+tools: `install_skill` (lands a raw SKILL.md body), `enable_skill`, and
+`disable_skill`. The `meta/install-skill` skill still drives the full
+install UX (parsing pasted descriptions, drafting frontmatter); these
+tools are the fast path when the SKILL.md text is already in hand.
 
 API: `GET /api/skills[/<id>]`, `POST /api/skills`,
 `POST /api/skills/<id>/{enable,disable,test,rollback}`,
@@ -369,8 +373,7 @@ API: `GET /api/skills[/<id>]`, `POST /api/skills`,
 
 Human-operator CLI mirror: `gini skills {list|show|enable|disable|test|rollback|validate|search}`.
 
-To install a SKILL.md the user pasted or linked, use the `meta/install-skill`
-skill. To draft a new one, use `meta/create-skill`.
+To draft a new SKILL.md interactively, use `meta/create-skill`.
 
 ## Approvals
 

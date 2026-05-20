@@ -32,6 +32,7 @@ import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJo
 import { createMemoryFromInput, editMemory, recall } from "../memory";
 import { resolveEffectiveContext } from "./effective-context";
 import { searchSessions } from "./search";
+import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
 import { isSkillActive } from "../integrations/connectors";
 import { riskForAction } from "./tool-risk";
 import {
@@ -112,6 +113,12 @@ export async function dispatchToolCall(
       return pendingOrAuto(config, "mcp.invoke", undefined, (reason) => requestInvokeMcp(config, taskId, toolCallId, args, reason));
     case "cancel_task":
       return { kind: "sync", result: await cancelTaskTool(config, taskId, args) };
+    case "install_skill":
+      return { kind: "sync", result: await installSkillTool(config, taskId, args) };
+    case "enable_skill":
+      return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "enabled") };
+    case "disable_skill":
+      return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "disabled") };
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -1567,6 +1574,101 @@ async function cancelTaskTool(
     data: { targetTaskId, previousStatus: target.status, newStatus: cancelled.status }
   });
   return `Cancelled task ${targetTaskId} (was ${target.status}, now ${cancelled.status}).`;
+}
+
+// Install a skill from a raw SKILL.md body. Wraps installSkillFromBody,
+// which validates the manifest, writes it to disk, and reloads the skill
+// registry. Returns the new skill id + name + validation issues so the
+// model can surface a useful confirmation.
+async function installSkillTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const body = requireString(args, "body");
+  let category: string | undefined;
+  if (args.category !== undefined && args.category !== null) {
+    if (typeof args.category !== "string" || args.category.length === 0) {
+      throw new Error("Invalid input: category must be a non-empty string.");
+    }
+    category = args.category;
+  }
+  let files: Array<{ name: string; content: string }> | undefined;
+  if (args.files !== undefined && args.files !== null) {
+    if (!Array.isArray(args.files)) {
+      throw new Error("Invalid input: files must be an array.");
+    }
+    const cleaned: Array<{ name: string; content: string }> = [];
+    for (const entry of args.files) {
+      if (!entry || typeof entry !== "object") {
+        throw new Error("Invalid input: files entries must be objects with name+content.");
+      }
+      const candidate = entry as { name?: unknown; content?: unknown };
+      if (typeof candidate.name !== "string" || candidate.name.length === 0) {
+        throw new Error("Invalid input: files entries require a non-empty name.");
+      }
+      if (typeof candidate.content !== "string") {
+        throw new Error("Invalid input: files entries require a string content.");
+      }
+      cleaned.push({ name: candidate.name, content: candidate.content });
+    }
+    files = cleaned;
+  }
+  const installed = await installSkillFromBody(config, { body, category, files });
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "skill.installed",
+        target: installed.skill.id,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: {
+          skillId: installed.skill.id,
+          name: installed.skill.name,
+          manifestPath: installed.manifestPath,
+          validationIssues: installed.validation.issues
+        }
+      },
+      { taskId: item.id }
+    );
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Installed skill",
+    data: { skillId: installed.skill.id, name: installed.skill.name, manifestPath: installed.manifestPath }
+  });
+  const issuesSuffix = installed.validation.issues.length > 0
+    ? ` Warnings: ${installed.validation.issues.join("; ")}.`
+    : "";
+  return `Installed skill ${installed.skill.id} ("${installed.skill.name}") at ${installed.manifestPath}.${issuesSuffix}`;
+}
+
+// Enable / disable a registered skill. Wraps setSkillStatus, which
+// writes the matching skill.enabled / skill.disabled audit row.
+async function setSkillStatusTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>,
+  status: "enabled" | "disabled"
+): Promise<string> {
+  const skillId = requireString(args, "skillId");
+  const skill = await setSkillStatus(config, skillId, status);
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: status === "enabled" ? "Enabled skill" : "Disabled skill",
+    data: { skillId: skill.id, name: skill.name, status }
+  });
+  await recordLowRiskAudit(config, taskId, status === "enabled" ? "skill.enable.requested" : "skill.disable.requested", skill.id, {
+    skillId: skill.id,
+    name: skill.name,
+    status
+  });
+  return `${status === "enabled" ? "Enabled" : "Disabled"} skill ${skill.id} ("${skill.name}").`;
 }
 
 // Poll the subagent record until its child task reaches a terminal state,

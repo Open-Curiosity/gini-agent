@@ -557,6 +557,76 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
+    // Install a skill from a raw SKILL.md body. Companion to the existing
+    // meta/install-skill agent skill (which the agent invokes when the
+    // user shares a skill description inline). This tool is the direct
+    // API path — use it when you already have the SKILL.md text in hand
+    // and just need to land it on the runtime.
+    toolset: "skills",
+    type: "function",
+    function: {
+      name: "install_skill",
+      description: "Install a skill from a raw SKILL.md document. Validates the manifest, writes it under the instance's skills directory, and reloads the skill registry. Use when the user shares a SKILL.md body (or you generated one) and wants it active. Companion to the meta/install-skill agent skill — that skill drives the full UX flow; this tool is the direct API call.",
+      parameters: {
+        type: "object",
+        properties: {
+          body: { type: "string", description: "Full SKILL.md content (YAML frontmatter + markdown body)." },
+          category: { type: "string", description: "Optional category override. Defaults to metadata.gini.category in the frontmatter, then 'user'." },
+          files: {
+            type: "array",
+            description: "Optional named-file payloads written next to SKILL.md (e.g. scripts/linear.sh). Each entry's name is treated as a relative path under the skill folder and must not escape it.",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "Relative path under the skill folder." },
+                content: { type: "string", description: "File contents." }
+              },
+              required: ["name", "content"]
+            }
+          }
+        },
+        required: ["body"]
+      }
+    }
+  },
+  {
+    // Enable a skill so it shows up in the system prompt and read_skill
+    // can fetch its body. Low-risk; the underlying handler runs
+    // `setSkillStatus(config, idOrName, "enabled")` and writes a
+    // skill.enabled audit row.
+    toolset: "skills",
+    type: "function",
+    function: {
+      name: "enable_skill",
+      description: "Enable a registered skill so it appears in the advertised-skills block and the agent can read its body. Use after the user asks to turn a skill on (or after install_skill if the manifest didn't auto-enable). Trivial; no approval gate.",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: { type: "string", description: "Skill id or name (e.g. 'skill_abc123' or 'apple-notes')." }
+        },
+        required: ["skillId"]
+      }
+    }
+  },
+  {
+    // Disable a skill so it stops appearing in the system prompt and
+    // read_skill refuses to fetch its body. Low-risk; underlying handler
+    // writes a skill.disabled audit row.
+    toolset: "skills",
+    type: "function",
+    function: {
+      name: "disable_skill",
+      description: "Disable a registered skill so it stops appearing in the advertised-skills block. Use when the user asks to turn a skill off. Trivial; no approval gate. The skill's manifest stays on disk — re-enable with enable_skill when needed.",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: { type: "string", description: "Skill id or name (e.g. 'skill_abc123' or 'apple-notes')." }
+        },
+        required: ["skillId"]
+      }
+    }
+  },
+  {
     // Cancel a task. Pairs with spawn_subagent for parent-side control
     // of a runaway child. Low-risk; the underlying `cancelTask` already
     // refuses on already-terminal tasks and cascades to child subagents.
