@@ -168,6 +168,79 @@ describe("telegram client", () => {
   test("empty token is rejected up front", () => {
     expect(() => createTelegramClient("")).toThrow(/required/);
   });
+
+  test("sendMessage threads the caller's AbortSignal into fetch", async () => {
+    let observedSignal: AbortSignal | undefined;
+    const client = createTelegramClient("TOK", {
+      fetchImpl: stubFetch((_url, init) => {
+        observedSignal = init.signal as AbortSignal | undefined;
+        return { ok: true, result: { message_id: 1, date: 0, chat: { id: 1, type: "private" }, text: "hi" } };
+      })
+    });
+    const controller = new AbortController();
+    await client.sendMessage(1, "hi", { signal: controller.signal });
+    expect(observedSignal).toBe(controller.signal);
+  });
+
+  test("sendMessage cancels in-flight fetch when the AbortSignal fires", async () => {
+    // Mock a slow Telegram POST that respects the signal: when aborted
+    // the underlying fetch rejects with AbortError, the client should
+    // surface the abort up to the caller (the messaging layer marks
+    // the outbound row failed).
+    const client = createTelegramClient("TOK", {
+      fetchImpl: ((_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            reject(new DOMException("Aborted", "AbortError"));
+            return;
+          }
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        })) as TelegramFetch
+    });
+    const controller = new AbortController();
+    const pending = client.sendMessage(1, "hi", { signal: controller.signal });
+    // Fire abort while the fetch is parked.
+    queueMicrotask(() => controller.abort());
+    await expect(pending).rejects.toThrow(/abort/i);
+  });
+
+  test("sendPhoto threads the AbortSignal through the JSON variant", async () => {
+    let observedSignal: AbortSignal | undefined;
+    const client = createTelegramClient("TOK", {
+      fetchImpl: stubFetch((_url, init) => {
+        observedSignal = init.signal as AbortSignal | undefined;
+        return { ok: true, result: { message_id: 1, date: 0, chat: { id: 1, type: "private" } } };
+      })
+    });
+    const controller = new AbortController();
+    await client.sendPhoto(
+      1,
+      { kind: "url", url: "https://x.test/p.png" },
+      { signal: controller.signal }
+    );
+    expect(observedSignal).toBe(controller.signal);
+  });
+
+  test("sendPhoto threads the AbortSignal through the multipart variant", async () => {
+    let observedSignal: AbortSignal | undefined;
+    const client = createTelegramClient("TOK", {
+      fetchImpl: stubFetch((_url, init) => {
+        observedSignal = init.signal as AbortSignal | undefined;
+        return { ok: true, result: { message_id: 1, date: 0, chat: { id: 1, type: "private" } } };
+      })
+    });
+    const controller = new AbortController();
+    const bytes = new Uint8Array([1, 2, 3]);
+    await client.sendPhoto(
+      1,
+      { kind: "bytes", bytes, filename: "x.png", contentType: "image/png" },
+      { signal: controller.signal }
+    );
+    expect(observedSignal).toBe(controller.signal);
+  });
 });
 
 describe("getFile / downloadFile", () => {

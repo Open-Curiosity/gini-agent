@@ -97,6 +97,12 @@ export interface SendMessageOptions {
   // before the agent's reply landed. Without that flag a deleted-mid-
   // task message silently drops the assistant's response.
   replyToMessageId?: number;
+  // Optional AbortSignal threaded through to the underlying fetch so a
+  // task cancel that races a slow Telegram POST tears the request down
+  // instead of egressing the message. The Discord outbound path already
+  // respects the supervisor's signal; this is the matching seam for
+  // Telegram.
+  signal?: AbortSignal;
 }
 
 // Photo source variants. The first two go out as JSON; `bytes` and
@@ -113,6 +119,9 @@ export interface SendPhotoOptions {
   caption?: string;
   parseMode?: TelegramParseMode;
   replyToMessageId?: number;
+  // See SendMessageOptions.signal — same seam, same purpose, for the
+  // photo-upload path (both JSON and multipart variants honor it).
+  signal?: AbortSignal;
 }
 
 export interface TelegramClient {
@@ -163,9 +172,11 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
   // local file path). FormData must NOT set its own content-type header
   // — letting fetch generate the multipart boundary is the only way it
   // gets the boundary right.
-  async function callMultipart<T>(method: string, form: FormData): Promise<T> {
+  async function callMultipart<T>(method: string, form: FormData, signal?: AbortSignal): Promise<T> {
     const url = `${base}/bot${token}/${method}`;
-    const response = await fetchImpl(url, { method: "POST", body: form });
+    const init: RequestInit = { method: "POST", body: form };
+    if (signal) init.signal = signal;
+    const response = await fetchImpl(url, init);
     return parseTelegramResponse<T>(response, method);
   }
 
@@ -186,20 +197,24 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
   return {
     getMe: () => call<TelegramUser>("getMe", {}),
     sendMessage: (chatId, text, opts) =>
-      call<TelegramMessage>("sendMessage", {
-        chat_id: chatId,
-        text,
-        ...(opts?.parseMode ? { parse_mode: opts.parseMode } : {}),
-        ...(opts?.disableWebPagePreview ? { disable_web_page_preview: true } : {}),
-        ...(opts?.replyToMessageId !== undefined
-          ? {
-              reply_to_message_id: opts.replyToMessageId,
-              // Required so a deleted-mid-task original message doesn't
-              // make the whole send fail; see SendMessageOptions doc.
-              allow_sending_without_reply: true
-            }
-          : {})
-      }),
+      call<TelegramMessage>(
+        "sendMessage",
+        {
+          chat_id: chatId,
+          text,
+          ...(opts?.parseMode ? { parse_mode: opts.parseMode } : {}),
+          ...(opts?.disableWebPagePreview ? { disable_web_page_preview: true } : {}),
+          ...(opts?.replyToMessageId !== undefined
+            ? {
+                reply_to_message_id: opts.replyToMessageId,
+                // Required so a deleted-mid-task original message doesn't
+                // make the whole send fail; see SendMessageOptions doc.
+                allow_sending_without_reply: true
+              }
+            : {})
+        },
+        opts?.signal
+      ),
     sendChatAction: (chatId, action, signal) =>
       call<true>("sendChatAction", { chat_id: chatId, action }, signal),
     getFile: (fileId) => call<TelegramFile>("getFile", { file_id: fileId }),
@@ -223,10 +238,18 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
           : {})
       };
       if (source.kind === "url") {
-        return call<TelegramMessage>("sendPhoto", { chat_id: chatId, photo: source.url, ...captionFields });
+        return call<TelegramMessage>(
+          "sendPhoto",
+          { chat_id: chatId, photo: source.url, ...captionFields },
+          opts?.signal
+        );
       }
       if (source.kind === "fileId") {
-        return call<TelegramMessage>("sendPhoto", { chat_id: chatId, photo: source.fileId, ...captionFields });
+        return call<TelegramMessage>(
+          "sendPhoto",
+          { chat_id: chatId, photo: source.fileId, ...captionFields },
+          opts?.signal
+        );
       }
       const form = new FormData();
       form.append("chat_id", String(chatId));
@@ -248,7 +271,7 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
         const file = Bun.file(source.path);
         form.append("photo", file, source.filename ?? basename(source.path));
       }
-      return callMultipart<TelegramMessage>("sendPhoto", form);
+      return callMultipart<TelegramMessage>("sendPhoto", form, opts?.signal);
     },
     getUpdates: (offset, longPollSeconds, signal) =>
       call<TelegramUpdate[]>(

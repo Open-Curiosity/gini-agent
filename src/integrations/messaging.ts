@@ -920,12 +920,14 @@ export async function sendMessagingOutput(
           await client.sendPhoto(target, photoSource, {
             caption: formatted || undefined,
             parseMode: useMdv2 && formatted ? "MarkdownV2" : undefined,
-            ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
+            ...(replyToMessageId !== undefined ? { replyToMessageId } : {}),
+            ...(options.signal ? { signal: options.signal } : {})
           });
         } else {
           const sendOpts: import("./telegram").SendMessageOptions = {};
           if (useMdv2) sendOpts.parseMode = "MarkdownV2";
           if (replyToMessageId !== undefined) sendOpts.replyToMessageId = replyToMessageId;
+          if (options.signal) sendOpts.signal = options.signal;
           await client.sendMessage(
             target,
             formatted,
