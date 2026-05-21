@@ -88,12 +88,12 @@ import type {
   ChatMessageRecord,
   ChatSessionRecord,
   ImportReport,
-  MessagingBridgeRecord,
   RuntimeConfig,
   RuntimeState
 } from "../types";
 import {
   addAudit,
+  buildMessagingBridgeRecord,
   createAgentRecord,
   createChatMessage,
   createChatSession,
@@ -2008,18 +2008,31 @@ export async function applyMigration(
           target.updatedAt = at;
         }
       } else {
-        const item: MessagingBridgeRecord = {
+        // Route through the shared field-default builder so the
+        // migrator inherits any new MessagingBridgeRecord defaults
+        // automatically — the hand-rolled literal here used to
+        // duplicate `instance`, `status`, `createdAt`, `updatedAt`,
+        // setting up a drift risk if those defaults ever change.
+        // We still push + audit inline because the migrator needs
+        // to pre-mint `decision.id` (the secret file path
+        // `messaging.<bridgeId>.bot-token.json` depends on it) AND
+        // wants a richer audit row tagged with `source:
+        // openclaw-migration`. `createMessagingBridgeRecord` doesn't
+        // accept a pre-minted id.
+        const item = buildMessagingBridgeRecord(state, {
           id: decision.id,
-          instance: state.instance,
           name: `${step.bridgeKind} (migrated from openclaw)`,
           kind: step.bridgeKind,
-          status: "configured",
           deliveryTargets: [],
-          createdAt: at,
-          updatedAt: at,
           secretRefs: [ref],
           metadata
-        };
+        });
+        // Pin to the at-timestamp the surrounding mutateState
+        // already captured so the audit row's evidence and the
+        // bridge's createdAt match exactly. buildMessagingBridgeRecord
+        // computes its own `now()` which can differ by a millisecond.
+        item.createdAt = at;
+        item.updatedAt = at;
         state.messagingBridges.unshift(item);
       }
       addAudit(
