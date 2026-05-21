@@ -2204,6 +2204,84 @@ describe("applyMigration memory units", () => {
     expect(rows[2]!.status).toBe("archived");
   });
 
+  test("binds migrated units to the matching agent's bank so recall surfaces them", async () => {
+    // Per ADR `agent-memory-isolation.md` every recall channel filters
+    // on `bank_id = ? AND agent_id = ?` where `bank_id =
+    // bankIdForAgent(agentId)` (i.e. `bank_<agentId>`). Inserting into
+    // DEFAULT_BANK_ID with agent_id NULL would parking the unit
+    // outside any recall channel. The migrator must pair each openclaw
+    // bank (the SQLite filename, e.g. `main`) with the gini agent of
+    // the same name, ensure that agent's bank exists, then insert
+    // with the matching `bankId` + `agentId`.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeHindsightMemorySqlite(join(OPENCLAW_ROOT, "memory"), "main.sqlite", [
+      { id: "u-recall", text: "Bob likes coffee", network: "experience" }
+    ]);
+    const config = loadConfig("memory-recall-binding");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.memoryUnitsCreated).toBe(1);
+    const state = readState("memory-recall-binding");
+    const mainAgent = state.agents.find((agent) => agent.name === "main");
+    expect(mainAgent).toBeDefined();
+    const memDb = getMemoryDb("memory-recall-binding");
+    const row = memDb
+      .query<{ bank_id: string; agent_id: string | null }, []>(
+        "SELECT bank_id, agent_id FROM memory_units WHERE text = ?"
+      )
+      .get("Bob likes coffee");
+    expect(row).toBeDefined();
+    expect(row!.agent_id).toBe(mainAgent!.id);
+    expect(row!.bank_id).toBe(`bank_${mainAgent!.id}`);
+    // Verify the agent's bank row actually exists in memory_banks (the
+    // FOREIGN KEY enforcement would have already caught a missing
+    // parent, but this proves ensureAgentBank wired up correctly).
+    const bank = memDb
+      .query<{ id: string; agent_id: string | null }, [string]>(
+        "SELECT id, agent_id FROM memory_banks WHERE id = ?"
+      )
+      .get(`bank_${mainAgent!.id}`);
+    expect(bank?.agent_id).toBe(mainAgent!.id);
+  });
+
+  test("falls back to default bank with warning when no gini agent matches the openclaw bank name", async () => {
+    // An openclaw deployment with an SQLite named after an agent that
+    // never made it into agents.list (or one the operator deleted)
+    // shouldn't make migration fail. We park the units in the default
+    // bank with agent_id NULL and warn the operator that recall will
+    // not return them until they manually reassign agent_id.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeHindsightMemorySqlite(join(OPENCLAW_ROOT, "memory"), "ghost.sqlite", [
+      { id: "u-orphan-1", text: "orphan one", network: "world" },
+      { id: "u-orphan-2", text: "orphan two", network: "world" }
+    ]);
+    const config = loadConfig("memory-orphan-bank");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.memoryUnitsCreated).toBe(2);
+    // Single warning across both orphan units (de-duplicated by source
+    // bank name so a Hindsight DB with 10k rows doesn't drown the
+    // operator in identical warnings).
+    const orphanWarnings = result.warnings.filter((warning) => warning.includes("ghost"));
+    expect(orphanWarnings).toHaveLength(1);
+    expect(orphanWarnings[0]).toContain("default bank");
+    expect(orphanWarnings[0]).toContain("agent_id");
+    const memDb = getMemoryDb("memory-orphan-bank");
+    const rows = memDb
+      .query<{ bank_id: string }, []>(
+        "SELECT bank_id FROM memory_units WHERE metadata LIKE '%\"openclawBank\":\"ghost\"%'"
+      )
+      .all();
+    expect(rows).toHaveLength(2);
+    // Units land in DEFAULT_BANK_ID — this is what recall channels
+    // never read (they filter on bank_id = bank_<agentId>), and is the
+    // load-bearing assertion behind the warning. agent_id may be
+    // backfilled by the normalizeState migration to the active agent,
+    // but bank_id stays at bank_default until the operator reassigns
+    // it manually, so units remain unreachable via the recall surface.
+    expect(rows.every((row) => row.bank_id === "bank_default")).toBe(true);
+  });
+
   test("preserves openclaw metadata + records source-bank + openclaw id", async () => {
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
     writeHindsightMemorySqlite(join(OPENCLAW_ROOT, "memory"), "secondary.sqlite", [

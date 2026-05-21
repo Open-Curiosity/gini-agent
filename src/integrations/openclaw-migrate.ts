@@ -97,11 +97,14 @@ import {
   createChatMessage,
   createChatSession,
   createImportReport,
+  DEFAULT_BANK_ID,
+  ensureAgentBank,
   ensureDefaultBank,
   id,
   insertMemoryUnit,
   mutateState,
-  now
+  now,
+  readState
 } from "../state";
 import type { MemoryUnitStatus, Network } from "../state/memory-db";
 import { writeSecret } from "../state/secrets";
@@ -1941,47 +1944,93 @@ export async function applyMigration(
     }
   }
 
-  // 7) Hindsight memory units. Insert each row verbatim into the
-  // gini instance's memory.db with embedding NULL — a follow-up
+  // 7) Hindsight memory units. Insert each row into the gini
+  // instance's memory.db with embedding NULL — a follow-up
   // `gini embedding reembed` pass populates vectors using the
   // configured embedding provider. We sanitize network/status
   // before insertion so an openclaw schema drift can't poison the
   // gini memory store with values the rest of the runtime won't
   // accept on read.
   //
-  // Gini's memory.db turns foreign keys on (`PRAGMA foreign_keys = ON`)
-  // and memory_units.bank_id references memory_banks.id. A fresh
-  // instance has no bank row yet, so the first insertMemoryUnit
-  // would throw "FOREIGN KEY constraint failed" before any work
-  // lands. Seed the default bank up front when there's anything to
-  // migrate. Openclaw banks don't survive the schema mismatch —
-  // gini consolidates everything under DEFAULT_BANK_ID and tags
-  // each unit with `openclawBank` in metadata so the operator can
-  // still trace lineage.
-  const hasMemorySteps = plan.steps.some((step) => step.kind === "memoryUnit");
-  if (hasMemorySteps) {
-    ensureDefaultBank(config.instance);
-  }
-  for (const step of plan.steps) {
-    if (step.kind !== "memoryUnit") continue;
-    try {
-      insertMemoryUnit(config.instance, {
-        text: step.text,
-        network: coerceMemoryNetwork(step.network),
-        status: coerceMemoryStatus(step.status),
-        confidence: step.confidence,
-        metadata: {
-          ...step.metadata,
-          openclawBank: step.sourceBank,
-          openclawUnitId: step.openclawId
-        },
-        mentionedAt: step.mentionedAt
-      });
-      memoryUnitsCreated += 1;
-    } catch (error) {
-      warnings.push(
-        `Failed to migrate memory unit ${step.openclawId}: ${error instanceof Error ? error.message : String(error)}`
-      );
+  // Bank + agent binding is load-bearing for recall (per ADR
+  // `agent-memory-isolation.md`): gini's `/api/memory/recall` and
+  // every internal recall channel filter on `bank_id = ? AND
+  // agent_id = ?`, where `bank_id` is `bankIdForAgent(agentId)`
+  // (`bank_<agentId>`) — NEVER `bank_default`. A unit inserted with
+  // `bankId = DEFAULT_BANK_ID` and `agentId = null` is queryable
+  // only via the legacy migration backfill path, not via the live
+  // recall surface, so a naive insert would silently make the
+  // migrated Hindsight memory invisible to the gini agent that
+  // owned it in openclaw.
+  //
+  // Resolution strategy: openclaw stores one SQLite per agent
+  // (`memory/<openclaw-agent-id>.sqlite`), so the `sourceBank`
+  // string we extracted at plan time (the SQLite basename minus
+  // the extension) is exactly the openclaw agent id. The migrator
+  // created gini AgentRecords whose `name` matches the openclaw
+  // id, so a `state.agents.find((a) => a.name === sourceBank)`
+  // lookup pairs the unit with the right gini agent. If no agent
+  // matches (rare — the sqlite was named differently, or the
+  // operator deleted the agent before importing), we fall back to
+  // the default bank with `agentId: null` and emit a warning so
+  // the operator knows the unit is parked and needs manual
+  // reassignment before recall will surface it.
+  //
+  // Gini's memory.db turns foreign keys on (`PRAGMA foreign_keys
+  // = ON`); `ensureAgentBank` / `ensureDefaultBank` create the
+  // referenced bank rows so the insert doesn't throw "FOREIGN KEY
+  // constraint failed" on a fresh instance.
+  const memorySteps = plan.steps.filter(
+    (step): step is Extract<MigrationStep, { kind: "memoryUnit" }> => step.kind === "memoryUnit"
+  );
+  if (memorySteps.length > 0) {
+    // Read state once instead of inside the per-step loop so we
+    // don't pound the state.json reader for every memory row.
+    const stateSnapshot = readState(config.instance);
+    const agentByName = new Map(stateSnapshot.agents.map((agent) => [agent.name, agent] as const));
+    // Track which fallbacks we've warned about so a Hindsight DB
+    // with 10000 orphan units doesn't produce 10000 identical
+    // warnings.
+    const warnedOrphanBanks = new Set<string>();
+    for (const step of memorySteps) {
+      const targetAgent = agentByName.get(step.sourceBank);
+      let bankId: string;
+      let agentId: string | null;
+      if (targetAgent) {
+        bankId = ensureAgentBank(config.instance, targetAgent.id).id;
+        agentId = targetAgent.id;
+      } else {
+        ensureDefaultBank(config.instance);
+        bankId = DEFAULT_BANK_ID;
+        agentId = null;
+        if (!warnedOrphanBanks.has(step.sourceBank)) {
+          warnedOrphanBanks.add(step.sourceBank);
+          warnings.push(
+            `Memory units from openclaw bank '${step.sourceBank}' have no matching gini agent (openclaw id missing from agents.list?). Units land in the default bank with agent_id NULL — \`/api/memory/recall\` will NOT surface them until you reassign agent_id manually (UPDATE memory_units SET agent_id = '<agent-id>' WHERE metadata LIKE '%"openclawBank":"${step.sourceBank}"%').`
+          );
+        }
+      }
+      try {
+        insertMemoryUnit(config.instance, {
+          bankId,
+          agentId,
+          text: step.text,
+          network: coerceMemoryNetwork(step.network),
+          status: coerceMemoryStatus(step.status),
+          confidence: step.confidence,
+          metadata: {
+            ...step.metadata,
+            openclawBank: step.sourceBank,
+            openclawUnitId: step.openclawId
+          },
+          mentionedAt: step.mentionedAt
+        });
+        memoryUnitsCreated += 1;
+      } catch (error) {
+        warnings.push(
+          `Failed to migrate memory unit ${step.openclawId}: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
     }
   }
 
