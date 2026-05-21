@@ -1213,6 +1213,36 @@ describe("planMigration", () => {
     expect(ref?.detail).toContain("OPENAI_API_KEY");
   });
 
+  test("apply surfaces persisted Telegram allow-list ids in result + audit row", async () => {
+    // The plan summary already shows the ids (R9.S1), but a script
+    // that skips `gini import plan` and runs apply directly used to
+    // see only a scalar count in the apply output, and the audit
+    // row also recorded only the count. Operators inspecting an
+    // audit trail post-fact had no way to recover which chats had
+    // been authorized. The apply result now carries the explicit
+    // list, and the audit evidence includes it too.
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withTelegramChannel: true,
+      withTelegramAllowFrom: true
+    });
+    const config = loadConfig("apply-surfaces-allowlist");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.bridgesAuthorized).toHaveLength(1);
+    expect(result.bridgesAuthorized[0]!.kind).toBe("telegram");
+    expect(result.bridgesAuthorized[0]!.allowedChatIds.sort((a, b) => a - b)).toEqual([12345, 67890]);
+    const state = readState("apply-surfaces-allowlist");
+    const audit = state.audit.find(
+      (entry) => entry.action === "messaging.configured"
+    );
+    expect(audit).toBeDefined();
+    const evidence = audit?.evidence as { allowedChatIds: number[]; allowedChatCount: number };
+    expect(evidence.allowedChatIds.sort((a, b) => a - b)).toEqual([12345, 67890]);
+    expect(evidence.allowedChatCount).toBe(2);
+  });
+
   test("rejects a default <state>/workspace that is itself a symlink", () => {
     // Hostile tarball plants `<state>/workspace` as a symlink to a
     // sibling directory the operator didn't intend to copy from.

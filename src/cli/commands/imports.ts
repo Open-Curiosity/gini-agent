@@ -102,6 +102,11 @@ export async function importInspect(ctx: CliContext): Promise<void> {
         sessionMessages: result.sessionMessagesCreated,
         memoryUnits: result.memoryUnitsCreated
       },
+      // Echo the persisted allow-list so an apply run without a
+      // preceding `gini import plan` (e.g. a script) still has a
+      // chance to spot a tampered backup that smuggled a foreign
+      // chat id into the bridge.
+      bridgesAuthorized: result.bridgesAuthorized,
       archivePath: result.archivePath,
       unsupported: result.unsupported,
       warnings: result.warnings,

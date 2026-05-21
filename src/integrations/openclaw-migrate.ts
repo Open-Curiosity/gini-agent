@@ -297,6 +297,12 @@ export interface MigrationResult {
   // distinct from `bridgesCreated` so a re-run with --force isn't
   // misreported as a brand-new bridge creation.
   bridgesRotated: number;
+  // Per-bridge allow-list snapshot the apply just persisted. The
+  // plan summary already exposes these (R9.S1); echoing them in the
+  // apply result lets a workflow that skips `gini import plan`
+  // still see which chat IDs are being authorized, and gives the
+  // CLI a place to print them after apply finishes.
+  bridgesAuthorized: Array<{ kind: "telegram" | "discord"; allowedChatIds: number[] }>;
   skillsCopied: number;
   secretsWritten: number;
   workspaceFilesCopied: number;
@@ -2085,6 +2091,7 @@ export async function applyMigration(
   let agentsCreated = 0;
   let bridgesCreated = 0;
   let bridgesRotated = 0;
+  const bridgesAuthorized: MigrationResult["bridgesAuthorized"] = [];
   let skillsCopied = 0;
   let secretsWritten = 0;
   let workspaceFilesCopied = 0;
@@ -2118,6 +2125,7 @@ export async function applyMigration(
       agentsCreated,
       bridgesCreated,
       bridgesRotated,
+      bridgesAuthorized,
       skillsCopied,
       secretsWritten,
       workspaceFilesCopied,
@@ -2559,7 +2567,16 @@ export async function applyMigration(
             kind: step.bridgeKind,
             source: "openclaw-migration",
             rotated: decision.kind === "existing",
-            allowedChatCount: step.allowedChatIds?.length ?? 0
+            allowedChatCount: step.allowedChatIds?.length ?? 0,
+            // Include the explicit ids in the audit evidence (in
+            // addition to the scalar count) so post-fact forensics
+            // can recover which chats were authorized at apply time.
+            // The plan summary already exposes these via R9.S1; the
+            // audit row would otherwise be the only durable record
+            // of the apply and a stale-but-counted list would hide
+            // a smuggled-id incident from anyone reading the audit
+            // trail rather than the original plan output.
+            allowedChatIds: step.allowedChatIds ?? []
           }
         },
         { system: true }
@@ -2579,6 +2596,14 @@ export async function applyMigration(
     } else {
       bridgesCreated += 1;
     }
+    // Capture the persisted allow-list so the CLI apply output and
+    // ImportReport carry the same ids the plan summary showed. A
+    // workflow that skips plan would otherwise have no visibility
+    // into the chat ids being authorized.
+    bridgesAuthorized.push({
+      kind: step.bridgeKind,
+      allowedChatIds: [...(step.allowedChatIds ?? [])]
+    });
   }
 
   // 6) Sessions. Each openclaw session JSONL becomes one ChatSessionRecord
@@ -2819,6 +2844,7 @@ export async function applyMigration(
     agentsCreated,
     bridgesCreated,
     bridgesRotated,
+    bridgesAuthorized,
     skillsCopied,
     secretsWritten,
     workspaceFilesCopied,
