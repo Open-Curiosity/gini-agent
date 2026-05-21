@@ -723,12 +723,28 @@ function inspectOpenclawMemory(stateRoot: string, memoryDir: string): {
       continue;
     }
     const bankLabel = entry.replace(/\.(sqlite|db)$/i, "");
+    // Refuse bank labels that aren't a safe slug. The label flows
+    // into operator-visible copy-paste SQL (the orphan-bank warning
+    // suggests an `UPDATE ... WHERE metadata LIKE '%"openclawBank":"<label>"%'`
+    // remediation), so a filename like `evil');DROP TABLE memory_units;--`
+    // would land as an injectable LIKE clause. Whitelist matches the
+    // same slug shape we accept for agent ids; anything else gets a
+    // skipped-with-note path instead of a code-injection vector.
+    if (!HINDSIGHT_BANK_LABEL_SAFE.test(bankLabel)) {
+      notes.push(`${entry}: bank label '${bankLabel}' contains characters that aren't safe for operator-visible SQL suggestions; skipped. Rename the SQLite file to use only [A-Za-z0-9._-] characters and re-migrate.`);
+      continue;
+    }
     const inspection = scanMemorySqlite(dbPath, bankLabel);
     hindsightUnits.push(...inspection.units);
     if (inspection.note) notes.push(`${entry}: ${inspection.note}`);
   }
   return { hindsightUnits, note: notes.length > 0 ? notes.join("; ") : undefined };
 }
+
+// Same safe-slug shape as SAFE_AGENT_SLUG — bank labels come from
+// openclaw memory SQLite filenames and feed into operator-visible
+// remediation SQL when units land in the orphan bank.
+const HINDSIGHT_BANK_LABEL_SAFE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 function scanMemorySqlite(dbPath: string, bankLabel: string): {
   units: MemoryUnitPlanShape[];

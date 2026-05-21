@@ -2963,6 +2963,34 @@ describe("applyMigration memory units", () => {
     expect(result.memoryUnitsCreated).toBe(0);
   });
 
+  test("refuses memory SQLite filenames that contain SQL-unsafe characters", async () => {
+    // The orphan-bank warning suggests a copy-paste `UPDATE` SQL that
+    // interpolates the bank label inside a LIKE literal. A filename
+    // like `evil');DROP TABLE memory_units;--.sqlite` would land an
+    // injection if the operator ran the suggestion verbatim. Refuse
+    // unsafe labels at scan time so the suggestion is never produced.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const memoryDir = join(OPENCLAW_ROOT, "memory");
+    mkdirSync(memoryDir, { recursive: true });
+    const hostileName = "evil');DROP TABLE memory_units;--.sqlite";
+    const hostilePath = join(memoryDir, hostileName);
+    writeHindsightMemorySqlite(memoryDir, hostileName, [
+      { id: "u1", text: "should-not-migrate", network: "world" }
+    ]);
+    // Sanity-check the seed actually landed at the hostile filename.
+    expect(existsSync(hostilePath)).toBe(true);
+    const config = loadConfig("memory-bank-slug-refused");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    expect(plan.steps.some((step) => step.kind === "memoryUnit")).toBe(false);
+    const memoryNote = plan.unsupported.find((entry) => entry.kind === "memory");
+    expect(memoryNote).toBeDefined();
+    expect(memoryNote!.detail).toContain("bank label");
+    expect(memoryNote!.detail).toContain("aren't safe for operator-visible SQL");
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.memoryUnitsCreated).toBe(0);
+  });
+
   test("empty memory directory produces no migration step and no unsupported note", async () => {
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
     // memory/ exists but no .sqlite files inside. Hooks for memory
