@@ -296,6 +296,20 @@ export interface PendingToolCall {
   result?: string;
 }
 
+// Lightweight per-tool-call record surfaced to the chat UI so the user sees
+// what the agent is doing while a task is in-flight. This is purely a
+// display payload — execution truth still lives in audit/trace/messages.
+// Capped on the producing side (~20) so long-running loops don't bloat
+// state. Cleared/ignored once the task reaches a terminal status.
+export interface ToolCallSummary {
+  id: string;          // tool_call_id
+  name: string;        // tool name as known to the model
+  argsPreview: string; // single-line, truncated args
+  status: "running" | "done" | "error";
+  startedAt: string;
+  completedAt?: string;
+}
+
 // Snapshot of the tool-calling conversation needed to resume the loop after
 // an approval gates a tool. We persist enough context that the runtime can
 // pick up where it left off when the user approves/denies.
@@ -361,6 +375,11 @@ export interface Task {
   // once the loop finishes (completed/failed) so completed tasks don't retain
   // long-lived conversation snapshots in state.
   toolCallState?: TaskToolCallState;
+  // Recent tool calls dispatched by the chat-task loop, surfaced to the chat
+  // UI as inline rows above the "Working…" indicator. Capped at ~20 entries
+  // (oldest dropped). Not persisted as audit truth — these are a display
+  // convenience only.
+  recentToolCalls?: ToolCallSummary[];
 }
 
 export interface RuntimeEvent {
