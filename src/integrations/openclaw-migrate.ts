@@ -77,6 +77,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   statSync,
   unlinkSync,
   writeFileSync
@@ -835,6 +836,39 @@ function resolveAgentDirOverride(
   return join(agentsDir, openclawId, "agent");
 }
 
+// Decide whether `candidate` resolves OUTSIDE of `root` after walking
+// every symlink in both paths. The migrator uses this to enforce that
+// every source path it reads stays inside `source.stateRoot` — the
+// boundary the operator chose via `--path`. Without this check a
+// crafted openclaw.json could escape the source root in three ways:
+//   1. `agents.list[].agentDir: "~/.aws"` redirects the auth-profiles
+//      read out of the state root (caught at agent step).
+//   2. `<state>/skills` is a SYMLINK to `/etc/`, so readdirSync at
+//      plan time follows it and the resulting source paths point at
+//      `/etc/...` (caught at skill discovery).
+//   3. `<state>/workspace` is a SYMLINK to `~/.ssh`, so the workspace
+//      file copy lifts arbitrary files into the gini instance (caught
+//      at workspace discovery).
+// Returns true when candidate escapes (caller should refuse + surface
+// an `unsupported` entry). Returns false when the candidate either
+// stays inside or cannot be resolved (broken symlink, missing file —
+// the underlying read will then surface a more specific error).
+function escapesSourceRoot(root: string, candidate: string): boolean {
+  try {
+    const rootReal = realpathSync(resolve(root));
+    const candidateReal = realpathSync(resolve(candidate));
+    const rel = relative(rootReal, candidateReal);
+    if (rel === "") return false;
+    return rel === ".." || rel.startsWith(`..${"/"}`) || rel.startsWith(`..\\`);
+  } catch {
+    // realpath fails when the path doesn't exist or is a broken
+    // symlink. The migrator's downstream existsSync / readFileSync
+    // calls will produce more specific errors than a synthetic
+    // "escape" decision, so we let them through here.
+    return false;
+  }
+}
+
 // Reject a copy source that is a symlink. `copyFileSync` and
 // `readFileSync` follow symlinks by default, so a hand-crafted openclaw
 // state with `skills/foo/SKILL.md` symlinked to `/etc/passwd` (or
@@ -1072,6 +1106,23 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       // model of its own — openclaw resolves the same way at runtime.
       // Drop the model when no provider resolved so the AgentRecord
       // doesn't pretend to honor a routing the runtime will discard.
+      // Defense-in-depth: `agents.list[].agentDir` can carry an
+      // absolute path or `~`-prefix the operator may not have written
+      // themselves (the openclaw.json could be from a coworker's
+      // backup tarball). A redirected agentDir at e.g. `~/.aws` would
+      // make the auth-profiles read below escape `source.stateRoot`
+      // and harvest credentials from the operator's other tools.
+      // Refuse anything that resolves outside the source root and
+      // surface it on the unsupported list so the operator sees the
+      // skip rather than discovering it via a missing migrated agent.
+      const agentDir = resolveAgentDirOverride(agent, source.agentsDir, openclawId);
+      if (escapesSourceRoot(source.stateRoot, agentDir)) {
+        unsupported.push({
+          kind: `agent:${openclawId}`,
+          detail: `Skipped agent '${openclawId}': agentDir override '${agent.agentDir ?? "(default)"}' resolves outside the openclaw state root. The migrator refuses to read auth-profiles.json from paths the operator didn't include in --path.`
+        });
+        continue;
+      }
       steps.push({
         kind: "agent",
         openclawId,
@@ -1080,7 +1131,7 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
         model: resolvedProvider ? resolvedModel : undefined
       });
       agentIds.push(openclawId);
-      agentDirs.set(openclawId, resolveAgentDirOverride(agent, source.agentsDir, openclawId));
+      agentDirs.set(openclawId, agentDir);
     }
   }
 
@@ -1250,7 +1301,13 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
     }
   }
 
-  // Skills (managed root: <state>/skills/<name>/SKILL.md)
+  // Skills (managed root: <state>/skills/<name>/SKILL.md).
+  // readdirSync follows directory symlinks, so a `<state>/skills`
+  // -> `/etc` symlink would enumerate /etc and the leaf
+  // `isSymlinkSource` check at apply time would pass (the leaf
+  // SKILL.md isn't itself a symlink even though its parent's parent
+  // is). Realpath each candidate against source.stateRoot here to
+  // refuse anything that escapes via a parent-directory symlink.
   if (existsSync(source.skillsDir)) {
     for (const name of readdirSync(source.skillsDir)) {
       const dir = join(source.skillsDir, name);
@@ -1262,19 +1319,34 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       }
       if (!stat.isDirectory()) continue;
       const skillPath = join(dir, "SKILL.md");
-      if (existsSync(skillPath)) {
-        steps.push({ kind: "skill", name, sourcePath: skillPath });
+      if (!existsSync(skillPath)) continue;
+      if (escapesSourceRoot(source.stateRoot, skillPath)) {
+        unsupported.push({
+          kind: `skill:${name}`,
+          detail: `Skipped skill '${name}': resolves outside the openclaw state root (likely a parent-directory symlink). The migrator only copies skills that physically live under --path.`
+        });
+        continue;
       }
+      steps.push({ kind: "skill", name, sourcePath: skillPath });
     }
   }
 
-  // Workspace bootstrap files
+  // Workspace bootstrap files. Same parent-symlink concern as skills:
+  // `<state>/workspace` -> `~/.ssh` would lift any file there into
+  // the gini workspace via the lstat-only leaf check. Validate
+  // containment up front.
   if (source.workspaceRoot) {
     for (const fileName of WORKSPACE_BOOTSTRAP_FILES) {
       const filePath = join(source.workspaceRoot, fileName);
-      if (existsSync(filePath)) {
-        steps.push({ kind: "workspaceFile", name: fileName, sourcePath: filePath });
+      if (!existsSync(filePath)) continue;
+      if (escapesSourceRoot(source.stateRoot, filePath)) {
+        unsupported.push({
+          kind: `workspaceFile:${fileName}`,
+          detail: `Skipped workspace bootstrap file '${fileName}': resolves outside the openclaw state root (likely a parent-directory symlink). The migrator only copies workspace files that physically live under --path.`
+        });
+        continue;
       }
+      steps.push({ kind: "workspaceFile", name: fileName, sourcePath: filePath });
     }
   }
 
@@ -1290,6 +1362,18 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       if (!entry.endsWith(".jsonl")) continue;
       const sessionPath = join(sessionDir, entry);
       const sessionId = entry.slice(0, -".jsonl".length);
+      // Refuse session paths that resolve outside the source root
+      // via a parent-directory symlink (same hazard as
+      // skills/workspace). The agent id is slug-validated upstream,
+      // so the segment names themselves are safe; this guards
+      // against a symlinked agentsDir or sessionDir.
+      if (escapesSourceRoot(source.stateRoot, sessionPath)) {
+        unsupported.push({
+          kind: `session:${agentId}/${sessionId}`,
+          detail: `Skipped openclaw session ${sessionId}: resolves outside the openclaw state root (likely a parent-directory symlink). The migrator only reads sessions that physically live under --path.`
+        });
+        continue;
+      }
       // `countSessionMessages` now applies the same content filter as
       // the apply-time parser (text-only blocks survive), so a tool-
       // only transcript reports 0 here and we drop it from the plan

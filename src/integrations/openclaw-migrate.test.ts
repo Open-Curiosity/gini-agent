@@ -858,15 +858,18 @@ describe("planMigration", () => {
     }
   });
 
-  test("honors agents.list[].agentDir for auth-profiles.json resolution", () => {
+  test("honors in-state-root agents.list[].agentDir for auth-profiles.json resolution", () => {
     // Openclaw lets operators relocate per-agent secret dirs via
-    // agents.list[].agentDir. Without this override, the migrator
-    // hard-codes <state>/agents/<id>/agent/ and silently misses every
-    // API key for installs using the override.
+    // agents.list[].agentDir. The override is honored when it
+    // resolves INSIDE the source state root (typical non-default
+    // layout: a per-tenant subdirectory under the same state). An
+    // override that escapes the state root is rejected separately
+    // (see the next test) to prevent a coworker's backup tarball
+    // from redirecting the auth read into the operator's other
+    // credential stores.
     rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
     mkdirSync(OPENCLAW_ROOT, { recursive: true });
-    const overrideDir = `${ROOT}/external-agent-secrets`;
-    rmSync(overrideDir, { recursive: true, force: true });
+    const overrideDir = join(OPENCLAW_ROOT, "tenants", "primary", "agent");
     mkdirSync(overrideDir, { recursive: true });
     writeFileSync(
       join(overrideDir, "auth-profiles.json"),
@@ -896,6 +899,56 @@ describe("planMigration", () => {
     } | undefined;
     expect(secret?.envVar).toBe("OPENAI_API_KEY");
     expect(secret?.valueFrom).toBe("sk-from-override-dir");
+  });
+
+  test("refuses external agents.list[].agentDir that escapes source.stateRoot", () => {
+    // A crafted openclaw.json (e.g., from a coworker's backup
+    // tarball) with `agentDir: "~/.aws"` or any absolute path
+    // outside the operator's chosen --path could exfiltrate
+    // credentials from the operator's other tools into
+    // `~/.gini/secrets.env`. Refuse-by-default and surface the
+    // skip on the unsupported list so the operator sees what was
+    // dropped. Operators who legitimately need an external
+    // agentDir can either move secrets into --path or use
+    // OPENCLAW_STATE_DIR to encompass both.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    const externalDir = `${ROOT}/external-agent-secrets`;
+    rmSync(externalDir, { recursive: true, force: true });
+    mkdirSync(externalDir, { recursive: true });
+    writeFileSync(
+      join(externalDir, "auth-profiles.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          "openai-default": {
+            type: "api_key",
+            provider: "openai",
+            key: "sk-would-be-exfiltrated"
+          }
+        }
+      })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: {
+          list: [{ id: "main", default: true, agentDir: externalDir }]
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    // No agent created, no secret migrated.
+    expect(plan.steps.some((step) => step.kind === "agent" && step.openclawId === "main")).toBe(
+      false
+    );
+    expect(plan.steps.some((step) => step.kind === "secret")).toBe(false);
+    expect(
+      plan.unsupported.some(
+        (entry) =>
+          entry.kind === "agent:main" && entry.detail.includes("outside the openclaw state root")
+      )
+    ).toBe(true);
   });
 
   test("rejects path-traversal agent ids before reading auth-profiles.json", () => {
@@ -1955,30 +2008,40 @@ describe("applyMigration archive", () => {
     expect(listing).toContain("openclaw.json");
   });
 
-  test("workspace symlink source is refused and warned about", async () => {
-    // `copyFileSync` follows symlinks by default, so a `workspace/SOUL.md`
-    // symlink to `/etc/passwd` would happily rematerialize that file
-    // inside the gini workspace, defeating the workspace sandbox other
-    // tooling relies on. Refuse symlinks outright instead of trying to
-    // walk a realpath chain.
+  test("workspace symlink source resolving outside source.stateRoot is refused at plan time", async () => {
+    // `copyFileSync` follows symlinks by default, so a
+    // `workspace/SOUL.md` symlink to `/etc/passwd` would happily
+    // rematerialize that file inside the gini workspace, defeating
+    // the workspace sandbox other tooling relies on. The planner's
+    // realpath containment check now catches this BEFORE the step
+    // is even added — the operator sees it on the unsupported list
+    // instead of via an apply-time warning.
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withWorkspaceFiles: true });
-    // Replace one workspace file with a symlink to a sensitive-looking
-    // outside target. Use /etc/hosts as the link target since it's
-    // world-readable on macOS/Linux test hosts.
     const link = join(OPENCLAW_ROOT, "workspace", "AGENTS.md");
     rmSync(link, { force: true });
     symlinkSync("/etc/hosts", link);
     const config = loadConfig("workspace-symlink-refused");
     const discovery = discoverOpenclawState(OPENCLAW_ROOT);
-    const result = await applyMigration(config, discovery, planMigration(discovery));
-    // SOUL.md still copies; AGENTS.md is dropped.
+    const plan = planMigration(discovery);
+    // The leaked file is never added to the plan as a workspace step.
+    expect(plan.steps.some(
+      (step) => step.kind === "workspaceFile" && step.name === "AGENTS.md"
+    )).toBe(false);
+    expect(
+      plan.unsupported.some(
+        (entry) =>
+          entry.kind === "workspaceFile:AGENTS.md" &&
+          entry.detail.includes("outside the openclaw state root")
+      )
+    ).toBe(true);
+    const result = await applyMigration(config, discovery, plan);
+    // SOUL.md still copies; AGENTS.md is gone.
     expect(result.workspaceFilesCopied).toBe(1);
     const target = join(GINI_STATE, "instances", "workspace-symlink-refused", "workspace", "AGENTS.md");
     expect(existsSync(target)).toBe(false);
-    expect(result.warnings.some((warning) => warning.includes("AGENTS.md") && warning.includes("symlink"))).toBe(true);
   });
 
-  test("skill SKILL.md symlink source is refused and warned about", async () => {
+  test("skill SKILL.md symlink resolving outside source.stateRoot is refused at plan time", async () => {
     // Same threat as the workspace test, applied to the skill copy
     // path which uses `readFileSync` (also follows symlinks).
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withSkill: true });
@@ -1987,11 +2050,50 @@ describe("applyMigration archive", () => {
     symlinkSync("/etc/hosts", link);
     const config = loadConfig("skill-symlink-refused");
     const discovery = discoverOpenclawState(OPENCLAW_ROOT);
-    const result = await applyMigration(config, discovery, planMigration(discovery));
-    expect(result.skillsCopied).toBe(0);
+    const plan = planMigration(discovery);
+    expect(plan.steps.some(
+      (step) => step.kind === "skill" && step.name === "memo-helper"
+    )).toBe(false);
     expect(
-      result.warnings.some((warning) => warning.includes("memo-helper") && warning.includes("symlink"))
+      plan.unsupported.some(
+        (entry) =>
+          entry.kind === "skill:memo-helper" &&
+          entry.detail.includes("outside the openclaw state root")
+      )
     ).toBe(true);
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.skillsCopied).toBe(0);
+  });
+
+  test("parent-directory symlink in skills/ is refused at plan time", async () => {
+    // Even if every leaf SKILL.md is itself a regular file, a parent
+    // directory symlinked outside source.stateRoot (e.g. `skills` ->
+    // `/etc`) would defeat the leaf-only `isSymlinkSource` check.
+    // The planner's realpath containment catches this.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const externalSkillsHome = `${ROOT}/external-skills`;
+    rmSync(externalSkillsHome, { recursive: true, force: true });
+    mkdirSync(join(externalSkillsHome, "extracted-skill"), { recursive: true });
+    writeFileSync(
+      join(externalSkillsHome, "extracted-skill", "SKILL.md"),
+      "---\nname: extracted\n---\nbody\n"
+    );
+    // Replace `<state>/skills` with a symlink to the external dir.
+    rmSync(join(OPENCLAW_ROOT, "skills"), { recursive: true, force: true });
+    symlinkSync(externalSkillsHome, join(OPENCLAW_ROOT, "skills"));
+    const config = loadConfig("skill-parent-symlink-refused");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    expect(plan.steps.some((step) => step.kind === "skill")).toBe(false);
+    expect(
+      plan.unsupported.some(
+        (entry) =>
+          entry.kind === "skill:extracted-skill" &&
+          entry.detail.includes("outside the openclaw state root")
+      )
+    ).toBe(true);
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.skillsCopied).toBe(0);
   });
 
   test("nested symlink inside skill scripts directory is dropped during recursive copy", async () => {
