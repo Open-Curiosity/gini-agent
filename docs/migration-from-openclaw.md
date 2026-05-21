@@ -121,7 +121,7 @@ Every applied migration writes a verbatim zip of your openclaw state root to:
 <instance>/imports/openclaw-<timestamp>.zip
 ```
 
-You can find the instance root with `gini status` (it prints the active instance dir). Restore from the archive by unzipping into a fresh path and pointing `gini import apply openclaw --path <unzipped-dir>` at it. The archive is intentionally kept on disk indefinitely — delete it manually only after you've confirmed the migration result is what you want.
+You can find the instance root with `gini status` (it prints the active instance dir). Restore from the archive by unzipping into a fresh path and pointing `gini import apply openclaw <unzipped-dir>` at it (the path is a positional argument, not a `--path` flag). The archive is intentionally kept on disk indefinitely — delete it manually only after you've confirmed the migration result is what you want.
 
 ## Common questions
 
