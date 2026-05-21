@@ -397,6 +397,25 @@ describe("parseOpenclawJson", () => {
   test("throws on irrecoverable syntax errors", () => {
     expect(() => parseOpenclawJson("not json at all")).toThrow();
   });
+
+  test("elides trailing comma when a block comment intervenes before the closer", () => {
+    // Hand-edited configs commonly carry `, /* note */` before a
+    // closing bracket. The scanner's whitespace-only lookahead would
+    // leave the comma in place and strict JSON.parse would reject
+    // the cleaned string.
+    const raw = `{"a": 1, /* note */}`;
+    expect(parseOpenclawJson(raw)).toEqual({ a: 1 });
+  });
+
+  test("elides trailing comma when a line comment intervenes before the closer", () => {
+    const raw = `[1, // note\n]`;
+    expect(parseOpenclawJson(raw)).toEqual([1]);
+  });
+
+  test("elides trailing comma when both whitespace and a comment intervene", () => {
+    const raw = `{\n  "a": 1,  \n  // explainer\n  /* still inside */\n}`;
+    expect(parseOpenclawJson(raw)).toEqual({ a: 1 });
+  });
 });
 
 describe("readStateDotenv", () => {

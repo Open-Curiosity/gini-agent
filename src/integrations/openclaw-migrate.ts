@@ -367,18 +367,46 @@ function stripCommentsAndTrailingCommas(input: string): string {
       continue;
     }
     // Trailing-comma elision: when we're outside any string literal,
-    // a comma followed by optional whitespace and a closing brace or
-    // bracket gets dropped. Doing this here (inside the string-aware
-    // pass) prevents a post-hoc regex from accidentally stripping
-    // commas inside string contents like `"hello, world"` — the
-    // previous /,(\s*[}\]])/g cleanup did exactly that and silently
-    // mangled user data.
+    // a comma followed by optional whitespace AND/OR intervening
+    // comments and then a closing brace or bracket gets dropped.
+    // Doing this here (inside the string-aware pass) prevents a
+    // post-hoc regex from accidentally stripping commas inside string
+    // contents like `"hello, world"` — the previous /,(\s*[}\]])/g
+    // cleanup did exactly that and silently mangled user data.
+    // The lookahead must walk past comments too: configs commonly
+    // carry `{"a": 1, /* note */}` or `[1, // note\n]`, where the
+    // next non-whitespace character is `/`, not `}` / `]`. A
+    // whitespace-only scan would leave the trailing comma in place
+    // and strict JSON.parse would then reject the cleaned string.
     if (c === ",") {
       let j = i + 1;
-      while (j < input.length && /\s/.test(input[j]!)) j += 1;
+      while (j < input.length) {
+        const lookahead = input[j]!;
+        if (/\s/.test(lookahead)) {
+          j += 1;
+          continue;
+        }
+        if (lookahead === "/" && j + 1 < input.length) {
+          const peek = input[j + 1]!;
+          if (peek === "/") {
+            j += 2;
+            while (j < input.length && input[j] !== "\n") j += 1;
+            continue;
+          }
+          if (peek === "*") {
+            j += 2;
+            while (j + 1 < input.length && !(input[j] === "*" && input[j + 1] === "/")) j += 1;
+            j += 2;
+            continue;
+          }
+        }
+        break;
+      }
       const closer = j < input.length ? input[j] : undefined;
       if (closer === "}" || closer === "]") {
-        // Skip the comma; keep the whitespace + closer untouched.
+        // Skip the comma; keep the whitespace + comments + closer
+        // untouched (the comment-stripping branches above run on the
+        // next iteration and clean up the comment bytes).
         i += 1;
         continue;
       }
