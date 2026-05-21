@@ -55,6 +55,7 @@ import { dispatchToolCall } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { isSkillActive } from "../integrations/connectors";
+import { getProvider } from "../integrations/connectors/registry";
 import { resolveEffectiveContext } from "./effective-context";
 
 // Default safety cap on chat-task loop iterations. Each iteration is one
@@ -423,12 +424,20 @@ function buildEnabledSkillsBlock(skills: SkillRecord[]): string {
 // Inactive-but-enabled skills block. Distinct from buildEnabledSkillsBlock:
 // these skills are turned on but unusable because a required connector is
 // missing. We tell the model exactly which provider needs connecting so it
-// can call `request_connector` instead of refusing or hallucinating.
+// can either invoke the provider's setup skill (when the provider declares
+// one) or call `request_connector` directly to ask the user to connect.
 //
 // Skills with `requiredConnectors` undefined / empty are skipped: those are
 // inactive for some other reason (validation status, etc.) and there's no
 // connector affordance to offer.
-function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
+//
+// We group by provider — multiple product skills often share the same
+// connector (e.g. all Google Workspace skills share google-oauth-desktop),
+// and emitting one line per provider keeps the block compact and points
+// the model at a single setup path per connector.
+//
+// Exported for unit testing; production callers use it via runChatTask.
+export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
   const candidates = skills.filter(
     (skill) => skill.status === "enabled" && (skill.requiredConnectors?.length ?? 0) > 0
   );
@@ -448,15 +457,31 @@ function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
       byName.set(skill.name, skill);
     }
   }
-  const lines = Array.from(byName.values())
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .map((s) => {
-      const desc = s.description.trim() || "(no description)";
-      const providers = (s.requiredConnectors ?? []).map((r) => r.provider).join(", ");
-      return `- ${s.name}: ${desc} — needs connector: ${providers}.`;
+  // Group dedup'd skills by provider id. setupSkill is captured per
+  // provider — if any skill's required provider declares one, the
+  // provider-level line directs the model to invoke that skill instead
+  // of calling request_connector directly.
+  const grouped = new Map<string, { skills: string[]; setupSkill?: string }>();
+  for (const skill of byName.values()) {
+    for (const req of skill.requiredConnectors ?? []) {
+      const entry = grouped.get(req.provider) ?? { skills: [] };
+      entry.skills.push(skill.name);
+      const module = getProvider(req.provider);
+      if (module?.setupSkill) entry.setupSkill = module.setupSkill;
+      grouped.set(req.provider, entry);
+    }
+  }
+  const lines = Array.from(grouped.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([provider, entry]) => {
+      const skillList = Array.from(new Set(entry.skills)).sort().join(", ");
+      if (entry.setupSkill) {
+        return `- ${provider} (used by: ${skillList}) — run \`read_skill\` with \`${entry.setupSkill}\` to set this up.`;
+      }
+      return `- ${provider} (used by: ${skillList}) — call \`request_connector\` with provider id \`${provider}\` to ask the user to connect.`;
     });
   return [
-    "Available skills that need connection (call `request_connector` with the provider id to ask the user to connect):",
+    "Skills below need an external connector. For providers with a setup skill listed, invoke that skill first (it walks through any install / OAuth / project provisioning, then captures credentials). Otherwise, call `request_connector` with the provider id directly.",
     ...lines
   ].join("\n");
 }

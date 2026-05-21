@@ -104,4 +104,11 @@ export interface ProviderModule {
     description?: string;
     required?: boolean;
   }>;
+  // Optional. The name of a bundled Gini skill that owns the setup flow
+  // for this provider. When set, the runtime tells the model to invoke
+  // THIS SKILL (via read_skill) when the connector is missing, instead of
+  // the default "call request_connector" shortcut. The setup skill is
+  // responsible for any installation, OAuth, project provisioning, etc.,
+  // and itself calls request_connector at the end to capture credentials.
+  setupSkill?: string;
 }

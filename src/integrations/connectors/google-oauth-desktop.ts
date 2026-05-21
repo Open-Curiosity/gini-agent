@@ -45,5 +45,13 @@ export const googleOauthDesktopProvider: ProviderModule = {
       GOOGLE_WORKSPACE_CLI_CLIENT_ID: "client_id",
       GOOGLE_WORKSPACE_CLI_CLIENT_SECRET: "client_secret"
     }
-  }
+  },
+  // The setup flow is non-trivial — install gws, install gcloud, gcloud
+  // auth login, project provisioning, APIs enable, THEN capture the
+  // OAuth client credentials. The `google-workspace-setup` skill owns
+  // the full walkthrough and calls `request_connector` at the end. The
+  // runtime advertises this skill in the "skills that need connection"
+  // system-prompt block so the model invokes the setup skill instead of
+  // dropping a bare Connect form on the user.
+  setupSkill: "google-workspace-setup"
 };
