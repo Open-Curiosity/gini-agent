@@ -9,6 +9,7 @@ import {
   readState
 } from "../state";
 import { addAudit } from "../state/audit";
+import { scaffoldAgentSoulFile } from "../runtime/identity-files";
 
 export function listAgents(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -50,6 +51,13 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
   // there's no copying of memories or hindsight units from the default
   // agent or any other agent.
   ensureAgentBank(config.instance, record.id);
+  // Scaffold the per-agent SOUL.md as a zero-byte placeholder so the
+  // user can fill it in without first having to create the directory.
+  // The load path treats an empty file as absent, so this does not
+  // change prompt behavior — it only surfaces the file on disk.
+  // Order matters: state has already been persisted, so a crash here
+  // can never leave a SOUL.md for a non-existent agent.
+  scaffoldAgentSoulFile(config.instance, record.id);
   return record;
 }
 

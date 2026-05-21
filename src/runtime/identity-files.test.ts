@@ -3,7 +3,7 @@
 // real on-disk paths without polluting a developer's actual instance.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import {
   approveSoul,
@@ -14,6 +14,8 @@ import {
   loadUserProfile,
   removeSoulSection,
   removeUserProfileSection,
+  scaffoldAgentSoulFile,
+  scaffoldInstanceIdentityFiles,
   scanForInjection,
   soulPath,
   soulProposedPath,
@@ -247,6 +249,118 @@ describe("identity-files", () => {
       expect(result.ok).toBe(true);
       const proposed = readFileSync(userProfileProposedPath(INSTANCE), "utf8");
       expect(proposed.trim()).toBe("");
+    });
+  });
+
+  describe("scaffoldInstanceIdentityFiles", () => {
+    test("creates INSTRUCTIONS.md and USER.md as zero-byte files when neither exists", () => {
+      const result = scaffoldInstanceIdentityFiles(INSTANCE);
+      // Both files materialize on disk.
+      expect(existsSync(instructionsPath(INSTANCE))).toBe(true);
+      expect(existsSync(userProfilePath(INSTANCE))).toBe(true);
+      // Truly zero-byte — no placeholder content. The load path treats
+      // empty files as absent, so the default-instructions fallback stays
+      // authoritative until the user writes something specific.
+      expect(statSync(instructionsPath(INSTANCE)).size).toBe(0);
+      expect(statSync(userProfilePath(INSTANCE)).size).toBe(0);
+      // Both paths are in the `created` list.
+      expect(result.created).toContain(instructionsPath(INSTANCE));
+      expect(result.created).toContain(userProfilePath(INSTANCE));
+      expect(result.created.length).toBe(2);
+    });
+
+    test("does not overwrite a pre-existing file with content", () => {
+      const path = userProfilePath(INSTANCE);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "Existing user notes.");
+      const result = scaffoldInstanceIdentityFiles(INSTANCE);
+      // USER.md was already on disk — scaffolding leaves it alone.
+      expect(readFileSync(path, "utf8")).toBe("Existing user notes.");
+      // Only INSTRUCTIONS.md should appear in the created list.
+      expect(result.created).toEqual([instructionsPath(INSTANCE)]);
+    });
+
+    test("is idempotent across repeat calls", () => {
+      const first = scaffoldInstanceIdentityFiles(INSTANCE);
+      expect(first.created.length).toBe(2);
+      const second = scaffoldInstanceIdentityFiles(INSTANCE);
+      // Second call sees both files already present and creates nothing.
+      expect(second.created).toEqual([]);
+      // Files are still zero-byte — re-touching cannot clobber content.
+      expect(statSync(instructionsPath(INSTANCE)).size).toBe(0);
+      expect(statSync(userProfilePath(INSTANCE)).size).toBe(0);
+    });
+
+    test("does not throw when the instance root is unwritable", () => {
+      // Make the instance root read-only so the touchIfMissing path fails
+      // on the open(O_CREAT|O_EXCL) call. The helper must catch and log
+      // rather than propagating — startup cannot crash on a permission
+      // glitch on a user-editable file.
+      mkdirSync(dirname(userProfilePath(INSTANCE)), { recursive: true });
+      const root = dirname(userProfilePath(INSTANCE));
+      const prevMode = statSync(root).mode;
+      chmodSync(root, 0o500); // r-x only, no write
+      try {
+        // Should NOT throw.
+        const result = scaffoldInstanceIdentityFiles(INSTANCE);
+        // Nothing was created (writes failed) but the call returned cleanly.
+        expect(result.created).toEqual([]);
+      } finally {
+        chmodSync(root, prevMode);
+      }
+    });
+  });
+
+  describe("scaffoldAgentSoulFile", () => {
+    test("creates agents/<agentId>/SOUL.md as a zero-byte file when absent", () => {
+      const result = scaffoldAgentSoulFile(INSTANCE, AGENT);
+      expect(result.created).toBe(soulPath(INSTANCE, AGENT));
+      expect(existsSync(soulPath(INSTANCE, AGENT))).toBe(true);
+      expect(statSync(soulPath(INSTANCE, AGENT)).size).toBe(0);
+    });
+
+    test("does not overwrite a pre-existing SOUL.md with content", () => {
+      const path = soulPath(INSTANCE, AGENT);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "Persona body.");
+      const result = scaffoldAgentSoulFile(INSTANCE, AGENT);
+      expect(result.created).toBeNull();
+      expect(readFileSync(path, "utf8")).toBe("Persona body.");
+    });
+
+    test("is idempotent across repeat calls", () => {
+      const first = scaffoldAgentSoulFile(INSTANCE, AGENT);
+      expect(first.created).toBe(soulPath(INSTANCE, AGENT));
+      const second = scaffoldAgentSoulFile(INSTANCE, AGENT);
+      // Second call is a no-op.
+      expect(second.created).toBeNull();
+      expect(statSync(soulPath(INSTANCE, AGENT)).size).toBe(0);
+    });
+
+    test("does not throw when the agents directory is unwritable", () => {
+      // Plant a read-only parent so the create fails inside the helper.
+      const instanceRootDir = dirname(soulPath(INSTANCE, AGENT)).replace(/\/agents\/.*$/, "");
+      mkdirSync(instanceRootDir, { recursive: true });
+      const prevMode = statSync(instanceRootDir).mode;
+      chmodSync(instanceRootDir, 0o500);
+      try {
+        const result = scaffoldAgentSoulFile(INSTANCE, AGENT);
+        expect(result.created).toBeNull();
+      } finally {
+        chmodSync(instanceRootDir, prevMode);
+      }
+    });
+
+    test("scaffolded empty file loads as null (fallback path stays authoritative)", () => {
+      // The whole point of scaffolding zero-byte files: they must not
+      // change prompt behavior. The load path trims and treats empty as
+      // absent, so the system-prompt assembler falls back to its
+      // default-instructions constant / elides the block as before.
+      scaffoldInstanceIdentityFiles(INSTANCE);
+      scaffoldAgentSoulFile(INSTANCE, AGENT);
+      expect(loadInstructions(INSTANCE)).toBeNull();
+      expect(loadUserProfile(INSTANCE)).toBeNull();
+      expect(loadSoul(INSTANCE, AGENT)).toBeNull();
     });
   });
 });

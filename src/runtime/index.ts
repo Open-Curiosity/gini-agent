@@ -6,6 +6,7 @@ import { addAudit } from "../state/audit";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
 import { providerHealth } from "../provider";
+import { scaffoldAgentSoulFile, scaffoldInstanceIdentityFiles } from "./identity-files";
 import { currentVersionInfo } from "./update";
 
 export function status(config: RuntimeConfig) {
@@ -87,6 +88,12 @@ export function install(config: RuntimeConfig): void {
   // After resetInstance removes the instance root, the directory is gone. Ensure it
   // before writing the config so reinstall is a clean idempotent operation.
   ensureDir(instanceRoot(config.instance));
+  // Scaffold the two instance-scoped identity files (INSTRUCTIONS.md and
+  // USER.md) as zero-byte placeholders. The loaders treat an empty file as
+  // absent and fall back to defaults, so this purely surfaces the files in
+  // the filesystem for the user to discover. Best-effort: scaffolding never
+  // throws on a filesystem error.
+  scaffoldInstanceIdentityFiles(config.instance);
   // Approval-mode migration: legacy configs that carry
   // `dangerouslyAutoApprove: true` without an explicit `approvalMode`
   // get aliased to `approvalMode: "yolo"`. Patch the in-memory config
@@ -102,7 +109,14 @@ export function install(config: RuntimeConfig): void {
   // behavior change from "gate everything" to "auto-approve safe
   // actions" for this instance.
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
-  readState(config.instance);
+  const state = readState(config.instance);
+  // Backfill per-agent SOUL.md placeholders for every existing agent.
+  // Catches the 21+ already-provisioned instances on disk that pre-date
+  // the scaffold logic. Quiet on no-ops — only the first creation per
+  // file matters; the rest are silent.
+  for (const agent of state.agents) {
+    scaffoldAgentSoulFile(config.instance, agent.id);
+  }
   // Audit + side-effects of the migration. Fire-and-forget; the
   // synchronous patch above is what the policy seam actually consults.
   void migrateLegacyApprovalMode(config);
@@ -228,6 +242,11 @@ export function updateAutoApproveSettings(
     config.dangerousTerminalPatterns = cleaned;
   }
   ensureDir(instanceRoot(config.instance));
+  // Safety net: settings PATCH can land on an instance whose identity
+  // files were never scaffolded (e.g. an instance bootstrapped on a build
+  // that pre-dated the scaffold logic). Idempotent — does nothing if the
+  // files already exist.
+  scaffoldInstanceIdentityFiles(config.instance);
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   const effectiveMode: ApprovalMode = config.approvalMode ?? (config.dangerouslyAutoApprove ? "yolo" : "auto");
   return {

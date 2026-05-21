@@ -21,14 +21,17 @@
 // See ADR runtime-identity-files.md for the full design.
 
 import {
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   writeFileSync
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { instanceRoot } from "../paths";
+import { appendLog } from "../state/trace";
 import type { Instance } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -60,6 +63,103 @@ export function soulPath(instance: Instance, agentId: string): string {
 
 export function soulProposedPath(instance: Instance, agentId: string): string {
   return `${soulPath(instance, agentId)}.proposed`;
+}
+
+// ---------------------------------------------------------------------------
+// Scaffold path. Touches the three identity files as zero-byte placeholders
+// at instance / agent creation so users see them in the filesystem before
+// they have anything specific to write. Reads still go through the
+// load-and-scan helpers, which treat a zero-byte (or whitespace-only) file
+// as absent and fall back to defaults — so scaffolded empty files do not
+// change prompt behavior.
+//
+// Both helpers are best-effort: any filesystem error is swallowed and
+// logged through `appendLog` so a permission glitch can never crash the
+// gateway at startup. They never overwrite an existing file.
+// ---------------------------------------------------------------------------
+
+// Touch a zero-byte file at `path` if and only if it does not already
+// exist. Uses `openSync(..., "wx")` so the create is atomic against a
+// concurrent writer racing the existence check (e.g. a user editing the
+// file by hand during runtime startup). Returns true when this call
+// actually created the file.
+function touchIfMissing(path: string): boolean {
+  if (existsSync(path)) return false;
+  ensureDir(dirname(path));
+  // O_CREAT | O_EXCL: fail if the file appeared between the existsSync
+  // and the open. We catch EEXIST and treat it as "someone else created
+  // it" — which is the same outcome we wanted.
+  let fd: number;
+  try {
+    fd = openSync(path, "wx");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "EEXIST") return false;
+    throw error;
+  }
+  closeSync(fd);
+  return true;
+}
+
+export interface ScaffoldInstanceResult {
+  created: string[];
+}
+
+// Touch INSTRUCTIONS.md and USER.md at the instance root if absent.
+// Never overwrites. Returns the list of paths created (possibly empty).
+// All filesystem errors are caught and logged; the gateway must not crash
+// because a placeholder file failed to materialize.
+export function scaffoldInstanceIdentityFiles(instance: Instance): ScaffoldInstanceResult {
+  const created: string[] = [];
+  const targets: Array<{ path: string; name: string }> = [
+    { path: instructionsPath(instance), name: "INSTRUCTIONS.md" },
+    { path: userProfilePath(instance), name: "USER.md" }
+  ];
+  for (const { path, name } of targets) {
+    try {
+      if (touchIfMissing(path)) created.push(path);
+    } catch (error) {
+      try {
+        appendLog(instance, "identity.scaffold.error", {
+          file: name,
+          path,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      } catch {
+        // Logging itself failed (state root unwritable etc.). Swallow —
+        // scaffolding is purely opportunistic, the load path tolerates
+        // missing files.
+      }
+    }
+  }
+  return { created };
+}
+
+export interface ScaffoldAgentResult {
+  created: string | null;
+}
+
+// Touch agents/<agentId>/SOUL.md at the instance root if absent. Never
+// overwrites. Returns the created path or null when the file already
+// existed (or the touch failed and was logged).
+export function scaffoldAgentSoulFile(instance: Instance, agentId: string): ScaffoldAgentResult {
+  const path = soulPath(instance, agentId);
+  try {
+    if (touchIfMissing(path)) return { created: path };
+    return { created: null };
+  } catch (error) {
+    try {
+      appendLog(instance, "identity.scaffold.error", {
+        file: "SOUL.md",
+        agentId,
+        path,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } catch {
+      // See scaffoldInstanceIdentityFiles — best-effort logging only.
+    }
+    return { created: null };
+  }
 }
 
 // ---------------------------------------------------------------------------
