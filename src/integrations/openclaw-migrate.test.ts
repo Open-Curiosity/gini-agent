@@ -2553,6 +2553,54 @@ describe("applyMigration memory units", () => {
     expect(totalForOpenclaw?.c).toBe(2);
   });
 
+  test("older Hindsight schema missing a column degrades to an unsupported note instead of aborting", async () => {
+    // Older Hindsight schemas may be missing `confidence` (or any
+    // other column the migrator's SELECT reads). prepare()/all() then
+    // throw "no such column" — without graceful handling that throw
+    // would propagate up and abort the whole planMigration call,
+    // taking down agent / skill / session migration too.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const memoryDir = join(OPENCLAW_ROOT, "memory");
+    mkdirSync(memoryDir, { recursive: true });
+    const dbPath = join(memoryDir, "legacy.sqlite");
+    const db = new Database(dbPath);
+    try {
+      // Hindsight-shape DB intentionally missing the `confidence`,
+      // `metadata`, and `mentioned_at` columns the migrator reads.
+      db.exec(`
+        CREATE TABLE memory_banks (id TEXT PRIMARY KEY);
+        CREATE TABLE memory_units (
+          id TEXT PRIMARY KEY,
+          text TEXT,
+          network TEXT,
+          status TEXT
+        );
+      `);
+      db.run("INSERT INTO memory_banks (id) VALUES ('bank_default')");
+      db.run(
+        "INSERT INTO memory_units (id, text, network, status) VALUES (?, ?, ?, ?)",
+        ["legacy-1", "old row", "world", "active"]
+      );
+    } finally {
+      db.close();
+    }
+    const config = loadConfig("memory-legacy-schema");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    // The plan completes without throwing — that's the load-bearing
+    // assertion (a throw here would crash the entire migration).
+    const memoryNote = plan.unsupported.find((entry) => entry.kind === "memory");
+    expect(memoryNote).toBeDefined();
+    expect(memoryNote!.detail).toContain("Hindsight schema detected but SELECT failed");
+    expect(plan.steps.some((step) => step.kind === "memoryUnit")).toBe(false);
+    // Apply also succeeds even though the SELECT failed — sessions /
+    // agents / skills migrate independently and we don't want one
+    // bad memory file to take the whole import down.
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.applied).toBe(true);
+    expect(result.memoryUnitsCreated).toBe(0);
+  });
+
   test("empty memory directory produces no migration step and no unsupported note", async () => {
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
     // memory/ exists but no .sqlite files inside. Hooks for memory

@@ -705,25 +705,44 @@ function scanMemorySqlite(dbPath: string, bankLabel: string): {
   }
   try {
     const tables = new Set<string>();
-    for (const row of db
-      .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-      .all() as Array<{ name: string }>) {
-      tables.add(row.name);
+    try {
+      for (const row of db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .all() as Array<{ name: string }>) {
+        tables.add(row.name);
+      }
+    } catch (error) {
+      return {
+        units: [],
+        note: `could not list tables (${error instanceof Error ? error.message : String(error)})`
+      };
     }
     if (tables.has("memory_units") && tables.has("memory_banks")) {
-      const rows = db
-        .prepare(
-          "SELECT id, text, network, status, confidence, metadata, mentioned_at FROM memory_units"
-        )
-        .all() as Array<{
-          id: string;
-          text: string;
-          network: string;
-          status: string;
-          confidence: number | null;
-          metadata: string | null;
-          mentioned_at: string;
-        }>;
+      // Older Hindsight schemas may be missing columns we now read
+      // (e.g. `confidence` was added later). prepare()/all() throw
+      // "no such column" against those; degrade to an unsupported
+      // note instead of aborting the whole planMigration call.
+      let rows: Array<{
+        id: string;
+        text: string;
+        network: string;
+        status: string;
+        confidence: number | null;
+        metadata: string | null;
+        mentioned_at: string;
+      }>;
+      try {
+        rows = db
+          .prepare(
+            "SELECT id, text, network, status, confidence, metadata, mentioned_at FROM memory_units"
+          )
+          .all() as typeof rows;
+      } catch (error) {
+        return {
+          units: [],
+          note: `Hindsight schema detected but SELECT failed (${error instanceof Error ? error.message : String(error)}); likely an older schema missing a column the migrator reads. Not migrated.`
+        };
+      }
       const units: MemoryUnitPlanShape[] = rows.map((row) => ({
         sourceBank: bankLabel,
         openclawId: row.id,
@@ -739,9 +758,15 @@ function scanMemorySqlite(dbPath: string, bankLabel: string): {
         : { units };
     }
     if (tables.has("chunks") && tables.has("files")) {
-      const chunkCount = (db
-        .prepare("SELECT COUNT(*) AS n FROM chunks")
-        .get() as { n: number }).n;
+      let chunkCount = 0;
+      try {
+        chunkCount = (db
+          .prepare("SELECT COUNT(*) AS n FROM chunks")
+          .get() as { n: number }).n;
+      } catch {
+        // Schema present but COUNT failed — fall through with 0 and
+        // let the note say so rather than aborting the whole plan.
+      }
       return {
         units: [],
         note: `file-chunk RAG schema detected (${chunkCount} chunks). No Hindsight equivalent; not migrated. Re-index relevant files into gini's memory via /api/memory/retain.`
