@@ -408,8 +408,12 @@ describe("parseOpenclawJson", () => {
   });
 
   test("elides trailing comma when a line comment intervenes before the closer", () => {
+    // parseOpenclawJson is typed as returning OpenclawConfig (an
+    // object shape); arrays are valid at runtime but the type cast
+    // hides that — re-cast to unknown so toEqual accepts the array
+    // shape for comparison.
     const raw = `[1, // note\n]`;
-    expect(parseOpenclawJson(raw)).toEqual([1]);
+    expect(parseOpenclawJson(raw) as unknown).toEqual([1]);
   });
 
   test("elides trailing comma when both whitespace and a comment intervene", () => {
@@ -2295,7 +2299,7 @@ describe("applyMigration memory units", () => {
     expect(mainAgent).toBeDefined();
     const memDb = getMemoryDb("memory-recall-binding");
     const row = memDb
-      .query<{ bank_id: string; agent_id: string | null }, []>(
+      .query<{ bank_id: string; agent_id: string | null }, [string]>(
         "SELECT bank_id, agent_id FROM memory_units WHERE text = ?"
       )
       .get("Bob likes coffee");
