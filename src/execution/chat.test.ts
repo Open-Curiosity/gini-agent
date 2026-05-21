@@ -25,7 +25,7 @@ import {
   normalizeProvider
 } from "../provider";
 import { decideApproval } from "../agent";
-import { mutateState, readState } from "../state";
+import { createChatMessage, mutateState, readState } from "../state";
 import {
   getChatSession,
   submitChatMessage,
@@ -169,12 +169,17 @@ describe("chat session waiting-approval placeholder (Review P1 #3)", () => {
     expect(assistantMsgs[0]?.content).toBe("All done.");
   });
 
-  test("synthesizes the placeholder from the connector.request approval reason when present", async () => {
-    // When a task is paused on a connector.request approval, the model has
-    // already produced the URL instructions (with sign-in / setup links) in
-    // the approval's `reason` field. Surface that reason as the placeholder
-    // chat bubble so the user sees the rendered instructions and can click
-    // the URLs — instead of a generic "Waiting for approval".
+  test("surfaces the connector.request approval reason as a durable assistant bubble (kind:approval_reason)", async () => {
+    // requestConnectorTool persists the model's `reason` as a real
+    // ChatMessageRecord at approval-creation time, tagged kind:"approval_reason".
+    // This durable row is what the user sees as the chat bubble above the
+    // inline form (with rendered URLs), AND what stays in history after the
+    // form is submitted and the approval resolves.
+    //
+    // Bypassing dispatchToolCall in this test — we set up the state shape
+    // dispatchToolCall produces and assert getChatSession returns the
+    // persisted row (not a synthesized placeholder) and that the row
+    // carries the kind tag.
     const config = buildConfig(workspaceRoot, "chat-placeholder-connector");
 
     const session = await createChat(config, { title: "connector-placeholder" });
@@ -188,9 +193,6 @@ describe("chat session waiting-approval placeholder (Review P1 #3)", () => {
     ].join("\n");
 
     const taskId = await mutateState(config.instance, (state) => {
-      // Build a task pinned to waiting_approval with no partialSummary, then
-      // attach a pending connector.request approval. This is the exact shape
-      // the chat surface sees while the agent is paused on a connector setup.
       const task: Task = {
         id: "task_connreq",
         title: "connect provider",
@@ -232,17 +234,79 @@ describe("chat session waiting-approval placeholder (Review P1 #3)", () => {
       };
       state.approvals.push(approval);
       task.approvalIds.push(approval.id);
+      // Mirror what requestConnectorTool does at dispatch time: persist
+      // the reason as a real assistant message tagged approval_reason.
+      createChatMessage(state, {
+        sessionId: session.id,
+        role: "assistant",
+        content: reasonText,
+        taskId: task.id,
+        kind: "approval_reason"
+      });
       return task.id;
     });
 
     const view = getChatSession(config, session.id);
     const assistantMsgs = view.messages.filter((m) => m.role === "assistant" && m.taskId === taskId);
+    // Exactly one assistant row for this task while waiting_approval:
+    // the persisted approval_reason. No synthesized placeholder layered
+    // on top of it.
     expect(assistantMsgs).toHaveLength(1);
-    expect(assistantMsgs[0]?.id).toBe(`${taskId}-streaming`);
-    // The placeholder content must be the approval's full reason (with URLs
-    // and line breaks) — not "Waiting for approval" and not the currentStep.
+    expect(assistantMsgs[0]?.id).toMatch(/^msg_/);
+    expect(assistantMsgs[0]?.kind).toBe("approval_reason");
     expect(assistantMsgs[0]?.content).toBe(reasonText);
     expect(assistantMsgs[0]?.content).toContain("https://console.cloud.google.com/apis/credentials");
+  });
+
+  test("approval_reason bubble survives task progress: partial-summary streaming renders alongside it", async () => {
+    // After the user submits the inline form, the task resumes and the
+    // model starts working again (gws install, gws auth login, etc.).
+    // partialSummary on the task should still synthesize a streaming
+    // bubble — the approval_reason row must NOT suppress it, otherwise
+    // the user sees no progress until the task finishes.
+    const config = buildConfig(workspaceRoot, "chat-placeholder-progress");
+    const session = await createChat(config, { title: "approval-then-progress" });
+    const reasonText = "Last step: paste your Client ID and Client Secret below.";
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task: Task = {
+        id: "task_progress",
+        title: "post-approval progress",
+        input: "calendar today",
+        status: "in_progress",
+        instance: state.instance,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        memoryIds: [],
+        skillIds: [],
+        chatSessionId: session.id,
+        partialSummary: "Running gws auth login..."
+      };
+      state.tasks.push(task);
+      const sessionRecord = state.chatSessions.find((s) => s.id === session.id);
+      if (sessionRecord) sessionRecord.taskIds.push(task.id);
+      createChatMessage(state, {
+        sessionId: session.id,
+        role: "assistant",
+        content: reasonText,
+        taskId: task.id,
+        kind: "approval_reason"
+      });
+      return task.id;
+    });
+
+    const view = getChatSession(config, session.id);
+    const assistantMsgs = view.messages.filter((m) => m.role === "assistant" && m.taskId === taskId);
+    // Two assistant rows: the persisted approval_reason AND the
+    // synthesized partial-summary placeholder.
+    expect(assistantMsgs).toHaveLength(2);
+    const reasonRow = assistantMsgs.find((m) => m.kind === "approval_reason");
+    const streamingRow = assistantMsgs.find((m) => m.id === `${taskId}-streaming`);
+    expect(reasonRow?.content).toBe(reasonText);
+    expect(streamingRow?.content).toBe("Running gws auth login...");
   });
 
   test("falls back to the generic placeholder when no connector.request approval is linked", async () => {

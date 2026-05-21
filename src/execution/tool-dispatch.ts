@@ -17,6 +17,7 @@ import {
   appendTrace,
   assertInsideWorkspace,
   createApproval,
+  createChatMessage,
   isTerminalTaskStatus,
   mutateState,
   now,
@@ -2201,6 +2202,24 @@ async function requestConnectorTool(
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
+    // Persist the model's `reason` as a durable assistant bubble in the
+    // chat session so it survives past approval resolution. Without this,
+    // the bubble exists only while the task is `waiting_approval` (via
+    // the synthesizer in getChatSession) and disappears once the user
+    // saves the form — leaving no record of the instructions they just
+    // acted on. Tag with kind:"approval_reason" so syncChatTaskResult's
+    // single-summary-per-task short-circuit doesn't mistake this for the
+    // task's final summary.
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for connector connect (chat-task)",

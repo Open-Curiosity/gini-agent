@@ -58,8 +58,18 @@ export function getChatSession(config: RuntimeConfig, id: string) {
   // updates automatically when approval grants and the task completes;
   // previously we persisted a real ChatMessageRecord for waiting_approval
   // and the sync short-circuit froze the UI at "Waiting for approval".
+  //
+  // Approval-reason messages (kind: "approval_reason") are durable history
+  // bubbles persisted at request_connector time so the user can scroll
+  // back and see what they were asked. They are intentionally excluded
+  // from this "task already has its summary" check — otherwise the
+  // partial-summary streaming bubble for the same task (gws install,
+  // gws auth login, etc.) would be suppressed after the approval
+  // resolves and the user would see no progress until task completion.
   const syncedAssistantTaskIds = new Set(
-    stored.filter((m) => m.role === "assistant" && m.taskId).map((m) => m.taskId as string)
+    stored
+      .filter((m) => m.role === "assistant" && m.taskId && m.kind !== "approval_reason")
+      .map((m) => m.taskId as string)
   );
   const synthetic: ChatMessageRecord[] = [];
   for (const task of tasks) {
@@ -67,19 +77,16 @@ export function getChatSession(config: RuntimeConfig, id: string) {
     if (syncedAssistantTaskIds.has(task.id)) continue;
     let content: string | undefined;
     if (task.status === "waiting_approval") {
-      // Look for a pending connector.request approval linked to this task.
-      // When found, surface the approval's `reason` field as the placeholder
-      // chat message — the model puts the URL instructions there and the user
-      // sees them rendered as markdown in the chat bubble (URLs auto-link via
-      // MarkdownContent). For other approval types, keep the generic placeholder.
-      const connectorRequest = state.approvals.find(
-        (a) => a.taskId === task.id && a.status === "pending" && a.action === "connector.request"
+      // connector.request approvals now persist their `reason` as a durable
+      // assistant message at request_connector time (kind:"approval_reason"),
+      // so no placeholder is needed for that case — the real message is in
+      // `stored` already. Other approval types (file.write, browser.connect,
+      // messaging.send, etc.) still get the generic "Working: …" placeholder.
+      const hasPersistedApprovalReason = stored.some(
+        (m) => m.role === "assistant" && m.taskId === task.id && m.kind === "approval_reason"
       );
-      if (connectorRequest && typeof connectorRequest.reason === "string" && connectorRequest.reason.trim().length > 0) {
-        content = connectorRequest.reason;
-      } else {
-        content = task.currentStep || "Waiting for approval...";
-      }
+      if (hasPersistedApprovalReason) continue;
+      content = task.currentStep || "Waiting for approval...";
     } else if (task.partialSummary) {
       content = task.partialSummary;
     }
@@ -172,7 +179,17 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
     if (!session) throw new Error(`Chat session not found: ${sessionId}`);
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Task not found: ${taskId}`);
-    const existing = state.chatMessages.find((message) => message.taskId === taskId && message.role === "assistant");
+    // Tasks can have multiple assistant messages — the durable
+    // approval-reason bubble (kind: "approval_reason") emitted from
+    // request_connector lives alongside the eventual terminal summary.
+    // The short-circuit here is only for the *summary*, so it must
+    // ignore approval_reason rows.
+    const existing = state.chatMessages.find(
+      (message) =>
+        message.taskId === taskId &&
+        message.role === "assistant" &&
+        message.kind !== "approval_reason"
+    );
     if (existing) return existing;
     // Review P1 #3: only sync truly terminal task results into a real
     // ChatMessageRecord. waiting_approval is in-flight — the synthetic
