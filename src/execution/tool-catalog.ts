@@ -465,12 +465,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
         type: "object",
         properties: {
           provider: { type: "string", description: "Provider id (e.g. 'linear'). Must match a registered provider module." },
-          reason: { type: "string", description: "The user-visible message shown above the inline Connect form. May contain `${var}` placeholders that the runtime substitutes from `params` at dispatch time (skill bodies typically own this string verbatim — copy it without paraphrasing)." },
-          params: {
-            type: "object",
-            description: "Optional. String values substituted for `${var}` placeholders in `reason` (e.g. { project_id: 'gini-workspace-1234567' } substitutes `${project_id}`). Unknown placeholders are left verbatim.",
-            additionalProperties: { type: "string" }
-          }
+          reason: { type: "string", description: "The full user-visible message shown above the inline Connect form. You are responsible for producing the complete text — including any URLs, project IDs, click instructions, or step-by-step guidance the user needs. Substitute any real values (project ids, etc.) directly into the string; do not leave `${...}` placeholders. The skill body (when one applies) shows the exact format to follow; copy it line-for-line, fill in the real values, and pass the result here verbatim." }
         },
         required: ["provider", "reason"]
       }

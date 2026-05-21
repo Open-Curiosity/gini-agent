@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 3.1.1
+    version: 3.1.2
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -191,16 +191,16 @@ If it errors with `PERMISSION_DENIED`, the user doesn't own the project — ask 
 
 #### Last step — OAuth client setup
 
-Call `request_connector` with the project id from Milestone B. Pass the markdown block below as the `reason` field **exactly as written** — leave `${project_id}` as a literal placeholder, the runtime substitutes it from your `params` argument at dispatch time. Do NOT summarize, shorten, or rephrase the instruction text; the user sees it verbatim in the chat bubble above the form.
+After Milestones A-C, call `request_connector` to capture the OAuth Desktop client credentials. The `reason` field is what the user sees in the chat bubble above the inline form — you are responsible for constructing it as a multi-line markdown message with the two Cloud Console URLs (with the actual project id substituted in) and clear click instructions.
 
-The exact `reason` string to copy:
+Use this exact format. **Substitute `<PROJECT_ID>` with the actual project id from Milestone B before passing the string as `reason`. Do not abbreviate, do not collapse to a single line, do not drop the URLs, do not leave `${...}` placeholders — there is no runtime substitution.**
 
 ```text
 **Last step.** Complete the two Cloud Console pages below, then paste the credentials.
 
 **Step 1 — OAuth consent screen** (skip if already configured)
 
-https://console.cloud.google.com/apis/credentials/consent?project=${project_id}
+https://console.cloud.google.com/apis/credentials/consent?project=<PROJECT_ID>
 
 - User Type: **External**
 - App name: **Gini Workspace**
@@ -210,7 +210,7 @@ https://console.cloud.google.com/apis/credentials/consent?project=${project_id}
 
 **Step 2 — Create an OAuth client**
 
-https://console.cloud.google.com/apis/credentials?project=${project_id}
+https://console.cloud.google.com/apis/credentials?project=<PROJECT_ID>
 
 - Click **Create Credentials → OAuth client ID**
 - Application type: **Desktop app**
@@ -220,21 +220,18 @@ https://console.cloud.google.com/apis/credentials?project=${project_id}
 Then paste the **Client ID** and **Client Secret** below.
 ```
 
-The full tool call:
+Then call:
 
 ```text
 request_connector {
   provider: "google-oauth-desktop",
-  reason: "<paste the markdown block above verbatim>",
-  params: {
-    project_id: "<actual project id from gcloud, e.g. gini-workspace-1234567>"
-  }
+  reason: "<the constructed markdown string above, with <PROJECT_ID> filled in>"
 }
 ```
 
-Do NOT post a separate chat message before the tool call. Do NOT `open <url>` for either Console URL — let the user click from the form.
+The inline form renders below the chat bubble. The user clicks the URLs from the bubble, completes both Console pages, and pastes the two values into the form. On Save, the connector is created with env bindings (`GOOGLE_WORKSPACE_CLI_CLIENT_ID`, `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`), and the flow resumes at Step 3.
 
-Don't gate on "reply done" between the two pages — the form submission is what advances the flow. The user can do them in any order, or come back later. The connector is created with the env bindings `GOOGLE_WORKSPACE_CLI_CLIENT_ID` and `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`, which `gws` picks up automatically. Continue to Step 3 once the connector is healthy.
+Do NOT post a separate chat message before the tool call. Do NOT `open <url>` for either Console URL — let the user click from the bubble. Don't gate on "reply done" between the two pages — the form submission is what advances the flow. The user can do them in any order, or come back later.
 
 ### 2B. Browser-only setup (emergency fallback)
 

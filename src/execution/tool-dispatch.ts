@@ -2081,7 +2081,7 @@ async function requestConnectorTool(
   args: Record<string, unknown>
 ): Promise<DispatchResult> {
   const providerId = requireString(args, "provider");
-  const modelReason = requireString(args, "reason");
+  const reason = requireString(args, "reason");
   const provider = getProvider(providerId);
   if (!provider) {
     // Synchronous error so the model can recover (it picked a bogus
@@ -2094,59 +2094,11 @@ async function requestConnectorTool(
       })
     };
   }
-  // Extract `params` from the tool call. Only string values are honored —
-  // the schema declares `additionalProperties: { type: "string" }` so anything
-  // else is a model bug we silently drop (keys with non-string values won't
-  // show up in `templateParams`).
-  const rawParams = args.params;
-  const templateParams: Record<string, string> = {};
-  if (rawParams && typeof rawParams === "object" && !Array.isArray(rawParams)) {
-    for (const [key, value] of Object.entries(rawParams as Record<string, unknown>)) {
-      if (typeof value === "string") {
-        templateParams[key] = value;
-      }
-    }
-  }
 
-  // Three branches for assembling the user-visible message:
-  //   1. Provider declares `requestInstructions` — the runtime owns the
-  //      template and substitutes `${name}` from `templateParams`. Required
-  //      `requestParams` must be present; missing ones surface as a sync
-  //      error so the model can retry with the right shape. Back-compat for
-  //      any provider that ships a built-in default.
-  //   2. Provider declares no template, but the model passed `params` — run
-  //      `${var}` substitution against the model's `reason` string. The skill
-  //      body owns the instruction text and tells the model to leave
-  //      `${var}` placeholders literal; the runtime fills them in here so the
-  //      model never has to interpolate URLs.
-  //   3. Neither — pass `reason` verbatim (today's default).
-  //
-  // Substitution semantics in (1) and (2) are identical: same regex, same
-  // verbatim fall-through for unknown placeholders.
-  const substitute = (template: string): string =>
-    template.replace(/\$\{([a-zA-Z0-9_]+)\}/g, (match, name: string) => {
-      // Leave unknown placeholders verbatim — better to surface `${foo}`
-      // in chat than to silently delete it; the user can flag the broken
-      // template and we can fix the skill or provider.
-      return name in templateParams ? templateParams[name] : match;
-    });
-  let effectiveReason = modelReason;
-  if (typeof provider.requestInstructions === "string" && provider.requestInstructions.length > 0) {
-    const required = (provider.requestParams ?? []).filter((p) => p.required).map((p) => p.name);
-    const missing = required.filter((name) => !(name in templateParams) || templateParams[name].length === 0);
-    if (missing.length > 0) {
-      return {
-        kind: "sync",
-        result: JSON.stringify({
-          ok: false,
-          error: `Missing required params for provider '${providerId}': ${missing.join(", ")}. Re-call request_connector with params: { ${missing.map((n) => `${n}: "..."`).join(", ")} }.`
-        })
-      };
-    }
-    effectiveReason = substitute(provider.requestInstructions);
-  } else if (Object.keys(templateParams).length > 0) {
-    effectiveReason = substitute(modelReason);
-  }
+  // The model owns the full user-visible string. The skill body (when one
+  // applies) shows the format — the model reads it, substitutes any real
+  // values like project IDs, and passes the finished text here. No runtime
+  // templating: `reason` becomes the approval's `reason` verbatim.
 
   // Fast path: if a healthy + configured connector already exists for
   // this provider, the model is calling defensively. Tell it to proceed
@@ -2172,16 +2124,12 @@ async function requestConnectorTool(
       action: "connector.request",
       target: provider.id,
       risk: "low",
-      reason: effectiveReason,
+      reason,
       payload: {
         provider: provider.id,
         providerLabel: provider.label,
         providerDescription: provider.description,
-        reason: effectiveReason,
-        // Persist the substitution inputs alongside the approval for audit
-        // and any future re-render. Empty object when the provider has no
-        // template (keeps the shape uniform).
-        templateParams,
+        reason,
         fields: provider.fields,
         toolCallId
       }
