@@ -777,6 +777,30 @@ describe("applyMigration", () => {
     expect(state.agents.some((agent) => agent.name === "main")).toBe(false);
   });
 
+  test("refuses to apply while a gateway is running on the same instance", async () => {
+    // The CLI's in-process mutateState lock cannot serialize writes
+    // across separate OS processes. If apply mutated state.json while
+    // a live gateway was reading-modifying-writing it, one of the two
+    // would lose updates. Refusing up front with a clear message is
+    // the only safe default.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const config = loadConfig("gateway-alive");
+    // Plant a runtime.pid file pointing at our own pid so the
+    // process.kill(pid, 0) check thinks a gateway is alive.
+    writeFileSync(
+      join(GINI_STATE, "instances", "gateway-alive", "runtime.pid"),
+      String(process.pid),
+      { mode: 0o644 }
+    );
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    await expect(applyMigration(config, discovery, plan)).rejects.toThrow(
+      /gateway is running/i
+    );
+    // Clear the pid file so subsequent tests aren't blocked.
+    rmSync(join(GINI_STATE, "instances", "gateway-alive", "runtime.pid"), { force: true });
+  });
+
   test("warns when a Discord bridge migrates without delivery channels", async () => {
     // The discord-poller's shouldRun gate refuses to start a loop for
     // a bridge with empty deliveryTargets. Openclaw doesn't expose a

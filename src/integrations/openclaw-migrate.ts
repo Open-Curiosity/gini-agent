@@ -79,7 +79,7 @@ import {
 } from "../state";
 import { writeSecret } from "../state/secrets";
 import { secretsEnvHasKey, writeKeyToSecretsEnv } from "../state/secrets-env";
-import { skillsDir } from "../paths";
+import { pidPath, skillsDir } from "../paths";
 import { assertHeaderSafeToken } from "./messaging";
 
 // --- Public types ---
@@ -719,12 +719,51 @@ export function summarizePlan(plan: MigrationPlan): MigrationPlanSummary {
 
 // --- Apply ---
 
+// Probe whether a gateway is alive for this instance. Detection is
+// cheap and synchronous: check the runtime.pid file for a PID and ask
+// the kernel via `kill(pid, 0)` whether the process exists. Stale pid
+// files (process gone, file left behind) return false — same convention
+// `gini status` uses elsewhere in the CLI.
+export function detectRunningGateway(instance: string): { pid: number } | null {
+  const path = pidPath(instance);
+  if (!existsSync(path)) return null;
+  let pid: number;
+  try {
+    pid = Number(readFileSync(path, "utf8").trim());
+  } catch {
+    return null;
+  }
+  if (!Number.isFinite(pid) || pid <= 0) return null;
+  try {
+    process.kill(pid, 0);
+    return { pid };
+  } catch {
+    return null;
+  }
+}
+
 export async function applyMigration(
   config: RuntimeConfig,
   source: OpenclawDiscovery,
   plan: MigrationPlan,
   options: ApplyOptions = {}
 ): Promise<MigrationResult> {
+  // The CLI apply path runs in a separate OS process from any live
+  // gateway, so the in-process mutateState lock can't serialize writes
+  // across them. Two independent read-modify-write cycles on state.json
+  // can lose updates even though the atomic tmp+rename prevents torn
+  // writes. Refuse to mutate while a gateway is up on this instance —
+  // the user runs `gini stop --instance <x>` first, applies, then
+  // restarts. No --force override here on purpose: foot-gunning the
+  // running gateway's own writes is exactly the failure mode the
+  // validator surfaced.
+  const running = detectRunningGateway(config.instance);
+  if (running) {
+    throw new Error(
+      `Gini gateway is running for instance '${config.instance}' (PID ${running.pid}). Stop it first with \`gini stop --instance ${config.instance}\` so the migration can write state.json without racing the gateway, then re-run \`gini import apply openclaw\`.`
+    );
+  }
+
   const warnings: string[] = [];
   let agentsCreated = 0;
   let bridgesCreated = 0;
