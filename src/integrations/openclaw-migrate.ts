@@ -951,7 +951,18 @@ export async function applyMigration(
       mkdirSync(targetDir, { recursive: true });
       const raw = readFileSync(step.sourcePath, "utf8");
       writeFileSync(targetSkill, rewriteSkillFrontmatter(raw), { mode: 0o644 });
-      copyDirShallow(dirname(step.sourcePath), targetDir, new Set(["SKILL.md"]));
+      // Propagate --force into the sibling-file copy so a rotated
+      // skill gets a fully refreshed bundle rather than a hybrid of
+      // new SKILL.md plus stale scripts/ files from the prior import.
+      // The earlier copy path skipped existing destinations
+      // unconditionally, which contradicted the documented --force
+      // intent.
+      copyDirShallow(
+        dirname(step.sourcePath),
+        targetDir,
+        new Set(["SKILL.md"]),
+        options.force === true
+      );
       skillsCopied += 1;
     } catch (error) {
       warnings.push(
@@ -1395,7 +1406,12 @@ function yamlScalar(value: unknown): string {
   return JSON.stringify(str);
 }
 
-function copyDirShallow(srcDir: string, dstDir: string, exclude: Set<string>): void {
+function copyDirShallow(
+  srcDir: string,
+  dstDir: string,
+  exclude: Set<string>,
+  overwrite: boolean
+): void {
   let entries;
   try {
     entries = readdirSync(srcDir, { withFileTypes: true });
@@ -1407,8 +1423,11 @@ function copyDirShallow(srcDir: string, dstDir: string, exclude: Set<string>): v
     const src = join(srcDir, entry.name);
     const dst = join(dstDir, entry.name);
     if (entry.isDirectory()) {
-      cpSync(src, dst, { recursive: true });
-    } else if (entry.isFile() && !existsSync(dst)) {
+      // cpSync(..., { recursive: true }) overwrites by default; passing
+      // { force: false } guards existing files when the caller hasn't
+      // opted into a refresh.
+      cpSync(src, dst, { recursive: true, force: overwrite });
+    } else if (entry.isFile() && (overwrite || !existsSync(dst))) {
       copyFileSync(src, dst);
     }
   }

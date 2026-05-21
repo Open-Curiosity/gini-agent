@@ -869,6 +869,37 @@ describe("applyMigration", () => {
     expect(readFileSync(helperPath, "utf8")).toContain("#!/bin/sh");
   });
 
+  test("--force refreshes skill sibling files alongside SKILL.md", async () => {
+    // --force was previously only refreshing SKILL.md; the sibling-file
+    // copy unconditionally skipped existing destinations, so a
+    // rotation left the operator with a new manifest pointing at
+    // stale scripts from the prior import. Verify both halves refresh.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withSkill: true });
+    const config = loadConfig("skill-force-refresh");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    await applyMigration(config, discovery, planMigration(discovery));
+
+    // Rewrite the sibling script in the openclaw source.
+    writeFileSync(
+      join(OPENCLAW_ROOT, "skills", "memo-helper", "scripts", "helper.sh"),
+      "#!/bin/sh\necho refreshed\n"
+    );
+    const result = await applyMigration(config, discovery, planMigration(discovery), {
+      force: true
+    });
+    expect(result.skillsCopied).toBe(1);
+    const helperPath = join(
+      GINI_STATE,
+      "instances",
+      "skill-force-refresh",
+      "skills",
+      "memo-helper",
+      "scripts",
+      "helper.sh"
+    );
+    expect(readFileSync(helperPath, "utf8")).toContain("refreshed");
+  });
+
   test("--force rotates a bot token on an existing bridge", async () => {
     seedOpenclawTree(OPENCLAW_ROOT, {
       withConfig: true,
