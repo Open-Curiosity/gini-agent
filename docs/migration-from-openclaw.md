@@ -86,7 +86,13 @@ You can read the report via `gini import` (the default subcommand lists reports)
 
 ## Verifying after migration
 
+The verification commands below are API-backed, so they need a running gateway. The migration prerequisite required stopping the gateway before `apply`, so the first step is `gini smoke` — it self-starts the runtime so every command after it has a live `/api/*` to call.
+
 ```bash
+# Smoke test the runtime end-to-end. This self-starts the runtime,
+# so the API-backed commands below have a live gateway to query.
+bun run gini smoke
+
 # Inspect agent state.
 bun run gini agents list
 
@@ -95,9 +101,6 @@ bun run gini messaging list
 
 # Inspect migrated chat history.
 bun run gini chat list
-
-# Smoke test the runtime end-to-end.
-bun run gini smoke
 ```
 
 After the smoke passes, populate the migrated memory unit embeddings with the active embedding provider, then start gini:

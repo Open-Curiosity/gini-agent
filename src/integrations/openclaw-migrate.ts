@@ -707,6 +707,26 @@ function unionChatIds(a: number[] | undefined, b: number[] | undefined): number[
   return Array.from(new Set([...(a ?? []), ...(b ?? [])]));
 }
 
+// Detect openclaw's multi-account Telegram configuration. Returns
+// the list of distinct account names from `channels.telegram.accounts`
+// (the modern schema where each key is an account name). We
+// deliberately do NOT count `telegram-<name>-allowFrom.json` files
+// on their own as evidence of multi-account, because those files
+// can survive a simplification of openclaw.json: an operator might
+// remove the `accounts` block but leave the stale per-account
+// credential files on disk, and refusing the migration in that
+// case would block a legitimate single-bot import. Only the live
+// `accounts` config object signals "multiple bots are actively
+// running" and warrants the migrator's refusal.
+function collectTelegramNamedAccounts(
+  channel: OpenclawChannelConfig | undefined
+): string[] {
+  if (!channel || typeof channel !== "object") return [];
+  const accounts = channel.accounts;
+  if (!accounts || typeof accounts !== "object" || Array.isArray(accounts)) return [];
+  return Object.keys(accounts as Record<string, unknown>).filter((key) => key.length > 0).sort();
+}
+
 // Enumerate every telegram-allowFrom shape openclaw writes. The
 // pairing-store fan-out (openclaw/src/pairing/pairing-store.ts:91)
 // produces three filenames the migrator must union:
@@ -1361,6 +1381,20 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
     agentDirs.set("main", join(source.agentsDir, "main", "agent"));
   } else {
     for (const agent of agentList) {
+      // Per-entry shape guard. parseOpenclawJson returns whatever
+      // JSON.parse produces — an `agents.list` of `[null, 42,
+      // "string"]` makes it past the array-shape check at the top
+      // of the planner, but `agent.id` on a primitive throws
+      // TypeError and aborts the entire plan command before any of
+      // the other unsupported entries reach the operator. Surface
+      // the malformed entry on the unsupported list and continue.
+      if (agent == null || typeof agent !== "object") {
+        unsupported.push({
+          kind: "agent",
+          detail: `Skipped malformed entry in agents.list (got ${agent === null ? "null" : typeof agent}); openclaw config has a value where an object was expected. Fix the openclaw config and re-migrate.`
+        });
+        continue;
+      }
       const openclawId = (agent.id ?? "").trim();
       if (!openclawId) continue;
       // The openclaw config is operator-supplied via --path, so a
@@ -1575,6 +1609,25 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
   const dotenv = readStateDotenv(source.stateRoot);
   for (const name of Object.keys(channels)) {
     if (name === "telegram") {
+      // Refuse to migrate when openclaw was configured with
+      // multiple named Telegram accounts. Each openclaw bot has
+      // its own token + allowlist scope (tenant isolation —
+      // corpbot only sees corp chats), while gini's model is one
+      // bridge per kind per instance. The migrator would have to
+      // collapse N tokens to one and union N allowlists, which
+      // silently widens access from "corpbot sees chat 100,
+      // personalbot sees chat 200" to "one bridge sees both."
+      // Surface the multi-account state explicitly and refuse —
+      // the operator can wire each bot manually via `gini
+      // messaging add` after the migration.
+      const namedAccounts = collectTelegramNamedAccounts(channels[name]);
+      if (namedAccounts.length > 1) {
+        unsupported.push({
+          kind: "messaging:telegram:multi-account",
+          detail: `Openclaw is configured with ${namedAccounts.length} Telegram accounts (${namedAccounts.join(", ")}). Gini's bridge model is one telegram bridge per instance, so collapsing them would silently union the per-account allow-lists and break tenant isolation. The migrator refuses to import; re-create each bridge manually via \`gini messaging add <name> telegram --bot-token <token>\` with the per-account chat IDs after the migration.`
+        });
+        continue;
+      }
       const inlineTelegram = resolveInlineChannelToken(channels[name], [
         "botToken",
         "token"

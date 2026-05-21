@@ -1428,6 +1428,74 @@ describe("planMigration", () => {
     expect(state.importReports.some((r) => r.id === report?.id)).toBe(true);
   });
 
+  test("refuses to collapse multiple openclaw telegram accounts into a single bridge", () => {
+    // Openclaw can run multiple telegram bots (each with its own
+    // token + allowlist for tenant isolation). Gini's bridge model
+    // is one per kind per instance — a naive union would silently
+    // widen access from "corpbot only sees corp chats" to "one bot
+    // sees every account's chats." Detect multi-account and refuse.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    mkdirSync(join(OPENCLAW_ROOT, "credentials"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: { list: [{ id: "main", default: true }] },
+        channels: {
+          telegram: {
+            dmPolicy: "pairing",
+            accounts: {
+              corpbot: { botToken: "tg-corp" },
+              personalbot: { botToken: "tg-personal" }
+            }
+          }
+        }
+      })
+    );
+    // Two per-account allowlists, each with their own scope.
+    writeFileSync(
+      join(OPENCLAW_ROOT, "credentials", "telegram-corpbot-allowFrom.json"),
+      JSON.stringify({ version: 1, allowFrom: ["100"] })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "credentials", "telegram-personalbot-allowFrom.json"),
+      JSON.stringify({ version: 1, allowFrom: ["200"] })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    expect(plan.steps.some((step) => step.kind === "bridge" && step.bridgeKind === "telegram")).toBe(false);
+    const refusal = plan.unsupported.find(
+      (entry) => entry.kind === "messaging:telegram:multi-account"
+    );
+    expect(refusal).toBeDefined();
+    expect(refusal?.detail).toContain("corpbot");
+    expect(refusal?.detail).toContain("personalbot");
+    expect(refusal?.detail).toContain("gini messaging add");
+  });
+
+  test("tolerates null and primitive entries in agents.list without aborting the plan", () => {
+    // parseOpenclawJson is JSON.parse → `as OpenclawConfig`; nothing
+    // validates per-entry shape. A coworker's malformed config with
+    // `[null, 42, { id: "main" }]` used to throw TypeError on the
+    // first null entry and abort `gini import plan` before any of
+    // the other steps reached the operator. Each malformed entry
+    // now becomes an unsupported entry and the well-formed entries
+    // continue to plan.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [null, 42, "string", { id: "main", default: true }] } })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    // 'main' still made it onto the plan.
+    expect(plan.steps.some((step) => step.kind === "agent" && step.openclawId === "main")).toBe(true);
+    // Three malformed entries each surfaced.
+    const malformed = plan.unsupported.filter(
+      (entry) => entry.kind === "agent" && entry.detail.includes("agents.list")
+    );
+    expect(malformed.length).toBeGreaterThanOrEqual(3);
+  });
+
   test("accepts openclaw `apiKey` field as an alias for `key`", () => {
     // Openclaw's auth-profile loader at openclaw/src/agents/auth-
     // profiles/store.ts:167-170 accepts `apiKey` and `key` as
@@ -1559,7 +1627,7 @@ describe("planMigration", () => {
   });
 
   test("disabled native bridge no longer blocks a fresh migration", async () => {
-    // The R21.CQ1 native-collision remediation directs operators
+    // The native-collision remediation directs operators
     // to `gini messaging disable <bridge-id>` followed by a re-
     // import. disableMessagingBridge sets status="disabled" but
     // does not remove the bridge record. The migrator's collision
