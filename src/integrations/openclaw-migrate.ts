@@ -1176,8 +1176,17 @@ export async function applyMigration(
     // migration, but warn them clearly that the supervisor will stay
     // dormant until they add at least one delivery channel.
     if (step.bridgeKind === "discord") {
+      // `gini messaging add` always creates a new bridge, so directing
+      // the operator there would leave them with two Discord bridges
+      // (the migrated one with the token but no targets, and a fresh
+      // one with targets but no shared identity). Until a dedicated
+      // edit verb lands, the actual recovery is to disable the
+      // migrated bridge and re-create it with channels. The bot
+      // token survives in the encrypted secret store between disable
+      // and add, but the operator has to re-supply it on add today
+      // since `messaging disable` clears the secret refs.
       warnings.push(
-        `Discord bridge migrated without deliveryTargets; supervisor will stay idle until you run \`gini messaging add\` to wire at least one channel.`
+        `Discord bridge migrated without deliveryTargets; supervisor will stay idle until you wire channels. Recovery: stop the gateway, then either (a) edit ~/.gini/instances/${config.instance}/state.json to add Discord channel snowflakes to the migrated bridge's deliveryTargets array, or (b) run \`gini messaging disable <bridge-id>\` then \`gini messaging add <name> discord <channel-id>... --bot-token <token>\` with the original token to re-create with delivery channels.`
       );
     }
     // First pass: decide whether we are creating or rotating. We only

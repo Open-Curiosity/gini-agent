@@ -1171,11 +1171,17 @@ describe("applyMigration", () => {
     const discovery = discoverOpenclawState(OPENCLAW_ROOT);
     const result = await applyMigration(config, discovery, planMigration(discovery));
     expect(result.bridgesCreated).toBe(1);
-    expect(
-      result.warnings.some((warning) =>
-        warning.includes("Discord") && warning.includes("deliveryTargets")
-      )
-    ).toBe(true);
+    const warning = result.warnings.find(
+      (w) => w.includes("Discord") && w.includes("deliveryTargets")
+    );
+    expect(warning).toBeDefined();
+    // The recovery instructions must point at the actual flow that
+    // works today, not at the misleading `gini messaging add` shortcut
+    // (which would create a SECOND Discord bridge alongside the
+    // migrated one).
+    expect(warning).toContain("messaging disable");
+    expect(warning).toContain("--bot-token");
+    expect(warning).toContain("state.json");
   });
 
   test("skips existing secrets.env entries unless --force is set", async () => {
