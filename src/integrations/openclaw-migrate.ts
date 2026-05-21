@@ -715,14 +715,22 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
   if (agentList.length === 0) {
     // Openclaw treats `main` as the implicit default when no list is
     // configured. We mirror that so users with the simplest config still
-    // get an agent record.
+    // get an agent record. The bare-model gate matches the per-agent
+    // branch below — model-only routing is dropped because the gini
+    // runtime AND-guards on (providerName, model).
     flagUnsupportedProvider(defaultRouting.providerName, "main");
+    if (defaultRouting.model && !defaultRouting.providerName) {
+      unsupported.push({
+        kind: "agent",
+        detail: `Default \`agents.defaults.model: "${defaultRouting.model}"\` has no provider prefix. The implicit \`main\` agent will fall back to the instance provider. Add a \`<provider>/${defaultRouting.model}\` prefix in openclaw and re-migrate to preserve the routing.`
+      });
+    }
     steps.push({
       kind: "agent",
       openclawId: "main",
       name: "main",
       providerName: defaultRouting.providerName,
-      model: defaultRouting.model
+      model: defaultRouting.providerName ? defaultRouting.model : undefined
     });
     agentIds.push("main");
     agentDirs.set("main", join(source.agentsDir, "main", "agent"));
@@ -746,15 +754,34 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       }
       const routing = parseOpenclawModelRouting(agent.model);
       const resolvedProvider = routing.providerName ?? defaultRouting.providerName;
+      const resolvedModel = routing.model ?? defaultRouting.model;
       flagUnsupportedProvider(resolvedProvider, openclawId);
+      // resolveEffectiveContext only honors a per-agent provider
+      // override when BOTH providerName and model are populated. A
+      // bare `model: "gpt-5-mini"` (no slash, no defaults-provider)
+      // resolves to model-only routing; the runtime silently
+      // discards the model and the agent falls back to the instance
+      // provider. Surface the partial routing so the operator either
+      // adds a provider prefix in openclaw before re-migrating or
+      // accepts the fallback knowingly; clear the orphan model on
+      // the AgentRecord so the resulting state is honest about
+      // what's active.
+      if (resolvedModel && !resolvedProvider) {
+        unsupported.push({
+          kind: "agent",
+          detail: `Agent '${openclawId}' has \`model: "${resolvedModel}"\` without a provider prefix. Gini's runtime ignores model-only overrides, so the imported agent will fall back to the instance provider. Add a \`<provider>/${resolvedModel}\` prefix in openclaw and re-migrate to preserve the routing.`
+        });
+      }
       // Fall back to the defaults block when the agent didn't supply a
       // model of its own — openclaw resolves the same way at runtime.
+      // Drop the model when no provider resolved so the AgentRecord
+      // doesn't pretend to honor a routing the runtime will discard.
       steps.push({
         kind: "agent",
         openclawId,
         name: openclawId,
         providerName: resolvedProvider,
-        model: routing.model ?? defaultRouting.model
+        model: resolvedProvider ? resolvedModel : undefined
       });
       agentIds.push(openclawId);
       agentDirs.set(openclawId, resolveAgentDirOverride(agent, source.agentsDir, openclawId));
@@ -831,7 +858,18 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       // in ~/.gini/secrets.env but the runtime would never read it.
       const envVar = canonicalApiKeyEnv(giniProvider);
       if (!envVar) continue;
-      if (seenSecretEnv.has(envVar)) continue;
+      if (seenSecretEnv.has(envVar)) {
+        // Openclaw lets operators store multiple auth profiles per
+        // provider for rotation/failover; gini's secrets.env stores
+        // exactly one key per env-var name. The first profile wins by
+        // file-read order; surface the rest so the operator knows
+        // which key they're left with and can rotate manually.
+        unsupported.push({
+          kind: `provider:${profile.provider ?? giniProvider}:duplicate`,
+          detail: `Multiple openclaw auth profiles map to '${envVar}'. The first plaintext key was kept; additional profiles were dropped. Edit ~/.gini/secrets.env manually if you need the other one instead.`
+        });
+        continue;
+      }
       seenSecretEnv.add(envVar);
       steps.push({ kind: "secret", envVar, valueFrom: plaintext, provider: giniProvider });
     }

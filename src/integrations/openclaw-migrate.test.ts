@@ -1055,6 +1055,77 @@ describe("planMigration", () => {
     expect(anthropicEntry?.detail).toContain("anthropic");
   });
 
+  test("surfaces bare-model routing (no provider prefix) as unsupported and drops the orphan model", () => {
+    // resolveEffectiveContext AND-guards on (providerName, model);
+    // a bare \`model: \"gpt-5-mini\"\` lands as model-only and the
+    // runtime silently discards the model. Tell the operator and
+    // drop the orphan so the AgentRecord doesn't lie.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: { list: [{ id: "main", default: true, model: "gpt-5-mini" }] }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const agent = plan.steps.find((step) => step.kind === "agent") as {
+      providerName: string | undefined;
+      model: string | undefined;
+    };
+    expect(agent.providerName).toBeUndefined();
+    expect(agent.model).toBeUndefined();
+    expect(
+      plan.unsupported.some(
+        (entry) =>
+          entry.kind === "agent" &&
+          entry.detail.includes("main") &&
+          entry.detail.includes("gpt-5-mini") &&
+          entry.detail.includes("without a provider prefix")
+      )
+    ).toBe(true);
+  });
+
+  test("flags dropped duplicate auth profiles for the same provider", () => {
+    // Openclaw allows multiple auth profiles per provider for
+    // rotation. Gini stores one key per env var; the migrator can
+    // only carry one, but it must say which it dropped.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "agents", "main", "agent", "auth-profiles.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          "openai-work": {
+            type: "api_key",
+            provider: "openai",
+            key: "sk-work-key"
+          },
+          "openai-personal": {
+            type: "api_key",
+            provider: "openai",
+            key: "sk-personal-key"
+          }
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const secrets = plan.steps.filter((step) => step.kind === "secret");
+    expect(secrets.length).toBe(1);
+    expect(
+      plan.unsupported.some(
+        (entry) =>
+          entry.kind === "provider:openai:duplicate" &&
+          entry.detail.includes("OPENAI_API_KEY")
+      )
+    ).toBe(true);
+  });
+
   test("surfaces unsupported defaults-model provider for the implicit main agent", () => {
     rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
     mkdirSync(OPENCLAW_ROOT, { recursive: true });
