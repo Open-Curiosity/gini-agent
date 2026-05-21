@@ -1449,4 +1449,41 @@ describe("buildInactiveSkillsBlock", () => {
     expect(block).toContain("setup skill");
     expect(block).toContain("request_connector");
   });
+
+  test("appends a no-browser-shortcut directive when a setup-skill provider is present", () => {
+    // The model has been observed shortcutting to browser_navigate
+    // (calendar.google.com, gmail.com, a Google sign-in page) instead of
+    // running the listed setup skill. The block must include an explicit
+    // directive forbidding that shortcut so the setup skill becomes the
+    // only sanctioned route.
+    const skill = makeSkill({
+      name: "google-calendar",
+      requiredConnectors: [{ provider: "google-oauth-desktop" }]
+    });
+    const block = buildInactiveSkillsBlock([skill]);
+    expect(block).toContain("ONLY correct path");
+    expect(block).toContain("browser_navigate");
+    expect(block).toContain("calendar.google.com");
+    expect(block).toContain("gmail.com");
+    expect(block).toContain("read_skill");
+    // The directive sits after the per-provider lines so the model reads
+    // "what needs connecting" before "the rule for how to satisfy it".
+    const lines = block.split("\n");
+    const providerLineIdx = lines.findIndex((line) => line.includes("google-oauth-desktop"));
+    const directiveIdx = lines.findIndex((line) => line.includes("ONLY correct path"));
+    expect(providerLineIdx).toBeGreaterThan(-1);
+    expect(directiveIdx).toBeGreaterThan(providerLineIdx);
+  });
+
+  test("skips the no-browser-shortcut directive when no provider declares a setup skill", () => {
+    // request_connector is the only path advertised when no setup skill is
+    // declared, so the browser-shortcut directive is unnecessary noise.
+    const skill = makeSkill({
+      name: "needs-linear",
+      requiredConnectors: [{ provider: "linear" }]
+    });
+    const block = buildInactiveSkillsBlock([skill]);
+    expect(block).not.toContain("ONLY correct path");
+    expect(block).not.toContain("browser_navigate");
+  });
 });

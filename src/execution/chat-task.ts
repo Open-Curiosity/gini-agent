@@ -480,10 +480,23 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
       }
       return `- ${provider} (used by: ${skillList}) — call \`request_connector\` with provider id \`${provider}\` to ask the user to connect.`;
     });
-  return [
+  // The setup skill is the ONLY correct path for the listed providers.
+  // Without this directive, the model has shortcutted to browser_navigate
+  // (opening gmail.com / calendar.google.com / a Google sign-in page) to
+  // extract data or coax the user into signing in outside the proper flow.
+  // Browser tools exist for unrelated web tasks; they are not a bypass for
+  // the connector handshake.
+  const hasSetupSkill = Array.from(grouped.values()).some((entry) => entry.setupSkill);
+  const sections: string[] = [
     "Skills below need an external connector. For providers with a setup skill listed, invoke that skill first (it walks through any install / OAuth / project provisioning, then captures credentials). Otherwise, call `request_connector` with the provider id directly.",
     ...lines
-  ].join("\n");
+  ];
+  if (hasSetupSkill) {
+    sections.push(
+      "IMPORTANT: When a skill above lists a setup skill, that setup skill is the ONLY correct path to satisfy the user's request. Do NOT use `browser_navigate`, `browser_click`, or other browser tools to access the provider's web surface directly (e.g. navigating to gmail.com or calendar.google.com to extract data, or opening a Google sign-in page outside the setup flow). The browser tools are for unrelated tasks. If the user asks for something that requires a missing-connector skill, your first step is `read_skill` with the listed setup skill — never `browser_navigate`."
+    );
+  }
+  return sections.join("\n");
 }
 
 // Advertise configured http MCP servers in the system prompt. The model
