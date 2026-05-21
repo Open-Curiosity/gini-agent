@@ -28,10 +28,12 @@
 //     the file is copied into `<gini-instance>/skills/<name>/SKILL.md`.
 //     Sibling files in the skill dir (scripts/, references/, etc.) are
 //     copied verbatim. Existing same-named skills are skipped.
-//   - Workspace bootstrap markdown (`AGENTS.md`, `SOUL.md`, `USER.md`,
-//     `IDENTITY.md`, `HEARTBEAT.md`, `MEMORY.md`) from openclaw's
-//     `~/.openclaw/workspace/` into the gini instance workspace. Existing
-//     same-named files are skipped (no overwrite by default).
+//   - Workspace bootstrap markdown (`AGENTS.md`, `SOUL.md`, `TOOLS.md`,
+//     `IDENTITY.md`, `USER.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`,
+//     `MEMORY.md`) from openclaw's `~/.openclaw/workspace/` into the gini
+//     instance workspace. The set mirrors openclaw's
+//     `BOOTSTRAP_FILENAMES` constant verbatim. Existing same-named files
+//     are skipped (no overwrite by default).
 //
 // What is intentionally NOT migrated:
 //   - Hindsight memory SQLite (`<state>/memory/<id>.sqlite`). Openclaw and
