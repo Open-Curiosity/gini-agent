@@ -1079,14 +1079,6 @@ describe("applyMigration", () => {
     const discovery = discoverOpenclawState(OPENCLAW_ROOT);
     await applyMigration(config, discovery, planMigration(discovery));
 
-    // Capture the bridge before rotation so we can assert specific
-    // fields actually change (not just any-write).
-    const stateBefore = readState("rotate");
-    const bridgeBefore = stateBefore.messagingBridges.find(
-      (entry) => entry.kind === "telegram"
-    )!;
-    const updatedAtBefore = bridgeBefore.updatedAt;
-
     // Rewrite config to point at a new token AND a new allow-list so the
     // merge path has something to verify.
     const cfg = JSON.parse(readFileSync(join(OPENCLAW_ROOT, "openclaw.json"), "utf8")) as {
@@ -1106,12 +1098,15 @@ describe("applyMigration", () => {
 
     const state = readState("rotate");
     const bridge = state.messagingBridges.find((entry) => entry.kind === "telegram")!;
+    // The rotated token decrypting to the new value, and the
+    // pre-rotation allow-list being merged into the post-rotation
+    // metadata, are both proofs the second mutateState block wrote
+    // to the persisted state graph rather than mutating a stale
+    // snapshot. We deliberately do NOT probe updatedAt for change —
+    // gini timestamps are millisecond-resolution ISO strings and the
+    // two writes can land in the same millisecond under fast I/O,
+    // producing a byte-identical string and a flake.
     expect(readSecret("rotate", bridge.secretRefs![0]!)).toBe("tg-token-rotated");
-
-    // The bridge record itself must have changed — proves the second
-    // mutateState block actually wrote to the persisted state graph
-    // rather than mutating a stale snapshot.
-    expect(bridge.updatedAt).not.toBe(updatedAtBefore);
     // Allow-list is the union of pre-rotation [12345, 67890] and
     // post-rotation [99988, 77766]; we never want a rotation to drop
     // an enrolled chat.
