@@ -273,7 +273,7 @@ describe("chat session waiting-approval placeholder (Review P1 #3)", () => {
         id: "task_progress",
         title: "post-approval progress",
         input: "calendar today",
-        status: "in_progress",
+        status: "running",
         instance: state.instance,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
