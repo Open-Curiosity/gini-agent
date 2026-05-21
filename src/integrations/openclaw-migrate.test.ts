@@ -2329,6 +2329,49 @@ describe("applyMigration archive", () => {
     expect(listing).toContain("openclaw.json");
   });
 
+  test("honors OPENCLAW_WORKSPACE_DIR even when it points outside the state root", async () => {
+    // Openclaw exposes OPENCLAW_WORKSPACE_DIR so operators can keep
+    // workspace markdown in a separate dotfiles repo. Earlier
+    // iterations containment-checked workspace file paths against
+    // source.stateRoot, which silently disabled the env override
+    // (operators lost every workspace file with no warning). Switch
+    // the containment boundary to source.workspaceRoot so the env
+    // opt-in works while still defending against leaf symlinks
+    // pointing OUTSIDE the workspace dir.
+    const externalWorkspace = `${ROOT}/external-workspace`;
+    rmSync(externalWorkspace, { recursive: true, force: true });
+    mkdirSync(externalWorkspace, { recursive: true });
+    writeFileSync(join(externalWorkspace, "AGENTS.md"), "# external AGENTS\n");
+    writeFileSync(join(externalWorkspace, "SOUL.md"), "# external SOUL\n");
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    process.env.OPENCLAW_STATE_DIR = OPENCLAW_ROOT;
+    process.env.OPENCLAW_WORKSPACE_DIR = externalWorkspace;
+    try {
+      const config = loadConfig("workspace-dir-override");
+      // No pathArg → env overrides take effect.
+      const discovery = discoverOpenclawState();
+      expect(discovery.workspaceRoot).toBe(externalWorkspace);
+      const result = await applyMigration(config, discovery, planMigration(discovery));
+      expect(result.workspaceFilesCopied).toBe(2);
+      const agentsPath = join(
+        GINI_STATE,
+        "instances",
+        "workspace-dir-override",
+        "workspace",
+        "AGENTS.md"
+      );
+      expect(readFileSync(agentsPath, "utf8")).toBe("# external AGENTS\n");
+    } finally {
+      delete process.env.OPENCLAW_STATE_DIR;
+      delete process.env.OPENCLAW_WORKSPACE_DIR;
+    }
+  });
+
   test("workspace symlink source resolving outside source.stateRoot is refused at plan time", async () => {
     // `copyFileSync` follows symlinks by default, so a
     // `workspace/SOUL.md` symlink to `/etc/passwd` would happily
@@ -2352,7 +2395,7 @@ describe("applyMigration archive", () => {
       plan.unsupported.some(
         (entry) =>
           entry.kind === "workspaceFile:AGENTS.md" &&
-          entry.detail.includes("outside the openclaw state root")
+          entry.detail.includes("outside the workspace root")
       )
     ).toBe(true);
     const result = await applyMigration(config, discovery, plan);

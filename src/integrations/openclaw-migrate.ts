@@ -560,8 +560,14 @@ function parseChatIdEntry(entry: unknown): number | null {
   return Number.isFinite(raw) ? raw : null;
 }
 
-function readAllowFromAsNumbers(path: string): number[] | undefined {
+function readAllowFromAsNumbers(stateRoot: string, path: string): number[] | undefined {
   if (!existsSync(path)) return undefined;
+  // Leaf-symlink defense — mirrors the other credential reads in
+  // this file (auth-profiles.json, .env, memory sqlite). A hostile
+  // state with `<state>/credentials/telegram-allowFrom.json`
+  // symlinked at e.g. `~/.aws/credentials.json` would otherwise
+  // parse it (the shape is narrow but the read happens regardless).
+  if (escapesSourceRoot(stateRoot, path)) return undefined;
   try {
     const data = JSON.parse(readFileSync(path, "utf8")) as { allowFrom?: unknown[] };
     const ids: number[] = [];
@@ -1396,6 +1402,7 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
         // configs that hold them inline. De-dup after the union so a
         // chat listed in both sources still appears exactly once.
         const fromFile = readAllowFromAsNumbers(
+          source.stateRoot,
           join(source.credentialsDir, "telegram-allowFrom.json")
         );
         const fromConfig = coerceAllowFromToNumbers(channels[name]?.allowFrom);
@@ -1474,17 +1481,28 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
   }
 
   // Workspace bootstrap files. Same parent-symlink concern as skills:
-  // `<state>/workspace` -> `~/.ssh` would lift any file there into
-  // the gini workspace via the lstat-only leaf check. Validate
-  // containment up front.
+  // a hostile workspace dir with `SOUL.md` symlinked at `~/.ssh/id_rsa`
+  // would lift that file into the gini workspace via the lstat-only
+  // leaf check.
+  //
+  // Containment is checked against `source.workspaceRoot`, NOT
+  // `source.stateRoot`: openclaw exposes `OPENCLAW_WORKSPACE_DIR` to
+  // relocate workspace OUTSIDE the state root (an intentional opt-in
+  // for operators who keep workspace markdown in a separate dotfiles
+  // repo), and `discoverOpenclawState` honors that env. Using the
+  // state root here would silently disable the env override —
+  // operators would lose every workspace file with no warning. The
+  // symlink hazard the check exists for is bound to the workspace
+  // root itself, not the state root, so workspaceRoot is the correct
+  // containment boundary.
   if (source.workspaceRoot) {
     for (const fileName of WORKSPACE_BOOTSTRAP_FILES) {
       const filePath = join(source.workspaceRoot, fileName);
       if (!existsSync(filePath)) continue;
-      if (escapesSourceRoot(source.stateRoot, filePath)) {
+      if (escapesSourceRoot(source.workspaceRoot, filePath)) {
         unsupported.push({
           kind: `workspaceFile:${fileName}`,
-          detail: `Skipped workspace bootstrap file '${fileName}': resolves outside the openclaw state root (likely a parent-directory symlink). The migrator only copies workspace files that physically live under --path.`
+          detail: `Skipped workspace bootstrap file '${fileName}': resolves outside the workspace root (likely a parent-directory symlink). The migrator only copies workspace files that physically live under the resolved workspace directory.`
         });
         continue;
       }
@@ -2117,7 +2135,17 @@ export async function applyMigration(
       createAgentRecord(state, {
         name: step.name,
         providerName: giniProvider ?? undefined,
-        model: step.model,
+        // Drop model when no provider resolved — `resolveEffectiveContext`
+        // AND-guards on (providerName, model), so a stored model with no
+        // provider is silently discarded at runtime and just misleads the
+        // operator inspecting the agent in the UI. The planner already
+        // nullifies model when the openclaw-side provider is missing
+        // (model: resolvedProvider ? resolvedModel : undefined), but the
+        // model survives when the openclaw provider exists yet has no
+        // gini mapping (e.g., anthropic, google). Mirror the planner's
+        // intent at the apply site so the stored record matches what the
+        // runtime will actually use.
+        model: giniProvider ? step.model : undefined,
         // Pull the canonical default-agent toolset whitelist from
         // src/state/defaults so the migrator can't drift if the gini
         // baseline ever changes. New toolsets added there will land
