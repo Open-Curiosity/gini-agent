@@ -235,7 +235,8 @@ describe("resolveLaunchSpec", () => {
       projectRootOverride: "/repo/gini",
       cwdOverride: neutralCwd,
       loginShell: "/bin/zsh",
-      loginShellReader: () => "/Users/test/.nvm/versions/node/v20.0.0/bin:/opt/homebrew/bin"
+      loginShellReader: () => "/Users/test/.nvm/versions/node/v20.0.0/bin:/opt/homebrew/bin",
+      mergeShellPath: true
     });
     // nvm bin is prepended so it wins over any system node on the base PATH.
     expect(spec.environment.PATH.startsWith("/Users/test/.nvm/versions/node/v20.0.0/bin:")).toBe(true);
@@ -252,7 +253,8 @@ describe("resolveLaunchSpec", () => {
       projectRootOverride: "/repo/gini",
       cwdOverride: neutralCwd,
       loginShell: "/bin/zsh",
-      loginShellReader: () => null
+      loginShellReader: () => null,
+      mergeShellPath: true
     });
     // No nvm dir, no shell-additions. Base launchd PATH still intact.
     expect(spec.environment.PATH).not.toContain(".nvm");
@@ -273,6 +275,66 @@ describe("resolveLaunchSpec", () => {
     });
     // No nvm path should appear unless we explicitly asked for it.
     expect(spec.environment.PATH).not.toContain(".nvm");
+  });
+
+  test("does not invoke the login shell when mergeShellPath is false (status / disable / kick paths)", () => {
+    // Regression for the codex-review finding that resolveLaunchSpec
+    // used to spawn the user's shell on every call site — including
+    // read-only commands like `autostart status`. The reader must NOT
+    // be invoked when mergeShellPath is false (default).
+    let calls = 0;
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      loginShell: "/bin/zsh",
+      loginShellReader: () => {
+        calls += 1;
+        return "/Users/test/.nvm/bin";
+      },
+      mergeShellPath: false
+    });
+    expect(calls).toBe(0);
+    expect(spec.environment.PATH).not.toContain(".nvm");
+  });
+
+  test("bakes SHELL into the gateway plist so refresh respawns can re-read it", () => {
+    // Regression for the codex-review finding that the autostart-
+    // refresh flow (which respawns `gini autostart enable --kind
+    // gateway` from the launchd-started gateway env) would lose the
+    // nvm/asdf merge because the gateway plist didn't set SHELL.
+    // With SHELL in the plist, the refresh child sees $SHELL and can
+    // re-merge the same interactive PATH.
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      loginShell: "/bin/zsh",
+      loginShellReader: () => "/Users/test/.nvm/bin",
+      mergeShellPath: true
+    });
+    expect(spec.environment.SHELL).toBe("/bin/zsh");
+  });
+
+  test("omits SHELL from the plist when neither loginShell nor process.env.SHELL is set", () => {
+    const prev = process.env.SHELL;
+    delete process.env.SHELL;
+    try {
+      const spec = resolveLaunchSpec({
+        instance: "dev",
+        homeOverride: home,
+        bunPathOverride: "/opt/bun/bin/bun",
+        projectRootOverride: "/repo/gini",
+        cwdOverride: neutralCwd
+      });
+      expect(spec.environment.SHELL).toBeUndefined();
+    } finally {
+      if (prev !== undefined) process.env.SHELL = prev;
+    }
   });
 
   // The Next.js BFF only proxies to the gateway over /api/*; it never

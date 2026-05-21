@@ -150,6 +150,11 @@ export interface ResolveLaunchOptions {
   loginShellReader?: LoginShellReader;
   // Test seam: override $SHELL. Defaults to process.env.SHELL.
   loginShell?: string;
+  // Opt-in: actually run the user's login shell to capture their PATH.
+  // Defaults to false so non-write callers (status, disable, kick) don't
+  // spend up to 3s spawning the user's shell just to compute metadata
+  // they don't need. The enable / write paths pass true.
+  mergeShellPath?: boolean;
 }
 
 // Build the launchd command line. We exec the Bun-driven runtime *directly*
@@ -222,14 +227,24 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   // to (1) alone. Bun's `spawnSync` snapshots PATH at process start, so
   // there's no useful runtime fix for this — the plist is the right
   // place to bake the PATH in.
+  // SHELL is baked into the plist so launchd-spawned children (notably
+  // the autostart-refresh path that runs `gini autostart enable
+  // --kind gateway` after an OpenAI key change) start with $SHELL set
+  // and can re-read the same shell PATH. Without this, refresh
+  // regenerates the plist with the bare launchd PATH and silently
+  // wipes the nvm/asdf merge we did at first enable.
+  const shell = options.loginShell ?? process.env.SHELL ?? "";
   const baseEnv: Record<string, string> = {
     PATH: buildLaunchAgentPath(bunPath, home, {
       loginShellReader: options.loginShellReader,
-      loginShell: options.loginShell
+      loginShell: options.loginShell,
+      mergeShellPath: options.mergeShellPath ?? false,
+      home
     }),
     HOME: home,
     LANG: process.env.LANG ?? "en_US.UTF-8"
   };
+  if (shell) baseEnv.SHELL = shell;
   // Opt-in: only propagate GINI_STATE_ROOT / GINI_LOG_ROOT into the plist
   // when an explicit testRoot is passed. Reading them from process.env
   // would bake whatever scratch path the developer's shell currently has
@@ -486,6 +501,13 @@ function buildWebShim(instance: Instance): string {
 interface BuildPathOptions {
   loginShellReader?: LoginShellReader;
   loginShell?: string;
+  // Opt-in: when true, spawn the user's login shell and merge its PATH
+  // into the base. Default false because most call sites
+  // (`resolveLaunchSpecPair` from status / disable / kick) only want
+  // metadata and shouldn't pay the 100-500ms shell spawn or risk a
+  // hung rc file. The enable path passes true.
+  mergeShellPath?: boolean;
+  home?: string;
 }
 
 function buildLaunchAgentPath(
@@ -515,14 +537,23 @@ function buildLaunchAgentPath(
   }).join(":");
 
   // Merge in the user's interactive-shell PATH so version-manager dirs
-  // (nvm, asdf, volta, …) make it into the plist. Best-effort: missing
-  // $SHELL or a failing read leaves the base PATH untouched.
+  // (nvm, asdf, volta, …) make it into the plist. Three gates apply:
   //
-  // Skipped under bun:test (and NODE_ENV=test) unless an explicit
-  // loginShellReader is provided. The existing autostart test suite
-  // calls resolveLaunchSpec dozens of times; spawning the user's shell
-  // each time would add seconds of latency AND make assertions on the
-  // PATH non-deterministic across developer machines.
+  //   1. `mergeShellPath: true` must be set by the caller. The default
+  //      is false so non-write call sites (status / disable / kick)
+  //      don't spend 100-500ms spawning a shell to compute a PATH that
+  //      gets thrown away.
+  //   2. Skipped under bun:test (and NODE_ENV=test) unless an explicit
+  //      loginShellReader is provided. The existing autostart suite
+  //      asserts on the PATH; live shell reads would make assertions
+  //      flaky across developer machines.
+  //   3. Missing $SHELL or a failing read leaves the base PATH alone.
+  // mergeShellPath is the single gate. Tests must opt in with
+  // mergeShellPath: true AND pass a loginShellReader; a reader alone
+  // does not override the default-off behavior, so test cases that
+  // verify "no shell read happened" can pass a counting reader and
+  // assert it was never called.
+  if (options.mergeShellPath !== true) return base;
   const explicitReader = options.loginShellReader !== undefined;
   if (!explicitReader && isTestEnv()) return base;
   const shell = options.loginShell ?? process.env.SHELL;
