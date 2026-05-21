@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Homebrew (or another package manager) and a Google account."
 metadata:
   gini:
-    version: 3.3.1
+    version: 3.4.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -14,7 +14,7 @@ metadata:
 
 # Google Workspace Setup
 
-One-time onboarding for the Google Workspace skills (`google-gmail`, `google-calendar`, `google-drive`, `google-docs`, `google-meet`, `google-forms`). Installs `gws` and `gcloud`, signs the user into their own Google Cloud project, enables the Workspace APIs, captures an OAuth Desktop client through the inline Connect form, and completes `gws auth login`.
+One-time onboarding for the Google Workspace skills (`google-gmail`, `google-calendar`, `google-drive`, `google-docs`, `google-sheets`, `google-meet`, `google-forms`). Installs `gws` and `gcloud`, signs the user into their own Google Cloud project, enables the Workspace APIs, captures an OAuth Desktop client through the inline Connect form, and completes `gws auth login`.
 
 The OAuth client lives in the user's own GCP project. The Client ID and Client Secret are captured through the inline Connect form (`request_connector` tool) and stored in Gini's encrypted secret store — never write them to chat or logs, and never write `client_secret.json` to disk.
 
@@ -28,7 +28,7 @@ This is the **exact sequence** the user wants. Do not branch into shortcuts, do 
 2. Confirm setup with the user.
 3. Install `gws` and `gcloud` silently in the background.
 4. Run `gcloud auth login`, which pops up the user's default browser for sign-in.
-5. After they sign in, create the Cloud project and enable the six Workspace APIs in the background.
+5. After they sign in, create the Cloud project and enable the seven Workspace APIs in the background.
 6. Send a single chat bubble with the last-step instructions (two Cloud Console URLs) and call `request_connector` — the inline form renders below the bubble.
 7. After the user pastes the credentials and clicks **Save**, run `gws auth login`, which pops up the user's default browser for OAuth consent.
 8. After they sign in, the original ask resumes.
@@ -82,9 +82,9 @@ This opens the user's **default browser** to Google's OAuth consent page. They s
 
 If `gcloud auth list` already shows an active account, ask once: "gcloud is signed in as `<email>`. Use this account?" — proceed on confirmation. Otherwise run `gcloud auth login` straight through.
 
-## Step 4 — Reach a Cloud project with the six APIs enabled
+## Step 4 — Reach a Cloud project with the seven APIs enabled
 
-The goal of this step is a single value, `<PROJECT_ID>`, that names a Cloud project the active gcloud account owns AND in which the six Workspace APIs are enabled. Every later step substitutes that string into URLs and `gcloud --project=` flags.
+The goal of this step is a single value, `<PROJECT_ID>`, that names a Cloud project the active gcloud account owns AND in which the seven Workspace APIs are enabled. Every later step substitutes that string into URLs and `gcloud --project=` flags.
 
 **Invariants for this step and every later `gcloud` call:**
 
@@ -145,7 +145,7 @@ If `gcloud projects create` errors with `RATE_LIMIT_EXCEEDED` for `cloudresource
 gcloud projects describe <PROJECT_ID> --format="value(projectId)"
 ```
 
-On success, enable the six APIs (already-enabled ones are no-ops, which is fine when 4a reused an existing project):
+On success, enable the seven APIs (already-enabled ones are no-ops, which is fine when 4a reused an existing project):
 
 ```bash
 gcloud services enable \
@@ -153,6 +153,7 @@ gcloud services enable \
   calendar-json.googleapis.com \
   drive.googleapis.com \
   docs.googleapis.com \
+  sheets.googleapis.com \
   forms.googleapis.com \
   meet.googleapis.com \
   --project=<PROJECT_ID>
@@ -224,7 +225,7 @@ To actually pop the browser, run gws in the background, scrape the URL out of it
 
 ```bash
 LOG=$(mktemp -t gws-auth.XXXXXX.log)
-gws auth login -s drive,gmail,calendar,docs,meet,forms > "$LOG" 2>&1 &
+gws auth login -s drive,gmail,calendar,docs,sheets,meet,forms > "$LOG" 2>&1 &
 GWS_PID=$!
 # Poll for the URL (gws prints it within a second of starting).
 URL=""
@@ -276,6 +277,7 @@ Recommended starting scopes per product (first column = `-s` shorthand; second c
 - **Drive** — `-s drive` ↔ `https://www.googleapis.com/auth/drive` (`.file`, `.readonly`, `.metadata.readonly` available as full URLs).
 - **Calendar** — `-s calendar` ↔ `https://www.googleapis.com/auth/calendar` (`.events`, `.readonly`, `.freebusy` available as full URLs).
 - **Docs** — `-s docs` ↔ `https://www.googleapis.com/auth/documents` (`.readonly` available).
+- **Sheets** — `-s sheets` ↔ `https://www.googleapis.com/auth/spreadsheets` (`.readonly` available as a full URL).
 - **Meet** — `-s meet` ↔ `https://www.googleapis.com/auth/meetings.space.created` (`.readonly` available).
 - **Forms** — `-s forms` ↔ `https://www.googleapis.com/auth/forms.body` (`.body.readonly`, `.responses.readonly` available).
 
@@ -314,7 +316,7 @@ If that returns JSON without an auth error, the setup is complete. Resume the us
 1. Walk this skill end-to-end the first time. Do not skip to `request_connector` or `gws auth login` without the install + project + APIs in place.
 2. **Sign-in is a human-in-the-loop step.** Never attempt to type the user's email or password. `gcloud auth login` and `gws auth login` both open the default browser — wait for the command to return.
 3. **Capture credentials through the inline form, not files.** Always use `request_connector { provider: "google-oauth-desktop" }`. Never ask the user for a path to `client_secret.json`, never write a JSON file under `~/.config/gws/`, and never `cat` or echo the credentials back into chat.
-4. **Enable all six Workspace APIs in Step 4 regardless of which product triggered setup.** One `gcloud services enable` call covers them all; this lets the user pivot to another product later without re-running setup.
+4. **Enable all seven Workspace APIs in Step 4 regardless of which product triggered setup.** One `gcloud services enable` call covers them all; this lets the user pivot to another product later without re-running setup.
 5. **Status messages are action-oriented and ungrouped.** Do not list "Installed gws, installed gcloud, signed in, created project, enabled APIs." The user sees a chat bubble per milestone (confirm setup, last-step form, done) — not a retrospective changelog.
 6. **Fail gracefully.** If `gcloud` errors with `PERMISSION_DENIED` or `ALREADY_EXISTS`, surface the error verbatim and ask the user. If an install fails, STOP — do not retry in a loop, hand off to the user with the one-line manual command.
 7. Narrow OAuth scopes to what the user actually asked for. Do not silently expand from read-only to write.
@@ -325,7 +327,7 @@ If that returns JSON without an auth error, the setup is complete. Resume the us
 If `gcloud` cannot be installed at all (uncommon — Homebrew is the standard path on macOS, and Linux has a documented tarball install), hand off the Cloud Console flow to the user manually:
 
 1. Tell them to open https://console.cloud.google.com/ and create a project named `gini-workspace`.
-2. Enable the six APIs at https://console.cloud.google.com/apis/library — Gmail, Calendar, Drive, Docs, Forms, Meet.
+2. Enable the seven APIs at https://console.cloud.google.com/apis/library — Gmail, Calendar, Drive, Docs, Sheets, Forms, Meet.
 3. Then resume from Step 5 (configure OAuth consent, create Desktop OAuth client, paste credentials into the inline form).
 
 For flags not shown here, run `gws auth --help` and `gws --help`.
