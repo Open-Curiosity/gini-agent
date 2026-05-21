@@ -32,6 +32,7 @@ const ORIGINAL_HOME = process.env.HOME;
 const ORIGINAL_STATE_ROOT = process.env.GINI_STATE_ROOT;
 const ORIGINAL_LOG_ROOT = process.env.GINI_LOG_ROOT;
 const ORIGINAL_WORKSPACE = process.env.GINI_WORKSPACE;
+const ORIGINAL_OPENCLAW_HOME = process.env.OPENCLAW_HOME;
 
 beforeAll(() => {
   rmSync(ROOT, { recursive: true, force: true });
@@ -44,6 +45,11 @@ beforeAll(() => {
   // workspaceDir() if inherited; clear it so apply tests write into the
   // sandbox instance's workspace rather than the real one.
   delete process.env.GINI_WORKSPACE;
+  // OPENCLAW_HOME takes precedence over HOME inside
+  // discoverOpenclawState; a developer with it set in their shell
+  // would see the discovery tests resolve to a different path than
+  // the test author intended. Clear it before any test runs.
+  delete process.env.OPENCLAW_HOME;
 });
 
 afterAll(() => {
@@ -52,6 +58,7 @@ afterAll(() => {
   restoreEnv("GINI_STATE_ROOT", ORIGINAL_STATE_ROOT);
   restoreEnv("GINI_LOG_ROOT", ORIGINAL_LOG_ROOT);
   restoreEnv("GINI_WORKSPACE", ORIGINAL_WORKSPACE);
+  restoreEnv("OPENCLAW_HOME", ORIGINAL_OPENCLAW_HOME);
 });
 
 function restoreEnv(name: string, previous: string | undefined): void {
