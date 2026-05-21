@@ -18,7 +18,7 @@ The three files are a curated layer over the existing memory pipeline; they do n
 
 System-prompt assembly order in `buildAgentSystemContext`:
 
-1. `INSTRUCTIONS.md` content (falls back to `DEFAULT_GINI_INSTRUCTIONS` constant when the file is absent)
+1. `INSTRUCTIONS.md` content (falls back to the bundled `src/runtime/defaults/INSTRUCTIONS.md` when the per-instance file is absent)
 2. `SOUL.md` content (per active agent, when present)
 3. Runtime identity block (unchanged, see ADR runtime-identity-injection.md)
 4. Pinned memories (`state.memories`, unchanged)
@@ -46,7 +46,8 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 
 ## Required Now
 
-- `src/system-prompt.ts` exports `DEFAULT_GINI_INSTRUCTIONS` (the prior in-code constant). `buildAgentSystemContext` takes new optional parameters `instructionsOverride`, `soul`, and `userProfile`; the call assembles them in the order above.
+- `src/runtime/defaults/INSTRUCTIONS.md` is the single source of truth for the default operating rules. Every byte of this file is spliced verbatim into the system prompt when no per-instance `INSTRUCTIONS.md` exists, and the scaffolder copies the same bytes into freshly-installed instances. There is no in-code constant; the prior `DEFAULT_GINI_INSTRUCTIONS` string has been replaced.
+- `src/system-prompt.ts` exports `getDefaultGiniInstructions()` (memoized per-process, reads and trims the bundled file) and `DEFAULT_INSTRUCTIONS_PATH` (the resolved path other modules import). A missing bundle file is unrecoverable — both the runtime fallback and the scaffolder throw with `"default INSTRUCTIONS.md missing from bundle"` rather than silently falling back to an empty string. `buildAgentSystemContext` takes new optional parameters `instructionsOverride`, `soul`, and `userProfile`; the call assembles them in the order above.
 - `src/runtime/identity-files.ts` owns file I/O and the injection scan:
   - `loadInstructions(instance)`, `loadSoul(instance, agentId)`, `loadUserProfile(instance)` return either the scanned content, a `[BLOCKED: ...]` notice, or `null` when the file is absent.
   - `writeSoul(instance, agentId, content, status)` and `writeUserProfile(instance, content, status)` write `<file>` for approved content and `<file>.proposed` for proposed content. The gateway only reads the approved file into the prompt; proposals require approval via the API.
@@ -64,8 +65,8 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 - **Per-agent filesystem convention.** `~/.gini/instances/<inst>/agents/<agentId>/SOUL.md` is the first per-agent filesystem artifact in Gini. The directory is created lazily on first write; readers tolerate a missing directory and treat it as "no SOUL set". This convention is reserved for per-agent state that is too large or too human-edited to belong in `state.json`.
 - **Approved-file vs proposed-file split.** The runtime only ever reads the approved file (`SOUL.md`, `USER.md`) into the system prompt. Agent-proposed edits land as `SOUL.md.proposed` / `USER.md.proposed` and never reach the model until the user approves them via the approval API. This mirrors how `add_memory` lands as `status: "proposed"` and only enters the pinned-memory block after a `POST /api/memory/<id>/approve`.
 - **Injection-scan policy is fail-soft.** A file that trips a threat pattern is replaced inline with a `[BLOCKED: <filename> contained potential prompt injection (<reasons>). Content not loaded.]` notice and a warning is appended to the runtime trace. The gateway must keep running — a hostile USER.md must not lock the user out of their own instance.
-- **INSTRUCTIONS.md is user-only.** The agent has no tool to edit it. The default constant remains in source so a fresh instance has a working preamble without filesystem setup.
-- **Scaffold asymmetry.** At instance creation `install()` seeds `INSTRUCTIONS.md` with the current `DEFAULT_GINI_INSTRUCTIONS` content so the user opens the file to a working baseline they can edit against — an empty file gives them nothing to anchor on. `USER.md` and per-agent `SOUL.md` stay zero-byte because no defaults exist (a user profile and an agent persona are both inherently caller-supplied). Drift cost: a user who never edits the seeded `INSTRUCTIONS.md` is frozen at install-time defaults even as the in-code constant evolves on later Gini upgrades. The escape hatch is deletion — removing the file restores the constant fallback path at the next chat turn.
+- **INSTRUCTIONS.md is user-only.** The agent has no tool to edit it. The bundled `src/runtime/defaults/INSTRUCTIONS.md` remains shipped with the runtime so a fresh instance has a working preamble without filesystem setup.
+- **Scaffold asymmetry.** At instance creation `install()` seeds `INSTRUCTIONS.md` with the bytes of the bundled `src/runtime/defaults/INSTRUCTIONS.md` so the user opens the file to a working baseline they can edit against — an empty file gives them nothing to anchor on. `USER.md` and per-agent `SOUL.md` stay zero-byte because no defaults exist (a user profile and an agent persona are both inherently caller-supplied). Drift cost: a user who never edits the seeded `INSTRUCTIONS.md` is frozen at install-time defaults even as the bundled file evolves on later Gini upgrades. The escape hatch is deletion — removing the file restores the bundled fallback path at the next chat turn.
 - **Subagents are unaffected.** Subagents continue to receive `subagent.systemPrompt` as an override and do not see the three files. The override path is intentional — a subagent's persona is its parent's responsibility.
 
 ## Read and Write Semantics
@@ -77,7 +78,7 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 
 ## Consequences
 
-- **Behavior change:** the agent's operating rules become user-editable. A fresh instance behaves identically to the prior in-code constant because `INSTRUCTIONS.md` is absent and the constant is the fallback.
+- **Behavior change:** the agent's operating rules become user-editable. A fresh instance behaves identically to the bundled defaults because `INSTRUCTIONS.md` is absent and the bundled file is the fallback. The bundled file is the single source of truth — the scaffolder copies its bytes verbatim and the runtime reads from it on every fresh install.
 - **Per-agent persona is on-disk.** Switching agents picks up that agent's `SOUL.md`. User identity is preserved because `USER.md` is instance-scoped.
 - **Audit and trust surface grows.** Three new audit actions cover the propose / approve lifecycle. The injection scan provides a documented trust boundary on user-controlled files that ride the system prompt.
 - **State growth is bounded.** Three files per instance plus one `SOUL.md` per agent. None are stored in `state.json`.
@@ -91,8 +92,10 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 
 ## Acceptance Checks
 
-- A fresh instance with no identity files present produces a system prompt that contains `DEFAULT_GINI_INSTRUCTIONS` and no SOUL/USER blocks.
-- Writing `~/.gini/instances/<inst>/INSTRUCTIONS.md` with custom content causes the next chat turn to use that content in place of the default constant.
+- A fresh instance with no per-instance identity files present produces a system prompt that contains the trimmed bytes of the bundled `src/runtime/defaults/INSTRUCTIONS.md` and no SOUL/USER blocks.
+- Writing `~/.gini/instances/<inst>/INSTRUCTIONS.md` with custom content causes the next chat turn to use that content in place of the bundled defaults.
+- A `gini install` against a fresh instance copies the bytes of `src/runtime/defaults/INSTRUCTIONS.md` into `~/.gini/instances/<inst>/INSTRUCTIONS.md` byte-for-byte (the scaffold and runtime fallback never drift).
+- If `src/runtime/defaults/INSTRUCTIONS.md` is removed from the bundle, both `getDefaultGiniInstructions()` and `scaffoldInstanceIdentityFiles()` throw with a clear "default INSTRUCTIONS.md missing from bundle" message rather than silently falling back to an empty preamble.
 - Writing `~/.gini/instances/<inst>/agents/<agentId>/SOUL.md` causes the next chat turn (under that active agent) to include the SOUL block after the instructions and before the identity block.
 - Writing `~/.gini/instances/<inst>/USER.md` causes the next chat turn to include the USER block between pinned memories and recalled memory.
 - A file containing `ignore previous instructions` is replaced in the prompt by `[BLOCKED: <filename> contained potential prompt injection (prompt_injection). Content not loaded.]` and a warning is emitted to the runtime trace.
@@ -101,8 +104,9 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 
 ## Critical Files
 
-- `src/system-prompt.ts` — `DEFAULT_GINI_INSTRUCTIONS`; `buildAgentSystemContext` accepts `instructionsOverride`, `soul`, `userProfile`.
-- `src/runtime/identity-files.ts` — load/write/scan helpers.
+- `src/runtime/defaults/INSTRUCTIONS.md` — the canonical default operating rules. Single source of truth: the runtime fallback reads it (trimmed, memoized) and the scaffolder copies it bytes-as-is into freshly-installed instances.
+- `src/system-prompt.ts` — `getDefaultGiniInstructions()` + `DEFAULT_INSTRUCTIONS_PATH`; `buildAgentSystemContext` accepts `instructionsOverride`, `soul`, `userProfile`.
+- `src/runtime/identity-files.ts` — load/write/scan helpers; `scaffoldInstanceIdentityFiles` reads the bundled defaults file once per call.
 - `src/execution/chat-task.ts`, `src/provider.ts` — call sites that load and forward the three files.
 - `src/execution/tool-catalog.ts`, `src/execution/tool-dispatch.ts` — `edit_soul` and `edit_user_profile`.
 - `~/.gini/instances/<inst>/INSTRUCTIONS.md`, `~/.gini/instances/<inst>/USER.md`, `~/.gini/instances/<inst>/agents/<agentId>/SOUL.md` — the on-disk artifacts.

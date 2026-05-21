@@ -4,8 +4,8 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
-import { DEFAULT_GINI_INSTRUCTIONS, buildAgentSystemContext } from "../system-prompt";
+import { dirname, join } from "node:path";
+import { buildAgentSystemContext } from "../system-prompt";
 import {
   approveSoul,
   approveUserProfile,
@@ -28,6 +28,15 @@ import {
 
 const INSTANCE = "ifiles-test";
 const AGENT = "agent_test";
+
+// Read the canonical bundled defaults once at test-load time. Tests
+// compare against the file directly (not the runtime cache) so the
+// scaffold and load behaviors are pinned to the same on-disk bytes that
+// ship with the runtime. Trim matches the convention chosen in
+// `getDefaultGiniInstructions` and `scaffoldInstanceIdentityFiles`.
+const DEFAULT_INSTRUCTIONS_FILE = join(import.meta.dir, "defaults", "INSTRUCTIONS.md");
+const expectedDefaultInstructions = readFileSync(DEFAULT_INSTRUCTIONS_FILE, "utf8");
+const expectedDefaultInstructionsTrimmed = expectedDefaultInstructions.trim();
 
 function scratch(): { root: string; cleanup: () => void } {
   const root = `/tmp/gini-identity-files-tests/${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -259,14 +268,15 @@ describe("identity-files", () => {
       // Both files materialize on disk.
       expect(existsSync(instructionsPath(INSTANCE))).toBe(true);
       expect(existsSync(userProfilePath(INSTANCE))).toBe(true);
-      // INSTRUCTIONS.md is seeded with the current defaults verbatim — no
+      // INSTRUCTIONS.md is seeded with the bundled defaults verbatim — no
       // header comment or other meta text, because every byte in the file
       // is spliced into the system prompt. The user opens the file to a
-      // working baseline they can edit against.
-      expect(readFileSync(instructionsPath(INSTANCE), "utf8")).toBe(DEFAULT_GINI_INSTRUCTIONS);
-      // Size in bytes — the constant contains multi-byte characters
-      // (em-dash, curly quotes), so disk-byte count != JS string length.
-      expect(statSync(instructionsPath(INSTANCE)).size).toBe(Buffer.byteLength(DEFAULT_GINI_INSTRUCTIONS, "utf8"));
+      // working baseline they can edit against. Compare bytes-as-is to pin
+      // the no-trailing-newline convention of the bundled file.
+      expect(readFileSync(instructionsPath(INSTANCE), "utf8")).toBe(expectedDefaultInstructions);
+      // Size in bytes — the file contains multi-byte characters (em-dash,
+      // curly quotes), so disk-byte count != JS string length.
+      expect(statSync(instructionsPath(INSTANCE)).size).toBe(Buffer.byteLength(expectedDefaultInstructions, "utf8"));
       // USER.md genuinely has no defaults — it's a personal profile, only
       // the user knows what belongs in it. Stays zero-byte.
       expect(statSync(userProfilePath(INSTANCE)).size).toBe(0);
@@ -284,14 +294,17 @@ describe("identity-files", () => {
       // behavior — this test pins that they don't.
       scaffoldInstanceIdentityFiles(INSTANCE);
       const loaded = loadInstructions(INSTANCE);
-      expect(loaded).toBe(DEFAULT_GINI_INSTRUCTIONS);
+      // The load path trims, so the result matches the trimmed bundle
+      // bytes — pinned distinctly from the file-bytes assertion above to
+      // make the trimming convention explicit.
+      expect(loaded).toBe(expectedDefaultInstructionsTrimmed);
       // The full system prompt for a fresh install (seeded file + no
       // SOUL/USER) matches the pre-scaffold default — the seed is purely
       // surface, not behavioral.
       const assembled = buildAgentSystemContext([], undefined, undefined, {
         instructionsOverride: loaded ?? undefined
       });
-      expect(assembled).toBe(DEFAULT_GINI_INSTRUCTIONS);
+      expect(assembled).toBe(expectedDefaultInstructionsTrimmed);
     });
 
     test("backfills a missing INSTRUCTIONS.md on an existing instance (USER.md already present)", () => {
@@ -302,7 +315,7 @@ describe("identity-files", () => {
       mkdirSync(dirname(userPath), { recursive: true });
       writeFileSync(userPath, "Existing user notes.");
       const result = scaffoldInstanceIdentityFiles(INSTANCE);
-      expect(readFileSync(instructionsPath(INSTANCE), "utf8")).toBe(DEFAULT_GINI_INSTRUCTIONS);
+      expect(readFileSync(instructionsPath(INSTANCE), "utf8")).toBe(expectedDefaultInstructions);
       expect(readFileSync(userPath, "utf8")).toBe("Existing user notes.");
       expect(result.created).toEqual([instructionsPath(INSTANCE)]);
     });
@@ -339,7 +352,7 @@ describe("identity-files", () => {
       expect(second.created).toEqual([]);
       // INSTRUCTIONS.md still holds the seeded defaults; USER.md still
       // zero-byte. Re-running scaffold can never clobber content.
-      expect(readFileSync(instructionsPath(INSTANCE), "utf8")).toBe(DEFAULT_GINI_INSTRUCTIONS);
+      expect(readFileSync(instructionsPath(INSTANCE), "utf8")).toBe(expectedDefaultInstructions);
       expect(statSync(userProfilePath(INSTANCE)).size).toBe(0);
     });
 

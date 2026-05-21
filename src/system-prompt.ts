@@ -5,6 +5,8 @@
 // and the chat-task agent loop in execution/ pull from here so they ship
 // the same instructions to the model.
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { AgentIdentity, IdentitySnapshotRecord, JobRecord, MemoryRecord } from "./types";
 
 // Number of user turns in the same chat session between full identity
@@ -18,29 +20,61 @@ export const IDENTITY_FULL_REFRESH_INTERVAL = 10;
 const IDENTITY_HEADER = "Your runtime identity:";
 const IDENTITY_DELTA_HEADER = "Runtime identity changes since last turn:";
 
-// Baseline operating-rules preamble. Lives in source so a fresh instance
-// has a working preamble without any filesystem setup. When
-// ~/.gini/instances/<inst>/INSTRUCTIONS.md is present, the chat-task /
-// provider call sites pass its content in as `instructionsOverride` and
-// the override wins. See ADR runtime-identity-files.md.
-export const DEFAULT_GINI_INSTRUCTIONS = [
-  "You are Gini, a local-first personal agent.",
-  "Reply directly and concisely.",
-  "When the user asks for an action you have a tool for, execute it; do not narrate what you would do.",
-  "Keep working until the task is done or you are genuinely blocked (waiting on approval, missing input, or a tool failure).",
-  "Do not claim to have performed side effects. Risky side effects are handled by tools and approvals.",
-  "When the user asks for a change to existing state, plan to the target end state — including cleanup of obsolete state — then execute the full plan before replying.",
-  "Describe what you actually did at the tool level (\"deleted job X and created job Y\"), not the user's intent verb. Only report blocked after confirming no composition of available tools reaches the target state.",
-  "When the user refers to \"this job\", \"my reminder\", or any existing scheduled job, call list_jobs first to find the right jobId before update_job or delete_job.",
-  "You have an interactive browser (Playwright Chromium) with a persistent per-instance profile — authenticated workflows persist across runs. If a site needs a sign-in the user has not done yet, propose opening the visible window (POST /api/browser/connect) so they can sign in once; cookies stick.",
-  "You can schedule one-shot or recurring jobs (interval or cron). Chat-created jobs deliver into a fresh dedicated chat thread named after the job, so repeated fires do not bury the current conversation. Use create_job rather than telling the user to set a reminder elsewhere.",
-  "Before claiming a capability gap (Telegram, MCP, connectors, subagents, messaging, etc.), load the `gini` skill — it documents what is built in and how to wire it up."
-].join("\n");
+// Path to the canonical default operating-rules file. The bytes of this
+// file are the single source of truth for the baseline preamble shipped
+// with the runtime. `getDefaultGiniInstructions()` reads it on first call
+// and caches the trimmed content; `scaffoldInstanceIdentityFiles` copies
+// the same file bytes-as-is into freshly-installed instances. Keeping the
+// two paths anchored on one disk artifact ensures the seeded
+// INSTRUCTIONS.md and the runtime fallback never drift. See ADR
+// runtime-identity-files.md.
+export const DEFAULT_INSTRUCTIONS_PATH = join(import.meta.dir, "runtime", "defaults", "INSTRUCTIONS.md");
+
+// Per-process memoized read. The file is a shipped build asset and never
+// changes between calls; reading it on every chat turn would be wasted
+// disk IO. We resolve it lazily so importing this module does not touch
+// the filesystem (tests construct prompts without needing the asset).
+let cachedDefaultInstructions: string | undefined;
+
+// Active resolver for the default-instructions path. Production code uses
+// the constant above; tests can swap a missing path in to exercise the
+// failure-mode branch and restore the original via the reset helper.
+let activeInstructionsPath: string = DEFAULT_INSTRUCTIONS_PATH;
+
+// Read the canonical default operating-rules file and return its trimmed
+// content. The bytes live in `src/runtime/defaults/INSTRUCTIONS.md` and
+// ship with the runtime — a missing file is an unrecoverable build
+// problem, so this throws loudly rather than falling back to a hardcoded
+// sentinel. See ADR runtime-identity-files.md.
+export function getDefaultGiniInstructions(): string {
+  if (cachedDefaultInstructions !== undefined) return cachedDefaultInstructions;
+  let raw: string;
+  try {
+    raw = readFileSync(activeInstructionsPath, "utf8");
+  } catch (error) {
+    throw new Error(
+      `default INSTRUCTIONS.md missing from bundle at ${activeInstructionsPath}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  cachedDefaultInstructions = raw.trim();
+  return cachedDefaultInstructions;
+}
+
+// Test-only: drop the memoized read and point the active path back at
+// the bundled file (or to an overridden path for the failure-mode test).
+// Production code must never call this — the bundled file does not change
+// at runtime — so the helper is gated behind a `__` prefix to signal
+// intent. Pass `undefined` to restore the default.
+export function __resetDefaultGiniInstructionsCacheForTest(overridePath?: string): void {
+  cachedDefaultInstructions = undefined;
+  activeInstructionsPath = overridePath ?? DEFAULT_INSTRUCTIONS_PATH;
+}
 
 export interface AgentSystemContextOptions {
-  // When set, replaces DEFAULT_GINI_INSTRUCTIONS as the operating-rules
-  // preamble. Sourced from ~/.gini/instances/<inst>/INSTRUCTIONS.md by
-  // the call sites; absent files fall back to the default.
+  // When set, replaces the default operating-rules preamble (from
+  // `getDefaultGiniInstructions`). Sourced from
+  // ~/.gini/instances/<inst>/INSTRUCTIONS.md by the call sites; absent
+  // files fall back to the default.
   instructionsOverride?: string;
   // Per-agent persona body sourced from
   // ~/.gini/instances/<inst>/agents/<agentId>/SOUL.md. Sits between
@@ -77,7 +111,7 @@ export function buildAgentSystemContext(
 ): string {
   const instructions = options?.instructionsOverride && options.instructionsOverride.trim().length > 0
     ? options.instructionsOverride
-    : DEFAULT_GINI_INSTRUCTIONS;
+    : getDefaultGiniInstructions();
   const parts: string[] = [instructions];
   if (options?.soul && options.soul.trim().length > 0) {
     parts.push(options.soul);
