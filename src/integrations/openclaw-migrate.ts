@@ -1455,7 +1455,19 @@ function convertFlowStyleMetadata(body: string): string {
   // the existing block's leading whitespace.
   const leadingMatch = /^[ \t]*/.exec(body.slice(header.index + header[0].length));
   const baseIndent = (leadingMatch?.[0] ?? "  ").length === 0 ? "  " : leadingMatch![0];
-  const giniBody = emitBlockYaml(inner as Record<string, unknown>, `${baseIndent}  `);
+  // emitBlockYaml may throw on values the gini skill loader cannot
+  // round-trip (newlines, mixed-quote strings). In that case we
+  // can't safely rewrite the block — half-rewriting would be worse
+  // than no rewriting — so leave the frontmatter untouched and let
+  // the operator see the unconverted openclaw block on the gini
+  // side. The skill will load but its openclaw metadata won't be
+  // visible under metadata.gini until they hand-translate.
+  let giniBody: string;
+  try {
+    giniBody = emitBlockYaml(inner as Record<string, unknown>, `${baseIndent}  `);
+  } catch {
+    return body;
+  }
   const replacement = `metadata:\n${baseIndent}gini:\n${giniBody}\n`;
   return `${body.slice(0, header.index)}${replacement}${body.slice(blockEnd + 1).replace(/^\r?\n/, "")}`;
 }
@@ -1561,22 +1573,43 @@ function emitBlockYaml(obj: Record<string, unknown>, indent: string): string {
   return lines.join("\n");
 }
 
-// Format a scalar for block-style YAML. Strings get quoted when they
-// would otherwise re-parse as a non-string scalar through gini's
-// `parseScalar` (true/false/null/~/integer/decimal), when they contain
-// characters the parser misreads (`:#\n\r\t"'\\` or leading
-// indicators), or — when emitted inside an inline array — when they
-// contain a comma (the inline parser splits on `,`). Numbers and
-// booleans go through `String()` unchanged because their textual form
-// is their own representation.
+// Format a scalar for block-style YAML, targeting the gini skill loader's
+// hand-rolled parseScalar. The loader at src/capabilities/skill-loader.ts
+// only strips outer quotes (`value.slice(1, -1)`) and does NOT decode
+// escapes of any kind — neither YAML's `''` doubling nor JSON's
+// backslash sequences. Whatever sits between the outer quotes is
+// returned verbatim as the string value.
+//
+// That makes encoding constrained: we can only quote when the content
+// itself is a "clean" sequence of characters that doesn't need its own
+// escaping. We pick a quote style per value:
+//   - single quotes when the value contains no apostrophe
+//   - double quotes when the value contains no double quote
+//   - bare when no quoting is needed at all
+//   - throw when both quote styles would themselves end up inside
+//     the literal (no representable form for this loader)
+//
+// Values containing newlines or control characters also cannot
+// round-trip through a one-line scalar, so those throw too. Throwing
+// is preferable to silent corruption — the migrator surfaces the
+// failing key in its warnings.
+//
+// Strings that would otherwise re-parse as a non-string scalar
+// (true/false/null/~/integer/decimal) get quoted regardless. Inside an
+// inline array, the loader splits on `,` without quote-awareness, so
+// callers must NOT use yamlScalar for inline-array elements that
+// contain commas — emitBlockYaml falls back to block style in that
+// case instead.
 function yamlScalar(value: unknown, options: { inInlineArray?: boolean } = {}): string {
   if (value === null) return "null";
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   const str = String(value);
-  if (str === "") return '""';
-  // Strings that would coerce to a non-string scalar must be quoted to
-  // round-trip as a string. Matches the predicates in
-  // src/capabilities/skill-loader.ts parseScalar.
+  if (str === "") return "''";
+  if (/[\n\r\t]/.test(str) || /[\x00-\x1F\x7F]/.test(str)) {
+    throw new Error(
+      `Cannot encode value containing newline or control character for the gini skill loader: ${JSON.stringify(str.slice(0, 64))}`
+    );
+  }
   const reparsesAsScalar =
     str === "true" ||
     str === "false" ||
@@ -1584,10 +1617,16 @@ function yamlScalar(value: unknown, options: { inInlineArray?: boolean } = {}): 
     str === "~" ||
     /^-?\d+$/.test(str) ||
     /^-?\d+\.\d+$/.test(str);
-  const hasParserSpecials = /[:#\n\r\t"'\\]|^[-?!&*|>%@`]|^\s|\s$/.test(str);
+  const hasParserSpecials = /[:#"'\\]|^[-?!&*|>%@`]|^\s|\s$/.test(str);
   const hasArrayComma = Boolean(options.inInlineArray) && str.includes(",");
   if (!reparsesAsScalar && !hasParserSpecials && !hasArrayComma) return str;
-  return JSON.stringify(str);
+  const hasSingle = str.includes("'");
+  const hasDouble = str.includes('"');
+  if (!hasSingle) return `'${str}'`;
+  if (!hasDouble) return `"${str}"`;
+  throw new Error(
+    `Cannot encode value containing both single and double quotes for the gini skill loader: ${JSON.stringify(str.slice(0, 64))}`
+  );
 }
 
 function copyDirShallow(

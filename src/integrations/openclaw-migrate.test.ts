@@ -364,6 +364,47 @@ describe("rewriteSkillFrontmatter", () => {
     expect(out).toContain("bins: [gh]");
   });
 
+  test("round-trips strings containing quotes and backslashes without JSON-escape corruption", async () => {
+    // JSON.stringify would emit \"-style escapes and the gini skill
+    // loader (which only strips outer quotes, no unescaping) would
+    // return the escape sequence verbatim. Verify the migrator's
+    // quoting picks a quote style that survives that round-trip.
+    const raw = [
+      "---",
+      "name: punc",
+      "description: Pins escape handling.",
+      "metadata:",
+      "  {",
+      '    "openclaw":',
+      "      {",
+      '        "url": "https://example.com/path?q=a&b=c",',
+      '        "with-double": "he said \\"hi\\"",',
+      '        "with-backslash": "C:\\\\windows\\\\system32",',
+      '        "with-apostrophe": "it'+"'"+'s fine"',
+      "      }",
+      "  }",
+      "---",
+      "body"
+    ].join("\n");
+    const rewritten = rewriteSkillFrontmatter(raw);
+    const { parseFrontmatter } = await import("../capabilities/skill-loader");
+    const fmText = /^---\r?\n([\s\S]*?)\r?\n---/.exec(rewritten)![1]!;
+    const fm = parseFrontmatter(fmText) as {
+      metadata?: {
+        gini?: {
+          url?: unknown;
+          "with-double"?: unknown;
+          "with-backslash"?: unknown;
+          "with-apostrophe"?: unknown;
+        };
+      };
+    };
+    expect(fm.metadata?.gini?.url).toBe("https://example.com/path?q=a&b=c");
+    expect(fm.metadata?.gini?.["with-double"]).toBe('he said "hi"');
+    expect(fm.metadata?.gini?.["with-backslash"]).toBe("C:\\windows\\system32");
+    expect(fm.metadata?.gini?.["with-apostrophe"]).toBe("it's fine");
+  });
+
   test("emits ambiguous string scalars as quoted YAML so they round-trip as strings", async () => {
     // Without quoting, "false"/"true"/"null" would re-parse as
     // booleans/null, numeric-looking strings would re-parse as
