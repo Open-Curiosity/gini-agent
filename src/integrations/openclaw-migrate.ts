@@ -1175,7 +1175,27 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
   const config: OpenclawConfig = parseOpenclawJson(readFileSync(source.configPath, "utf8"));
 
   // Agents
-  const agentList = config.agents?.list ?? [];
+  //
+  // `parseOpenclawJson` is just `JSON.parse(raw) as OpenclawConfig` —
+  // no schema validation. An openclaw.json from a coworker's tarball
+  // or a half-edited config can have `agents.list` of any shape:
+  // missing, an object, a number, a stringified array. The original
+  // code did `config.agents?.list ?? []` and then `for (const agent
+  // of agentList)`, which throws `TypeError: agentList is not
+  // iterable` and aborts the entire `gini import plan` command with
+  // a stack trace before the operator sees any of the other
+  // unsupported entries. Detect the schema drift here and surface it
+  // as an unsupported entry, then continue with an empty list so the
+  // rest of the plan (workspace files, skills, sessions, memory) can
+  // still be inspected.
+  const rawAgentList = config.agents?.list;
+  const agentList: OpenclawAgentConfig[] = Array.isArray(rawAgentList) ? rawAgentList : [];
+  if (rawAgentList !== undefined && !Array.isArray(rawAgentList)) {
+    unsupported.push({
+      kind: "agent",
+      detail: `\`agents.list\` in openclaw.json is not an array (got ${typeof rawAgentList}); falling back to the implicit 'main' agent. Fix the openclaw config and re-migrate to recover the explicit agent list.`
+    });
+  }
   const agentIds: string[] = [];
   // Map each retained agent id to the directory we should look for
   // auth-profiles.json under. Operators can override per-agent via

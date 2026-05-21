@@ -1205,6 +1205,34 @@ describe("planMigration", () => {
     expect(ref?.detail).toContain("OPENAI_API_KEY");
   });
 
+  test("surfaces malformed `agents.list` as an unsupported entry instead of throwing", () => {
+    // parseOpenclawJson is `JSON.parse() as OpenclawConfig` with no
+    // schema validation, so a tarball from a coworker or a hand-edit
+    // can land any shape in agents.list. The original code's
+    // `for (const agent of agentList)` would throw TypeError on a
+    // non-array and abort `gini import plan` with a stack trace
+    // before the operator saw any of the other steps. Now the
+    // schema drift becomes an unsupported entry; the rest of the
+    // plan is still inspectable.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: { not: "an array" } } })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const drift = plan.unsupported.find(
+      (entry) =>
+        entry.kind === "agent" &&
+        entry.detail.includes("`agents.list`") &&
+        entry.detail.includes("not an array")
+    );
+    expect(drift).toBeDefined();
+    // The implicit 'main' agent fallback still runs so a migration
+    // with one bad config field isn't a total loss.
+    expect(plan.steps.some((step) => step.kind === "agent" && step.openclawId === "main")).toBe(true);
+  });
+
   test("warns when an openclaw agent had per-agent tool/sandbox restrictions that gini's toolset model can't carry", () => {
     // openclaw's tools.profile / tools.allow / tools.deny / tools.exec
     // / tools.fs / sandbox fields restrict a specific agent's tool
