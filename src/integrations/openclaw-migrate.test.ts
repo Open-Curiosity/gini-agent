@@ -402,6 +402,35 @@ describe("planMigration", () => {
     expect((telegram as { tokenValue: string }).tokenValue).toBe("tg-token-from-config");
   });
 
+  test("unions telegram allow-list from credentials file AND inline config", () => {
+    // Operators using dmPolicy="allowlist" carry their allow-list inline in
+    // openclaw.json (the modern surface). Configs that pre-date that move
+    // still write to credentials/telegram-allowFrom.json. The migrator
+    // must consult both sources or it silently drops enrollments.
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withTelegramChannel: true,
+      withTelegramAllowFrom: true
+    });
+    const cfgPath = join(OPENCLAW_ROOT, "openclaw.json");
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as {
+      channels: Record<string, Record<string, unknown>>;
+    };
+    cfg.channels.telegram = {
+      ...cfg.channels.telegram,
+      dmPolicy: "allowlist",
+      allowFrom: ["67890", "999111", 222333]
+    };
+    writeFileSync(cfgPath, JSON.stringify(cfg));
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const telegram = plan.steps.find((step) => step.kind === "bridge") as {
+      allowedChatIds: number[];
+    };
+    expect(telegram.allowedChatIds.sort((a, b) => a - b)).toEqual([
+      12345, 67890, 222333, 999111
+    ]);
+  });
+
   test("falls back to state-dir .env when config.env.vars omits the token", () => {
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: false, withDotenv: true });
     writeFileSync(

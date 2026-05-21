@@ -338,6 +338,27 @@ function readAllowFromAsNumbers(path: string): number[] | undefined {
   }
 }
 
+// Telegram chat ids come over the wire as numbers but operators routinely
+// hand-edit them as strings in openclaw.json. We accept either, filter
+// anything non-finite (Telegram chat ids are 64-bit integers but stay
+// inside Number.MAX_SAFE_INTEGER in practice), and return undefined when
+// the source produced nothing — keeps the union helper's "no input"
+// signal clean.
+function coerceAllowFromToNumbers(raw: unknown): number[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const ids: number[] = [];
+  for (const entry of raw) {
+    const value = typeof entry === "number" ? entry : Number(entry);
+    if (Number.isFinite(value)) ids.push(value);
+  }
+  return ids.length > 0 ? ids : undefined;
+}
+
+function unionChatIds(a: number[] | undefined, b: number[] | undefined): number[] | undefined {
+  if (!a && !b) return undefined;
+  return Array.from(new Set([...(a ?? []), ...(b ?? [])]));
+}
+
 // Map openclaw's wide provider catalog onto the narrow set gini supports
 // at the moment. Returning `null` puts the provider in the unsupported
 // list — the user can wire it manually after the migration. Add a row
@@ -470,9 +491,19 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
     if (name === "telegram") {
       const token = envVars.TELEGRAM_BOT_TOKEN ?? dotenv.TELEGRAM_BOT_TOKEN;
       if (token) {
-        const allowedChatIds = readAllowFromAsNumbers(
+        // Union the allow-list from BOTH sources openclaw uses:
+        //   1. `<credDir>/telegram-allowFrom.json` (legacy + default-account)
+        //   2. inline `channels.telegram.allowFrom` in the config (the
+        //      modern surface; required when dmPolicy="allowlist" per
+        //      openclaw's zod schema)
+        // Reading only the file silently drops allow-lists for the many
+        // configs that hold them inline. De-dup after the union so a
+        // chat listed in both sources still appears exactly once.
+        const fromFile = readAllowFromAsNumbers(
           join(source.credentialsDir, "telegram-allowFrom.json")
         );
+        const fromConfig = coerceAllowFromToNumbers(channels[name]?.allowFrom);
+        const allowedChatIds = unionChatIds(fromFile, fromConfig);
         steps.push({
           kind: "bridge",
           bridgeKind: "telegram",
