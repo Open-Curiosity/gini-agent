@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Homebrew (or another package manager) and a Google account."
 metadata:
   gini:
-    version: 3.3.0
+    version: 3.3.1
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -92,15 +92,33 @@ The goal of this step is a single value, `<PROJECT_ID>`, that names a Cloud proj
 - Treat `<PROJECT_ID>` as a value you discover, not a value you write. Read it from the output of `projects list` or `projects create`, then thread it through.
 - If the user named a specific project earlier in this chat ("use my work project `acme-data-1234`"), use that as `<PROJECT_ID>` and skip straight to 4c. Don't second-guess by listing or creating.
 
-### 4a. Look for a Gini-managed project first
+### 4a. Look for an ACTIVE Gini-managed project first
 
 ```bash
-gcloud projects list --filter="projectId:gini-workspace-*" --format="value(projectId)"
+gcloud projects list --filter="projectId:gini-workspace-* lifecycleState:ACTIVE" --format="value(projectId)"
 ```
 
-The filter is on **project ID prefix**, which we control — not display name, which collides freely. Every project this skill creates has an ID starting with `gini-workspace-`. If the command returns one or more IDs, pick the first as `<PROJECT_ID>` and skip ahead to 4c. A prior setup run already provisioned it; making another would just leave orphans.
+The filter is on **project ID prefix**, which we control — not display name, which collides freely. Every project this skill creates has an ID starting with `gini-workspace-`. If the command returns one or more IDs, pick the first as `<PROJECT_ID>` and skip ahead to 4d. A prior setup run already provisioned it; making another would just leave orphans.
 
-### 4b. Otherwise, create one (only when 4a returns nothing)
+### 4b. Otherwise, undelete a recently-deleted one
+
+Google retains deleted project IDs in `DELETE_REQUESTED` state for ~30 days. During that window the name is reserved (so creating with the same ID fails with `ALREADY_EXISTS`) but the project can be restored with one call. Check before creating:
+
+```bash
+gcloud projects list --filter="projectId:gini-workspace-* lifecycleState:DELETE_REQUESTED" --format="value(projectId)"
+```
+
+If this returns one or more IDs, pick the most recent and undelete it:
+
+```bash
+gcloud projects undelete <PROJECT_ID>
+```
+
+Undelete is a single API call — it does NOT count against the per-minute project-create write quota the way `gcloud projects create` does, so this also avoids `RATE_LIMIT_EXCEEDED` during heavy testing. Most enabled APIs survive the undelete, but treat that as best-effort — 4d will re-enable any that didn't.
+
+Skip ahead to 4d once undelete succeeds. (Service Usage takes 30-90 s to re-recognize the project after undelete; 4d's `services enable` retries internally so it tolerates the gap.)
+
+### 4c. Otherwise, create a fresh one
 
 The bare ID `gini-workspace` is almost always globally claimed — don't waste an attempt on it. Derive a deterministic, account-scoped suffix from the gcloud account so re-runs converge instead of accumulating projects:
 
@@ -115,9 +133,11 @@ Take the part before `@`, lowercase, and strip to `[a-z0-9-]`. The project-ID ca
 gcloud projects create gini-workspace-<suffix> --name="Gini Workspace"
 ```
 
-If even that ID is taken (rare — only when a different user with the same email local-part already claimed it globally), append a 4-char random tiebreaker. `<PROJECT_ID>` is whichever ID succeeded.
+If even that ID is taken AND no DELETE_REQUESTED match was found in 4b (rare — only when a different user with the same email local-part already claimed it globally), append a 4-char random tiebreaker. `<PROJECT_ID>` is whichever ID succeeded.
 
-### 4c. Verify access, then enable the APIs
+If `gcloud projects create` errors with `RATE_LIMIT_EXCEEDED` for `cloudresourcemanager.googleapis.com.write_requests`, the user has burned through Google's per-account project-create quota (usually from repeated testing). Surface the error verbatim and ask: "Google is rate-limiting project creates; the quota typically clears in ~10 minutes. Want to wait and retry, or do you have an existing Cloud project I can use? Reply with a project ID or 'wait'." Do not loop the create call.
+
+### 4d. Verify access, then enable the APIs
 
 `projects describe` is the cheapest probe that fails fast if the active account doesn't own `<PROJECT_ID>` — much better than learning it from `services enable`'s permission error after the model has already committed to a flow.
 
@@ -140,7 +160,7 @@ gcloud services enable \
 
 Calendar's service ID is `calendar-json.googleapis.com` (not `calendar.googleapis.com`).
 
-If either 4c command errors with `PERMISSION_DENIED`, the active account doesn't own `<PROJECT_ID>`. Surface the error verbatim and ask the user briefly: "I don't have access to `<PROJECT_ID>`. Which project should I use?" Take their answer as the new `<PROJECT_ID>` and re-run from `projects describe`. Do not fall back to `gcloud config get-value project` to recover — that's the same stale value that produced the original failure.
+If either 4d command errors with `PERMISSION_DENIED`, the active account doesn't own `<PROJECT_ID>`. Surface the error verbatim and ask the user briefly: "I don't have access to `<PROJECT_ID>`. Which project should I use?" Take their answer as the new `<PROJECT_ID>` and re-run from `projects describe`. Do not fall back to `gcloud config get-value project` to recover — that's the same stale value that produced the original failure.
 
 ## Step 5 — Last step: capture OAuth Desktop credentials
 
