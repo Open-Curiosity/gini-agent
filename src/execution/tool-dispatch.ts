@@ -2114,6 +2114,52 @@ async function requestConnectorTool(
     };
   }
 
+  // Setup-skill gate: providers that declare `setupSkill` own a multi-step
+  // prerequisite flow (install CLI, OAuth, project provisioning, enable
+  // APIs, etc.) before credential capture is meaningful. The model has
+  // been observed bypassing the skill and calling request_connector
+  // directly with a generic reason, leaving the user without the
+  // prerequisites needed to mint credentials. Refuse the call when the
+  // task's tool-call history shows no prior `read_skill` for the
+  // declared setup skill — the error directs the model there, the
+  // skill body itself calls request_connector at the end, and the
+  // resumed call passes this same gate naturally because the
+  // intervening read_skill is now in the message history.
+  if (provider.setupSkill) {
+    const task = state.tasks.find((t) => t.id === taskId);
+    const messages = task?.toolCallState?.messages ?? [];
+    const hasReadSetup = messages.some((m) => {
+      if (!m || typeof m !== "object") return false;
+      const msg = m as { role?: unknown; tool_calls?: unknown };
+      if (msg.role !== "assistant") return false;
+      const calls = msg.tool_calls;
+      if (!Array.isArray(calls)) return false;
+      return calls.some((c) => {
+        if (!c || typeof c !== "object") return false;
+        const call = c as { function?: { name?: unknown; arguments?: unknown } };
+        const fn = call.function;
+        if (!fn || fn.name !== "read_skill") return false;
+        try {
+          const args = typeof fn.arguments === "string"
+            ? JSON.parse(fn.arguments)
+            : (fn.arguments ?? {});
+          return (args as { name?: unknown })?.name === provider.setupSkill;
+        } catch {
+          return false;
+        }
+      });
+    });
+    if (!hasReadSetup) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: `This provider's setup is owned by the '${provider.setupSkill}' skill. Call \`read_skill\` with name '${provider.setupSkill}' first — that skill body walks through the required prerequisites (install, OAuth, project provisioning, APIs) and itself calls request_connector at the end.`
+        })
+      };
+    }
+  }
+
   const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
     const item = findTask(mutable, taskId);
     if (isTerminalTaskStatus(item.status)) {

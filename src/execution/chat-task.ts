@@ -476,7 +476,7 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
     .map(([provider, entry]) => {
       const skillList = Array.from(new Set(entry.skills)).sort().join(", ");
       if (entry.setupSkill) {
-        return `- ${provider} (used by: ${skillList}) — run \`read_skill\` with \`${entry.setupSkill}\` to set this up.`;
+        return `- ${provider} (used by: ${skillList}) — run \`read_skill\` with \`${entry.setupSkill}\` first; request_connector will be rejected until you do.`;
       }
       return `- ${provider} (used by: ${skillList}) — call \`request_connector\` with provider id \`${provider}\` to ask the user to connect.`;
     });
@@ -487,8 +487,11 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
   // Browser tools exist for unrelated web tasks; they are not a bypass for
   // the connector handshake.
   const hasSetupSkill = Array.from(grouped.values()).some((entry) => entry.setupSkill);
+  const intro = hasSetupSkill
+    ? "Skills below need an external connector. The runtime gates `request_connector` for providers that declare a setup skill — call `read_skill` with the setup skill first (it owns the full prerequisite flow and will invoke request_connector itself). For providers WITHOUT a setup skill, call `request_connector` with the provider id directly."
+    : "Skills below need an external connector. For providers with a setup skill listed, invoke that skill first (it walks through any install / OAuth / project provisioning, then captures credentials). Otherwise, call `request_connector` with the provider id directly.";
   const sections: string[] = [
-    "Skills below need an external connector. For providers with a setup skill listed, invoke that skill first (it walks through any install / OAuth / project provisioning, then captures credentials). Otherwise, call `request_connector` with the provider id directly.",
+    intro,
     ...lines
   ];
   if (hasSetupSkill) {
