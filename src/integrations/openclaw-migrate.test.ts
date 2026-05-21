@@ -25,7 +25,7 @@ import {
 } from "./openclaw-migrate";
 import { loadConfig } from "../paths";
 import { mutateState, readState } from "../state";
-import { getMemoryDb } from "../state/memory-db";
+import { closeAllMemoryDbs, getMemoryDb } from "../state/memory-db";
 import { readSecret } from "../state/secrets";
 
 // Isolated roots so the tests never touch ~/.gini or ~/.openclaw on the
@@ -1677,6 +1677,14 @@ describe("summarizePlan", () => {
 
 describe("applyMigration", () => {
   beforeEach(() => {
+    // Close any cached memory.db handles before deleting GINI_STATE.
+    // dbCache (src/state/memory-db.ts) is module-level, so it survives
+    // across reruns of the same test file inside a single Bun process.
+    // Without this, `bun test --rerun-each=N` (or any in-process
+    // re-execution) hits the cached handle on run 2+ pointing at a
+    // file inode the previous beforeEach already unlinked, and
+    // applyMigration's `getMemoryDb` call throws SQLITE_IOERR_VNODE.
+    closeAllMemoryDbs();
     rmSync(GINI_STATE, { recursive: true, force: true });
     rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
     rmSync(join(GINI_HOME, ".openclaw"), { recursive: true, force: true });
@@ -2149,6 +2157,14 @@ describe("applyMigration", () => {
 
 describe("applyMigration archive", () => {
   beforeEach(() => {
+    // Close any cached memory.db handles before deleting GINI_STATE.
+    // dbCache (src/state/memory-db.ts) is module-level, so it survives
+    // across reruns of the same test file inside a single Bun process.
+    // Without this, `bun test --rerun-each=N` (or any in-process
+    // re-execution) hits the cached handle on run 2+ pointing at a
+    // file inode the previous beforeEach already unlinked, and
+    // applyMigration's `getMemoryDb` call throws SQLITE_IOERR_VNODE.
+    closeAllMemoryDbs();
     rmSync(GINI_STATE, { recursive: true, force: true });
     rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
     rmSync(join(GINI_HOME, ".gini"), { recursive: true, force: true });
@@ -2401,6 +2417,14 @@ describe("applyMigration archive", () => {
 
 describe("applyMigration sessions", () => {
   beforeEach(() => {
+    // Close any cached memory.db handles before deleting GINI_STATE.
+    // dbCache (src/state/memory-db.ts) is module-level, so it survives
+    // across reruns of the same test file inside a single Bun process.
+    // Without this, `bun test --rerun-each=N` (or any in-process
+    // re-execution) hits the cached handle on run 2+ pointing at a
+    // file inode the previous beforeEach already unlinked, and
+    // applyMigration's `getMemoryDb` call throws SQLITE_IOERR_VNODE.
+    closeAllMemoryDbs();
     rmSync(GINI_STATE, { recursive: true, force: true });
     rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
     rmSync(join(GINI_HOME, ".gini"), { recursive: true, force: true });
@@ -2644,6 +2668,14 @@ describe("applyMigration sessions", () => {
 
 describe("applyMigration memory units", () => {
   beforeEach(() => {
+    // Close any cached memory.db handles before deleting GINI_STATE.
+    // dbCache (src/state/memory-db.ts) is module-level, so it survives
+    // across reruns of the same test file inside a single Bun process.
+    // Without this, `bun test --rerun-each=N` (or any in-process
+    // re-execution) hits the cached handle on run 2+ pointing at a
+    // file inode the previous beforeEach already unlinked, and
+    // applyMigration's `getMemoryDb` call throws SQLITE_IOERR_VNODE.
+    closeAllMemoryDbs();
     rmSync(GINI_STATE, { recursive: true, force: true });
     rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
     rmSync(join(GINI_HOME, ".gini"), { recursive: true, force: true });
