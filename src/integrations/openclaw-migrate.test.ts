@@ -1648,6 +1648,45 @@ describe("applyMigration", () => {
     expect(state.agents.some((agent) => agent.name === "main")).toBe(false);
   });
 
+  test("refuses to apply while another import holds the per-instance lock", async () => {
+    // Two `gini import apply openclaw` invocations against the same
+    // instance must NOT race on state.json. The migrator acquires an
+    // O_EXCL lockfile at `<instance>/.import-lock`; a second process
+    // that finds the lock held by a still-alive PID throws with a
+    // diagnostic message instead of proceeding.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const config = loadConfig("import-lock-busy");
+    // Plant an existing lock holding the current PID — `process.kill(pid, 0)`
+    // will return true so the stale-cleanup path won't fire.
+    const lockPath = join(GINI_STATE, "instances", "import-lock-busy", ".import-lock");
+    mkdirSync(join(GINI_STATE, "instances", "import-lock-busy"), { recursive: true });
+    writeFileSync(lockPath, `pid=${process.pid}\nat=2026-01-01T00:00:00.000Z\n`);
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    await expect(applyMigration(config, discovery, plan)).rejects.toThrow(/Another gini import/i);
+    // Clear the lock so subsequent tests aren't blocked.
+    rmSync(lockPath, { force: true });
+  });
+
+  test("cleans up a stale lock left behind by a crashed previous run", async () => {
+    // If the previous apply died without releasing the lockfile, the
+    // operator shouldn't have to grep filesystems to recover. We
+    // detect a stale lock (recorded PID is gone) and remove + retry.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const config = loadConfig("import-lock-stale");
+    const lockPath = join(GINI_STATE, "instances", "import-lock-stale", ".import-lock");
+    mkdirSync(join(GINI_STATE, "instances", "import-lock-stale"), { recursive: true });
+    // PID 999999 is reserved-but-unused on macOS/Linux test hosts; if
+    // it ever happened to be alive on a host this assertion fails
+    // visibly, which is preferable to silently passing.
+    writeFileSync(lockPath, `pid=999999\nat=2026-01-01T00:00:00.000Z\n`);
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.applied).toBe(true);
+    // Lockfile should have been removed at exit.
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
   test("refuses to apply while a gateway is running on the same instance", async () => {
     // The CLI's in-process mutateState lock cannot serialize writes
     // across separate OS processes. If apply mutated state.json while

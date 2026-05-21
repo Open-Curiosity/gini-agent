@@ -70,15 +70,20 @@
 
 import {
   chmodSync,
+  closeSync,
+  constants as fsConstants,
   copyFileSync,
   cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   statSync,
-  writeFileSync
+  unlinkSync,
+  writeFileSync,
+  writeSync
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
@@ -1415,6 +1420,116 @@ export function detectRunningGateway(instance: string): { pid: number } | null {
   }
 }
 
+// Per-instance import lock. Two `gini import apply openclaw`
+// invocations against the same gini instance must NOT race — the
+// in-process `mutateState` lock only serializes writers inside a
+// single Node process, and `writeState` uses a fixed temp filename
+// (`<state>.tmp`) without any cross-process exclusion. A parallel
+// apply would either lose updates (one rename overwrites the other's
+// in-flight tmp mid-stream) or land both rows into state.json with
+// the planner's idempotency dedup not having seen the other's writes.
+// `O_EXCL | O_CREAT` gives us a kernel-enforced atomic check-and-set
+// on the lockfile name; we record the holder's PID + start time so a
+// crashed previous run can be detected and cleaned up automatically
+// instead of forcing the operator to grep for a stale lockfile.
+interface ImportLockHandle {
+  path: string;
+  release: () => void;
+}
+
+function acquireImportLock(instance: string): ImportLockHandle {
+  const root = instanceRoot(instance);
+  mkdirSync(root, { recursive: true });
+  const lockPath = join(root, ".import-lock");
+  let fd: number;
+  try {
+    fd = openSync(
+      lockPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+      0o600
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    // Stale-lock detection: read the recorded PID. If that process
+    // is gone, the previous run crashed without releasing — drop the
+    // lock and retry once. We deliberately do NOT loop more than
+    // once: a second EEXIST after the cleanup means a third party
+    // raced in, and the right thing is to surface the conflict to
+    // the operator rather than spin.
+    const existingPid = readImportLockPid(lockPath);
+    const alive = existingPid !== null && isProcessAlive(existingPid);
+    if (alive) {
+      throw new Error(
+        `Another gini import is running for instance '${instance}' (PID ${existingPid}, lock at ${lockPath}). Wait for it to finish, or stop that process and retry.`
+      );
+    }
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      // Someone else cleaned up between our read and unlink — fall
+      // through to the retry which will succeed or surface a real
+      // conflict.
+    }
+    try {
+      fd = openSync(
+        lockPath,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+        0o600
+      );
+    } catch (retryError) {
+      throw new Error(
+        `Another gini import raced into the import lock for instance '${instance}' (lock at ${lockPath}). Retry shortly; if the conflict persists, remove the lock file manually after confirming no migration is in progress.`
+      );
+    }
+  }
+  try {
+    writeSync(
+      fd,
+      `pid=${process.pid}\nat=${now()}\ncmd=gini import apply openclaw\n`
+    );
+  } catch {
+    // Lock metadata is informational only — failing to write it
+    // doesn't invalidate the lock itself; ignore the error.
+  }
+  return {
+    path: lockPath,
+    release: () => {
+      try {
+        closeSync(fd);
+      } catch {
+        // close failure is non-fatal — fd will be reaped on process exit.
+      }
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        // unlink failure (e.g., someone already removed it) is non-fatal.
+      }
+    }
+  };
+}
+
+function readImportLockPid(lockPath: string): number | null {
+  try {
+    const content = readFileSync(lockPath, "utf8");
+    const match = /^pid=(\d+)/m.exec(content);
+    if (!match) return null;
+    const pid = Number(match[1]);
+    return Number.isFinite(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function applyMigration(
   config: RuntimeConfig,
   source: OpenclawDiscovery,
@@ -1460,6 +1575,16 @@ export async function applyMigration(
       `Gini gateway is running for instance '${config.instance}' (PID ${running.pid}). Stop it first with \`gini stop --instance ${config.instance}\` so the migration can write state.json without racing the gateway, then re-run \`gini import apply openclaw\`.`
     );
   }
+
+  // Cross-process serialization. `mutateState` / `writeState`
+  // serialize writes only inside a single Node process; two parallel
+  // `gini import apply openclaw` invocations would race on the
+  // shared `<state>.tmp` filename and either corrupt state.json or
+  // lose updates. Acquire an O_EXCL lockfile at the instance root
+  // for the lifetime of the migration so a second concurrent process
+  // fails fast with a clear message instead of clobbering the first.
+  const importLock = acquireImportLock(config.instance);
+  try {
 
   const warnings: string[] = [];
   let agentsCreated = 0;
@@ -2111,6 +2236,9 @@ export async function applyMigration(
     unsupported: plan.unsupported,
     warnings
   };
+  } finally {
+    importLock.release();
+  }
 }
 
 // Walk an openclaw session JSONL and extract just the human-readable
