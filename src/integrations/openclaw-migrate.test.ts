@@ -22,6 +22,15 @@ const GINI_STATE = `${ROOT}/gini-state`;
 const GINI_HOME = `${ROOT}/home`;
 const OPENCLAW_ROOT = `${ROOT}/openclaw-state`;
 
+// Capture pre-test env so we can restore it. Bun runs all test files in
+// one process, so leaving HOME/GINI_STATE_ROOT/etc. pointing at our
+// /tmp paths would poison any subsequent test (or any homedir() consumer)
+// that runs after this file.
+const ORIGINAL_HOME = process.env.HOME;
+const ORIGINAL_STATE_ROOT = process.env.GINI_STATE_ROOT;
+const ORIGINAL_LOG_ROOT = process.env.GINI_LOG_ROOT;
+const ORIGINAL_WORKSPACE = process.env.GINI_WORKSPACE;
+
 beforeAll(() => {
   rmSync(ROOT, { recursive: true, force: true });
   mkdirSync(ROOT, { recursive: true });
@@ -29,13 +38,24 @@ beforeAll(() => {
   process.env.GINI_STATE_ROOT = GINI_STATE;
   process.env.GINI_LOG_ROOT = `${ROOT}/logs`;
   process.env.HOME = GINI_HOME;
+  // GINI_WORKSPACE leaks the developer's real workspace path into
+  // workspaceDir() if inherited; clear it so apply tests write into the
+  // sandbox instance's workspace rather than the real one.
+  delete process.env.GINI_WORKSPACE;
 });
 
 afterAll(() => {
   rmSync(ROOT, { recursive: true, force: true });
-  delete process.env.GINI_STATE_ROOT;
-  delete process.env.GINI_LOG_ROOT;
+  restoreEnv("HOME", ORIGINAL_HOME);
+  restoreEnv("GINI_STATE_ROOT", ORIGINAL_STATE_ROOT);
+  restoreEnv("GINI_LOG_ROOT", ORIGINAL_LOG_ROOT);
+  restoreEnv("GINI_WORKSPACE", ORIGINAL_WORKSPACE);
 });
+
+function restoreEnv(name: string, previous: string | undefined): void {
+  if (previous === undefined) delete process.env[name];
+  else process.env[name] = previous;
+}
 
 function seedOpenclawTree(stateRoot: string, options: {
   withConfig?: boolean;
