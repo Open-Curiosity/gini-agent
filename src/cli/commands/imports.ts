@@ -45,6 +45,11 @@ export async function importInspect(ctx: CliContext): Promise<void> {
         `Unknown flag${unknownFlags.length > 1 ? "s" : ""}: ${unknownFlags.join(", ")}\nUsage: gini import plan openclaw [path]`
       );
     }
+    if (positional.length > 2) {
+      throw new Error(
+        `Unexpected extra argument(s): ${positional.slice(2).join(", ")}\nUsage: gini import plan openclaw [path]`
+      );
+    }
     const [source, path] = positional;
     if (source !== "openclaw") {
       throw new Error("Usage: gini import plan openclaw [path]");
@@ -69,6 +74,11 @@ export async function importInspect(ctx: CliContext): Promise<void> {
     if (unknownFlags.length > 0) {
       throw new Error(
         `Unknown flag${unknownFlags.length > 1 ? "s" : ""}: ${unknownFlags.join(", ")}\nUsage: gini import apply openclaw [path] [--force]`
+      );
+    }
+    if (positional.length > 2) {
+      throw new Error(
+        `Unexpected extra argument(s): ${positional.slice(2).join(", ")}\nUsage: gini import apply openclaw [path] [--force]`
       );
     }
     const [source, path] = positional;
