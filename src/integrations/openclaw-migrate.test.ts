@@ -966,6 +966,36 @@ describe("applyMigration", () => {
     rmSync(join(GINI_STATE, "instances", "gateway-alive", "runtime.pid"), { force: true });
   });
 
+  test("warns when an imported agent uses an unsupported provider", async () => {
+    // Without a warning, an openclaw agent whose model was
+    // \"anthropic/claude-3-5-sonnet\" would silently turn into a gini
+    // agent with providerName: undefined and would route through the
+    // instance-level provider on first run. Operators don't expect
+    // that — they'd see the wrong model in audit + outputs without an
+    // obvious reason.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: {
+          list: [{ id: "main", default: true, model: "anthropic/claude-3-5-sonnet" }]
+        }
+      })
+    );
+    const config = loadConfig("unsupported-agent-provider");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.agentsCreated).toBe(1);
+    expect(
+      result.warnings.some((warning) =>
+        warning.includes("main") &&
+        warning.includes("anthropic") &&
+        warning.includes("fall back")
+      )
+    ).toBe(true);
+  });
+
   test("warns when a Discord bridge migrates without delivery channels", async () => {
     // The discord-poller's shouldRun gate refuses to start a loop for
     // a bridge with empty deliveryTargets. Openclaw doesn't expose a

@@ -970,6 +970,19 @@ export async function applyMigration(
         continue;
       }
       const giniProvider = step.providerName ? mapProviderToGini(step.providerName) : null;
+      // The openclaw agent had a provider routing gini doesn't natively
+      // support (e.g. anthropic, google). Without a warning, the agent
+      // would land with providerName: undefined, silently falling back
+      // to the instance-level RuntimeConfig.provider — a subtle
+      // behavior change the operator would have to discover by running
+      // the migrated agent and noticing the wrong model. Surface it as
+      // a warning so the agent's routing gap is visible alongside the
+      // unsupported provider entry.
+      if (step.providerName && !giniProvider) {
+        warnings.push(
+          `Agent '${step.name}' used openclaw provider '${step.providerName}'; gini has no native mapping so the migrated agent will fall back to the instance-level provider.`
+        );
+      }
       createAgentRecord(state, {
         name: step.name,
         providerName: giniProvider ?? undefined,
