@@ -886,6 +886,21 @@ export async function applyMigration(
       warnings.push(`Skipped ${step.bridgeKind} bridge: ${message}`);
       continue;
     }
+    // Discord's gini supervisor (`discord-poller.ts:shouldRun`) gates
+    // on a non-empty `deliveryTargets` channel list, but openclaw and
+    // gini model Discord access differently — openclaw stores a
+    // per-sender allow-list (`channels.discord.allowFrom` + a
+    // credentials file), gini stores per-channel snowflakes the bot
+    // operates in. The two cannot be mapped 1:1 from disk state, so
+    // we provision the bridge with the token + status:"configured" so
+    // the operator can finish wiring with `gini messaging` after the
+    // migration, but warn them clearly that the supervisor will stay
+    // dormant until they add at least one delivery channel.
+    if (step.bridgeKind === "discord") {
+      warnings.push(
+        `Discord bridge migrated without deliveryTargets; supervisor will stay idle until you run \`gini messaging add\` to wire at least one channel.`
+      );
+    }
     // First pass: decide whether we are creating or rotating. We only
     // need the bridge id (and existence flag) out of state here; we
     // intentionally do NOT keep a reference to the bridge object,

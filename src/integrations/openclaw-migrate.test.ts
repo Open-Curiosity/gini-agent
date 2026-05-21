@@ -777,6 +777,26 @@ describe("applyMigration", () => {
     expect(state.agents.some((agent) => agent.name === "main")).toBe(false);
   });
 
+  test("warns when a Discord bridge migrates without delivery channels", async () => {
+    // The discord-poller's shouldRun gate refuses to start a loop for
+    // a bridge with empty deliveryTargets. Openclaw doesn't expose a
+    // channel-list equivalent we can map 1:1, so the migrator MUST
+    // call attention to the gap.
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withDiscordChannel: true
+    });
+    const config = loadConfig("discord-warn");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.bridgesCreated).toBe(1);
+    expect(
+      result.warnings.some((warning) =>
+        warning.includes("Discord") && warning.includes("deliveryTargets")
+      )
+    ).toBe(true);
+  });
+
   test("skips existing secrets.env entries unless --force is set", async () => {
     // ~/.gini/secrets.env is shared across instances, so silently
     // overwriting OPENAI_API_KEY with whatever openclaw stored would
