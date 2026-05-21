@@ -62,6 +62,7 @@ The `default` instance is pinned to memorable ports — web `7777`, runtime `777
 │       ├── snapshots/
 │       ├── skills/
 │       ├── workspace/
+│       ├── imports/
 │       └── logs/
 └── models/
 ```
