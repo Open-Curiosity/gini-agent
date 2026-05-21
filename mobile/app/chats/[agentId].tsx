@@ -1,5 +1,5 @@
 import { router, Stack, useLocalSearchParams } from "expo-router";
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -24,10 +24,13 @@ export default function ChatsScreen() {
   const chats = useChats(agentId ?? null);
   const createChat = useCreateChat();
 
-  if (chats.error instanceof ApiError && chats.error.status === 401) {
-    router.replace("/setup");
-    return null;
-  }
+  // 401 → setup. Effect-driven so the redirect doesn't short-circuit
+  // hooks below (Rules of Hooks).
+  const unauthorized =
+    chats.error instanceof ApiError && chats.error.status === 401;
+  useEffect(() => {
+    if (unauthorized) router.replace("/setup");
+  }, [unauthorized]);
 
   const agent = useMemo(
     () => (agents.data?.agents ?? []).find((a) => a.id === agentId),
@@ -48,6 +51,8 @@ export default function ChatsScreen() {
       }
     });
   };
+
+  if (unauthorized) return null;
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: theme.bg }]} edges={["bottom"]}>

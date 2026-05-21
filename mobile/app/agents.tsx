@@ -1,5 +1,5 @@
 import { Link, router, Stack } from "expo-router";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -24,11 +24,13 @@ export default function AgentsScreen() {
 
   // Auth-gate fallback. If the cached token has been rotated out from
   // under us, the agents query 401s — kick the user back to setup
-  // rather than spinning forever.
-  if (agents.error instanceof ApiError && agents.error.status === 401) {
-    router.replace("/setup");
-    return null;
-  }
+  // rather than spinning forever. Redirect from an effect so all later
+  // hooks still run on the 401 render (Rules of Hooks).
+  const unauthorized =
+    agents.error instanceof ApiError && agents.error.status === 401;
+  useEffect(() => {
+    if (unauthorized) router.replace("/setup");
+  }, [unauthorized]);
 
   const data = agents.data;
   const list = useMemo<AgentRecord[]>(() => data?.agents ?? [], [data]);
@@ -59,6 +61,8 @@ export default function AgentsScreen() {
     },
     [activeAgentId, useAgent]
   );
+
+  if (unauthorized) return null;
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: theme.bg }]} edges={["bottom"]}>

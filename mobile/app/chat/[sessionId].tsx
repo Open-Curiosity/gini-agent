@@ -53,10 +53,13 @@ export default function ChatDetailScreen() {
     syncedTaskIdsRef.current = new Set();
   }, [sessionId]);
 
-  if (session.error instanceof ApiError && session.error.status === 401) {
-    router.replace("/setup");
-    return null;
-  }
+  // 401 → setup. Effect-driven so all later hooks still run on the
+  // unauthorized render (Rules of Hooks).
+  const unauthorized =
+    session.error instanceof ApiError && session.error.status === 401;
+  useEffect(() => {
+    if (unauthorized) router.replace("/setup");
+  }, [unauthorized]);
 
   const messages = session.data?.messages;
   const tasks = session.data?.tasks;
@@ -136,6 +139,8 @@ export default function ChatDetailScreen() {
 
   const showSendBusy = Boolean(inflightTaskId) || send.isPending;
   const headerTitle = session.data?.title?.trim() || "New chat";
+
+  if (unauthorized) return null;
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: theme.bg }]} edges={["bottom"]}>
