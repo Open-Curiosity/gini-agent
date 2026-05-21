@@ -88,13 +88,28 @@ export function useChatSession(id: string | null) {
   });
 }
 
-export function useCreateChat() {
+// POST /api/chat always creates the chat under the runtime's currently
+// active agent — there's no body field to pin it to a specific agent.
+// Without re-asserting our route's agentId first, another client (web
+// session, CLI) switching agents would silently misroute the new chat.
+export function useCreateChat(agentId: string | null) {
   const qc = useQueryClient();
   return useMutation<ChatSession, Error, void>({
-    mutationFn: () =>
-      api<ChatSession>("/chat", { method: "POST", body: JSON.stringify({ title: "" }) }),
+    mutationFn: async () => {
+      if (agentId) {
+        await api(`/agents/${agentId}/use`, { method: "POST" });
+      }
+      return api<ChatSession>("/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "" })
+      });
+    },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["chats"] });
+      // Invalidate this agent's list explicitly so the new chat shows
+      // up immediately, plus the broader keys other clients depend on.
+      qc.invalidateQueries({ queryKey: ["chats", agentId] });
+      qc.invalidateQueries({ queryKey: ["agents"] });
+      qc.invalidateQueries({ queryKey: ["status"] });
     }
   });
 }

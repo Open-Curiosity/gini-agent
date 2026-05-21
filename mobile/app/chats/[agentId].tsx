@@ -22,7 +22,7 @@ export default function ChatsScreen() {
   const { agentId } = useLocalSearchParams<{ agentId: string }>();
   const agents = useAgents();
   const chats = useChats(agentId ?? null);
-  const createChat = useCreateChat();
+  const createChat = useCreateChat(agentId ?? null);
 
   // 401 → setup. Effect-driven so the redirect doesn't short-circuit
   // hooks below (Rules of Hooks).
