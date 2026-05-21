@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 import type { ApprovalMode, RuntimeConfig } from "./types";
 import { cancelTask, decideApproval, resolveApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
-import { readState, readTrace } from "./state";
+import { addAudit, mutateState, readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -24,6 +24,7 @@ import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableM
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
+import { approveSoul, approveUserProfile, soulPath, userProfilePath } from "./runtime/identity-files";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
@@ -356,6 +357,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["DELETE", /^\/api\/memory\/([^/]+)$/, async (_request, params) => json(await archiveMemory(config, params[0]))],
     ["POST", /^\/api\/memory\/([^/]+)\/approve$/, async (_request, params) => json(await updateMemory(config, params[0], "active"))],
     ["POST", /^\/api\/memory\/([^/]+)\/reject$/, async (_request, params) => json(await updateMemory(config, params[0], "rejected"))],
+    // Identity-file approval surface. The chat-task `edit_soul` /
+    // `edit_user_profile` tools land their proposals on
+    // <file>.proposed and the runtime continues to read the approved
+    // <file> until one of these endpoints renames the proposal over
+    // the approved target. See ADR runtime-identity-files.md.
+    ["POST", /^\/api\/identity-files\/soul\/approve$/, async () => json(approveSoulProposal(config))],
+    ["POST", /^\/api\/identity-files\/user\/approve$/, async () => json(approveUserProfileProposal(config))],
     ["GET", /^\/api\/skills$/, (request) => {
       const query = new URL(request.url).searchParams.get("q");
       return json(query ? searchSkills(config, query) : listSkills(config));
@@ -617,6 +625,54 @@ function parseChatIdStrict(raw: unknown): number {
 async function body(request: Request): Promise<Record<string, unknown>> {
   if (!request.body) return {};
   return (await request.json()) as Record<string, unknown>;
+}
+
+// Promote SOUL.md.proposed → SOUL.md for the active agent and write an
+// `identity.soul.approved` audit row. Returns `{ ok: true, path }` on
+// success or `{ ok: false, reason }` when no proposal exists / no
+// active agent. The API surface mirrors the propose tool — the rename
+// itself is atomic. See ADR runtime-identity-files.md.
+async function approveSoulProposal(config: RuntimeConfig): Promise<{ ok: boolean; reason?: string; path?: string }> {
+  const state = readState(config.instance);
+  const agentId = state.activeAgentId;
+  if (!agentId) return { ok: false, reason: "no active agent" };
+  const promoted = approveSoul(config.instance, agentId);
+  if (!promoted) return { ok: false, reason: "no proposal to approve" };
+  const path = soulPath(config.instance, agentId);
+  await mutateState(config.instance, (s) => {
+    addAudit(
+      s,
+      {
+        actor: "user",
+        action: "identity.soul.approved",
+        target: path,
+        risk: "low",
+        evidence: { agentId, path }
+      },
+      { agentId }
+    );
+  });
+  return { ok: true, path };
+}
+
+async function approveUserProfileProposal(config: RuntimeConfig): Promise<{ ok: boolean; reason?: string; path?: string }> {
+  const promoted = approveUserProfile(config.instance);
+  if (!promoted) return { ok: false, reason: "no proposal to approve" };
+  const path = userProfilePath(config.instance);
+  await mutateState(config.instance, (s) => {
+    addAudit(
+      s,
+      {
+        actor: "user",
+        action: "identity.user_profile.approved",
+        target: path,
+        risk: "low",
+        evidence: { path }
+      },
+      { system: true }
+    );
+  });
+  return { ok: true, path };
 }
 
 async function authorized(request: Request, config: RuntimeConfig): Promise<boolean> {

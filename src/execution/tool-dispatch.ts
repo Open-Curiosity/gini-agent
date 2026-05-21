@@ -30,6 +30,12 @@ import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
 import { createMemoryFromInput, editMemory, recall } from "../memory";
+import {
+  loadSoul,
+  loadUserProfile,
+  writeSoul,
+  writeUserProfile
+} from "../runtime/identity-files";
 import { resolveEffectiveContext } from "./effective-context";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
@@ -107,6 +113,10 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await addMemoryTool(config, taskId, args) };
     case "update_memory":
       return { kind: "sync", result: await updateMemoryTool(config, taskId, args) };
+    case "edit_soul":
+      return { kind: "sync", result: await editSoulTool(config, taskId, args) };
+    case "edit_user_profile":
+      return { kind: "sync", result: await editUserProfileTool(config, taskId, args) };
     case "search_history":
       return { kind: "sync", result: await searchHistoryTool(config, taskId, args) };
     case "send_message":
@@ -1532,6 +1542,126 @@ async function updateMemoryTool(
     data: { memoryId, appliedFields: Object.keys(input) }
   });
   return `Updated memory ${memory.id}: ${Object.keys(input).join(", ")}.`;
+}
+
+// Propose an edit to the active agent's SOUL.md. The body always lands
+// as SOUL.md.proposed; the user approves via the identity-files
+// approval API before the new content rides the next system prompt.
+// See ADR runtime-identity-files.md.
+async function editSoulTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const content = requireString(args, "content");
+  const action = optionalString(args, "action", "set");
+  if (action !== "set" && action !== "append") {
+    throw new Error("Invalid input: action must be 'set' or 'append'.");
+  }
+  const state = readState(config.instance);
+  const effective = resolveEffectiveContext(state, config);
+  const agentId = effective.agentId;
+  if (!agentId) {
+    throw new Error("Cannot edit SOUL.md: no active agent.");
+  }
+  // For 'append', the new proposal carries the existing approved body
+  // followed by a blank line and the new content. The approved file
+  // stays the source of truth — proposals are not chained on top of
+  // earlier unapproved proposals.
+  let body = content;
+  if (action === "append") {
+    const existing = loadSoul(config.instance, agentId);
+    if (existing && existing.trim().length > 0 && !existing.startsWith("[BLOCKED:")) {
+      body = `${existing.trim()}\n\n${content.trim()}`;
+    }
+  }
+  const result = writeSoul(config.instance, agentId, body, "proposed");
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "identity.soul.proposed",
+        target: result.path,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: {
+          agentId,
+          action,
+          path: result.path,
+          contentBytes: body.length,
+          scanFindings: result.scanFindings
+        }
+      },
+      { taskId: item.id }
+    );
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "model",
+    message: "Proposed SOUL.md edit",
+    data: { agentId, action, path: result.path, contentBytes: body.length, scanFindings: result.scanFindings }
+  });
+  const scanNote = result.scanFindings.length > 0
+    ? ` (scan flagged: ${result.scanFindings.join(", ")}; content blocked from prompt until approved)`
+    : "";
+  return `Proposed SOUL.md edit at ${result.path}${scanNote}. Awaiting user approval via POST /api/identity-files/soul/approve.`;
+}
+
+// Propose an edit to the instance-scoped USER.md. Same propose →
+// approve flow as edit_soul. Instance-scoped so user identity carries
+// across agent switches.
+async function editUserProfileTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const content = requireString(args, "content");
+  const action = optionalString(args, "action", "set");
+  if (action !== "set" && action !== "append") {
+    throw new Error("Invalid input: action must be 'set' or 'append'.");
+  }
+  let body = content;
+  if (action === "append") {
+    const existing = loadUserProfile(config.instance);
+    if (existing && existing.trim().length > 0 && !existing.startsWith("[BLOCKED:")) {
+      body = `${existing.trim()}\n\n${content.trim()}`;
+    }
+  }
+  const result = writeUserProfile(config.instance, body, "proposed");
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "identity.user_profile.proposed",
+        target: result.path,
+        risk: "low",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: {
+          action,
+          path: result.path,
+          contentBytes: body.length,
+          scanFindings: result.scanFindings
+        }
+      },
+      { taskId: item.id }
+    );
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "model",
+    message: "Proposed USER.md edit",
+    data: { action, path: result.path, contentBytes: body.length, scanFindings: result.scanFindings }
+  });
+  const scanNote = result.scanFindings.length > 0
+    ? ` (scan flagged: ${result.scanFindings.join(", ")}; content blocked from prompt until approved)`
+    : "";
+  return `Proposed USER.md edit at ${result.path}${scanNote}. Awaiting user approval via POST /api/identity-files/user/approve.`;
 }
 
 // Cross-session lookup wrapping `searchSessions`. Returns up to `limit`

@@ -820,6 +820,59 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
         required: ["jobId"]
       }
     }
+  },
+  {
+    // Propose an edit to the active agent's SOUL.md (per-agent persona).
+    // The tool writes the new body to SOUL.md.proposed; the runtime
+    // continues to read the approved SOUL.md (if any) until the user
+    // approves the proposal via `POST /api/identity-files/soul/approve`.
+    // Always exposed alongside add_memory — the "identity" toolset is
+    // not part of the legacy default set; gating on enable would silently
+    // hide the per-agent persona surface on fresh instances.
+    // See ADR runtime-identity-files.md.
+    toolset: "identity",
+    type: "function",
+    function: {
+      name: "edit_soul",
+      description: "Propose an edit to the active agent's SOUL.md (per-agent persona). The proposed body lands as SOUL.md.proposed and does NOT enter the system prompt until the user approves it via `POST /api/identity-files/soul/approve`. Use sparingly — SOUL.md is the agent's voice and values; pin only stable persona facts that should outlast a single conversation. `action: \"set\"` replaces the whole file. `action: \"append\"` adds a new section (separated by a blank line) below the existing content (or the existing approved SOUL.md if no proposal exists yet). Requires an active agent — there is no per-instance SOUL.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["set", "append"],
+            description: "Whether to replace the whole SOUL.md body or append a new section below the existing approved content.",
+            default: "set"
+          },
+          content: { type: "string", description: "The new SOUL.md body (action=set) or the section to append (action=append). Keep it concise — every turn pays for this in tokens." }
+        },
+        required: ["content"]
+      }
+    }
+  },
+  {
+    // Propose an edit to the instance-scoped USER.md. Same propose →
+    // approve flow as edit_soul. USER.md is instance-scoped so the
+    // user's identity carries across agent switches. Always exposed.
+    toolset: "identity",
+    type: "function",
+    function: {
+      name: "edit_user_profile",
+      description: "Propose an edit to the instance-scoped USER.md (user profile). The proposed body lands as USER.md.proposed and does NOT enter the system prompt until the user approves it via `POST /api/identity-files/user/approve`. Use when the user shares a stable identity fact you should remember about THEM (preferences, role, recurring goals). Distinct from add_memory: USER.md is a single curated profile block that rides the system prompt every turn; add_memory pins short discrete facts. `action: \"set\"` replaces the whole file; `action: \"append\"` adds a new section.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["set", "append"],
+            description: "Whether to replace the whole USER.md body or append a new section below the existing approved content.",
+            default: "set"
+          },
+          content: { type: "string", description: "The new USER.md body (action=set) or the section to append (action=append)." }
+        },
+        required: ["content"]
+      }
+    }
   }
 ];
 
@@ -907,6 +960,14 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (tool.function.name === "install_skill") return true;
     if (tool.function.name === "enable_skill") return true;
     if (tool.function.name === "disable_skill") return true;
+    // Identity-file edit tools. The "identity" toolset is not part of
+    // the legacy default set; gating on enable would silently hide the
+    // per-agent SOUL.md / instance USER.md edit surface on fresh
+    // instances. The proposed-vs-approved file split (see ADR
+    // runtime-identity-files.md) keeps unreviewed content out of the
+    // prompt regardless of toolset state, so always-on here is safe.
+    if (tool.function.name === "edit_soul") return true;
+    if (tool.function.name === "edit_user_profile") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;

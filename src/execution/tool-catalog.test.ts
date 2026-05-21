@@ -61,7 +61,12 @@ const ALWAYS_ON = new Set([
   "cancel_task",
   "install_skill",
   "enable_skill",
-  "disable_skill"
+  "disable_skill",
+  // Identity-file edit tools live under the "identity" toolset which is
+  // not in defaults; always-on so a fresh instance can propose SOUL.md /
+  // USER.md edits. The propose-vs-approve file split is the gate.
+  "edit_soul",
+  "edit_user_profile"
 ]);
 
 describe("buildToolCatalog", () => {
