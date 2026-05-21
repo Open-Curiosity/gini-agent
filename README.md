@@ -23,7 +23,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 
 ## Architecture In One Sentence
 
-Gini's **runtime is the gateway**: a single Bun process per instance owns state and performs work. The Next.js web app, CLI, future mobile app, MCP surfaces, and messaging bridges are clients of the same authenticated `/api/*` contract.
+Gini's **runtime is the gateway**: a single Bun process per instance owns state and performs work. The Next.js web app, CLI, future mobile app, MCP surfaces, and messaging bridges are clients of the same authenticated `/api/*` contract. The one documented exception is `gini import apply openclaw`, which requires the gateway stopped and mutates state in-process; see [Architecture Overview](docs/architecture-overview.md) and [Openclaw Migration](docs/adr/openclaw-migration.md).
 
 ```text
                  GATEWAY (Bun runtime, one per instance)
