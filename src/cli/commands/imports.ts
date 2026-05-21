@@ -93,7 +93,8 @@ export async function importInspect(ctx: CliContext): Promise<void> {
       applied: result.applied,
       counts: {
         agents: result.agentsCreated,
-        bridges: result.bridgesCreated,
+        bridgesCreated: result.bridgesCreated,
+        bridgesRotated: result.bridgesRotated,
         skills: result.skillsCopied,
         secrets: result.secretsWritten,
         workspaceFiles: result.workspaceFilesCopied,

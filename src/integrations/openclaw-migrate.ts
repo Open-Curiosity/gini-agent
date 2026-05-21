@@ -236,7 +236,13 @@ export interface MigrationResult {
   applied: boolean;
   report: ImportReport;
   agentsCreated: number;
+  // Net-new MessagingBridgeRecord rows minted this apply.
   bridgesCreated: number;
+  // Bridges whose secret + metadata were updated in place via --force
+  // (the `decision.kind === "existing"` branch). Operators need this
+  // distinct from `bridgesCreated` so a re-run with --force isn't
+  // misreported as a brand-new bridge creation.
+  bridgesRotated: number;
   skillsCopied: number;
   secretsWritten: number;
   workspaceFilesCopied: number;
@@ -1589,6 +1595,7 @@ export async function applyMigration(
   const warnings: string[] = [];
   let agentsCreated = 0;
   let bridgesCreated = 0;
+  let bridgesRotated = 0;
   let skillsCopied = 0;
   let secretsWritten = 0;
   let workspaceFilesCopied = 0;
@@ -1620,6 +1627,7 @@ export async function applyMigration(
       report: failedReport,
       agentsCreated,
       bridgesCreated,
+      bridgesRotated,
       skillsCopied,
       secretsWritten,
       workspaceFilesCopied,
@@ -2006,7 +2014,11 @@ export async function applyMigration(
         { system: true }
       );
     });
-    bridgesCreated += 1;
+    if (decision.kind === "existing") {
+      bridgesRotated += 1;
+    } else {
+      bridgesCreated += 1;
+    }
   }
 
   // 6) Sessions. Each openclaw session JSONL becomes one ChatSessionRecord
@@ -2195,6 +2207,7 @@ export async function applyMigration(
   const counts: Record<string, number> = {
     agentsCreated,
     bridgesCreated,
+    bridgesRotated,
     skillsCopied,
     secretsWritten,
     workspaceFilesCopied,
@@ -2226,6 +2239,7 @@ export async function applyMigration(
     report,
     agentsCreated,
     bridgesCreated,
+    bridgesRotated,
     skillsCopied,
     secretsWritten,
     workspaceFilesCopied,

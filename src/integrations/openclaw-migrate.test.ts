@@ -1609,7 +1609,12 @@ describe("applyMigration", () => {
     const second = await applyMigration(config, discovery, planMigration(discovery), {
       force: true
     });
-    expect(second.bridgesCreated).toBe(1);
+    // The second apply rotates the existing bridge — bridgesCreated
+    // stays at 0, bridgesRotated bumps to 1 — so an operator reading
+    // the counts can tell a rotation apart from a fresh creation
+    // (matters because rotation touches the encrypted bot-token store).
+    expect(second.bridgesCreated).toBe(0);
+    expect(second.bridgesRotated).toBe(1);
 
     const state = readState("rotate");
     const bridge = state.messagingBridges.find((entry) => entry.kind === "telegram")!;
