@@ -52,7 +52,7 @@ The migrator walks the openclaw state and synthesizes equivalent gini records fo
 | `<state>/skills/<name>/SKILL.md` | `<instance>/skills/<name>/SKILL.md` | Top-level `openclaw:` frontmatter block is rewritten to `metadata:\n  gini:`. Sibling files in the skill dir (scripts, references) are copied verbatim. |
 | `<state>/workspace/{AGENTS,SOUL,TOOLS,IDENTITY,USER,HEARTBEAT,BOOTSTRAP,MEMORY}.md` | `<instance>/workspace/<file>` | Same-named files are skipped unless `--force` is passed. The migrator looks for the workspace dir at `<state>/workspace/` first, then `<openclaw-home>/.openclaw/workspace/` as a fallback. |
 | `<state>/agents/<id>/sessions/*.jsonl` | One `ChatSessionRecord` per JSONL plus one `ChatMessageRecord` per `type: "message"` line | Tool_use and tool_result blocks are dropped from migrated message content (`ChatMessageRecord.content` is a flat string). The full verbatim transcript stays in the archive zip. Session createdAt/updatedAt are rebased to the openclaw timestamps so recent-chats sort reflects the original transcript date, not migration day. |
-| `<state>/memory/<id>.sqlite` (Hindsight schema: `memory_banks` + `memory_units`) | One `memory_units` row per source row in `<instance>/memory.db` | Migrated with embedding NULL; run `gini embedding reembed` after migration to populate vectors with your configured embedding provider. Unknown statuses/networks are coerced to `active`/`experience` so a schema drift can't poison recall. The legacy file-chunk RAG schema (`chunks` + `files` + `embedding_cache`) has no direct gini target and lands on the `unsupported` list with a `Re-index via /api/memory/retain` hint. |
+| `<state>/memory/<id>.sqlite` (Hindsight schema: `memory_banks` + `memory_units`) | One `memory_units` row per source row in `<instance>/memory.db`, routed into the per-agent bank (`bank_<agentId>`) of the gini agent whose name matches the source SQLite filename | Migrated with embedding NULL; run `gini embedding reembed --all-banks` after migration to populate vectors across every per-agent bank (the default `gini embedding reembed` only walks the default bank). Unknown statuses/networks are coerced to `active`/`experience` so a schema drift can't poison recall. The legacy file-chunk RAG schema (`chunks` + `files` + `embedding_cache`) has no direct gini target and lands on the `unsupported` list with a `Re-index via /api/memory/retain` hint. |
 
 Provider keys land in `~/.gini/secrets.env` because the installed `gini` wrapper sources that file with `set -a` on every invocation. Connector tokens go through the per-instance encrypted secret store described in [Connector Secret Storage](adr/connector-secret-storage.md) — they are never logged or echoed.
 
@@ -104,9 +104,12 @@ After the smoke passes, populate the migrated memory unit embeddings with the ac
 
 ```bash
 # Re-embed every migrated memory unit so semantic recall returns them.
-# The migrator stores units with embedding NULL; this pass fills them in
-# using the configured embedding provider.
-bun run gini embedding reembed
+# The migrator stores units with embedding NULL and routes them into
+# the matching per-agent bank (`bank_<agentId>`); --all-banks
+# enumerates every bank in the instance so per-agent units aren't
+# missed. Plain `gini embedding reembed` only walks the default bank
+# and would leave per-agent units invisible to semantic recall.
+bun run gini embedding reembed --all-banks
 
 bun run gini start
 ```
@@ -138,4 +141,4 @@ The migrator creates the agent record but skips the API key (Anthropic isn't in 
 Yes. Each `<state>/agents/<id>/sessions/<sessionId>.jsonl` becomes one `ChatSessionRecord` plus one `ChatMessageRecord` per `type: "message"` line under the matching gini agent. Tool_use and tool_result blocks are dropped from the migrated message text (`ChatMessageRecord.content` is a single string), but the full verbatim transcript stays in `<instance>/imports/openclaw-<timestamp>.zip` for anyone who needs the original tool-call detail. Session timestamps are rebased to the openclaw values so recent-chats sort matches what you remember from openclaw.
 
 **Will my Hindsight memory come over?**
-If your `<state>/memory/<id>.sqlite` carries the Hindsight schema (`memory_banks` + `memory_units`), yes — each unit lands in `<instance>/memory.db` verbatim with embedding NULL. Run `gini embedding reembed` after migration to populate the vectors so semantic recall returns them. If your memory store instead carries the legacy file-chunk RAG schema (`chunks` + `files` + `embedding_cache`), it lands on the `unsupported` list — there's no clean target for that shape in gini today; re-index the underlying files via `/api/memory/retain` if you still need them.
+If your `<state>/memory/<id>.sqlite` carries the Hindsight schema (`memory_banks` + `memory_units`), yes — each unit lands in `<instance>/memory.db` and is routed into the per-agent bank (`bank_<agentId>`) of the gini agent whose name matches the source SQLite filename. Run `gini embedding reembed --all-banks` after migration to populate vectors across every per-agent bank — the plain `gini embedding reembed` only walks `bank_default` and would leave the per-agent units invisible to semantic recall. If your memory store instead carries the legacy file-chunk RAG schema (`chunks` + `files` + `embedding_cache`), it lands on the `unsupported` list — there's no clean target for that shape in gini today; re-index the underlying files via `/api/memory/retain` if you still need them.

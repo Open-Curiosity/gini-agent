@@ -9,7 +9,7 @@ import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
 import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./memory";
-import { embeddingStatus, reembedBank } from "./memory/embedding";
+import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embedding";
 import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
@@ -309,6 +309,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/embedding\/status$/, () => json(embeddingStatus(config))],
     ["POST", /^\/api\/embedding\/reembed$/, async (request) => {
       const payload = await body(request);
+      // `allBanks: true` enumerates every bank known to the instance
+      // and reembeds each — the canonical workflow after `gini import
+      // apply openclaw`, which routes Hindsight units into per-agent
+      // banks (`bank_<agentId>`) that the default single-bank reembed
+      // path would otherwise miss. `bankId` is ignored when allBanks
+      // is set since they conflict semantically.
+      if (payload.allBanks === true) {
+        return json(await reembedAllBanks(config, { dryRun: payload.dryRun === true }));
+      }
       const result = await reembedBank(config, {
         bankId: typeof payload.bankId === "string" ? payload.bankId : undefined,
         dryRun: payload.dryRun === true
