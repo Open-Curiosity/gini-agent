@@ -67,7 +67,19 @@ export function getChatSession(config: RuntimeConfig, id: string) {
     if (syncedAssistantTaskIds.has(task.id)) continue;
     let content: string | undefined;
     if (task.status === "waiting_approval") {
-      content = task.currentStep || "Waiting for approval...";
+      // Look for a pending connector.request approval linked to this task.
+      // When found, surface the approval's `reason` field as the placeholder
+      // chat message — the model puts the URL instructions there and the user
+      // sees them rendered as markdown in the chat bubble (URLs auto-link via
+      // MarkdownContent). For other approval types, keep the generic placeholder.
+      const connectorRequest = state.approvals.find(
+        (a) => a.taskId === task.id && a.status === "pending" && a.action === "connector.request"
+      );
+      if (connectorRequest && typeof connectorRequest.reason === "string" && connectorRequest.reason.trim().length > 0) {
+        content = connectorRequest.reason;
+      } else {
+        content = task.currentStep || "Waiting for approval...";
+      }
     } else if (task.partialSummary) {
       content = task.partialSummary;
     }

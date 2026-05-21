@@ -231,9 +231,14 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
             </div>
             {isConnectorRequest ? (
               <>
-                <p className="mt-1 whitespace-pre-wrap text-xs text-foreground/90">
-                  {renderReason(reasonText)}
-                </p>
+                {/*
+                  No reason body here: for connector.request approvals the
+                  multi-line reason (with URLs) is surfaced as the chat
+                  bubble above this card via the synthetic placeholder in
+                  getChatSession. Rendering it again inside the form would
+                  duplicate the instructions; the form keeps only the title
+                  and the input fields.
+                */}
                 <div className="mt-3 space-y-3">
                   {fields.map((field) => (
                     <div key={field.name} className="space-y-1">
