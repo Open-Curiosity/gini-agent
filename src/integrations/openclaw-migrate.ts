@@ -1922,8 +1922,9 @@ export async function applyMigration(
   // for the lifetime of the migration so a second concurrent process
   // fails fast with a clear message instead of clobbering the first.
   const importLock = acquireImportLock(config.instance);
-  try {
-
+  // Hoisted above the try/catch so the failure-report path in the
+  // catch can read the partial counters; let-declarations inside the
+  // try block would be block-scoped and unreachable from catch.
   const warnings: string[] = [];
   let agentsCreated = 0;
   let bridgesCreated = 0;
@@ -1935,6 +1936,7 @@ export async function applyMigration(
   let sessionMessagesCreated = 0;
   let memoryUnitsCreated = 0;
   let archivePath: string | undefined;
+  try {
 
   // Short-circuit when there's no openclaw config to read. Otherwise
   // apply would write an "applied" ImportReport with all-zero counts
@@ -2662,6 +2664,52 @@ export async function applyMigration(
     unsupported: plan.unsupported,
     warnings
   };
+  } catch (err) {
+    // Durable failure-report write. Without this, a mid-apply throw
+    // (e.g., archive succeeds but a later agent/bridge/memory step
+    // fails) leaves `gini import` with no record of the attempt —
+    // contradicting the docs/migration-from-openclaw.md promise that
+    // every apply lands on the activity feed. The counts here are
+    // the partial counters as of the failure so the operator can see
+    // how far the migration got. We swallow secondary failures from
+    // the report write itself (e.g., if the gateway came up mid-
+    // migration both this write and the original throw would error)
+    // so the original cause is what the operator sees.
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    try {
+      await guardedMutate((state: RuntimeState) =>
+        createImportReport(state, {
+          source: "openclaw",
+          path: source.stateRoot,
+          mode: "applied",
+          status: "failed",
+          counts: {
+            agentsCreated,
+            bridgesCreated,
+            bridgesRotated,
+            skillsCopied,
+            secretsWritten,
+            workspaceFilesCopied,
+            sessionsCreated,
+            sessionMessagesCreated,
+            memoryUnitsCreated,
+            unsupported: plan.unsupported.length,
+            warnings: warnings.length
+          },
+          findings: [
+            ...(archivePath ? [`Archived openclaw state to ${archivePath}`] : []),
+            ...plan.unsupported.map((entry) => `Unsupported: ${entry.kind} — ${entry.detail}`),
+            ...warnings.map((warning) => `Warning: ${warning}`)
+          ],
+          error: errorMessage
+        })
+      );
+    } catch {
+      // Intentionally empty — preserve the original failure cause
+      // rather than overwriting it with a secondary report-write
+      // error. The lockfile still gets released in finally.
+    }
+    throw err;
   } finally {
     importLock.release();
   }

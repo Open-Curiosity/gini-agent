@@ -2684,6 +2684,35 @@ describe("applyMigration archive", () => {
     const state = readState("archive-fail");
     expect(state.agents.some((agent) => agent.name === "main")).toBe(false);
   });
+
+  test("records a failed ImportReport when a mid-apply step throws", async () => {
+    // Without this catch path, a throw inside the apply body leaves
+    // `gini import` with no record of the attempt, contradicting the
+    // operator-facing audit-trail promise in migration-from-openclaw.md.
+    // We use the blocked-imports-as-file trick to force the archive
+    // step (which sits inside the new try/catch envelope) to throw,
+    // then assert a failed-status report row landed before the throw
+    // re-propagated to the caller.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const config = loadConfig("apply-failure-report");
+    const blockedImportsParent = join(GINI_STATE, "instances", "apply-failure-report");
+    mkdirSync(blockedImportsParent, { recursive: true });
+    writeFileSync(join(blockedImportsParent, "imports"), "blocking-file");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    await expect(
+      applyMigration(config, discovery, planMigration(discovery))
+    ).rejects.toThrow();
+    const state = readState("apply-failure-report");
+    const failedReport = state.importReports.find(
+      (report) =>
+        report.source === "openclaw" &&
+        report.mode === "applied" &&
+        report.status === "failed"
+    );
+    expect(failedReport).toBeDefined();
+    expect(failedReport?.error).toBeTruthy();
+    expect(failedReport?.error?.length ?? 0).toBeGreaterThan(0);
+  });
 });
 
 describe("applyMigration sessions", () => {
