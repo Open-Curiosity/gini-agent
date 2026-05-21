@@ -43,7 +43,16 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     ...(init.headers ?? {})
   };
 
-  const url = `${creds.baseUrl}/api${path}`;
+  // Defensively re-derive the origin so a malformed value in storage
+  // (e.g. one written by an older build that didn't normalize) can't
+  // leak query strings into the request URL.
+  let origin: string;
+  try {
+    origin = new URL(creds.baseUrl).origin;
+  } catch {
+    throw new ApiError(0, "Stored base URL is invalid.");
+  }
+  const url = `${origin}/api${path}`;
   const response = await fetch(url, { ...rest, headers });
 
   // 204 No Content (or any empty body) — return null cast as T so callers

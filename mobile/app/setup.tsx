@@ -14,7 +14,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError } from "@/src/api";
-import { saveCredentials } from "@/src/auth";
+import { normalizeBaseUrl, saveCredentials } from "@/src/auth";
 import type { RuntimeStatus } from "@/src/types";
 
 const DEFAULT_BASE_URL = "http://localhost:7421";
@@ -28,10 +28,12 @@ export default function SetupScreen() {
   const [error, setError] = useState<string | null>(null);
 
   const onSubmit = async () => {
-    const trimmedUrl = baseUrl.trim().replace(/\/+$/, "");
     const trimmedToken = token.trim();
-    if (!trimmedUrl) {
-      setError("Base URL is required.");
+    let normalizedUrl: string;
+    try {
+      normalizedUrl = normalizeBaseUrl(baseUrl);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Invalid base URL.");
       return;
     }
     if (!trimmedToken) {
@@ -45,9 +47,9 @@ export default function SetupScreen() {
       // strand the user on a "broken" agents screen with no easy way
       // back without nuking storage.
       await api<RuntimeStatus>("/status", {
-        auth: { baseUrl: trimmedUrl, token: trimmedToken }
+        auth: { baseUrl: normalizedUrl, token: trimmedToken }
       });
-      await saveCredentials({ baseUrl: trimmedUrl, token: trimmedToken });
+      await saveCredentials({ baseUrl: normalizedUrl, token: trimmedToken });
       router.replace("/agents");
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {

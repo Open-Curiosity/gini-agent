@@ -48,11 +48,32 @@ function broadcast(next: AuthCredentials | null) {
   for (const listener of listeners) listener(next);
 }
 
+// Reduce a user-supplied base URL to scheme + host + port. The gateway
+// accepts `?token=...` as an auth fallback, so a pasted URL like
+// `http://host:7421?token=leaked` would otherwise be concatenated into
+// every request and silently authenticate that way. Reject anything
+// that doesn't parse so a malformed value can't be saved.
+export function normalizeBaseUrl(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) throw new Error("Base URL is required.");
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error("Invalid base URL.");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Base URL must use http or https.");
+  }
+  return parsed.origin;
+}
+
 export async function saveCredentials(creds: AuthCredentials): Promise<void> {
-  // Normalize the URL once at save time so call sites don't have to
-  // double-strip trailing slashes.
+  // Funnel all writes through normalizeBaseUrl so query strings, paths,
+  // and trailing slashes can't sneak in via either the setup screen or
+  // a future re-save path.
   const normalized: AuthCredentials = {
-    baseUrl: creds.baseUrl.replace(/\/+$/, ""),
+    baseUrl: normalizeBaseUrl(creds.baseUrl),
     token: creds.token.trim()
   };
   await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
