@@ -4,10 +4,11 @@ import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { RiskPill } from "@/components/StatusPill";
-import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
 import { api } from "@/lib/api";
-import { useApprovals, useInvalidate, useProviders } from "@/lib/queries";
+import { useApprovals, useInvalidate } from "@/lib/queries";
 import type { Approval } from "@runtime/types";
 
 // Inline Approve / Deny actions rendered under the synthetic
@@ -23,19 +24,38 @@ import type { Approval } from "@runtime/types";
 //     bubble compact; opening it shows the full payload so the user can
 //     audit before deciding.
 //   - When `approval.action === "connector.request"` (raised by the
-//     `request_connector` tool) we swap the default Approve/Deny pair
-//     for a "Connect <provider>" button that opens AddConnectorDialog in
-//     `request` mode. Submitting the dialog calls
-//     POST /api/approvals/<id>/connect, which creates the connector,
-//     probes it, and resolves the approval on success — that drives the
-//     existing resume flow without any extra chat plumbing.
+//     `request_connector` tool) we replace the default Approve/Deny pair
+//     with an inline form that renders the provider's declared fields
+//     directly inside the approval card. The Save button POSTs the
+//     field values to /api/approvals/<id>/connect, which creates the
+//     connector, probes it, and resolves the approval on success — the
+//     existing resume flow handles the rest with no extra chat plumbing.
+//     The standalone `AddConnectorDialog` component is still mounted on
+//     /connectors for the regular add flow; this card just bypasses it.
+
+// Shape of a provider field as carried on the approval payload. This
+// mirrors `ProviderField` from src/integrations/connectors/types.ts;
+// we declare it locally so the chat surface can stay decoupled from the
+// runtime module path.
+interface PayloadField {
+  name: string;
+  label: string;
+  description?: string;
+  secret: boolean;
+  required?: boolean;
+  placeholder?: string;
+}
+
 export function ApprovalActions({ taskId }: { taskId: string }) {
   const approvals = useApprovals();
-  const providers = useProviders();
   const invalidate = useInvalidate();
   const [expanded, setExpanded] = useState(false);
-  const [connectFor, setConnectFor] = useState<Approval | null>(null);
   const [connectError, setConnectError] = useState<string | null>(null);
+  // Field values for the inline connector.request form, keyed by approval
+  // id so two pending connector requests (rare but possible) don't trample
+  // each other. The map is sparse: an approval has an entry only after the
+  // user types into one of its fields.
+  const [requestFields, setRequestFields] = useState<Record<string, Record<string, string>>>({});
 
   const pending = (approvals.data ?? []).filter(
     (a) => a.taskId === taskId && a.status === "pending"
@@ -52,30 +72,36 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
     onError: (error: Error) => toast.error(error.message)
   });
 
-  // POSTs the user-entered secrets to the approval connect endpoint. On
-  // probe failure we keep the dialog open with the inline error message
-  // so the user can correct the credential without losing context. On
-  // success the endpoint resolves the approval — invalidating the chat
-  // surface lets the resumed task's running/summary message render.
+  // POSTs the user-entered field values to the approval connect endpoint.
+  // The runtime stores every value as a secret (encrypted at rest) so the
+  // env binding lookup in resolveSkillEnv can find them; the field's
+  // `secret` flag only drives the input type in the UI. On probe failure
+  // we keep the form mounted with the inline error message so the user
+  // can correct the credential without losing context. On success the
+  // endpoint resolves the approval — invalidating the chat surface lets
+  // the resumed task's running/summary message render.
   const connect = useMutation({
-    mutationFn: async ({ approvalId, body }: { approvalId: string; body: CreateConnectorBody }) => {
+    mutationFn: async ({ approvalId, secrets }: { approvalId: string; secrets: Record<string, string> }) => {
       const response = await api<{ ok: boolean; message?: string; connector?: unknown }>(
         `/approvals/${approvalId}/connect`,
         {
           method: "POST",
-          body: JSON.stringify({
-            secrets: body.secrets,
-            scopes: body.scopes,
-            name: body.name
-          })
+          body: JSON.stringify({ secrets })
         }
       );
       return response;
     },
-    onSuccess: (result) => {
+    onSuccess: (result, vars) => {
       if (result.ok) {
-        setConnectFor(null);
         setConnectError(null);
+        // Clear field state for this approval — the card is about to
+        // unmount as the approval moves out of `pending`.
+        setRequestFields((prev) => {
+          if (!(vars.approvalId in prev)) return prev;
+          const next = { ...prev };
+          delete next[vars.approvalId];
+          return next;
+        });
         invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "connectors"]);
       } else {
         setConnectError(result.message ?? "Could not connect. Please verify the credentials and try again.");
@@ -116,6 +142,24 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
           (typeof approval.payload.reason === "string" && approval.payload.reason.length > 0
             ? approval.payload.reason
             : undefined) || approval.target;
+
+        // Provider fields for the inline form. Payloads predate the
+        // typed shape, so we defensively re-validate before rendering.
+        const fields: PayloadField[] = isConnectorRequest && Array.isArray(approval.payload?.fields)
+          ? (approval.payload.fields as unknown[]).filter(
+              (f): f is PayloadField =>
+                typeof f === "object"
+                && f !== null
+                && typeof (f as PayloadField).name === "string"
+                && typeof (f as PayloadField).label === "string"
+                && typeof (f as PayloadField).secret === "boolean"
+            )
+          : [];
+        const values = requestFields[approval.id] ?? {};
+        const requiredMissing = fields.some(
+          (field) => field.required && !(values[field.name] ?? "").trim()
+        );
+
         return (
           <div
             key={approval.id}
@@ -123,17 +167,21 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
           >
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-mono text-xs text-foreground">
-                {isBrowserConnect ? "Open a browser window" : approval.action}
+                {isConnectorRequest
+                  ? `Connect ${providerLabel}`
+                  : isBrowserConnect
+                    ? "Open a browser window"
+                    : approval.action}
               </span>
               {/*
-                Suppress the MEDIUM-RISK badge for `browser.connect`. The
-                action is still gated (the user still gives explicit consent
-                before we spawn a window) but the visual framing is softer
-                because this is a benign sign-in step, not a destructive
-                action. All other approvals keep the badge.
+                Suppress the MEDIUM-RISK badge for `browser.connect` and
+                `connector.request`. Both are gated (the user still chooses
+                whether to connect) but the visual framing is softer because
+                they're benign sign-in / setup steps, not destructive actions.
+                All other approvals keep the badge.
               */}
-              {isBrowserConnect ? null : <RiskPill value={approval.risk} />}
-              {isBrowserConnect ? null : (
+              {isBrowserConnect || isConnectorRequest ? null : <RiskPill value={approval.risk} />}
+              {isBrowserConnect || isConnectorRequest ? null : (
                 <button
                   type="button"
                   className="ml-auto text-[11px] text-muted-foreground underline-offset-2 hover:underline"
@@ -143,7 +191,46 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
                 </button>
               )}
             </div>
-            {isBrowserConnect ? (
+            {isConnectorRequest ? (
+              <>
+                <p className="mt-1 text-xs text-foreground/90">{reasonText}</p>
+                <div className="mt-3 space-y-3">
+                  {fields.map((field) => (
+                    <div key={field.name} className="space-y-1">
+                      <Label htmlFor={`approval-${approval.id}-${field.name}`}>
+                        {field.label}
+                        {field.required ? " *" : ""}
+                      </Label>
+                      <Input
+                        id={`approval-${approval.id}-${field.name}`}
+                        type={field.secret ? "password" : "text"}
+                        value={values[field.name] ?? ""}
+                        placeholder={field.placeholder}
+                        autoComplete="off"
+                        onChange={(event) => {
+                          const next = event.target.value;
+                          setRequestFields((prev) => ({
+                            ...prev,
+                            [approval.id]: {
+                              ...(prev[approval.id] ?? {}),
+                              [field.name]: next
+                            }
+                          }));
+                          // Clear the inline error as soon as the user
+                          // edits a field — a stale error after a retry
+                          // would be confusing.
+                          if (connectError) setConnectError(null);
+                        }}
+                      />
+                      {field.description ? (
+                        <p className="text-[11px] text-muted-foreground">{field.description}</p>
+                      ) : null}
+                    </div>
+                  ))}
+                  {connectError ? <p className="text-xs text-destructive">{connectError}</p> : null}
+                </div>
+              </>
+            ) : isBrowserConnect ? (
               <p className="mt-1 text-xs text-foreground/90">{reasonText}</p>
             ) : (
               <>
@@ -163,18 +250,32 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
                 <>
                   <Button
                     size="sm"
-                    disabled={connect.isPending}
+                    disabled={connect.isPending || requiredMissing}
                     onClick={() => {
+                      // Every field's value is sent as a secret — the
+                      // runtime encrypts them at rest regardless of the
+                      // field's `secret` flag, and resolveSkillEnv only
+                      // reads from secretRefs. Storing the non-secret
+                      // client_id this way is benign (heavier than
+                      // necessary, but auditable) and keeps the env
+                      // binding lookup working without a separate
+                      // metadata path.
+                      const secrets: Record<string, string> = {};
+                      for (const field of fields) {
+                        const raw = (values[field.name] ?? "").trim();
+                        if (!raw) continue;
+                        secrets[field.name] = raw;
+                      }
                       setConnectError(null);
-                      setConnectFor(approval);
+                      connect.mutate({ approvalId: approval.id, secrets });
                     }}
                   >
-                    Connect {providerLabel}
+                    {connect.isPending ? "Saving…" : "Save"}
                   </Button>
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={decide.isPending}
+                    disabled={decide.isPending || connect.isPending}
                     onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
                   >
                     Cancel
@@ -203,24 +304,6 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
           </div>
         );
       })}
-      {connectFor ? (
-        <AddConnectorDialog
-          open={!!connectFor}
-          onOpenChange={(open) => {
-            if (!open) {
-              setConnectFor(null);
-              setConnectError(null);
-            }
-          }}
-          providers={providers.data ?? []}
-          defaultProvider={String(connectFor.payload?.provider ?? "")}
-          lockProvider
-          mode="request"
-          pending={connect.isPending}
-          externalError={connectError}
-          onSubmit={(body) => connect.mutate({ approvalId: connectFor.id, body })}
-        />
-      ) : null}
     </div>
   );
 }
