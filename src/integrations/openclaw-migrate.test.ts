@@ -1677,6 +1677,31 @@ describe("applyMigration", () => {
     rmSync(lockPath, { force: true });
   });
 
+  test("refuses to unlink a lockfile that records no PID (peer mid-acquisition)", async () => {
+    // The acquisition path used to be open-then-write — between the
+    // two syscalls a peer could find the lockfile existing but empty,
+    // read no PID, treat it as stale, and unlink the peer's live
+    // lock. We now refuse-when-uncertain: an existing lockfile with
+    // no recorded PID is treated as held by a peer mid-acquisition,
+    // not as a stale crash artifact. This makes the migrator
+    // conservative (manual cleanup if a process truly crashes in the
+    // micro-window between create and write), but preserves
+    // correctness for the common case.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const config = loadConfig("import-lock-no-pid");
+    const lockPath = join(GINI_STATE, "instances", "import-lock-no-pid", ".import-lock");
+    mkdirSync(join(GINI_STATE, "instances", "import-lock-no-pid"), { recursive: true });
+    // No `pid=` line — simulates the open-but-not-yet-written state.
+    writeFileSync(lockPath, "");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    await expect(
+      applyMigration(config, discovery, planMigration(discovery))
+    ).rejects.toThrow(/no recorded PID/i);
+    // The migrator must NOT have removed the lockfile.
+    expect(existsSync(lockPath)).toBe(true);
+    rmSync(lockPath, { force: true });
+  });
+
   test("cleans up a stale lock left behind by a crashed previous run", async () => {
     // If the previous apply died without releasing the lockfile, the
     // operator shouldn't have to grep filesystems to recover. We

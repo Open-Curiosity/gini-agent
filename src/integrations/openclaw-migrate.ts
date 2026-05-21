@@ -70,20 +70,16 @@
 
 import {
   chmodSync,
-  closeSync,
-  constants as fsConstants,
   copyFileSync,
   cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
-  openSync,
   readdirSync,
   readFileSync,
   statSync,
   unlinkSync,
-  writeFileSync,
-  writeSync
+  writeFileSync
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
@@ -1477,13 +1473,17 @@ function acquireImportLock(instance: string): ImportLockHandle {
   const root = instanceRoot(instance);
   mkdirSync(root, { recursive: true });
   const lockPath = join(root, ".import-lock");
-  let fd: number;
+  // writeFileSync with flag "wx" (O_WRONLY | O_CREAT | O_EXCL) opens
+  // the lockfile atomically AND writes the PID before closing. The
+  // alternative — openSync followed by writeSync — leaves a tiny
+  // userspace window where the lockfile exists empty; a peer hitting
+  // EEXIST in that window would read no PID, treat the lock as stale,
+  // unlink it, and proceed in parallel. Combining open + write keeps
+  // the empty-file window to libc-internal microseconds (instead of
+  // a userspace function call between two separate syscalls).
+  const lockContent = `pid=${process.pid}\nat=${now()}\ncmd=gini import apply openclaw\n`;
   try {
-    fd = openSync(
-      lockPath,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
-      0o600
-    );
+    writeFileSync(lockPath, lockContent, { flag: "wx", mode: 0o600 });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     // Stale-lock detection: read the recorded PID. If that process
@@ -1492,9 +1492,22 @@ function acquireImportLock(instance: string): ImportLockHandle {
     // once: a second EEXIST after the cleanup means a third party
     // raced in, and the right thing is to surface the conflict to
     // the operator rather than spin.
+    //
+    // CRITICAL: when the existing lockfile has NO recorded PID we
+    // refuse to unlink. The two cases that produce a no-PID lock are
+    // (a) a peer process is mid-acquisition (its writeFileSync hasn't
+    // flushed yet) — unlinking would corrupt active serialization;
+    // (b) a peer crashed in the libc-microsecond window between
+    // open and write — vanishingly rare. Conservative refuse-when-
+    // uncertain is the right trade: case (b) requires manual lock
+    // cleanup; case (a) preserves correctness.
     const existingPid = readImportLockPid(lockPath);
-    const alive = existingPid !== null && isProcessAlive(existingPid);
-    if (alive) {
+    if (existingPid === null) {
+      throw new Error(
+        `Import lock at ${lockPath} exists but has no recorded PID — a peer process is mid-acquisition. Retry shortly; if the lock persists with no PID after several seconds, remove it manually after confirming no migration is in progress.`
+      );
+    }
+    if (isProcessAlive(existingPid)) {
       throw new Error(
         `Another gini import is running for instance '${instance}' (PID ${existingPid}, lock at ${lockPath}). Wait for it to finish, or stop that process and retry.`
       );
@@ -1507,34 +1520,16 @@ function acquireImportLock(instance: string): ImportLockHandle {
       // conflict.
     }
     try {
-      fd = openSync(
-        lockPath,
-        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
-        0o600
-      );
+      writeFileSync(lockPath, lockContent, { flag: "wx", mode: 0o600 });
     } catch (retryError) {
       throw new Error(
         `Another gini import raced into the import lock for instance '${instance}' (lock at ${lockPath}). Retry shortly; if the conflict persists, remove the lock file manually after confirming no migration is in progress.`
       );
     }
   }
-  try {
-    writeSync(
-      fd,
-      `pid=${process.pid}\nat=${now()}\ncmd=gini import apply openclaw\n`
-    );
-  } catch {
-    // Lock metadata is informational only — failing to write it
-    // doesn't invalidate the lock itself; ignore the error.
-  }
   return {
     path: lockPath,
     release: () => {
-      try {
-        closeSync(fd);
-      } catch {
-        // close failure is non-fatal — fd will be reaped on process exit.
-      }
       try {
         unlinkSync(lockPath);
       } catch {
