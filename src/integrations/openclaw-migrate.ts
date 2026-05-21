@@ -707,6 +707,38 @@ function unionChatIds(a: number[] | undefined, b: number[] | undefined): number[
   return Array.from(new Set([...(a ?? []), ...(b ?? [])]));
 }
 
+// Enumerate every telegram-allowFrom shape openclaw writes. The
+// pairing-store fan-out (openclaw/src/pairing/pairing-store.ts:91)
+// produces three filenames the migrator must union:
+//   * telegram-allowFrom.json (legacy / pre-doctor-migration)
+//   * telegram-default-allowFrom.json (post-doctor when no named
+//     accounts are configured)
+//   * telegram-<account>-allowFrom.json (per named account)
+// We scan the credentials dir for anything matching `telegram-`
+// prefix + `-allowFrom.json` suffix so a new account name added
+// after this migrator shipped still gets picked up. The base
+// `telegram-allowFrom.json` (no account segment) is enumerated
+// explicitly because the regex requires a hyphen between the
+// kind prefix and the suffix.
+function listTelegramAllowFromFiles(credentialsDir: string): string[] {
+  const out: string[] = [];
+  const legacy = join(credentialsDir, "telegram-allowFrom.json");
+  if (existsSync(legacy)) out.push(legacy);
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(credentialsDir);
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    if (entry === "telegram-allowFrom.json") continue;
+    if (!entry.startsWith("telegram-")) continue;
+    if (!entry.endsWith("-allowFrom.json")) continue;
+    out.push(join(credentialsDir, entry));
+  }
+  return out;
+}
+
 // Split an openclaw `provider/model` string (or AgentModelConfig
 // object) into its provider and model components. Returns undefined
 // values when the routing isn't set so callers can fall back to the
@@ -1161,6 +1193,13 @@ interface AuthProfileLike {
   type?: string;
   provider?: string;
   key?: string;
+  // Openclaw's auth-profile loader accepts `apiKey` as an alias
+  // for `key` (see openclaw/src/agents/auth-profiles/store.ts).
+  // The comment there reads "Accept both spellings so users don't
+  // silently lose their credentials" — the migrator must honor
+  // the same alias or operators who wrote `apiKey: sk-...` get
+  // their plaintext credential silently dropped on migration.
+  apiKey?: string;
   token?: string;
   access?: string;
   keyRef?: OpenclawSecretRefLike;
@@ -1463,7 +1502,7 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
         });
         continue;
       }
-      const plaintext = profile.key ?? profile.token ?? profile.access;
+      const plaintext = profile.key ?? profile.apiKey ?? profile.token ?? profile.access;
       if (!plaintext) {
         // The profile may still carry a SecretRef indirection (keyRef
         // / tokenRef) where the real value lives in an env var, a
@@ -1545,20 +1584,29 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
         dotenv.TELEGRAM_BOT_TOKEN ??
         inlineTelegram;
       if (token) {
-        // Union the allow-list from BOTH sources openclaw uses:
-        //   1. `<credDir>/telegram-allowFrom.json` (legacy + default-account)
-        //   2. inline `channels.telegram.allowFrom` in the config (the
-        //      modern surface; required when dmPolicy="allowlist" per
-        //      openclaw's zod schema)
-        // Reading only the file silently drops allow-lists for the many
-        // configs that hold them inline. De-dup after the union so a
-        // chat listed in both sources still appears exactly once.
-        const fromFile = readAllowFromAsNumbers(
-          source.stateRoot,
-          join(source.credentialsDir, "telegram-allowFrom.json")
+        // Union the allow-list from EVERY source openclaw uses. The
+        // pairing-store writes to multiple filenames depending on
+        // the openclaw version and whether named accounts are
+        // configured:
+        //   1. `telegram-allowFrom.json` — legacy unscoped file
+        //   2. `telegram-default-allowFrom.json` — what openclaw's
+        //      doctor migration renames the legacy file to when no
+        //      named accounts are configured (openclaw/src/infra/
+        //      state-migrations.ts:651)
+        //   3. `telegram-<account>-allowFrom.json` — one per named
+        //      account when `channels.telegram.accounts` is set
+        //      (openclaw/src/pairing/pairing-store.ts:91-113)
+        //   4. inline `channels.telegram.allowFrom` in the config
+        //      (the modern surface; required for dmPolicy="allowlist")
+        // Reading only (1) silently drops authorized chats for every
+        // install that went through the openclaw doctor migration
+        // OR uses named accounts. De-dup after the union so chats
+        // that appear in multiple files still show up exactly once.
+        const fromFiles = listTelegramAllowFromFiles(source.credentialsDir).flatMap(
+          (path) => readAllowFromAsNumbers(source.stateRoot, path) ?? []
         );
         const fromConfig = coerceAllowFromToNumbers(channels[name]?.allowFrom);
-        const allowedChatIds = unionChatIds(fromFile, fromConfig);
+        const allowedChatIds = unionChatIds(fromFiles, fromConfig);
         steps.push({
           kind: "bridge",
           bridgeKind: "telegram",
@@ -2318,6 +2366,15 @@ export async function applyMigration(
     }
     try {
       copyFileSync(step.sourcePath, target);
+      // Node's copyFileSync preserves the source file's mode. A
+      // sloppy openclaw backup with 0o666 entries (extract from a
+      // tarball with permissive umask, or a manually-chmodded
+      // tree) would land world-writable in the operator's
+      // <instance>/workspace/ — any local user could rewrite the
+      // agent prompt the gateway loads at startup. Normalize to
+      // owner-only, matching the explicit mode the SKILL.md write
+      // below already uses on its own surface.
+      chmodSync(target, 0o600);
       workspaceFilesCopied += 1;
     } catch (error) {
       warnings.push(
@@ -2528,6 +2585,27 @@ export async function applyMigration(
         (bridge) => bridge.kind === step.bridgeKind
       );
       if (found) {
+        // Same provenance-check pattern as the agent-name
+        // collision: only auto-rotate when the existing bridge
+        // was created by an earlier run of THIS migrator (audited
+        // via `messaging.configured` row with
+        // `evidence.source: "openclaw-migration"`). A native bot
+        // bridge the operator created themselves carries their
+        // own token + allow-list, and silently overwriting it
+        // under `--force` would be data loss. Refuse the collision
+        // and surface an unsupported entry so the operator can
+        // disable their bridge manually if they want the openclaw
+        // token to take over.
+        const isPriorMigration = state.audit.some(
+          (entry) =>
+            entry.action === "messaging.configured" &&
+            entry.target === found.id &&
+            (entry.evidence as { source?: string } | undefined)?.source ===
+              "openclaw-migration"
+        );
+        if (!isPriorMigration) {
+          return { kind: "native-collision" as const, id: found.id };
+        }
         return { kind: "existing" as const, id: found.id };
       }
       // Pre-insert the new bridge record with empty `secretRefs`.
@@ -2554,6 +2632,23 @@ export async function applyMigration(
       state.messagingBridges.unshift(item);
       return { kind: "new" as const, id: newId };
     });
+    if (decision.kind === "native-collision") {
+      // Refuse-by-default protects the operator's native bridge
+      // from a silent --force clobber. The agent-collision flow
+      // accepts --force to merge; the bridge case is stricter
+      // because the persisted artifacts are richer (bot token,
+      // allow-list, lastOffset/lastInbound watermarks) and
+      // overwriting the wrong one leaks an unfamiliar token to
+      // a chat group the operator didn't intend. The remediation
+      // is explicit: disable the native bridge first, then
+      // re-run the migration so a fresh openclaw-tagged bridge
+      // can take the slot.
+      plan.unsupported.push({
+        kind: `messaging:${step.bridgeKind}:native-collision`,
+        detail: `Gini already has a ${step.bridgeKind} bridge that was NOT created by this migrator. The migrator refuses to rotate it because the existing bot token and allow-list would be silently overwritten. Either disable the existing bridge (\`gini messaging disable <bridge-id>\`) and re-migrate, or accept that the openclaw ${step.bridgeKind} bridge can't be imported without losing the native one.`
+      });
+      continue;
+    }
     if (decision.kind === "existing" && !options.force) {
       warnings.push(
         `Skipped ${step.bridgeKind} bridge: one already exists (use --force to rotate token and merge allow-list)`
@@ -3514,8 +3609,48 @@ function copyDirShallow(
         force: overwrite,
         filter: (candidate) => !isSymlinkSource(candidate)
       });
+      // cpSync preserves source mode bits. Normalize the copied
+      // subtree to owner-only so a sloppy openclaw backup with
+      // 0o666 entries can't land world-writable in the operator's
+      // <instance>/skills/ tree — the gateway reads these at
+      // startup, so any local user with the original perms could
+      // rewrite the skill prompt.
+      chmodTreeOwnerOnly(dst);
     } else if (entry.isFile() && (overwrite || !existsSync(dst))) {
       copyFileSync(src, dst);
+      chmodSync(dst, 0o600);
+    }
+  }
+}
+
+// Recursive chmod helper for sibling copies. cpSync inherits source
+// mode; on import we want every file to be owner-readable only and
+// every directory to be owner-traversable only. Best-effort: a
+// chmod failure on a single entry shouldn't abort the migration,
+// since the data is already in place and a perms warning is a
+// cosmetic follow-up rather than a correctness blocker.
+function chmodTreeOwnerOnly(dir: string): void {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    /* best-effort */
+  }
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      chmodTreeOwnerOnly(path);
+    } else if (entry.isFile()) {
+      try {
+        chmodSync(path, 0o600);
+      } catch {
+        /* best-effort */
+      }
     }
   }
 }

@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -1425,6 +1426,178 @@ describe("planMigration", () => {
     expect(report?.error).toContain("Unexpected token");
     const state = readState("plan-failure-report");
     expect(state.importReports.some((r) => r.id === report?.id)).toBe(true);
+  });
+
+  test("accepts openclaw `apiKey` field as an alias for `key`", () => {
+    // Openclaw's auth-profile loader at openclaw/src/agents/auth-
+    // profiles/store.ts:167-170 accepts `apiKey` and `key` as
+    // interchangeable; users in the wild write both forms. The
+    // migrator must too, otherwise an entire openclaw config with
+    // `apiKey: sk-...` silently loses its credential.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "agents", "main", "agent", "auth-profiles.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          "openai-default": {
+            type: "api_key",
+            provider: "openai",
+            apiKey: "sk-from-apikey-alias"
+          }
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const secretStep = plan.steps.find((step) => step.kind === "secret") as
+      | { envVar: string; valueFrom: string }
+      | undefined;
+    expect(secretStep).toBeDefined();
+    expect(secretStep!.envVar).toBe("OPENAI_API_KEY");
+    expect(secretStep!.valueFrom).toBe("sk-from-apikey-alias");
+  });
+
+  test("unions telegram-default-allowFrom.json and named-account variants with the legacy file", () => {
+    // Openclaw's doctor migration moves the legacy
+    // credentials/telegram-allowFrom.json to
+    // telegram-default-allowFrom.json (when no named accounts) or
+    // fans out to telegram-<account>-allowFrom.json (when named
+    // accounts are configured). The migrator must read all three
+    // shapes, otherwise any install that ran openclaw's doctor
+    // OR used named accounts has its authorized chats silently
+    // dropped.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    mkdirSync(join(OPENCLAW_ROOT, "credentials"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: { list: [{ id: "main", default: true }] },
+        channels: { telegram: { dmPolicy: "pairing" } }
+      })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, ".env"),
+      "TELEGRAM_BOT_TOKEN=tg-token-for-allowfrom-variants\n"
+    );
+    // Legacy file: chat 100
+    writeFileSync(
+      join(OPENCLAW_ROOT, "credentials", "telegram-allowFrom.json"),
+      JSON.stringify({ version: 1, allowFrom: ["100"] })
+    );
+    // Default-account file: chat 200 (what openclaw doctor produces)
+    writeFileSync(
+      join(OPENCLAW_ROOT, "credentials", "telegram-default-allowFrom.json"),
+      JSON.stringify({ version: 1, allowFrom: ["200"] })
+    );
+    // Named-account files: chats 300 and 400
+    writeFileSync(
+      join(OPENCLAW_ROOT, "credentials", "telegram-corpbot-allowFrom.json"),
+      JSON.stringify({ version: 1, allowFrom: ["300"] })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "credentials", "telegram-personal-allowFrom.json"),
+      JSON.stringify({ version: 1, allowFrom: ["400"] })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const bridge = plan.steps.find((step) => step.kind === "bridge") as
+      | { allowedChatIds: number[] }
+      | undefined;
+    expect(bridge).toBeDefined();
+    expect(bridge!.allowedChatIds.sort((a, b) => a - b)).toEqual([100, 200, 300, 400]);
+  });
+
+  test("refuses to rotate a native messaging bridge under --force", async () => {
+    // A native gini telegram bridge the operator created themselves
+    // must not be silently overwritten by `gini import apply --force`.
+    // The bridge collision check uses the same audit-marker
+    // pattern as the agent collision: a `messaging.configured`
+    // row with `source: "openclaw-migration"` marks "ours";
+    // anything else is the operator's, refuse to touch.
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withTelegramChannel: true,
+      withTelegramAllowFrom: true
+    });
+    const config = loadConfig("bridge-native-collision");
+    // Plant a native telegram bridge the operator created via the
+    // regular addMessagingBridge path (no openclaw audit marker).
+    mutateState(config.instance, (state) => {
+      state.messagingBridges.unshift({
+        id: "bridge_native",
+        instance: config.instance,
+        name: "operator's native bot",
+        kind: "telegram",
+        deliveryTargets: [],
+        status: "configured",
+        secretRefs: [{ purpose: "bot-token", path: "messaging.bridge_native.bot-token.json" }],
+        metadata: { allowedChatIds: [999], lastOffset: 50 },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      });
+    });
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    const result = await applyMigration(config, discovery, plan, { force: true });
+    expect(result.bridgesCreated).toBe(0);
+    expect(result.bridgesRotated).toBe(0);
+    const collision = result.unsupported.find(
+      (entry) => entry.kind === "messaging:telegram:native-collision"
+    );
+    expect(collision).toBeDefined();
+    expect(collision?.detail).toContain("gini messaging disable");
+    // The native bridge's metadata/token must be untouched.
+    const state = readState(config.instance);
+    const bridge = state.messagingBridges.find((b) => b.id === "bridge_native");
+    expect((bridge?.metadata as { allowedChatIds: number[] }).allowedChatIds).toEqual([999]);
+    expect((bridge?.metadata as { lastOffset: number }).lastOffset).toBe(50);
+  });
+
+  test("rotates a prior-migration bridge with --force without refusing", async () => {
+    // The collision refusal applies only to native bridges. A
+    // bridge created by an earlier run of THIS migrator should
+    // re-import cleanly under --force so the operator can refresh
+    // the token.
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withTelegramChannel: true,
+      withTelegramAllowFrom: true
+    });
+    const config = loadConfig("bridge-prior-migration-rotate");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    // First import: lays down the openclaw-tagged bridge.
+    const first = await applyMigration(config, discovery, planMigration(discovery));
+    expect(first.bridgesCreated).toBe(1);
+    // Second import with --force: rotates instead of refusing.
+    const second = await applyMigration(config, discovery, planMigration(discovery), { force: true });
+    expect(second.bridgesRotated).toBe(1);
+    expect(
+      second.unsupported.some((entry) =>
+        entry.kind === "messaging:telegram:native-collision"
+      )
+    ).toBe(false);
+  });
+
+  test("chmods migrated workspace files to 0600 even when openclaw source was world-readable", async () => {
+    // Node's copyFileSync preserves source mode by default. A
+    // sloppy openclaw backup with 0666 entries would land world-
+    // writable under <instance>/workspace/, and the gateway reads
+    // those at startup — any local user could rewrite the agent's
+    // prompt. Normalize to owner-only after copy.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withWorkspaceFiles: true });
+    // Force the source files to a permissive mode.
+    chmodSync(join(OPENCLAW_ROOT, "workspace", "SOUL.md"), 0o666);
+    const config = loadConfig("workspace-chmod");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.workspaceFilesCopied).toBeGreaterThan(0);
+    const target = join(config.workspaceRoot, "SOUL.md");
+    expect(statSync(target).mode & 0o777).toBe(0o600);
   });
 
   test("rejects non-integer Telegram allow-list entries instead of coercing to 0", () => {

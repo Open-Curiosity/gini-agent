@@ -68,12 +68,12 @@ The migrator surfaces every unmigrated subsystem in the `unsupported` field so y
 
 `gini import apply openclaw` is safe to re-run. The default behavior skips anything that already exists by name:
 
-- Agents with a matching `name` are left alone.
+- Agents with a matching `name`: behavior depends on provenance. If the existing agent was created by an earlier run of this migrator (audited via an `openclaw.agent.tagged` row tying the agent id to the openclaw agent id), re-importing reuses it and idempotently dedupes sessions and memory. If it's a native gini agent the operator created themselves, the migrator refuses to attach openclaw sessions and memory to it — an `agent:<name>:name-collision` entry lands on the `unsupported` list and the operator must either delete the native agent (`gini agent delete <name>`) and re-migrate so a fresh tagged agent gets created, or pass `--force` to acknowledge the merge of openclaw history into the existing agent.
 - Workspace files that already exist on disk are skipped.
 - Skills with the same directory name are skipped.
-- One messaging bridge per kind is kept; a second apply does not fork the bridge.
+- Messaging bridges: at most one per kind exists per instance. If the bridge was created by an earlier run of this migrator (audited via a `messaging.configured` row carrying `evidence.source: "openclaw-migration"`), `--force` rotates its token and merges the allow-list. If it's a native bridge the operator created themselves, the migrator refuses to touch it even with `--force` (the bot token and allow-list would be silently overwritten); a `messaging:<kind>:native-collision` entry lands on the `unsupported` list with remediation pointing at `gini messaging disable <bridge-id>` followed by a re-migration.
 
-Use `--force` to rotate values: a fresh openclaw config with a new `TELEGRAM_BOT_TOKEN` re-applied with `--force` rewrites the encrypted secret file and updates `metadata.allowedChatIds`. Workspace files and skills also overwrite under `--force`.
+Use `--force` to rotate values: a fresh openclaw config with a new `TELEGRAM_BOT_TOKEN` re-applied with `--force` against a migrator-created bridge rewrites the encrypted secret file and updates `metadata.allowedChatIds`. Workspace files and skills also overwrite under `--force`.
 
 ## Audit trail
 
