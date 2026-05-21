@@ -129,16 +129,19 @@ export default function ChatDetailScreen() {
     return () => clearTimeout(id);
   }, [messages?.length, sessionId, pendingPhase]);
 
+  const showSendBusy = Boolean(inflightTaskId) || send.isPending;
+  const headerTitle = session.data?.title?.trim() || "New chat";
+
   const submit = () => {
     const trimmed = text.trim();
-    if (!trimmed || send.isPending || !sessionId) return;
+    // Hardware-keyboard onSubmitEditing can fire mid-task; `showSendBusy`
+    // also covers the in-flight assistant work, not just the mutation's
+    // own pending state.
+    if (!trimmed || showSendBusy || !sessionId) return;
     send.mutate(trimmed, {
       onSuccess: () => setText("")
     });
   };
-
-  const showSendBusy = Boolean(inflightTaskId) || send.isPending;
-  const headerTitle = session.data?.title?.trim() || "New chat";
 
   if (unauthorized) return null;
 
