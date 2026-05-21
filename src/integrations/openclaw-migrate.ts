@@ -52,8 +52,8 @@
 //   - Hindsight memory units (`<state>/memory/*.sqlite` whose schema
 //     advertises `memory_banks` + `memory_units`). Each row is inserted
 //     verbatim into the gini instance's memory.db with embedding NULL;
-//     a follow-up `gini memory backfill-embeddings` pass populates
-//     vectors using the configured embedding provider. The legacy
+//     a follow-up `gini embedding reembed` pass populates vectors
+//     using the configured embedding provider. The legacy
 //     file-chunk RAG schema (`chunks`/`files`/`embedding_cache`) has no
 //     direct gini target and is reported on the unsupported list with
 //     a `Re-index via /api/memory/retain` hint.
@@ -1823,8 +1823,8 @@ export async function applyMigration(
 
   // 7) Hindsight memory units. Insert each row verbatim into the
   // gini instance's memory.db with embedding NULL — a follow-up
-  // `gini memory backfill-embeddings` pass populates vectors using
-  // the configured embedding provider. We sanitize network/status
+  // `gini embedding reembed` pass populates vectors using the
+  // configured embedding provider. We sanitize network/status
   // before insertion so an openclaw schema drift can't poison the
   // gini memory store with values the rest of the runtime won't
   // accept on read.
