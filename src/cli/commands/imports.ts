@@ -96,8 +96,12 @@ export async function importInspect(ctx: CliContext): Promise<void> {
         bridges: result.bridgesCreated,
         skills: result.skillsCopied,
         secrets: result.secretsWritten,
-        workspaceFiles: result.workspaceFilesCopied
+        workspaceFiles: result.workspaceFilesCopied,
+        sessions: result.sessionsCreated,
+        sessionMessages: result.sessionMessagesCreated,
+        memoryUnits: result.memoryUnitsCreated
       },
+      archivePath: result.archivePath,
       unsupported: result.unsupported,
       warnings: result.warnings,
       reportId: result.report.id
