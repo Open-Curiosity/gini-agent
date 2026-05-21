@@ -364,6 +364,28 @@ export function readStateDotenv(stateRoot: string): Record<string, string> {
   return out;
 }
 
+// Merge `env.vars` and direct uppercase keys under `env` into a single
+// flat env-var map. Mirrors openclaw's runtime
+// `collectConfigEnvVarsByTarget` which iterates every entry under
+// `env`, skipping only the structured `shellEnv` and `vars` slots.
+// Returns string values only — non-string entries are dropped because
+// they cannot land in a shell-sourced secrets.env.
+function collectOpenclawEnv(env: OpenclawConfig["env"]): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!env) return out;
+  const direct = env as Record<string, unknown>;
+  for (const [key, value] of Object.entries(direct)) {
+    if (key === "shellEnv" || key === "vars") continue;
+    if (typeof value === "string") out[key] = value;
+  }
+  if (env.vars && typeof env.vars === "object") {
+    for (const [key, value] of Object.entries(env.vars)) {
+      if (typeof value === "string") out[key] = value;
+    }
+  }
+  return out;
+}
+
 function readAllowFromAsNumbers(path: string): number[] | undefined {
   if (!existsSync(path)) return undefined;
   try {
@@ -641,7 +663,13 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
   // the bridges gini implements today; the per-channel ADRs are
   // `docs/adr/telegram-bridge.md` and `docs/adr/discord-bridge.md`).
   const channels = config.channels ?? {};
-  const envVars = config.env?.vars ?? {};
+  // Openclaw's env schema is `{ shellEnv?, vars?, ...catchall<string> }`
+  // — direct uppercase keys under `env` are valid (the upstream
+  // resolver iterates all entries skipping just `shellEnv`/`vars`).
+  // Union both shapes so configs that hand-edit
+  // `env: { TELEGRAM_BOT_TOKEN: "..." }` directly migrate as readily
+  // as configs nesting under `env.vars`.
+  const envVars = collectOpenclawEnv(config.env);
   const dotenv = readStateDotenv(source.stateRoot);
   for (const name of Object.keys(channels)) {
     if (name === "telegram") {

@@ -686,6 +686,50 @@ describe("planMigration", () => {
     ]);
   });
 
+  test("discovers tokens under direct env.<KEY> as well as env.vars.<KEY>", () => {
+    // Openclaw's env zod schema is { shellEnv?, vars?, catchall<string> },
+    // so configs that hand-edit `env: { TELEGRAM_BOT_TOKEN: "..." }`
+    // directly (without nesting under vars) are valid. Reading only
+    // env.vars drops them silently.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        channels: { telegram: { dmPolicy: "pairing" } },
+        env: { TELEGRAM_BOT_TOKEN: "tg-direct-key" }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const telegram = plan.steps.find((step) => step.kind === "bridge") as {
+      tokenValue: string;
+    } | undefined;
+    expect(telegram?.tokenValue).toBe("tg-direct-key");
+  });
+
+  test("env.vars takes precedence over direct env.<KEY> for the same name", () => {
+    // When both shapes carry the same key, vars wins — that mirrors
+    // the order operators expect from their existing openclaw config
+    // edits, where vars is the documented nesting.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        channels: { telegram: { dmPolicy: "pairing" } },
+        env: {
+          TELEGRAM_BOT_TOKEN: "tg-direct-key",
+          vars: { TELEGRAM_BOT_TOKEN: "tg-from-vars" }
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const telegram = plan.steps.find((step) => step.kind === "bridge") as {
+      tokenValue: string;
+    } | undefined;
+    expect(telegram?.tokenValue).toBe("tg-from-vars");
+  });
+
   test("falls back to state-dir .env when config.env.vars omits the token", () => {
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: false, withDotenv: true });
     writeFileSync(
