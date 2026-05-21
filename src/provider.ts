@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { buildAgentSystemContext } from "./system-prompt";
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
+import { appendTrace } from "./state/trace";
 import type { CostRecord, MemoryRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -825,7 +826,13 @@ export async function generateTaskSummary(
   // Optional per-call override. Resolved by callers from the active agent's
   // providerName/model via resolveEffectiveContext. Embeddings/reranker still
   // read config.provider — do NOT mutate config here.
-  providerOverride?: ProviderConfig
+  providerOverride?: ProviderConfig,
+  // Optional owning task id. When present, identity-file scan blocks
+  // emit a runtime trace warning on the task — matches the chat-task
+  // path's onBlocked plumbing. When absent (no task context — e.g.
+  // tests calling generateTaskSummary directly), the [BLOCKED: ...]
+  // notice in the prompt is the only signal.
+  taskId?: string
 ): Promise<ProviderResult> {
   const provider = normalizeProvider(providerOverride ?? config.provider);
   if (provider.name === "echo") {
@@ -842,9 +849,19 @@ export async function generateTaskSummary(
   // SOUL.md. Active-agent lookup is best-effort — when no agent is
   // active the SOUL.md block is elided. See ADR runtime-identity-files.md.
   const activeAgentId = resolveActiveAgentId(config);
-  const instructionsOverride = loadInstructions(config.instance) ?? undefined;
-  const soulBlock = loadSoul(config.instance, activeAgentId) ?? undefined;
-  const userProfileBlock = loadUserProfile(config.instance) ?? undefined;
+  const onBlocked = taskId
+    ? (filename: string, findings: string[]): void => {
+        appendTrace(config.instance, taskId, {
+          type: "model",
+          message: `identity file blocked: ${filename}`,
+          data: { filename, findings }
+        });
+      }
+    : undefined;
+  const loadOpts = onBlocked ? { onBlocked } : undefined;
+  const instructionsOverride = loadInstructions(config.instance, loadOpts) ?? undefined;
+  const soulBlock = loadSoul(config.instance, activeAgentId, loadOpts) ?? undefined;
+  const userProfileBlock = loadUserProfile(config.instance, loadOpts) ?? undefined;
   const systemContext = buildAgentSystemContext(memories, recalledContext, undefined, {
     instructionsOverride,
     soul: soulBlock,

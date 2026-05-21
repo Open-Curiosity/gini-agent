@@ -563,7 +563,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     }
   };
 
-  const providerResult = await generateTaskSummary(config, task.input, activeMemory, recalledContext, onDelta);
+  const providerResult = await generateTaskSummary(config, task.input, activeMemory, recalledContext, onDelta, undefined, taskId);
   await flush();
   appendTrace(config.instance, taskId, {
     type: "model",
