@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 3.0.0
+    version: 3.0.1
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -189,54 +189,34 @@ Calendar's service ID is `calendar-json.googleapis.com` (not `calendar.googleapi
 
 If it errors with `PERMISSION_DENIED`, the user doesn't own the project — ask them to switch with `gcloud auth login` or pick a project they own with `gcloud config set project <project_id>`.
 
-#### Milestone D — Capture the OAuth client credentials
+#### Last step — OAuth client setup
 
-Tell the user (one short message):
+Substitute `<project_id>` with the real project id from Milestone B. Send the URLs as plain text in chat (chat renders them as clickable links) — do NOT `open` them or shell out to a browser.
 
-> Now I need you to create an OAuth Desktop client in Cloud Console. I'll open the two URLs you need — click through each, then paste the Client ID and Client Secret into the form I'll show you in chat.
+Post a single chat message in this shape:
 
-Then open the OAuth consent screen page in the user's default browser:
+> **Last step: manual OAuth client setup.**
+>
+> **Step A — Consent screen (if not configured):**
+> `https://console.cloud.google.com/apis/credentials/consent?project=<project_id>`
+> → User Type: **External**, App name `Gini Workspace`, your email for support + developer contact, save through Scopes, add yourself as a Test user.
+>
+> **Step B — Create an OAuth client:**
+> `https://console.cloud.google.com/apis/credentials?project=<project_id>`
+> → "Create Credentials" → "OAuth client ID" → Application type: **Desktop app**.
+>
+> Paste the Client ID and Client Secret below when you have them.
 
-```bash
-open "https://console.cloud.google.com/apis/credentials/consent?project=<project_id>"
-```
-
-Click list for the consent screen:
-
-1. User Type: pick **External**, click **Create**.
-2. App name: `Gini Workspace`. User support email: your own email. Developer contact: your own email. Click **Save and continue**.
-3. Scopes step: click **Save and continue** without adding anything.
-4. Test users step: click **Add users**, type your own email, click **Add**, then **Save and continue**.
-5. Skip Verification (click **Back to Dashboard** at the bottom).
-
-Wait for the user to reply **"done"**.
-
-Then open the Credentials page:
-
-```bash
-open "https://console.cloud.google.com/apis/credentials?project=<project_id>"
-```
-
-Click list for the Desktop client:
-
-1. Click **Create Credentials** → **OAuth client ID**.
-2. Application type: **Desktop app**.
-3. Name: `gws CLI`.
-4. Click **Create**.
-5. The dialog shows your **Client ID** and **Client Secret**. Leave it open — you'll need both values for the next step.
-
-Now call `request_connector` so the inline form opens in chat:
+Immediately call `request_connector` so the inline form renders right under the message:
 
 ```text
 request_connector {
   provider: "google-oauth-desktop",
-  reason: "Paste the Client ID and Client Secret from the OAuth Desktop client you just created in Cloud Console."
+  reason: "Paste the Client ID and Client Secret from the OAuth Desktop client you just created."
 }
 ```
 
-The user pastes the two strings into the form and clicks **Save**. The connector is created with the env bindings `GOOGLE_WORKSPACE_CLI_CLIENT_ID` and `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`, which `gws` picks up automatically. The chat-task resumes once the connector is healthy.
-
-Continue to Step 3.
+Don't gate on "reply done" between Step A and Step B — the form submission is what advances the flow. The user can do A and B in any order, or come back later. The connector is created with the env bindings `GOOGLE_WORKSPACE_CLI_CLIENT_ID` and `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`, which `gws` picks up automatically. Continue to Step 3 once the connector is healthy.
 
 ### 2B. Browser-only setup (emergency fallback)
 
