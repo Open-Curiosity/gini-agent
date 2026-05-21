@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 2.1.0
+    version: 3.0.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -14,9 +14,9 @@ metadata:
 
 # Google Workspace Setup
 
-One-time onboarding for the Google Workspace skills (`google-gmail`, `google-calendar`, `google-drive`, `google-docs`, `google-meet`, `google-forms`). Installs the upstream `gws` CLI, creates an OAuth Desktop client in the user's own Google Cloud project, completes OAuth, picks scopes per product, and adds `gws` to the per-instance auto-approve list.
+One-time onboarding for the Google Workspace skills (`google-gmail`, `google-calendar`, `google-drive`, `google-docs`, `google-meet`, `google-forms`). Installs the upstream `gws` CLI, creates an OAuth Desktop client in the user's own Google Cloud project, stores the Client ID and Client Secret in Gini's connector store, completes OAuth, picks scopes per product, and adds `gws` to the per-instance auto-approve list.
 
-The OAuth client lives in the user's own GCP project. Never paste `client_secret.json` contents or anything under `~/.config/gws/` into chat or logs.
+The OAuth client lives in the user's own GCP project. The Client ID and Client Secret are captured through the inline Connect form (`request_connector` tool) and stored in Gini's encrypted secret store — never write them to chat or logs, and never write `client_secret.json` to disk.
 
 This skill is idempotent — re-running it re-verifies the install and lets the user widen scopes.
 
@@ -66,43 +66,19 @@ Verify:
 gws --version
 ```
 
-### 1.5. Existing OAuth client (optional shortcut)
+### 1.5. Existing OAuth Desktop client (optional shortcut)
 
 Before starting Step 2, ask the user:
 
-> Do you already have a Google OAuth Desktop `client_secret.json` from another project? If yes, paste the path and I'll move it into place — we'll skip the Cloud Console setup. If no, I'll create one for you.
+> Do you already have a Google OAuth Desktop client from another project? If yes, I'll show you a form where you can paste the Client ID and Client Secret and we'll skip the Cloud Console setup. If no, I'll create one for you.
 
 Branch on the answer:
 
-- **User pastes a path.** Verify the file is a Desktop client, then drop it into `~/.config/gws/`:
+- **User says yes.** Call `request_connector { provider: "google-oauth-desktop", reason: "Paste the Client ID and Client Secret from your existing OAuth Desktop client." }`. The inline form opens in chat; the user pastes the two values and clicks Save. On success, run the API-verification sub-step below, then jump to Step 3 (`gws auth login`).
 
-  ```bash
-  # 1. Confirm the file is readable.
-  test -r "<PATH>" || echo "MISSING: <PATH> is not readable"
+  After the connector is created, verify the project has all six Workspace APIs enabled. Read the project id from the user (or ask them) — `gws` itself doesn't need the project id once the OAuth client is wired, but the APIs must be enabled in the project that owns the OAuth client.
 
-  # 2. Confirm it's a Desktop client (has the `installed` key, not `web`).
-  jq -e '.installed.client_id' "<PATH>" > /dev/null && echo "OK: Desktop client" \
-    || (jq -e '.web.client_id' "<PATH>" > /dev/null \
-        && echo "WRONG TYPE: this is a Web client, not a Desktop client" \
-        || echo "INVALID: not a recognizable OAuth client_secret.json")
-
-  # 3. If OK, move it into place.
-  mkdir -p ~/.config/gws && cp "<PATH>" ~/.config/gws/client_secret.json
-  ```
-
-  Interpret the output:
-  - `OK: Desktop client` → copy in place, **skip Step 2 entirely**, then run the API-verification sub-step below before jumping to Step 3 (`gws auth login`).
-  - `WRONG TYPE: ...` → tell the user: "That's a Web OAuth client — `gws` needs a Desktop client. Want me to create a new Desktop client?" If yes, fall through to Step 2.
-  - `INVALID: ...` or `MISSING: ...` → tell the user what's wrong and ask whether they want to re-paste a different path or have Gini create a new one.
-
-  Then verify the project has all six Workspace APIs enabled:
-
-  1. Parse the project ID from the JSON:
-
-     ```bash
-     jq -r '.installed.project_id' ~/.config/gws/client_secret.json 2>/dev/null \
-       || python3 -c "import json; print(json.load(open('$HOME/.config/gws/client_secret.json'))['installed']['project_id'])"
-     ```
+  1. Ask: "Which Google Cloud project owns that OAuth client? I'll check the six Workspace APIs are enabled there." Wait for the project id.
 
   2. If `gcloud` is available, enable all six APIs in one shot:
 
@@ -144,7 +120,7 @@ Branch on the answer:
 
 - **User says no, doesn't have one, or asks Gini to do it.** Fall through to Step 2.
 
-Skip this branch entirely if `~/.config/gws/client_secret.json` already exists — go straight to Step 3.
+Skip this branch entirely if a `google-oauth-desktop` connector already exists and is healthy — go straight to Step 3.
 
 ### 2. Pick a setup path
 
@@ -159,7 +135,7 @@ command -v gcloud
 
 ### 2A. gcloud-hybrid setup
 
-Project creation + API enablement run through `terminal_exec`. OAuth consent screen + Desktop client creation happen in the user's default browser. Do NOT spawn managed Chrome for Step 2A.
+Project creation + API enablement run through `terminal_exec`. OAuth consent screen + Desktop client creation happen in the user's default browser. Capturing the Client ID and Client Secret happens through the inline Connect form (`request_connector`). Do NOT spawn managed Chrome for Step 2A.
 
 Don't list completed actions in chat. Status messages should be action-oriented (what the user must do next), not retrospective.
 
@@ -213,64 +189,52 @@ Calendar's service ID is `calendar-json.googleapis.com` (not `calendar.googleapi
 
 If it errors with `PERMISSION_DENIED`, the user doesn't own the project — ask them to switch with `gcloud auth login` or pick a project they own with `gcloud config set project <project_id>`.
 
-#### Milestone D — Configure the OAuth consent screen
+#### Milestone D — Capture the OAuth client credentials
 
-Open the consent screen page in the user's default browser (`open` on macOS, `xdg-open` on Linux):
+Tell the user (one short message):
+
+> Now I need you to create an OAuth Desktop client in Cloud Console. I'll open the two URLs you need — click through each, then paste the Client ID and Client Secret into the form I'll show you in chat.
+
+Then open the OAuth consent screen page in the user's default browser:
 
 ```bash
 open "https://console.cloud.google.com/apis/credentials/consent?project=<project_id>"
 ```
 
-Tell the user:
+Click list for the consent screen:
 
-> I've opened the OAuth consent screen page in your default browser. Please do the following, then reply **"done"**:
->
-> 1. User Type: pick **External**, click **Create**.
-> 2. App name: `Gini Workspace`. User support email: your own email. Developer contact: your own email. Click **Save and continue**.
-> 3. Scopes step: click **Save and continue** without adding anything.
-> 4. Test users step: click **Add users**, type your own email, click **Add**, then **Save and continue**.
-> 5. Skip the Verification step (click **Back to Dashboard** at the bottom).
+1. User Type: pick **External**, click **Create**.
+2. App name: `Gini Workspace`. User support email: your own email. Developer contact: your own email. Click **Save and continue**.
+3. Scopes step: click **Save and continue** without adding anything.
+4. Test users step: click **Add users**, type your own email, click **Add**, then **Save and continue**.
+5. Skip Verification (click **Back to Dashboard** at the bottom).
 
-Wait for "done." Do not try to drive these clicks yourself.
+Wait for the user to reply **"done"**.
 
-#### Milestone E — Create the OAuth Desktop client
+Then open the Credentials page:
 
 ```bash
 open "https://console.cloud.google.com/apis/credentials?project=<project_id>"
 ```
 
-Tell the user:
+Click list for the Desktop client:
 
-> I've opened the Credentials page. Please:
->
-> 1. Click **Create Credentials** at the top of the page, then **OAuth client ID** in the dropdown.
-> 2. Application type: **Desktop app**.
-> 3. Name: `gws CLI`.
-> 4. Click **Create**.
-> 5. In the dialog that appears, click **DOWNLOAD JSON**.
->
-> Then paste the full path to the downloaded file here (it usually lands in `~/Downloads/`, e.g. `~/Downloads/client_secret_123-abc.apps.googleusercontent.com.json`).
+1. Click **Create Credentials** → **OAuth client ID**.
+2. Application type: **Desktop app**.
+3. Name: `gws CLI`.
+4. Click **Create**.
+5. The dialog shows your **Client ID** and **Client Secret**. Leave it open — you'll need both values for the next step.
 
-Wait for the user's path. Continue to Milestone F.
+Now call `request_connector` so the inline form opens in chat:
 
-#### Milestone F — Move the JSON into place
-
-Try `mv` through `terminal_exec` first (substitute `<path>` with the literal path the user pasted):
-
-```bash
-mkdir -p ~/.config/gws
-mv "<path>" ~/.config/gws/client_secret.json
+```text
+request_connector {
+  provider: "google-oauth-desktop",
+  reason: "Paste the Client ID and Client Secret from the OAuth Desktop client you just created in Cloud Console."
+}
 ```
 
-If `mv` fails with `EACCES` / `Operation not permitted` / a sandbox error, tell the user:
-
-> macOS sandboxing blocks me from reading `~/Downloads/` directly. Please drag the JSON file from `~/Downloads/` to `~/.config/gws/client_secret.json` in Finder, then reply **"done"**.
-
-Verify:
-
-```bash
-ls -la ~/.config/gws/client_secret.json
-```
+The user pastes the two strings into the form and clicks **Save**. The connector is created with the env bindings `GOOGLE_WORKSPACE_CLI_CLIENT_ID` and `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`, which `gws` picks up automatically. The chat-task resumes once the connector is healthy.
 
 Continue to Step 3.
 
@@ -336,7 +300,7 @@ Verify the snapshot shows a signed-in state: project picker, account avatar, or 
 1. `browser_close {}` — closes the visible Chrome. Profile dir and cookies persist.
 2. `browser_connect { reason: "Continue Cloud Console setup invisibly", headless: true }` — relaunches headless using the same profile dir.
 
-If after Milestone A.5 a `browser_snapshot` shows a captcha challenge, an "unusual activity" warning, or Console refuses to load, fall back to headed mode: `browser_close`, then `browser_connect { reason: "Re-open Chrome (bot detection tripped headless)" }` (no `headless` flag). Continue Milestones B-F in the visible window. Say once: "Console flagged my headless session — I'll do the rest in the visible window."
+If after Milestone A.5 a `browser_snapshot` shows a captcha challenge, an "unusual activity" warning, or Console refuses to load, fall back to headed mode: `browser_close`, then `browser_connect { reason: "Re-open Chrome (bot detection tripped headless)" }` (no `headless` flag). Continue Milestones B-E in the visible window. Say once: "Console flagged my headless session — I'll do the rest in the visible window."
 
 #### Milestone B — Create or pick a Cloud project
 
@@ -409,7 +373,7 @@ On Test users, click **Add users**, type the user's own email, click **Add**, th
 
 Skip Verification ("Back to Dashboard" at the bottom).
 
-#### Milestone E — Create the OAuth Desktop client
+#### Milestone E — Capture the OAuth client credentials
 
 ```text
 browser_navigate { url: "https://console.cloud.google.com/apis/credentials" }
@@ -420,26 +384,18 @@ browser_snapshot {}
 2. Snapshot. In "Application type," choose **Desktop app**.
 3. Snapshot. Type `gws CLI` into "Name."
 4. Click **Create**.
-5. Snapshot. Click **DOWNLOAD JSON** in the resulting dialog.
-6. Wait ~2s for the download to land.
+5. Snapshot. The dialog shows the **Client ID** and **Client Secret**. Read both values from the snapshot (or ask the user to copy them).
 
-#### Milestone F — Move the JSON into place
+Then call `request_connector` so the inline form opens in chat:
 
-Gini's managed Chrome saves downloads under `~/.gini/instances/<instance>/downloads/`, not `~/Downloads`. Resolve `<instance>` from `gini status` or `GET /api/status` → `instance`. Substitute the resolved name; do not leave `<instance>` literal:
-
-```bash
-INSTANCE_DOWNLOADS=~/.gini/instances/<instance>/downloads
-mkdir -p ~/.config/gws
-mv "$(ls -t "$INSTANCE_DOWNLOADS"/client_secret_*.apps.googleusercontent.com.json | head -n 1)" ~/.config/gws/client_secret.json
+```text
+request_connector {
+  provider: "google-oauth-desktop",
+  reason: "Paste the Client ID and Client Secret from the OAuth Desktop client you just created in Cloud Console."
+}
 ```
 
-Verify:
-
-```bash
-ls -la ~/.config/gws/client_secret.json
-```
-
-If the glob expanded to nothing, fall back to `~/Downloads/client_secret_*.apps.googleusercontent.com.json`.
+The user pastes the two strings into the form and clicks **Save**. The connector is created with the env bindings `GOOGLE_WORKSPACE_CLI_CLIENT_ID` and `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`, which `gws` picks up automatically. The chat-task resumes once the connector is healthy.
 
 #### Cleanup — close the browser
 
@@ -451,7 +407,7 @@ Call `browser_close {}` to tear down the headless Chrome.
 gws auth login          # interactive scope pick + browser consent
 ```
 
-`gws` opens its own browser tab; the user picks scopes (see the table below) and approves.
+`gws` reads the Client ID and Client Secret from the env vars Gini binds (`GOOGLE_WORKSPACE_CLI_CLIENT_ID`, `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`), opens its own browser tab, lets the user pick scopes (see the table below) and approve. If `gws auth login` exits with an OAuth client error, the Client ID or Client Secret entered in Step 2 was wrong — re-run `request_connector` for `google-oauth-desktop` to capture the correct pair.
 
 ### 4. Pick the right scopes per product
 
@@ -530,15 +486,15 @@ If that returns JSON without an auth error, the setup is complete.
 2. **Detect `gcloud` before deciding the path.** Run `command -v gcloud` first. Do not silently fall through to browser-only when `gcloud` is available.
 3. **Enable all six Workspace APIs regardless of path.** Step 2A's `gcloud services enable` accepts all six in one call; Step 2B's Milestone C loops through all six.
 4. **Sign-in is a human-in-the-loop step.** Never attempt to type the user's email or password into Google's sign-in form. Open the page (or run `gcloud auth login`), hand off to the user, wait for their "done."
-5. **Snapshot before every click.** Element refs are only valid against the most recent `browser_snapshot`. After any navigation or interaction, re-snapshot and look up the target by its accessible label in the new tree.
-6. **Fail gracefully.** If a `gcloud` command errors with `PERMISSION_DENIED` or `ALREADY_EXISTS`, surface the error verbatim and ask the user. If `browser_snapshot` doesn't show an expected element after two or three attempts (re-snapshot, try `browser_scroll`, try a label variant like "Create project" vs "New project"), STOP. Tell the user: "I got stuck at <milestone>. Please finish manually from here: <one paragraph with the exact Cloud Console URL and what to click>." Do not loop forever on a UI that has changed.
-7. Narrow OAuth scopes to what the user actually asked for. Do not silently expand from read-only to write.
-8. When the user is on a personal `@gmail.com` account, never request the full `recommended` scope preset — it will fail because the app is unverified. Use a comma-separated `-s` list.
-9. Treat the entire `~/.config/gws/` directory as sensitive — never `cat` or copy its contents into chat or logs.
+5. **Capture credentials through the inline form, not files.** Always use `request_connector { provider: "google-oauth-desktop" }` to get the Client ID and Client Secret. Never ask the user for a path to a `client_secret.json`, never write a JSON file under `~/.config/gws/`, and never `cat` or echo the credentials back into chat.
+6. **Snapshot before every click.** Element refs are only valid against the most recent `browser_snapshot`. After any navigation or interaction, re-snapshot and look up the target by its accessible label in the new tree.
+7. **Fail gracefully.** If a `gcloud` command errors with `PERMISSION_DENIED` or `ALREADY_EXISTS`, surface the error verbatim and ask the user. If `browser_snapshot` doesn't show an expected element after two or three attempts (re-snapshot, try `browser_scroll`, try a label variant like "Create project" vs "New project"), STOP. Tell the user: "I got stuck at <milestone>. Please finish manually from here: <one paragraph with the exact Cloud Console URL and what to click>." Do not loop forever on a UI that has changed.
+8. Narrow OAuth scopes to what the user actually asked for. Do not silently expand from read-only to write.
+9. When the user is on a personal `@gmail.com` account, never request the full `recommended` scope preset — it will fail because the app is unverified. Use a comma-separated `-s` list.
 10. If the user is in a CI or headless environment, point them at the export flow (`gws auth export --unmasked > credentials.json` on a desktop machine, then `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=…` on the headless one).
 
 ## Manual Fallback
 
-If both Step 2A and Step 2B get stuck, hand off the Cloud Console URLs and click sequence from Milestones B-F (in Step 2B) to the user and ask them to do it manually. Then resume at Step 3.
+If both Step 2A and Step 2B get stuck, hand off the Cloud Console URLs and click sequence from Milestones B-E (in Step 2B) to the user and ask them to do it manually. Once they have a Client ID and Client Secret in hand, call `request_connector { provider: "google-oauth-desktop", ... }` and resume at Step 3.
 
 For flags not shown here, run `gws auth --help` and `gws --help`.
