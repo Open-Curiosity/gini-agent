@@ -644,10 +644,22 @@ function isHeaderSafeApiKey(value: string): boolean {
 // Build a short human-readable description of an openclaw SecretRef so
 // the unsupported-entry message tells the operator where the
 // credential lives without leaking the value itself.
+//
+// Exec refs deliberately omit `command` (and `id`, which 1Password-
+// style integrations co-opt as the `op://Vault/Item/field` lookup
+// path). The command is operator-authored shell text that frequently
+// embeds organization, vault, or item identifiers — disclosure
+// metadata that should not land in plan/apply output, audit reports,
+// or anywhere a third party could read. The provider name (e.g.
+// "1password", "vault") is enough for the operator to recognize
+// which resolver the entry referred to without echoing the lookup.
 function describeSecretRef(ref: OpenclawSecretRefLike): string {
   if (ref.source === "env" && ref.id) return `source=env, var=${ref.id}`;
   if (ref.source === "file" && ref.path) return `source=file, path=${ref.path}`;
-  if (ref.source === "exec" && ref.command) return `source=exec, command=${ref.command}`;
+  if (ref.source === "exec") {
+    const provider = ref.provider ? `, provider=${ref.provider}` : "";
+    return `source=exec${provider}`;
+  }
   if (ref.source) return `source=${ref.source}`;
   return "unknown SecretRef shape";
 }

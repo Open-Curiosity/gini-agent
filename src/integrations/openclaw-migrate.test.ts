@@ -1205,6 +1205,57 @@ describe("planMigration", () => {
     expect(ref?.detail).toContain("OPENAI_API_KEY");
   });
 
+  test("redacts the exec command from SecretRef detail to avoid leaking secret-store paths", async () => {
+    // Openclaw exec-source SecretRefs carry operator-authored shell
+    // commands like `op read op://CorpName-Vault/openai-prod/credential`.
+    // The command itself isn't a literal credential but the lookup path
+    // embeds organization, vault, and item identifiers that should not
+    // land in plan/apply output, reports, or anywhere a third party
+    // could read. The migrator must surface that a SecretRef exists
+    // (so the operator knows their key wasn't migrated) without
+    // echoing the command.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    const sensitiveCommand = "op read op://CorpName-Vault/openai-prod/credential";
+    const sensitiveId = "op://CorpName-Vault/openai-prod/credential";
+    writeFileSync(
+      join(OPENCLAW_ROOT, "agents", "main", "agent", "auth-profiles.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          "openai-via-1password": {
+            type: "api_key",
+            provider: "openai",
+            keyRef: {
+              source: "exec",
+              provider: "1password",
+              id: sensitiveId,
+              command: sensitiveCommand
+            }
+          }
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const ref = plan.unsupported.find(
+      (entry) =>
+        entry.kind === "provider:openai" && entry.detail.includes("SecretRef")
+    );
+    expect(ref).toBeDefined();
+    // Provider name is acceptable disclosure metadata — operators
+    // need to know it's a 1password ref to look it up themselves.
+    expect(ref?.detail).toContain("source=exec");
+    expect(ref?.detail).toContain("1password");
+    // Lookup paths must NOT appear.
+    expect(ref?.detail).not.toContain(sensitiveCommand);
+    expect(ref?.detail).not.toContain(sensitiveId);
+    expect(ref?.detail).not.toContain("CorpName-Vault");
+  });
+
   test("skips codex secret writes and points the operator at codex --login", () => {
     // Gini's codex provider reads OAuth from ~/.codex/auth.json, the
     // same file openclaw uses. There's no bearer env to migrate, so
