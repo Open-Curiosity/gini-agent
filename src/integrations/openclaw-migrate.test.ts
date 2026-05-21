@@ -165,7 +165,10 @@ function seedOpenclawTree(stateRoot: string, options: {
   }
 
   if (options.withWorkspaceFiles) {
-    const wsDir = join(GINI_HOME, ".openclaw", "workspace");
+    // Seed inside the snapshot's stateRoot, matching openclaw's own
+    // convention (<state>/workspace/). The HOME-relative fallback only
+    // fires for un-pathed discovery and is exercised separately.
+    const wsDir = join(stateRoot, "workspace");
     mkdirSync(wsDir, { recursive: true });
     writeFileSync(join(wsDir, "AGENTS.md"), "# AGENTS\n");
     writeFileSync(join(wsDir, "SOUL.md"), "# SOUL\n");
@@ -725,6 +728,29 @@ describe("planMigration", () => {
       "AGENTS.md",
       "SOUL.md"
     ]);
+  });
+
+  test("does not fall back to HOME workspace when pathArg is explicit", () => {
+    // An operator pointing --path at a snapshot or backup expects the
+    // migrator to read from that directory only. A HOME-relative
+    // workspace fallback would silently pull live ~/.openclaw/workspace
+    // when the snapshot is missing a workspace subdir, mixing two
+    // sources into one migration.
+    const snapshotRoot = `${ROOT}/explicit-snapshot`;
+    rmSync(snapshotRoot, { recursive: true, force: true });
+    mkdirSync(snapshotRoot, { recursive: true });
+    writeFileSync(join(snapshotRoot, "openclaw.json"), JSON.stringify({}));
+    // Plant a workspace at HOME-relative location that the migrator
+    // MUST NOT pick up given pathArg was explicit.
+    const homeWorkspace = join(GINI_HOME, ".openclaw", "workspace");
+    mkdirSync(homeWorkspace, { recursive: true });
+    writeFileSync(join(homeWorkspace, "AGENTS.md"), "# live AGENTS\n");
+    try {
+      const discovery = discoverOpenclawState(snapshotRoot);
+      expect(discovery.workspaceRoot).toBeNull();
+    } finally {
+      rmSync(homeWorkspace, { recursive: true, force: true });
+    }
   });
 
   test("finds workspace files inside the state root when HOME doesn't match", () => {

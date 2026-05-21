@@ -225,8 +225,13 @@ export function discoverOpenclawState(pathArg?: string): OpenclawDiscovery {
   // The default workspace dir lives INSIDE the state root by convention
   // (`<state>/workspace/`). Honor `OPENCLAW_WORKSPACE_DIR` and
   // `OPENCLAW_PROFILE` overrides first, then fall back to the in-state
-  // location, then the HOME-relative path for setups that overrode the
-  // state root but not HOME.
+  // location. The HOME-relative `<home>/.openclaw/workspace` fallback
+  // only fires when neither `pathArg` nor `OPENCLAW_STATE_DIR` was
+  // supplied — when the operator explicitly points the migrator at a
+  // snapshot or backup directory, falling through to the live HOME
+  // workspace would silently cross the source boundary and copy
+  // bootstrap markdown from the running install into the import.
+  const explicitStateRoot = Boolean(pathArg) || Boolean(envOverride);
   const workspaceCandidates: string[] = [];
   if (process.env.OPENCLAW_WORKSPACE_DIR) {
     workspaceCandidates.push(resolve(process.env.OPENCLAW_WORKSPACE_DIR));
@@ -234,10 +239,14 @@ export function discoverOpenclawState(pathArg?: string): OpenclawDiscovery {
   const profile = process.env.OPENCLAW_PROFILE;
   if (profile && profile.toLowerCase() !== "default") {
     workspaceCandidates.push(join(stateRoot, `workspace-${profile}`));
-    workspaceCandidates.push(join(home, ".openclaw", `workspace-${profile}`));
+    if (!explicitStateRoot) {
+      workspaceCandidates.push(join(home, ".openclaw", `workspace-${profile}`));
+    }
   }
   workspaceCandidates.push(join(stateRoot, "workspace"));
-  workspaceCandidates.push(join(home, ".openclaw", "workspace"));
+  if (!explicitStateRoot) {
+    workspaceCandidates.push(join(home, ".openclaw", "workspace"));
+  }
   const workspaceRoot = workspaceCandidates.find((candidate) => existsSync(candidate)) ?? null;
   return {
     stateRoot,
