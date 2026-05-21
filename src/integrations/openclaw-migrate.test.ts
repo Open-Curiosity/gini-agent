@@ -2714,6 +2714,41 @@ describe("applyMigration", () => {
     expect(warning).not.toContain("state.json");
   });
 
+  test("suppresses the Discord delivery-target warning when the bridge is skipped (existing, no --force)", async () => {
+    // On re-import without --force the migrator finds the existing
+    // Discord bridge and emits the "Skipped" warning. The
+    // delivery-target warning would be noise: it was meaningful on
+    // the first import (where the migrator created a dormant
+    // skeleton), but the operator's existing bridge presumably
+    // already has channels wired, so warning them again to
+    // re-create it would just add confusion.
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withDiscordChannel: true
+    });
+    const config = loadConfig("discord-skip-no-warn");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    // First apply lays down the bridge skeleton (will warn about
+    // delivery targets).
+    const first = await applyMigration(config, discovery, planMigration(discovery));
+    expect(first.bridgesCreated).toBe(1);
+    expect(
+      first.warnings.some((w) => w.includes("Discord") && w.includes("deliveryTargets"))
+    ).toBe(true);
+    // Second apply finds the existing bridge and skips. The
+    // delivery-target warning must NOT fire — the only Discord
+    // message should be the "Skipped" notice.
+    const second = await applyMigration(config, discovery, planMigration(discovery));
+    expect(second.bridgesCreated).toBe(0);
+    expect(second.bridgesRotated).toBe(0);
+    expect(
+      second.warnings.some((w) => w.includes("Discord") && w.includes("deliveryTargets"))
+    ).toBe(false);
+    expect(
+      second.warnings.some((w) => w.includes("Skipped discord bridge"))
+    ).toBe(true);
+  });
+
   test("skips existing secrets.env entries unless --force is set", async () => {
     // ~/.gini/secrets.env is shared across instances, so silently
     // overwriting OPENAI_API_KEY with whatever openclaw stored would

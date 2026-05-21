@@ -2504,23 +2504,6 @@ export async function applyMigration(
     // the operator can finish wiring with `gini messaging` after the
     // migration, but warn them clearly that the supervisor will stay
     // dormant until they add at least one delivery channel.
-    if (step.bridgeKind === "discord") {
-      // Gini doesn't currently expose an "edit existing bridge" verb on
-      // the messaging API, and `gini messaging add` is strict-create
-      // (would produce a second Discord bridge alongside the migrated
-      // one). Direct the operator at the only safe in-band flow:
-      // disable the dormant bridge and re-create with the desired
-      // delivery channels, re-supplying the bot token from openclaw.
-      // We deliberately do NOT suggest hand-editing state.json — that
-      // skips the audit chain, the per-instance mutateState lock, and
-      // the atomic tmp+rename, all of which exist to keep state
-      // consistent. Implementing a dedicated edit verb is the right
-      // long-term answer; the warning surfaces the friction in the
-      // meantime.
-      warnings.push(
-        `Discord bridge migrated without deliveryTargets; supervisor will stay idle until you wire channels. Run \`gini messaging disable <bridge-id>\` then \`gini messaging add <name> discord <channel-id>... --bot-token <token>\` to re-create the bridge with delivery channels, supplying the same bot token openclaw used.`
-      );
-    }
     // First pass: decide whether we are creating or rotating, AND
     // for the create path, insert the bridge record BEFORE we touch
     // the encrypted secret store. Mirrors the canonical
@@ -2576,6 +2559,25 @@ export async function applyMigration(
         `Skipped ${step.bridgeKind} bridge: one already exists (use --force to rotate token and merge allow-list)`
       );
       continue;
+    }
+    if (step.bridgeKind === "discord") {
+      // Openclaw stored a per-sender allow-list, gini stores per-
+      // channel delivery snowflakes — the two cannot be mapped 1:1
+      // from disk state, so the migrated Discord bridge lands with
+      // an empty `deliveryTargets[]` and the supervisor will stay
+      // idle until the operator wires channels in. We only want to
+      // warn when an actual create or rotate is about to happen
+      // (the skip branch above already produced its own "Skipped"
+      // message and the operator's existing bridge has its own
+      // delivery channels). Gini doesn't expose an "edit existing
+      // bridge" verb yet, so the remediation is disable-and-
+      // recreate. Editing state.json by hand would skip the audit
+      // chain, the per-instance mutateState lock, and the atomic
+      // tmp+rename — all the consistency guards exist for a
+      // reason.
+      warnings.push(
+        `Discord bridge migrated without deliveryTargets; supervisor will stay idle until you wire channels. Run \`gini messaging disable <bridge-id>\` then \`gini messaging add <name> discord <channel-id>... --bot-token <token>\` to re-create the bridge with delivery channels, supplying the same bot token openclaw used.`
+      );
     }
     const ref = writeSecret(
       config.instance,
