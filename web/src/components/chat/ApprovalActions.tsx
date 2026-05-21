@@ -46,6 +46,44 @@ interface PayloadField {
   placeholder?: string;
 }
 
+// Render the approval card's reason text with line breaks preserved and
+// HTTPS URLs auto-linkified. Skills can embed Cloud Console URLs in the
+// `reason` field so the user clicks directly from the inline form body;
+// without auto-linkification the URLs render as plain text and require
+// copy-paste.
+//
+// Trailing punctuation (`.`, `,`, `;`, `:`, `!`, `?`, `)`) is stripped
+// from the matched URL and treated as text — `https://example.com/foo.`
+// links to `https://example.com/foo`, with the dot rendered after the
+// anchor. The `reason` is constructed by the runtime from skill
+// instructions, not free-form user input, so we don't need to escape
+// against XSS beyond React's default text rendering.
+function renderReason(text: string): React.ReactNode[] {
+  const parts = text.split(/(https?:\/\/[^\s]+)/g);
+  return parts.map((part, index) => {
+    const isUrl = /^https?:\/\//.test(part);
+    if (!isUrl) {
+      return <span key={index}>{part}</span>;
+    }
+    const trailingMatch = part.match(/[.,;:!?)]+$/);
+    const trailing = trailingMatch ? trailingMatch[0] : "";
+    const url = trailing ? part.slice(0, part.length - trailing.length) : part;
+    return (
+      <span key={index}>
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          className="underline text-blue-400 hover:text-blue-300 break-all"
+        >
+          {url}
+        </a>
+        {trailing}
+      </span>
+    );
+  });
+}
+
 export function ApprovalActions({ taskId }: { taskId: string }) {
   const approvals = useApprovals();
   const invalidate = useInvalidate();
@@ -193,7 +231,9 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
             </div>
             {isConnectorRequest ? (
               <>
-                <p className="mt-1 text-xs text-foreground/90">{reasonText}</p>
+                <p className="mt-1 whitespace-pre-wrap text-xs text-foreground/90">
+                  {renderReason(reasonText)}
+                </p>
                 <div className="mt-3 space-y-3">
                   {fields.map((field) => (
                     <div key={field.name} className="space-y-1">
@@ -231,7 +271,9 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
                 </div>
               </>
             ) : isBrowserConnect ? (
-              <p className="mt-1 text-xs text-foreground/90">{reasonText}</p>
+              <p className="mt-1 whitespace-pre-wrap text-xs text-foreground/90">
+                {renderReason(reasonText)}
+              </p>
             ) : (
               <>
                 <p className="mt-1 text-xs text-muted-foreground">{approval.reason}</p>
