@@ -1,5 +1,13 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -1853,6 +1861,80 @@ describe("applyMigration archive", () => {
     const listing = execFileSync("unzip", ["-l", archive], { encoding: "utf8" });
     expect(listing).toContain("marker.txt");
     expect(listing).toContain("openclaw.json");
+  });
+
+  test("workspace symlink source is refused and warned about", async () => {
+    // `copyFileSync` follows symlinks by default, so a `workspace/SOUL.md`
+    // symlink to `/etc/passwd` would happily rematerialize that file
+    // inside the gini workspace, defeating the workspace sandbox other
+    // tooling relies on. Refuse symlinks outright instead of trying to
+    // walk a realpath chain.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withWorkspaceFiles: true });
+    // Replace one workspace file with a symlink to a sensitive-looking
+    // outside target. Use /etc/hosts as the link target since it's
+    // world-readable on macOS/Linux test hosts.
+    const link = join(OPENCLAW_ROOT, "workspace", "AGENTS.md");
+    rmSync(link, { force: true });
+    symlinkSync("/etc/hosts", link);
+    const config = loadConfig("workspace-symlink-refused");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    // SOUL.md still copies; AGENTS.md is dropped.
+    expect(result.workspaceFilesCopied).toBe(1);
+    const target = join(GINI_STATE, "instances", "workspace-symlink-refused", "workspace", "AGENTS.md");
+    expect(existsSync(target)).toBe(false);
+    expect(result.warnings.some((warning) => warning.includes("AGENTS.md") && warning.includes("symlink"))).toBe(true);
+  });
+
+  test("skill SKILL.md symlink source is refused and warned about", async () => {
+    // Same threat as the workspace test, applied to the skill copy
+    // path which uses `readFileSync` (also follows symlinks).
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withSkill: true });
+    const link = join(OPENCLAW_ROOT, "skills", "memo-helper", "SKILL.md");
+    rmSync(link, { force: true });
+    symlinkSync("/etc/hosts", link);
+    const config = loadConfig("skill-symlink-refused");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.skillsCopied).toBe(0);
+    expect(
+      result.warnings.some((warning) => warning.includes("memo-helper") && warning.includes("symlink"))
+    ).toBe(true);
+  });
+
+  test("nested symlink inside skill scripts directory is dropped during recursive copy", async () => {
+    // cpSync with `dereference: false` (Node default) would preserve a
+    // nested outward-pointing symlink, leaving a dangling exfiltration
+    // vector that gini tools could later read through. copyDirShallow's
+    // filter must refuse them.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withSkill: true });
+    const link = join(OPENCLAW_ROOT, "skills", "memo-helper", "scripts", "evil.sh");
+    symlinkSync("/etc/hosts", link);
+    const config = loadConfig("skill-nested-symlink");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.skillsCopied).toBe(1);
+    const evilTarget = join(
+      GINI_STATE,
+      "instances",
+      "skill-nested-symlink",
+      "skills",
+      "memo-helper",
+      "scripts",
+      "evil.sh"
+    );
+    expect(existsSync(evilTarget)).toBe(false);
+    // helper.sh (the legitimate sibling file from the fixture) still copies.
+    const helperTarget = join(
+      GINI_STATE,
+      "instances",
+      "skill-nested-symlink",
+      "skills",
+      "memo-helper",
+      "scripts",
+      "helper.sh"
+    );
+    expect(existsSync(helperTarget)).toBe(true);
   });
 
   test("archive directory + file land at owner-only modes (0700 / 0600)", async () => {

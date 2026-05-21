@@ -73,6 +73,7 @@ import {
   copyFileSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -775,6 +776,32 @@ function resolveAgentDirOverride(
     return override.replace(/^~(?=\/|$)/, home);
   }
   return join(agentsDir, openclawId, "agent");
+}
+
+// Reject a copy source that is a symlink. `copyFileSync` and
+// `readFileSync` follow symlinks by default, so a hand-crafted openclaw
+// state with `skills/foo/SKILL.md` symlinked to `/etc/passwd` (or
+// `workspace/SOUL.md` -> `~/.aws/credentials`) would dereference and
+// rematerialize the link target inside the gini instance — defeating
+// the workspace sandbox that `assertInsideWorkspaceNoSymlinkEscape`
+// elsewhere relies on. The migrator imports from operator-supplied
+// `--path` arguments (a tarball extract, a coworker's backup), so the
+// source is not necessarily trustworthy. Refusing symlinks outright is
+// simpler than a realpath escape check and matches the operator-
+// authored shape of legitimate openclaw skills (no symlinks in
+// bundled fixtures, no symlinks in the real backup we tested against).
+// `cpSync` with `dereference: false` (Node's default) preserves
+// symlinks as symlinks — copyDirShallow uses an explicit filter to
+// drop them entirely so the destination never holds a dangling
+// outward-pointing link either.
+function isSymlinkSource(sourcePath: string): boolean {
+  try {
+    return lstatSync(sourcePath).isSymbolicLink();
+  } catch {
+    // lstat failure (missing source) falls through to the underlying
+    // copy attempt, which surfaces a more specific error.
+    return false;
+  }
 }
 
 // Openclaw's own agent-id validator (`normalizeAgentId` at
@@ -1553,6 +1580,12 @@ export async function applyMigration(
       warnings.push(`Skipped existing workspace file: ${step.name} (use --force to overwrite)`);
       continue;
     }
+    if (isSymlinkSource(step.sourcePath)) {
+      warnings.push(
+        `Skipped workspace file ${step.name}: source is a symlink and may point outside the openclaw state root. Replace the symlink with the actual content in openclaw before re-migrating.`
+      );
+      continue;
+    }
     try {
       copyFileSync(step.sourcePath, target);
       workspaceFilesCopied += 1;
@@ -1575,6 +1608,12 @@ export async function applyMigration(
     const targetSkill = join(targetDir, "SKILL.md");
     if (existsSync(targetSkill) && !options.force) {
       warnings.push(`Skipped existing skill: ${step.name} (use --force to overwrite)`);
+      continue;
+    }
+    if (isSymlinkSource(step.sourcePath)) {
+      warnings.push(
+        `Skipped skill ${step.name}: SKILL.md is a symlink and may point outside the openclaw state root. Replace the symlink with the actual content in openclaw before re-migrating.`
+      );
       continue;
     }
     try {
@@ -2354,13 +2393,26 @@ function copyDirShallow(
   }
   for (const entry of entries) {
     if (exclude.has(entry.name)) continue;
+    // Dirent's isDirectory/isFile/isSymbolicLink are mutually exclusive,
+    // so a top-level symlink falls into neither isDirectory nor isFile
+    // and is naturally dropped here. The deeper concern is nested
+    // symlinks inside a recursed directory — cpSync with
+    // `dereference: false` (Node default) would preserve them as
+    // outward-pointing links in the destination, leaving a dangling
+    // exfiltration vector that gini tools could later read through.
+    // Use cpSync's filter callback to refuse any symlink encountered
+    // during the recursive walk.
     const src = join(srcDir, entry.name);
     const dst = join(dstDir, entry.name);
     if (entry.isDirectory()) {
       // cpSync(..., { recursive: true }) overwrites by default; passing
       // { force: false } guards existing files when the caller hasn't
       // opted into a refresh.
-      cpSync(src, dst, { recursive: true, force: overwrite });
+      cpSync(src, dst, {
+        recursive: true,
+        force: overwrite,
+        filter: (candidate) => !isSymlinkSource(candidate)
+      });
     } else if (entry.isFile() && (overwrite || !existsSync(dst))) {
       copyFileSync(src, dst);
     }
