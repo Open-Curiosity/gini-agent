@@ -67,7 +67,8 @@ import type {
   ImportReport,
   Instance,
   MessagingBridgeRecord,
-  RuntimeConfig
+  RuntimeConfig,
+  RuntimeState
 } from "../types";
 import {
   addAudit,
@@ -978,7 +979,7 @@ export async function applyMigration(
   // activity feed records the attempt; the failed status makes the
   // outcome unambiguous.
   if (!plan.source.configExists) {
-    const failedReport = await guardedMutate((state) =>
+    const failedReport = await guardedMutate((state: RuntimeState) =>
       createImportReport(state, {
         source: "openclaw",
         path: source.stateRoot,
@@ -1106,7 +1107,7 @@ export async function applyMigration(
 
   // 4) Agents. Skip if an agent with the same name already exists so
   // re-running the migrator is idempotent.
-  await guardedMutate((state) => {
+  await guardedMutate((state: RuntimeState) => {
     for (const step of plan.steps) {
       if (step.kind !== "agent") continue;
       if (state.agents.some((existing) => existing.name === step.name)) {
@@ -1197,7 +1198,7 @@ export async function applyMigration(
     // from the first call would land on a stale snapshot that gets
     // discarded before the next write, so the rotation appears to
     // succeed (no error) while the metadata never persists.
-    const decision = await guardedMutate((state) => {
+    const decision = await guardedMutate((state: RuntimeState) => {
       const found = state.messagingBridges.find(
         (bridge) => bridge.kind === step.bridgeKind
       );
@@ -1217,7 +1218,7 @@ export async function applyMigration(
       "bot-token",
       step.tokenValue
     );
-    await guardedMutate((state) => {
+    await guardedMutate((state: RuntimeState) => {
       const at = now();
       const metadata: Record<string, unknown> =
         step.bridgeKind === "telegram"
@@ -1295,7 +1296,7 @@ export async function applyMigration(
     ...plan.unsupported.map((entry) => `Unsupported: ${entry.kind} — ${entry.detail}`),
     ...warnings.map((warning) => `Warning: ${warning}`)
   ];
-  const report = await guardedMutate((state) =>
+  const report = await guardedMutate((state: RuntimeState) =>
     createImportReport(state, {
       source: "openclaw",
       path: source.stateRoot,
