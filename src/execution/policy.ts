@@ -119,9 +119,9 @@ export function resolveApprovalPolicy(
   // under "auto" mode. Spawning a visible Chrome with a persistent
   // per-instance profile is the trust-establishment moment that
   // warrants explicit user consent — every subsequent click/type
-  // happens within a window the user already approved opening. The
-  // ADR (browser-default-toolset.md) calls this out as the second
-  // exception to the browser carve-out alongside browser.upload_file.
+  // happens within a window the user already approved opening. It's
+  // the second exception to the browser carve-out alongside
+  // browser.upload_file (which egresses workspace bytes).
 
   if (action === "terminal.exec") {
     const command = typeof (payload as TerminalExecPayload | undefined)?.command === "string"

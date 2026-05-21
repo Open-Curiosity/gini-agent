@@ -142,9 +142,9 @@ export function defaultTools(instance: Instance, at: string): ToolRecord[] {
 // toolset's enabled/disabled status.
 //
 // `browser` is included so new agents can drive the headless Chrome
-// surface (navigate/snapshot/click/type/upload/etc.) on day one, per
-// ADR browser-default-toolset.md. A migration in store.ts widens
-// existing agent_default rows whose toolsets predate this addition.
+// surface (navigate/snapshot/click/type/upload/etc.) on day one.
+// A migration in store.ts widens existing agent_default rows whose
+// toolsets predate this addition.
 export const DEFAULT_AGENT_TOOLSETS: readonly string[] = [
   "file",
   "terminal",

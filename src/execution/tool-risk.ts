@@ -16,10 +16,9 @@ export const ACTION_RISK: ReadonlyMap<string, RiskLevel> = new Map<string, RiskL
   ["browser.tabs.close", "medium"],
   // browser.connect spawns a persistent Chrome profile and surfaces a
   // desktop window — the trust-establishment moment that warrants an
-  // explicit approval row. Other browser actions skip approval per the
-  // browser-default-toolset ADR because they happen *within* a window
-  // the user already approved; this is the action that establishes
-  // that window.
+  // explicit approval row. Other browser actions skip approval because
+  // they happen *within* a window the user already approved; this is
+  // the action that establishes that window.
   ["browser.connect", "medium"],
   ["browser.upload_file", "high"]
   // anything not listed defaults to "low" via the helper below
