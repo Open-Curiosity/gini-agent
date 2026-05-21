@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Homebrew (or another package manager) and a Google account."
 metadata:
   gini:
-    version: 3.2.1
+    version: 3.2.2
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -82,39 +82,52 @@ This opens the user's **default browser** to Google's OAuth consent page. They s
 
 If `gcloud auth list` already shows an active account, ask once: "gcloud is signed in as `<email>`. Use this account?" — proceed on confirmation. Otherwise run `gcloud auth login` straight through.
 
-## Step 4 — Create the Cloud project and enable APIs
+## Step 4 — Reach a Cloud project with the six APIs enabled
 
-Both substeps are silent. The user does not need to click anything in a browser for this step.
+The goal of this step is a single value, `<PROJECT_ID>`, that names a Cloud project the active gcloud account owns AND in which the six Workspace APIs are enabled. Every later step substitutes that string into URLs and `gcloud --project=` flags.
 
-**Carry the actual project ID forward.** The literal string `gini-workspace` is globally claimed and the bare name will fail with `ALREADY_EXISTS` for most users — this is the common case, not the exception. Treat the project ID as a value the model captures from `gcloud`'s output, then passes back to every subsequent `gcloud` and `gws` call via `--project=<id>`. Never assume the active project is what you think it is — `gcloud config get-value project` can carry over an unrelated project from earlier shells.
+**Invariants for this step and every later `gcloud` call:**
 
-### 4a. Reuse an existing Gini Workspace project if one exists
+- Pass `--project=<PROJECT_ID>` explicitly on every `gcloud` command that accepts it. Don't rely on `gcloud config get-value project`; its value can carry over from an unrelated shell or a prior failed run, which is exactly how the wrong-project `PERMISSION_DENIED` failure happens.
+- Treat `<PROJECT_ID>` as a value you discover, not a value you write. Read it from the output of `projects list` or `projects create`, then thread it through.
+- If the user named a specific project earlier in this chat ("use my work project `acme-data-1234`"), use that as `<PROJECT_ID>` and skip straight to 4c. Don't second-guess by listing or creating.
+
+### 4a. Look for a Gini-managed project first
 
 ```bash
-gcloud projects list --filter="name:'Gini Workspace'" --format="value(projectId)"
+gcloud projects list --filter="projectId:gini-workspace-*" --format="value(projectId)"
 ```
 
-If this returns one or more IDs, pick the first one as `<PROJECT_ID>` and skip ahead to 4c. (The user already ran setup before; no need to make another project.)
+The filter is on **project ID prefix**, which we control — not display name, which collides freely. Every project this skill creates has an ID starting with `gini-workspace-`. If the command returns one or more IDs, pick the first as `<PROJECT_ID>` and skip ahead to 4c. A prior setup run already provisioned it; making another would just leave orphans.
 
-### 4b. Otherwise create one
+### 4b. Otherwise, create one (only when 4a returns nothing)
 
-Pick an ID. Try the bare name first; on `ALREADY_EXISTS`, append a stable suffix derived from the user's email local-part (e.g. `gini-workspace-shelden` for `shelden@…`). Do not use a random suffix — re-runs of setup should land on the same project.
+The bare ID `gini-workspace` is almost always globally claimed — don't waste an attempt on it. Derive a deterministic, account-scoped suffix from the gcloud account so re-runs converge instead of accumulating projects:
 
 ```bash
-# Attempt 1:
-gcloud projects create gini-workspace --name="Gini Workspace"
-# On ALREADY_EXISTS:
+gcloud config get-value account
+# → something like "shelden@lilaclabs.ai"
+```
+
+Take the part before `@`, lowercase, and strip to `[a-z0-9-]`. The project-ID cap is 30 chars; `gini-workspace-` is 15, so truncate the suffix to 15 chars if needed.
+
+```bash
 gcloud projects create gini-workspace-<suffix> --name="Gini Workspace"
 ```
 
-`<PROJECT_ID>` is whichever one of those returned success. Remember it.
+If even that ID is taken (rare — only when a different user with the same email local-part already claimed it globally), append a 4-char random tiebreaker. `<PROJECT_ID>` is whichever ID succeeded.
 
-### 4c. Set the active project and enable the six APIs
+### 4c. Verify access, then enable the APIs
 
-Use `--project=<PROJECT_ID>` on the enable call rather than relying on `gcloud config` to carry the value — the explicit flag is what guards against the wrong-project failure shown by the `[user@host] does not have permission to access projects/...` error.
+`projects describe` is the cheapest probe that fails fast if the active account doesn't own `<PROJECT_ID>` — much better than learning it from `services enable`'s permission error after the model has already committed to a flow.
 
 ```bash
-gcloud config set project <PROJECT_ID>
+gcloud projects describe <PROJECT_ID> --format="value(projectId)"
+```
+
+On success, enable the six APIs (already-enabled ones are no-ops, which is fine when 4a reused an existing project):
+
+```bash
 gcloud services enable \
   gmail.googleapis.com \
   calendar-json.googleapis.com \
@@ -125,9 +138,9 @@ gcloud services enable \
   --project=<PROJECT_ID>
 ```
 
-Calendar's service ID is `calendar-json.googleapis.com` (not `calendar.googleapis.com`). Already-enabled APIs are no-ops.
+Calendar's service ID is `calendar-json.googleapis.com` (not `calendar.googleapis.com`).
 
-If `services enable` errors with `PERMISSION_DENIED` even with `--project=<PROJECT_ID>`, the active gcloud account doesn't own that project. Surface the error verbatim and ask the user briefly: "I don't have access to `<PROJECT_ID>`. Which Cloud project should I use?" Wait for an ID, then re-run 4c with that one. Do not silently fall back to `gcloud config get-value project` — that's how the wrong project sneaks in.
+If either 4c command errors with `PERMISSION_DENIED`, the active account doesn't own `<PROJECT_ID>`. Surface the error verbatim and ask the user briefly: "I don't have access to `<PROJECT_ID>`. Which project should I use?" Take their answer as the new `<PROJECT_ID>` and re-run from `projects describe`. Do not fall back to `gcloud config get-value project` to recover — that's the same stale value that produced the original failure.
 
 ## Step 5 — Last step: capture OAuth Desktop credentials
 
