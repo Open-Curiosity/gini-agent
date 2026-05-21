@@ -522,6 +522,43 @@ describe("rewriteSkillFrontmatter", () => {
     const raw = "---\nname: foo\ndescription: bar\n---\nbody";
     expect(rewriteSkillFrontmatter(raw)).toBe(raw);
   });
+
+  test("does not duplicate metadata: when a legacy openclaw: sits alongside an existing metadata: block", () => {
+    // Two top-level keys would produce invalid YAML and the gini
+    // loader's first-match-wins parser silently drops one side.
+    const raw = [
+      "---",
+      "name: dual",
+      "metadata:",
+      "  license: MIT",
+      "openclaw:",
+      "  emoji: X",
+      "---",
+      "body"
+    ].join("\n");
+    const out = rewriteSkillFrontmatter(raw);
+    const metadataCount = (out.match(/^metadata:[ \t]*(?:\r?\n|$)/gm) ?? []).length;
+    expect(metadataCount).toBe(1);
+  });
+
+  test("does not consume an unrelated field's flow block when metadata is block-style", () => {
+    // convertFlowStyleMetadata used to scan forward from metadata:
+    // for any `{`, so a later field whose value happened to be a flow
+    // block carrying an `openclaw` key was misread as the metadata
+    // value, replacing the block-style metadata field outright.
+    const raw = [
+      "---",
+      "name: scopey",
+      "metadata:",
+      "  license: MIT",
+      "config:",
+      '  { "openclaw": { "emoji": "Z" } }',
+      "---",
+      "body"
+    ].join("\n");
+    const out = rewriteSkillFrontmatter(raw);
+    expect(out).toContain("metadata:\n  license: MIT");
+  });
 });
 
 describe("discoverOpenclawState", () => {

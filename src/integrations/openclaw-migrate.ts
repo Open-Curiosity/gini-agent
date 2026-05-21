@@ -1425,9 +1425,15 @@ function rewriteFrontmatterBody(body: string): string {
   // Shape 2: block-style nested key (any indentation).
   out = out.replace(/^([ \t]+)openclaw:(\s*)$/gm, "$1gini:$2");
   // Shape 3: legacy top-level block. Promote to metadata.gini with
-  // child indentation bumped by two spaces.
+  // child indentation bumped by two spaces. Skip when a top-level
+  // `metadata:` already exists — promoting in that case would produce
+  // a second sibling `metadata:` key, which is invalid YAML and the
+  // gini skill loader's first match wins (silently dropping whichever
+  // half landed second). Operators with both keys present should
+  // hand-merge.
+  const hasTopLevelMetadata = /^metadata:[ \t]*(?:\r?\n|$)/m.test(out);
   const legacy = /^openclaw:[ \t]*\r?\n((?:[ \t]+.*(?:\r?\n|$))*)/m.exec(out);
-  if (legacy) {
+  if (legacy && !hasTopLevelMetadata) {
     const children = legacy[1] ?? "";
     const reindented = children
       .split("\n")
@@ -1449,8 +1455,17 @@ function rewriteFrontmatterBody(body: string): string {
 function convertFlowStyleMetadata(body: string): string {
   const header = /^metadata:[ \t]*\r?\n/m.exec(body);
   if (!header) return body;
-  const blockStart = body.indexOf("{", header.index + header[0].length);
-  if (blockStart < 0) return body;
+  // Only treat the metadata value as a flow-style block when the very
+  // next non-whitespace character (on the line immediately following
+  // `metadata:`) is `{`. Otherwise the metadata value is block-style
+  // (or absent), and scanning forward indiscriminately for a `{` would
+  // match a brace belonging to a sibling field — silently rewriting
+  // that field's value as if it were the metadata block.
+  const afterHeader = header.index + header[0].length;
+  const tail = body.slice(afterHeader);
+  const peek = /^([ \t]+)\{/.exec(tail);
+  if (!peek) return body;
+  const blockStart = afterHeader + (peek[0].length - 1);
   // Walk forward tracking brace depth and string state so we find the
   // matching closing brace even with nested objects.
   const blockEnd = findMatchingBrace(body, blockStart);
