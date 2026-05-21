@@ -362,8 +362,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // <file>.proposed and the runtime continues to read the approved
     // <file> until one of these endpoints renames the proposal over
     // the approved target. See ADR runtime-identity-files.md.
-    ["POST", /^\/api\/identity-files\/soul\/approve$/, async () => json(approveSoulProposal(config))],
-    ["POST", /^\/api\/identity-files\/user\/approve$/, async () => json(approveUserProfileProposal(config))],
+    ["POST", /^\/api\/identity-files\/soul\/approve$/, async () => json(await approveSoulProposal(config))],
+    ["POST", /^\/api\/identity-files\/user\/approve$/, async () => json(await approveUserProfileProposal(config))],
     ["GET", /^\/api\/skills$/, (request) => {
       const query = new URL(request.url).searchParams.get("q");
       return json(query ? searchSkills(config, query) : listSkills(config));
