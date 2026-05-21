@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Homebrew (or another package manager) and a Google account."
 metadata:
   gini:
-    version: 3.2.0
+    version: 3.2.1
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -86,30 +86,48 @@ If `gcloud auth list` already shows an active account, ask once: "gcloud is sign
 
 Both substeps are silent. The user does not need to click anything in a browser for this step.
 
-Create (or reuse) a project. Default name is `gini-workspace`; append a suffix like the user's initials if the global ID is taken:
+**Carry the actual project ID forward.** The literal string `gini-workspace` is globally claimed and the bare name will fail with `ALREADY_EXISTS` for most users — this is the common case, not the exception. Treat the project ID as a value the model captures from `gcloud`'s output, then passes back to every subsequent `gcloud` and `gws` call via `--project=<id>`. Never assume the active project is what you think it is — `gcloud config get-value project` can carry over an unrelated project from earlier shells.
+
+### 4a. Reuse an existing Gini Workspace project if one exists
 
 ```bash
-gcloud projects create gini-workspace --name="Gini Workspace"
-gcloud config set project gini-workspace
+gcloud projects list --filter="name:'Gini Workspace'" --format="value(projectId)"
 ```
 
-If `gini-workspace` returns `ALREADY_EXISTS`, try `gini-workspace-<initials>` or ask the user briefly.
+If this returns one or more IDs, pick the first one as `<PROJECT_ID>` and skip ahead to 4c. (The user already ran setup before; no need to make another project.)
 
-Enable all six Workspace APIs in one call (already-enabled APIs are no-ops):
+### 4b. Otherwise create one
+
+Pick an ID. Try the bare name first; on `ALREADY_EXISTS`, append a stable suffix derived from the user's email local-part (e.g. `gini-workspace-shelden` for `shelden@…`). Do not use a random suffix — re-runs of setup should land on the same project.
 
 ```bash
+# Attempt 1:
+gcloud projects create gini-workspace --name="Gini Workspace"
+# On ALREADY_EXISTS:
+gcloud projects create gini-workspace-<suffix> --name="Gini Workspace"
+```
+
+`<PROJECT_ID>` is whichever one of those returned success. Remember it.
+
+### 4c. Set the active project and enable the six APIs
+
+Use `--project=<PROJECT_ID>` on the enable call rather than relying on `gcloud config` to carry the value — the explicit flag is what guards against the wrong-project failure shown by the `[user@host] does not have permission to access projects/...` error.
+
+```bash
+gcloud config set project <PROJECT_ID>
 gcloud services enable \
   gmail.googleapis.com \
   calendar-json.googleapis.com \
   drive.googleapis.com \
   docs.googleapis.com \
   forms.googleapis.com \
-  meet.googleapis.com
+  meet.googleapis.com \
+  --project=<PROJECT_ID>
 ```
 
-Calendar's service ID is `calendar-json.googleapis.com` (not `calendar.googleapis.com`).
+Calendar's service ID is `calendar-json.googleapis.com` (not `calendar.googleapis.com`). Already-enabled APIs are no-ops.
 
-On `PERMISSION_DENIED`, surface the error verbatim and ask the user to pick a project they own with `gcloud config set project <project_id>`.
+If `services enable` errors with `PERMISSION_DENIED` even with `--project=<PROJECT_ID>`, the active gcloud account doesn't own that project. Surface the error verbatim and ask the user briefly: "I don't have access to `<PROJECT_ID>`. Which Cloud project should I use?" Wait for an ID, then re-run 4c with that one. Do not silently fall back to `gcloud config get-value project` — that's how the wrong project sneaks in.
 
 ## Step 5 — Last step: capture OAuth Desktop credentials
 
