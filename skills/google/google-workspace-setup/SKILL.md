@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Homebrew (or another package manager) and a Google account."
 metadata:
   gini:
-    version: 3.4.0
+    version: 3.5.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -221,6 +221,8 @@ Open this URL in your browser to authenticate:
 
 and blocks waiting for the user to complete consent. **It does NOT spawn the browser itself** — despite what `gws auth login --help` claims. If you just run `gws auth login` from `terminal_exec`, the URL goes into Gini's captured stdout and the user never sees it.
 
+**Always pass every service we enabled APIs for to `-s`, regardless of what the user originally asked.** The user enabled APIs for all seven Workspace products in Step 4, and Google's consent screen renders each scope as its own row with per-scope checkboxes (for unverified apps in testing mode) — the user picks which to grant *there*, not by us pre-filtering the `-s` list. Narrowing `-s` to just "calendar" because the user's first ask was a calendar question silently locks them out of Drive / Gmail / Docs / etc. for the rest of the session.
+
 To actually pop the browser, run gws in the background, scrape the URL out of its log, hand it to `open`, then wait for gws to finish. One `terminal_exec` call, single shell pipeline:
 
 ```bash
@@ -250,7 +252,7 @@ rm -f "$LOG"
 exit $GWS_EXIT
 ```
 
-The user's default browser pops to Google's consent page, they pick scopes and approve, gws receives the callback, the command exits. `terminal_exec`'s timeout should be generous (≥ 3 min) — most users take 20-60 s, but a forgotten 2FA prompt can stretch it.
+The user's default browser pops to Google's consent page listing every requested scope with its own checkbox; they tick the ones they want, click Continue, gws receives the callback, the command exits. `terminal_exec`'s timeout should be generous (≥ 3 min) — most users take 20-60 s, but a forgotten 2FA prompt can stretch it.
 
 If `wait $GWS_PID` returns non-zero, gws's exit reason is in `$LOG` (printed before exit). Common cases:
 
@@ -258,19 +260,25 @@ If `wait $GWS_PID` returns non-zero, gws's exit reason is in `$LOG` (printed bef
 - "redirect_uri mismatch" → the Cloud Console OAuth client was created as Web type, not Desktop. Re-create as Desktop and re-paste.
 - The user closed the browser without approving → just re-run the same block. Idempotent.
 
-### Picking scopes if the user wants narrower
+### When the user wants different scopes than the default
+
+Two cases warrant deviating from the all-seven-services default:
+
+- **The user explicitly asks for a narrower or read-only grant** ("I only use Gmail, skip the rest" / "give Gini read-only access"). Trust them, and run with their narrower picks.
+- **The user is on a personal `@gmail.com` account AND wants the "full" Gmail scope** (`https://mail.google.com/`, which includes permanent delete). The default `recommended` preset will fail on unverified personal apps; you have to pass the full scope URL via `--scopes`.
 
 ```bash
-# Read-only across listed services
+# Read-only across the user's chosen services
 gws auth login --readonly -s gmail,drive
 
-# Exact per-scope picks (full URLs)
+# Exact per-scope picks (full URLs) — for the rare case the user names a
+# specific scope shape `-s` can't express
 gws auth login --scopes "https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/drive"
 ```
 
 `-s` takes **service names**, not scope strings — `-s gmail.readonly` is silently dropped.
 
-Recommended starting scopes per product (first column = `-s` shorthand; second column = full URL for `--scopes`):
+Reference table of `-s` shorthand ↔ full scope URL (only useful when the user names a specific scope shape; the default is the full seven-service `-s` list, not anything from this table):
 
 - **Gmail** — `-s gmail` ↔ `https://www.googleapis.com/auth/gmail.modify` (read + send + reply + label + draft; NOT permanent delete). Narrower: `.readonly` / `.send` / `.compose`.
 - **Gmail (full, incl. permanent delete)** — `--scopes "https://mail.google.com/"`. No `-s` shorthand.
@@ -281,7 +289,7 @@ Recommended starting scopes per product (first column = `-s` shorthand; second c
 - **Meet** — `-s meet` ↔ `https://www.googleapis.com/auth/meetings.space.created` (`.readonly` available).
 - **Forms** — `-s forms` ↔ `https://www.googleapis.com/auth/forms.body` (`.body.readonly`, `.responses.readonly` available).
 
-If the user is on a personal `@gmail.com` account, the default `recommended` preset will fail because the app is unverified. Always use a comma-separated `-s` list.
+Never pass `--full` or the default `recommended` preset on a personal `@gmail.com` account — those expand to 80+ scopes including pubsub and cloud-platform, which an unverified app cannot grant. The seven-service `-s` list stays under the ~25-scope cap.
 
 ## Step 7 — Stop the per-call approval prompt (optional)
 
@@ -319,7 +327,7 @@ If that returns JSON without an auth error, the setup is complete. Resume the us
 4. **Enable all seven Workspace APIs in Step 4 regardless of which product triggered setup.** One `gcloud services enable` call covers them all; this lets the user pivot to another product later without re-running setup.
 5. **Status messages are action-oriented and ungrouped.** Do not list "Installed gws, installed gcloud, signed in, created project, enabled APIs." The user sees a chat bubble per milestone (confirm setup, last-step form, done) — not a retrospective changelog.
 6. **Fail gracefully.** If `gcloud` errors with `PERMISSION_DENIED` or `ALREADY_EXISTS`, surface the error verbatim and ask the user. If an install fails, STOP — do not retry in a loop, hand off to the user with the one-line manual command.
-7. Narrow OAuth scopes to what the user actually asked for. Do not silently expand from read-only to write.
+7. **`gws auth login -s` includes every service we enabled APIs for in Step 4, not just the one the user happened to ask about.** Google's consent screen renders each scope as its own checkbox row in testing mode — the user picks there. Narrowing `-s` based on the current request silently locks the user out of the other six surfaces; they'd have to re-run setup the next time they want anything else. The only time you narrow is when the user explicitly says so ("read-only," "Gmail only," etc.).
 8. If the user is in a CI or headless environment, point them at the export flow (`gws auth export --unmasked > credentials.json` on a desktop machine, then `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=…` on the headless one).
 
 ## Manual Fallback
