@@ -20,6 +20,7 @@ import {
   parseOpenclawModelRouting,
   planMigration,
   readStateDotenv,
+  recordOpenclawPlanFailure,
   rewriteSkillFrontmatter,
   summarizePlan
 } from "./openclaw-migrate";
@@ -1211,6 +1212,98 @@ describe("planMigration", () => {
     expect(ref).toBeDefined();
     expect(ref?.detail).toContain("MY_OPENAI");
     expect(ref?.detail).toContain("OPENAI_API_KEY");
+  });
+
+  test("orphan-bank remediation message tells operator to update bank_id too", async () => {
+    // /api/memory/recall filters by both bank_id AND agent_id. The
+    // migrator routes orphan memory (no matching agent) into the
+    // default bank with agent_id NULL — updating only agent_id would
+    // leave the row pinned in bank_default while recall queries
+    // bank_<agentId>, so the units stay invisible. The warning must
+    // mention bank_id and the agent-create step that materializes
+    // the per-agent bank.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    // Plant a memory.db whose source bank name doesn't match any
+    // agent in agents.list[]. The default openclaw fixture has
+    // agents.list = [{ id: "main" }], so a memory file named
+    // `ghost.sqlite` is intentionally orphan.
+    const memoryDir = join(OPENCLAW_ROOT, "memory");
+    mkdirSync(memoryDir, { recursive: true });
+    const ghostDbPath = join(memoryDir, "ghost.sqlite");
+    const { Database: Sqlite } = require("bun:sqlite");
+    const seed = new Sqlite(ghostDbPath, { create: true });
+    seed.run(
+      "CREATE TABLE memory_banks (id TEXT PRIMARY KEY, name TEXT, created_at TEXT)"
+    );
+    seed.run(
+      "INSERT INTO memory_banks (id, name, created_at) VALUES ('bank-1', 'ghost', '2026-01-01T00:00:00Z')"
+    );
+    seed.run(
+      "CREATE TABLE memory_units (id TEXT PRIMARY KEY, bank_id TEXT, text TEXT, network TEXT, status TEXT, confidence REAL, metadata TEXT, mentioned_at TEXT, created_at TEXT, updated_at TEXT, embedding BLOB, embedding_model TEXT, embedding_dim INTEGER, last_recalled_at TEXT, recall_count INTEGER)"
+    );
+    seed.run(
+      "INSERT INTO memory_units (id, bank_id, text, network, status, confidence, metadata, mentioned_at, created_at, updated_at) VALUES ('unit-1', 'bank-1', 'orphan fact', 'experience', 'active', 0.8, '{}', '2026-01-01', '2026-01-01', '2026-01-01')"
+    );
+    seed.close();
+    const config = loadConfig("orphan-bank-message");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    const warning = result.warnings.find((w) => w.includes("openclaw bank 'ghost'"));
+    expect(warning).toBeDefined();
+    expect(warning).toContain("bank_id");
+    expect(warning).toContain("gini agents add");
+    expect(warning).toContain("bank_<agent-id>");
+  });
+
+  test("failed archive does not echo 'Archived to X' in the failure report findings", async () => {
+    // archivePath is assigned before zip runs (zip needs it as an
+    // argument). If zip then fails, the catch path would otherwise
+    // record a finding "Archived openclaw state to <path>" even
+    // though no such file exists. Gate the finding on a separate
+    // archiveSucceeded flag set only after zip + chmod complete.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const config = loadConfig("archive-fail-no-finding");
+    // Block the archive step by planting <instance>/imports as a
+    // regular file (mkdirSync recursive then throws on the leaf).
+    const instanceDir = join(GINI_STATE, "instances", "archive-fail-no-finding");
+    mkdirSync(instanceDir, { recursive: true });
+    writeFileSync(join(instanceDir, "imports"), "blocking-file");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    await expect(
+      applyMigration(config, discovery, planMigration(discovery))
+    ).rejects.toThrow();
+    const state = readState("archive-fail-no-finding");
+    const failedReport = state.importReports.find(
+      (r) => r.source === "openclaw" && r.status === "failed"
+    );
+    expect(failedReport).toBeDefined();
+    // The catch wrote a failed report, but archive never succeeded
+    // so the findings array must not claim an archive was created.
+    expect(
+      failedReport?.findings.some((line) => line.includes("Archived openclaw state to"))
+    ).toBe(false);
+  });
+
+  test("recordOpenclawPlanFailure persists a failed ImportReport for plan-time throws", async () => {
+    // planMigration parses the operator-supplied openclaw.json. A
+    // malformed file beyond what the tolerant JSONC scanner can fix
+    // throws SyntaxError before applyMigration's catch runs, so the
+    // failed-report write must come from a separate code path the
+    // CLI can invoke directly. This test exercises that helper
+    // independently of the CLI wiring.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: false });
+    const config = loadConfig("plan-failure-report");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const synthetic = new Error("openclaw.json: Unexpected token } at position 42");
+    const report = await recordOpenclawPlanFailure(config, discovery, synthetic);
+    expect(report).not.toBeNull();
+    expect(report?.status).toBe("failed");
+    expect(report?.mode).toBe("applied");
+    expect(report?.source).toBe("openclaw");
+    expect(report?.error).toContain("planMigration failed before apply could run");
+    expect(report?.error).toContain("Unexpected token");
+    const state = readState("plan-failure-report");
+    expect(state.importReports.some((r) => r.id === report?.id)).toBe(true);
   });
 
   test("rejects non-integer Telegram allow-list entries instead of coercing to 0", () => {

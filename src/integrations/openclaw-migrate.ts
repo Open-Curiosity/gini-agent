@@ -2115,6 +2115,12 @@ export async function applyMigration(
   let sessionMessagesCreated = 0;
   let memoryUnitsCreated = 0;
   let archivePath: string | undefined;
+  // archivePath is assigned before zip runs (the zip command needs
+  // it as an argument), so a throw between assignment and zip
+  // success would leave archivePath truthy with no actual file on
+  // disk. Track success separately so the failed-report catch
+  // only echoes "Archived to X" when the archive really exists.
+  let archiveSucceeded = false;
   try {
 
   // Short-circuit when there's no openclaw config to read. Without
@@ -2239,6 +2245,7 @@ export async function applyMigration(
     }
   }
   chmodSync(archivePath, 0o600);
+  archiveSucceeded = true;
 
   // 1) Provider secrets to ~/.gini/secrets.env. Done first so a freshly
   // installed gini picks them up on the next `gini run`. Mirror the
@@ -2808,7 +2815,7 @@ export async function applyMigration(
         if (!warnedOrphanBanks.has(step.sourceBank)) {
           warnedOrphanBanks.add(step.sourceBank);
           warnings.push(
-            `Memory units from openclaw bank '${step.sourceBank}' have no matching gini agent (openclaw id missing from agents.list?). Units land in the default bank with agent_id NULL — \`/api/memory/recall\` will NOT surface them until you reassign agent_id manually (UPDATE memory_units SET agent_id = '<agent-id>' WHERE metadata LIKE '%"openclawBank":"${step.sourceBank}"%').`
+            `Memory units from openclaw bank '${step.sourceBank}' have no matching gini agent (openclaw id missing from agents.list?). Units land in the default bank with agent_id NULL. \`/api/memory/recall\` filters by both bank_id AND agent_id, so reassigning only agent_id leaves the rows pinned in the default bank and invisible to recall. To recover: (1) create the gini agent (\`gini agents add <agent-id>\`) which also creates \`bank_<agent-id>\`, then (2) update BOTH fields: \`UPDATE memory_units SET agent_id = '<agent-id>', bank_id = 'bank_<agent-id>' WHERE metadata LIKE '%"openclawBank":"${step.sourceBank}"%'\`.`
           );
         }
       }
@@ -2920,7 +2927,9 @@ export async function applyMigration(
             warnings: warnings.length
           },
           findings: [
-            ...(archivePath ? [`Archived openclaw state to ${archivePath}`] : []),
+            ...(archiveSucceeded && archivePath
+              ? [`Archived openclaw state to ${archivePath}`]
+              : []),
             ...plan.unsupported.map((entry) => `Unsupported: ${entry.kind} — ${entry.detail}`),
             ...warnings.map((warning) => `Warning: ${warning}`)
           ],
@@ -2935,6 +2944,43 @@ export async function applyMigration(
     throw err;
   } finally {
     importLock.release();
+  }
+}
+
+// Write a failed ImportReport when `planMigration` throws before
+// the CLI ever gets to `applyMigration`. The apply path has its
+// own catch that records the failure, but plan-time failures
+// (malformed openclaw.json that survives the JSONC cleanup,
+// readFileSync ENOENT on configPath, etc.) propagate out of
+// `planMigration` straight to the CLI top-level without ever
+// reaching apply. Mirror the apply catch's pattern: refuse to
+// write while a gateway is alive (apply's lock + mutateState lock
+// can't serialize across processes), then record a failed report
+// so the activity feed shows the attempt instead of a silent stack
+// trace. Callers re-throw the original error after this returns so
+// the CLI exit code stays nonzero.
+export async function recordOpenclawPlanFailure(
+  config: RuntimeConfig,
+  source: OpenclawDiscovery,
+  error: unknown
+): Promise<ImportReport | null> {
+  const running = detectRunningGateway(config.instance);
+  if (running) return null;
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  try {
+    return await mutateState(config.instance, (state: RuntimeState) =>
+      createImportReport(state, {
+        source: "openclaw",
+        path: source.stateRoot,
+        mode: "applied",
+        status: "failed",
+        counts: {},
+        findings: [],
+        error: `planMigration failed before apply could run: ${errorMessage}`
+      })
+    );
+  } catch {
+    return null;
   }
 }
 

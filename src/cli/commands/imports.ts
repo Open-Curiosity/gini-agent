@@ -7,6 +7,7 @@ import {
   describeSource,
   discoverOpenclawState,
   planMigration,
+  recordOpenclawPlanFailure,
   summarizePlan
 } from "../../integrations/openclaw-migrate";
 
@@ -86,7 +87,20 @@ export async function importInspect(ctx: CliContext): Promise<void> {
       throw new Error("Usage: gini import apply openclaw [path] [--force]");
     }
     const discovery = discoverOpenclawState(path);
-    const plan = planMigration(discovery);
+    // planMigration parses the operator-supplied openclaw.json. If
+    // the file is malformed beyond what the tolerant JSONC scanner
+    // can fix, JSON.parse throws SyntaxError out of planMigration
+    // before applyMigration's catch path runs. Record a failed
+    // ImportReport so the activity feed shows the attempt; the
+    // original error still propagates so the CLI exit code stays
+    // nonzero and the operator sees the parse problem.
+    let plan;
+    try {
+      plan = planMigration(discovery);
+    } catch (err) {
+      await recordOpenclawPlanFailure(ctx.config, discovery, err);
+      throw err;
+    }
     const result = await applyMigration(ctx.config, discovery, plan, { force });
     print({
       source: describeSource(discovery),
