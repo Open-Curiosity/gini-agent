@@ -599,10 +599,26 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
   // AgentRecord keeps provider and model on separate fields, so we split
   // before handing them to the migration step.
   const defaultRouting = parseOpenclawModelRouting(config.agents?.defaults?.model);
+  // Track providers we've already complained about so a config with
+  // dozens of anthropic agents doesn't produce dozens of duplicate
+  // unsupported entries.
+  const flaggedUnsupportedProviders = new Set<string>();
+  const flagUnsupportedProvider = (providerName: string | undefined, agentLabel: string) => {
+    if (!providerName) return;
+    if (mapProviderToGini(providerName) !== null) return;
+    const key = providerName.toLowerCase();
+    if (flaggedUnsupportedProviders.has(key)) return;
+    flaggedUnsupportedProviders.add(key);
+    unsupported.push({
+      kind: `provider:${providerName}`,
+      detail: `Agent '${agentLabel}' uses openclaw provider '${providerName}'; gini has no native mapping and the imported agent will fall back to the instance provider until you wire one.`
+    });
+  };
   if (agentList.length === 0) {
     // Openclaw treats `main` as the implicit default when no list is
     // configured. We mirror that so users with the simplest config still
     // get an agent record.
+    flagUnsupportedProvider(defaultRouting.providerName, "main");
     steps.push({
       kind: "agent",
       openclawId: "main",
@@ -630,13 +646,15 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
         continue;
       }
       const routing = parseOpenclawModelRouting(agent.model);
+      const resolvedProvider = routing.providerName ?? defaultRouting.providerName;
+      flagUnsupportedProvider(resolvedProvider, openclawId);
       // Fall back to the defaults block when the agent didn't supply a
       // model of its own — openclaw resolves the same way at runtime.
       steps.push({
         kind: "agent",
         openclawId,
         name: openclawId,
-        providerName: routing.providerName ?? defaultRouting.providerName,
+        providerName: resolvedProvider,
         model: routing.model ?? defaultRouting.model
       });
       agentIds.push(openclawId);

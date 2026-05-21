@@ -876,6 +876,46 @@ describe("planMigration", () => {
     expect(telegram?.tokenValue).toBe("tg-token-from-dotenv");
   });
 
+  test("surfaces unsupported provider routing at plan time, not only apply time", () => {
+    // A user with no auth-profiles.json but agents.list[0].model
+    // pointing at an unsupported provider would have seen a clean
+    // dry-run and then a surprise warning + silent fallback to the
+    // instance provider on apply. The plan must surface the same
+    // provider:<name> entry the auth-profiles loop emits.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: {
+          list: [{ id: "main", default: true, model: "anthropic/claude-3-5-sonnet" }]
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const anthropicEntry = plan.unsupported.find(
+      (entry) => entry.kind === "provider:anthropic"
+    );
+    expect(anthropicEntry).toBeDefined();
+    expect(anthropicEntry?.detail).toContain("main");
+    expect(anthropicEntry?.detail).toContain("anthropic");
+  });
+
+  test("surfaces unsupported defaults-model provider for the implicit main agent", () => {
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: { defaults: { model: "google/gemini-2.5-pro" } }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    expect(
+      plan.unsupported.some((entry) => entry.kind === "provider:google")
+    ).toBe(true);
+  });
+
   test("captures unsupported channels in the report", () => {
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
     const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));

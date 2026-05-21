@@ -1,5 +1,5 @@
 import type { CliContext } from "../context";
-import { hasFlag, restAfter } from "../args";
+import { parseSubArgs, restAfter } from "../args";
 import { api } from "../api";
 import { print } from "../output";
 import {
@@ -10,8 +10,20 @@ import {
   summarizePlan
 } from "../../integrations/openclaw-migrate";
 
+const PLAN_FLAGS: ReadonlySet<string> = new Set();
+const APPLY_FLAGS: ReadonlySet<string> = new Set();
+const APPLY_BOOLEAN_FLAGS: ReadonlySet<string> = new Set(["--force"]);
+
+// `gini import inspect|plan|apply` share the same dispatch but vary
+// wildly in what they need from the surrounding context. We destructure
+// `cliArgs` up front because every branch consumes it, but `ctx.config`
+// is accessed only in the branches that legitimately need it — that
+// access triggers loadConfig which materializes the instance dir
+// (traces/, logs/, skills/, snapshots/, workspace/). `plan` is pure
+// inspection of an external openclaw source and must not create gini
+// scaffolding as a side effect.
 export async function importInspect(ctx: CliContext): Promise<void> {
-  const { config, cliArgs } = ctx;
+  const { cliArgs } = ctx;
   const sub = cliArgs[1] ?? "list";
   if (sub === "inspect") {
     const [source, path] = restAfter(cliArgs, sub);
@@ -19,7 +31,7 @@ export async function importInspect(ctx: CliContext): Promise<void> {
       throw new Error("Usage: gini import inspect openclaw <path>");
     }
     print(
-      await api(config, "/api/imports/inspect", {
+      await api(ctx.config, "/api/imports/inspect", {
         method: "POST",
         body: JSON.stringify({ source, path })
       })
@@ -27,8 +39,13 @@ export async function importInspect(ctx: CliContext): Promise<void> {
     return;
   }
   if (sub === "plan") {
-    const rest = restAfter(cliArgs, sub);
-    const [source, path] = rest.filter((value) => !value.startsWith("--"));
+    const { positional, unknownFlags } = parseSubArgs(restAfter(cliArgs, sub), PLAN_FLAGS);
+    if (unknownFlags.length > 0) {
+      throw new Error(
+        `Unknown flag${unknownFlags.length > 1 ? "s" : ""}: ${unknownFlags.join(", ")}\nUsage: gini import plan openclaw [path]`
+      );
+    }
+    const [source, path] = positional;
     if (source !== "openclaw") {
       throw new Error("Usage: gini import plan openclaw [path]");
     }
@@ -42,16 +59,25 @@ export async function importInspect(ctx: CliContext): Promise<void> {
     return;
   }
   if (sub === "apply") {
-    const rest = restAfter(cliArgs, sub);
-    const positional = rest.filter((value) => !value.startsWith("--"));
+    const tail = restAfter(cliArgs, sub);
+    // parseSubArgs only recognizes value-bearing flags; --force is a
+    // boolean, so we partition it out before calling the parser
+    // (otherwise the next positional would be consumed as the value).
+    const filteredTail = tail.filter((token) => !APPLY_BOOLEAN_FLAGS.has(token));
+    const force = tail.includes("--force");
+    const { positional, unknownFlags } = parseSubArgs(filteredTail, APPLY_FLAGS);
+    if (unknownFlags.length > 0) {
+      throw new Error(
+        `Unknown flag${unknownFlags.length > 1 ? "s" : ""}: ${unknownFlags.join(", ")}\nUsage: gini import apply openclaw [path] [--force]`
+      );
+    }
     const [source, path] = positional;
     if (source !== "openclaw") {
       throw new Error("Usage: gini import apply openclaw [path] [--force]");
     }
-    const force = hasFlag(rest, "--force");
     const discovery = discoverOpenclawState(path);
     const plan = planMigration(discovery);
-    const result = await applyMigration(config, discovery, plan, { force });
+    const result = await applyMigration(ctx.config, discovery, plan, { force });
     print({
       source: describeSource(discovery),
       applied: result.applied,
@@ -68,5 +94,5 @@ export async function importInspect(ctx: CliContext): Promise<void> {
     });
     return;
   }
-  print(await api(config, "/api/imports"));
+  print(await api(ctx.config, "/api/imports"));
 }
