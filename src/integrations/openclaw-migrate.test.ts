@@ -6,6 +6,7 @@ import {
   discoverOpenclawState,
   mapProviderToGini,
   parseOpenclawJson,
+  parseOpenclawModelRouting,
   planMigration,
   readStateDotenv,
   rewriteSkillFrontmatter,
@@ -74,10 +75,13 @@ function seedOpenclawTree(stateRoot: string, options: {
   if (options.withConfig) {
     const cfg = {
       agents: {
-        defaults: { model: "gpt-5.4-mini" },
+        // openclaw model strings carry provider+model together as
+        // "<provider>/<model>" — verbatim shape from openclaw's
+        // AgentModelConfig schema.
+        defaults: { model: "openai/gpt-5.4-mini" },
         list: [
-          { id: "main", default: true, model: "gpt-5.4-mini", providerName: "openai" },
-          { id: "work", providerName: "openai", model: "gpt-5.4-mini" }
+          { id: "main", default: true, model: "openai/gpt-5.4-mini" },
+          { id: "work", model: "openai/gpt-5.4-mini" }
         ]
       },
       channels: {
@@ -231,6 +235,44 @@ describe("readStateDotenv", () => {
   });
 });
 
+describe("parseOpenclawModelRouting", () => {
+  test("splits a provider/model string", () => {
+    expect(parseOpenclawModelRouting("openai/gpt-5")).toEqual({
+      providerName: "openai",
+      model: "gpt-5"
+    });
+    expect(parseOpenclawModelRouting("anthropic/claude-3-5-sonnet-20240620")).toEqual({
+      providerName: "anthropic",
+      model: "claude-3-5-sonnet-20240620"
+    });
+  });
+
+  test("reads the primary slot when given the object form", () => {
+    expect(parseOpenclawModelRouting({ primary: "openai/gpt-5", fallbacks: [] })).toEqual({
+      providerName: "openai",
+      model: "gpt-5"
+    });
+  });
+
+  test("returns model-only routing for bare model strings", () => {
+    expect(parseOpenclawModelRouting("gpt-5-mini")).toEqual({
+      providerName: undefined,
+      model: "gpt-5-mini"
+    });
+  });
+
+  test("returns empty routing when undefined", () => {
+    expect(parseOpenclawModelRouting(undefined)).toEqual({
+      providerName: undefined,
+      model: undefined
+    });
+    expect(parseOpenclawModelRouting({})).toEqual({
+      providerName: undefined,
+      model: undefined
+    });
+  });
+});
+
 describe("mapProviderToGini", () => {
   test("maps native providers", () => {
     expect(mapProviderToGini("openai")).toBe("openai");
@@ -377,6 +419,44 @@ describe("planMigration", () => {
       .filter((step) => step.kind === "agent")
       .map((step) => (step as { name: string }).name);
     expect(agentNames).toEqual(["main", "work"]);
+  });
+
+  test("parses provider and model out of openclaw's provider/model strings", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const agents = plan.steps.filter((step) => step.kind === "agent") as Array<{
+      name: string;
+      providerName: string | undefined;
+      model: string | undefined;
+    }>;
+    // Every imported agent must carry both pieces extracted from the
+    // openclaw "openai/gpt-5.4-mini" string.
+    for (const agent of agents) {
+      expect(agent.providerName).toBe("openai");
+      expect(agent.model).toBe("gpt-5.4-mini");
+    }
+  });
+
+  test("falls back to defaults.model when an agent omits its own model", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: false });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: {
+          defaults: { model: "openrouter/anthropic/claude-3-haiku" },
+          list: [{ id: "main", default: true }]
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const agent = plan.steps.find((step) => step.kind === "agent") as {
+      providerName: string | undefined;
+      model: string | undefined;
+    };
+    // openclaw's openrouter routing carries the upstream-provider as
+    // part of the model id; we keep that intact in the model field.
+    expect(agent.providerName).toBe("openrouter");
+    expect(agent.model).toBe("anthropic/claude-3-haiku");
   });
 
   test("extracts provider keys and marks unsupported providers", () => {

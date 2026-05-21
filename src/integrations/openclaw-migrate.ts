@@ -92,12 +92,18 @@ export interface OpenclawDiscovery {
   agentsDir: string;
 }
 
+// Openclaw's AgentModelConfig (cribbed verbatim from
+// `/tmp/openclaw/src/config/types.agents-shared.ts:8-15`): either a
+// "provider/model" string or an object with `primary` plus optional
+// `fallbacks`. We only need the primary slot for the migration since
+// gini stores a single provider+model per agent today.
+type OpenclawAgentModelConfig = string | { primary?: string; fallbacks?: string[] };
+
 interface OpenclawAgentConfig {
   id?: string;
   default?: boolean;
-  model?: string;
+  model?: OpenclawAgentModelConfig;
   workspace?: string;
-  providerName?: string;
 }
 
 interface OpenclawChannelConfig {
@@ -108,7 +114,7 @@ interface OpenclawChannelConfig {
 
 export interface OpenclawConfig {
   agents?: {
-    defaults?: { workspace?: string; model?: string };
+    defaults?: { workspace?: string; model?: OpenclawAgentModelConfig };
     list?: OpenclawAgentConfig[];
   };
   channels?: Record<string, OpenclawChannelConfig>;
@@ -359,6 +365,36 @@ function unionChatIds(a: number[] | undefined, b: number[] | undefined): number[
   return Array.from(new Set([...(a ?? []), ...(b ?? [])]));
 }
 
+// Split an openclaw `provider/model` string (or AgentModelConfig
+// object) into its provider and model components. Returns undefined
+// values when the routing isn't set so callers can fall back to the
+// defaults block or leave gini's instance-level provider in charge.
+//
+// Examples:
+//   "openai/gpt-5"               → { providerName: "openai", model: "gpt-5" }
+//   "anthropic/claude-3-haiku"   → { providerName: "anthropic", model: "claude-3-haiku" }
+//   { primary: "openai/gpt-5" }  → same as the first example
+//   undefined                    → { providerName: undefined, model: undefined }
+//
+// Bare "model" strings (no slash) are treated as model-only with no
+// provider, which is the openclaw schema's allowed shape for partial
+// routing (the runtime resolves provider from the agent's authProfileOrder
+// in that case).
+export function parseOpenclawModelRouting(
+  raw: OpenclawAgentModelConfig | undefined
+): { providerName: string | undefined; model: string | undefined } {
+  const primary = typeof raw === "string" ? raw : raw?.primary;
+  if (!primary) return { providerName: undefined, model: undefined };
+  const slash = primary.indexOf("/");
+  if (slash <= 0) {
+    return { providerName: undefined, model: primary };
+  }
+  return {
+    providerName: primary.slice(0, slash),
+    model: primary.slice(slash + 1)
+  };
+}
+
 // Map openclaw's wide provider catalog onto the narrow set gini supports
 // at the moment. Returning `null` puts the provider in the unsupported
 // list — the user can wire it manually after the migration. Add a row
@@ -419,6 +455,12 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
   // Agents
   const agentList = config.agents?.list ?? [];
   const agentIds: string[] = [];
+  // Openclaw stores provider+model together as a "provider/model" string
+  // (e.g. "openai/gpt-5", "anthropic/claude-3-5-sonnet"). The `primary`
+  // slot of `AgentModelConfig` carries the same shape. Gini's
+  // AgentRecord keeps provider and model on separate fields, so we split
+  // before handing them to the migration step.
+  const defaultRouting = parseOpenclawModelRouting(config.agents?.defaults?.model);
   if (agentList.length === 0) {
     // Openclaw treats `main` as the implicit default when no list is
     // configured. We mirror that so users with the simplest config still
@@ -427,19 +469,23 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       kind: "agent",
       openclawId: "main",
       name: "main",
-      model: config.agents?.defaults?.model
+      providerName: defaultRouting.providerName,
+      model: defaultRouting.model
     });
     agentIds.push("main");
   } else {
     for (const agent of agentList) {
       const openclawId = (agent.id ?? "").trim();
       if (!openclawId) continue;
+      const routing = parseOpenclawModelRouting(agent.model);
+      // Fall back to the defaults block when the agent didn't supply a
+      // model of its own — openclaw resolves the same way at runtime.
       steps.push({
         kind: "agent",
         openclawId,
         name: openclawId,
-        providerName: agent.providerName,
-        model: agent.model ?? config.agents?.defaults?.model
+        providerName: routing.providerName ?? defaultRouting.providerName,
+        model: routing.model ?? defaultRouting.model
       });
       agentIds.push(openclawId);
     }
