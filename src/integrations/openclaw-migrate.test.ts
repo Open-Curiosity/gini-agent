@@ -1205,6 +1205,47 @@ describe("planMigration", () => {
     expect(ref?.detail).toContain("OPENAI_API_KEY");
   });
 
+  test("surfaces on-disk agent session dirs that aren't in agents.list as orphan-sessions", () => {
+    // Openclaw auto-creates <state>/agents/<id>/sessions/ for any
+    // agent id the runtime sees in a session key — subagents spawned
+    // at runtime, agents removed from agents.list[] after sessions
+    // accumulated, ids that arrived on inbound traffic. The
+    // migrator's session-step generator iterates agentIds (sourced
+    // from agents.list[]) and never scans the filesystem, so those
+    // on-disk transcripts get silently dropped. Surface each orphan
+    // dir + session count so the operator can re-add the agent in
+    // openclaw.json or recover from the archive zip.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "sessions"), { recursive: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "ghost", "sessions"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    // Plant orphan session transcripts under an agent that isn't in
+    // agents.list[]. Content shape mirrors what the apply path reads,
+    // but the migrator never gets that far because the agent isn't planned.
+    writeFileSync(
+      join(OPENCLAW_ROOT, "agents", "ghost", "sessions", "abc-123.jsonl"),
+      JSON.stringify({ type: "message", role: "user", content: [{ type: "text", text: "lost" }] }) + "\n"
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "agents", "ghost", "sessions", "def-456.jsonl"),
+      JSON.stringify({ type: "message", role: "user", content: [{ type: "text", text: "also lost" }] }) + "\n"
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const orphan = plan.unsupported.find(
+      (entry) => entry.kind === "agent:ghost:orphan-sessions"
+    );
+    expect(orphan).toBeDefined();
+    expect(orphan?.detail).toContain("2 on-disk session file");
+    expect(orphan?.detail).toContain("ghost");
+    // 'main' is in the list, so it does NOT appear as an orphan.
+    expect(
+      plan.unsupported.some((entry) => entry.kind === "agent:main:orphan-sessions")
+    ).toBe(false);
+  });
+
   test("surfaces malformed `agents.list` as an unsupported entry instead of throwing", () => {
     // parseOpenclawJson is `JSON.parse() as OpenclawConfig` with no
     // schema validation, so a tarball from a coworker or a hand-edit

@@ -1613,6 +1613,35 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
     }
   }
 
+  // Surface on-disk agent dirs the operator's openclaw.json doesn't
+  // list. Openclaw's runtime auto-mkdirs `<state>/agents/<id>/
+  // sessions/` for any agent id that appears in a session key —
+  // subagents created by spawn, ids the operator removed from
+  // `agents.list[]` after sessions accumulated, or ids the runtime
+  // saw on inbound traffic. Those on-disk dirs carry real transcripts
+  // and dropping them silently is data loss. The migrator does NOT
+  // implicitly create gini AgentRecords for them (operator
+  // deliberately scoped their `agents.list[]`); it surfaces each
+  // orphan as an unsupported entry with the session-file count so
+  // the operator can either re-add the agent to openclaw.json and
+  // re-migrate, or copy the on-disk transcripts manually.
+  if (existsSync(source.agentsDir)) {
+    const planned = new Set<string>(agentIds);
+    for (const entry of readdirSync(source.agentsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (planned.has(entry.name)) continue;
+      if (!isSafeAgentSlug(entry.name)) continue;
+      const orphanSessionsDir = join(source.agentsDir, entry.name, "sessions");
+      if (!existsSync(orphanSessionsDir)) continue;
+      const jsonlCount = readdirSync(orphanSessionsDir).filter((f) => f.endsWith(".jsonl")).length;
+      if (jsonlCount === 0) continue;
+      unsupported.push({
+        kind: `agent:${entry.name}:orphan-sessions`,
+        detail: `Found ${jsonlCount} on-disk session file(s) under <state>/agents/${entry.name}/sessions/ but no entry for agent '${entry.name}' in agents.list[]. Openclaw auto-creates these dirs for subagents and ids removed from the config. The migrator does NOT implicitly create a gini AgentRecord for them — add agent '${entry.name}' to openclaw.json and re-migrate, or copy the transcripts from the archive zip if you need them.`
+      });
+    }
+  }
+
   // Sessions: scan <state>/agents/<id>/sessions for .jsonl transcripts
   // (skipping rotated `.reset.<timestamp>` archives). Each becomes a
   // ChatSessionRecord + N ChatMessageRecord rows on the gini side. The
