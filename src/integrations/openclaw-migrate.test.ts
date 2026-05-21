@@ -1,0 +1,606 @@
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  applyMigration,
+  discoverOpenclawState,
+  mapProviderToGini,
+  parseOpenclawJson,
+  planMigration,
+  readStateDotenv,
+  rewriteSkillFrontmatter,
+  summarizePlan
+} from "./openclaw-migrate";
+import { loadConfig } from "../paths";
+import { mutateState, readState } from "../state";
+import { readSecret } from "../state/secrets";
+
+// Isolated roots so the tests never touch ~/.gini or ~/.openclaw on the
+// developer's machine.
+const ROOT = "/tmp/gini-openclaw-migrate-test";
+const GINI_STATE = `${ROOT}/gini-state`;
+const GINI_HOME = `${ROOT}/home`;
+const OPENCLAW_ROOT = `${ROOT}/openclaw-state`;
+
+beforeAll(() => {
+  rmSync(ROOT, { recursive: true, force: true });
+  mkdirSync(ROOT, { recursive: true });
+  mkdirSync(GINI_HOME, { recursive: true });
+  process.env.GINI_STATE_ROOT = GINI_STATE;
+  process.env.GINI_LOG_ROOT = `${ROOT}/logs`;
+  process.env.HOME = GINI_HOME;
+});
+
+afterAll(() => {
+  rmSync(ROOT, { recursive: true, force: true });
+  delete process.env.GINI_STATE_ROOT;
+  delete process.env.GINI_LOG_ROOT;
+});
+
+function seedOpenclawTree(stateRoot: string, options: {
+  withConfig?: boolean;
+  withAuthProfile?: boolean;
+  withDotenv?: boolean;
+  withTelegramChannel?: boolean;
+  withDiscordChannel?: boolean;
+  withTelegramAllowFrom?: boolean;
+  withSkill?: boolean;
+  withWorkspaceFiles?: boolean;
+  withUnsupportedDirs?: boolean;
+} = {}): void {
+  rmSync(stateRoot, { recursive: true, force: true });
+  mkdirSync(stateRoot, { recursive: true });
+
+  if (options.withConfig) {
+    const cfg = {
+      agents: {
+        defaults: { model: "gpt-5.4-mini" },
+        list: [
+          { id: "main", default: true, model: "gpt-5.4-mini", providerName: "openai" },
+          { id: "work", providerName: "openai", model: "gpt-5.4-mini" }
+        ]
+      },
+      channels: {
+        ...(options.withTelegramChannel ? { telegram: { dmPolicy: "pairing" } } : {}),
+        ...(options.withDiscordChannel ? { discord: { dmPolicy: "pairing" } } : {}),
+        whatsapp: { dmPolicy: "pairing" }
+      },
+      env: {
+        vars: {
+          ...(options.withTelegramChannel ? { TELEGRAM_BOT_TOKEN: "tg-token-from-config" } : {}),
+          ...(options.withDiscordChannel ? { DISCORD_BOT_TOKEN: "discord-token-from-config" } : {})
+        }
+      }
+    };
+    writeFileSync(join(stateRoot, "openclaw.json"), JSON.stringify(cfg, null, 2));
+  }
+
+  if (options.withDotenv) {
+    writeFileSync(
+      join(stateRoot, ".env"),
+      [
+        `export TELEGRAM_BOT_TOKEN='tg-token-from-dotenv'`,
+        `DISCORD_BOT_TOKEN="discord-token-from-dotenv"`,
+        `# comment`,
+        ``
+      ].join("\n")
+    );
+  }
+
+  if (options.withAuthProfile) {
+    const dir = join(stateRoot, "agents", "main", "agent");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "auth-profiles.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          "openai-default": { type: "api_key", provider: "openai", key: "sk-test-from-openclaw" },
+          "anthropic-default": { type: "api_key", provider: "anthropic", key: "sk-ant-unsupported" }
+        }
+      })
+    );
+  }
+
+  if (options.withTelegramAllowFrom) {
+    mkdirSync(join(stateRoot, "credentials"), { recursive: true });
+    writeFileSync(
+      join(stateRoot, "credentials", "telegram-allowFrom.json"),
+      JSON.stringify({ version: 1, allowFrom: ["12345", "67890"] })
+    );
+  }
+
+  if (options.withSkill) {
+    const dir = join(stateRoot, "skills", "memo-helper");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "SKILL.md"),
+      [
+        "---",
+        "name: memo-helper",
+        "description: Helps with memos.",
+        "openclaw:",
+        "  version: 1.0.0",
+        "  category: productivity",
+        "---",
+        "",
+        "# Memo Helper",
+        "Body content."
+      ].join("\n")
+    );
+    mkdirSync(join(dir, "scripts"), { recursive: true });
+    writeFileSync(join(dir, "scripts", "helper.sh"), "#!/bin/sh\necho hi\n");
+  }
+
+  if (options.withWorkspaceFiles) {
+    const wsDir = join(GINI_HOME, ".openclaw", "workspace");
+    mkdirSync(wsDir, { recursive: true });
+    writeFileSync(join(wsDir, "AGENTS.md"), "# AGENTS\n");
+    writeFileSync(join(wsDir, "SOUL.md"), "# SOUL\n");
+  }
+
+  if (options.withUnsupportedDirs) {
+    mkdirSync(join(stateRoot, "memory"), { recursive: true });
+    mkdirSync(join(stateRoot, "tasks"), { recursive: true });
+    mkdirSync(join(stateRoot, "plugins"), { recursive: true });
+    mkdirSync(join(stateRoot, "devices"), { recursive: true });
+  }
+}
+
+describe("parseOpenclawJson", () => {
+  test("parses strict JSON", () => {
+    expect(parseOpenclawJson('{"agents":{"list":[{"id":"main"}]}}')).toEqual({
+      agents: { list: [{ id: "main" }] }
+    });
+  });
+
+  test("strips line and block comments", () => {
+    const raw = `{
+      // top comment
+      "agents": {
+        /* block
+           comment */
+        "list": [{ "id": "main" }]
+      }
+    }`;
+    expect(parseOpenclawJson(raw)).toEqual({ agents: { list: [{ id: "main" }] } });
+  });
+
+  test("strips trailing commas", () => {
+    const raw = `{ "channels": { "telegram": {}, "discord": {}, } }`;
+    expect(parseOpenclawJson(raw)).toEqual({ channels: { telegram: {}, discord: {} } });
+  });
+
+  test("preserves comment-like text inside strings", () => {
+    const raw = `{ "note": "this has // not a comment and /* also not */ inside" }`;
+    expect(parseOpenclawJson(raw)).toEqual({
+      note: "this has // not a comment and /* also not */ inside"
+    });
+  });
+
+  test("throws on irrecoverable syntax errors", () => {
+    expect(() => parseOpenclawJson("not json at all")).toThrow();
+  });
+});
+
+describe("readStateDotenv", () => {
+  test("parses single, double, and unquoted values with export prefix", () => {
+    const dir = `${ROOT}/dotenv-parse`;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, ".env"),
+      [
+        `export FOO='single'`,
+        `BAR="double"`,
+        `BAZ=bare`,
+        `# comment line`,
+        `INVALID line with no equals`
+      ].join("\n")
+    );
+    const parsed = readStateDotenv(dir);
+    expect(parsed.FOO).toBe("single");
+    expect(parsed.BAR).toBe("double");
+    expect(parsed.BAZ).toBe("bare");
+    expect(parsed.INVALID).toBeUndefined();
+  });
+
+  test("returns empty object when .env is absent", () => {
+    const dir = `${ROOT}/dotenv-missing`;
+    mkdirSync(dir, { recursive: true });
+    expect(readStateDotenv(dir)).toEqual({});
+  });
+});
+
+describe("mapProviderToGini", () => {
+  test("maps native providers", () => {
+    expect(mapProviderToGini("openai")).toBe("openai");
+    expect(mapProviderToGini("codex")).toBe("codex");
+    expect(mapProviderToGini("openrouter")).toBe("openrouter");
+    expect(mapProviderToGini("ollama")).toBe("local");
+    expect(mapProviderToGini("lmstudio")).toBe("local");
+    expect(mapProviderToGini("vllm")).toBe("local");
+  });
+
+  test("returns null for unsupported providers", () => {
+    expect(mapProviderToGini("anthropic")).toBeNull();
+    expect(mapProviderToGini("google")).toBeNull();
+    expect(mapProviderToGini(undefined)).toBeNull();
+  });
+
+  test("is case-insensitive", () => {
+    expect(mapProviderToGini("OpenAI")).toBe("openai");
+  });
+});
+
+describe("rewriteSkillFrontmatter", () => {
+  test("rewrites flow-style metadata.openclaw → metadata.gini", () => {
+    const raw = [
+      "---",
+      "name: github",
+      'description: "GitHub CLI."',
+      "metadata:",
+      "  {",
+      '    "openclaw":',
+      "      {",
+      '        "emoji": "🐙",',
+      '        "requires": { "bins": ["gh"] }',
+      "      }",
+      "  }",
+      "---",
+      "body"
+    ].join("\n");
+    const out = rewriteSkillFrontmatter(raw);
+    expect(out).toContain('"gini":');
+    expect(out).not.toContain('"openclaw"');
+    expect(out).toContain('"emoji": "🐙"');
+  });
+
+  test("rewrites block-style nested metadata.openclaw → metadata.gini", () => {
+    const raw = [
+      "---",
+      "name: foo",
+      "metadata:",
+      "  openclaw:",
+      "    emoji: X",
+      "    requires:",
+      "      bins: [foo]",
+      "---",
+      "body"
+    ].join("\n");
+    const out = rewriteSkillFrontmatter(raw);
+    expect(out).toContain("metadata:\n  gini:\n");
+    expect(out).toContain("    emoji: X");
+    expect(out).not.toMatch(/openclaw:/);
+  });
+
+  test("promotes legacy top-level openclaw: block and re-indents children", () => {
+    const raw = [
+      "---",
+      "name: memo-helper",
+      "description: Helps with memos.",
+      "openclaw:",
+      "  version: 1.0.0",
+      "  category: productivity",
+      "---",
+      "body"
+    ].join("\n");
+    const out = rewriteSkillFrontmatter(raw);
+    expect(out).toContain("metadata:\n  gini:\n");
+    // Children must land four spaces in (two under gini:, two more under metadata:).
+    expect(out).toContain("    version: 1.0.0");
+    expect(out).toContain("    category: productivity");
+    expect(out).not.toMatch(/^openclaw:/m);
+  });
+
+  test("leaves non-frontmatter openclaw mentions alone", () => {
+    const raw = "---\nname: foo\n---\nThis skill references openclaw: in its body.";
+    expect(rewriteSkillFrontmatter(raw)).toBe(raw);
+  });
+
+  test("is a no-op when SKILL.md has no openclaw markers", () => {
+    const raw = "---\nname: foo\ndescription: bar\n---\nbody";
+    expect(rewriteSkillFrontmatter(raw)).toBe(raw);
+  });
+});
+
+describe("discoverOpenclawState", () => {
+  beforeEach(() => {
+    delete process.env.OPENCLAW_STATE_DIR;
+    delete process.env.OPENCLAW_WORKSPACE_DIR;
+    delete process.env.OPENCLAW_PROFILE;
+  });
+
+  test("honors an explicit path argument", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    expect(discovery.stateRoot).toBe(OPENCLAW_ROOT);
+    expect(discovery.configPath).toBe(join(OPENCLAW_ROOT, "openclaw.json"));
+  });
+
+  test("honors OPENCLAW_STATE_DIR env", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    process.env.OPENCLAW_STATE_DIR = OPENCLAW_ROOT;
+    const discovery = discoverOpenclawState();
+    expect(discovery.stateRoot).toBe(OPENCLAW_ROOT);
+  });
+
+  test("falls back to ~/.openclaw under HOME", () => {
+    const homeOpenclaw = join(GINI_HOME, ".openclaw");
+    seedOpenclawTree(homeOpenclaw, { withConfig: true });
+    const discovery = discoverOpenclawState();
+    expect(discovery.stateRoot).toBe(homeOpenclaw);
+    expect(discovery.configPath).toBe(join(homeOpenclaw, "openclaw.json"));
+    rmSync(homeOpenclaw, { recursive: true, force: true });
+  });
+});
+
+describe("planMigration", () => {
+  beforeEach(() => {
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    rmSync(join(GINI_HOME, ".openclaw"), { recursive: true, force: true });
+  });
+
+  test("seeds an implicit main agent when no agents list exists", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: false });
+    // Add a minimal config without an agents list.
+    writeFileSync(join(OPENCLAW_ROOT, "openclaw.json"), JSON.stringify({}));
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const agentSteps = plan.steps.filter((step) => step.kind === "agent");
+    expect(agentSteps).toHaveLength(1);
+    expect((agentSteps[0] as { name: string }).name).toBe("main");
+  });
+
+  test("emits one agent step per configured agent", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const agentNames = plan.steps
+      .filter((step) => step.kind === "agent")
+      .map((step) => (step as { name: string }).name);
+    expect(agentNames).toEqual(["main", "work"]);
+  });
+
+  test("extracts provider keys and marks unsupported providers", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withAuthProfile: true });
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const secrets = plan.steps.filter((step) => step.kind === "secret");
+    expect(secrets).toHaveLength(1);
+    expect((secrets[0] as { envVar: string }).envVar).toBe("OPENAI_API_KEY");
+    expect(plan.unsupported.some((entry) => entry.kind === "provider:anthropic")).toBe(true);
+  });
+
+  test("creates telegram bridge step with allowed chat ids from config env", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withTelegramChannel: true,
+      withTelegramAllowFrom: true
+    });
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const telegram = plan.steps.find((step) => step.kind === "bridge");
+    expect(telegram).toBeDefined();
+    expect((telegram as { bridgeKind: string }).bridgeKind).toBe("telegram");
+    expect((telegram as { allowedChatIds: number[] }).allowedChatIds).toEqual([12345, 67890]);
+    expect((telegram as { tokenValue: string }).tokenValue).toBe("tg-token-from-config");
+  });
+
+  test("falls back to state-dir .env when config.env.vars omits the token", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: false, withDotenv: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ channels: { telegram: {} } })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const telegram = plan.steps.find(
+      (step) => step.kind === "bridge"
+    ) as { tokenValue: string } | undefined;
+    expect(telegram?.tokenValue).toBe("tg-token-from-dotenv");
+  });
+
+  test("captures unsupported channels in the report", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    expect(plan.unsupported.some((entry) => entry.kind === "channel:whatsapp")).toBe(true);
+  });
+
+  test("captures memory/tasks/plugins as unsupported", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withUnsupportedDirs: true });
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const kinds = plan.unsupported.map((entry) => entry.kind);
+    expect(kinds).toContain("memory");
+    expect(kinds).toContain("tasks");
+    expect(kinds).toContain("plugins");
+    expect(kinds).toContain("devices");
+  });
+
+  test("picks up skills and workspace files", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withSkill: true,
+      withWorkspaceFiles: true
+    });
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    expect(plan.steps.some((step) => step.kind === "skill")).toBe(true);
+    const workspaceSteps = plan.steps.filter((step) => step.kind === "workspaceFile");
+    expect(workspaceSteps.map((step) => (step as { name: string }).name).sort()).toEqual([
+      "AGENTS.md",
+      "SOUL.md"
+    ]);
+  });
+
+  test("finds workspace files inside the state root when HOME doesn't match", () => {
+    // Real openclaw's onboard writes workspace files to <stateRoot>/workspace/.
+    // When the user migrates from a non-default state root (tarball extract,
+    // sandboxed home, etc.) the migrator must still find them via the
+    // pathArg-relative candidate rather than the HOME-relative one.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "workspace"), { recursive: true });
+    writeFileSync(join(OPENCLAW_ROOT, "workspace", "AGENTS.md"), "# AGENTS\n");
+    writeFileSync(join(OPENCLAW_ROOT, "workspace", "USER.md"), "# USER\n");
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const workspaceSteps = plan.steps.filter((step) => step.kind === "workspaceFile");
+    expect(workspaceSteps.map((step) => (step as { name: string }).name).sort()).toEqual([
+      "AGENTS.md",
+      "USER.md"
+    ]);
+  });
+});
+
+describe("summarizePlan", () => {
+  test("redacts plaintext secret values", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withAuthProfile: true });
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const summary = summarizePlan(plan);
+    const serialized = JSON.stringify(summary);
+    expect(serialized).not.toContain("sk-test-from-openclaw");
+    expect(serialized).not.toContain("tg-token-from-config");
+    expect(summary.counts.secrets).toBeGreaterThan(0);
+  });
+
+  test("populates counts that match the plan steps", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withAuthProfile: true,
+      withTelegramChannel: true,
+      withSkill: true,
+      withWorkspaceFiles: true
+    });
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const summary = summarizePlan(plan);
+    expect(summary.counts.agents).toBe(2);
+    expect(summary.counts.secrets).toBe(1);
+    expect(summary.counts.bridges).toBe(1);
+    expect(summary.counts.skills).toBe(1);
+    expect(summary.counts.workspaceFiles).toBe(2);
+  });
+});
+
+describe("applyMigration", () => {
+  beforeEach(() => {
+    rmSync(GINI_STATE, { recursive: true, force: true });
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    rmSync(join(GINI_HOME, ".openclaw"), { recursive: true, force: true });
+    rmSync(join(GINI_HOME, ".gini"), { recursive: true, force: true });
+  });
+
+  test("creates agents, writes secrets, and configures a telegram bridge", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withAuthProfile: true,
+      withTelegramChannel: true,
+      withTelegramAllowFrom: true
+    });
+    const config = loadConfig("apply-end-to-end");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    const result = await applyMigration(config, discovery, plan);
+
+    expect(result.agentsCreated).toBe(2);
+    expect(result.secretsWritten).toBe(1);
+    expect(result.bridgesCreated).toBe(1);
+
+    // Persisted state should hold the new agents and bridge.
+    const state = await mutateState("apply-end-to-end", (current) => current);
+    expect(state.agents.some((agent) => agent.name === "main")).toBe(true);
+    expect(state.agents.some((agent) => agent.name === "work")).toBe(true);
+    expect(state.messagingBridges.some((bridge) => bridge.kind === "telegram")).toBe(true);
+
+    // Provider key should be in ~/.gini/secrets.env at mode 0600.
+    const secretsEnv = readFileSync(join(GINI_HOME, ".gini", "secrets.env"), "utf8");
+    expect(secretsEnv).toContain("OPENAI_API_KEY=");
+    expect(secretsEnv).toContain("sk-test-from-openclaw");
+
+    // Bridge token should decrypt back to the plaintext we passed in.
+    const bridge = state.messagingBridges.find((entry) => entry.kind === "telegram")!;
+    const ref = bridge.secretRefs?.[0];
+    expect(ref).toBeDefined();
+    expect(readSecret("apply-end-to-end", ref!)).toBe("tg-token-from-config");
+    expect((bridge.metadata as { allowedChatIds: number[] }).allowedChatIds).toEqual([
+      12345, 67890
+    ]);
+
+    // Import report should land in state.
+    expect(result.report.mode).toBe("applied");
+    expect(result.report.status).toBe("completed");
+  });
+
+  test("is idempotent — second apply skips existing agents and bridges", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withAuthProfile: true,
+      withTelegramChannel: true
+    });
+    const config = loadConfig("idempotent-apply");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const first = await applyMigration(config, discovery, planMigration(discovery));
+    const second = await applyMigration(config, discovery, planMigration(discovery));
+    expect(first.agentsCreated).toBeGreaterThan(0);
+    expect(second.agentsCreated).toBe(0);
+    expect(second.bridgesCreated).toBe(0);
+    expect(second.warnings.some((warning) => warning.includes("Skipped existing"))).toBe(true);
+  });
+
+  test("copies a skill with sibling files and rewrites the frontmatter", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withSkill: true });
+    const config = loadConfig("skill-copy");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.skillsCopied).toBe(1);
+
+    const skillPath = join(GINI_STATE, "instances", "skill-copy", "skills", "memo-helper", "SKILL.md");
+    const copied = readFileSync(skillPath, "utf8");
+    expect(copied).toContain("metadata:\n  gini:");
+    expect(copied).not.toContain("\nopenclaw:");
+
+    const helperPath = join(
+      GINI_STATE,
+      "instances",
+      "skill-copy",
+      "skills",
+      "memo-helper",
+      "scripts",
+      "helper.sh"
+    );
+    expect(readFileSync(helperPath, "utf8")).toContain("#!/bin/sh");
+  });
+
+  test("--force rotates a bot token on an existing bridge", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withTelegramChannel: true });
+    const config = loadConfig("rotate");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    await applyMigration(config, discovery, planMigration(discovery));
+    // Rewrite config to point at a new token, then re-apply with force.
+    const cfg = JSON.parse(readFileSync(join(OPENCLAW_ROOT, "openclaw.json"), "utf8")) as {
+      env: { vars: Record<string, string> };
+    };
+    cfg.env.vars.TELEGRAM_BOT_TOKEN = "tg-token-rotated";
+    writeFileSync(join(OPENCLAW_ROOT, "openclaw.json"), JSON.stringify(cfg));
+    const second = await applyMigration(config, discovery, planMigration(discovery), {
+      force: true
+    });
+    expect(second.bridgesCreated).toBe(1);
+    const state = readState("rotate");
+    const bridge = state.messagingBridges.find((entry) => entry.kind === "telegram")!;
+    expect(readSecret("rotate", bridge.secretRefs![0]!)).toBe("tg-token-rotated");
+  });
+
+  test("skips telegram channel with no token and records the gap", async () => {
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: { list: [{ id: "main", default: true }] },
+        channels: { telegram: {} }
+      })
+    );
+    const config = loadConfig("no-token");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.bridgesCreated).toBe(0);
+    expect(result.unsupported.some((entry) => entry.kind === "telegram")).toBe(true);
+  });
+});

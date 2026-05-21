@@ -667,7 +667,12 @@ export interface ImportReport {
   instance: Instance;
   source: ImportSource;
   path: string;
-  mode: "inspect";
+  // `inspect` reports walk a source path without touching it (the historical
+  // `gini import inspect` surface). `applied` reports record a migration
+  // that actually mutated gini state — produced by `gini import apply
+  // openclaw`. The two share storage so the activity feed and audit trail
+  // surface every import attempt uniformly.
+  mode: "inspect" | "applied";
   status: "completed" | "failed";
   counts: Record<string, number>;
   findings: string[];
