@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   applyMigration,
+  canonicalApiKeyEnv,
   discoverOpenclawState,
   mapProviderToGini,
   parseOpenclawJson,
@@ -273,6 +274,19 @@ describe("parseOpenclawModelRouting", () => {
   });
 });
 
+describe("canonicalApiKeyEnv", () => {
+  test("matches the env var names normalizeProvider sets", () => {
+    expect(canonicalApiKeyEnv("openai")).toBe("OPENAI_API_KEY");
+    expect(canonicalApiKeyEnv("openrouter")).toBe("OPENROUTER_API_KEY");
+    // The local provider uses GINI_LOCAL_API_KEY — NOT LOCAL_API_KEY,
+    // which is what a hand-rolled toUpperCase + _API_KEY would produce.
+    expect(canonicalApiKeyEnv("local")).toBe("GINI_LOCAL_API_KEY");
+    // Codex returns null because there is no canonical bearer env —
+    // codex reads OAuth from ~/.codex/auth.json.
+    expect(canonicalApiKeyEnv("codex")).toBeNull();
+  });
+});
+
 describe("mapProviderToGini", () => {
   test("maps native providers", () => {
     expect(mapProviderToGini("openai")).toBe("openai");
@@ -507,6 +521,71 @@ describe("planMigration", () => {
     expect(secrets).toHaveLength(1);
     expect((secrets[0] as { envVar: string }).envVar).toBe("OPENAI_API_KEY");
     expect(plan.unsupported.some((entry) => entry.kind === "provider:anthropic")).toBe(true);
+  });
+
+  test("uses the canonical GINI_LOCAL_API_KEY env name for the local provider", () => {
+    // A hand-rolled `${PROVIDER.toUpperCase()}_API_KEY` would produce
+    // LOCAL_API_KEY, which the runtime never reads. Source the env
+    // name from the provider layer instead.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "agents", "main", "agent", "auth-profiles.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          "lmstudio-default": {
+            type: "api_key",
+            provider: "lmstudio",
+            key: "sk-local-fixture"
+          }
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const secret = plan.steps.find((step) => step.kind === "secret") as {
+      envVar: string;
+      provider: string;
+    };
+    expect(secret.envVar).toBe("GINI_LOCAL_API_KEY");
+    expect(secret.provider).toBe("local");
+  });
+
+  test("skips codex secret writes and points the operator at codex --login", () => {
+    // Gini's codex provider reads OAuth from ~/.codex/auth.json, the
+    // same file openclaw uses. There's no bearer env to migrate, so
+    // writing a CODEX_API_KEY would be unread by the runtime and would
+    // also leak the openclaw access token under a misleading name.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "agents", "main", "agent", "auth-profiles.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          "codex-default": {
+            type: "oauth",
+            provider: "codex",
+            access: "sk-codex-fixture-access"
+          }
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    expect(plan.steps.some((step) => step.kind === "secret")).toBe(false);
+    expect(
+      plan.unsupported.some(
+        (entry) => entry.kind === "provider:codex" && entry.detail.includes("codex --login")
+      )
+    ).toBe(true);
   });
 
   test("creates telegram bridge step with allowed chat ids from config env", () => {

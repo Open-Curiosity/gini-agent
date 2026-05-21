@@ -81,6 +81,7 @@ import { writeSecret } from "../state/secrets";
 import { secretsEnvHasKey, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { pidPath, skillsDir } from "../paths";
 import { assertHeaderSafeToken } from "./messaging";
+import { normalizeProvider } from "../provider";
 
 // --- Public types ---
 
@@ -396,6 +397,22 @@ export function parseOpenclawModelRouting(
   };
 }
 
+// Resolve the canonical env-var name gini uses for a given provider.
+// Routes through `normalizeProvider` so the migrator and the runtime
+// agree on naming — hand-rolling `${PROVIDER.toUpperCase()}_API_KEY`
+// produces LOCAL_API_KEY for the local provider while the runtime
+// expects GINI_LOCAL_API_KEY, and synthesizes CODEX_API_KEY for the
+// codex provider which the runtime ignores entirely (codex reads OAuth
+// from ~/.codex/auth.json instead). Codex callers must skip the secret
+// migration up front; this helper returns null for codex as a safety
+// belt in case a caller forgets that gate.
+export function canonicalApiKeyEnv(
+  providerName: "openai" | "codex" | "openrouter" | "local"
+): string | null {
+  const normalized = normalizeProvider({ name: providerName, model: "" });
+  return normalized.apiKeyEnv ?? null;
+}
+
 // Map openclaw's wide provider catalog onto the narrow set gini supports
 // at the moment. Returning `null` puts the provider in the unsupported
 // list — the user can wire it manually after the migration. Add a row
@@ -535,9 +552,28 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
         }
         continue;
       }
+      // Codex uses an OAuth file (~/.codex/auth.json), not a bearer env
+      // var — that file is shared with openclaw verbatim, so the
+      // migration is a no-op once the operator has logged in via
+      // `codex --login`. Writing a CODEX_API_KEY would be unread by the
+      // runtime and leak the openclaw access token under a misleading
+      // name. Surface this explicitly so the operator knows what to do.
+      if (giniProvider === "codex") {
+        unsupported.push({
+          kind: "provider:codex",
+          detail: "Gini's codex provider reads OAuth from ~/.codex/auth.json (shared with openclaw); run `codex --login` if you haven't already. No secret was migrated."
+        });
+        continue;
+      }
       const plaintext = profile.key ?? profile.token ?? profile.access;
       if (!plaintext) continue;
-      const envVar = `${giniProvider.toUpperCase()}_API_KEY`;
+      // Source the canonical env var name from the provider layer
+      // rather than hand-rolling `${PROVIDER}_API_KEY`. The local
+      // provider uses `GINI_LOCAL_API_KEY` (per `normalizeProvider` in
+      // src/provider.ts), so a hand-rolled "LOCAL_API_KEY" would land
+      // in ~/.gini/secrets.env but the runtime would never read it.
+      const envVar = canonicalApiKeyEnv(giniProvider);
+      if (!envVar) continue;
       if (seenSecretEnv.has(envVar)) continue;
       seenSecretEnv.add(envVar);
       steps.push({ kind: "secret", envVar, valueFrom: plaintext, provider: giniProvider });
