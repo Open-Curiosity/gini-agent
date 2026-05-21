@@ -2581,8 +2581,16 @@ export async function applyMigration(
     // ref attachment appears to succeed while the metadata never
     // persists.
     const decision = await guardedMutate((state: RuntimeState) => {
+      // Skip disabled bridges. `gini messaging disable` is the
+      // remediation we point operators at when they hit a native
+      // collision; disabling has to unblock the migrator's next
+      // run or the documented recovery is a dead-end loop. The
+      // disable call (src/integrations/messaging.ts) only flips
+      // status="disabled" and clears secretRefs — it doesn't
+      // remove the record — so the migrator has to do the
+      // filtering at the lookup site.
       const found = state.messagingBridges.find(
-        (bridge) => bridge.kind === step.bridgeKind
+        (bridge) => bridge.kind === step.bridgeKind && bridge.status !== "disabled"
       );
       if (found) {
         // Same provenance-check pattern as the agent-name

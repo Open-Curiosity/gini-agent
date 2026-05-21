@@ -1558,6 +1558,53 @@ describe("planMigration", () => {
     expect((bridge?.metadata as { lastOffset: number }).lastOffset).toBe(50);
   });
 
+  test("disabled native bridge no longer blocks a fresh migration", async () => {
+    // The R21.CQ1 native-collision remediation directs operators
+    // to `gini messaging disable <bridge-id>` followed by a re-
+    // import. disableMessagingBridge sets status="disabled" but
+    // does not remove the bridge record. The migrator's collision
+    // check used to find the disabled bridge by kind anyway and
+    // re-refuse the import — a dead-end loop. Filter by status so
+    // disabling actually unblocks the documented recovery.
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withTelegramChannel: true,
+      withTelegramAllowFrom: true
+    });
+    const config = loadConfig("bridge-disabled-unblocks");
+    // Plant a disabled native bridge (the post-`disable` shape).
+    mutateState(config.instance, (state) => {
+      state.messagingBridges.unshift({
+        id: "bridge_disabled_native",
+        instance: config.instance,
+        name: "operator's disabled bot",
+        kind: "telegram",
+        deliveryTargets: [],
+        status: "disabled",
+        secretRefs: [],
+        metadata: { allowedChatIds: [], lastOffset: 0 },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      });
+    });
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    const result = await applyMigration(config, discovery, plan);
+    // Fresh migrator-tagged bridge gets created; the disabled
+    // one stays disabled in state.
+    expect(result.bridgesCreated).toBe(1);
+    expect(
+      result.unsupported.some((entry) =>
+        entry.kind === "messaging:telegram:native-collision"
+      )
+    ).toBe(false);
+    const state = readState(config.instance);
+    const disabled = state.messagingBridges.find((b) => b.id === "bridge_disabled_native");
+    expect(disabled?.status).toBe("disabled");
+    const fresh = state.messagingBridges.find((b) => b.id !== "bridge_disabled_native");
+    expect(fresh?.status).toBe("configured");
+  });
+
   test("rotates a prior-migration bridge with --force without refusing", async () => {
     // The collision refusal applies only to native bridges. A
     // bridge created by an earlier run of THIS migrator should
