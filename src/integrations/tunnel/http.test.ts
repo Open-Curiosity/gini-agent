@@ -123,6 +123,102 @@ describe("tunnel HTTP integration", () => {
     expect(payload.publicUrl).toBe("https://example.trycloudflare.com/abcdefghij0123456789/");
   });
 
+  test("PATCH /api/tunnel with { enabled: true } invokes applyConfig and returns the new snapshot", async () => {
+    const config = testConfig("tunnel-http-patch-enable");
+    const calls: Array<{ enabled?: boolean; appleNotes?: { enabled?: boolean } }> = [];
+    const handler = createHandler(config, {
+      tunnel: {
+        getSecret: () => "abcdefghij0123456789",
+        getSnapshot: () => stubSnapshot(),
+        applyConfig: async (update) => {
+          calls.push(update);
+          return { ...stubSnapshot(), publicUrl: "https://example.trycloudflare.com/abcdefghij0123456789/" };
+        }
+      }
+    });
+    const response = await handler(
+      new Request("http://127.0.0.1:7337/api/tunnel", {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${config.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ enabled: true })
+      })
+    );
+    expect(response.status).toBe(200);
+    const payload = (await response.json()) as TunnelSnapshot;
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual({ enabled: true });
+    expect(payload.publicUrl).toBe("https://example.trycloudflare.com/abcdefghij0123456789/");
+  });
+
+  test("PATCH /api/tunnel with { appleNotes: { enabled } } forwards the nested shape verbatim", async () => {
+    const config = testConfig("tunnel-http-patch-notes");
+    const calls: Array<{ enabled?: boolean; appleNotes?: { enabled?: boolean } }> = [];
+    const handler = createHandler(config, {
+      tunnel: {
+        getSecret: () => "abcdefghij0123456789",
+        getSnapshot: () => stubSnapshot(),
+        applyConfig: async (update) => {
+          calls.push(update);
+          return stubSnapshot();
+        }
+      }
+    });
+    const response = await handler(
+      new Request("http://127.0.0.1:7337/api/tunnel", {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${config.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ appleNotes: { enabled: false } })
+      })
+    );
+    expect(response.status).toBe(200);
+    expect(calls[0]).toEqual({ appleNotes: { enabled: false } });
+  });
+
+  test("PATCH /api/tunnel ignores non-boolean fields silently", async () => {
+    // Defensive: the toggle component only ever sends booleans, but a
+    // hand-rolled curl could pass a string. The runtime treats those as
+    // no-ops rather than throwing.
+    const config = testConfig("tunnel-http-patch-typesafe");
+    const calls: Array<{ enabled?: boolean; appleNotes?: { enabled?: boolean } }> = [];
+    const handler = createHandler(config, {
+      tunnel: {
+        getSecret: () => "abcdefghij0123456789",
+        getSnapshot: () => stubSnapshot(),
+        applyConfig: async (update) => {
+          calls.push(update);
+          return stubSnapshot();
+        }
+      }
+    });
+    const response = await handler(
+      new Request("http://127.0.0.1:7337/api/tunnel", {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${config.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ enabled: "true", appleNotes: { enabled: 1 } })
+      })
+    );
+    expect(response.status).toBe(200);
+    expect(calls[0]).toEqual({});
+  });
+
+  test("PATCH /api/tunnel returns 501 when applyConfig hook is absent", async () => {
+    const config = testConfig("tunnel-http-patch-501");
+    const handler = createHandler(config, {
+      tunnel: {
+        getSecret: () => "abcdefghij0123456789",
+        getSnapshot: () => stubSnapshot()
+      }
+    });
+    const response = await handler(
+      new Request("http://127.0.0.1:7337/api/tunnel", {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${config.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ enabled: true })
+      })
+    );
+    expect(response.status).toBe(501);
+  });
+
   test("GET /api/tunnel/qr.svg returns an SVG image", async () => {
     const config = testConfig("tunnel-http-qr-svg");
     const handler = createHandler(config, {

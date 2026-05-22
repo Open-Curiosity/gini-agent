@@ -72,7 +72,7 @@ export interface TunnelManagerOptions {
 export class TunnelManager {
   private readonly instance: Instance;
   private readonly config: TunnelConfig;
-  private readonly targetUrl: string;
+  private targetUrl: string;
   private readonly spawn?: SpawnTunnelOptions["spawn"];
   private readonly osascript?: RunOsascript;
   private readonly binary?: string;
@@ -134,6 +134,18 @@ export class TunnelManager {
 
   getSnapshot(): TunnelSnapshot {
     return { ...this.snapshot, appleNotes: { ...this.snapshot.appleNotes } };
+  }
+
+  /**
+   * Update the local origin cloudflared forwards to. Used by the runtime
+   * to swap from a placeholder URL to the resolved web port once
+   * Next.js has finished booting. Must be called before `start()` —
+   * after the manager owns a live handle, the cloudflared subprocess
+   * is already bound to the prior target.
+   */
+  setTargetUrl(url: string): void {
+    this.targetUrl = url;
+    this.snapshot = { ...this.snapshot, targetUrl: url };
   }
 
   /**

@@ -331,6 +331,12 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
       GINI_TOKEN: config.token,
       GINI_INSTANCE: config.instance,
       GINI_DIST_DIR: `.next-${instanceSlug}`,
+      // Forwarded so the Next.js middleware can recognize the
+      // per-instance tunnel secret and rewrite external requests
+      // (`https://<...>.trycloudflare.com/<secret>/...`) by stripping
+      // the prefix before the app router sees the path. Direct localhost
+      // requests are untouched.
+      GINI_TUNNEL_SECRET: (config.tunnel?.secret ?? ""),
       PORT: String(port)
     }
   });

@@ -5,7 +5,7 @@ import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
-import { configPath, loadConfig, parseInstance, runtimePortPath, tunnelLogPath } from "./paths";
+import { configPath, loadConfig, parseInstance, runtimePortPath, tunnelLogPath, webPortPath } from "./paths";
 import { appendLog, mutateState, readState } from "./state";
 import { applyLegacyTelegramPairingMigration } from "./state/store";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
@@ -167,12 +167,32 @@ if (tunnelResolved.mutated) {
   }
 }
 
+// Target the Next.js web app (not the raw runtime API). The web app
+// already proxies /api/* to the runtime via the BFF and serves the full
+// settings/chat/etc. UI; tunneling the web port lets a phone scan the
+// QR and land on a real product surface. The web port is written by
+// the child process after the runtime boots, so we resolve it lazily:
+// the manager polls webPortPath() until a port appears, with a 60s
+// ceiling that covers a cold Next.js compile.
 const tunnelManager = new TunnelManager({
   instance: config.instance,
   config: tunnelResolved.config,
-  targetUrl: `http://127.0.0.1:${config.port}`,
+  targetUrl: `http://127.0.0.1:${config.port}`, // placeholder; replaced by resolveWebTarget() below
   logPath: tunnelLogPath(config.instance)
 });
+
+async function resolveWebTarget(): Promise<string> {
+  const path = webPortPath(config.instance);
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    try {
+      const raw = readFileSync(path, "utf8").trim();
+      const port = Number(raw);
+      if (Number.isFinite(port) && port > 0) return `http://127.0.0.1:${port}`;
+    } catch { /* file not yet written */ }
+    await Bun.sleep(1000);
+  }
+  throw new Error("web port did not appear within 60s — the Next.js dev server may have failed to start");
+}
 
 const server = Bun.serve({
   port: config.port,
@@ -276,11 +296,17 @@ console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=
 // snapshot. The manager is told to stay quiet when the user hasn't
 // opted in.
 if (tunnelResolved.config.enabled) {
-  void tunnelManager.start().catch((error) => {
-    appendLog(config.instance, "tunnel.start.error", {
-      error: error instanceof Error ? error.message : String(error)
-    });
-  });
+  void (async () => {
+    try {
+      const target = await resolveWebTarget();
+      tunnelManager.setTargetUrl(target);
+      await tunnelManager.start();
+    } catch (error) {
+      appendLog(config.instance, "tunnel.start.error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  })();
 }
 
 // Self-rescheduling scheduler loop. We await runDueJobs(config) before
