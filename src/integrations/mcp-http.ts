@@ -97,11 +97,18 @@ export function redactSecretsInText(input: string): string {
   for (const name of AUTH_HEADER_NAMES) {
     const plain = new RegExp(`("${name}"\\s*:\\s*)"[^"]*"`, "gi");
     out = out.replace(plain, '$1"[REDACTED]"');
-    const escaped = new RegExp(`(\\\\"${name}\\\\"\\s*:\\s*)\\\\"[^"\\\\]*\\\\"`, "gi");
+    // Escaped form: `\"name\":\"value\"` embedded inside another JSON
+    // string. The value must allow JSON-escaped characters — `\\/`, `\\u00xx`,
+    // backslash-escaped quotes — so use `(?:[^"\\]|\\.)*` instead of
+    // `[^"\\]*`, otherwise the match bails at the first `\\`.
+    //
+    // Regex source we want: (\\"NAME\\"\s*:\s*)\\"(?:[^"\\]|\\.)*\\"
+    // In a string passed to new RegExp, every `\\` doubles to `\\\\`.
+    const escaped = new RegExp(`(\\\\"${name}\\\\"\\s*:\\s*)\\\\"(?:[^"\\\\]|\\\\.)*\\\\"`, "gi");
     out = out.replace(escaped, '$1\\"[REDACTED]\\"');
   }
   out = out.replace(/("[A-Za-z][\w-]*-(?:token|key)"\s*:\s*)"[^"]*"/gi, '$1"[REDACTED]"');
-  out = out.replace(/(\\"[A-Za-z][\w-]*-(?:token|key)\\"\s*:\s*)\\"[^"\\]*\\"/gi, '$1\\"[REDACTED]\\"');
+  out = out.replace(/(\\"[A-Za-z][\w-]*-(?:token|key)\\"\s*:\s*)\\"(?:[^"\\]|\\.)*\\"/gi, '$1\\"[REDACTED]\\"');
 
   // 2) Cookie header: redact the entire value up to newline / end-of-string,
   //    not just up to the first `;`. A `Cookie:` header is a single
@@ -115,7 +122,11 @@ export function redactSecretsInText(input: string): string {
   //    next newline OR end-of-string OR a closing JSON token (`"` followed
   //    by `,` or `}`) so we don't accidentally swallow trailing JSON
   //    structure when the header is embedded in a quoted value.
-  out = out.replace(/((?:set-)?cookie\s*:\s*)(?:(?!"[,}])[^\r\n])+/gi, "$1[REDACTED]");
+  // Stop on newline, EOS, a literal `]` (so a Cookie fragment embedded in a
+  // JSON array like `{"errors":["Cookie: x=Y"], …}` doesn't swallow the
+  // closing bracket and everything after it), or a `"` followed by a JSON
+  // structural terminator (`,` / `}` / `]`).
+  out = out.replace(/((?:set-)?cookie\s*:\s*)(?:(?!"[,}\]])[^\r\n\]])+/gi, "$1[REDACTED]");
 
   // 3) Header-style well-known auth headers (after Cookie handling so the
   //    Cookie line is already fully redacted). Stops at line terminators
@@ -146,7 +157,10 @@ export function redactSecretsInText(input: string): string {
   //    Only the immediately following token is consumed — not arbitrary
   //    trailing prose — so a sentence like "Bearer ABC123 then more text"
   //    leaves "then more text" untouched.
-  out = out.replace(/\bbearer\s+[A-Za-z0-9._\-+/=]+/gi, "Bearer [REDACTED]");
+  // RFC 6750 b64token: 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"=".
+  // The `~` was previously missing; tokens that include it (e.g. PASETO-ish
+  // formats) leaked the tail past the first `~`.
+  out = out.replace(/\bbearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]");
 
   return out;
 }
