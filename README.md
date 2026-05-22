@@ -40,7 +40,7 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns state 
 ## What's in the box
 
 - Authenticated localhost gateway and a Next.js + Tailwind + shadcn/ui control plane
-- Persistent chat, runs, tasks, approvals, traces, audit events, jobs, memories, and skills in local SQLite
+- Persistent chat, runs, tasks, approvals, traces, audit events, jobs, memories, and skills
 - Approval-gated file, terminal, and code tools
 - Provider support: Codex OAuth, OpenAI API key, OpenRouter, and any OpenAI-compatible local server
 - Local embeddings and reranking by default
@@ -60,7 +60,7 @@ If the browser doesn't open automatically (or you want to navigate manually), ru
 
 Caveat on macOS 26 (Tahoe): after a SIGKILL, launchd sometimes refuses to auto-respawn (`pended nondemand spawn = inefficient`). Run `gini autostart kick` to force a respawn when that happens; RunAtLoad still fires at login.
 
-If you opted out of autostart (`--no-autostart`) or you're on Linux (autostart is macOS-only in v1), run `gini setup` then `gini start` to launch the runtime by hand.
+If you opted out of autostart (`--no-autostart`) or you're on Linux (autostart is currently macOS-only), run `gini setup` then `gini start` to launch the runtime by hand.
 
 After install, the URLs are stable:
 
@@ -114,7 +114,7 @@ gini provider set openrouter <model>       # uses $OPENROUTER_API_KEY
 gini provider set local <model> --base-url http://127.0.0.1:8000/v1
 ```
 
-The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). Credentials are read from environment variables — never written to Gini config. Run `gini --help` for the full flag set, or see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract.
+The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). API keys are read from environment variables, and Codex OAuth is read from `~/.codex/auth.json` (or `CODEX_AUTH_JSON`) — nothing is written to Gini config. Run `gini --help` for the full flag set, or see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract.
 
 ## Parallel Instances
 

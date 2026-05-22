@@ -2,10 +2,6 @@
 
 Thanks for your interest in contributing. This guide covers the basics for outside contributors. Repository-wide conventions live in [`AGENTS.md`](AGENTS.md); please read that first.
 
-## Code of conduct
-
-This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). By participating you agree to uphold it.
-
 ## Reporting issues
 
 - **Bugs**: open an issue using the Bug Report template. Include OS, Bun version, instance name, and relevant `~/.gini/instances/<instance>/logs/` output.
@@ -24,7 +20,7 @@ bun run gini install
 bun run gini start
 ```
 
-Each repo worktree gets an isolated instance derived from the directory name, so you can run multiple checkouts in parallel without colliding with the installed `default` instance. See [`README.md`](README.md#from-source-for-developers) for details.
+Each repo worktree gets an isolated instance derived from the directory name, so you can run multiple checkouts in parallel without colliding with the installed `default` instance. See [`README.md`](README.md#from-source) for details.
 
 ## Making changes
 
