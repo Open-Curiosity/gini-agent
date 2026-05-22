@@ -137,6 +137,34 @@ export class TunnelManager {
   }
 
   /**
+   * Mutate the live config a running manager observes. Used by the
+   * runtime's `applyConfig` hook so flipping `enabled` or the Apple
+   * Notes toggle from the web UI takes effect immediately for any
+   * subsequent refresh — the manager is constructed once at boot and
+   * persists across HTTP requests.
+   */
+  updateConfig(update: { enabled?: boolean; appleNotes?: TunnelConfig["appleNotes"] }): void {
+    if (typeof update.enabled === "boolean") {
+      (this.config as { enabled: boolean }).enabled = update.enabled;
+    }
+    if (update.appleNotes) {
+      (this.config as { appleNotes: TunnelConfig["appleNotes"] }).appleNotes = {
+        ...this.config.appleNotes,
+        ...update.appleNotes
+      };
+      this.snapshot = {
+        ...this.snapshot,
+        appleNotes: {
+          ...this.snapshot.appleNotes,
+          enabled: this.config.appleNotes.enabled,
+          folder: this.config.appleNotes.folder,
+          noteName: this.config.appleNotes.noteName
+        }
+      };
+    }
+  }
+
+  /**
    * Await any in-flight Apple Notes refresh. Returns immediately when no
    * write is pending. Tests use this to wait deterministically for the
    * fire-and-forget refresh kicked off by `start()`; production callers

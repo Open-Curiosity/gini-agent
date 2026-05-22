@@ -14,6 +14,7 @@ import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/br
 import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
 import { resolveTunnelConfig, TunnelManager } from "./integrations/tunnel";
+import type { PersistedTunnelConfig } from "./types";
 
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
@@ -201,7 +202,59 @@ const server = Bun.serve({
       // `GET /api/tunnel` invoke the manager and return its internal
       // snapshot (including the persisted secret), defeating the
       // disabled-aware getSnapshot above.
-      refreshAppleNote: tunnelResolved.config.enabled ? () => tunnelManager.refreshAppleNote() : undefined
+      refreshAppleNote: tunnelResolved.config.enabled ? () => tunnelManager.refreshAppleNote() : undefined,
+      // PATCH /api/tunnel routes here. Persists the change to config.json
+      // and starts/stops cloudflared accordingly so the UI's toggle
+      // takes effect without requiring a runtime restart.
+      applyConfig: async (update) => {
+        const next: PersistedTunnelConfig = { ...(config.tunnel ?? {}) };
+        if (typeof update.enabled === "boolean") next.enabled = update.enabled;
+        if (update.appleNotes) {
+          next.appleNotes = { ...(next.appleNotes ?? {}), ...update.appleNotes };
+        }
+        config.tunnel = next;
+        // Persist alongside the in-memory mutation so the next boot
+        // sees the change even if the runtime exits before any other
+        // settings write fires.
+        try {
+          const onDisk = JSON.parse(readFileSync(configPath(config.instance), "utf8")) as Record<string, unknown>;
+          onDisk.tunnel = next;
+          writeFileSync(configPath(config.instance), `${JSON.stringify(onDisk, null, 2)}\n`);
+        } catch (error) {
+          appendLog(config.instance, "tunnel.config.persist.error", {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+        // Update the live manager. Two paths:
+        //  - Just-enabled: spin cloudflared up now.
+        //  - Just-disabled: tear it down.
+        //  - Enabled + appleNotes flipped: nothing process-level to do.
+        const becameEnabled = next.enabled === true && tunnelResolved.config.enabled !== true;
+        const becameDisabled = next.enabled === false && tunnelResolved.config.enabled === true;
+        tunnelResolved.config = {
+          ...tunnelResolved.config,
+          enabled: next.enabled ?? tunnelResolved.config.enabled,
+          appleNotes: { ...tunnelResolved.config.appleNotes, ...(next.appleNotes ?? {}) }
+        };
+        // The manager observes the same config object reference, but
+        // appleNotes.enabled lives inside it and needs to be mirrored
+        // forward for the next refresh.
+        tunnelManager.updateConfig({
+          enabled: tunnelResolved.config.enabled,
+          appleNotes: tunnelResolved.config.appleNotes
+        });
+        if (becameEnabled) {
+          await tunnelManager.start().catch((error) => {
+            appendLog(config.instance, "tunnel.start.error", {
+              error: error instanceof Error ? error.message : String(error)
+            });
+          });
+        }
+        if (becameDisabled) {
+          await tunnelManager.stop();
+        }
+        return tunnelManager.getSnapshot();
+      }
     }
   })
 });

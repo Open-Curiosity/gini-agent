@@ -60,6 +60,14 @@ export interface TunnelHandlerHooks {
    * that promise.
    */
   refreshAppleNote?(): Promise<TunnelSnapshot>;
+  /**
+   * Optional: mutate the persisted tunnel config. The runtime
+   * implementation applies the change in-memory + on-disk, may start or
+   * stop the cloudflared subprocess, and returns the resulting snapshot.
+   * Exposed so the web UI's settings toggle can flip enabled state
+   * without operators dropping into a shell.
+   */
+  applyConfig?(update: { enabled?: boolean; appleNotes?: { enabled?: boolean } }): Promise<TunnelSnapshot>;
 }
 
 export interface CreateHandlerOptions {
@@ -114,6 +122,27 @@ export function createHandler(
       return new Response(ansi, {
         headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }
       });
+    }],
+    // PATCH /api/tunnel mutates the persisted tunnel config. Accepts a
+    // partial `{ enabled?: boolean; appleNotes?: { enabled?: boolean } }`
+    // payload. The runtime applies the change in-memory AND writes it
+    // back to config.json so the next boot picks it up. Returns the
+    // updated snapshot. Used by the web UI's settings toggle so the
+    // operator can flip the tunnel feature on/off without dropping
+    // into a shell.
+    ["PATCH", /^\/api\/tunnel$/, async (request) => {
+      if (!tunnel?.applyConfig) return json({ error: "tunnel patch not supported" }, 501);
+      const payload = await body(request);
+      const enabledRaw = (payload as { enabled?: unknown }).enabled;
+      const notesPayload = (payload as { appleNotes?: { enabled?: unknown } }).appleNotes;
+      const notesEnabledRaw = notesPayload?.enabled;
+      const update: { enabled?: boolean; appleNotes?: { enabled?: boolean } } = {};
+      if (typeof enabledRaw === "boolean") update.enabled = enabledRaw;
+      if (typeof notesEnabledRaw === "boolean") {
+        update.appleNotes = { enabled: notesEnabledRaw };
+      }
+      const snapshot = await tunnel.applyConfig(update);
+      return json(snapshot);
     }],
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/version$/, () => json(currentVersionInfo())],

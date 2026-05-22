@@ -13,10 +13,14 @@ import { runtimeToken, runtimeUrl } from "@/lib/runtime";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-async function forwardRedacted(method: "GET"): Promise<Response> {
+async function forwardRedacted(method: "GET" | "PATCH", body?: string): Promise<Response> {
   const upstream = await fetch(`${runtimeUrl()}/api/tunnel`, {
     method,
-    headers: { authorization: `Bearer ${runtimeToken()}` }
+    headers: {
+      authorization: `Bearer ${runtimeToken()}`,
+      ...(body !== undefined ? { "content-type": "application/json" } : {})
+    },
+    body
   });
   if (!upstream.ok) {
     return new Response(await upstream.text(), {
@@ -69,3 +73,8 @@ function redactAppleNotes(payload: unknown): Record<string, unknown> | null {
 }
 
 export const GET = async (_request: NextRequest) => forwardRedacted("GET");
+export const PATCH = async (request: NextRequest) => {
+  let body = "";
+  try { body = await request.text(); } catch { body = ""; }
+  return forwardRedacted("PATCH", body || "{}");
+};

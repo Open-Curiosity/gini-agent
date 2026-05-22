@@ -12,6 +12,7 @@ import { ToolsetsCard, type ToolsetRow } from "./_components/ToolsetsCard";
 import { McpCard, MessagingCard, type McpRow, type MessagingRow } from "./_components/McpCard";
 import { DevicesCard, type DeviceRow } from "./_components/DevicesCard";
 import { BrowserSettingsCard } from "./_components/BrowserSettingsCard";
+import { TunnelSettingsCard } from "./_components/TunnelSettingsCard";
 
 export default function SettingsPage() {
   const invalidate = useInvalidate();
@@ -108,6 +109,8 @@ export default function SettingsPage() {
       <PageHeader title="Settings" description="Providers, browser, agents, toolsets, integrations, devices" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
         <ProviderCard displayName={displayName} model={effectiveProviderModel} />
+
+        <TunnelSettingsCard />
 
         <BrowserSettingsCard />
 
