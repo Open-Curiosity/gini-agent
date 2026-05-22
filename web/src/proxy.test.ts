@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NextRequest } from "next/server";
@@ -11,20 +11,25 @@ import { proxy } from "./proxy";
 // process and leak into sibling test files — runtime.test.ts in
 // particular reads the same exports and breaks if it sees a stale
 // in-memory stub.
+//
+// Test layout: per-test instance + scratch root via mkdtempSync, so the
+// module-level mtime cache in lib/runtime.ts cannot return a stale
+// entry from a prior test (two writes within the same millisecond
+// would otherwise share a cache entry).
 
-const ROOT = join(tmpdir(), "gini-proxy-test-root");
-const INSTANCE = "proxy-test";
-const CONFIG_DIR = join(ROOT, "instances", INSTANCE);
-const CONFIG_PATH = join(CONFIG_DIR, "config.json");
+let suiteRoot: string;
 const TOKEN = "test-token";
-
 const envSnapshot: { instance?: string; root?: string; token?: string; url?: string } = {};
+const originalFetch = globalThis.fetch;
+let instanceCounter = 0;
+let currentInstance: string;
 
 beforeAll(() => {
   envSnapshot.instance = process.env.GINI_INSTANCE;
   envSnapshot.root = process.env.GINI_STATE_ROOT;
   envSnapshot.token = process.env.GINI_TOKEN;
   envSnapshot.url = process.env.GINI_RUNTIME_URL;
+  suiteRoot = mkdtempSync(join(tmpdir(), "gini-proxy-test-"));
 });
 
 afterAll(() => {
@@ -36,22 +41,32 @@ afterAll(() => {
   else process.env.GINI_TOKEN = envSnapshot.token;
   if (envSnapshot.url === undefined) delete process.env.GINI_RUNTIME_URL;
   else process.env.GINI_RUNTIME_URL = envSnapshot.url;
-  rmSync(ROOT, { recursive: true, force: true });
+  // CRITICAL: restore globalThis.fetch. The beforeEach replaces it with
+  // a Bun mock; without this restoration, sibling test files in the
+  // same Bun process inherit the stubbed fetch and start failing
+  // because every real HTTP request resolves to providerConfigured:true
+  // regardless of target. browser-connect tests in particular hit
+  // unreachable CDP endpoints and expect timeouts; the stub turns
+  // those into spurious successes.
+  globalThis.fetch = originalFetch;
+  rmSync(suiteRoot, { recursive: true, force: true });
 });
 
 function writeTunnelConfig(tunnel: unknown): void {
-  mkdirSync(CONFIG_DIR, { recursive: true });
+  const dir = join(suiteRoot, "instances", currentInstance);
+  mkdirSync(dir, { recursive: true });
   writeFileSync(
-    CONFIG_PATH,
-    JSON.stringify({ instance: INSTANCE, token: TOKEN, tunnel }, null, 2)
+    join(dir, "config.json"),
+    JSON.stringify({ instance: currentInstance, token: TOKEN, tunnel }, null, 2)
   );
 }
 
 describe("proxy", () => {
   beforeEach(() => {
-    rmSync(ROOT, { recursive: true, force: true });
-    process.env.GINI_INSTANCE = INSTANCE;
-    process.env.GINI_STATE_ROOT = ROOT;
+    instanceCounter += 1;
+    currentInstance = `proxy-test-${instanceCounter}`;
+    process.env.GINI_INSTANCE = currentInstance;
+    process.env.GINI_STATE_ROOT = suiteRoot;
     process.env.GINI_TOKEN = TOKEN;
     // Pin the runtime URL so isProviderConfigured() always targets the
     // stubbed fetch below — without a static URL the helper would resolve
@@ -67,7 +82,10 @@ describe("proxy", () => {
   });
 
   afterEach(() => {
-    rmSync(ROOT, { recursive: true, force: true });
+    // Restore the original fetch after each test so a sibling test
+    // that runs between hooks doesn't observe the stub.
+    globalThis.fetch = originalFetch;
+    rmSync(join(suiteRoot, "instances", currentInstance), { recursive: true, force: true });
   });
 
   test("external host with tunnel disabled returns 404", async () => {
