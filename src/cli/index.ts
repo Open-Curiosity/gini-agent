@@ -96,7 +96,7 @@ export async function run(): Promise<void> {
     case "stop": stop(ctx); break;
     case "status": await statusCmd(ctx); break;
     case "doctor": await doctorCmd(ctx); break;
-    case "reset": reset(ctx); break;
+    case "reset": await reset(ctx); break;
     case "setup": await setup(ctx); break;
     case "autostart": await autostart(ctx); break;
     case "task": await task(ctx); break;

@@ -164,6 +164,73 @@ describe("migratePinnedMemoriesToUserProfile", () => {
     expect(occurrences).toBe(1);
   });
 
+  test("does not double-append when USER.md already carries the migration header (crash recovery)", async () => {
+    const config = makeConfig("crash-recovery");
+    // Seed state.memories AND a USER.md that already carries the migration
+    // header. Simulates a crash between the file write and the marker
+    // stamp on a previous startup. The header check must skip the second
+    // append while still clearing the array and stamping the marker.
+    await seedMemories(config, [{ id: "mem_a", content: "First fact." }]);
+    const path = userProfilePath(config.instance);
+    ensureDir(join(root, "instances", config.instance));
+    writeFileSync(path, "<!-- migrated from pinned memories on 2026-05-21T00:00:00.000Z -->\n- First fact.\n");
+    const beforeBytes = readFileSync(path, "utf8");
+
+    const report = await migratePinnedMemoriesToUserProfile(config);
+    expect(report.ran).toBe(true);
+    // The file is left alone — the on-disk header signals the prior pass
+    // wrote it. The marker still lands so the array is drained.
+    const afterBytes = readFileSync(path, "utf8");
+    expect(afterBytes).toBe(beforeBytes);
+
+    const state = readState(config.instance);
+    const stateDyn = state as unknown as { migrations?: { statePinnedToUserMd?: string }; memories?: unknown[] };
+    expect(stateDyn.migrations?.statePinnedToUserMd).toBeDefined();
+    expect(stateDyn.memories === undefined || (Array.isArray(stateDyn.memories) && stateDyn.memories.length === 0)).toBe(true);
+  });
+
+  test("emits per-row migrated audit events alongside the summary", async () => {
+    const config = makeConfig("per-row-audit");
+    await seedMemories(config, [
+      { id: "mem_a", content: "Alpha fact." },
+      { id: "mem_b", content: "Bravo fact." }
+    ]);
+
+    await migratePinnedMemoriesToUserProfile(config);
+    const state = readState(config.instance);
+    const rowAudits = state.audit.filter((event) => event.action === "memory.pinned.migrated.row");
+    expect(rowAudits).toHaveLength(2);
+    const ids = rowAudits.map((event) => event.evidence?.memoryId);
+    expect(ids).toContain("mem_a");
+    expect(ids).toContain("mem_b");
+    const contents = rowAudits.map((event) => event.evidence?.content);
+    expect(contents).toContain("Alpha fact.");
+    expect(contents).toContain("Bravo fact.");
+  });
+
+  test("tolerates malformed state.memories rows without throwing", async () => {
+    const config = makeConfig("malformed-rows");
+    await mutateState(config.instance, (state) => {
+      const stateDyn = state as unknown as { memories: unknown };
+      // Hand-edited / corrupted state: missing fields, wrong types,
+      // non-objects, nullish entries. The migration must skip these.
+      stateDyn.memories = [
+        null,
+        "not an object",
+        { id: "mem_a", status: "active" }, // missing content
+        { id: "mem_b", status: "active", content: 42 }, // non-string content
+        { id: "mem_c", status: "active", content: "Valid fact." }
+      ];
+    });
+
+    const report = await migratePinnedMemoriesToUserProfile(config);
+    expect(report.ran).toBe(true);
+    expect(report.migrated).toBe(1);
+
+    const body = readFileSync(userProfilePath(config.instance), "utf8");
+    expect(body).toContain("- Valid fact.");
+  });
+
   test("is idempotent — second call returns ran: false with no new write", async () => {
     const config = makeConfig("idempotent");
     await seedMemories(config, [{ id: "mem_a", content: "First fact." }]);

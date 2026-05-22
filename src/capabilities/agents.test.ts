@@ -58,7 +58,7 @@ describe("createAgent", () => {
 
   test("inherits provider/model from the default agent when caller omits them", async () => {
     const config = buildConfig(workspaceRoot, "create-agent-inherit", root);
-    install(config);
+    await install(config);
     // install() seeds the default agent from config.provider, but does so
     // via a fire-and-forget mutateState. Wait for it to settle so the
     // inheritance read sees the seeded value rather than the undefined
@@ -84,7 +84,7 @@ describe("createAgent", () => {
 
   test("explicit overrides win over default-agent inheritance", async () => {
     const config = buildConfig(workspaceRoot, "create-agent-override", root);
-    install(config);
+    await install(config);
     await mutateState(config.instance, (state) => {
       const defaultAgent = state.agents.find((agent) => agent.id === "agent_default");
       if (!defaultAgent) throw new Error("default agent missing after install");
@@ -107,7 +107,7 @@ describe("createAgent", () => {
 
   test("deleteAgent removes the agent, its memories, and its hindsight bank", async () => {
     const config = buildConfig(workspaceRoot, "delete-agent-cascade", root);
-    install(config);
+    await install(config);
 
     const created = await createAgent(config, { name: "scratch" });
     // Bank already created by createAgent → ensureAgentBank. Stamp a
@@ -139,7 +139,7 @@ describe("createAgent", () => {
 
   test("deleteAgent resolves by name", async () => {
     const config = buildConfig(workspaceRoot, "delete-agent-by-name", root);
-    install(config);
+    await install(config);
     const created = await createAgent(config, { name: "by-name" });
     const result = await deleteAgent(config, "by-name");
     expect(result.id).toBe(created.id);
@@ -149,7 +149,7 @@ describe("createAgent", () => {
 
   test("deleteAgent refuses to delete the default agent", async () => {
     const config = buildConfig(workspaceRoot, "delete-agent-default", root);
-    install(config);
+    await install(config);
     await expect(deleteAgent(config, "agent_default")).rejects.toThrow(
       "Cannot delete the default agent."
     );
@@ -157,7 +157,7 @@ describe("createAgent", () => {
 
   test("deleteAgent refuses to delete the active agent", async () => {
     const config = buildConfig(workspaceRoot, "delete-agent-active", root);
-    install(config);
+    await install(config);
     const created = await createAgent(config, { name: "active-one" });
     await useAgent(config, created.id);
     await expect(deleteAgent(config, created.id)).rejects.toThrow(
@@ -167,7 +167,7 @@ describe("createAgent", () => {
 
   test("deleteAgent throws when the agent does not exist", async () => {
     const config = buildConfig(workspaceRoot, "delete-agent-missing", root);
-    install(config);
+    await install(config);
     await expect(deleteAgent(config, "agent_does_not_exist")).rejects.toThrow(
       "Agent not found: agent_does_not_exist"
     );

@@ -86,7 +86,7 @@ function countMemoryUnitsIfPresent(config: RuntimeConfig): number {
   }
 }
 
-export function install(config: RuntimeConfig): void {
+export async function install(config: RuntimeConfig): Promise<void> {
   // After resetInstance removes the instance root, the directory is gone. Ensure it
   // before writing the config so reinstall is a clean idempotent operation.
   ensureDir(instanceRoot(config.instance));
@@ -115,22 +115,21 @@ export function install(config: RuntimeConfig): void {
   // the instance-scoped USER.md and clear the array. Idempotent via a state
   // marker; best-effort — a failure audits via appendLog and lets the runtime
   // continue. Must run AFTER scaffoldInstanceIdentityFiles (so USER.md is
-  // materialized) and BEFORE the SOUL.md backfill loop below (the backfill
-  // touches agents, the migration touches memories — independent surfaces,
-  // but keeping migrations ordered before agent work matches the install
-  // flow's "drain legacy first, then provision per-agent" shape). See ADR
-  // memory-surface-consolidation.md.
-  void migratePinnedMemoriesToUserProfile(config).then((report) => {
-    if (report.error) {
-      try {
-        appendLog(config.instance, "memory.pinned.migration.error", {
-          error: report.error
-        });
-      } catch {
-        // Logging itself failing must not crash startup.
-      }
+  // materialized) and BEFORE the SOUL.md backfill loop below — the
+  // `normalizeState` path on the next readState consults the marker and
+  // strips the dead `state.memories` field, and the SOUL.md backfill should
+  // see the post-migration shape rather than racing the file write.
+  // See ADR memory-surface-consolidation.md.
+  const migrationReport = await migratePinnedMemoriesToUserProfile(config);
+  if (migrationReport.error) {
+    try {
+      appendLog(config.instance, "memory.pinned.migration.error", {
+        error: migrationReport.error
+      });
+    } catch {
+      // Logging itself failing must not crash startup.
     }
-  });
+  }
   const state = readState(config.instance);
   // Backfill per-agent SOUL.md placeholders for every existing agent.
   // Catches the 21+ already-provisioned instances on disk that pre-date
@@ -151,14 +150,14 @@ export function install(config: RuntimeConfig): void {
   void seedDefaultAgentFromRuntimeConfig(config);
 }
 
-export function resetInstance(config: RuntimeConfig): void {
+export async function resetInstance(config: RuntimeConfig): Promise<void> {
   // Close the cached memory DB handle (if any) before removing the state
   // root so we release the WAL/SHM file descriptors. Without this, the
   // physical files would still be unlinked but a subsequent getMemoryDb()
   // could hand back the closed handle from the cache.
   closeMemoryDb(config.instance);
   rmSync(config.stateRoot, { recursive: true, force: true });
-  install(config);
+  await install(config);
 }
 
 export function uninstallInstance(config: RuntimeConfig): void {

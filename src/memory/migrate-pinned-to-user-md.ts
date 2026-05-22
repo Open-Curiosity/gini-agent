@@ -18,20 +18,6 @@ import { addAudit } from "../state/audit";
 import { appendLog } from "../state/trace";
 import { writeUserProfile, userProfilePath } from "../runtime/identity-files";
 
-// Legacy MemoryRecord shape (pre-consolidation). Inlined here because the
-// type was removed from `src/types.ts` — the migration is the only
-// remaining consumer of the structural shape and it needs to read whatever
-// the persisted state.json still carries on disk.
-interface LegacyMemoryRecord {
-  id: string;
-  agentId?: string;
-  content: string;
-  status: "proposed" | "active" | "archived" | "rejected" | "conflicted";
-  confidence?: number;
-  createdAt?: string;
-  updatedAt?: string;
-}
-
 export interface MigrationReport {
   // True when the migration ran in this call (regardless of whether any rows
   // were actually migrated — a state file with `state.memories: []` still
@@ -79,8 +65,15 @@ function readApprovedUserProfile(instance: Instance): string {
 }
 
 // Drain `state.memories` into USER.md. Idempotent via the
-// `state.migrations.statePinnedToUserMd` marker. Best-effort: a thrown
-// error is captured in the returned report (the runtime keeps booting).
+// `state.migrations.statePinnedToUserMd` marker AND, as defense in
+// depth, by inspecting USER.md for the header this migration writes so
+// a crash between the file write and the marker stamp does not lead to
+// a double-append on the next startup.
+//
+// Best-effort: a thrown error is captured in the returned report (the
+// runtime keeps booting). Malformed `state.memories` rows (anything
+// other than `{ content: string, status: string }`) are skipped, never
+// throw.
 //
 // Migration semantics:
 //   - Only rows with status === "active" are migrated. Proposed and
@@ -95,35 +88,71 @@ function readApprovedUserProfile(instance: Instance): string {
 export async function migratePinnedMemoriesToUserProfile(
   config: RuntimeConfig
 ): Promise<MigrationReport> {
+  try {
+    return await runMigration(config);
+  } catch (error) {
+    // Catch-all guard. The body below already wraps every IO seam in
+    // its own try/catch, but a malformed state.memories row (e.g.
+    // `status` is not a string) could throw inside the per-row loop —
+    // the marker stays unset so the next startup retries, and the
+    // gateway keeps booting either way.
+    const message = error instanceof Error ? error.message : String(error);
+    try {
+      appendLog(config.instance, "memory.pinned.migration.failed", {
+        stage: "unexpected",
+        error: message
+      });
+    } catch {
+      // Swallow — logging itself failing must not crash startup.
+    }
+    return { ran: false, migrated: 0, error: message };
+  }
+}
+
+async function runMigration(config: RuntimeConfig): Promise<MigrationReport> {
   // Read-only snapshot to decide whether the migration needs to run at all.
   // Avoids burning a mutateState window when the marker is already set.
   const initial = readState(config.instance);
   const dyn = initial as unknown as {
     migrations?: { statePinnedToUserMd?: string };
-    memories?: LegacyMemoryRecord[];
+    memories?: unknown;
   };
   if (dyn.migrations?.statePinnedToUserMd) {
     return { ran: false, migrated: 0 };
   }
 
+  // Crash-idempotency check: a previous run may have written USER.md
+  // before the marker landed. Skip the file write (but still stamp the
+  // marker + clear the array below) if USER.md already carries our
+  // migration header.
+  const existingBody = readApprovedUserProfile(config.instance);
+  const alreadyAppended = existingBody.includes(MIGRATION_HEADER_PREFIX);
+
+  // Robust shape extraction: tolerate malformed rows. Anything that
+  // isn't a `{ status: "active", content: string }` is silently
+  // dropped. The migration MUST NOT crash on a hand-edited state file.
   const candidates: string[] = [];
+  const candidateIds: string[] = [];
   const seen = new Set<string>();
-  for (const memory of dyn.memories ?? []) {
-    if (memory.status !== "active") continue;
-    const text = (memory.content ?? "").trim();
+  const rawMemories = Array.isArray(dyn.memories) ? dyn.memories : [];
+  for (const entry of rawMemories) {
+    if (!entry || typeof entry !== "object") continue;
+    const row = entry as Record<string, unknown>;
+    if (row.status !== "active") continue;
+    const text = typeof row.content === "string" ? row.content.trim() : "";
     if (!text) continue;
     if (seen.has(text)) continue;
     seen.add(text);
     candidates.push(text);
+    candidateIds.push(typeof row.id === "string" ? row.id : `mem_unknown_${candidates.length}`);
   }
 
   const at = new Date().toISOString();
-  let appendedBody = "";
-  if (candidates.length > 0) {
-    const existingBody = readApprovedUserProfile(config.instance).trim();
+  if (candidates.length > 0 && !alreadyAppended) {
+    const trimmed = existingBody.trim();
     const migratedSection = renderMigratedSection(candidates, at);
-    appendedBody = existingBody.length > 0
-      ? `${existingBody}\n\n${migratedSection}\n`
+    const appendedBody = trimmed.length > 0
+      ? `${trimmed}\n\n${migratedSection}\n`
       : `${migratedSection}\n`;
     try {
       // Auto-approved write — same semantics edit_user_profile uses
@@ -149,17 +178,34 @@ export async function migratePinnedMemoriesToUserProfile(
   try {
     await mutateState(config.instance, (state) => {
       const stateDyn = state as unknown as {
-        memories?: LegacyMemoryRecord[];
+        memories?: unknown;
         migrations?: { statePinnedToUserMd?: string };
       };
-      const migratedIds = (stateDyn.memories ?? [])
-        .filter((memory: LegacyMemoryRecord) => memory.status === "active")
-        .map((memory: LegacyMemoryRecord) => memory.id);
       stateDyn.memories = [];
       stateDyn.migrations = {
         ...(stateDyn.migrations ?? {}),
         statePinnedToUserMd: at
       };
+      // Per-row audit so operators can see exactly which pinned memory
+      // landed in USER.md. The ADR for the consolidation calls for the
+      // per-row + summary breakdown; the summary row follows below.
+      for (let i = 0; i < candidates.length; i += 1) {
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "memory.pinned.migrated.row",
+            target: userProfilePath(config.instance),
+            risk: "low",
+            evidence: {
+              memoryId: candidateIds[i],
+              content: candidates[i],
+              marker: at
+            }
+          },
+          { system: true }
+        );
+      }
       addAudit(
         state,
         {
@@ -169,8 +215,9 @@ export async function migratePinnedMemoriesToUserProfile(
           risk: "low",
           evidence: {
             migrated: candidates.length,
-            migratedIds,
-            marker: at
+            migratedIds: candidateIds,
+            marker: at,
+            alreadyAppended
           }
         },
         { system: true }

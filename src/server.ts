@@ -31,7 +31,7 @@ const SCHEDULER_DRAIN_TIMEOUT_MS = 5000;
 
 const instance = parseInstance();
 const config = loadConfig(instance);
-install(config);
+await install(config);
 writePid(config);
 
 // Inform the browser session manager which instance to consult for the

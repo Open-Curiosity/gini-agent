@@ -143,7 +143,7 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
   const alreadyRunning = await isRunning(config);
   let runtimeStarted = false;
   if (!alreadyRunning) {
-    install(config);
+    await install(config);
     const requestedRuntimePort = config.port;
     const claimedPort = await availablePort(requestedRuntimePort);
     if (claimedPort !== requestedRuntimePort && options.runtimePortPinned) {
@@ -151,7 +151,7 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
       throw new Error(`Requested runtime port ${requestedRuntimePort} is busy. Stop the other process or pick a different --port.`);
     }
     config.port = claimedPort;
-    install(config);
+    await install(config);
     writeFileSync(runtimePortPath(config.instance), String(config.port));
     // Foreground mode keeps the child attached to the CLI: no detached process
     // group, and stdio is tee'd to both the user's terminal and runtime-stdout.log.
