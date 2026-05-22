@@ -717,13 +717,15 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
-    // Cross-session lookup. Scans past tasks, traces, memories, skills,
-    // and audit rows for a substring match. Low-risk; read-only.
+    // Cross-session lookup. Scans past tasks, traces, skills, and audit
+    // rows for a substring match. Low-risk; read-only. (Pinned memories
+    // were dropped in the state.memories consolidation — for memory
+    // recall use `recall_memory` against the Hindsight bank instead.)
     toolset: "session_search",
     type: "function",
     function: {
       name: "search_history",
-      description: "Search past chat sessions, task traces, stored memories, skill text, and audit events for a substring. Use when the user references something they did before ('did I ever ask about X?', 'find that conversation about Y'). Returns up to `limit` snippets ordered by score, each with kind (task/trace/memory/skill/audit), title, excerpt, and taskId when applicable.",
+      description: "Search past chat sessions, task traces, skill text, and audit events for a substring. Use when the user references something they did before ('did I ever ask about X?', 'find that conversation about Y'). Returns up to `limit` snippets ordered by score, each with kind (task/trace/skill/audit), title, excerpt, and taskId when applicable. For memory recall use `recall_memory` instead — it queries the Hindsight bank where auto-retain persists facts.",
       parameters: {
         type: "object",
         properties: {

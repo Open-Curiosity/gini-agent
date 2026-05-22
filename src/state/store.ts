@@ -268,6 +268,42 @@ function migrateProfileFieldsToAgent(state: RuntimeState): void {
   delete stateAny.activeProfileId;
 }
 
+// Strip legacy improvement proposals with `kind: "memory"` from the
+// in-memory shape. The `memory` kind was removed alongside the
+// state.memories consolidation; older state files may still carry
+// proposals on that kind which would otherwise fall through the
+// proposeImprovement normalizer and get mis-applied as a skill or job.
+// Each removed proposal lands an audit row so operators can see the
+// pruning happened. See ADR memory-surface-consolidation.md.
+function dropDeadMemoryImprovements(state: RuntimeState): void {
+  if (!Array.isArray(state.improvements)) return;
+  const removed: Array<{ id: string; title: string; status: string }> = [];
+  state.improvements = state.improvements.filter((proposal) => {
+    const dyn = proposal as unknown as { kind?: unknown; id?: unknown; title?: unknown; status?: unknown };
+    if (dyn.kind !== "memory") return true;
+    removed.push({
+      id: typeof dyn.id === "string" ? dyn.id : "<unknown>",
+      title: typeof dyn.title === "string" ? dyn.title : "<untitled>",
+      status: typeof dyn.status === "string" ? dyn.status : "<unknown>"
+    });
+    return false;
+  });
+  if (removed.length === 0) return;
+  for (const entry of removed) {
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "improvement.memory-kind.removed",
+        target: entry.id,
+        risk: "low",
+        evidence: { title: entry.title, status: entry.status, reason: "kind: memory removed in consolidation" }
+      },
+      { system: true }
+    );
+  }
+}
+
 // Defensive drop of the legacy `state.memories` field. The migration in
 // `migratePinnedMemoriesToUserProfile` clears the array and sets a marker
 // so this normally runs against an empty array, but old state files from
@@ -637,6 +673,11 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   // pinned content intact until the migration drains it. See ADR
   // memory-surface-consolidation.md.
   dropDeadMemoriesField(state);
+  // Strip legacy improvement proposals with `kind: "memory"` so the
+  // proposeImprovement normalizer never sees them and silently
+  // mis-applies them as skills or jobs. See ADR
+  // memory-surface-consolidation.md.
+  dropDeadMemoryImprovements(state);
   state.relays ??= [];
   state.notifications ??= [];
   state.events ??= [];

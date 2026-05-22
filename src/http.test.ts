@@ -348,7 +348,7 @@ describe("runtime api", () => {
 
     await call(handler, config, "/api/improvements", {
       method: "POST",
-      body: JSON.stringify({ kind: "memory", title: "event-test", payload: { content: "events are observable" } })
+      body: JSON.stringify({ kind: "skill", title: "event-test", payload: { name: "event-test" } })
     });
     const response = await rawCall(handler, config, "/api/events/stream", {}, config.token);
     const reader = response.body?.getReader();
@@ -372,7 +372,7 @@ describe("runtime api", () => {
 
     await call(handler, config, "/api/improvements", {
       method: "POST",
-      body: JSON.stringify({ kind: "memory", title: "first", payload: { content: "first" } })
+      body: JSON.stringify({ kind: "skill", title: "first", payload: { name: "first" } })
     });
     // Read the full event log once to discover the most-recent id.
     const events = await call(handler, config, "/api/events");
@@ -639,7 +639,7 @@ describe("runtime api", () => {
 
     await call(handler, config, "/api/improvements", {
       method: "POST",
-      body: JSON.stringify({ kind: "memory", title: "readiness", payload: { content: "readiness evidence" } })
+      body: JSON.stringify({ kind: "skill", title: "readiness", payload: { name: "readiness" } })
     });
     const readiness = await call(handler, config, "/api/readiness/v1");
 

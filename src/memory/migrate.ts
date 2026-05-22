@@ -9,27 +9,21 @@
 //
 // The exported functions stay so `/api/memory/migrate` and the
 // `gini memory migrate` CLI surface keep returning a structured report
-// without breaking older callers. They now report a no-op result.
+// without breaking older callers. They explicitly report a no-op result
+// — there is no pinned-memory work left to do, the install-time
+// migration already drained the array.
 
 import type { RuntimeConfig } from "../types";
 
 export interface MigrationReport {
-  total: number;
-  migrated: number;
-  skipped: number;
-  failed: number;
-  errors: Array<{ memoryId: string; error: string }>;
-  unitIds: string[];
+  skipped: true;
+  reason: string;
 }
 
 export async function migrateLegacyMemories(_config: RuntimeConfig): Promise<MigrationReport> {
   return {
-    total: 0,
-    migrated: 0,
-    skipped: 0,
-    failed: 0,
-    errors: [],
-    unitIds: []
+    skipped: true,
+    reason: "pinned-memory migration ran during install; no legacy rows remain to drain into Hindsight"
   };
 }
 
