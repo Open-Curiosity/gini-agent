@@ -3,6 +3,24 @@
 // actually read so a runtime field rename doesn't silently fan out
 // across the app.
 
+// ChatBlock is the typed conversation block the runtime emits over the
+// /api/chat/:id/blocks (and /stream) endpoints. We re-export from
+// `@runtime/types` so the mobile client cannot drift from the wire
+// contract — adding a new block kind to src/types.ts immediately fans
+// out into the renderer's exhaustive switch here.
+export type {
+  ChatBlock,
+  ChatBlockKind,
+  UserTextBlock,
+  AssistantTextBlock,
+  ToolCallBlock,
+  ToolCallStatus,
+  ToolResultBlock,
+  PhaseBlock,
+  ApprovalRequestedBlock,
+  SystemNoteBlock
+} from "@runtime/types";
+
 export interface ChatSession {
   id: string;
   instance: string;
