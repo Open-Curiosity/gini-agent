@@ -3,24 +3,31 @@
 // real on-disk paths without polluting a developer's actual instance.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildAgentSystemContext } from "../system-prompt";
 import {
+  HISTORY_MAX_SNAPSHOTS,
   approveSoul,
   approveUserProfile,
   dedupeAppendLines,
   instructionsPath,
+  listSoulHistory,
+  listUserProfileHistory,
   loadInstructions,
   loadSoul,
   loadUserProfile,
   removeSoulSection,
   removeUserProfileSection,
+  restoreSoulFromHistory,
+  restoreUserProfileFromHistory,
   scaffoldAgentSoulFile,
   scaffoldInstanceIdentityFiles,
   scanForInjection,
+  soulHistoryDir,
   soulPath,
   soulProposedPath,
+  userProfileHistoryDir,
   userProfilePath,
   userProfileProposedPath,
   writeSoul,
@@ -497,6 +504,218 @@ describe("identity-files", () => {
       scaffoldAgentSoulFile(INSTANCE, AGENT);
       expect(loadUserProfile(INSTANCE)).toBeNull();
       expect(loadSoul(INSTANCE, AGENT)).toBeNull();
+    });
+  });
+
+  describe("history snapshots", () => {
+    test("first approved write to USER.md does NOT create a snapshot (nothing to roll back to)", () => {
+      writeUserProfile(INSTANCE, "Initial body.", "approved");
+      expect(existsSync(userProfileHistoryDir(INSTANCE))).toBe(false);
+      expect(listUserProfileHistory(INSTANCE)).toEqual([]);
+    });
+
+    test("second approved USER.md write snapshots the previous body and writes the new one", () => {
+      writeUserProfile(INSTANCE, "v1 body.", "approved");
+      writeUserProfile(INSTANCE, "v2 body.", "approved");
+      // Active file holds the newest body.
+      expect(readFileSync(userProfilePath(INSTANCE), "utf8")).toBe("v2 body.");
+      // History dir contains exactly one snapshot — the v1 body.
+      const entries = listUserProfileHistory(INSTANCE);
+      expect(entries.length).toBe(1);
+      expect(readFileSync(entries[0].path, "utf8")).toBe("v1 body.");
+      // Filename is the ISO-styled YYYY-MM-DDTHH-MM-SS.sssZ.md (colons
+      // replaced with dashes). A `-N` suffix appears only when names
+      // collide within the same millisecond — single-write case is the
+      // bare ISO form.
+      expect(entries[0].name).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z(-\d+)?\.md$/);
+    });
+
+    test("each subsequent write adds a new snapshot until the cap", () => {
+      writeUserProfile(INSTANCE, "v1", "approved");
+      writeUserProfile(INSTANCE, "v2", "approved");
+      writeUserProfile(INSTANCE, "v3", "approved");
+      writeUserProfile(INSTANCE, "v4", "approved");
+      // 4 writes → 3 snapshots (the first write doesn't snapshot anything).
+      expect(listUserProfileHistory(INSTANCE).length).toBe(3);
+      expect(readFileSync(userProfilePath(INSTANCE), "utf8")).toBe("v4");
+    });
+
+    test("retention cap evicts oldest snapshots above HISTORY_MAX_SNAPSHOTS", () => {
+      // Seed the history dir directly with HISTORY_MAX_SNAPSHOTS old
+      // entries (each with a distinct old mtime), then trigger one more
+      // write. The cap should drop one entry so the count stays at the
+      // limit. Backdating mtimes is the only way to verify the prune
+      // order in a single test run — otherwise all snapshots share the
+      // same mtime millisecond.
+      writeUserProfile(INSTANCE, "seed", "approved");
+      const dir = userProfileHistoryDir(INSTANCE);
+      mkdirSync(dir, { recursive: true });
+      const baseTime = new Date("2026-01-01T00:00:00.000Z").getTime();
+      for (let i = 0; i < HISTORY_MAX_SNAPSHOTS; i++) {
+        const path = join(dir, `2026-01-01T00-00-${String(i).padStart(2, "0")}.000Z.md`);
+        writeFileSync(path, `seeded-${i}`);
+        const t = new Date(baseTime + i * 1000);
+        utimesSync(path, t, t);
+      }
+      // We have HISTORY_MAX_SNAPSHOTS pre-seeded entries on disk PLUS a
+      // current USER.md. One more write should snapshot the current body
+      // AND prune the oldest of the seeded entries (mtime baseTime).
+      writeUserProfile(INSTANCE, "post-cap", "approved");
+      const entries = listUserProfileHistory(INSTANCE);
+      expect(entries.length).toBe(HISTORY_MAX_SNAPSHOTS);
+      // The oldest seeded snapshot (`...T00-00-00.000Z.md`, mtime baseTime)
+      // was pruned.
+      expect(entries.some((e) => e.name === "2026-01-01T00-00-00.000Z.md")).toBe(false);
+      // The newest seeded snapshot (`...T00-00-49.000Z.md`, mtime
+      // baseTime + 49s) survived because we evict from the oldest end.
+      expect(entries.some((e) => e.name === `2026-01-01T00-00-${String(HISTORY_MAX_SNAPSHOTS - 1).padStart(2, "0")}.000Z.md`)).toBe(true);
+    });
+
+    test("SOUL approval (propose → approve) snapshots the pre-approval approved body", () => {
+      // First seed an approved SOUL.md.
+      writeSoul(INSTANCE, AGENT, "Persona v1.", "approved");
+      // Propose a v2.
+      writeSoul(INSTANCE, AGENT, "Persona v2.", "proposed");
+      // No snapshot yet — the propose path doesn't snapshot.
+      expect(listSoulHistory(INSTANCE, AGENT).length).toBe(0);
+      // Approve the proposal. The pre-approval body should land in
+      // history, and the active SOUL.md should hold the v2 body.
+      expect(approveSoul(INSTANCE, AGENT)).toBe(true);
+      const entries = listSoulHistory(INSTANCE, AGENT);
+      expect(entries.length).toBe(1);
+      expect(readFileSync(entries[0].path, "utf8")).toBe("Persona v1.");
+      expect(readFileSync(soulPath(INSTANCE, AGENT), "utf8")).toBe("Persona v2.");
+    });
+
+    test("SOUL.md proposed write does NOT snapshot (only approval matters for history)", () => {
+      writeSoul(INSTANCE, AGENT, "Persona v1.", "approved");
+      writeSoul(INSTANCE, AGENT, "Persona v2-proposed.", "proposed");
+      // A proposal can be discarded before approval — snapshotting on
+      // every proposed write would flood the history dir with bodies
+      // the user never accepted.
+      expect(listSoulHistory(INSTANCE, AGENT).length).toBe(0);
+    });
+
+    test("remove action with approved status snapshots the pre-remove body", () => {
+      writeUserProfile(
+        INSTANCE,
+        "Likes coffee.\n\nDislikes commute traffic.\n\nFavorite color: blue.",
+        "approved"
+      );
+      const result = removeUserProfileSection(INSTANCE, "coffee", "approved");
+      expect(result.ok).toBe(true);
+      // History captures the pre-remove body intact.
+      const entries = listUserProfileHistory(INSTANCE);
+      expect(entries.length).toBe(1);
+      expect(readFileSync(entries[0].path, "utf8")).toBe(
+        "Likes coffee.\n\nDislikes commute traffic.\n\nFavorite color: blue."
+      );
+      // Active file no longer has the matched paragraph.
+      const active = readFileSync(userProfilePath(INSTANCE), "utf8");
+      expect(active).not.toContain("coffee");
+      expect(active).toContain("commute traffic");
+    });
+
+    test("listUserProfileHistory returns entries newest-first", () => {
+      writeUserProfile(INSTANCE, "v1", "approved");
+      // Stagger writes so mtimes differ. We can't rely on a 1ms gap so we
+      // force the order via utimesSync after the writes complete.
+      writeUserProfile(INSTANCE, "v2", "approved");
+      writeUserProfile(INSTANCE, "v3", "approved");
+      const dir = userProfileHistoryDir(INSTANCE);
+      // Force unambiguous mtime ordering on the snapshots so the test
+      // doesn't rely on the test runner's sub-millisecond write timing.
+      const snapshots = readdirSync(dir).sort();
+      const baseTime = new Date("2026-01-01T00:00:00.000Z").getTime();
+      for (let i = 0; i < snapshots.length; i++) {
+        const t = new Date(baseTime + i * 1000);
+        utimesSync(join(dir, snapshots[i]), t, t);
+      }
+      const entries = listUserProfileHistory(INSTANCE);
+      expect(entries.length).toBeGreaterThan(0);
+      // mtime DESC ordering means the newest entry comes first.
+      for (let i = 0; i < entries.length - 1; i++) {
+        expect(entries[i].mtimeMs).toBeGreaterThanOrEqual(entries[i + 1].mtimeMs);
+      }
+    });
+
+    test("snapshot failure does NOT break the write path", () => {
+      // Plant a file at the history-dir path so ensureDir fails. The
+      // snapshot helper must log + continue rather than crash the write.
+      writeUserProfile(INSTANCE, "v1", "approved");
+      // Force the history directory to be a file (not a directory) so
+      // the next snapshot's ensureDir fails. We delete the dir-as-dir
+      // and replace it with a file at the same path.
+      const dir = userProfileHistoryDir(INSTANCE);
+      // The history dir doesn't exist yet — the first write didn't
+      // snapshot (no prior content). Create it as a file by hand to
+      // sabotage the second write's snapshot.
+      writeFileSync(dir, "not-a-directory");
+      // Second write should succeed even though the snapshot can't be
+      // taken — best-effort posture.
+      writeUserProfile(INSTANCE, "v2", "approved");
+      expect(readFileSync(userProfilePath(INSTANCE), "utf8")).toBe("v2");
+    });
+  });
+
+  describe("restoreUserProfileFromHistory / restoreSoulFromHistory", () => {
+    test("restores the named snapshot and snapshots the pre-restore body", () => {
+      writeUserProfile(INSTANCE, "v1 body.", "approved");
+      writeUserProfile(INSTANCE, "v2 body.", "approved");
+      writeUserProfile(INSTANCE, "v3 body.", "approved");
+      // Latest active is v3, history has v1 and v2.
+      const entries = listUserProfileHistory(INSTANCE);
+      expect(entries.length).toBe(2);
+      // Find the snapshot holding "v1 body." and roll back to it.
+      const v1Snap = entries.find((e) => readFileSync(e.path, "utf8") === "v1 body.");
+      expect(v1Snap).toBeDefined();
+      const result = restoreUserProfileFromHistory(INSTANCE, v1Snap!.name);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.restoredBytes).toBe(Buffer.byteLength("v1 body.", "utf8"));
+        // A pre-restore snapshot of v3 was taken so the rollback is itself
+        // reversible.
+        expect(result.preRestoreSnapshot).not.toBeNull();
+      }
+      // Active file now holds v1 body.
+      expect(readFileSync(userProfilePath(INSTANCE), "utf8")).toBe("v1 body.");
+      // History grew by one entry (the pre-restore snapshot of v3).
+      const after = listUserProfileHistory(INSTANCE);
+      expect(after.length).toBe(3);
+      expect(after.some((e) => readFileSync(e.path, "utf8") === "v3 body.")).toBe(true);
+    });
+
+    test("returns { ok: false, reason: 'no snapshot' } when the named snapshot does not exist", () => {
+      writeUserProfile(INSTANCE, "v1", "approved");
+      const result = restoreUserProfileFromHistory(INSTANCE, "2026-01-01T00-00-00.000Z.md");
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("no snapshot");
+      // Active file is untouched.
+      expect(readFileSync(userProfilePath(INSTANCE), "utf8")).toBe("v1");
+    });
+
+    test("rejects snapshot names that escape the history directory", () => {
+      writeUserProfile(INSTANCE, "v1", "approved");
+      // Path-traversal attempt — must be rejected without touching disk.
+      const result = restoreUserProfileFromHistory(INSTANCE, "../USER.md");
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("no snapshot");
+      // Anything that contains a slash or doesn't end in .md is also
+      // rejected.
+      const slash = restoreUserProfileFromHistory(INSTANCE, "subdir/foo.md");
+      expect(slash.ok).toBe(false);
+      const noExt = restoreUserProfileFromHistory(INSTANCE, "foo");
+      expect(noExt.ok).toBe(false);
+    });
+
+    test("SOUL restore round-trips the same way", () => {
+      writeSoul(INSTANCE, AGENT, "Persona v1.", "approved");
+      writeSoul(INSTANCE, AGENT, "Persona v2.", "approved");
+      const entries = listSoulHistory(INSTANCE, AGENT);
+      expect(entries.length).toBe(1);
+      const result = restoreSoulFromHistory(INSTANCE, AGENT, entries[0].name);
+      expect(result.ok).toBe(true);
+      expect(readFileSync(soulPath(INSTANCE, AGENT), "utf8")).toBe("Persona v1.");
     });
   });
 });

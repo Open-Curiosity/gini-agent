@@ -22,14 +22,18 @@
 
 import {
   closeSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
+  statSync,
+  unlinkSync,
   writeFileSync
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { instanceRoot } from "../paths";
 import { appendLog } from "../state/trace";
 import { DEFAULT_INSTRUCTIONS_PATH } from "../system-prompt";
@@ -64,6 +68,23 @@ export function soulPath(instance: Instance, agentId: string): string {
 
 export function soulProposedPath(instance: Instance, agentId: string): string {
   return `${soulPath(instance, agentId)}.proposed`;
+}
+
+// History snapshot directory next to the active file. Each successful
+// write to USER.md or SOUL.md drops a copy of the file's PREVIOUS
+// contents here under an ISO-8601 filename (colons replaced with dashes
+// because some filesystems reject them in paths). Retention is capped at
+// HISTORY_MAX_SNAPSHOTS — older entries are pruned on each write.
+//
+// The directory is per-file, not per-instance — keeps USER.md history
+// separate from SOUL.md history and per-agent SOUL histories isolated
+// from each other.
+export function userProfileHistoryDir(instance: Instance): string {
+  return `${userProfilePath(instance)}.history`;
+}
+
+export function soulHistoryDir(instance: Instance, agentId: string): string {
+  return `${soulPath(instance, agentId)}.history`;
 }
 
 // ---------------------------------------------------------------------------
@@ -380,15 +401,262 @@ function writeFileSafe(path: string, content: string): void {
   renameSync(tmp, path);
 }
 
+// ---------------------------------------------------------------------------
+// History snapshots. Every successful write to an approved identity file
+// (USER.md or SOUL.md) copies the file's PREVIOUS body to a per-file
+// `<file>.history/` directory under an ISO-8601 filename. Lets the user
+// recover from an over-eager edit (model collapsed a section, dropped a
+// fact) without manual backups. See ADR runtime-identity-files.md.
+//
+// Filename format: `YYYY-MM-DDTHH-MM-SS.sssZ.md`. Colons aren't legal in
+// some filesystems, so we replace them with dashes; the ISO timestamp
+// stays sortable as a string regardless.
+//
+// Retention cap is enforced after each snapshot: directory entries are
+// sorted by mtime descending and anything beyond HISTORY_MAX_SNAPSHOTS is
+// deleted. Set deliberately high enough (50) that a typical year of edits
+// doesn't lose history, but bounded enough that an accidental loop
+// doesn't fill the disk.
+//
+// Snapshot creation is best-effort: a filesystem failure (permissions,
+// disk full) is logged via `appendLog` and the write proceeds. The
+// snapshot exists for human recovery, not for system correctness.
+// ---------------------------------------------------------------------------
+
+export const HISTORY_MAX_SNAPSHOTS = 50;
+
+// Render an ISO timestamp into a path-safe filename. Replace the colons
+// (illegal in some filesystems) and keep the rest of the ISO string
+// intact so the names sort lexicographically by recency. If the base
+// name (sans suffix) collides with an existing entry — two writes in the
+// same millisecond — append a small ascending suffix so each snapshot is
+// distinct on disk.
+function snapshotFilename(historyDir: string, at: Date): string {
+  const base = at.toISOString().replace(/:/g, "-");
+  let candidate = `${base}.md`;
+  let suffix = 0;
+  while (existsSync(join(historyDir, candidate))) {
+    suffix += 1;
+    candidate = `${base}-${suffix}.md`;
+  }
+  return candidate;
+}
+
+// Drop a copy of `sourcePath`'s current contents into `historyDir` under
+// an ISO-named filename. No-op when the source file does not exist (first
+// write — nothing to snapshot). Prunes the directory back to
+// HISTORY_MAX_SNAPSHOTS entries after a successful copy.
+//
+// Returns the snapshot path on success, or `null` when no snapshot was
+// taken (source missing, or the copy/prune step failed). Failures audit
+// via `appendLog` and never throw — the write path must not break on a
+// snapshot error.
+function snapshotIdentityFile(
+  instance: Instance,
+  sourcePath: string,
+  historyDir: string,
+  displayName: string
+): string | null {
+  if (!existsSync(sourcePath)) return null;
+  try {
+    ensureDir(historyDir);
+    // Use a per-process suffix on the tmp name so two writes landing in
+    // the same millisecond don't fight for the same path. The final
+    // filename is the ISO timestamp (with a distinguishing suffix when
+    // names collide); rename is atomic.
+    const at = new Date();
+    const targetPath = join(historyDir, snapshotFilename(historyDir, at));
+    const tmp = `${targetPath}.tmp-${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
+    copyFileSync(sourcePath, tmp);
+    renameSync(tmp, targetPath);
+    pruneSnapshotHistory(historyDir);
+    return targetPath;
+  } catch (error) {
+    try {
+      appendLog(instance, "identity.history.snapshot.error", {
+        file: displayName,
+        source: sourcePath,
+        historyDir,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } catch {
+      // Logging itself failed (state root unwritable, etc.). Swallow —
+      // the snapshot is purely a recovery convenience.
+    }
+    return null;
+  }
+}
+
+// Drop oldest snapshots until the directory holds at most
+// HISTORY_MAX_SNAPSHOTS entries. Sort by mtime descending so the newest
+// are retained when ISO names collide (sub-millisecond writes can produce
+// duplicate filenames; mtime breaks the tie).
+function pruneSnapshotHistory(historyDir: string): void {
+  if (!existsSync(historyDir)) return;
+  let entries: string[];
+  try {
+    entries = readdirSync(historyDir);
+  } catch {
+    return;
+  }
+  // Filter to .md files so an accidental sibling artifact (a half-
+  // written tmp, a stray editor swap file) doesn't get pruned alongside
+  // legitimate snapshots.
+  const snapshots = entries.filter((name) => name.endsWith(".md"));
+  if (snapshots.length <= HISTORY_MAX_SNAPSHOTS) return;
+  const annotated: Array<{ name: string; mtimeMs: number }> = [];
+  for (const name of snapshots) {
+    const path = join(historyDir, name);
+    try {
+      annotated.push({ name, mtimeMs: statSync(path).mtimeMs });
+    } catch {
+      // Stat failure — skip; another sweep will pick it up next time.
+    }
+  }
+  annotated.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const toDelete = annotated.slice(HISTORY_MAX_SNAPSHOTS);
+  for (const entry of toDelete) {
+    try {
+      unlinkSync(join(historyDir, entry.name));
+    } catch {
+      // Permission glitch or race with another writer. Leave the file;
+      // the next sweep will retry.
+    }
+  }
+}
+
+// List snapshots for a USER.md or SOUL.md history directory, newest
+// first. Returns an empty array when the directory doesn't exist or is
+// empty. Each entry is the bare filename (no path) so callers can
+// pretty-print as `<file>.history/<name>` and pass the name back into
+// `restoreUserProfileFromHistory` / `restoreSoulFromHistory`.
+export interface SnapshotEntry {
+  name: string;
+  path: string;
+  mtimeMs: number;
+  sizeBytes: number;
+}
+
+export function listUserProfileHistory(instance: Instance): SnapshotEntry[] {
+  return listHistoryEntries(userProfileHistoryDir(instance));
+}
+
+export function listSoulHistory(instance: Instance, agentId: string): SnapshotEntry[] {
+  return listHistoryEntries(soulHistoryDir(instance, agentId));
+}
+
+function listHistoryEntries(historyDir: string): SnapshotEntry[] {
+  if (!existsSync(historyDir)) return [];
+  let names: string[];
+  try {
+    names = readdirSync(historyDir);
+  } catch {
+    return [];
+  }
+  const entries: SnapshotEntry[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".md")) continue;
+    const path = join(historyDir, name);
+    try {
+      const stat = statSync(path);
+      entries.push({ name, path, mtimeMs: stat.mtimeMs, sizeBytes: stat.size });
+    } catch {
+      // Stat failure — skip silently; the entry will reappear next call
+      // if the filesystem recovers.
+    }
+  }
+  entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return entries;
+}
+
+// Restore a USER.md or SOUL.md from a named snapshot. The pre-restore
+// contents are snapshotted first so the rollback is itself reversible.
+// Returns the restored body on success, or null when the snapshot does
+// not exist. Throws on filesystem failure during the restore write
+// itself — at that point the rollback was requested explicitly and the
+// caller wants to know.
+export type RestoreResult =
+  | { ok: true; restoredBytes: number; from: string; preRestoreSnapshot: string | null }
+  | { ok: false; reason: "no snapshot" | "no source" };
+
+export function restoreUserProfileFromHistory(
+  instance: Instance,
+  snapshotName: string
+): RestoreResult {
+  return restoreIdentityFromHistory(
+    instance,
+    snapshotName,
+    userProfilePath(instance),
+    userProfileHistoryDir(instance),
+    "USER.md"
+  );
+}
+
+export function restoreSoulFromHistory(
+  instance: Instance,
+  agentId: string,
+  snapshotName: string
+): RestoreResult {
+  return restoreIdentityFromHistory(
+    instance,
+    snapshotName,
+    soulPath(instance, agentId),
+    soulHistoryDir(instance, agentId),
+    "SOUL.md"
+  );
+}
+
+function restoreIdentityFromHistory(
+  instance: Instance,
+  snapshotName: string,
+  approvedPath: string,
+  historyDir: string,
+  displayName: string
+): RestoreResult {
+  // Defense: don't accept a snapshotName that escapes the history dir.
+  // The CLI / API caller hands us this value; treat it as untrusted.
+  const safeName = basename(snapshotName);
+  if (safeName !== snapshotName || safeName.length === 0 || !safeName.endsWith(".md")) {
+    return { ok: false, reason: "no snapshot" };
+  }
+  const snapshotPath = join(historyDir, safeName);
+  if (!existsSync(snapshotPath)) return { ok: false, reason: "no snapshot" };
+  let body: string;
+  try {
+    body = readFileSync(snapshotPath, "utf8");
+  } catch {
+    return { ok: false, reason: "no snapshot" };
+  }
+  // Snapshot the pre-restore body so the restore is itself reversible.
+  // Best-effort — see snapshotIdentityFile.
+  const preRestoreSnapshot = snapshotIdentityFile(instance, approvedPath, historyDir, displayName);
+  writeFileSafe(approvedPath, body);
+  return {
+    ok: true,
+    restoredBytes: Buffer.byteLength(body, "utf8"),
+    from: snapshotPath,
+    preRestoreSnapshot
+  };
+}
+
 function writeIdentityFile(
+  instance: Instance,
   targetApproved: string,
   targetProposed: string,
+  historyDir: string,
   content: string,
   status: IdentityFileStatus,
   displayName: string
 ): IdentityFileWriteResult {
   const scan = scanForInjection(content, displayName);
   const path = status === "approved" ? targetApproved : targetProposed;
+  // Snapshot the previous approved body before overwriting. Only meaningful
+  // when we're writing the approved path — proposals aren't part of the
+  // canonical history (they may never be approved). First write is a no-op
+  // because the file doesn't exist yet.
+  if (status === "approved") {
+    snapshotIdentityFile(instance, targetApproved, historyDir, displayName);
+  }
   writeFileSafe(path, content);
   return { path, status, scanFindings: scan.findings };
 }
@@ -400,8 +668,10 @@ export function writeSoul(
   status: IdentityFileStatus
 ): IdentityFileWriteResult {
   return writeIdentityFile(
+    instance,
     soulPath(instance, agentId),
     soulProposedPath(instance, agentId),
+    soulHistoryDir(instance, agentId),
     content,
     status,
     "SOUL.md"
@@ -414,8 +684,10 @@ export function writeUserProfile(
   status: IdentityFileStatus
 ): IdentityFileWriteResult {
   return writeIdentityFile(
+    instance,
     userProfilePath(instance),
     userProfileProposedPath(instance),
+    userProfileHistoryDir(instance),
     content,
     status,
     "USER.md"
@@ -426,16 +698,38 @@ export function writeUserProfile(
 // Returns true when a proposal existed and was promoted; false when no
 // proposal was found (no-op).
 export function approveSoul(instance: Instance, agentId: string): boolean {
-  return promote(soulProposedPath(instance, agentId), soulPath(instance, agentId));
+  return promote(
+    instance,
+    soulProposedPath(instance, agentId),
+    soulPath(instance, agentId),
+    soulHistoryDir(instance, agentId),
+    "SOUL.md"
+  );
 }
 
 export function approveUserProfile(instance: Instance): boolean {
-  return promote(userProfileProposedPath(instance), userProfilePath(instance));
+  return promote(
+    instance,
+    userProfileProposedPath(instance),
+    userProfilePath(instance),
+    userProfileHistoryDir(instance),
+    "USER.md"
+  );
 }
 
-function promote(proposedPath: string, approvedPath: string): boolean {
+function promote(
+  instance: Instance,
+  proposedPath: string,
+  approvedPath: string,
+  historyDir: string,
+  displayName: string
+): boolean {
   if (!existsSync(proposedPath)) return false;
   ensureDir(dirname(approvedPath));
+  // Snapshot the pre-promotion approved body so the user can rollback
+  // out of an approved-but-regretted edit. First approval is a no-op
+  // because the approved file doesn't exist yet.
+  snapshotIdentityFile(instance, approvedPath, historyDir, displayName);
   renameSync(proposedPath, approvedPath);
   return true;
 }
@@ -554,8 +848,10 @@ function dropParagraphContaining(body: string, needle: string): { changed: boole
 }
 
 function removeIdentityFileSection(
+  instance: Instance,
   approvedPath: string,
   proposedPath: string,
+  historyDir: string,
   needle: string,
   status: IdentityFileStatus,
   displayName: string
@@ -577,6 +873,12 @@ function removeIdentityFileSection(
   }
   const scan = scanForInjection(result, displayName);
   const targetPath = status === "approved" ? approvedPath : proposedPath;
+  // Snapshot the pre-remove approved body when this is going to land at
+  // the approved path. Proposals don't snapshot (the approved file isn't
+  // being touched yet).
+  if (status === "approved") {
+    snapshotIdentityFile(instance, approvedPath, historyDir, displayName);
+  }
   writeFileSafe(targetPath, result);
   return { ok: true, path: targetPath, status, scanFindings: scan.findings };
 }
@@ -588,8 +890,10 @@ export function removeSoulSection(
   status: IdentityFileStatus
 ): IdentityFileRemoveResult {
   return removeIdentityFileSection(
+    instance,
     soulPath(instance, agentId),
     soulProposedPath(instance, agentId),
+    soulHistoryDir(instance, agentId),
     needle,
     status,
     "SOUL.md"
@@ -602,8 +906,10 @@ export function removeUserProfileSection(
   status: IdentityFileStatus
 ): IdentityFileRemoveResult {
   return removeIdentityFileSection(
+    instance,
     userProfilePath(instance),
     userProfileProposedPath(instance),
+    userProfileHistoryDir(instance),
     needle,
     status,
     "USER.md"
