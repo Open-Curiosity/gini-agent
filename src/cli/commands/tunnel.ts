@@ -78,14 +78,16 @@ export async function tunnel(ctx: CliContext): Promise<void> {
   }
 
   if (sub === "sync-notes") {
-    // No dedicated endpoint — the manager refreshes Apple Notes automatically
-    // when the tunnel snapshot changes. We surface a hint and the current
-    // status so the user can verify after a restart.
-    const snapshot = await api(config, "/api/tunnel");
+    // Explicit re-sync trigger. GET /api/tunnel is read-only by default
+    // (so the web Settings card's 5s poll doesn't queue osascript
+    // subprocesses); passing `?refreshNotes=1` is the documented
+    // contract for the operator's "I just granted Automation
+    // permission" flow.
+    const snapshot = await api(config, "/api/tunnel?refreshNotes=1");
     print({
       ok: true,
       snapshot,
-      message: "Apple Notes refresh happens automatically when the tunnel URL changes. Restart the runtime to force a fresh push."
+      message: "Apple Notes refresh triggered. Check the snapshot's appleNotes.lastSyncedAt / lastError for the result."
     });
     return;
   }

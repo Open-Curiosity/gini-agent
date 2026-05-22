@@ -100,7 +100,31 @@ describe("tunnel HTTP integration", () => {
     expect(payload.publicUrl).toBe("https://example.trycloudflare.com/abcdefghij0123456789");
   });
 
-  test("GET /api/tunnel invokes refreshAppleNote when the hook is provided", async () => {
+  test("GET /api/tunnel does NOT refresh Apple Notes by default", async () => {
+    const config = testConfig("tunnel-http-no-refresh");
+    let refreshes = 0;
+    const handler = createHandler(config, {
+      tunnel: {
+        getSecret: () => "abcdefghij0123456789",
+        getSnapshot: () => stubSnapshot(),
+        refreshAppleNote: async () => {
+          refreshes += 1;
+          return stubSnapshot();
+        }
+      }
+    });
+    const response = await handler(
+      new Request("http://127.0.0.1:7337/api/tunnel", {
+        headers: { authorization: `Bearer ${config.token}` }
+      })
+    );
+    expect(response.status).toBe(200);
+    // The web Settings card polls this endpoint every 5s; we must not
+    // queue an osascript subprocess on every poll.
+    expect(refreshes).toBe(0);
+  });
+
+  test("GET /api/tunnel?refreshNotes=1 invokes refreshAppleNote when the hook is provided", async () => {
     const config = testConfig("tunnel-http-refresh");
     let refreshes = 0;
     const handler = createHandler(config, {
@@ -114,7 +138,7 @@ describe("tunnel HTTP integration", () => {
       }
     });
     const response = await handler(
-      new Request("http://127.0.0.1:7337/api/tunnel", {
+      new Request("http://127.0.0.1:7337/api/tunnel?refreshNotes=1", {
         headers: { authorization: `Bearer ${config.token}` }
       })
     );
@@ -124,7 +148,7 @@ describe("tunnel HTTP integration", () => {
     expect(payload.appleNotes.lastSyncedAt).toBe("2026-02-02T00:00:00Z");
   });
 
-  test("GET /api/tunnel falls back to snapshot when refreshAppleNote throws", async () => {
+  test("GET /api/tunnel?refreshNotes=1 falls back to snapshot when refreshAppleNote throws", async () => {
     const config = testConfig("tunnel-http-refresh-failure");
     const handler = createHandler(config, {
       tunnel: {
@@ -134,7 +158,7 @@ describe("tunnel HTTP integration", () => {
       }
     });
     const response = await handler(
-      new Request("http://127.0.0.1:7337/api/tunnel", {
+      new Request("http://127.0.0.1:7337/api/tunnel?refreshNotes=1", {
         headers: { authorization: `Bearer ${config.token}` }
       })
     );

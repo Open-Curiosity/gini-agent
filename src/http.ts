@@ -81,16 +81,20 @@ export function createHandler(
   const tunnel = options.tunnel ?? null;
   const routes: Array<[string, RegExp, Handler]> = [
     // GET /api/tunnel returns the live tunnel snapshot (URL + secret + Apple
-    // Notes mirror status). Side-effect: when the hooks expose a
-    // `refreshAppleNote()` method, we re-run the iCloud Notes write
-    // before returning so the operator can use this endpoint as the
-    // "re-sync after granting Automation permission" trigger documented
-    // in the ADR. Auth on the surrounding handler still gates this —
-    // only the operator and authorized tunneled requests can read the
-    // secret.
-    ["GET", /^\/api\/tunnel$/, async () => {
+    // Notes mirror status).
+    //
+    // Side-effect contract: Apple Notes is re-synced ONLY when the caller
+    // passes `?refreshNotes=1`. The web Settings card polls this endpoint
+    // every 5s for status; firing an osascript pipeline on each poll
+    // would queue Notes.app writes faster than they can finish and
+    // burn TCC-prompt timeouts on permission-denied hosts. The CLI's
+    // `gini tunnel sync-notes` (and any operator hitting the URL by
+    // hand to retry after granting Automation permission) keeps the
+    // documented behaviour by adding the flag.
+    ["GET", /^\/api\/tunnel$/, async (request) => {
       if (!tunnel) return json({ enabled: false }, 200);
-      if (tunnel.refreshAppleNote) {
+      const refreshRequested = new URL(request.url).searchParams.get("refreshNotes") === "1";
+      if (refreshRequested && tunnel.refreshAppleNote) {
         try {
           const snapshot = await tunnel.refreshAppleNote();
           return json(snapshot);

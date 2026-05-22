@@ -124,6 +124,18 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
       }
     }
 
+    // Root-bootstrap (`/<secret>` with no further path): redirect to "/"
+    // so the URL bar collapses and the secret stops showing up in browser
+    // history, screen-share, and screenshots after first visit. The
+    // Set-Cookie on the redirect response authorizes the follow-up GET
+    // for "/". Other prefixed paths like `/<secret>/settings` keep
+    // rewriting because a redirect there would drop the user's intended
+    // deep-link destination.
+    if (hasPrefix && stripped === "/") {
+      const homeRedirect = NextResponse.redirect(new URL("/", request.url));
+      attachSession(homeRedirect, secret);
+      return homeRedirect;
+    }
     const rewritten = request.nextUrl.clone();
     rewritten.pathname = stripped;
     const response = NextResponse.rewrite(rewritten);

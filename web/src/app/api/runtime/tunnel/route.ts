@@ -13,8 +13,17 @@ import { runtimeToken, runtimeUrl } from "@/lib/runtime";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-async function forwardRedacted(method: "GET" | "PATCH", body?: string): Promise<Response> {
-  const upstream = await fetch(`${runtimeUrl()}/api/tunnel`, {
+async function forwardRedacted(
+  method: "GET" | "PATCH",
+  body?: string,
+  search?: string
+): Promise<Response> {
+  // Forward the query string verbatim so the operator can opt into the
+  // documented `?refreshNotes=1` Apple Notes re-sync trigger. GET
+  // without the flag stays read-only — important because the Settings
+  // card polls this endpoint every 5s and we don't want to queue an
+  // osascript subprocess on each poll.
+  const upstream = await fetch(`${runtimeUrl()}/api/tunnel${search ?? ""}`, {
     method,
     headers: {
       authorization: `Bearer ${runtimeToken()}`,
@@ -73,7 +82,10 @@ function redactAppleNotes(payload: unknown): Record<string, unknown> | null {
   };
 }
 
-export const GET = async (_request: NextRequest) => forwardRedacted("GET");
+export const GET = async (request: NextRequest) => {
+  const search = new URL(request.url).search;
+  return forwardRedacted("GET", undefined, search);
+};
 export const PATCH = async (request: NextRequest) => {
   let body = "";
   try { body = await request.text(); } catch { body = ""; }
