@@ -2,7 +2,13 @@ import { writeFileSync } from "node:fs";
 import type { ApprovalMode, RuntimeConfig } from "./types";
 import { cancelTask, decideApproval, resolveApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
-import { readState, readTrace } from "./state";
+import {
+  listChatBlocks,
+  listChatBlocksAfter,
+  readState,
+  readTrace,
+  subscribeChatBlocks
+} from "./state";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -119,6 +125,20 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["PATCH", /^\/api\/chat\/([^/]+)$/, async (request, params) => json(await renameChat(config, params[0], await body(request)))],
     ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
+    // ChatBlock protocol endpoints (ADR chat-block-protocol.md). The
+    // /blocks endpoint returns the full ordered list for initial render;
+    // /stream is the SSE companion clients subscribe to for live
+    // updates. Both validate the session exists so a stale link returns
+    // 404 rather than streaming an empty channel forever.
+    ["GET", /^\/api\/chat\/([^/]+)\/blocks$/, (_request, params) => {
+      const sessionId = params[0];
+      const state = readState(config.instance);
+      if (!state.chatSessions.some((s) => s.id === sessionId)) {
+        return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      }
+      return json(listChatBlocks(config.instance, sessionId));
+    }],
+    ["GET", /^\/api\/chat\/([^/]+)\/stream$/, (request, params) => chatBlockStream(config, request, params[0])],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
     ["GET", /^\/api\/tasks$/, (request) => {
@@ -755,6 +775,92 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
     cancel() {
       closed = true;
       if (interval) clearInterval(interval);
+    }
+  });
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive"
+    }
+  });
+}
+
+// ChatBlock SSE stream. Per ADR chat-block-protocol.md, each frame is
+// `id: <blockId>\nevent: chat_block\ndata: <json>\n\n` so a browser
+// EventSource auto-attaches Last-Event-ID on reconnect and the runtime
+// resumes from the cursor instead of re-replaying the full list.
+//
+// Differs from `eventStream` above: that route polls the global ring
+// buffer at 1s. Here we use the in-process EventEmitter wired into
+// insertChatBlock / upsertAssistantTextBlock / updateToolCallBlock —
+// inserts and upserts both fire AFTER the SQLite commit so subscribers
+// observe durable rows.
+function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: string): Response {
+  let closed = false;
+  let keepalive: Timer | undefined;
+  let unsubscribe: (() => void) | undefined;
+  const encoder = new TextEncoder();
+  const seen = new Set<string>();
+  const lastEventId =
+    request.headers.get("last-event-id") ??
+    new URL(request.url).searchParams.get("lastEventId") ??
+    null;
+
+  // Validate the session exists. We do this inside the stream factory
+  // (rather than at the route handler) so the 404 carries the SSE
+  // content-type semantics for clients that route both error and
+  // success branches through the same EventSource handler.
+  const state = readState(config.instance);
+  if (!state.chatSessions.some((s) => s.id === sessionId)) {
+    return new Response(JSON.stringify({ error: `Chat session not found: ${sessionId}` }), {
+      status: 404,
+      headers: { "content-type": "application/json" }
+    });
+  }
+
+  const stream = new ReadableStream({
+    start(controller) {
+      const enqueueBlock = (block: { id: string; kind: string }): void => {
+        if (closed) return;
+        if (seen.has(block.id)) return;
+        // Frame: SSE `id` is the block id (clients send it as
+        // Last-Event-ID on reconnect), the `event` is "chat_block",
+        // and the `data` is the JSON-encoded ChatBlock. Newlines in
+        // the payload are escaped by JSON.stringify so the SSE frame
+        // boundary stays at the trailing blank line.
+        controller.enqueue(
+          encoder.encode(
+            `id: ${block.id}\nevent: chat_block\ndata: ${JSON.stringify(block)}\n\n`
+          )
+        );
+        seen.add(block.id);
+      };
+
+      // Initial backfill: send any blocks the client is missing.
+      // listChatBlocksAfter honors Last-Event-ID (or falls back to the
+      // full list when the cursor is unknown / absent).
+      const backfill = listChatBlocksAfter(config.instance, sessionId, lastEventId);
+      for (const block of backfill) enqueueBlock(block);
+
+      // Subscribe to future inserts/upserts. Listeners fire AFTER the
+      // SQLite commit so observers see durable rows.
+      unsubscribe = subscribeChatBlocks(config.instance, sessionId, (block) => {
+        enqueueBlock(block);
+      });
+
+      // Idle keepalive (mirrors eventStream above). Proxies often cap
+      // idle streams around 30-60s; a comment line resets the idle-byte
+      // clock at every hop without surfacing as an event.
+      keepalive = setInterval(() => {
+        if (closed) return;
+        controller.enqueue(encoder.encode(`: keepalive\n\n`));
+      }, 5_000);
+    },
+    cancel() {
+      closed = true;
+      if (keepalive) clearInterval(keepalive);
+      if (unsubscribe) unsubscribe();
     }
   });
   return new Response(stream, {
