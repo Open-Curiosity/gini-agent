@@ -417,20 +417,23 @@ export default function SkillsPage() {
                                 );
                               })()
                             ) : (
+                              // No connector exists for this required
+                              // provider yet. Hand the user off to a fresh
+                              // chat instead of popping the credential
+                              // dialog: connectors like OAuth desktop apps
+                              // need real install/auth steps the agent can
+                              // walk through, not a Client ID/secret form.
+                              // Rotate (broken-connector branch above) still
+                              // uses the inline dialog because the user
+                              // already has credentials to refresh.
                               <Button
                                 size="sm"
                                 variant="outline"
                                 className="h-6 px-2 text-[10px]"
-                                onClick={() =>
-                                  setDialog({
-                                    open: true,
-                                    provider: req.provider,
-                                    suggestedName: provider.label,
-                                    mode: "create"
-                                  })
-                                }
+                                disabled={setupViaChat.isPending}
+                                onClick={() => setupViaChat.mutate(detail)}
                               >
-                                Set up {provider.label}
+                                {setupViaChat.isPending ? "Opening chat…" : `Set up ${provider.label}`}
                               </Button>
                             )}
                           </li>
