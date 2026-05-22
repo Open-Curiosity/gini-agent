@@ -35,7 +35,14 @@ function scratch(): { home: string; stateRoot: string; cleanup: () => void } {
 }
 
 describe("setup-api", () => {
-  let env: { HOME?: string; GINI_STATE_ROOT?: string; OPENAI_API_KEY?: string; CODEX_AUTH_JSON?: string };
+  let env: {
+    HOME?: string;
+    GINI_STATE_ROOT?: string;
+    OPENAI_API_KEY?: string;
+    CODEX_AUTH_JSON?: string;
+    GINI_PROVIDER?: string;
+    GINI_MODEL?: string;
+  };
   let s: ReturnType<typeof scratch>;
   let config: RuntimeConfig;
 
@@ -46,12 +53,19 @@ describe("setup-api", () => {
       HOME: process.env.HOME,
       GINI_STATE_ROOT: process.env.GINI_STATE_ROOT,
       OPENAI_API_KEY: process.env.OPENAI_API_KEY,
-      CODEX_AUTH_JSON: process.env.CODEX_AUTH_JSON
+      CODEX_AUTH_JSON: process.env.CODEX_AUTH_JSON,
+      GINI_PROVIDER: process.env.GINI_PROVIDER,
+      GINI_MODEL: process.env.GINI_MODEL
     };
     s = scratch();
     process.env.HOME = s.home;
     process.env.GINI_STATE_ROOT = s.stateRoot;
     delete process.env.OPENAI_API_KEY;
+    // Scrub provider/model env so the test's assertions about the
+    // platform default ("codex"/gpt-5.5) are not skewed by an ambient
+    // GINI_PROVIDER=echo or similar in the caller's shell.
+    delete process.env.GINI_PROVIDER;
+    delete process.env.GINI_MODEL;
     // Point CODEX_AUTH_JSON at a non-existent scratch path so the codex
     // credential probe in providerHealth() resolves into the test
     // sandbox instead of falling back to ~/.codex/auth.json on the
@@ -78,6 +92,10 @@ describe("setup-api", () => {
     else process.env.OPENAI_API_KEY = env.OPENAI_API_KEY;
     if (env.CODEX_AUTH_JSON === undefined) delete process.env.CODEX_AUTH_JSON;
     else process.env.CODEX_AUTH_JSON = env.CODEX_AUTH_JSON;
+    if (env.GINI_PROVIDER === undefined) delete process.env.GINI_PROVIDER;
+    else process.env.GINI_PROVIDER = env.GINI_PROVIDER;
+    if (env.GINI_MODEL === undefined) delete process.env.GINI_MODEL;
+    else process.env.GINI_MODEL = env.GINI_MODEL;
     if (prevSkipRefresh === undefined) delete process.env.GINI_SKIP_PLIST_REFRESH;
     else process.env.GINI_SKIP_PLIST_REFRESH = prevSkipRefresh;
     s.cleanup();

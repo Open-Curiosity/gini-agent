@@ -179,4 +179,3 @@ export async function setSetupProvider(
     plistRefreshNeeded: false
   };
 }
-

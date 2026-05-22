@@ -69,6 +69,8 @@ describe("gini setup", () => {
     };
     delete env.OPENAI_API_KEY;
     delete env.CODEX_AUTH_JSON;
+    delete env.GINI_PROVIDER;
+    delete env.GINI_MODEL;
     const result = await runCli({
       args: ["setup", "--non-interactive", "--state-root", stateRoot, "--instance", instance],
       env
@@ -106,6 +108,8 @@ describe("gini setup", () => {
       OPENAI_API_KEY: "sk-test"
     };
     delete env.CODEX_AUTH_JSON;
+    delete env.GINI_PROVIDER;
+    delete env.GINI_MODEL;
     const result = await runCli({
       args: ["setup", "--non-interactive", "--state-root", stateRoot, "--instance", instance],
       env
@@ -127,6 +131,8 @@ describe("gini setup", () => {
       OPENAI_API_KEY: "sk-test-fresh-123"
     };
     delete env.CODEX_AUTH_JSON;
+    delete env.GINI_PROVIDER;
+    delete env.GINI_MODEL;
     const result = await runCli({
       args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
       env
@@ -159,6 +165,8 @@ describe("gini setup", () => {
     };
     delete env.OPENAI_API_KEY;
     delete env.CODEX_AUTH_JSON;
+    delete env.GINI_PROVIDER;
+    delete env.GINI_MODEL;
     const result = await runCli({
       args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
       env
@@ -192,6 +200,8 @@ describe("gini setup", () => {
       OPENAI_API_KEY: "sk-chmod-test"
     };
     delete env.CODEX_AUTH_JSON;
+    delete env.GINI_PROVIDER;
+    delete env.GINI_MODEL;
     const result = await runCli({
       args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
       env
@@ -211,6 +221,8 @@ describe("gini setup", () => {
     };
     delete env.OPENAI_API_KEY;
     delete env.CODEX_AUTH_JSON;
+    delete env.GINI_PROVIDER;
+    delete env.GINI_MODEL;
     const result = await runCli({
       args: ["setup", "--state-root", stateRoot],
       env,
@@ -425,6 +437,8 @@ describe("gini setup --yes codex precedence", () => {
       CODEX_AUTH_JSON: authPath
     };
     delete env.OPENAI_API_KEY;
+    delete env.GINI_PROVIDER;
+    delete env.GINI_MODEL;
     const result = await runCli({
       args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
       env
@@ -451,6 +465,8 @@ describe("gini setup --yes codex precedence", () => {
       CODEX_AUTH_JSON: authPath,
       OPENAI_API_KEY: "sk-also-set"
     };
+    delete env.GINI_PROVIDER;
+    delete env.GINI_MODEL;
     const result = await runCli({
       args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
       env
@@ -473,6 +489,8 @@ describe("gini setup --yes codex precedence", () => {
     };
     delete env.OPENAI_API_KEY;
     delete env.CODEX_AUTH_JSON;
+    delete env.GINI_PROVIDER;
+    delete env.GINI_MODEL;
     const result = await runCli({
       args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
       env
