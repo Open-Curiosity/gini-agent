@@ -75,13 +75,13 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     // 404 here before any auth-bearing BFF route is reached.
     if (!TUNNEL_SECRET) return new NextResponse("Not Found", { status: 404 });
     const prefix = `/${TUNNEL_SECRET}`;
-    // Bare `/<secret>` → 308 to the slash form so relative links on the
-    // landing pages resolve under the prefix.
-    if (pathname === prefix) {
-      const url = request.nextUrl.clone();
-      url.pathname = `${prefix}/`;
-      return NextResponse.redirect(url, 308);
-    }
+    // Bare `/<secret>` (no trailing slash) — Next 16 normalizes away the
+    // trailing slash on outbound URLs, which turned a previous
+    // `redirect("/<secret>/")` into a 308 that pointed back to
+    // `/<secret>` and locked the browser in a redirect loop.
+    // Treat the bare form as an unmatched path; clients (including the
+    // QR-encoded URL) always include the trailing slash so this only
+    // affects hand-typed inputs, where a clean 404 beats a broken loop.
     if (!pathname.startsWith(`${prefix}/`)) {
       return new NextResponse("Not Found", { status: 404 });
     }
