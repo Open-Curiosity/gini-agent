@@ -142,7 +142,14 @@ export async function proxyRequest(
   if (guard) return guard;
 
   const upstreamUrl = new URL(request.url);
-  const target = `${options.runtimeUrl}/api/${canonical.join("/")}${upstreamUrl.search}`;
+  // Re-encode each canonicalized segment so URL-special characters that
+  // survived canonicalization (`?`, `#`, `;`, raw `%`, etc.) cannot
+  // re-acquire structural meaning when Bun's fetch parses the target. The
+  // BFF's view of the path now matches the upstream's byte-for-byte: if
+  // the guard didn't see "messaging/<bridge>/allow", the gateway won't
+  // either.
+  const encodedPath = canonical.map((segment) => encodeURIComponent(segment)).join("/");
+  const target = `${options.runtimeUrl}/api/${encodedPath}${upstreamUrl.search}`;
   const headers = pickForwardHeaders(request.headers);
   headers.set("authorization", `Bearer ${options.token}`);
   const init: RequestInit = { method: request.method, headers };
@@ -184,18 +191,23 @@ const MAX_DECODE_DEPTH = 5;
 function canonicalizeSegments(segments: string[]): string[] | null {
   const out: string[] = [];
   for (let segment of segments) {
-    let depth = 0;
-    while (depth < MAX_DECODE_DEPTH) {
+    let stabilized = false;
+    for (let depth = 0; depth < MAX_DECODE_DEPTH; depth += 1) {
       let next: string;
       try {
         next = decodeURIComponent(segment);
       } catch {
         return null;
       }
-      if (next === segment) break;
+      if (next === segment) {
+        stabilized = true;
+        break;
+      }
       segment = next;
-      depth += 1;
     }
+    // A segment that is still decoding after MAX_DECODE_DEPTH iterations is
+    // adversarially encoded and we refuse to guess the canonical form.
+    if (!stabilized) return null;
     if (segment === "" || segment === "." || segment === "..") return null;
     if (segment.includes("/") || segment.includes("\\")) return null;
     if (/[\x00-\x1f\x7f]/.test(segment)) return null;
