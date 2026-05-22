@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
@@ -233,6 +234,7 @@ function AddMessagingBridgeButtons() {
   const [kind, setKind] = useState<AddBridgeKind>("telegram");
   const [name, setName] = useState("");
   const [botToken, setBotToken] = useState("");
+  const [deliveryTargets, setDeliveryTargets] = useState("");
   const [result, setResult] = useState<MessagingBridgeRecord | null>(null);
   // The deferred close-reset runs 150ms after close() so the dialog's
   // exit animation reads stable state. Tracking the timer id lets us
@@ -248,7 +250,7 @@ function AddMessagingBridgeButtons() {
   // fresh session with a stale success view.
   const sessionRef = useRef(0);
 
-  const add = useMutation<MessagingBridgeRecord, Error, { name: string; kind: AddBridgeKind; botToken: string }>({
+  const add = useMutation<MessagingBridgeRecord, Error, { name: string; kind: AddBridgeKind; botToken: string; deliveryTargets: string[] }>({
     mutationFn: (input) =>
       api<MessagingBridgeRecord>("/messaging", {
         method: "POST",
@@ -280,6 +282,7 @@ function AddMessagingBridgeButtons() {
     setKind(next);
     setName("");
     setBotToken("");
+    setDeliveryTargets("");
     setResult(null);
     add.reset();
     setOpen(true);
@@ -293,6 +296,7 @@ function AddMessagingBridgeButtons() {
       resetTimerRef.current = null;
       setName("");
       setBotToken("");
+      setDeliveryTargets("");
       setResult(null);
       add.reset();
     }, 150);
@@ -301,6 +305,7 @@ function AddMessagingBridgeButtons() {
   const submit = () => {
     const trimmedName = name.trim();
     const trimmedToken = botToken.trim();
+    const parsedTargets = parseDeliveryTargets(deliveryTargets);
     if (!trimmedName) {
       toast.error("Name is required.");
       return;
@@ -309,9 +314,13 @@ function AddMessagingBridgeButtons() {
       toast.error("Bot token is required.");
       return;
     }
+    if (kind === "discord" && parsedTargets.length === 0) {
+      toast.error("At least one Discord channel ID is required.");
+      return;
+    }
     const submittingSession = sessionRef.current;
     add.mutate(
-      { name: trimmedName, kind, botToken: trimmedToken },
+      { name: trimmedName, kind, botToken: trimmedToken, deliveryTargets: parsedTargets },
       {
         onSuccess: (record) => {
           if (sessionRef.current !== submittingSession) return;
@@ -379,6 +388,26 @@ function AddMessagingBridgeButtons() {
                     Stored encrypted in the per-instance secret store. Never leaves your machine.
                   </p>
                 </div>
+                {kind === "discord" ? (
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="bridge-targets" className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                      Channel IDs
+                    </Label>
+                    <Textarea
+                      id="bridge-targets"
+                      value={deliveryTargets}
+                      onChange={(event) => setDeliveryTargets(event.target.value)}
+                      placeholder={"123456789012345678\n987654321098765432"}
+                      autoComplete="off"
+                      rows={3}
+                    />
+                    <p className="text-[11px] text-muted-foreground">
+                      One channel ID per line, or comma-separated. Enable Developer Mode in
+                      Discord, right-click a channel, and choose Copy Channel ID. The bot will
+                      poll these channels for incoming messages.
+                    </p>
+                  </div>
+                ) : null}
               </div>
               {add.error ? (
                 <p className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
@@ -391,7 +420,12 @@ function AddMessagingBridgeButtons() {
                 </DialogClose>
                 <Button
                   onClick={submit}
-                  disabled={add.isPending || name.trim().length === 0 || botToken.trim().length === 0}
+                  disabled={
+                    add.isPending
+                    || name.trim().length === 0
+                    || botToken.trim().length === 0
+                    || (kind === "discord" && parseDeliveryTargets(deliveryTargets).length === 0)
+                  }
                 >
                   {add.isPending ? "Adding…" : `Add ${label}`}
                 </Button>
@@ -469,11 +503,11 @@ function BridgeAddedSummary({
         ) : null}
         {record.kind === "discord" ? (
           <div className="space-y-2 rounded-md border border-indigo-500/30 bg-indigo-500/5 p-3">
-            <p className="text-sm font-medium">Next: invite the bot to your server</p>
+            <p className="text-sm font-medium">Next: invite the bot to your channels</p>
             <p>
-              Open the Discord Developer Portal, copy the bot&apos;s OAuth2 install URL, and add it
-              to the server and channels you want to use. Then click Health on the new bridge to
-              verify the token.
+              The bot will poll the channel IDs you supplied. Open the Discord Developer Portal,
+              copy the bot&apos;s OAuth2 install URL, and add it to the server so it can read
+              those channels. Click Health on the new bridge afterward to verify the token.
             </p>
           </div>
         ) : null}
@@ -489,4 +523,14 @@ function labelFor(kind: string): string {
   if (kind === "telegram") return "Telegram";
   if (kind === "discord") return "Discord";
   return kind;
+}
+
+// Split a free-form Discord channel-ID input on commas and whitespace
+// so the user can paste a list however they have it — comma-separated
+// from a spreadsheet, one-per-line from a notes file, or mixed.
+function parseDeliveryTargets(raw: string): string[] {
+  return raw
+    .split(/[\s,]+/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
 }
