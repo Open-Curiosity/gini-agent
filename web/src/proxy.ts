@@ -59,18 +59,22 @@ async function isProviderConfigured(): Promise<boolean | null> {
 const TUNNEL_SECRET = process.env.GINI_TUNNEL_SECRET ?? "";
 
 export async function proxy(request: NextRequest): Promise<NextResponse> {
-  // Tunneled-request handling. Cloudflared forwards the verbatim
-  // pathname, so a tunneled GET `https://<hostname>/<secret>/settings`
-  // arrives here as pathname=/<secret>/settings. We strip the prefix
-  // for downstream routing and reject any tunneled request that
-  // doesn't carry the secret. Localhost requests are passed through
-  // unchanged — the secret is only required from the public host.
   const host = request.headers.get("host") ?? "";
   const isLocalHost = host.startsWith("localhost") || host.startsWith("127.0.0.1");
+  const { pathname } = request.nextUrl;
+
   if (!isLocalHost) {
+    // External host (cloudflared): every request must carry the secret
+    // prefix, including API calls. Previously the matcher excluded
+    // `/api/*`, which meant anyone who knew the trycloudflare hostname
+    // could reach `/api/runtime/state`, `/tasks`, `/memory`, etc. — the
+    // BFF would forward to the runtime with the operator's bearer token
+    // injected server-side. Now the proxy runs for every path (the
+    // matcher gates only on `_next/static`, `_next/image`, and
+    // `favicon.ico`), and tunneled requests without the secret prefix
+    // 404 here before any auth-bearing BFF route is reached.
     if (!TUNNEL_SECRET) return new NextResponse("Not Found", { status: 404 });
     const prefix = `/${TUNNEL_SECRET}`;
-    const { pathname } = request.nextUrl;
     // Bare `/<secret>` → 308 to the slash form so relative links on the
     // landing pages resolve under the prefix.
     if (pathname === prefix) {
@@ -81,17 +85,33 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     if (!pathname.startsWith(`${prefix}/`)) {
       return new NextResponse("Not Found", { status: 404 });
     }
+    const stripped = pathname.slice(prefix.length) || "/";
+    // After strip: API calls go straight through with the secret-stripped
+    // path so the BFF routes match. Page navigations rewrite to the
+    // un-prefixed app-router path and continue through the setup gate.
+    if (stripped.startsWith("/api/")) {
+      const rewritten = request.nextUrl.clone();
+      rewritten.pathname = stripped;
+      return NextResponse.rewrite(rewritten);
+    }
+    // Page request: rewrite and then run the same setup gate localhost
+    // requests use, so a tunneled `/setup` flow still works.
+    if (stripped.startsWith("/setup")) {
+      const rewritten = request.nextUrl.clone();
+      rewritten.pathname = stripped;
+      return NextResponse.rewrite(rewritten);
+    }
+    const configured = await isProviderConfigured();
+    if (configured === false) {
+      const setupUrl = new URL(`${prefix}/setup`, request.url);
+      return NextResponse.redirect(setupUrl);
+    }
     const rewritten = request.nextUrl.clone();
-    rewritten.pathname = pathname.slice(prefix.length) || "/";
+    rewritten.pathname = stripped;
     return NextResponse.rewrite(rewritten);
   }
 
-  const { pathname } = request.nextUrl;
-  // Public surfaces that must not be gated:
-  //   - /setup itself (otherwise infinite redirect)
-  //   - All /api/* (BFF must always be reachable for the /setup page to
-  //     hit /api/runtime/setup/status and /api/runtime/setup/provider)
-  //   - Next.js internals (_next/, favicon, etc.) — covered by the matcher
+  // Localhost: existing setup gate.
   if (pathname.startsWith("/setup") || pathname.startsWith("/api/")) {
     return NextResponse.next();
   }
@@ -104,11 +124,12 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
 }
 
 export const config = {
-  // Exclude API routes (the BFF), Next.js static + image assets, and the
-  // favicon — proxy runs at request time and re-running it for every
-  // _next/static asset would be wasteful. We DO match the bare root path
-  // and any app route so the gating works end-to-end.
+  // Match everything except Next.js static assets and the favicon. API
+  // routes are NOT excluded — they need to go through the secret-path
+  // gate when arriving via the cloudflared tunnel, otherwise the BFF's
+  // bearer-token-injecting proxy hands authenticated access to anyone
+  // who knows the trycloudflare hostname.
   matcher: [
-    "/((?!api|_next/static|_next/image|favicon.ico).*)"
+    "/((?!_next/static|_next/image|favicon.ico).*)"
   ]
 };

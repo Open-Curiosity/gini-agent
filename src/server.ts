@@ -264,6 +264,18 @@ const server = Bun.serve({
           appleNotes: tunnelResolved.config.appleNotes
         });
         if (becameEnabled) {
+          // Resolve the live web port before spawning cloudflared so the
+          // tunnel targets the Next.js UI (full settings/chat surface)
+          // rather than the placeholder runtime port (raw /api/* + the
+          // bare landing). The boot-time path does the same.
+          try {
+            const target = await resolveWebTarget();
+            tunnelManager.setTargetUrl(target);
+          } catch (error) {
+            appendLog(config.instance, "tunnel.start.error", {
+              error: error instanceof Error ? error.message : String(error)
+            });
+          }
           await tunnelManager.start().catch((error) => {
             appendLog(config.instance, "tunnel.start.error", {
               error: error instanceof Error ? error.message : String(error)
@@ -299,6 +311,12 @@ if (tunnelResolved.config.enabled) {
   void (async () => {
     try {
       const target = await resolveWebTarget();
+      // Race protection: if applyConfig flipped `enabled` to false while
+      // we were waiting for the web port, don't resurrect the tunnel. The
+      // user-visible state already says "off" — silently respawning here
+      // would put the snapshot back into a live state that contradicts
+      // the config and prevents the next disable-toggle from working.
+      if (!tunnelResolved.config.enabled) return;
       tunnelManager.setTargetUrl(target);
       await tunnelManager.start();
     } catch (error) {
