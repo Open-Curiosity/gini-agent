@@ -52,7 +52,7 @@ export async function install_(ctx: CliContext): Promise<void> {
     // providerConfigured:false; the browser /setup flow takes over.
   }
   const { config } = ctx;
-  install(config);
+  await install(config);
   print({ installed: true, instance: config.instance, stateRoot: config.stateRoot, port: config.port });
 }
 
@@ -74,8 +74,8 @@ export async function doctorCmd(ctx: CliContext): Promise<void> {
   print(await doctor(ctx.config, ctx.web));
 }
 
-export function reset(ctx: CliContext): void {
-  resetInstance(ctx.config);
+export async function reset(ctx: CliContext): Promise<void> {
+  await resetInstance(ctx.config);
   print({ reset: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot });
 }
 
