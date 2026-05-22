@@ -535,3 +535,28 @@ export function removeUserProfileSection(
     "USER.md"
   );
 }
+
+// Preview a remove against the approved USER.md without writing. Used by
+// the dispatch layer to decide whether a hostile residue body should
+// route through the propose-gate instead of auto-approving. Mirrors the
+// success/failure shape of removeUserProfileSection but never touches
+// disk.
+export function previewRemoveUserProfileSection(
+  instance: Instance,
+  needle: string
+):
+  | { ok: true; scanFindings: string[]; nextBody: string }
+  | { ok: false; reason: "no source" | "no match" } {
+  const approvedPath = userProfilePath(instance);
+  if (!existsSync(approvedPath)) return { ok: false, reason: "no source" };
+  let raw: string;
+  try {
+    raw = readFileSync(approvedPath, "utf8");
+  } catch {
+    return { ok: false, reason: "no source" };
+  }
+  const { changed, result } = dropParagraphContaining(raw, needle);
+  if (!changed) return { ok: false, reason: "no match" };
+  const scan = scanForInjection(result, "USER.md");
+  return { ok: true, scanFindings: scan.findings, nextBody: result };
+}

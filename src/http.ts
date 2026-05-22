@@ -24,7 +24,7 @@ import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableM
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
-import { approveSoul, soulPath } from "./runtime/identity-files";
+import { approveSoul, approveUserProfile, soulPath, userProfilePath } from "./runtime/identity-files";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
@@ -344,10 +344,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // lands its proposal on SOUL.md.proposed and the runtime continues
     // to read the approved SOUL.md until this endpoint renames the
     // proposal over the approved target. `edit_user_profile` is
-    // auto-approved post-consolidation — see ADR
-    // memory-surface-consolidation.md. See also ADR
+    // auto-approved post-consolidation for clean bodies; a write that
+    // trips the injection scanner falls back to USER.md.proposed and
+    // requires this approval endpoint before it lands at the approved
+    // path. See ADR memory-surface-consolidation.md and ADR
     // runtime-identity-files.md for the original propose/approve design.
     ["POST", /^\/api\/identity-files\/soul\/approve$/, async () => json(await approveSoulProposal(config))],
+    ["POST", /^\/api\/identity-files\/user\/approve$/, async () => json(await approveUserProfileProposal(config))],
     ["GET", /^\/api\/skills$/, (request) => {
       const query = new URL(request.url).searchParams.get("q");
       return json(query ? searchSkills(config, query) : listSkills(config));
@@ -634,6 +637,31 @@ async function approveSoulProposal(config: RuntimeConfig): Promise<{ ok: boolean
         evidence: { agentId, path }
       },
       { agentId }
+    );
+  });
+  return { ok: true, path };
+}
+
+// Promote USER.md.proposed → USER.md and write an audit row. Reached
+// when `edit_user_profile` produced a body the injection scanner flagged
+// — the auto-approve path bypasses this endpoint entirely. Returns
+// `{ ok: true, path }` on success or `{ ok: false, reason }` when no
+// proposal exists. See ADR memory-surface-consolidation.md.
+async function approveUserProfileProposal(config: RuntimeConfig): Promise<{ ok: boolean; reason?: string; path?: string }> {
+  const promoted = approveUserProfile(config.instance);
+  if (!promoted) return { ok: false, reason: "no proposal to approve" };
+  const path = userProfilePath(config.instance);
+  await mutateState(config.instance, (s) => {
+    addAudit(
+      s,
+      {
+        actor: "user",
+        action: "identity.user_profile.approved",
+        target: path,
+        risk: "low",
+        evidence: { path, approvedFromProposal: true }
+      },
+      { system: true }
     );
   });
   return { ok: true, path };

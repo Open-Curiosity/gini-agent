@@ -261,7 +261,7 @@ describe("edit_user_profile dispatch (auto-approved)", () => {
     expect(audit?.evidence?.autoApproved).toBe(true);
   });
 
-  test("records scan findings on the audit when the body trips a threat pattern", async () => {
+  test("routes a body that trips a threat pattern to USER.md.proposed and emits a proposed audit", async () => {
     const instance = "user-approved-blocked";
     const config = makeConfig(instance);
     await seedAgent(config);
@@ -277,15 +277,22 @@ describe("edit_user_profile dispatch (auto-approved)", () => {
 
     expect(result.kind).toBe("sync");
     if (result.kind === "sync") {
-      // Fail-soft: the body still writes (the injection scanner on the
-      // load path replaces it with a BLOCKED notice at read time when
-      // the scan finds threats). The scan findings ride on the audit
-      // row + tool-result string so the operator can see them.
+      // A hostile body never auto-approves. It lands at USER.md.proposed
+      // and the tool result tells the model the content is blocked from
+      // the prompt until the operator approves it via the API.
+      expect(result.result).toMatch(/Proposed USER.md edit/);
       expect(result.result).toMatch(/scan flagged: prompt_injection/);
+      expect(result.result).toMatch(/blocked from prompt until approved/);
     }
+    // Approved file untouched; proposal sits at .proposed for review.
+    expect(existsSync(userProfilePath(instance))).toBe(false);
+    expect(existsSync(userProfileProposedPath(instance))).toBe(true);
+
     const audit = readState(instance).audit.find(
-      (event) => event.action === "identity.user_profile.approved"
+      (event) => event.action === "identity.user_profile.proposed"
     );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.autoApproved).toBe(false);
     expect((audit?.evidence?.scanFindings as string[] | undefined) ?? []).toContain("prompt_injection");
   });
 
