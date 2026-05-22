@@ -42,6 +42,47 @@ export interface McpCallToolResult {
   error?: string;
 }
 
+// Strip authentication-bearing headers from a string snippet (typically a
+// captured upstream HTTP response body that an MCP server echoed back to
+// us). Servers sometimes mirror the request — including the
+// `Authorization` header — into error responses, which we then persist
+// into `mcpServers[*].message` and `mcp.health` audits. Redact before
+// the value lands in state.json or audit evidence.
+//
+// The redaction is best-effort, not exhaustive: it targets well-known
+// auth header names plus any `*-Token` / `*-Key` variant. The body might
+// be JSON, plaintext, HTML, or framed SSE; matching on a header-style
+// `Name: value` prefix on each line covers the common cases without
+// trying to parse arbitrary upstream formats.
+const AUTH_HEADER_NAMES = [
+  "authorization",
+  "cookie",
+  "set-cookie",
+  "proxy-authorization",
+  "x-api-key",
+  "x-auth-token"
+];
+
+export function redactSecretsInText(input: string): string {
+  if (!input) return input;
+  // 1) Exact-match well-known auth headers: replace the value with [REDACTED].
+  let out = input;
+  for (const name of AUTH_HEADER_NAMES) {
+    const re = new RegExp(`(${name}\\s*[:=]\\s*)([^\\r\\n,;"']+)`, "gi");
+    out = out.replace(re, "$1[REDACTED]");
+  }
+  // 2) Any header-style line that ends in `-token` or `-key` (e.g.
+  //    `X-Service-Token: …`). Conservative: requires the name to be at
+  //    the start of a line or after `, ` / `; ` to avoid mangling JSON
+  //    values that happen to contain "key".
+  out = out.replace(/(^|[\r\n,;])([A-Za-z][\w-]*-(?:token|key))\s*:\s*[^\r\n,;"']+/gi, "$1$2: [REDACTED]");
+  // 3) Bearer tokens that appear without a header name (e.g. echoed in a
+  //    JSON `"authorization":"Bearer …"` body or in prose). We already
+  //    handled the header-name case above; this catches bare `Bearer X`.
+  out = out.replace(/\bBearer\s+[A-Za-z0-9._\-+/=]+/g, "Bearer [REDACTED]");
+  return out;
+}
+
 // Resolve `${VAR}` placeholders inside a header value against the supplied
 // env map. Returns undefined when any referenced var is missing; callers
 // treat that as a missing-credential error rather than sending the literal
@@ -95,7 +136,12 @@ async function postRpc(url: string, headers: Record<string, string>, method: str
     } catch {
       body = "";
     }
-    return { ok: false, error: `MCP HTTP ${response.status}${body ? `: ${body}` : ""}` };
+    // Upstream may echo the request headers (including `Authorization`)
+    // back in its error body. The body lands in `mcpServers[*].message`
+    // and `mcp.health` audit evidence on disk, so we must scrub before
+    // returning. See `redactSecretsInText`.
+    const safeBody = redactSecretsInText(body);
+    return { ok: false, error: `MCP HTTP ${response.status}${safeBody ? `: ${safeBody}` : ""}` };
   }
   const raw = await response.text();
   const payload = parseRpcPayload(raw, id);

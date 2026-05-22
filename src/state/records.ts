@@ -734,7 +734,8 @@ export function createSubagentRecord(
 
 export function createMcpServerRecord(
   state: RuntimeState,
-  server: Omit<McpServerRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
+  server: Omit<McpServerRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">,
+  options: { actor?: "user" | "runtime" | "agent" } = {}
 ): McpServerRecord {
   const at = now();
   const item: McpServerRecord = {
@@ -747,11 +748,14 @@ export function createMcpServerRecord(
   };
   state.mcpServers.unshift(item);
   // MCP servers are configured at the instance level; tool invocations
-  // later attribute to the calling task.
+  // later attribute to the calling task. `actor` defaults to "user"
+  // because the CRUD path (`gini mcp add`, POST /api/mcp/servers) is the
+  // common case; runtime-driven creation (auto-register from a connector)
+  // overrides this so the audit row honestly attributes to the system.
   addAudit(
     state,
     {
-      actor: "user",
+      actor: options.actor ?? "user",
       action: "mcp.configured",
       target: item.id,
       risk: "medium",
