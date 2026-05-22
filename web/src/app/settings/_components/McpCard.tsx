@@ -366,14 +366,25 @@ function AddMessagingBridgeButtons() {
           // dismiss-then-resubmit would mint two bridges with the same
           // name fighting over the same bot token. Cancel button is
           // already disabled by add.isPending below.
-          if (add.isPending) return;
+          //
+          // Reading submittingRef.current alongside add.isPending
+          // closes a same-frame race: between submit() flipping the
+          // ref synchronously and React committing the next render,
+          // this closure still reads add.isPending === false from the
+          // prior render's lexical scope. The ref is updated
+          // synchronously, so any later closure sees the new value.
+          if (submittingRef.current || add.isPending) return;
           close();
         }}
       >
         <DialogContent
           showCloseButton={!add.isPending}
-          onEscapeKeyDown={(event) => { if (add.isPending) event.preventDefault(); }}
-          onInteractOutside={(event) => { if (add.isPending) event.preventDefault(); }}
+          onEscapeKeyDown={(event) => {
+            if (submittingRef.current || add.isPending) event.preventDefault();
+          }}
+          onInteractOutside={(event) => {
+            if (submittingRef.current || add.isPending) event.preventDefault();
+          }}
         >
           <DialogHeader>
             <DialogTitle>Add {label} bridge</DialogTitle>
