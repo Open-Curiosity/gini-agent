@@ -196,6 +196,39 @@ describe("redactSecretsInText", () => {
     expect(out).not.toContain("SUPERSECRET");
     expect(out).toContain("[REDACTED]");
   });
+
+  test('redacts escaped-JSON x-api-key value containing JSON escape sequences', () => {
+    // Real bearer/token values frequently contain `\/`, `\u00xx`, etc. when
+    // an upstream re-encodes a JSON body inside another JSON string. The
+    // escaped-JSON pass must consume `\X` as a unit so the value pattern
+    // doesn't bail at the first backslash.
+    //
+    // Source text: {"error":"{\"x-api-key\":\"abc\/SUPERSECRET\"}"} — the
+    // inner JSON value contains a backslash-escaped `/` which the previous
+    // [^"\\] character class bailed on.
+    const input = '{"error":"{\\"x-api-key\\":\\"abc\\/SUPERSECRET\\"}"}';
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test('redacts bare bearer token with full RFC 6750 charset (~ included)', () => {
+    // RFC 6750 b64token = ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" with trailing "="
+    const input = "Bearer abc.def-ghi_jkl~mno+pqr/stu=";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("abc.def-ghi_jkl~mno+pqr/stu");
+    expect(out).not.toContain("~mno");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test('cookie redaction inside JSON array preserves trailing structure', () => {
+    // {"errors":["Cookie: x=Y"],"status":401} — the redaction must stop at
+    // the `]` so that `,"status":401}` is preserved after the redacted value.
+    const input = '{"errors":["Cookie: session=SUPERSECRET"],"status":401}';
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain('"status":401}');
+  });
 });
 
 describe("postRpc error body redaction (regression)", () => {
