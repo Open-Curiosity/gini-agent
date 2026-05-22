@@ -240,6 +240,13 @@ function AddMessagingBridgeButtons() {
   // otherwise the late reset would clobber the freshly-set kind/name
   // in the new dialog session.
   const resetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Monotonic per-dialog-session counter. An in-flight create's
+  // per-call onSuccess captures the value at submit time and only
+  // promotes the response into `result` if the same session is still
+  // active. close() and openFor() bump this so a POST that resolves
+  // after the user closes or reopens the dialog can't pollute a
+  // fresh session with a stale success view.
+  const sessionRef = useRef(0);
 
   const add = useMutation<MessagingBridgeRecord, Error, { name: string; kind: AddBridgeKind; botToken: string }>({
     mutationFn: (input) =>
@@ -247,10 +254,13 @@ function AddMessagingBridgeButtons() {
         method: "POST",
         body: JSON.stringify(input)
       }),
-    onSuccess: (record, variables) => {
+    onSuccess: (_record, variables) => {
+      // Always fire — the bridge exists server-side regardless of
+      // whether the user's dialog session is still open. The
+      // mutate()-level onSuccess below handles routing the record
+      // into the success view only when the session is still active.
       toast.success(`${labelFor(variables.kind)} bridge added.`);
       invalidate(["messaging", "events", "state"]);
-      setResult(record);
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -266,6 +276,7 @@ function AddMessagingBridgeButtons() {
 
   const openFor = (next: AddBridgeKind) => {
     cancelResetTimer();
+    sessionRef.current += 1;
     setKind(next);
     setName("");
     setBotToken("");
@@ -276,6 +287,7 @@ function AddMessagingBridgeButtons() {
 
   const close = () => {
     setOpen(false);
+    sessionRef.current += 1;
     cancelResetTimer();
     resetTimerRef.current = setTimeout(() => {
       resetTimerRef.current = null;
@@ -297,7 +309,16 @@ function AddMessagingBridgeButtons() {
       toast.error("Bot token is required.");
       return;
     }
-    add.mutate({ name: trimmedName, kind, botToken: trimmedToken });
+    const submittingSession = sessionRef.current;
+    add.mutate(
+      { name: trimmedName, kind, botToken: trimmedToken },
+      {
+        onSuccess: (record) => {
+          if (sessionRef.current !== submittingSession) return;
+          setResult(record);
+        }
+      }
+    );
   };
 
   const label = labelFor(kind);
