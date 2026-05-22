@@ -525,6 +525,11 @@ function AgentPickerModal({
   onCancelNewAgent: () => void;
   onClose: () => void;
 }) {
+  // Full-height panel modeled on Slack's workspace switcher: large title
+  // top-left, list takes the middle (flex: 1), and the "+ New agent" row
+  // pins to the bottom under a divider. The Modal itself still uses
+  // `transparent` + slide animation so the sheet slides up over the
+  // current screen rather than replacing it outright.
   return (
     <Modal
       visible={visible}
@@ -533,20 +538,11 @@ function AgentPickerModal({
       onRequestClose={onClose}
       statusBarTranslucent
     >
-      {/* Backdrop closes the sheet on tap; the sheet itself is a sibling
-          Pressable so taps inside don't bubble back to the backdrop. */}
-      <Pressable
-        style={styles.modalBackdrop}
-        onPress={onClose}
-        accessibilityRole="button"
-        accessibilityLabel="Close agent picker"
-      />
       <View style={styles.modalSheet}>
-        <SafeAreaView edges={["bottom"]} style={styles.modalSheetInner}>
-          <View style={styles.modalHandle} />
+        <SafeAreaView edges={["top", "bottom"]} style={styles.modalSheetInner}>
           <View style={styles.modalHeader}>
             <Text style={styles.modalTitle}>
-              {mode === "list" ? "Switch agent" : "New agent"}
+              {mode === "list" ? "Agents" : "New agent"}
             </Text>
             <TouchableOpacity
               onPress={onClose}
@@ -559,20 +555,24 @@ function AgentPickerModal({
             </TouchableOpacity>
           </View>
           {mode === "list" ? (
-            <FlatList
-              data={agents}
-              keyExtractor={(a) => a.id}
-              renderItem={({ item }) => (
-                <AgentPickerRow
-                  agent={item}
-                  selected={item.id === selectedAgentId}
-                  onPress={() => onPick(item)}
-                />
-              )}
-              ListFooterComponent={
-                <NewAgentFooterRow onPress={onStartNewAgent} />
-              }
-            />
+            <>
+              <FlatList
+                data={agents}
+                keyExtractor={(a) => a.id}
+                style={styles.pickerList}
+                contentContainerStyle={styles.pickerListContent}
+                renderItem={({ item }) => (
+                  <AgentPickerRow
+                    agent={item}
+                    selected={item.id === selectedAgentId}
+                    onPress={() => onPick(item)}
+                  />
+                )}
+                ItemSeparatorComponent={PickerRowSpacer}
+              />
+              <View style={styles.pickerFooterDivider} />
+              <NewAgentFooterRow onPress={onStartNewAgent} />
+            </>
           ) : (
             <NewAgentForm
               name={newAgentName}
@@ -587,6 +587,10 @@ function AgentPickerModal({
       </View>
     </Modal>
   );
+}
+
+function PickerRowSpacer() {
+  return <View style={styles.pickerRowSpacer} />;
 }
 
 function NewAgentForm({
@@ -702,10 +706,14 @@ function AgentPickerRow({
   );
 }
 
+// The "+ New agent" row mirrors AgentPickerRow's shape (same height,
+// padding, and corner radius) so the pinned footer reads as part of the
+// same row family — just with an accent color and a leading "+". It sits
+// below a divider rather than being part of the FlatList itself, which
+// is what keeps it visually anchored to the bottom of the panel.
 function NewAgentFooterRow({ onPress }: { onPress: () => void }) {
   return (
-    <View>
-      <View style={styles.pickerFooterDivider} />
+    <View style={styles.pickerFooterContainer}>
       <TouchableOpacity
         onPress={onPress}
         activeOpacity={0.7}
@@ -805,68 +813,67 @@ const styles = StyleSheet.create({
   },
   newButtonText: { color: theme.buttonText, fontSize: 15, fontWeight: "600" },
 
-  // Modal — slide-up sheet with a dim backdrop. The sheet itself sits at
-  // the bottom and consumes its own safe-area inset so the close row sits
-  // above the home indicator on iOS.
-  modalBackdrop: {
+  // Modal — full-height panel modeled on Slack's workspace switcher.
+  // The sheet fills the entire screen (the slide animation still gives
+  // it a panel feel) and the inner SafeAreaView consumes both the top
+  // notch inset and the bottom home-indicator inset so neither the
+  // title nor the pinned footer collides with system chrome.
+  modalSheet: {
     position: "absolute",
     top: 0,
     left: 0,
     right: 0,
     bottom: 0,
-    backgroundColor: "rgba(0,0,0,0.5)"
+    backgroundColor: theme.bg
   },
-  modalSheet: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: theme.bg,
-    borderTopLeftRadius: 16,
-    borderTopRightRadius: 16,
-    maxHeight: "75%",
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: theme.border
-  },
-  modalSheetInner: { paddingBottom: 8 },
-  modalHandle: {
-    width: 36,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: theme.subtle,
-    opacity: 0.5,
-    alignSelf: "center",
-    marginTop: 8,
-    marginBottom: 4
-  },
+  modalSheetInner: { flex: 1 },
   modalHeader: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 16,
-    paddingVertical: 10
+    paddingHorizontal: 24,
+    paddingTop: 24,
+    paddingBottom: 16
   },
-  modalTitle: { flex: 1, color: theme.text, fontSize: 17, fontWeight: "600" },
+  modalTitle: { flex: 1, color: theme.text, fontSize: 28, fontWeight: "700" },
   modalClose: { paddingHorizontal: 4, paddingVertical: 4 },
   modalCloseText: { color: theme.accent, fontSize: 15, fontWeight: "500" },
 
+  // Agent picker rows — tall, breathy rows like Slack's workspace list.
+  // Selected row gets a card-like rounded outline + filled background
+  // so it reads as the active card without dominating the list. Row
+  // text aligns with the title's left edge: header padding 24 ==
+  // row marginHorizontal 4 + row paddingHorizontal 20.
+  pickerList: { flex: 1 },
+  pickerListContent: { paddingVertical: 4 },
   pickerRow: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 16,
-    minHeight: 64
+    paddingHorizontal: 20,
+    paddingVertical: 18,
+    marginHorizontal: 4,
+    minHeight: 72,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "transparent"
   },
-  pickerRowSelected: { backgroundColor: theme.rowSelected },
-  pickerBody: { flex: 1, gap: 2 },
-  pickerTitle: { color: theme.text, fontSize: 16, fontWeight: "700" },
-  pickerSubtitle: { color: theme.subtle, fontSize: 13 },
+  pickerRowSelected: {
+    backgroundColor: theme.rowSelected,
+    borderColor: theme.border
+  },
+  pickerRowSpacer: { height: 4 },
+  pickerBody: { flex: 1, gap: 4 },
+  pickerTitle: { color: theme.text, fontSize: 17, fontWeight: "700" },
+  pickerSubtitle: { color: theme.subtle, fontSize: 14 },
   pickerFooterDivider: {
     height: StyleSheet.hairlineWidth,
     backgroundColor: theme.border
   },
-  pickerNewAgentText: { color: theme.accent, fontSize: 16, fontWeight: "600" },
+  pickerFooterContainer: { paddingVertical: 4 },
+  pickerNewAgentText: { color: theme.accent, fontSize: 17, fontWeight: "600" },
 
-  // New-agent inline form.
-  newAgentForm: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 16, gap: 12 },
+  // New-agent inline form. Sits inside the same full-height panel as
+  // the list, so it gets generous top padding to balance the header.
+  newAgentForm: { paddingHorizontal: 24, paddingTop: 16, paddingBottom: 24, gap: 12 },
   newAgentInput: {
     backgroundColor: theme.inputBg,
     color: theme.text,
