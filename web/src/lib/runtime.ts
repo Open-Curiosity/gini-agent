@@ -16,19 +16,19 @@ const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control", "las
 // embedding pass against every bank in the instance, a DoS vector
 // for any operator who's paying per-token for embeddings.
 // `messaging/<bridge>/<verb>` covers the operator-only bot allowlist
-// surface (allow / deny / pair / reject-pending / disable / health
-// /send/receive) — any of those forwarded cross-origin would let an
-// attacker page mutate the bot's allowlist or fire outbound messages
-// as the operator. The bare `messaging` POST creates a brand-new bridge
-// (with a bot token) under the operator's identity, so it has to land
-// in the same guard or a cross-origin page can plant attacker-supplied
-// ingress.
+// surface (allow / deny / pair / reject-pending / disable / remove /
+// health / send / receive) — any of those forwarded cross-origin
+// would let an attacker page mutate the bot's allowlist or fire
+// outbound messages as the operator. The bare `messaging` POST
+// creates a brand-new bridge (with a bot token) under the operator's
+// identity, so it has to land in the same guard or a cross-origin
+// page can plant attacker-supplied ingress.
 const PRIVILEGED_POST_ROUTES: ReadonlyArray<RegExp> = [
   /^update$/,
   /^update\/check$/,
   /^embedding\/reembed$/,
   /^messaging$/,
-  /^messaging\/[^/]+\/(allow|deny|pair|reject-pending|disable|health|send|receive)$/
+  /^messaging\/[^/]+\/(allow|deny|pair|reject-pending|disable|remove|health|send|receive)$/
 ];
 
 // Cache the file-read values across requests but invalidate on mtime change,
@@ -221,10 +221,33 @@ function guardPrivilegedRequest(request: Request, pathSegments: string[]): Respo
   const route = pathSegments.join("/");
   if (!PRIVILEGED_POST_ROUTES.some((pattern) => pattern.test(route))) return null;
 
-  const requestOrigin = new URL(request.url).origin;
+  // Compare the browser-supplied Origin against the Host header the
+  // browser actually used. Next.js dev (and most reverse-proxy /
+  // tunnel setups) carry a stale internal hostname in `request.url`
+  // — typically `localhost:<port>` — regardless of the public URL,
+  // so the old strict `Origin === new URL(request.url).origin`
+  // comparison rejected every legitimate non-localhost client.
+  // Matching against Host preserves the CSRF defense (a cross-origin
+  // attacker page has a different Origin host than the BFF's own
+  // Host header) while letting tailnet / tunnel / hostname access
+  // through. When the Host header is absent (synthetic Request
+  // objects in tests, non-browser HTTP/2 clients that send :authority
+  // instead) we fall back to request.url's host so the legacy
+  // localhost-equality check still applies. Sec-Fetch-Site below
+  // remains the primary signal — the browser sets it and JS can't
+  // spoof it.
   const origin = request.headers.get("origin");
-  if (origin && origin !== requestOrigin) {
-    return Response.json({ error: "Forbidden" }, { status: 403 });
+  if (origin) {
+    const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
+    let originHost: string;
+    try {
+      originHost = new URL(origin).host;
+    } catch {
+      return Response.json({ error: "Forbidden" }, { status: 403 });
+    }
+    if (originHost !== expectedHost) {
+      return Response.json({ error: "Forbidden" }, { status: 403 });
+    }
   }
 
   const fetchSite = request.headers.get("sec-fetch-site");
