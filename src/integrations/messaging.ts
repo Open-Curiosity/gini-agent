@@ -798,20 +798,21 @@ export async function denyChat(config: RuntimeConfig, idOrName: string, chatId: 
   });
 }
 
-// Remove a chat from `recentDeniedChats` without touching the allowlist.
+// Drop a chat from `recentDeniedChats` without touching the allowlist.
 // Backs the operator UI's "Reject" button on a pending pairing request —
 // the chat stays denied (the bridge keeps dropping its messages), but the
 // row is cleared from the pending list so it doesn't keep nagging the
 // operator. If the same chat sends another message after this it'll
-// re-appear in `recentDeniedChats` (we don't have a long-term denylist),
-// matching babyclaw's session-local reject semantics.
-export async function forgetDeniedChat(config: RuntimeConfig, idOrName: string, chatId: number) {
+// re-appear in `recentDeniedChats` because there is no long-term denylist.
+export async function rejectPendingChat(config: RuntimeConfig, idOrName: string, chatId: number) {
   if (!Number.isFinite(chatId)) throw new Error("chatId must be a finite number.");
   return mutateState(config.instance, (state) => {
     const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
     if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
     if (live.kind !== "telegram") {
-      throw new Error(`Pending pairing requests only apply to telegram bridges (got '${live.kind}').`);
+      // Reuse the existing allowlist-only prefix so statusFromErrorMessage
+      // already maps this to a 400 the way it does for allowChat / denyChat.
+      throw new Error(`Chat allowlist only applies to telegram bridges (got '${live.kind}').`);
     }
     const meta = { ...(live.metadata ?? {}) };
     meta.recentDeniedChats = readRecentDeniedChats(live).filter((entry) => entry.chatId !== chatId);

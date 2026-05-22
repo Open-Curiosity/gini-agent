@@ -146,7 +146,7 @@ function TelegramPendingRequests({ bridgeId }: { bridgeId: string }) {
   });
   const reject = useMutation({
     mutationFn: (chatId: number) =>
-      api(`/messaging/${encodeURIComponent(bridgeId)}/forget`, {
+      api(`/messaging/${encodeURIComponent(bridgeId)}/reject-pending`, {
         method: "POST",
         body: JSON.stringify({ chatId })
       }),

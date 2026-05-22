@@ -20,7 +20,7 @@ import { searchSessions } from "./execution/search";
 import { listToolsets, setToolsetStatus } from "./capabilities/toolsets";
 import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/subagents";
 import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./integrations/mcp";
-import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableMessagingBridge, forgetDeniedChat, listAllowedChats, listMessagingMessages, pairMessagingBridge, receiveMessagingInput, sendMessagingOutput } from "./integrations/messaging";
+import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableMessagingBridge, listAllowedChats, listMessagingMessages, pairMessagingBridge, receiveMessagingInput, rejectPendingChat, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
@@ -543,10 +543,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const chatId = parseChatIdStrict(payload.chatId);
       return json(await denyChat(config, params[0], chatId));
     }],
-    ["POST", /^\/api\/messaging\/([^/]+)\/forget$/, async (request, params) => {
+    ["POST", /^\/api\/messaging\/([^/]+)\/reject-pending$/, async (request, params) => {
       const payload = await body(request);
       const chatId = parseChatIdStrict(payload.chatId);
-      return json(await forgetDeniedChat(config, params[0], chatId));
+      return json(await rejectPendingChat(config, params[0], chatId));
     }],
     ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],
     // Browser-driven onboarding endpoints. The webapp's /setup route polls
