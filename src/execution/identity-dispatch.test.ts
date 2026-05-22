@@ -144,6 +144,71 @@ describe("edit_soul dispatch", () => {
     expect(proposed).toMatch(/Existing persona body\.\n\nExtra paragraph\./);
   });
 
+  test("append de-duplicates lines that already exist in the approved SOUL.md", async () => {
+    // Storage-layer safety net: even if the model re-emits the existing
+    // body as part of the append payload, duplicate lines drop out so
+    // SOUL.md doesn't grow stale copies.
+    const instance = "soul-propose-append-dedupe";
+    const config = makeConfig(instance);
+    await seedAgent(config);
+    const taskId = await seedTask(config);
+
+    const approvedPath = soulPath(instance, TEST_AGENT);
+    mkdirSync(dirname(approvedPath), { recursive: true });
+    writeFileSync(approvedPath, "Voice: terse\nFocus: accuracy");
+
+    await dispatchToolCall(
+      config,
+      taskId,
+      "edit_soul",
+      "call_soul_append_dedupe",
+      JSON.stringify({
+        action: "append",
+        // Re-emits the existing body alongside one genuinely new line.
+        content: "Voice: terse\nFocus: accuracy\nTone: dry"
+      })
+    );
+    const proposed = readFileSync(soulProposedPath(instance, TEST_AGENT), "utf8");
+    // Existing body kept; only the new line appears below it.
+    expect(proposed).toBe("Voice: terse\nFocus: accuracy\n\nTone: dry");
+  });
+
+  test("append no-ops cleanly when every line is already present", async () => {
+    const instance = "soul-propose-append-noop";
+    const config = makeConfig(instance);
+    await seedAgent(config);
+    const taskId = await seedTask(config);
+
+    const approvedPath = soulPath(instance, TEST_AGENT);
+    mkdirSync(dirname(approvedPath), { recursive: true });
+    writeFileSync(approvedPath, "Voice: terse\nFocus: accuracy");
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "edit_soul",
+      "call_soul_append_noop",
+      JSON.stringify({
+        action: "append",
+        content: "Voice: terse\nFocus: accuracy"
+      })
+    );
+
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toMatch(/No SOUL\.md change/);
+    }
+    // No proposal was written — the existing approved file stays intact.
+    expect(existsSync(soulProposedPath(instance, TEST_AGENT))).toBe(false);
+    expect(readFileSync(approvedPath, "utf8")).toBe("Voice: terse\nFocus: accuracy");
+
+    const audit = readState(instance).audit.find(
+      (event) => event.action === "identity.soul.append.noop"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.droppedLineCount).toBe(2);
+  });
+
   // The "no active agent" branch in editSoulTool is a defensive guard —
   // normalizeState always seeds a default agent on read, so the branch
   // is unreachable from a state-mutation path. Covered by the
@@ -259,6 +324,72 @@ describe("edit_user_profile dispatch (auto-approved)", () => {
     );
     expect(audit).toBeDefined();
     expect(audit?.evidence?.autoApproved).toBe(true);
+  });
+
+  test("append de-duplicates lines that already exist in the approved USER.md", async () => {
+    // Storage-layer safety net: model that re-emits the current USER.md
+    // alongside a new fact does not duplicate the existing entries.
+    const instance = "user-approved-append-dedupe";
+    const config = makeConfig(instance);
+    await seedAgent(config);
+    const taskId = await seedTask(config);
+
+    const approvedPath = userProfilePath(instance);
+    mkdirSync(dirname(approvedPath), { recursive: true });
+    writeFileSync(approvedPath, "Name: Alex\nRole: engineer");
+
+    await dispatchToolCall(
+      config,
+      taskId,
+      "edit_user_profile",
+      "call_user_append_dedupe",
+      JSON.stringify({
+        action: "append",
+        // Re-emits both existing facts plus one new one.
+        content: "Name: Alex\nRole: engineer\nLocation: Berlin"
+      })
+    );
+
+    const body = readFileSync(approvedPath, "utf8");
+    expect(body).toBe("Name: Alex\nRole: engineer\n\nLocation: Berlin");
+    // No .proposed sibling — clean body auto-approved.
+    expect(existsSync(userProfileProposedPath(instance))).toBe(false);
+  });
+
+  test("append no-ops cleanly when every line is already present in USER.md", async () => {
+    const instance = "user-approved-append-noop";
+    const config = makeConfig(instance);
+    await seedAgent(config);
+    const taskId = await seedTask(config);
+
+    const approvedPath = userProfilePath(instance);
+    mkdirSync(dirname(approvedPath), { recursive: true });
+    writeFileSync(approvedPath, "Name: Alex\nRole: engineer");
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "edit_user_profile",
+      "call_user_append_noop",
+      JSON.stringify({
+        action: "append",
+        content: "Name: Alex\nRole: engineer"
+      })
+    );
+
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toMatch(/No USER\.md change/);
+    }
+    // Approved file untouched; no .proposed sibling created.
+    expect(readFileSync(approvedPath, "utf8")).toBe("Name: Alex\nRole: engineer");
+    expect(existsSync(userProfileProposedPath(instance))).toBe(false);
+
+    const audit = readState(instance).audit.find(
+      (event) => event.action === "identity.user_profile.append.noop"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.droppedLineCount).toBe(2);
   });
 
   test("routes a body that trips a threat pattern to USER.md.proposed and emits a proposed audit", async () => {

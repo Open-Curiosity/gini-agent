@@ -9,6 +9,7 @@ import { buildAgentSystemContext } from "../system-prompt";
 import {
   approveSoul,
   approveUserProfile,
+  dedupeAppendLines,
   instructionsPath,
   loadInstructions,
   loadSoul,
@@ -199,6 +200,75 @@ describe("identity-files", () => {
       writeUserProfile(INSTANCE, "v1", "approved");
       writeUserProfile(INSTANCE, "v2", "approved");
       expect(readFileSync(userProfilePath(INSTANCE), "utf8")).toBe("v2");
+    });
+  });
+
+  describe("dedupeAppendLines", () => {
+    // Append-with-dedupe is the storage-layer safety net: when the model
+    // picks `action: "append"` and re-emits content that already lives in
+    // the existing body, we drop the duplicate lines so USER.md and
+    // SOUL.md don't accumulate copies of the same facts.
+    test("empty existing + new content returns the new content unchanged", () => {
+      const result = dedupeAppendLines("", "Name: Alex\nRole: engineer");
+      expect(result.residual).toBe("Name: Alex\nRole: engineer");
+      expect(result.empty).toBe(false);
+      expect(result.droppedLineCount).toBe(0);
+    });
+
+    test("drops to-append lines that already exist verbatim in existing", () => {
+      const result = dedupeAppendLines("Name: Alex", "Name: Alex\nRole: engineer");
+      expect(result.residual).toBe("Role: engineer");
+      expect(result.empty).toBe(false);
+      expect(result.droppedLineCount).toBe(1);
+    });
+
+    test("flags empty residual when every line is already present", () => {
+      const result = dedupeAppendLines("Name: Alex\nRole: engineer", "Name: Alex\nRole: engineer");
+      expect(result.residual).toBe("");
+      expect(result.empty).toBe(true);
+      expect(result.droppedLineCount).toBe(2);
+    });
+
+    test("trims whitespace before comparing so reformatted lines still dedupe", () => {
+      const result = dedupeAppendLines("Name: Alex", "  Name: Alex  ");
+      expect(result.empty).toBe(true);
+      expect(result.droppedLineCount).toBe(1);
+    });
+
+    test("case-sensitive — different casing counts as a new line", () => {
+      // Deliberate: `Name: Alex` and `name: alex` could be different facts
+      // (e.g. nested headers vs body content), don't get clever.
+      const result = dedupeAppendLines("Name: Alex", "name: alex");
+      expect(result.residual).toBe("name: alex");
+      expect(result.empty).toBe(false);
+      expect(result.droppedLineCount).toBe(0);
+    });
+
+    test("dedupes within-batch duplicates too", () => {
+      // Model emits the same line twice in one append payload; second
+      // copy is dropped even though it wasn't in the existing body.
+      const result = dedupeAppendLines("", "Name: Alex\nName: Alex");
+      expect(result.residual).toBe("Name: Alex");
+      expect(result.droppedLineCount).toBe(1);
+    });
+
+    test("preserves intra-residual blank lines but strips leading/trailing", () => {
+      // Multi-paragraph append: drop the duplicate header but keep the
+      // blank-line separator between the surviving paragraphs.
+      const result = dedupeAppendLines(
+        "Name: Alex\nRole: engineer",
+        "Name: Alex\n\nLocation: Berlin\n\nPrefers: TypeScript"
+      );
+      expect(result.residual).toBe("Location: Berlin\n\nPrefers: TypeScript");
+      expect(result.empty).toBe(false);
+      expect(result.droppedLineCount).toBe(1);
+    });
+
+    test("handles CRLF input by normalizing to LF before comparing", () => {
+      const result = dedupeAppendLines("Name: Alex", "Name: Alex\r\nRole: engineer");
+      expect(result.residual).toBe("Role: engineer");
+      expect(result.empty).toBe(false);
+      expect(result.droppedLineCount).toBe(1);
     });
   });
 

@@ -31,12 +31,15 @@ import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
 import { recall } from "../memory";
 import {
+  dedupeAppendLines,
   loadSoul,
   loadUserProfile,
   previewRemoveUserProfileSection,
   removeSoulSection,
   removeUserProfileSection,
   scanForInjection,
+  soulPath,
+  userProfilePath,
   writeSoul,
   writeUserProfile,
   type IdentityFileStatus
@@ -1499,12 +1502,45 @@ async function editSoulTool(
   // For 'append', the new proposal carries the existing approved body
   // followed by a blank line and the new content. The approved file
   // stays the source of truth — proposals are not chained on top of
-  // earlier unapproved proposals.
+  // earlier unapproved proposals. Lines from `content` that already
+  // exist verbatim in the existing body are dropped so a model that
+  // re-emits the current file alongside the new fact doesn't duplicate.
   let body = content;
+  let appendDedupeDropped = 0;
   if (action === "append") {
     const existing = loadSoul(config.instance, agentId);
     if (existing && existing.trim().length > 0 && !existing.startsWith("[BLOCKED:")) {
-      body = `${existing.trim()}\n\n${content.trim()}`;
+      const dedupe = dedupeAppendLines(existing, content);
+      appendDedupeDropped = dedupe.droppedLineCount;
+      if (dedupe.empty) {
+        // Nothing new to append — surface a no-op so the model knows the
+        // write was redundant and the file stays clean. Audit + trace
+        // record the suppression so it stays observable.
+        await mutateState(config.instance, (state) => {
+          const item = findTask(state, taskId);
+          addAudit(
+            state,
+            {
+              actor: "agent",
+              action: "identity.soul.append.noop",
+              target: soulPath(config.instance, agentId),
+              risk: "low",
+              taskId: item.id,
+              runId: item.runId,
+              evidence: { agentId, droppedLineCount: appendDedupeDropped }
+            },
+            { taskId: item.id }
+          );
+          item.updatedAt = now();
+        });
+        appendTrace(config.instance, taskId, {
+          type: "model",
+          message: "SOUL.md append no-op (all lines already present)",
+          data: { agentId, droppedLineCount: appendDedupeDropped }
+        });
+        return `No SOUL.md change: all appended lines already exist in the approved body.`;
+      }
+      body = `${existing.trim()}\n\n${dedupe.residual}`;
     }
   }
   const result = writeSoul(config.instance, agentId, body, "proposed");
@@ -1524,7 +1560,8 @@ async function editSoulTool(
           action,
           path: result.path,
           contentBytes: body.length,
-          scanFindings: result.scanFindings
+          scanFindings: result.scanFindings,
+          ...(appendDedupeDropped > 0 ? { droppedLineCount: appendDedupeDropped } : {})
         }
       },
       { taskId: item.id }
@@ -1620,10 +1657,44 @@ async function editUserProfileTool(
   }
   const content = requireString(args, "content");
   let body = content;
+  let appendDedupeDropped = 0;
   if (action === "append") {
     const existing = loadUserProfile(config.instance);
     if (existing && existing.trim().length > 0 && !existing.startsWith("[BLOCKED:")) {
-      body = `${existing.trim()}\n\n${content.trim()}`;
+      // Drop lines from `content` that already live verbatim in the
+      // existing body so a model that re-emits the current file
+      // alongside the new fact doesn't duplicate (the dominant
+      // overshoot pattern on weaker tool-calling models). When the
+      // residual is empty no write happens — the file is already
+      // current.
+      const dedupe = dedupeAppendLines(existing, content);
+      appendDedupeDropped = dedupe.droppedLineCount;
+      if (dedupe.empty) {
+        await mutateState(config.instance, (state) => {
+          const item = findTask(state, taskId);
+          addAudit(
+            state,
+            {
+              actor: "agent",
+              action: "identity.user_profile.append.noop",
+              target: userProfilePath(config.instance),
+              risk: "low",
+              taskId: item.id,
+              runId: item.runId,
+              evidence: { droppedLineCount: appendDedupeDropped }
+            },
+            { taskId: item.id }
+          );
+          item.updatedAt = now();
+        });
+        appendTrace(config.instance, taskId, {
+          type: "model",
+          message: "USER.md append no-op (all lines already present)",
+          data: { droppedLineCount: appendDedupeDropped }
+        });
+        return `No USER.md change: all appended lines already exist.`;
+      }
+      body = `${existing.trim()}\n\n${dedupe.residual}`;
     }
   }
   // Pre-scan the proposed body. When the scan flags a threat the write
@@ -1653,7 +1724,8 @@ async function editUserProfileTool(
           path: result.path,
           contentBytes: body.length,
           scanFindings: result.scanFindings,
-          autoApproved
+          autoApproved,
+          ...(appendDedupeDropped > 0 ? { droppedLineCount: appendDedupeDropped } : {})
         }
       },
       { taskId: item.id }

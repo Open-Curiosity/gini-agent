@@ -219,13 +219,21 @@ describe("buildAgentSystemContext", () => {
 
   test("preserves prior contract: recalled with no override or files", () => {
     // Existing callers that don't pass the new options object must keep
-    // producing the same block shape as before.
+    // producing the same block shape as before: bundled instructions
+    // verbatim, then the recalled-memory block. No soul / user / identity
+    // / pinned-memory blocks land in the prompt.
     const out = buildAgentSystemContext("1. (semantic) snip");
     expect(out).toContain(expectedDefaultInstructions);
     expect(out).toContain("Long-term memory of prior conversations");
     expect(out).not.toContain("Pinned memories about this user");
-    expect(out).not.toContain("SOUL");
-    expect(out).not.toContain("USER profile");
+    // The output is exactly the instructions + the recalled block, joined
+    // by the standard separator — no other blocks slipped in.
+    expect(out).toBe(
+      [
+        expectedDefaultInstructions,
+        "Long-term memory of prior conversations with this user (use these facts when answering):\n1. (semantic) snip"
+      ].join("\n\n")
+    );
   });
 });
 

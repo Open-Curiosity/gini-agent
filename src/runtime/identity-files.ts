@@ -441,6 +441,80 @@ function promote(proposedPath: string, approvedPath: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Append-with-dedupe. Belt-and-suspenders: when the model picks
+// `action: "append"` and re-emits content that already lives in the
+// existing body (a known model overshoot — the dispatch surfaces the
+// current file to the prompt every turn but weaker models still
+// re-include it), the storage layer drops the duplicates so USER.md and
+// SOUL.md stay clean.
+//
+// Comparison unit is the trimmed line. We split both sides on newlines,
+// drop empty-after-trim lines from the to-append side, and keep only
+// to-append lines whose trimmed form does not appear verbatim (trimmed)
+// anywhere in `existing`. The split deliberately uses individual lines
+// rather than paragraph blocks because the most common duplicate pattern
+// the model produces is "append the same paragraph again" — line-level
+// dedupe handles that AND also catches partial overlaps (existing has
+// lines A,B,C; model appends A,B,C,D → only D lands).
+//
+// Returns the residual content (joined with `\n`) and a boolean flag.
+// When the residual is empty, the caller should no-op the write.
+// ---------------------------------------------------------------------------
+
+export interface AppendDedupeResult {
+  // Lines from `toAppend` that were not already present in `existing`.
+  // Joined with `\n`. Empty string when everything was a duplicate.
+  residual: string;
+  // Convenience flag: true iff `residual` is empty (after trim).
+  // Callers branch on this to suppress the write entirely.
+  empty: boolean;
+  // Number of lines from the input that were dropped as duplicates.
+  // Surfaced so the dispatch layer can audit/trace the no-op detail.
+  droppedLineCount: number;
+}
+
+export function dedupeAppendLines(existing: string, toAppend: string): AppendDedupeResult {
+  // Build a set of trimmed lines from the existing body. Trimming each
+  // line lets us match against a re-emit that adds different leading
+  // whitespace. Case-sensitive (deliberate — `Name: Alex` should not
+  // suppress `name: alex`; different facts).
+  const existingSet = new Set<string>();
+  for (const line of existing.replace(/\r\n/g, "\n").split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length > 0) existingSet.add(trimmed);
+  }
+  const kept: string[] = [];
+  let dropped = 0;
+  for (const line of toAppend.replace(/\r\n/g, "\n").split("\n")) {
+    const trimmed = line.trim();
+    // Drop a wholly empty line only if it's a duplicate-by-design (the
+    // line separator between the existing body and the appended body).
+    // Otherwise blank lines inside the appended body are preserved so a
+    // multi-paragraph append stays readable.
+    if (trimmed.length === 0) {
+      kept.push(line);
+      continue;
+    }
+    if (existingSet.has(trimmed)) {
+      dropped += 1;
+      continue;
+    }
+    kept.push(line);
+    // Also add to the set so a within-batch duplicate (model emits the
+    // same line twice in one append) drops the second copy.
+    existingSet.add(trimmed);
+  }
+  // Strip any leading/trailing blank lines from the residual — they only
+  // existed as separators between content that's now gone.
+  const residual = kept.join("\n").replace(/^\s*\n|\n\s*$/g, "");
+  return {
+    residual,
+    empty: residual.trim().length === 0,
+    droppedLineCount: dropped
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Remove path. Drop a paragraph (block delimited by blank lines) that
 // contains a substring from the approved file body. Writes the result
 // through the same propose/approve gate as `writeSoul` / `writeUserProfile`,
