@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runtimeTunnelState } from "./runtime";
@@ -17,45 +17,61 @@ import { runtimeTunnelState } from "./runtime";
 // Reading from config.json on each request (with the helper's mtime
 // cache for cheap repeated reads) keeps the proxy in lockstep with the
 // gateway's source of truth.
+//
+// Test layout: each test runs against a UNIQUE state root + UNIQUE
+// instance name so the production-side mtime cache (a module-level Map
+// keyed by absolute config path in lib/runtime.ts) cannot return a
+// stale entry from a prior test. Reusing one path with sequential
+// rmSync+write cycles risked a flake on filesystems where two writes
+// within the same millisecond produced identical statSync().mtimeMs —
+// the cache would serve the previous test's body.
 
-const ROOT = join(tmpdir(), "gini-runtime-tunnel-state-test");
+let suiteRoot: string;
+const envSnapshot: { instance: string | undefined; root: string | undefined } = {
+  instance: undefined,
+  root: undefined
+};
+
+beforeAll(() => {
+  envSnapshot.instance = process.env.GINI_INSTANCE;
+  envSnapshot.root = process.env.GINI_STATE_ROOT;
+  suiteRoot = mkdtempSync(join(tmpdir(), "gini-runtime-tunnel-state-"));
+});
+
+afterAll(() => {
+  rmSync(suiteRoot, { recursive: true, force: true });
+  // Restore env so a later suite that depends on the original values
+  // doesn't see this suite's overrides.
+  if (envSnapshot.instance === undefined) delete process.env.GINI_INSTANCE;
+  else process.env.GINI_INSTANCE = envSnapshot.instance;
+  if (envSnapshot.root === undefined) delete process.env.GINI_STATE_ROOT;
+  else process.env.GINI_STATE_ROOT = envSnapshot.root;
+});
+
+let instanceCounter = 0;
+let currentInstance: string;
 
 function withConfig(tunnel: unknown): void {
-  const instanceDir = join(ROOT, "instances", "tunnel-state-test");
+  const instanceDir = join(suiteRoot, "instances", currentInstance);
   mkdirSync(instanceDir, { recursive: true });
   writeFileSync(
     join(instanceDir, "config.json"),
-    JSON.stringify({ instance: "tunnel-state-test", tunnel }, null, 2)
+    JSON.stringify({ instance: currentInstance, tunnel }, null, 2)
   );
 }
 
-function previousEnv(): { instance?: string; root?: string } {
-  return {
-    instance: process.env.GINI_INSTANCE,
-    root: process.env.GINI_STATE_ROOT
-  };
-}
-
-let snapshot: ReturnType<typeof previousEnv>;
-
 describe("runtimeTunnelState", () => {
   beforeEach(() => {
-    snapshot = previousEnv();
-    rmSync(ROOT, { recursive: true, force: true });
-    process.env.GINI_INSTANCE = "tunnel-state-test";
-    process.env.GINI_STATE_ROOT = ROOT;
+    instanceCounter += 1;
+    currentInstance = `tunnel-state-test-${instanceCounter}`;
+    process.env.GINI_INSTANCE = currentInstance;
+    process.env.GINI_STATE_ROOT = suiteRoot;
   });
 
   afterEach(() => {
-    rmSync(ROOT, { recursive: true, force: true });
-    // Restore env so a later test that depends on the original values
-    // doesn't see this suite's overrides. Without restoration the
-    // process-wide env mutation would leak across tests run in the
-    // same Bun process.
-    if (snapshot.instance === undefined) delete process.env.GINI_INSTANCE;
-    else process.env.GINI_INSTANCE = snapshot.instance;
-    if (snapshot.root === undefined) delete process.env.GINI_STATE_ROOT;
-    else process.env.GINI_STATE_ROOT = snapshot.root;
+    // Tear down the per-test instance dir so we don't accumulate state,
+    // but leave suiteRoot intact for the remaining tests.
+    rmSync(join(suiteRoot, "instances", currentInstance), { recursive: true, force: true });
   });
 
   test("returns disabled + empty when config.json is missing", () => {
@@ -89,7 +105,7 @@ describe("runtimeTunnelState", () => {
   });
 
   test("returns disabled when config.json is invalid JSON", () => {
-    const instanceDir = join(ROOT, "instances", "tunnel-state-test");
+    const instanceDir = join(suiteRoot, "instances", currentInstance);
     mkdirSync(instanceDir, { recursive: true });
     writeFileSync(join(instanceDir, "config.json"), "{ not valid");
     expect(runtimeTunnelState()).toEqual({ enabled: false, secret: "" });
