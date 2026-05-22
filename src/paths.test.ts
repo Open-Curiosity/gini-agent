@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultRuntimePort, defaultWebPort, isEnvProviderName, loadConfig, migrateLegacyInstancePaths } from "./paths";
+import { defaultRuntimePort, defaultWebPort, loadConfig, migrateLegacyInstancePaths } from "./paths";
 
 describe("default port helpers", () => {
   test("production default instance is pinned to memorable 7777/7778 ports", () => {
@@ -91,18 +91,14 @@ describe("GINI_PROVIDER env recognition", () => {
     }
   }
 
-  test("isEnvProviderName accepts the three documented values and rejects others", () => {
-    expect(isEnvProviderName("openai")).toBe(true);
-    expect(isEnvProviderName("codex")).toBe(true);
-    expect(isEnvProviderName("echo")).toBe(true);
-    expect(isEnvProviderName("anthropic")).toBe(false);
-    expect(isEnvProviderName("")).toBe(false);
-    expect(isEnvProviderName(undefined)).toBe(false);
-  });
-
-  test("GINI_PROVIDER=echo lands on echo/gini-echo-v0 (smoke contract)", () => {
-    // Without this, ephemeral smoke (src/cli/args.ts pins GINI_PROVIDER=echo)
-    // would fall through to the codex default and call the real backend.
+  test("defaultConfig honors GINI_PROVIDER=echo for the smoke ephemeral path", () => {
+    // Echo is a test-only provider. The user-facing `gini install`
+    // validator rejects it (see admin.ts); the only legitimate way to
+    // land on echo through defaultConfig() is the ephemeral smoke
+    // runner in src/cli/args.ts, which pins GINI_PROVIDER=echo and
+    // bypasses install_. Without this branch, smoke would fall through
+    // to the codex default and call the real backend with a nonsense
+    // model.
     withProviderEnv({ provider: "echo" }, () => {
       const config = loadConfig("smoke-echo-default");
       expect(config.provider.name).toBe("echo");

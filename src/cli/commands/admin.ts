@@ -9,7 +9,7 @@ import type { RuntimeConfig } from "../../types";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
-import { configPath, isEnvProviderName, loadConfig, parseInstance } from "../../paths";
+import { configPath, loadConfig, parseInstance } from "../../paths";
 import {
   awaitForegroundLogFlush,
   doctor,
@@ -34,7 +34,7 @@ export async function install_(ctx: CliContext): Promise<void> {
   // takes over for a brand-new instance; `gini setup --yes` and the
   // browser /setup page can still rewrite that later.
   //
-  // GINI_PROVIDER=openai|codex|echo (optionally with GINI_MODEL) always
+  // GINI_PROVIDER=openai|codex (optionally with GINI_MODEL) always
   // wins when set, whether or not a config already exists on disk. This
   // is load-bearing for the conductor `setup` script: if a worktree's
   // instance dir was materialized earlier (e.g. by a tmux `gini run`
@@ -51,18 +51,24 @@ export async function install_(ctx: CliContext): Promise<void> {
   // wins — defaultConfig() honors GINI_MODEL on a fresh install, so the
   // existing-config path must match that contract or users get an
   // asymmetric "model env ignored after first install" surprise.
+  //
+  // The validator and override branch deliberately reject `echo`. Echo
+  // is a test-only provider: it's reachable through the ephemeral smoke
+  // path (src/cli/args.ts pins GINI_PROVIDER=echo and smoke bypasses
+  // install_), but not as a user-facing install option. The allow-list
+  // in defaultConfig() is wider than this one for that reason.
   const instance = parseInstance(ctx.rawArgs);
   const envProvider = process.env.GINI_PROVIDER;
-  if (envProvider && !isEnvProviderName(envProvider)) {
+  if (envProvider !== undefined && envProvider !== "openai" && envProvider !== "codex") {
     throw new Error(
       `GINI_PROVIDER='${envProvider}' is not a recognized provider. ` +
-      `Use 'openai', 'codex', or 'echo', leave it unset to accept the platform default, ` +
+      `Use 'openai' or 'codex', leave it unset to accept the platform default, ` +
       `or run \`gini provider set <name> [model]\` after install.`
     );
   }
   const { config } = ctx;
   const envModel = process.env.GINI_MODEL;
-  if (envProvider === "openai" || envProvider === "codex" || envProvider === "echo") {
+  if (envProvider === "openai" || envProvider === "codex") {
     // Mirror defaultConfig()'s provider field shape so the on-disk form
     // is identical whether the env vars hit the fresh-config branch in
     // defaultConfig() or this rewrite path on a pre-existing/migrated
@@ -75,11 +81,7 @@ export async function install_(ctx: CliContext): Promise<void> {
     //     clobbered to gpt-5.5 by a re-run of `gini install` with the
     //     same GINI_PROVIDER.
     const providerChanged = config.provider?.name !== envProvider;
-    const providerDefaultModel = envProvider === "codex"
-      ? "gpt-5.5"
-      : envProvider === "openai"
-        ? "gpt-5.4-mini"
-        : "gini-echo-v0";
+    const providerDefaultModel = envProvider === "codex" ? "gpt-5.5" : "gpt-5.4-mini";
     const model = envModel
       ?? (providerChanged ? providerDefaultModel : (config.provider?.model ?? providerDefaultModel));
     config.provider = {

@@ -221,29 +221,24 @@ export function workspaceDir(instance: Instance): string {
     : join(instanceRoot(instance), "workspace");
 }
 
-// Allow-list of provider names that GINI_PROVIDER may set. Shared between
-// defaultConfig() and the `gini install` validator so the two sites can't
-// drift. `echo` is here because the ephemeral smoke path pins it to keep
-// CI offline (src/cli/args.ts); without it, smoke would fall through to
-// the codex default and hit the real codex backend with a nonsense model.
-export const ENV_PROVIDER_ALLOWED = ["openai", "codex", "echo"] as const;
-export type EnvProviderName = (typeof ENV_PROVIDER_ALLOWED)[number];
-
-export function isEnvProviderName(value: unknown): value is EnvProviderName {
-  return typeof value === "string"
-    && (ENV_PROVIDER_ALLOWED as readonly string[]).includes(value);
-}
-
 export function defaultConfig(instance: Instance): RuntimeConfig {
   // Platform default fallback is codex/gpt-5.5. Users without `codex` CLI
   // auth will hit a runtime error on first prompt — that's the accepted
-  // tradeoff for not landing on the placeholder `echo` provider. The
-  // `echo` provider is still a valid explicit choice (tests, the
-  // `gini provider set echo` path, and the ephemeral smoke runner),
-  // it just isn't the default.
+  // tradeoff for not landing on the placeholder `echo` provider.
+  //
+  // The allow-list here is intentionally wider than the `gini install`
+  // validator: `echo` is recognized here ONLY because the ephemeral smoke
+  // path pins GINI_PROVIDER=echo (src/cli/args.ts) and smoke materializes
+  // its config directly through defaultConfig() — it does NOT flow through
+  // install_(). Without this branch, smoke would fall through to the
+  // codex default and call the real codex backend with a nonsense model.
+  // The user-facing `gini install` path forbids echo; see admin.ts.
   const envProvider = process.env.GINI_PROVIDER;
-  const providerName: EnvProviderName = isEnvProviderName(envProvider) ? envProvider : "codex";
-  const defaultModelFor: Record<EnvProviderName, string> = {
+  const providerName: "openai" | "codex" | "echo" =
+    envProvider === "openai" || envProvider === "codex" || envProvider === "echo"
+      ? envProvider
+      : "codex";
+  const defaultModelFor: Record<"openai" | "codex" | "echo", string> = {
     codex: "gpt-5.5",
     openai: "gpt-5.4-mini",
     echo: "gini-echo-v0"
