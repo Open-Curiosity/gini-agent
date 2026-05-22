@@ -304,7 +304,14 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // is hostile to fresh-clone "gini start" workflows: a stale .next/ from a
   // previous checkout will silently serve outdated code. Dev mode compiles
   // on demand and always reflects the current source.
-  const command = ["run", "dev", "--", "-p", String(port)];
+  // GINI_WEB_MODE=production swaps the dev server for the prebuilt
+  // production bundle. Dev mode's HMR WebSocket can't traverse a
+  // cloudflared tunnel reliably (the upgrade gets dropped), which leaves
+  // React Query and server components in a half-hydrated state for
+  // anyone hitting the gateway through the tunnel. Running `next start`
+  // against the prebuilt output avoids HMR entirely.
+  const webMode = process.env.GINI_WEB_MODE === "production" ? "start" : "dev";
+  const command = ["run", webMode, "--", "-p", String(port)];
   // detached: true puts the child in its own process group so we can SIGTERM
   // the entire group on stop (`bun run dev` re-execs into Next.js, leaving an
   // orphaned grandchild if we only kill the recorded pid).

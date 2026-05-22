@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -13,7 +13,6 @@ import {
   DialogTitle
 } from "@/components/ui/dialog";
 import { api } from "@/lib/api";
-import { useInvalidate } from "@/lib/queries";
 
 interface AppleNotesStatus {
   enabled: boolean | null;
@@ -38,7 +37,7 @@ interface TunnelSnapshot {
 // by the BFF redactor. `cloudflareUrl` (the bare host) is enough to show
 // the operator that the tunnel is live; full URLs stay on the host.
 export function TunnelSettingsCard() {
-  const invalidate = useInvalidate();
+  const queryClient = useQueryClient();
   const snapshot = useQuery({
     queryKey: ["tunnel"],
     queryFn: () => api<TunnelSnapshot>("/tunnel"),
@@ -53,27 +52,90 @@ export function TunnelSettingsCard() {
     ? snapshot.data?.appleNotes?.lastError ?? "iCloud account not found in Notes.app on this host."
     : null;
 
+  // Toggling the tunnel off while the operator is currently accessing the
+  // gateway through that same tunnel is inherently self-defeating: the
+  // runtime tears cloudflared down before our PATCH gets a response, so
+  // the fetch hangs and the toggle button looks frozen. Optimistic
+  // updates flip the visible state the instant the user clicks, the
+  // request fires fire-and-forget, and refetches that come back as
+  // errors (because the tunnel is gone) leave the optimistic state in
+  // place instead of reverting.
   const toggleTunnel = useMutation({
-    mutationFn: (enabled: boolean) =>
-      api<TunnelSnapshot>("/tunnel", { method: "PATCH", body: JSON.stringify({ enabled }) }),
-    onSuccess: (_, enabled) => {
-      toast.success(enabled ? "Tunnel enabled" : "Tunnel disabled");
-      invalidate(["tunnel"]);
+    mutationFn: async (enabled: boolean) => {
+      // Race the actual PATCH against a short ceiling — the runtime
+      // applies the change as soon as it parses the body, so we don't
+      // need to wait for the response. If the response never comes
+      // (tunnel torn down before the reply was written), we resolve
+      // anyway and let the optimistic state stand.
+      const fetchPromise = api<TunnelSnapshot>("/tunnel", {
+        method: "PATCH",
+        body: JSON.stringify({ enabled })
+      }).catch(() => null);
+      const ceiling = new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500));
+      return Promise.race([fetchPromise, ceiling]);
     },
-    onError: (error: Error) => toast.error(error.message)
+    onMutate: async (enabled: boolean) => {
+      await queryClient.cancelQueries({ queryKey: ["tunnel"] });
+      const previous = queryClient.getQueryData<TunnelSnapshot>(["tunnel"]);
+      // Project the snapshot onto a "what the user expects to see" view:
+      // disabling clears the live URL fields, enabling leaves a stub
+      // observedAt so the description switches to "Connecting…" instead
+      // of "Off" until the next refetch.
+      queryClient.setQueryData<TunnelSnapshot | undefined>(["tunnel"], (old) =>
+        old
+          ? {
+              ...old,
+              cloudflareUrl: enabled ? old.cloudflareUrl : null,
+              publicUrl: null,
+              observedAt: enabled ? old.observedAt ?? new Date().toISOString() : null,
+              appleNotes: enabled
+                ? old.appleNotes
+                : old.appleNotes
+                  ? { ...old.appleNotes, lastSyncedAt: null }
+                  : null
+            }
+          : old
+      );
+      return { previous };
+    },
+    onSuccess: (_data, enabled) => {
+      toast.success(enabled ? "Tunnel enabled" : "Tunnel disabled");
+    },
+    onError: (error: Error, _enabled, context) => {
+      // Hard fetch error (DNS, refused) — keep the optimistic state so
+      // the user isn't bounced back to a value that no longer matches
+      // reality. Surface the error in a toast for visibility.
+      toast.error(error.message);
+      if (context?.previous) queryClient.setQueryData(["tunnel"], context.previous);
+    }
   });
 
   const toggleNotes = useMutation({
-    mutationFn: (enabled: boolean) =>
-      api<TunnelSnapshot>("/tunnel", {
+    mutationFn: async (enabled: boolean) => {
+      const fetchPromise = api<TunnelSnapshot>("/tunnel", {
         method: "PATCH",
         body: JSON.stringify({ appleNotes: { enabled } })
-      }),
-    onSuccess: (_, enabled) => {
-      toast.success(enabled ? "Apple Notes mirror enabled" : "Apple Notes mirror disabled");
-      invalidate(["tunnel"]);
+      }).catch(() => null);
+      const ceiling = new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500));
+      return Promise.race([fetchPromise, ceiling]);
     },
-    onError: (error: Error) => toast.error(error.message)
+    onMutate: async (enabled: boolean) => {
+      await queryClient.cancelQueries({ queryKey: ["tunnel"] });
+      const previous = queryClient.getQueryData<TunnelSnapshot>(["tunnel"]);
+      queryClient.setQueryData<TunnelSnapshot | undefined>(["tunnel"], (old) =>
+        old && old.appleNotes
+          ? { ...old, appleNotes: { ...old.appleNotes, enabled } }
+          : old
+      );
+      return { previous };
+    },
+    onSuccess: (_data, enabled) => {
+      toast.success(enabled ? "Apple Notes mirror enabled" : "Apple Notes mirror disabled");
+    },
+    onError: (error: Error, _enabled, context) => {
+      toast.error(error.message);
+      if (context?.previous) queryClient.setQueryData(["tunnel"], context.previous);
+    }
   });
 
   const liveUrl = snapshot.data?.cloudflareUrl ?? null;
