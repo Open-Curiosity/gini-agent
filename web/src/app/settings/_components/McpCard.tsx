@@ -194,6 +194,20 @@ function TelegramPendingRequests({ bridgeId }: { bridgeId: string }) {
             <p className="font-mono text-[10px] text-muted-foreground">
               {entry.chatType} · chat {entry.chatId}
             </p>
+            {entry.verificationCode ? (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Code:{" "}
+                <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-foreground">
+                  {entry.verificationCode}
+                </code>
+                {entry.verificationCodeExpiresAt ? (
+                  <span className="ml-2">
+                    expires {new Date(entry.verificationCodeExpiresAt).toLocaleTimeString()}
+                  </span>
+                ) : null}
+                <span className="ml-2">— confirm with the user before approving.</span>
+              </p>
+            ) : null}
           </div>
           <div className="flex items-center gap-2">
             <Button
@@ -477,13 +491,12 @@ function AddMessagingBridgeButtons() {
   );
 }
 
-// Post-create summary view. For Telegram, surfaces the auto-minted
-// pairing code with a copy button so the user can DM the bot and
-// enroll their chat without needing to look up their own chat_id.
-// The TTL surfaced here matches PAIRING_CODE_TTL_MS in
-// src/integrations/messaging.ts (15 * 60 * 1000 ms). For Discord,
-// points the user at the invite-and-add-to-channel flow since there's
-// no pairing token to display.
+// Post-create summary view. For Telegram, points the operator at the
+// per-chat enrollment flow: anyone DMs the bot, the bot replies with
+// a short verification code, the same code surfaces under this bridge
+// in the pending-request list with Approve / Reject buttons. For
+// Discord, points the operator at the invite-and-add-to-channel
+// flow since there's no per-user enrollment surface.
 function BridgeAddedSummary({
   record,
   onClose
@@ -491,24 +504,8 @@ function BridgeAddedSummary({
   record: MessagingBridgeRecord;
   onClose: () => void;
 }) {
-  const metadata = (record.metadata ?? {}) as {
-    pairingCode?: string;
-    pairingCodeExpiresAt?: string;
-    botUsername?: string;
-  };
-  const code = metadata.pairingCode;
-  const expires = metadata.pairingCodeExpiresAt;
+  const metadata = (record.metadata ?? {}) as { botUsername?: string };
   const botUsername = metadata.botUsername;
-
-  const copyCode = async () => {
-    if (!code) return;
-    try {
-      await navigator.clipboard.writeText(code);
-      toast.success("Pairing code copied.");
-    } catch {
-      toast.error("Couldn't access the clipboard — copy the code manually.");
-    }
-  };
 
   return (
     <>
@@ -518,26 +515,18 @@ function BridgeAddedSummary({
         </p>
         {record.kind === "telegram" ? (
           <div className="space-y-2 rounded-md border border-sky-500/30 bg-sky-500/5 p-3">
-            <p className="text-sm font-medium">Next: pair your chat</p>
-            {code ? (
-              <>
-                <p>
-                  DM {botUsername ? `@${botUsername}` : "your bot"} on Telegram with the code below
-                  to enroll your chat. The code expires
-                  {expires ? ` at ${new Date(expires).toLocaleString()}` : " in 15 minutes"}.
-                </p>
-                <div className="flex flex-wrap items-center gap-2">
-                  <code className="rounded bg-muted px-2 py-1 font-mono text-sm">{code}</code>
-                  <Button size="sm" variant="outline" onClick={copyCode}>Copy</Button>
-                </div>
-                <p className="text-[11px] text-muted-foreground">
-                  Your chat is enrolled automatically once the code matches — the bot replies
-                  &quot;Paired&quot; and you can start messaging. No approval step required.
-                </p>
-              </>
-            ) : (
-              <p>Bridge created. Use the bridge&apos;s Health button to confirm the token is valid.</p>
-            )}
+            <p className="text-sm font-medium">Next: enroll a chat</p>
+            <p>
+              Have anyone (yourself included) DM {botUsername ? `@${botUsername}` : "your bot"} on
+              Telegram. The bot replies with a short verification code (e.g.{" "}
+              <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">AB-1A-22</code>
+              ); the same code appears as a pending request under this bridge.
+            </p>
+            <p className="text-[11px] text-muted-foreground">
+              Confirm the code matches what the user reports, then click Approve. The bot greets
+              the chat afterward so the user knows they&apos;re paired. Codes expire after 10 minutes —
+              a fresh DM mints a new one.
+            </p>
           </div>
         ) : null}
         {record.kind === "discord" ? (
