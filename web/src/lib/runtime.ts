@@ -15,11 +15,17 @@ const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control", "las
 // though it doesn't lose data — `allBanks: true` runs an expensive
 // embedding pass against every bank in the instance, a DoS vector
 // for any operator who's paying per-token for embeddings.
-const PRIVILEGED_POST_ROUTES = new Set([
-  "update",
-  "update/check",
-  "embedding/reembed"
-]);
+// `messaging/<bridge>/<verb>` covers the operator-only bot allowlist
+// surface (allow / deny / pair / reject-pending / disable / health
+// /send/receive) — any of those forwarded cross-origin would let an
+// attacker page mutate the bot's allowlist or fire outbound messages
+// as the operator.
+const PRIVILEGED_POST_ROUTES: ReadonlyArray<RegExp> = [
+  /^update$/,
+  /^update\/check$/,
+  /^embedding\/reembed$/,
+  /^messaging\/[^/]+\/(allow|deny|pair|reject-pending|disable|health|send|receive)$/
+];
 
 // Cache the file-read values across requests but invalidate on mtime change,
 // so a gateway respawn that picks a different port doesn't strand the BFF
@@ -154,8 +160,9 @@ export async function proxyRequest(
 }
 
 function guardPrivilegedRequest(request: Request, pathSegments: string[]): Response | null {
+  if (request.method !== "POST") return null;
   const route = pathSegments.join("/");
-  if (request.method !== "POST" || !PRIVILEGED_POST_ROUTES.has(route)) return null;
+  if (!PRIVILEGED_POST_ROUTES.some((pattern) => pattern.test(route))) return null;
 
   const requestOrigin = new URL(request.url).origin;
   const origin = request.headers.get("origin");
