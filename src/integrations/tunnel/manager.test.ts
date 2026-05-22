@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -9,6 +9,26 @@ import {
   type TunnelManagerOptions
 } from "./manager";
 import type { RuntimeConfig } from "../../types";
+
+// Snapshot the env keys this suite mutates so we can restore them in
+// afterAll. Without this, a sibling suite that depends on the original
+// process-wide GINI_STATE_ROOT / GINI_LOG_ROOT (or the absence thereof)
+// would inherit our /tmp/gini-tunnel-tests overrides when run in the
+// same Bun process.
+const envSnapshot: { stateRoot: string | undefined; logRoot: string | undefined } = {
+  stateRoot: process.env.GINI_STATE_ROOT,
+  logRoot: process.env.GINI_LOG_ROOT
+};
+beforeAll(() => {
+  envSnapshot.stateRoot = process.env.GINI_STATE_ROOT;
+  envSnapshot.logRoot = process.env.GINI_LOG_ROOT;
+});
+afterAll(() => {
+  if (envSnapshot.stateRoot === undefined) delete process.env.GINI_STATE_ROOT;
+  else process.env.GINI_STATE_ROOT = envSnapshot.stateRoot;
+  if (envSnapshot.logRoot === undefined) delete process.env.GINI_LOG_ROOT;
+  else process.env.GINI_LOG_ROOT = envSnapshot.logRoot;
+});
 
 describe("resolveTunnelConfig", () => {
   test("generates a fresh secret when the on-disk value is missing", () => {

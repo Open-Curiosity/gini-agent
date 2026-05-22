@@ -1,8 +1,28 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { createHandler } from "../../http";
 import type { RuntimeConfig } from "../../types";
 import type { TunnelSnapshot } from "./manager";
+
+// Snapshot the env keys this suite mutates so we can restore them in
+// afterAll. testConfig() reassigns GINI_STATE_ROOT / GINI_LOG_ROOT for
+// every test — without restoration, a sibling suite that relies on the
+// original values (or their absence) would inherit our scratch paths
+// when both suites run in the same Bun process.
+const envSnapshot: { stateRoot: string | undefined; logRoot: string | undefined } = {
+  stateRoot: process.env.GINI_STATE_ROOT,
+  logRoot: process.env.GINI_LOG_ROOT
+};
+beforeAll(() => {
+  envSnapshot.stateRoot = process.env.GINI_STATE_ROOT;
+  envSnapshot.logRoot = process.env.GINI_LOG_ROOT;
+});
+afterAll(() => {
+  if (envSnapshot.stateRoot === undefined) delete process.env.GINI_STATE_ROOT;
+  else process.env.GINI_STATE_ROOT = envSnapshot.stateRoot;
+  if (envSnapshot.logRoot === undefined) delete process.env.GINI_LOG_ROOT;
+  else process.env.GINI_LOG_ROOT = envSnapshot.logRoot;
+});
 
 describe("tunnel HTTP integration", () => {
   test("tunneled requests bypass bearer-token auth", async () => {
