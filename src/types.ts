@@ -19,7 +19,7 @@ export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local";
 
 export type ImprovementStatus = "proposed" | "approved" | "rejected" | "applied";
 
-export type ImprovementKind = "memory" | "skill" | "job";
+export type ImprovementKind = "skill" | "job";
 
 export type PairingStatus = "pending" | "claimed" | "expired" | "revoked";
 

@@ -8,7 +8,7 @@ import { checkConnector, createConnector, deleteConnector, updateConnector } fro
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
-import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./memory";
+import { migrateLegacyMemories, recall, reflect, retain } from "./memory";
 import { embeddingStatus, reembedBank } from "./memory/embedding";
 import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
@@ -24,7 +24,7 @@ import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableM
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
-import { approveSoul, approveUserProfile, soulPath, userProfilePath } from "./runtime/identity-files";
+import { approveSoul, soulPath } from "./runtime/identity-files";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
@@ -208,19 +208,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(agentId ? events.filter((event) => event.agentId === agentId) : events);
     }],
     ["GET", /^\/api\/events\/stream$/, (request) => eventStream(config, request)],
-    ["GET", /^\/api\/memory$/, () => {
-      // Phase C — MemoryRecord listings are scoped to the active agent so
-      // the web UI's "Memory" page only shows the active agent's pool.
-      const state = readState(config.instance);
-      const effective = resolveEffectiveContext(state, config);
-      const memories = effective.agentId
-        ? state.memories.filter((memory) => memory.agentId === effective.agentId)
-        : state.memories;
-      return json(memories);
-    }],
-    ["POST", /^\/api\/memory$/, async (request) => {
-      return json(await createMemoryFromInput(config, await body(request)), 201);
-    }],
     // Hindsight phase 6: one-time migration trigger.
     ["POST", /^\/api\/memory\/migrate$/, async () => {
       const report = await migrateLegacyMemories(config);
@@ -353,17 +340,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!updated) return json({ error: "bank not found" }, 404);
       return json(updated);
     }],
-    ["PATCH", /^\/api\/memory\/([^/]+)$/, async (request, params) => json(await editMemory(config, params[0], await body(request)))],
-    ["DELETE", /^\/api\/memory\/([^/]+)$/, async (_request, params) => json(await archiveMemory(config, params[0]))],
-    ["POST", /^\/api\/memory\/([^/]+)\/approve$/, async (_request, params) => json(await updateMemory(config, params[0], "active"))],
-    ["POST", /^\/api\/memory\/([^/]+)\/reject$/, async (_request, params) => json(await updateMemory(config, params[0], "rejected"))],
-    // Identity-file approval surface. The chat-task `edit_soul` /
-    // `edit_user_profile` tools land their proposals on
-    // <file>.proposed and the runtime continues to read the approved
-    // <file> until one of these endpoints renames the proposal over
-    // the approved target. See ADR runtime-identity-files.md.
+    // Identity-file approval surface. The chat-task `edit_soul` tool
+    // lands its proposal on SOUL.md.proposed and the runtime continues
+    // to read the approved SOUL.md until this endpoint renames the
+    // proposal over the approved target. `edit_user_profile` is
+    // auto-approved post-consolidation — see ADR
+    // memory-surface-consolidation.md. See also ADR
+    // runtime-identity-files.md for the original propose/approve design.
     ["POST", /^\/api\/identity-files\/soul\/approve$/, async () => json(await approveSoulProposal(config))],
-    ["POST", /^\/api\/identity-files\/user\/approve$/, async () => json(await approveUserProfileProposal(config))],
     ["GET", /^\/api\/skills$/, (request) => {
       const query = new URL(request.url).searchParams.get("q");
       return json(query ? searchSkills(config, query) : listSkills(config));
@@ -655,26 +639,6 @@ async function approveSoulProposal(config: RuntimeConfig): Promise<{ ok: boolean
   return { ok: true, path };
 }
 
-async function approveUserProfileProposal(config: RuntimeConfig): Promise<{ ok: boolean; reason?: string; path?: string }> {
-  const promoted = approveUserProfile(config.instance);
-  if (!promoted) return { ok: false, reason: "no proposal to approve" };
-  const path = userProfilePath(config.instance);
-  await mutateState(config.instance, (s) => {
-    addAudit(
-      s,
-      {
-        actor: "user",
-        action: "identity.user_profile.approved",
-        target: path,
-        risk: "low",
-        evidence: { path }
-      },
-      { system: true }
-    );
-  });
-  return { ok: true, path };
-}
-
 async function authorized(request: Request, config: RuntimeConfig): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
   const queryToken = new URL(request.url).searchParams.get("token");
@@ -707,11 +671,10 @@ function statusFromErrorMessage(message: string): number {
   // Agent delete guards (default agent, active agent) throw user-input
   // errors that should surface as 400.
   if (message.startsWith("Cannot delete")) return 400;
-  // Memory write paths (createMemoryFromInput, the "remember "-prefix
-  // path in agent.ts) throw this when no agent is active. Sibling routes
-  // (/memory/retain, /memory/recall, /memory/reflect) already return 400
-  // for the same condition — map this here so legacy POST /api/memory
-  // matches.
+  // Hindsight memory routes (/memory/retain, /memory/recall,
+  // /memory/reflect) and identity-file edit tools throw this when no
+  // agent is active. Map to 400 so callers see a clean user-input error
+  // rather than a 500.
   if (message.includes("no active agent")) return 400;
   // Browser-connect surfaces user-input failures with these prefixes;
   // forward them to 400 so the webapp can surface the original error text

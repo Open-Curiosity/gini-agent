@@ -35,9 +35,9 @@ describe("runtime api", () => {
     const proposal = await call(handler, config, "/api/improvements", {
       method: "POST",
       body: JSON.stringify({
-        kind: "memory",
+        kind: "skill",
         title: "Remember review preference",
-        payload: { content: "Prefer evidence-backed reviews." }
+        payload: { name: "review-pref", description: "Prefer evidence-backed reviews.", trigger: "review", steps: ["Cite evidence"] }
       })
     });
 
@@ -45,7 +45,7 @@ describe("runtime api", () => {
     const state = readState(config.instance);
 
     expect(rejected.status).toBe("rejected");
-    expect(state.memories).toHaveLength(0);
+    expect(state.skills.some((skill) => skill.name === "review-pref")).toBe(false);
     expect(state.audit.some((event) => event.action === "improvement.rejected")).toBe(true);
   });
 
@@ -476,20 +476,13 @@ describe("runtime api", () => {
     expect(detail.taskIds).toContain(submitted.taskId);
   });
 
-  test("supports memory edit/archive and approval-gated file patch diffs", async () => {
+  test("approval-gated file patch produces a diff approval", async () => {
+    // Memory CRUD via `/api/memory` was removed alongside the
+    // state.memories consolidation. See ADR
+    // memory-surface-consolidation.md.
     const config = testConfig("memory-patch");
     config.workspaceRoot = process.cwd();
     const handler = createHandler(config);
-
-    const memory = await call(handler, config, "/api/memory", {
-      method: "POST",
-      body: JSON.stringify({ content: "original memory", status: "active" })
-    });
-    const edited = await call(handler, config, `/api/memory/${memory.id}`, {
-      method: "PATCH",
-      body: JSON.stringify({ content: "edited memory" })
-    });
-    const archived = await call(handler, config, `/api/memory/${memory.id}`, { method: "DELETE" });
 
     const task = await call(handler, config, "/api/tasks", {
       method: "POST",
@@ -498,8 +491,6 @@ describe("runtime api", () => {
     const detail = await waitForTask(handler, config, task.id);
     const approval = readState(config.instance).approvals.find((item) => item.taskId === task.id);
 
-    expect(edited.content).toBe("edited memory");
-    expect(archived.status).toBe("archived");
     expect(detail.task.status).toBe("waiting_approval");
     expect(approval?.action).toBe("file.patch");
     expect(String(approval?.payload.diff)).toContain("--- before");
@@ -1501,26 +1492,12 @@ describe("runtime api", () => {
         memoryIds: [],
         skillIds: []
       });
-      state.memories.unshift({
-        id: "mem_ghost",
-        instance: state.instance,
-        agentId: "agent_ghost",
-        content: "ghost",
-        status: "active",
-        confidence: 1,
-        sensitivity: "normal",
-        provenance: "test",
-        createdAt: at,
-        updatedAt: at
-      });
     });
     // Trigger the migration via a fresh read.
     await call(handler, config, "/api/tasks");
     const stamped = readState(config.instance);
     const ghostTask = stamped.tasks.find((t) => t.id === "task_ghost");
-    const ghostMemory = stamped.memories.find((m) => m.id === "mem_ghost");
     expect(ghostTask?.agentId).toBe(defaultAgentId);
-    expect(ghostMemory?.agentId).toBe(defaultAgentId);
     // Re-reading should be idempotent — no further backfill row beyond
     // what the first migration produced.
     await call(handler, config, "/api/tasks");
@@ -1551,10 +1528,6 @@ describe("runtime api", () => {
     const job = await call(handler, config, "/api/jobs", {
       method: "POST",
       body: JSON.stringify({ name: "branch-job", prompt: "hi", intervalSeconds: 3600 })
-    });
-    const memory = await call(handler, config, "/api/memory", {
-      method: "POST",
-      body: JSON.stringify({ content: "branch-mem", status: "active" })
     });
     await mutateState(config.instance, (state) => {
       state.tasks.unshift({
@@ -1601,12 +1574,6 @@ describe("runtime api", () => {
         { actor: "runtime", action: "test.branch.sessionId", target: "from-session", risk: "low" },
         { sessionId: session.id }
       );
-      // memoryId branch
-      addAudit(
-        state,
-        { actor: "runtime", action: "test.branch.memoryId", target: "from-memory", risk: "low" },
-        { memoryId: memory.id }
-      );
       // system: true branch
       addAudit(
         state,
@@ -1619,7 +1586,6 @@ describe("runtime api", () => {
     expect(audit.find((a) => a.action === "test.branch.taskId")?.agentId).toBe(defaultAgentId);
     expect(audit.find((a) => a.action === "test.branch.jobId")?.agentId).toBe(defaultAgentId);
     expect(audit.find((a) => a.action === "test.branch.sessionId")?.agentId).toBe(defaultAgentId);
-    expect(audit.find((a) => a.action === "test.branch.memoryId")?.agentId).toBe(defaultAgentId);
     expect(audit.find((a) => a.action === "test.branch.system")?.agentId).toBeUndefined();
   });
 
@@ -1667,17 +1633,11 @@ describe("runtime api", () => {
         { actor: "runtime", action: "test.missing.session", target: "x", risk: "low" },
         { sessionId: "chat_does_not_exist" }
       );
-      addAudit(
-        state,
-        { actor: "runtime", action: "test.missing.memory", target: "x", risk: "low" },
-        { memoryId: "mem_does_not_exist" }
-      );
     });
     const audit = readState(config.instance).audit;
     expect(audit.find((a) => a.action === "test.missing.task")?.agentId).toBeUndefined();
     expect(audit.find((a) => a.action === "test.missing.job")?.agentId).toBeUndefined();
     expect(audit.find((a) => a.action === "test.missing.session")?.agentId).toBeUndefined();
-    expect(audit.find((a) => a.action === "test.missing.memory")?.agentId).toBeUndefined();
   });
 
   test("POST /api/messaging/:id/allow with a malformed chatId returns 400 (not 500)", async () => {

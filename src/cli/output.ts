@@ -63,7 +63,10 @@ export function improvementPayload(kind: string, title: string, content: string)
   if (kind === "job") {
     return { name: title, prompt: content, intervalSeconds: 3600 };
   }
-  return { content, confidence: 0.75 };
+  // Legacy "memory" payload was removed alongside the state.memories
+  // consolidation. Fall through to a skill-shaped payload so a legacy
+  // caller gets a sane proposal instead of crashing.
+  return { name: title, description: content, trigger: title, steps: [content], status: "enabled" };
 }
 
 export function help(): void {
