@@ -249,6 +249,12 @@ function AddMessagingBridgeButtons() {
   // after the user closes or reopens the dialog can't pollute a
   // fresh session with a stale success view.
   const sessionRef = useRef(0);
+  // Synchronous single-flight guard. The submit button's
+  // disabled={add.isPending} relies on a state propagation that only
+  // commits on the next React render. A same-frame double-click can
+  // fire submit() twice before that render lands, so we need a ref
+  // that flips synchronously to gate the second call.
+  const submittingRef = useRef(false);
 
   const add = useMutation<MessagingBridgeRecord, Error, { name: string; kind: AddBridgeKind; botToken: string; deliveryTargets: string[] }>({
     mutationFn: (input) =>
@@ -303,6 +309,7 @@ function AddMessagingBridgeButtons() {
   };
 
   const submit = () => {
+    if (submittingRef.current) return;
     const trimmedName = name.trim();
     const trimmedToken = botToken.trim();
     const parsedTargets = parseDeliveryTargets(deliveryTargets);
@@ -318,6 +325,7 @@ function AddMessagingBridgeButtons() {
       toast.error("At least one Discord channel ID is required.");
       return;
     }
+    submittingRef.current = true;
     const submittingSession = sessionRef.current;
     add.mutate(
       { name: trimmedName, kind, botToken: trimmedToken, deliveryTargets: parsedTargets },
@@ -325,6 +333,9 @@ function AddMessagingBridgeButtons() {
         onSuccess: (record) => {
           if (sessionRef.current !== submittingSession) return;
           setResult(record);
+        },
+        onSettled: () => {
+          submittingRef.current = false;
         }
       }
     );
