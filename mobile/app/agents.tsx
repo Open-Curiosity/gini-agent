@@ -8,6 +8,7 @@ import {
   RefreshControl,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View
 } from "react-native";
@@ -17,6 +18,7 @@ import { relativeTime } from "@/src/format";
 import {
   useAgents,
   useChats,
+  useCreateAgent,
   useCreateChat,
   useUseAgent
 } from "@/src/queries";
@@ -30,6 +32,7 @@ import type { AgentRecord, ChatSession } from "@/src/types";
 export default function AgentsScreen() {
   const agents = useAgents();
   const useAgent = useUseAgent();
+  const createAgent = useCreateAgent();
 
   // Local selection so the chat list flips instantly on tap. Default is
   // seeded from the server's activeAgentId once agents resolve; after
@@ -37,6 +40,11 @@ export default function AgentsScreen() {
   // case another client switched the server-side active agent.
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // The picker either shows the agent list or, after the user taps "+
+  // New agent", an inline name-entry form. Resets to "list" on close.
+  const [pickerMode, setPickerMode] = useState<"list" | "create">("list");
+  const [newAgentName, setNewAgentName] = useState("");
+  const [newAgentError, setNewAgentError] = useState<string | null>(null);
 
   // 401 redirect via effect so all hooks below execute on the
   // unauthorized render (Rules of Hooks).
@@ -107,6 +115,46 @@ export default function AgentsScreen() {
     });
   }, [agentId, createChat]);
 
+  const closePicker = useCallback(() => {
+    setPickerOpen(false);
+    // Reset the inner form on close so re-opening lands back on the
+    // agent list instead of leaving the user mid-create.
+    setPickerMode("list");
+    setNewAgentName("");
+    setNewAgentError(null);
+  }, []);
+
+  const onStartNewAgent = useCallback(() => {
+    setNewAgentError(null);
+    setNewAgentName("");
+    setPickerMode("create");
+  }, []);
+
+  const onCancelNewAgent = useCallback(() => {
+    setPickerMode("list");
+    setNewAgentName("");
+    setNewAgentError(null);
+  }, []);
+
+  const onSubmitNewAgent = useCallback(() => {
+    const trimmed = newAgentName.trim();
+    if (!trimmed) return;
+    setNewAgentError(null);
+    createAgent.mutate(trimmed, {
+      onSuccess: (created) => {
+        // Pivot selection to the new agent so the chat list reloads
+        // against it, and keep the runtime's active-agent state in
+        // sync (matches what tapping an existing row does).
+        setSelectedAgentId(created.id);
+        useAgent.mutate(created.id);
+        closePicker();
+      },
+      onError: (err) => {
+        setNewAgentError(err.message || "Failed to create agent");
+      }
+    });
+  }, [closePicker, createAgent, newAgentName, useAgent]);
+
   if (unauthorized) return null;
 
   return (
@@ -153,13 +201,16 @@ export default function AgentsScreen() {
         visible={pickerOpen}
         agents={list}
         selectedAgentId={selectedAgentId}
+        mode={pickerMode}
+        newAgentName={newAgentName}
+        newAgentError={newAgentError}
+        creating={createAgent.isPending}
         onPick={onPickAgent}
-        onNewAgent={() => {
-          // Hook into the create-agent flow added in the next change.
-          // Kept as a stub for now so the new footer row has a press
-          // target wired without touching the parent in this commit.
-        }}
-        onClose={() => setPickerOpen(false)}
+        onStartNewAgent={onStartNewAgent}
+        onChangeNewAgentName={setNewAgentName}
+        onSubmitNewAgent={onSubmitNewAgent}
+        onCancelNewAgent={onCancelNewAgent}
+        onClose={closePicker}
       />
     </SafeAreaView>
   );
@@ -407,15 +458,29 @@ function AgentPickerModal({
   visible,
   agents,
   selectedAgentId,
+  mode,
+  newAgentName,
+  newAgentError,
+  creating,
   onPick,
-  onNewAgent,
+  onStartNewAgent,
+  onChangeNewAgentName,
+  onSubmitNewAgent,
+  onCancelNewAgent,
   onClose
 }: {
   visible: boolean;
   agents: AgentRecord[];
   selectedAgentId: string | null;
+  mode: "list" | "create";
+  newAgentName: string;
+  newAgentError: string | null;
+  creating: boolean;
   onPick: (agent: AgentRecord) => void;
-  onNewAgent: () => void;
+  onStartNewAgent: () => void;
+  onChangeNewAgentName: (value: string) => void;
+  onSubmitNewAgent: () => void;
+  onCancelNewAgent: () => void;
   onClose: () => void;
 }) {
   return (
@@ -438,7 +503,9 @@ function AgentPickerModal({
         <SafeAreaView edges={["bottom"]} style={styles.modalSheetInner}>
           <View style={styles.modalHandle} />
           <View style={styles.modalHeader}>
-            <Text style={styles.modalTitle}>Switch agent</Text>
+            <Text style={styles.modalTitle}>
+              {mode === "list" ? "Switch agent" : "New agent"}
+            </Text>
             <TouchableOpacity
               onPress={onClose}
               hitSlop={8}
@@ -449,23 +516,108 @@ function AgentPickerModal({
               <Text style={styles.modalCloseText}>Done</Text>
             </TouchableOpacity>
           </View>
-          <FlatList
-            data={agents}
-            keyExtractor={(a) => a.id}
-            renderItem={({ item }) => (
-              <AgentPickerRow
-                agent={item}
-                selected={item.id === selectedAgentId}
-                onPress={() => onPick(item)}
-              />
-            )}
-            ListFooterComponent={
-              <NewAgentFooterRow onPress={onNewAgent} />
-            }
-          />
+          {mode === "list" ? (
+            <FlatList
+              data={agents}
+              keyExtractor={(a) => a.id}
+              renderItem={({ item }) => (
+                <AgentPickerRow
+                  agent={item}
+                  selected={item.id === selectedAgentId}
+                  onPress={() => onPick(item)}
+                />
+              )}
+              ListFooterComponent={
+                <NewAgentFooterRow onPress={onStartNewAgent} />
+              }
+            />
+          ) : (
+            <NewAgentForm
+              name={newAgentName}
+              error={newAgentError}
+              creating={creating}
+              onChangeName={onChangeNewAgentName}
+              onSubmit={onSubmitNewAgent}
+              onCancel={onCancelNewAgent}
+            />
+          )}
         </SafeAreaView>
       </View>
     </Modal>
+  );
+}
+
+function NewAgentForm({
+  name,
+  error,
+  creating,
+  onChangeName,
+  onSubmit,
+  onCancel
+}: {
+  name: string;
+  error: string | null;
+  creating: boolean;
+  onChangeName: (value: string) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  const trimmed = name.trim();
+  const submitDisabled = creating || trimmed.length === 0;
+  return (
+    <View style={styles.newAgentForm}>
+      <TextInput
+        value={name}
+        onChangeText={onChangeName}
+        placeholder="Agent name"
+        placeholderTextColor={theme.subtle}
+        autoFocus
+        autoCapitalize="words"
+        autoCorrect={false}
+        returnKeyType="done"
+        onSubmitEditing={() => {
+          if (!submitDisabled) onSubmit();
+        }}
+        editable={!creating}
+        style={styles.newAgentInput}
+        accessibilityLabel="Agent name"
+      />
+      {error ? (
+        <Text style={styles.newAgentError}>{error}</Text>
+      ) : null}
+      <View style={styles.newAgentActions}>
+        <TouchableOpacity
+          onPress={onCancel}
+          disabled={creating}
+          style={[
+            styles.newAgentButton,
+            styles.newAgentCancel,
+            creating && styles.newAgentButtonDisabled
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel="Cancel"
+        >
+          <Text style={styles.newAgentCancelText}>Cancel</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={onSubmit}
+          disabled={submitDisabled}
+          style={[
+            styles.newAgentButton,
+            styles.newAgentSubmit,
+            submitDisabled && styles.newAgentButtonDisabled
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel="Create agent"
+        >
+          {creating ? (
+            <ActivityIndicator color={theme.buttonText} />
+          ) : (
+            <Text style={styles.newAgentSubmitText}>Create</Text>
+          )}
+        </TouchableOpacity>
+      </View>
+    </View>
   );
 }
 
@@ -642,5 +794,30 @@ const styles = StyleSheet.create({
     height: StyleSheet.hairlineWidth,
     backgroundColor: theme.border
   },
-  pickerNewAgentText: { color: theme.accent, fontSize: 16, fontWeight: "600" }
+  pickerNewAgentText: { color: theme.accent, fontSize: 16, fontWeight: "600" },
+
+  // New-agent inline form.
+  newAgentForm: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 16, gap: 12 },
+  newAgentInput: {
+    backgroundColor: theme.inputBg,
+    color: theme.text,
+    fontSize: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderRadius: 10
+  },
+  newAgentError: { color: theme.danger, fontSize: 13 },
+  newAgentActions: { flexDirection: "row", gap: 8 },
+  newAgentButton: {
+    flex: 1,
+    height: 44,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  newAgentCancel: { backgroundColor: theme.inputBg },
+  newAgentCancelText: { color: theme.text, fontSize: 15, fontWeight: "600" },
+  newAgentSubmit: { backgroundColor: theme.button },
+  newAgentSubmitText: { color: theme.buttonText, fontSize: 15, fontWeight: "600" },
+  newAgentButtonDisabled: { opacity: 0.5 }
 });

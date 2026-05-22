@@ -56,6 +56,24 @@ export function useUseAgent() {
   });
 }
 
+// POST /api/agents only requires `name`; the runtime copies provider /
+// toolsets / messaging targets from the default agent (see
+// src/capabilities/agents.ts). The created agent is returned so callers
+// can pivot the selection to it immediately.
+export function useCreateAgent() {
+  const qc = useQueryClient();
+  return useMutation<AgentRecord, Error, string>({
+    mutationFn: (name: string) =>
+      api<AgentRecord>("/agents", {
+        method: "POST",
+        body: JSON.stringify({ name })
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["agents"] });
+    }
+  });
+}
+
 // Per-agent chat list. The gateway filters server-side via ?agentId, so
 // the React Query key includes the agentId — switching agents triggers a
 // fresh fetch instead of briefly flashing the previous agent's chats.
