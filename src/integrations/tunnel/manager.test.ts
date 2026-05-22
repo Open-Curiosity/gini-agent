@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import {
   composeAppleNoteBody,
   renderSnapshotQr,
@@ -100,6 +101,14 @@ describe("TunnelManager", () => {
     expect(snapshot.appleNotes.available).toBe(true);
     expect(snapshot.appleNotes.lastSyncedAt).not.toBeNull();
     expect(calls.some((script) => script.includes("make new note"))).toBe(true);
+    // The runtime log must never contain the secret-bearing public URL.
+    // The credential bypasses bearer auth, so persisting it to disk
+    // would make stale logs equivalent to a leaked token.
+    const logPath = join("/tmp/gini-tunnel-tests-logs/tunnel-manager-notes/runtime.jsonl");
+    if (existsSync(logPath)) {
+      const contents = readFileSync(logPath, "utf8");
+      expect(contents).not.toContain(snapshot.secret);
+    }
     await manager.stop();
   });
 
@@ -252,6 +261,10 @@ function setupInstanceDir(instance: string): void {
   process.env.GINI_STATE_ROOT = root;
   process.env.GINI_LOG_ROOT = `${root}-logs`;
   rmSync(`${root}/instances/${instance}`, { recursive: true, force: true });
+  // Clean the log dir too. Historical runtime.jsonl entries from earlier
+  // runs would otherwise be visible to credential-leak regression
+  // assertions and confuse "is this a fresh write or stale residue?".
+  rmSync(`${root}-logs/${instance}`, { recursive: true, force: true });
 }
 
 interface ScriptedSpawnOptions {

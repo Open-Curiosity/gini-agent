@@ -342,10 +342,14 @@ export class TunnelManager {
           lastError: null
         }
       };
+      // Persist only the secret-less cloudflare hostname. The full
+      // publicUrl carries the secret path that bypasses bearer auth, so
+      // logging it to ~/.gini/instances/<inst>/logs/runtime.jsonl would
+      // make the credential survive in plain text on disk.
       appendLog(this.instance, "tunnel.notes.synced", {
         folder: target.folder,
         note: target.noteName,
-        publicUrl: this.snapshot.publicUrl
+        cloudflareUrl: this.snapshot.cloudflareUrl
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
