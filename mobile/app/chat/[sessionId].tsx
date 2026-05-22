@@ -13,127 +13,84 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApiError } from "@/src/api";
+import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import {
-  useChatSession,
-  useSendMessage,
-  useSyncChatTask
+  isTaskInFlight,
+  useChatBlocks,
+  useSendMessage
 } from "@/src/queries";
 import { theme } from "@/src/theme";
-import type { ChatMessage } from "@/src/types";
+import type { ChatBlock } from "@/src/types";
 
-// Web parity: a paired assistant ChatMessage is only persisted once the
-// task is terminal AND not waiting on approval. Until then, we render
-// an ephemeral "thinking" / "working" placeholder driven by currentStep.
-const TERMINAL_TASK_STATUSES = new Set<string>([
-  "completed",
-  "failed",
-  "cancelled"
-]);
-
+// Pure renderer of the runtime's typed ChatBlock stream. The previous
+// implementation derived a phase indicator from Task.currentStep,
+// synthesized an in-flight placeholder, and POSTed /sync after each
+// terminal task. All that derivation lives server-side now — this
+// screen polls /chat/:id/blocks, walks the list, and dispatches each
+// block through BlockRenderer.
 export default function ChatDetailScreen() {
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
-  const session = useChatSession(sessionId ?? null);
+  const blocks = useChatBlocks(sessionId ?? null);
   const send = useSendMessage(sessionId ?? null);
-  const sync = useSyncChatTask(sessionId ?? null);
 
   const [text, setText] = useState("");
   const scrollRef = useRef<ScrollView | null>(null);
-  // Tracks taskIds for which we've already issued a /sync POST so the
-  // polling effect doesn't re-fire it every tick once the task is
-  // terminal but the paired assistant message hasn't materialised yet.
-  const syncedTaskIdsRef = useRef<Set<string>>(new Set());
-
-  // Reset the "already synced" guard whenever the user navigates to a
-  // different chat. Without this, stale ids from a previous session
-  // would suppress legitimate sync calls.
-  useEffect(() => {
-    syncedTaskIdsRef.current = new Set();
-  }, [sessionId]);
 
   // 401 → setup. Effect-driven so all later hooks still run on the
   // unauthorized render (Rules of Hooks).
   const unauthorized =
-    session.error instanceof ApiError && session.error.status === 401;
+    blocks.error instanceof ApiError && blocks.error.status === 401;
   useEffect(() => {
     if (unauthorized) router.replace("/setup");
   }, [unauthorized]);
 
-  const messages = session.data?.messages;
-  const tasks = session.data?.tasks;
+  const list = useMemo<ChatBlock[]>(() => blocks.data ?? [], [blocks.data]);
 
-  const tasksById = useMemo(
-    () => new Map((tasks ?? []).map((t) => [t.id, t])),
-    [tasks]
-  );
-
-  // Mirrors web/src/app/chat/page.tsx: the in-flight task is the latest
-  // user message's task whose status is non-terminal. Stays set while
-  // the assistant is producing partial output so the busy state and
-  // phase indicator remain wired until the runtime declares it done.
-  const inflightTaskId = useMemo<string | null>(() => {
-    if (!messages) return null;
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      const m = messages[i]!;
-      if (m.role === "user" && m.taskId) {
-        const task = tasksById.get(m.taskId);
-        if (task && TERMINAL_TASK_STATUSES.has(task.status)) return null;
-        return m.taskId;
-      }
+  // Title derivation: first user_text block's excerpt, falling back to
+  // "Chat" while the list is empty. Avoids a second polling call to
+  // /chat/:id for the session record — the block stream carries enough
+  // for the detail header.
+  const headerTitle = useMemo(() => {
+    const firstUserText = list.find((b) => b.kind === "user_text");
+    if (firstUserText && firstUserText.kind === "user_text") {
+      const trimmed = firstUserText.text.trim();
+      if (trimmed) return trimmed.length > 40 ? `${trimmed.slice(0, 40)}…` : trimmed;
     }
-    return null;
-  }, [messages, tasksById]);
+    return "Chat";
+  }, [list]);
 
-  const pendingPhase = useMemo<string | null>(() => {
-    if (!inflightTaskId) return null;
-    const task = tasksById.get(inflightTaskId);
-    if (!task) return "Thinking";
-    if (task.currentStep === "Thinking") return "Thinking";
-    if (task.currentStep === "Working") return "Working";
-    if (task.currentStep === "Waiting for approval") return "Waiting for approval";
-    if (task.status === "queued") return "Thinking";
-    if (task.currentStep) return task.currentStep;
-    return "Working";
-  }, [inflightTaskId, tasksById]);
+  const inFlight = useMemo(() => isTaskInFlight(list), [list]);
 
-  // Auto-sync: once a user message's task is terminal but no paired
-  // assistant message exists, POST /sync to materialise the assistant
-  // record. The web client does the same.
+  // The most recent assistant_text block's updatedAt advances on every
+  // streaming delta. Including it in the scroll dep array means the
+  // ScrollView pins to the bottom as text accretes mid-stream, not just
+  // on block count change.
+  const lastAssistantUpdatedAt = useMemo(() => {
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const b = list[i]!;
+      if (b.kind === "assistant_text") return b.updatedAt;
+    }
+    return "";
+  }, [list]);
+
+  // Auto-scroll to bottom on new block arrival and on streaming text
+  // accretion. The 50ms defer lets layout settle so the new content is
+  // measured before the scroll request lands.
   useEffect(() => {
-    if (!messages || !tasks) return;
-    const assistantTaskIds = new Set(
-      messages
-        .filter((m) => m.role === "assistant" && m.taskId)
-        .map((m) => m.taskId as string)
+    const id = setTimeout(
+      () => scrollRef.current?.scrollToEnd({ animated: true }),
+      50
     );
-    for (const message of messages) {
-      if (message.role !== "user" || !message.taskId) continue;
-      if (assistantTaskIds.has(message.taskId)) continue;
-      if (syncedTaskIdsRef.current.has(message.taskId)) continue;
-      const task = tasks.find((t) => t.id === message.taskId);
-      if (!task || !TERMINAL_TASK_STATUSES.has(task.status)) continue;
-      syncedTaskIdsRef.current.add(message.taskId);
-      sync.mutate(message.taskId);
-    }
-  }, [messages, tasks, sync]);
-
-  // Scroll to bottom on new message arrival or on first render of a
-  // session. Behavior matches the web's `scrollIntoView` on
-  // messages.length and selected change.
-  useEffect(() => {
-    // setTimeout 0 defers to after layout so the new bubble is measured
-    // before we ask the ScrollView to scroll.
-    const id = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
     return () => clearTimeout(id);
-  }, [messages?.length, sessionId, pendingPhase]);
+  }, [list.length, sessionId, lastAssistantUpdatedAt]);
 
-  const showSendBusy = Boolean(inflightTaskId) || send.isPending;
-  const headerTitle = session.data?.title?.trim() || "New chat";
+  const showSendBusy = send.isPending || inFlight;
 
   const submit = () => {
     const trimmed = text.trim();
     // Hardware-keyboard onSubmitEditing can fire mid-task; `showSendBusy`
-    // also covers the in-flight assistant work, not just the mutation's
-    // own pending state.
+    // also covers in-flight assistant work, not just the mutation's own
+    // pending state.
     if (!trimmed || showSendBusy || !sessionId) return;
     send.mutate(trimmed, {
       onSuccess: () => setText("")
@@ -158,7 +115,7 @@ export default function ChatDetailScreen() {
         keyboardVerticalOffset={Platform.OS === "ios" ? 80 : 0}
         style={styles.flex}
       >
-        {!session.data ? (
+        {blocks.isPending && !blocks.data ? (
           <View style={styles.center}>
             <ActivityIndicator color={theme.subtle} />
           </View>
@@ -168,16 +125,13 @@ export default function ChatDetailScreen() {
             contentContainerStyle={styles.messages}
             keyboardShouldPersistTaps="handled"
           >
-            {messages && messages.length > 0 ? (
-              messages.map((m) => <Bubble key={m.id} message={m} />)
+            {list.length > 0 ? (
+              list.map((block) => <BlockRenderer key={block.id} block={block} />)
             ) : (
               <View style={styles.emptyChat}>
                 <Text style={styles.emptyChatText}>What can I help with?</Text>
               </View>
             )}
-            {inflightTaskId && !hasPendingAssistantBubble(messages, inflightTaskId) ? (
-              <Phase label={pendingPhase ?? "Working"} />
-            ) : null}
           </ScrollView>
         )}
 
@@ -218,83 +172,18 @@ export default function ChatDetailScreen() {
   );
 }
 
-function hasPendingAssistantBubble(
-  messages: ChatMessage[] | undefined,
-  inflightTaskId: string | null
-): boolean {
-  if (!messages || !inflightTaskId) return false;
-  return messages.some((m) => m.role === "assistant" && m.taskId === inflightTaskId);
-}
-
-function Bubble({ message }: { message: ChatMessage }) {
-  const isUser = message.role === "user";
-  const isSystem = message.role === "system";
-  const bg = isUser
-    ? theme.userBubble
-    : isSystem
-      ? theme.systemBubble
-      : theme.assistantBubble;
-  const color = isUser
-    ? theme.userBubbleText
-    : isSystem
-      ? theme.systemBubbleText
-      : theme.assistantBubbleText;
-  const align = isUser ? "flex-end" : "flex-start";
-  return (
-    <View style={{ alignSelf: align, maxWidth: "85%" }}>
-      <View
-        style={[
-          styles.bubble,
-          {
-            backgroundColor: bg,
-            borderTopRightRadius: isUser ? 4 : 16,
-            borderTopLeftRadius: isUser ? 16 : 4
-          }
-        ]}
-      >
-        <Text style={[styles.bubbleText, { color }]} selectable>
-          {message.content}
-        </Text>
-      </View>
-    </View>
-  );
-}
-
-function Phase({ label }: { label: string }) {
-  return (
-    <View style={{ alignSelf: "flex-start", maxWidth: "85%" }}>
-      <View
-        style={[
-          styles.bubble,
-          styles.phase,
-          {
-            backgroundColor: theme.assistantBubble,
-            borderTopLeftRadius: 4
-          }
-        ]}
-      >
-        <ActivityIndicator size="small" color={theme.subtle} />
-        <Text style={[styles.bubbleText, styles.phaseLabel]}>{label}…</Text>
-      </View>
-    </View>
-  );
-}
-
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.bg },
   flex: { flex: 1 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   messages: { padding: 16, gap: 10, paddingBottom: 24 },
-  emptyChat: { flex: 1, minHeight: 240, alignItems: "center", justifyContent: "center" },
-  emptyChatText: { fontSize: 18, fontWeight: "500", color: theme.subtle },
-  bubble: {
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 16
+  emptyChat: {
+    flex: 1,
+    minHeight: 240,
+    alignItems: "center",
+    justifyContent: "center"
   },
-  bubbleText: { fontSize: 16, lineHeight: 22 },
-  phase: { flexDirection: "row", alignItems: "center", gap: 8 },
-  phaseLabel: { color: theme.subtle, fontStyle: "italic" },
+  emptyChatText: { fontSize: 18, fontWeight: "500", color: theme.subtle },
   composerWrap: {
     flexDirection: "row",
     alignItems: "flex-end",
