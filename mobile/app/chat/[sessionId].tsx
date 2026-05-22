@@ -59,6 +59,17 @@ export default function ChatDetailScreen() {
     });
   }, [list]);
 
+  // callId → tool_result lookup. The chat detail uses this so each
+  // tool_call row can pull its own paired result for the expand-on-tap
+  // affordance. tool_result blocks themselves never render standalone.
+  const toolResultsByCallId = useMemo(() => {
+    const map = new Map<string, Extract<ChatBlock, { kind: "tool_result" }>>();
+    for (const b of list) {
+      if (b.kind === "tool_result") map.set(b.callId, b);
+    }
+    return map;
+  }, [list]);
+
   // Title derivation: first user_text block's excerpt, falling back to
   // "Chat" while the list is empty. Avoids a second polling call to
   // /chat/:id for the session record — the block stream carries enough
@@ -139,7 +150,17 @@ export default function ChatDetailScreen() {
             keyboardShouldPersistTaps="handled"
           >
             {visible.length > 0 ? (
-              visible.map((block) => <BlockRenderer key={block.id} block={block} />)
+              visible.map((block) => (
+                <BlockRenderer
+                  key={block.id}
+                  block={block}
+                  toolResult={
+                    block.kind === "tool_call"
+                      ? toolResultsByCallId.get(block.callId)
+                      : undefined
+                  }
+                />
+              ))
             ) : (
               <View style={styles.emptyChat}>
                 <Text style={styles.emptyChatText}>What can I help with?</Text>

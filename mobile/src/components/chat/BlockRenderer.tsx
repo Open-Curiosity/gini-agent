@@ -1,4 +1,4 @@
-import type { ChatBlock } from "@/src/types";
+import type { ChatBlock, ToolResultBlock } from "@/src/types";
 import { BlockApprovalRequested } from "./BlockApprovalRequested";
 import { BlockAssistantText } from "./BlockAssistantText";
 import { BlockPhase } from "./BlockPhase";
@@ -10,18 +10,25 @@ import { BlockUserText } from "./BlockUserText";
 // `block.kind` — adding a new block kind to src/types.ts (via the
 // runtime's ChatBlock union) requires a new case here, and the `never`
 // guard in the default branch makes the compiler enforce it.
-export function BlockRenderer({ block }: { block: ChatBlock }) {
+//
+// tool_result blocks render inline only when their parent tool_call is
+// tapped. The chat screen builds the callId → result map and passes it
+// here so each row can find its own result without scanning the list.
+export function BlockRenderer({
+  block,
+  toolResult
+}: {
+  block: ChatBlock;
+  toolResult?: ToolResultBlock;
+}) {
   switch (block.kind) {
     case "user_text":
       return <BlockUserText block={block} />;
     case "assistant_text":
       return <BlockAssistantText block={block} />;
     case "tool_call":
-      return <BlockToolCall block={block} />;
+      return <BlockToolCall block={block} result={toolResult} />;
     case "tool_result":
-      // Tool results are noise in the transcript — the assistant's reply
-      // already summarizes the meaningful output. The block is still
-      // emitted and persisted so future "expand details" UI can reach it.
       return null;
     case "phase":
       return <BlockPhase block={block} />;

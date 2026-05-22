@@ -205,6 +205,17 @@ export default function ChatPage() {
     });
   }, [blocks]);
 
+  // Map each tool_call's callId to its paired tool_result block so the
+  // BlockToolCall renderer can expand-on-click without re-walking the
+  // list per row. Tool results don't render as standalone blocks.
+  const toolResultsByCallId = useMemo(() => {
+    const map = new Map<string, (typeof blocks)[number] & { kind: "tool_result" }>();
+    for (const b of blocks) {
+      if (b.kind === "tool_result") map.set(b.callId, b);
+    }
+    return map;
+  }, [blocks]);
+
   const sessionTitle = selectedSession?.title || "New chat";
   const hasBlocks = visibleBlocks.length > 0;
 
@@ -268,7 +279,14 @@ export default function ChatPage() {
                   <ul className="space-y-5">
                     {visibleBlocks.map((block) => (
                       <li key={block.id}>
-                        <BlockRenderer block={block} />
+                        <BlockRenderer
+                          block={block}
+                          toolResult={
+                            block.kind === "tool_call"
+                              ? toolResultsByCallId.get(block.callId)
+                              : undefined
+                          }
+                        />
                       </li>
                     ))}
                   </ul>
