@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-05-21
-- **See also:** [Runtime Identity Injection](./runtime-identity-injection.md), [Per-Agent Memory Isolation](./agent-memory-isolation.md), [Agents Replace Profiles And Drive Runtime Behavior](./agents-replace-profiles.md)
+- **See also:** [Runtime Identity Injection](./runtime-identity-injection.md), [Per-Agent Memory Isolation](./agent-memory-isolation.md), [Agents Replace Profiles And Drive Runtime Behavior](./agents-replace-profiles.md), [Memory Surface Consolidation](./memory-surface-consolidation.md), [Identity-File Long-Horizon Design](./identity-file-long-horizon-design.md)
 
 ## Decision
 
@@ -80,7 +80,8 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 - **Behavior change:** the agent's operating rules become user-editable. A fresh instance behaves identically to the bundled defaults because `INSTRUCTIONS.md` is absent and the bundled file is the fallback. The bundled file is the single source of truth — the scaffolder copies its bytes verbatim and the runtime reads from it on every fresh install.
 - **Per-agent persona is on-disk.** Switching agents picks up that agent's `SOUL.md`. User identity is preserved because `USER.md` is instance-scoped.
 - **Audit and trust surface grows.** Three new audit actions cover the propose / approve lifecycle. The injection scan provides a documented trust boundary on user-controlled files that ride the system prompt.
-- **State growth is bounded.** Three files per instance plus one `SOUL.md` per agent. None are stored in `state.json`.
+- **State growth is bounded.** Three files per instance plus one `SOUL.md` per agent. None are stored in `state.json`. Per-write history snapshots accumulate under `<file>.history/` directories with a 50-entry retention cap; see ADR [identity-file-long-horizon-design.md](./identity-file-long-horizon-design.md).
+- **Long-horizon hygiene is deliberate.** USER.md and SOUL.md ride into the system prompt under a budget header (`N / 1500 chars, X%`) so the model can self-manage consolidation. Every approved write snapshots the previous body so the user can roll back via `gini identity rollback`. See ADR [identity-file-long-horizon-design.md](./identity-file-long-horizon-design.md) for the full design.
 
 ## Alternatives Considered
 
