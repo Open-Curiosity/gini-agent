@@ -82,8 +82,28 @@ describe("spawnQuickTunnel", () => {
         startupTimeoutMs: 50
       })
     ).rejects.toThrow(/did not advertise a URL within 50ms/);
-    fakeChild.kill("SIGTERM");
+    // The startup failure path must SIGTERM the child even though we
+    // never received a handle back. Otherwise a flaky cloudflared boot
+    // leaks the subprocess every retry.
     await fakeChild.exited;
+  });
+
+  test("startup timeout kills the child process", async () => {
+    const fakeChild = makeFakeChild([], { keepOpen: true });
+    const spawnStub: SpawnTunnelOptions["spawn"] = () => fakeChild;
+    await spawnQuickTunnel({
+      targetUrl: "http://127.0.0.1:7778",
+      spawn: spawnStub,
+      startupTimeoutMs: 30
+    }).catch(() => undefined);
+    // The fake child resolves exited on kill; if spawnQuickTunnel's
+    // cleanup path runs, exited resolves promptly. Awaiting it bounded
+    // by 1s asserts the cleanup actually ran.
+    const winner = await Promise.race([
+      fakeChild.exited.then(() => "exited" as const),
+      Bun.sleep(1000).then(() => "leaked" as const)
+    ]);
+    expect(winner).toBe("exited");
   });
 });
 

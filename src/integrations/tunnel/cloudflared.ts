@@ -76,15 +76,39 @@ export async function spawnQuickTunnel(options: SpawnTunnelOptions): Promise<Tun
   const urlPromise = parseUrlFromStderr(child.stderr, logHandle);
   const timeoutMs = options.startupTimeoutMs ?? 25_000;
 
-  const url = await Promise.race([
-    urlPromise,
-    child.exited.then((code) => {
-      throw new Error(`cloudflared exited before advertising a URL (code ${code})`);
-    }),
-    Bun.sleep(timeoutMs).then(() => {
-      throw new Error(`cloudflared did not advertise a URL within ${timeoutMs}ms`);
-    })
-  ]);
+  let url: string;
+  try {
+    url = await Promise.race([
+      urlPromise,
+      child.exited.then((code) => {
+        throw new Error(`cloudflared exited before advertising a URL (code ${code})`);
+      }),
+      Bun.sleep(timeoutMs).then(() => {
+        throw new Error(`cloudflared did not advertise a URL within ${timeoutMs}ms`);
+      })
+    ]);
+  } catch (error) {
+    // Clean up before the throw escapes: kill the child if it's still
+    // running and close the log handle. Without this, a startup-timeout
+    // path leaves cloudflared running in the background indefinitely,
+    // and the open file descriptor leaks until GC eventually finalises
+    // the handle. Both kills are best-effort — a kill against a child
+    // that already exited is harmless.
+    try { child.kill("SIGTERM"); } catch { /* ignore */ }
+    try {
+      await Promise.race([child.exited, Bun.sleep(2_000)]);
+    } catch { /* ignore */ }
+    try { child.kill("SIGKILL"); } catch { /* ignore */ }
+    if (logHandle) {
+      try { await logHandle.close(); } catch { /* ignore */ }
+      logHandle = null;
+    }
+    // Swallow the orphaned urlPromise so its eventual rejection (the
+    // stream closes after kill) does not surface as an unhandled
+    // rejection later in the event loop.
+    void urlPromise.catch(() => {});
+    throw error;
+  }
 
   const handle: TunnelHandle = {
     url,
