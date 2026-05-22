@@ -12,7 +12,7 @@ Gini exposes three markdown files at the runtime root that the agent loop loads 
 |---|---|---|---|
 | `INSTRUCTIONS.md` | `~/.gini/instances/<inst>/INSTRUCTIONS.md` | instance | user-only; never edited by the agent |
 | `SOUL.md` | `~/.gini/instances/<inst>/agents/<agentId>/SOUL.md` | per-agent | agent may propose edits via `edit_soul` (proposed → approved) |
-| `USER.md` | `~/.gini/instances/<inst>/USER.md` | instance | agent may propose edits via `edit_user_profile` (proposed → approved) |
+| `USER.md` | `~/.gini/instances/<inst>/USER.md` | instance | agent edits via `edit_user_profile`; clean bodies auto-approve, the injection scanner routes hostile bodies through proposed → approved |
 
 The three files are a curated layer over the Hindsight memory pipeline. The legacy `state.memories` pinned-memory store was retired alongside the memory-surface consolidation — USER.md (instance), SOUL.md (per-agent), and Hindsight (per-agent bank) are the three memory surfaces now. See ADR [memory-surface-consolidation.md](./memory-surface-consolidation.md).
 
@@ -96,9 +96,10 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 - A `gini install` against a fresh instance copies the bytes of `src/runtime/defaults/INSTRUCTIONS.md` into `~/.gini/instances/<inst>/INSTRUCTIONS.md` byte-for-byte (the scaffold and runtime fallback never drift).
 - If `src/runtime/defaults/INSTRUCTIONS.md` is removed from the bundle, both `getDefaultGiniInstructions()` and `scaffoldInstanceIdentityFiles()` throw with a clear "default INSTRUCTIONS.md missing from bundle" message rather than silently falling back to an empty preamble.
 - Writing `~/.gini/instances/<inst>/agents/<agentId>/SOUL.md` causes the next chat turn (under that active agent) to include the SOUL block after the instructions and before the identity block.
-- Writing `~/.gini/instances/<inst>/USER.md` causes the next chat turn to include the USER block between pinned memories and recalled memory.
+- Writing `~/.gini/instances/<inst>/USER.md` causes the next chat turn to include the USER block ahead of any Hindsight-recalled context.
 - A file containing `ignore previous instructions` is replaced in the prompt by `[BLOCKED: <filename> contained potential prompt injection (prompt_injection). Content not loaded.]` and a warning is emitted to the runtime trace.
-- `edit_soul` and `edit_user_profile` write `<file>.proposed` and create an `identity.*.proposed` audit row; the new content does not appear in the next turn's prompt until approval.
+- `edit_soul` writes `SOUL.md.proposed` and creates an `identity.soul.proposed` audit row; the new content does not appear in the next turn's prompt until approval via `POST /api/identity-files/soul/approve`.
+- `edit_user_profile` writes a clean body directly to USER.md and emits `identity.user_profile.approved` with `autoApproved: true`; a body the injection scanner flags lands at USER.md.proposed instead and emits `identity.user_profile.proposed` (operator promotes via `POST /api/identity-files/user/approve`).
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` are green.
 
 ## Critical Files

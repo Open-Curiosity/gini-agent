@@ -336,7 +336,6 @@ export interface Task {
   tracePath: string;
   auditIds: string[];
   approvalIds: string[];
-  memoryIds: string[];
   skillIds: string[];
   jobId?: string;
   parentTaskId?: string;

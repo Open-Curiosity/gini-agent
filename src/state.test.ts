@@ -127,7 +127,6 @@ describe("state primitives", () => {
             tracePath: `${dir}/traces/task_legacy.jsonl`,
             auditIds: [],
             approvalIds: [],
-            memoryIds: [],
             skillIds: []
           }
         ],

@@ -1202,7 +1202,6 @@ describe("runtime api", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: []
       });
     });
@@ -1489,7 +1488,6 @@ describe("runtime api", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: []
       });
     });
@@ -1542,7 +1540,6 @@ describe("runtime api", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: []
       });
     });

@@ -86,7 +86,6 @@ export function createTask(
     tracePath: tracePath(instance, taskId),
     auditIds: [],
     approvalIds: [],
-    memoryIds: [],
     skillIds: [],
     jobId,
     parentTaskId,

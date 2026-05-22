@@ -153,8 +153,9 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const effectiveForAgent = resolveEffectiveContext(stateForAgent, config);
   const agentIdForMemory = effectiveForAgent.agentId;
 
-  // Auto-recall: same as the legacy path. If recall fails we continue with
-  // pinned memories only; the model can still answer.
+  // Auto-recall: queries the Hindsight bank for relevant context. If
+  // recall fails we continue without it — the model can still answer
+  // off USER.md / SOUL.md and the task input.
   let recalledContext: string | undefined;
   let hindsightUnitsRecalled = 0;
   if (agentIdForMemory) {

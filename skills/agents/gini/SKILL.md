@@ -484,4 +484,7 @@ land in the queue, and wait for the user's decision.
 5. When the user asks Gini to remember to do something later, create a
    scheduled job — the runtime auto-binds it to a dedicated thread so
    future fires don't bury the current conversation.
-6. Keep pinned memories short; offload depth to recall.
+6. For durable identity facts ("my name is X", "I prefer Y") call
+   `edit_user_profile` so they ride the prompt every turn across agents.
+   For ephemeral facts let auto-retain land them in Hindsight — never
+   narrate "I'll remember that" without actually calling a tool.
