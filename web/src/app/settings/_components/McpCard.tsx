@@ -119,12 +119,11 @@ export function MessagingCard({
   );
 }
 
-// Babyclaw-style pending pairing requests for a Telegram bridge. Polls the
-// bridge's chat allowlist every 3 s; each chat that messaged the bot but
-// isn't yet on the allowlist surfaces here as an Approve/Reject row. The
-// underlying state lives on the bridge as `metadata.recentDeniedChats`,
-// so this is purely a presentation of data the runtime is already
-// collecting today — no schema or poller changes needed.
+// Pending pairing requests for a Telegram bridge. Polls the bridge's chat
+// allowlist every 3 s; each chat that messaged the bot but isn't yet on
+// the allowlist surfaces here as an Approve/Reject row. The underlying
+// state lives on the bridge as `metadata.recentDeniedChats`, populated by
+// the Telegram poller every time a non-allowlisted update arrives.
 function TelegramPendingRequests({ bridgeId }: { bridgeId: string }) {
   const invalidate = useInvalidate();
   const chats = useQuery({
