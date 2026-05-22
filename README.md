@@ -247,6 +247,10 @@ GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --instance sandbox s
 
 This is the short preview. See the full roadmap in [ROADMAP.md](ROADMAP.md).
 
+## Contributing
+
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, verification commands, and PR conventions. For architecture conventions and module boundaries, see [AGENTS.md](AGENTS.md). Report security issues privately per [SECURITY.md](SECURITY.md).
+
 ## License
 
 [MIT](LICENSE)
