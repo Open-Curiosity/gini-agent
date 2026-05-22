@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Check, X } from "lucide-react";
 import { toast } from "sonner";
@@ -234,6 +234,12 @@ function AddMessagingBridgeButtons() {
   const [name, setName] = useState("");
   const [botToken, setBotToken] = useState("");
   const [result, setResult] = useState<MessagingBridgeRecord | null>(null);
+  // The deferred close-reset runs 150ms after close() so the dialog's
+  // exit animation reads stable state. Tracking the timer id lets us
+  // cancel it when the user reopens the dialog within that window —
+  // otherwise the late reset would clobber the freshly-set kind/name
+  // in the new dialog session.
+  const resetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const add = useMutation<MessagingBridgeRecord, Error, { name: string; kind: AddBridgeKind; botToken: string }>({
     mutationFn: (input) =>
@@ -249,7 +255,17 @@ function AddMessagingBridgeButtons() {
     onError: (error: Error) => toast.error(error.message)
   });
 
+  const cancelResetTimer = () => {
+    if (resetTimerRef.current) {
+      clearTimeout(resetTimerRef.current);
+      resetTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => () => cancelResetTimer(), []);
+
   const openFor = (next: AddBridgeKind) => {
+    cancelResetTimer();
     setKind(next);
     setName("");
     setBotToken("");
@@ -260,8 +276,9 @@ function AddMessagingBridgeButtons() {
 
   const close = () => {
     setOpen(false);
-    // Defer state reset so the closing animation isn't disrupted.
-    setTimeout(() => {
+    cancelResetTimer();
+    resetTimerRef.current = setTimeout(() => {
+      resetTimerRef.current = null;
       setName("");
       setBotToken("");
       setResult(null);
