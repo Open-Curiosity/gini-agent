@@ -68,9 +68,8 @@ export default function RootLayout() {
           <Stack screenOptions={screenOptions}>
             <Stack.Screen name="index" options={{ headerShown: false }} />
             <Stack.Screen name="setup" options={{ title: "Connect to Gini" }} />
-            <Stack.Screen name="agents" options={{ title: "Agents" }} />
+            <Stack.Screen name="agents" options={{ headerShown: false }} />
             <Stack.Screen name="settings" options={{ title: "Settings" }} />
-            <Stack.Screen name="chats/[agentId]" options={{ title: "Chats" }} />
             <Stack.Screen name="chat/[sessionId]" options={{ title: "Chat" }} />
           </Stack>
         </QueryClientProvider>
