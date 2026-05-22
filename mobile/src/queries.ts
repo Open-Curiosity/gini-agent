@@ -221,7 +221,12 @@ export function useSendMessage(sessionId: string | null) {
       });
     },
     onSuccess: () => {
+      // Invalidate both the legacy session query and the block list so the
+      // chat detail screen picks up the new user_text block (and the
+      // runtime's follow-up phase / assistant_text blocks) on the next
+      // poll tick rather than waiting for the 3s idle cadence to expire.
       qc.invalidateQueries({ queryKey: ["chat", sessionId] });
+      qc.invalidateQueries({ queryKey: ["chat-blocks", sessionId] });
       qc.invalidateQueries({ queryKey: ["chats"] });
     }
   });
