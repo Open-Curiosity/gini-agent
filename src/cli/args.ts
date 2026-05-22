@@ -51,7 +51,13 @@ export function applyGlobalEnvOverrides(values: string[], ephemeral: boolean): v
     // independently — otherwise smoke ends up with provider=codex and
     // model=gini-echo-v0, which is broken. Couple the model pin to the
     // provider pin so both move together (or neither does).
-    if (process.env.GINI_PROVIDER === undefined) {
+    // Treat blank/whitespace GINI_PROVIDER as unset. CI environments
+    // sometimes pass `GINI_PROVIDER=""` (e.g. an unset shell variable
+    // expanding to empty in a templated command), which would skip the
+    // pin and let defaultConfig fall through to codex/gpt-5.5 — exactly
+    // the offline-contract break this block exists to prevent.
+    const explicitProvider = process.env.GINI_PROVIDER?.trim();
+    if (!explicitProvider) {
       process.env.GINI_PROVIDER = "echo";
       process.env.GINI_MODEL ??= "gini-echo-v0";
     }
