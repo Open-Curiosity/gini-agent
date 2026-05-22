@@ -145,32 +145,24 @@ describe("install_ provider env override", () => {
   });
 
   test("pre-existing config + no env vars leaves provider byte-identical on disk", async () => {
-    // Byte equality catches regressions where the no-env branch silently
-    // rewrites the file with semantically-identical content. mtime is the
-    // sharper signal — install() unconditionally rewrites config.json on
-    // every call (src/runtime/index.ts), so a mtime bump here would mean
-    // the env-override branch ran when it shouldn't have. We seed a
-    // config that already matches the install()-produced shape so the
-    // installer's own write is a content no-op, leaving any byte
-    // difference attributable to the env-override branch.
+    // install() always rewrites config.json on every call
+    // (src/runtime/index.ts), so the file's mtime WILL advance even
+    // when the content is unchanged — mtime is not a usable invariant
+    // here. Byte equality is the meaningful pin: a regression where
+    // the no-env branch silently mutated fields would show up as a
+    // bytes diff. Seed a config matching the install()-produced shape
+    // so the installer's own write is a content no-op, leaving any
+    // byte drift attributable to the env-override branch.
     const instance = "no-env-preserved";
     seedFullyFormedInstanceConfig(instance, {
       provider: { name: "openai", model: "gpt-5.4-mini", apiKeyEnv: "OPENAI_API_KEY" }
     });
     const cfgPath = persistedConfigPath(instance);
     const beforeBytes = readFileSync(cfgPath);
-    const beforeMtime = statSync(cfgPath).mtimeMs;
     await install_(makeCtx(instance));
     const afterBytes = readFileSync(cfgPath);
     expect(afterBytes.equals(beforeBytes)).toBe(true);
-    // install() always rewrites; the mtime check here pins that the
-    // rewrite produced byte-for-byte identical output (no incidental
-    // ordering / formatting drift), and any deeper regression that
-    // touched fields would show up as a bytes diff above.
     expect(statSync(cfgPath).size).toBe(beforeBytes.length);
-    // Suppress unused-warning while keeping the snapshot intentional —
-    // beforeMtime is captured for future-proof regression tracing.
-    void beforeMtime;
   });
 
   test("GINI_PROVIDER=bogus throws and leaves the existing config byte-identical on disk", async () => {
