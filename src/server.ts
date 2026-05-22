@@ -194,6 +194,80 @@ async function resolveWebTarget(): Promise<string> {
   throw new Error("web port did not appear within 60s — the Next.js dev server may have failed to start");
 }
 
+// Serializes /api/tunnel PATCH calls. Each new applyConfig invocation
+// `.then()`s off this promise so the second caller runs against the
+// first caller's post-mutation `tunnelResolved.config.enabled` — without
+// it the becameEnabled/becameDisabled diff was racing on the shared
+// state and could leave cloudflared running while the persisted config
+// said disabled. Caller-visible errors still propagate; the chain itself
+// swallows rejections so one failed PATCH cannot poison every subsequent
+// PATCH.
+let pendingApply: Promise<void> = Promise.resolve();
+
+async function runApplyConfig(
+  update: { enabled?: boolean; appleNotes?: { enabled?: boolean } }
+): Promise<ReturnType<typeof tunnelManager.getSnapshot>> {
+  const next: PersistedTunnelConfig = { ...(config.tunnel ?? {}) };
+  if (typeof update.enabled === "boolean") next.enabled = update.enabled;
+  if (update.appleNotes) {
+    next.appleNotes = { ...(next.appleNotes ?? {}), ...update.appleNotes };
+  }
+  config.tunnel = next;
+  // Persist alongside the in-memory mutation so the next boot
+  // sees the change even if the runtime exits before any other
+  // settings write fires.
+  try {
+    const onDisk = JSON.parse(readFileSync(configPath(config.instance), "utf8")) as Record<string, unknown>;
+    onDisk.tunnel = next;
+    writeFileSync(configPath(config.instance), `${JSON.stringify(onDisk, null, 2)}\n`);
+  } catch (error) {
+    appendLog(config.instance, "tunnel.config.persist.error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+  // Update the live manager. Two paths:
+  //  - Just-enabled: spin cloudflared up now.
+  //  - Just-disabled: tear it down.
+  //  - Enabled + appleNotes flipped: nothing process-level to do.
+  const becameEnabled = next.enabled === true && tunnelResolved.config.enabled !== true;
+  const becameDisabled = next.enabled === false && tunnelResolved.config.enabled === true;
+  tunnelResolved.config = {
+    ...tunnelResolved.config,
+    enabled: next.enabled ?? tunnelResolved.config.enabled,
+    appleNotes: { ...tunnelResolved.config.appleNotes, ...(next.appleNotes ?? {}) }
+  };
+  // The manager observes the same config object reference, but
+  // appleNotes.enabled lives inside it and needs to be mirrored
+  // forward for the next refresh.
+  tunnelManager.updateConfig({
+    enabled: tunnelResolved.config.enabled,
+    appleNotes: tunnelResolved.config.appleNotes
+  });
+  if (becameEnabled) {
+    // Resolve the live web port before spawning cloudflared so the
+    // tunnel targets the Next.js UI (full settings/chat surface)
+    // rather than the placeholder runtime port (raw /api/* + the
+    // bare landing). The boot-time path does the same.
+    try {
+      const target = await resolveWebTarget();
+      tunnelManager.setTargetUrl(target);
+    } catch (error) {
+      appendLog(config.instance, "tunnel.start.error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+    await tunnelManager.start().catch((error) => {
+      appendLog(config.instance, "tunnel.start.error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+  }
+  if (becameDisabled) {
+    await tunnelManager.stop();
+  }
+  return tunnelManager.getSnapshot();
+}
+
 const server = Bun.serve({
   port: config.port,
   hostname: "127.0.0.1",
@@ -230,66 +304,22 @@ const server = Bun.serve({
       // PATCH /api/tunnel routes here. Persists the change to config.json
       // and starts/stops cloudflared accordingly so the UI's toggle
       // takes effect without requiring a runtime restart.
-      applyConfig: async (update) => {
-        const next: PersistedTunnelConfig = { ...(config.tunnel ?? {}) };
-        if (typeof update.enabled === "boolean") next.enabled = update.enabled;
-        if (update.appleNotes) {
-          next.appleNotes = { ...(next.appleNotes ?? {}), ...update.appleNotes };
-        }
-        config.tunnel = next;
-        // Persist alongside the in-memory mutation so the next boot
-        // sees the change even if the runtime exits before any other
-        // settings write fires.
-        try {
-          const onDisk = JSON.parse(readFileSync(configPath(config.instance), "utf8")) as Record<string, unknown>;
-          onDisk.tunnel = next;
-          writeFileSync(configPath(config.instance), `${JSON.stringify(onDisk, null, 2)}\n`);
-        } catch (error) {
-          appendLog(config.instance, "tunnel.config.persist.error", {
-            error: error instanceof Error ? error.message : String(error)
-          });
-        }
-        // Update the live manager. Two paths:
-        //  - Just-enabled: spin cloudflared up now.
-        //  - Just-disabled: tear it down.
-        //  - Enabled + appleNotes flipped: nothing process-level to do.
-        const becameEnabled = next.enabled === true && tunnelResolved.config.enabled !== true;
-        const becameDisabled = next.enabled === false && tunnelResolved.config.enabled === true;
-        tunnelResolved.config = {
-          ...tunnelResolved.config,
-          enabled: next.enabled ?? tunnelResolved.config.enabled,
-          appleNotes: { ...tunnelResolved.config.appleNotes, ...(next.appleNotes ?? {}) }
-        };
-        // The manager observes the same config object reference, but
-        // appleNotes.enabled lives inside it and needs to be mirrored
-        // forward for the next refresh.
-        tunnelManager.updateConfig({
-          enabled: tunnelResolved.config.enabled,
-          appleNotes: tunnelResolved.config.appleNotes
-        });
-        if (becameEnabled) {
-          // Resolve the live web port before spawning cloudflared so the
-          // tunnel targets the Next.js UI (full settings/chat surface)
-          // rather than the placeholder runtime port (raw /api/* + the
-          // bare landing). The boot-time path does the same.
-          try {
-            const target = await resolveWebTarget();
-            tunnelManager.setTargetUrl(target);
-          } catch (error) {
-            appendLog(config.instance, "tunnel.start.error", {
-              error: error instanceof Error ? error.message : String(error)
-            });
-          }
-          await tunnelManager.start().catch((error) => {
-            appendLog(config.instance, "tunnel.start.error", {
-              error: error instanceof Error ? error.message : String(error)
-            });
-          });
-        }
-        if (becameDisabled) {
-          await tunnelManager.stop();
-        }
-        return tunnelManager.getSnapshot();
+      //
+      // Serialized through `pendingApply`: concurrent PATCHes (the UI
+      // optimistically fires two toggles in quick succession, or the
+      // operator runs `gini tunnel disable` while the web UI is mid-
+      // enable) used to race the `becameEnabled` / `becameDisabled`
+      // diff against `tunnelResolved.config.enabled`. Both branches read
+      // the same shared state pre-mutation, both wrote, and whichever
+      // happened to await `resolveWebTarget()` longest won — leaving
+      // cloudflared and the persisted config out of sync. Funnelling
+      // each call through a chained promise forces the second caller to
+      // see the FIRST caller's post-mutation state before computing its
+      // own diff.
+      applyConfig: (update) => {
+        const next = pendingApply.then(() => runApplyConfig(update));
+        pendingApply = next.then(() => undefined, () => undefined);
+        return next;
       }
     }
   })
