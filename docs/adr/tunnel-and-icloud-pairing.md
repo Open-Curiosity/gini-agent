@@ -46,9 +46,14 @@ shape that depends on memorising the URL breaks at the next reboot.
    prefix the operator bookmarks or pastes into a note keeps working.
 
 4. The bearer-token gate stays the only authorization path for direct
-   localhost requests. Tunneled requests cannot reach `/api/pairing/claim`
-   without going through the secret-path strip; bearer-tokened requests
-   without the secret keep working unchanged.
+   localhost requests. `/api/pairing/claim` remains the existing public
+   bootstrap endpoint — it accepts unauthenticated POSTs over both
+   direct localhost (so a fresh CLI without a token can mint one) and
+   over the tunnel after the secret-path strip (so a paired-mobile flow
+   can claim a device through the tunnel URL without first holding the
+   bearer token). The secret-path prefix is still required for tunneled
+   access; a tunneled POST without the prefix is treated like any other
+   wrong path and 404s.
 
 5. The gateway exposes three additional routes that are reachable through
    either the bearer-token path or the tunnel path:
@@ -82,12 +87,13 @@ shape that depends on memorising the URL breaks at the next reboot.
 
 - **Localhost bearer token**: unchanged. Still the only way to reach
   `/api/pairing/claim` and the only way for direct callers.
-- **Tunnel secret-path**: same surface area as the bearer-token path
-  except for `/api/pairing/claim` (which is intentionally
-  secret-path-reachable so the operator can pair a phone through the
-  tunnel without holding the bearer token first; see point 4). Anyone
-  in possession of the URL has full operator-level access until the
-  next restart.
+- **Tunnel secret-path**: same surface area as the bearer-token path.
+  `/api/pairing/claim` is reachable both directly (no bearer required,
+  the existing pairing bootstrap) and over the tunnel after the
+  secret-path strip; the prefix is still required for any tunneled
+  request, so a stranger without the URL cannot reach claim through
+  the tunnel. Anyone in possession of the full secret-path URL has
+  full operator-level access until the next restart.
 - **No password auth**: by design. The URL is the credential. The secret
   is generated with `crypto.getRandomValues(24 bytes)` — 192 bits of
   entropy — so an attacker cannot guess the path without already knowing
