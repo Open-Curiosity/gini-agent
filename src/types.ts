@@ -224,16 +224,28 @@ export interface RuntimeConfig {
   // `/<secret>/` are treated as fully authorized. The secret is persisted
   // so the URL prefix stays stable across restarts even though the
   // cloudflared hostname rotates.
-  tunnel?: {
-    enabled?: boolean;
-    secret?: string;
-    appleNotes?: {
-      enabled?: boolean;
-      folder?: string;
-      noteName?: string;
-      account?: string;
-    };
-  };
+  tunnel?: PersistedTunnelConfig;
+}
+
+// On-disk shape for the `tunnel` slot under `config.json`. Every field is
+// optional because legacy configs predate this feature and a freshly
+// minted instance only has the secret persisted (other fields fill in
+// from defaults). The resolved shape (`TunnelConfig` in
+// src/integrations/tunnel/manager.ts) is derived from this via the
+// resolveTunnelConfig defaulter — keep the resolved type as
+// `Required<PersistedTunnelConfig>`-equivalent so both layers stay in
+// lockstep when a new field is added.
+export interface PersistedTunnelConfig {
+  enabled?: boolean;
+  secret?: string;
+  appleNotes?: PersistedAppleNotesConfig;
+}
+
+export interface PersistedAppleNotesConfig {
+  enabled?: boolean;
+  folder?: string;
+  noteName?: string;
+  account?: string;
 }
 
 export interface RuntimeState {

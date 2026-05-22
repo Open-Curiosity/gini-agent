@@ -9,7 +9,7 @@
 // reaching into the subprocess.
 
 import { appendLog } from "../../state";
-import type { Instance, RuntimeConfig } from "../../types";
+import type { Instance, PersistedAppleNotesConfig, PersistedTunnelConfig, RuntimeConfig } from "../../types";
 import {
   isICloudAccountAvailable,
   updateAppleNote,
@@ -20,16 +20,13 @@ import { spawnQuickTunnel, type SpawnTunnelOptions, type TunnelHandle } from "./
 import { encodeQr, renderQrAnsi, renderQrSvg } from "./qr";
 import { generateSecret, normalizeSecret, tunnelPathPrefix } from "./secret-path";
 
-export interface TunnelConfig {
-  enabled: boolean;
-  secret: string;
-  appleNotes: {
-    enabled: boolean;
-    folder: string;
-    noteName: string;
-    account: string;
-  };
-}
+// Resolved tunnel config: every PersistedTunnelConfig field with defaults
+// applied. New fields added to the persisted shape automatically widen
+// this resolved shape too, so the manager and CLI surfaces stay in sync
+// without a manual second declaration.
+export type TunnelConfig = Required<PersistedTunnelConfig> & {
+  appleNotes: Required<PersistedAppleNotesConfig>;
+};
 
 export interface TunnelSnapshot {
   /** Public URL with the secret path appended (`https://x.trycloudflare.com/<secret>/`). */

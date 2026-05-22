@@ -8,6 +8,7 @@ import { api } from "../api";
 import { print } from "../output";
 import { configPath } from "../../paths";
 import { generateSecret } from "../../integrations/tunnel";
+import type { PersistedTunnelConfig } from "../../types";
 
 export async function tunnel(ctx: CliContext): Promise<void> {
   const { config, cliArgs } = ctx;
@@ -110,19 +111,23 @@ export async function tunnel(ctx: CliContext): Promise<void> {
   );
 }
 
-interface TunnelConfigShape {
-  enabled?: boolean;
-  secret?: string;
-  appleNotes?: { enabled?: boolean; folder?: string; noteName?: string; account?: string };
-}
+// The mutator receives a normalized `appleNotes` slot so callers don't
+// have to guard `current.appleNotes ?? {}` at every assignment site.
+type WritableTunnelConfig = PersistedTunnelConfig & {
+  appleNotes: NonNullable<PersistedTunnelConfig["appleNotes"]>;
+};
 
 function mutateTunnelConfig(
   ctx: CliContext,
-  mutate: (tunnel: TunnelConfigShape) => TunnelConfigShape
+  mutate: (tunnel: WritableTunnelConfig) => PersistedTunnelConfig
 ): void {
   const path = configPath(ctx.config.instance);
   const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-  const current = ((raw.tunnel ?? {}) as TunnelConfigShape);
-  raw.tunnel = mutate({ ...current, appleNotes: { ...(current.appleNotes ?? {}) } });
+  const current = (raw.tunnel ?? {}) as PersistedTunnelConfig;
+  const normalized: WritableTunnelConfig = {
+    ...current,
+    appleNotes: { ...(current.appleNotes ?? {}) }
+  };
+  raw.tunnel = mutate(normalized);
   writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`);
 }
