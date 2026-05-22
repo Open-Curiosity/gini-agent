@@ -336,47 +336,69 @@ describe("codexProvider.checkCredentials (direct)", () => {
 
   test("no env and no file → returns missing", () => {
     const home = scratch("codex-direct-missing");
-    withCodexEnv(home, {}, () => {
+    // node:os homedir() ignores process.env.HOME mutations after process
+    // start in Bun, so swapping HOME alone won't isolate this test from a
+    // real ~/.codex/auth.json on the dev machine. Point CODEX_AUTH_JSON at
+    // a sandboxed non-existent path so the helper resolves into the test
+    // sandbox instead.
+    withCodexEnv(home, { CODEX_AUTH_JSON: join(home, "no-such-auth.json") }, () => {
       const status = __testing.codexProvider.checkCredentials();
       expect(status.available).toBe(false);
       expect(status.source).toBe("missing");
     });
   });
 
-  test("CODEX_AUTH_JSON parseable → returns env", () => {
+  test("CODEX_AUTH_JSON points at a usable auth file → returns env", () => {
     const home = scratch("codex-direct-env");
-    withCodexEnv(home, { CODEX_AUTH_JSON: "{}" }, () => {
+    const authPath = join(home, "auth.json");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ OPENAI_API_KEY: "sk-codex" }));
+    withCodexEnv(home, { CODEX_AUTH_JSON: authPath }, () => {
       const status = __testing.codexProvider.checkCredentials();
       expect(status.available).toBe(true);
       expect(status.source).toBe("env");
     });
   });
 
-  test("~/.codex/auth.json parseable → returns file", () => {
-    const home = scratch("codex-direct-file");
-    mkdirSync(join(home, ".codex"), { recursive: true });
-    writeFileSync(join(home, ".codex", "auth.json"), "{}");
-    withCodexEnv(home, {}, () => {
+  test("CODEX_AUTH_JSON points at a usable auth file (tokens.access_token form) → returns env", () => {
+    const home = scratch("codex-direct-env-token");
+    const authPath = join(home, "auth.json");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ tokens: { access_token: "tok-abc" } }));
+    withCodexEnv(home, { CODEX_AUTH_JSON: authPath }, () => {
       const status = __testing.codexProvider.checkCredentials();
       expect(status.available).toBe(true);
-      expect(status.source).toBe("file");
+      expect(status.source).toBe("env");
     });
   });
 
-  test("~/.codex/auth.json invalid JSON → returns missing", () => {
-    const home = scratch("codex-direct-invalid");
-    mkdirSync(join(home, ".codex"), { recursive: true });
-    writeFileSync(join(home, ".codex", "auth.json"), "not json {");
-    withCodexEnv(home, {}, () => {
+  test("CODEX_AUTH_JSON points at a file with no credentials → returns missing", () => {
+    const home = scratch("codex-direct-empty");
+    const authPath = join(home, "auth.json");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(authPath, "{}");
+    withCodexEnv(home, { CODEX_AUTH_JSON: authPath }, () => {
       const status = __testing.codexProvider.checkCredentials();
       expect(status.available).toBe(false);
       expect(status.source).toBe("missing");
     });
   });
 
-  test("CODEX_AUTH_JSON invalid JSON → returns missing (when no file)", () => {
+  test("CODEX_AUTH_JSON points at a file with invalid JSON → returns missing", () => {
     const home = scratch("codex-direct-invalid-env");
-    withCodexEnv(home, { CODEX_AUTH_JSON: "not json {" }, () => {
+    const authPath = join(home, "auth.json");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(authPath, "not json {");
+    withCodexEnv(home, { CODEX_AUTH_JSON: authPath }, () => {
+      const status = __testing.codexProvider.checkCredentials();
+      expect(status.available).toBe(false);
+      expect(status.source).toBe("missing");
+    });
+  });
+
+  test("CODEX_AUTH_JSON points at a non-existent path → returns missing", () => {
+    const home = scratch("codex-direct-missing-path");
+    withCodexEnv(home, { CODEX_AUTH_JSON: join(home, "no-such-auth.json") }, () => {
       const status = __testing.codexProvider.checkCredentials();
       expect(status.available).toBe(false);
       expect(status.source).toBe("missing");
@@ -391,13 +413,16 @@ describe("gini setup --yes codex precedence", () => {
     // step as already configured and leaves the config pointing at codex.
     const stateRoot = scratch("codex-yes");
     const home = scratch("codex-yes-home");
+    const authPath = join(home, "auth.json");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ OPENAI_API_KEY: "sk-codex" }));
     const instance = "dev";
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       GINI_STATE_ROOT: stateRoot,
       GINI_INSTANCE: instance,
       HOME: home,
-      CODEX_AUTH_JSON: "{}"
+      CODEX_AUTH_JSON: authPath
     };
     delete env.OPENAI_API_KEY;
     const result = await runCli({
@@ -414,13 +439,16 @@ describe("gini setup --yes codex precedence", () => {
   test("CODEX_AUTH_JSON and OPENAI_API_KEY both set → picks codex (precedence)", async () => {
     const stateRoot = scratch("codex-precedence");
     const home = scratch("codex-precedence-home");
+    const authPath = join(home, "auth.json");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ OPENAI_API_KEY: "sk-codex" }));
     const instance = "dev";
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       GINI_STATE_ROOT: stateRoot,
       GINI_INSTANCE: instance,
       HOME: home,
-      CODEX_AUTH_JSON: "{}",
+      CODEX_AUTH_JSON: authPath,
       OPENAI_API_KEY: "sk-also-set"
     };
     const result = await runCli({
