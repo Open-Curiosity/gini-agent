@@ -3,6 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "license": "MIT",
+  "description": "Local-first agent runtime you can inspect, approve, and debug.",
   "type": "module",
   "bin": {
     "gini": "./src/cli.ts"
