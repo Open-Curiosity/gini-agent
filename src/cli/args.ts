@@ -42,6 +42,14 @@ export function applyGlobalEnvOverrides(values: string[], ephemeral: boolean): v
     process.env.GINI_STATE_ROOT ??= `/tmp/gini-smoke-${process.pid}`;
     process.env.GINI_LOG_ROOT ??= `/tmp/gini-smoke-${process.pid}-logs`;
     process.env.GINI_PORT ??= String(7400 + Math.floor(Math.random() * 1000));
+    // Smoke must stay deterministic and offline (docs/operations.md). The
+    // platform default provider is codex/gpt-5.5, which would call the
+    // real codex backend and fail on any machine without codex auth.
+    // Pin echo here so `gini smoke` works on every laptop and CI worker.
+    // ??= preserves explicit overrides like
+    // `GINI_PROVIDER=codex bun run gini smoke`.
+    process.env.GINI_PROVIDER ??= "echo";
+    process.env.GINI_MODEL ??= "gini-echo-v0";
     // Smoke must never pull down the local embedding model — keeps CI fast
     // and offline. The default provider is local; explicit echo keeps smoke
     // contractually unaffected by the default change.
