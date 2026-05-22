@@ -295,12 +295,17 @@ const server = Bun.serve({
       // missing fields. Sensitive content (secret + publicUrl) is still
       // stripped by the BFF redactor before reaching the browser.
       getSnapshot: () => tunnelManager.getSnapshot(),
-      // Only expose the refresh hook when the tunnel feature is opted into.
-      // Without this gate, a disabled-tunnel runtime would still let
-      // `GET /api/tunnel` invoke the manager and return its internal
-      // snapshot (including the persisted secret), defeating the
-      // disabled-aware getSnapshot above.
-      refreshAppleNote: tunnelResolved.config.enabled ? () => tunnelManager.refreshAppleNote() : undefined,
+      // Wire the refresh hook unconditionally so the gateway can re-run
+      // the Apple Notes write the moment the operator flips the tunnel
+      // ON via the web UI — without this, the hook captured at boot
+      // would stay `undefined` for the rest of the process lifetime
+      // and GET /api/tunnel would never trigger the documented re-sync
+      // path until the next restart. Disabled-state gating moved
+      // inside the closure so it consults the live config object that
+      // applyConfig mutates.
+      refreshAppleNote: () => tunnelResolved.config.enabled
+        ? tunnelManager.refreshAppleNote()
+        : Promise.resolve(tunnelManager.getSnapshot()),
       // PATCH /api/tunnel routes here. Persists the change to config.json
       // and starts/stops cloudflared accordingly so the UI's toggle
       // takes effect without requiring a runtime restart.
