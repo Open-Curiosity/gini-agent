@@ -187,7 +187,8 @@ const server = Bun.serve({
       // localhost by appending the persisted secret, bypassing the
       // bearer-token check the rest of the gateway relies on.
       getSecret: () => (tunnelResolved.config.enabled ? tunnelResolved.config.secret : null),
-      getSnapshot: () => (tunnelResolved.config.enabled ? tunnelManager.getSnapshot() : null)
+      getSnapshot: () => (tunnelResolved.config.enabled ? tunnelManager.getSnapshot() : null),
+      refreshAppleNote: () => tunnelManager.refreshAppleNote()
     }
   })
 });

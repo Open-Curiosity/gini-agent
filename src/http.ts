@@ -52,6 +52,14 @@ export interface TunnelHandlerHooks {
   getSecret(): string | null;
   /** Snapshot of the current tunnel state for `/api/tunnel`. */
   getSnapshot(): TunnelSnapshot | null;
+  /**
+   * Optional: re-run the Apple Notes refresh and return the post-refresh
+   * snapshot. The ADR documents `GET /api/tunnel` as the operator's
+   * trigger for re-syncing the iCloud Note after they grant Automation
+   * permission to Notes.app — calling this hook from the handler keeps
+   * that promise.
+   */
+  refreshAppleNote?(): Promise<TunnelSnapshot>;
 }
 
 export interface CreateHandlerOptions {
@@ -65,11 +73,25 @@ export function createHandler(
   const tunnel = options.tunnel ?? null;
   const routes: Array<[string, RegExp, Handler]> = [
     // GET /api/tunnel returns the live tunnel snapshot (URL + secret + Apple
-    // Notes mirror status). The bearer-token auth on the surrounding
-    // handler already gates this — only the operator and authorized
-    // tunneled requests can read the secret.
-    ["GET", /^\/api\/tunnel$/, () => {
+    // Notes mirror status). Side-effect: when the hooks expose a
+    // `refreshAppleNote()` method, we re-run the iCloud Notes write
+    // before returning so the operator can use this endpoint as the
+    // "re-sync after granting Automation permission" trigger documented
+    // in the ADR. Auth on the surrounding handler still gates this —
+    // only the operator and authorized tunneled requests can read the
+    // secret.
+    ["GET", /^\/api\/tunnel$/, async () => {
       if (!tunnel) return json({ enabled: false }, 200);
+      if (tunnel.refreshAppleNote) {
+        try {
+          const snapshot = await tunnel.refreshAppleNote();
+          return json(snapshot);
+        } catch {
+          // Refresh errors are already logged inside the manager; fall
+          // through to the snapshot so the caller still sees the
+          // current state and the `appleNotes.lastError` field.
+        }
+      }
       const snapshot = tunnel.getSnapshot();
       return json(snapshot ?? { enabled: false });
     }],

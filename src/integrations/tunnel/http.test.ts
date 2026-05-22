@@ -80,6 +80,49 @@ describe("tunnel HTTP integration", () => {
     expect(payload.publicUrl).toBe("https://example.trycloudflare.com/abcdefghij0123456789/");
   });
 
+  test("GET /api/tunnel invokes refreshAppleNote when the hook is provided", async () => {
+    const config = testConfig("tunnel-http-refresh");
+    let refreshes = 0;
+    const handler = createHandler(config, {
+      tunnel: {
+        getSecret: () => "abcdefghij0123456789",
+        getSnapshot: () => stubSnapshot(),
+        refreshAppleNote: async () => {
+          refreshes += 1;
+          return { ...stubSnapshot(), appleNotes: { ...stubSnapshot().appleNotes, lastSyncedAt: "2026-02-02T00:00:00Z" } };
+        }
+      }
+    });
+    const response = await handler(
+      new Request("http://127.0.0.1:7337/api/tunnel", {
+        headers: { authorization: `Bearer ${config.token}` }
+      })
+    );
+    expect(response.status).toBe(200);
+    expect(refreshes).toBe(1);
+    const payload = (await response.json()) as TunnelSnapshot;
+    expect(payload.appleNotes.lastSyncedAt).toBe("2026-02-02T00:00:00Z");
+  });
+
+  test("GET /api/tunnel falls back to snapshot when refreshAppleNote throws", async () => {
+    const config = testConfig("tunnel-http-refresh-failure");
+    const handler = createHandler(config, {
+      tunnel: {
+        getSecret: () => "abcdefghij0123456789",
+        getSnapshot: () => stubSnapshot(),
+        refreshAppleNote: async () => { throw new Error("permission denied"); }
+      }
+    });
+    const response = await handler(
+      new Request("http://127.0.0.1:7337/api/tunnel", {
+        headers: { authorization: `Bearer ${config.token}` }
+      })
+    );
+    expect(response.status).toBe(200);
+    const payload = (await response.json()) as TunnelSnapshot;
+    expect(payload.publicUrl).toBe("https://example.trycloudflare.com/abcdefghij0123456789/");
+  });
+
   test("GET /api/tunnel/qr.svg returns an SVG image", async () => {
     const config = testConfig("tunnel-http-qr-svg");
     const handler = createHandler(config, {
