@@ -401,13 +401,12 @@ function ChatList({
 
 function ChatRow({ session }: { session: ChatSession }) {
   const title = session.title?.trim() || "New chat";
-  // Excerpt: prefer the runtime-supplied summary; the agent name
-  // fallback that the dark theme had relied on a passed `agent` prop —
-  // the new layout doesn't pipe the agent down because the design
-  // doesn't show it on the row. Empty subtitle is rendered as " " to
-  // keep the row's vertical rhythm consistent across rows with and
-  // without a summary.
-  const subtitle = session.summary?.trim() ?? "";
+  // Excerpt: the server-supplied `lastMessagePreview` is the latest
+  // user_text / assistant_text content for the session (already
+  // truncated runtime-side). Falls back to the older summary field
+  // for legacy sessions that predate the protocol.
+  const subtitle =
+    session.lastMessagePreview?.trim() || session.summary?.trim() || "";
   const time = chatListTime(session.updatedAt ?? session.createdAt);
 
   return (

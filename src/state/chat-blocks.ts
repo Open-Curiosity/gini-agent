@@ -486,6 +486,43 @@ export function listChatBlocksAfter(
     .map(rowToBlock);
 }
 
+// Per-session most-recent message text. Returns a Map keyed by sessionId
+// containing the latest user_text / assistant_text block's text (other
+// block kinds are skipped — phase/tool_call/tool_result/etc. aren't
+// "messages" in the conversational sense). Used by the chat list
+// endpoint to populate a preview subtitle without N+1 queries.
+//
+// Uses a window function so we get the latest matching row per session
+// in one SQL trip. Sessions with no qualifying blocks are omitted from
+// the map (caller treats that as null).
+export function getLatestMessagesBySession(
+  instance: Instance
+): Map<string, string> {
+  const db = getMemoryDb(instance);
+  const rows = db
+    .query<{ session_id: string; payload_json: string }, [string]>(
+      `SELECT session_id, payload_json FROM (
+         SELECT session_id, payload_json, kind, ordinal,
+                ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ordinal DESC) AS rn
+         FROM chat_blocks
+         WHERE instance = ? AND kind IN ('user_text', 'assistant_text')
+       ) WHERE rn = 1`
+    )
+    .all(instance);
+  const map = new Map<string, string>();
+  for (const row of rows) {
+    try {
+      const payload = JSON.parse(row.payload_json) as { text?: string };
+      if (typeof payload.text === "string" && payload.text.trim().length > 0) {
+        map.set(row.session_id, payload.text);
+      }
+    } catch {
+      // skip malformed rows — never block the chat list on a parse error
+    }
+  }
+  return map;
+}
+
 // Cascade delete invoked by deleteChatSession in src/state/records.ts so
 // stale block rows don't survive the session. Returns the number of rows
 // removed so the caller can audit it; idempotent for sessions that never

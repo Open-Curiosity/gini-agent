@@ -5,6 +5,7 @@ import {
   createChatMessage,
   createChatSession,
   deleteChatSession,
+  getLatestMessagesBySession,
   insertChatBlock,
   isTerminalTaskStatus,
   mutateState,
@@ -40,13 +41,32 @@ const DEFAULT_CHAT_TITLES: ReadonlySet<string> = new Set([
 const AUTO_RENAME_USER_TURNS = 2;
 const AUTO_RENAME_ASSISTANT_TURNS = 2;
 
+// Truncation cap for the latest-message preview attached to each chat
+// list row. 140 leaves enough text for a one-liner subtitle on the
+// mobile list without ballooning the wire payload.
+const LAST_MESSAGE_PREVIEW_CHARS = 140;
+
 export function listChatSessions(config: RuntimeConfig) {
   const state = readState(config.instance);
-  return state.chatSessions.map((session) => ({
-    ...session,
-    messages: state.chatMessages.filter((message) => message.sessionId === session.id),
-    runs: state.runs.filter((run) => session.runIds.includes(run.id))
-  }));
+  // Single SQL pass returns the most recent user_text / assistant_text
+  // block per session, so clients can render a "last message" subtitle
+  // without N+1 fetches. Sessions with no qualifying blocks fall back to
+  // null and the client renders just the title.
+  const latestByCallId = getLatestMessagesBySession(config.instance);
+  return state.chatSessions.map((session) => {
+    const raw = latestByCallId.get(session.id) ?? null;
+    const lastMessagePreview = raw
+      ? raw.length > LAST_MESSAGE_PREVIEW_CHARS
+        ? `${raw.slice(0, LAST_MESSAGE_PREVIEW_CHARS).trimEnd()}…`
+        : raw
+      : null;
+    return {
+      ...session,
+      lastMessagePreview,
+      messages: state.chatMessages.filter((message) => message.sessionId === session.id),
+      runs: state.runs.filter((run) => session.runIds.includes(run.id))
+    };
+  });
 }
 
 export function getChatSession(config: RuntimeConfig, id: string) {

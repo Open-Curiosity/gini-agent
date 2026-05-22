@@ -33,6 +33,11 @@ export interface ChatSession {
   runIds?: string[];
   summary?: string;
   source?: string;
+  // Server-computed latest user_text / assistant_text content for the
+  // session, truncated to ~140 chars on the runtime side. Null when the
+  // session has no qualifying blocks yet (empty chat). Used by the chat
+  // list to render a one-line subtitle below the title.
+  lastMessagePreview?: string | null;
 }
 
 export type ChatRole = "user" | "assistant" | "system" | "tool";
