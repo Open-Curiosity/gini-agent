@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { httpMcpCallTool, httpMcpInitialize, httpMcpListTools, resolveHeaderValue } from "./mcp-http";
+import { httpMcpCallTool, httpMcpInitialize, httpMcpListTools, redactSecretsInText, resolveHeaderValue } from "./mcp-http";
 
 const originalFetch = globalThis.fetch;
 
@@ -40,6 +40,53 @@ beforeEach(() => {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+});
+
+describe("redactSecretsInText", () => {
+  test("strips Authorization header values", () => {
+    const input = "HTTP/1.1 401 Unauthorized\nAuthorization: Bearer lin_api_SECRET_VALUE";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("lin_api_SECRET_VALUE");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test("strips bare 'Bearer <token>' in JSON-ish bodies", () => {
+    const input = `{"echo":{"authorization":"Bearer sk-LEAKED_TOKEN"}}`;
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("sk-LEAKED_TOKEN");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test("strips X-Api-Key and Cookie", () => {
+    const input = "X-Api-Key: AAAA-BBBB\nCookie: session=abc123";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("AAAA-BBBB");
+    expect(out).not.toContain("abc123");
+  });
+
+  test("redacts arbitrary *-Token / *-Key header values", () => {
+    const input = "X-Service-Token: secret-token-value\nX-Some-Key: another-secret";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("secret-token-value");
+    expect(out).not.toContain("another-secret");
+  });
+
+  test("leaves non-secret bodies untouched", () => {
+    expect(redactSecretsInText("rate limited; retry-after: 30s")).toBe("rate limited; retry-after: 30s");
+  });
+});
+
+describe("postRpc error body redaction (regression)", () => {
+  test("sanitizes echoed Authorization in upstream 401 body", async () => {
+    const leakedToken = "lin_api_LEAKED_FOR_TEST";
+    const upstreamBody = `unauthorized; received Authorization: Bearer ${leakedToken}`;
+    globalThis.fetch = (async () => new Response(upstreamBody, { status: 401 })) as unknown as typeof fetch;
+    const result = await httpMcpInitialize("https://example.test/mcp", { authorization: `Bearer ${leakedToken}` });
+    expect(result.ok).toBe(false);
+    expect(result.error).toBeTruthy();
+    expect(result.error).not.toContain(leakedToken);
+    expect(result.error).toContain("401");
+  });
 });
 
 describe("resolveHeaderValue", () => {

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { mutateState, readState } from "../state";
 import { writeSecret } from "../state/secrets";
 import type { ConnectorRecord, McpServerRecord, RuntimeConfig } from "../types";
-import { createConnector } from "./connectors";
+import { checkConnector, createConnector } from "./connectors";
 import { syncProviderMcpServers } from "./mcp-sync";
 
 const ROOT = mkdtempSync(join(tmpdir(), "gini-mcp-sync-"));
@@ -176,5 +176,97 @@ describe("syncProviderMcpServers", () => {
     expect(created).toContain("linear");
     state = readState(config.instance);
     expect(state.mcpServers.find((s) => s.name === "linear")).toBeDefined();
+  });
+
+  test("re-checks usability inside the lock — concurrent disable wins the race", async () => {
+    // Simulates: the pre-lock check sees a healthy connector, but before
+    // the mutateState callback fires, an operator (or another path)
+    // disables the connector. The lock-scoped re-check must observe the
+    // disabled state and bail out, leaving no MCP row behind.
+    const config = buildConfig("mcp-sync-race-disable");
+    await mutateState(config.instance, (state) => {
+      state.connectors.push(newConnector({ id: "id_linear", instance: config.instance, health: "healthy" }));
+    });
+    // Flip status to disabled in a separate mutate so the in-lock re-check
+    // sees the latest value.
+    await mutateState(config.instance, (state) => {
+      const c = state.connectors.find((x) => x.id === "id_linear");
+      if (c) c.status = "disabled";
+    });
+    const created = await syncProviderMcpServers(config);
+    expect(created).toEqual([]);
+    const state = readState(config.instance);
+    expect(state.mcpServers.find((s) => s.name === "linear")).toBeUndefined();
+  });
+
+  test("does not report a stale 'created' entry when a concurrent CLI add wins", async () => {
+    // Pre-lock check sees no MCP row; in-lock re-check finds one (the
+    // user's `gini mcp add linear` raced ahead). `created` must not list
+    // `linear` because we never inserted.
+    const config = buildConfig("mcp-sync-race-existing");
+    await mutateState(config.instance, (state) => {
+      state.connectors.push(newConnector({ id: "id_linear", instance: config.instance, health: "healthy" }));
+    });
+    await mutateState(config.instance, (state) => {
+      const racer: McpServerRecord = {
+        id: "mcp_user_linear",
+        instance: config.instance,
+        name: "linear",
+        command: "",
+        args: [],
+        envKeys: [],
+        status: "configured",
+        exposedTools: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        transport: "http",
+        url: "https://mcp.linear.app/mcp"
+      };
+      state.mcpServers.push(racer);
+    });
+    const created = await syncProviderMcpServers(config);
+    expect(created).toEqual([]);
+  });
+
+  test("emits a mcp.configured audit with actor=runtime (not actor=user)", async () => {
+    const config = buildConfig("mcp-sync-audit-actor");
+    await mutateState(config.instance, (state) => {
+      state.connectors.push(newConnector({ id: "id_linear", instance: config.instance, health: "healthy" }));
+    });
+    await syncProviderMcpServers(config);
+    const state = readState(config.instance);
+    const auto = state.audit.find((a) => a.action === "mcp.auto_register");
+    expect(auto?.actor).toBe("runtime");
+    const configured = state.audit.find((a) => a.action === "mcp.configured");
+    expect(configured).toBeDefined();
+    // Runtime-driven creation must NOT look user-initiated.
+    expect(configured?.actor).toBe("runtime");
+  });
+
+  test("clean sync (no failure) leaves no mcp.auto_register_failed audit", async () => {
+    // Negative control for the failure path: a presence-only provider
+    // (no mcpServer descriptor) flips healthy and syncProviderMcpServers
+    // is effectively a no-op. The catch handler must not fire.
+    const config = buildConfig("mcp-sync-failure-clean");
+    await mutateState(config.instance, (state) => {
+      state.connectors.push({
+        id: "id_demo",
+        instance: config.instance,
+        name: "Demo",
+        provider: "demo",
+        status: "configured",
+        scopes: [],
+        secretRefs: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        health: "unknown",
+        source: "user"
+      });
+    });
+    const updated = await checkConnector(config, "id_demo");
+    expect(updated.health).toBe("healthy");
+    const state = readState(config.instance);
+    const failure = state.audit.find((a) => a.action === "mcp.auto_register_failed");
+    expect(failure).toBeUndefined();
   });
 });

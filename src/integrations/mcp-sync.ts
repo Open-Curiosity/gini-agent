@@ -13,9 +13,23 @@
 // `checkConnector`). `mcp.ts` itself depends on `./connectors`, so
 // importing back from there would create the cycle.
 
-import type { RuntimeConfig } from "../types";
+import type { ConnectorRecord, RuntimeConfig } from "../types";
 import { addAudit, createMcpServerRecord, mutateState, readState } from "../state";
 import { getProvider } from "./connectors/registry";
+
+// A connector is "usable" for auto-register iff it is configured and has
+// either confirmed healthy (probe ran) or — for probe-less providers —
+// has unknown health (no remote check exists). Anything else (disabled,
+// error, or unknown for a probe-based provider) defers registration so a
+// stale or never-probed credential can't be promoted to an MCP entry.
+function findUsableConnector(connectors: ConnectorRecord[], providerId: string, hasProbe: boolean): ConnectorRecord | undefined {
+  return connectors.find(
+    (c) =>
+      c.provider === providerId
+      && c.status === "configured"
+      && (c.health === "healthy" || (!hasProbe && c.health === "unknown"))
+  );
+}
 
 // Idempotently materialize an MCP server record for every provider that
 // declares one and has at least one configured + healthy connector. The
@@ -28,7 +42,9 @@ import { getProvider } from "./connectors/registry";
 //   - server startup (back-fill for connectors that pre-date this code)
 //
 // Returns the list of newly-created MCP server names so callers can log
-// or audit the transition.
+// or audit the transition. Names only appear in the return list when the
+// insert actually happened inside the lock (i.e. no concurrent CLI add /
+// connector disable raced ahead between our read and the mutate).
 export async function syncProviderMcpServers(config: RuntimeConfig): Promise<string[]> {
   const state = readState(config.instance);
   const created: string[] = [];
@@ -36,35 +52,36 @@ export async function syncProviderMcpServers(config: RuntimeConfig): Promise<str
   for (const providerId of providerIds) {
     const module = getProvider(providerId);
     if (!module?.mcpServer) continue;
-    // Only register once a connector is actually usable. Mirrors the same
-    // active-skill gate: `health: "unknown"` for a probe-based provider
-    // hasn't run a real probe yet, so we defer.
     const hasProbe = Boolean(module.probe);
-    const usable = state.connectors.find(
-      (c) =>
-        c.provider === providerId
-        && c.status === "configured"
-        && (c.health === "healthy" || (!hasProbe && c.health === "unknown"))
-    );
-    if (!usable) continue;
+    // Cheap pre-check outside the lock to skip providers that obviously
+    // have no usable connector. Authoritative check runs again inside the
+    // mutateState callback so a concurrent disable/delete can't slip a
+    // configured row past us.
+    if (!findUsableConnector(state.connectors, providerId, hasProbe)) continue;
     const desired = module.mcpServer;
-    // Name-based dedup: leave any existing entry (configured, disabled, or
-    // error) alone. The user's manual config wins.
     if (state.mcpServers.some((s) => s.name === desired.name)) continue;
-    await mutateState(config.instance, (mutating) => {
-      // Re-check inside the lock to avoid a race with a concurrent CLI
-      // `gini mcp add` that landed between our read and the mutate.
-      if (mutating.mcpServers.some((s) => s.name === desired.name)) return;
-      const record = createMcpServerRecord(mutating, {
-        name: desired.name,
-        command: "",
-        args: [],
-        envKeys: [],
-        exposedTools: desired.exposedTools ?? [],
-        transport: desired.transport ?? "http",
-        url: desired.url,
-        headers: desired.headers ? { ...desired.headers } : undefined
-      });
+    const inserted = await mutateState(config.instance, (mutating): { id: string; name: string } | undefined => {
+      // Re-check usability and existence inside the lock so we don't race
+      // with a concurrent `gini mcp add`, a connector delete that wiped
+      // the credential, or a `connector.disable` that flipped the row's
+      // status between our read and write.
+      const stillUsable = findUsableConnector(mutating.connectors, providerId, hasProbe);
+      if (!stillUsable) return undefined;
+      if (mutating.mcpServers.some((s) => s.name === desired.name)) return undefined;
+      const record = createMcpServerRecord(
+        mutating,
+        {
+          name: desired.name,
+          command: "",
+          args: [],
+          envKeys: [],
+          exposedTools: desired.exposedTools ?? [],
+          transport: desired.transport ?? "http",
+          url: desired.url,
+          headers: desired.headers ? { ...desired.headers } : undefined
+        },
+        { actor: "runtime" }
+      );
       addAudit(
         mutating,
         {
@@ -76,8 +93,9 @@ export async function syncProviderMcpServers(config: RuntimeConfig): Promise<str
         },
         { system: true }
       );
+      return { id: record.id, name: record.name };
     });
-    created.push(desired.name);
+    if (inserted) created.push(inserted.name);
   }
   return created;
 }
