@@ -45,18 +45,26 @@ export function tunnelPathPrefix(secret: string): string {
 
 /**
  * Returns the pathname remainder when `pathname` matches the tunnel prefix
- * for `secret`, or `null` when it does not. Used by the HTTP guard to
- * decide whether to bypass bearer-token auth and rewrite the request.
- *
- * Accepts the bare `/secret` form too (no trailing slash) so a user who
- * types the QR-encoded URL with the trailing slash trimmed off still
- * lands on the runtime root instead of a misleading 401.
+ * for `secret`, or `null` when it does not. The bare `/<secret>` form (no
+ * trailing slash) is reported separately via `stripTunnelPrefixWithKind`
+ * because callers must redirect to the slash form before serving the
+ * landing — otherwise relative links on that landing resolve against
+ * `/` instead of `/<secret>/` and lose the prefix.
  */
 export function stripTunnelPrefix(pathname: string, secret: string): string | null {
   const prefix = tunnelPathPrefix(secret);
-  if (pathname === `/${secret}`) return "/";
   if (pathname.startsWith(prefix)) return pathname.slice(prefix.length - 1);
   return null;
+}
+
+/**
+ * Detect whether `pathname` is the bare-secret form (no trailing slash).
+ * The HTTP guard uses this to 301 the browser to `/<secret>/` so links
+ * like `./api/status` rendered on the landing page resolve to
+ * `/<secret>/api/status` instead of `/api/status`.
+ */
+export function isBareTunnelPrefix(pathname: string, secret: string): boolean {
+  return pathname === `/${secret}`;
 }
 
 function base64UrlEncode(bytes: Uint8Array): string {

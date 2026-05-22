@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   generateSecret,
+  isBareTunnelPrefix,
   normalizeSecret,
   stripTunnelPrefix,
   tunnelPathPrefix
@@ -34,12 +35,23 @@ describe("secret-path", () => {
   test("stripTunnelPrefix removes the prefix and preserves the rest", () => {
     expect(stripTunnelPrefix("/abc/api/status", "abc")).toBe("/api/status");
     expect(stripTunnelPrefix("/abc/", "abc")).toBe("/");
-    expect(stripTunnelPrefix("/abc", "abc")).toBe("/");
+  });
+
+  test("stripTunnelPrefix returns null for the bare prefix (no trailing slash)", () => {
+    // The bare form is handled separately by the HTTP guard with a 301.
+    expect(stripTunnelPrefix("/abc", "abc")).toBeNull();
   });
 
   test("stripTunnelPrefix returns null when the prefix does not match", () => {
     expect(stripTunnelPrefix("/api/status", "abc")).toBeNull();
     expect(stripTunnelPrefix("/abc-other/api", "abc")).toBeNull();
     expect(stripTunnelPrefix("/zzz/abc/api", "abc")).toBeNull();
+  });
+
+  test("isBareTunnelPrefix detects the no-trailing-slash form only", () => {
+    expect(isBareTunnelPrefix("/abc", "abc")).toBe(true);
+    expect(isBareTunnelPrefix("/abc/", "abc")).toBe(false);
+    expect(isBareTunnelPrefix("/abc/api", "abc")).toBe(false);
+    expect(isBareTunnelPrefix("/other", "abc")).toBe(false);
   });
 });

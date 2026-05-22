@@ -134,7 +134,7 @@ describe("tunnel HTTP integration", () => {
     expect(html).toContain("api/status");
   });
 
-  test("tunneled GET /<secret> (no trailing slash) also lands on the landing", async () => {
+  test("tunneled GET /<secret> (no trailing slash) 301s to the slash form", async () => {
     const config = testConfig("tunnel-http-no-slash");
     const handler = createHandler(config, {
       tunnel: {
@@ -145,8 +145,13 @@ describe("tunnel HTTP integration", () => {
     const response = await handler(
       new Request("http://127.0.0.1:7337/abcdefghij0123456789")
     );
-    expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toContain("text/html");
+    // The relative links on the landing page (`./api/status`, etc.)
+    // would resolve against `/` if we served the landing directly at
+    // `/<secret>`, dropping the secret prefix. Redirecting first means
+    // every browser hits the landing with the URL bar already showing
+    // `/<secret>/` so subsequent navigation works.
+    expect(response.status).toBe(301);
+    expect(response.headers.get("location")).toContain("/abcdefghij0123456789/");
   });
 
   test("getSecret returning null disables the secret-path bypass entirely", async () => {

@@ -1,5 +1,5 @@
 export { encodeQr, renderQrAnsi, renderQrSvg, type QrMatrix } from "./qr";
-export { generateSecret, normalizeSecret, stripTunnelPrefix, tunnelPathPrefix } from "./secret-path";
+export { generateSecret, isBareTunnelPrefix, normalizeSecret, stripTunnelPrefix, tunnelPathPrefix } from "./secret-path";
 export {
   extractTunnelUrl,
   readTunnelUrlFromStream,

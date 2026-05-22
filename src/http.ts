@@ -2,6 +2,7 @@ import { writeFileSync } from "node:fs";
 import type { ApprovalMode, RuntimeConfig } from "./types";
 import {
   encodeQr,
+  isBareTunnelPrefix,
   renderQrAnsi,
   renderQrSvg,
   stripTunnelPrefix,
@@ -727,6 +728,18 @@ export function createHandler(
     let tunneled = false;
     let effectivePathname = url.pathname;
     if (secret) {
+      // Bare `/<secret>` (no trailing slash) is redirected to the slash
+      // form. Without this, the landing page renders fine but its
+      // relative links (`./api/status`, etc.) resolve against the parent
+      // directory of `/<secret>`, which is `/` — so clicking any link
+      // lands on `/api/status` (no secret prefix) and returns 401. A 301
+      // teaches the browser to update the URL bar before rendering, and
+      // all subsequent relative resolution stays inside `/<secret>/...`.
+      if (isBareTunnelPrefix(url.pathname, secret) && request.method === "GET") {
+        const redirected = new URL(url.toString());
+        redirected.pathname = `/${secret}/`;
+        return Response.redirect(redirected.toString(), 301);
+      }
       const stripped = stripTunnelPrefix(url.pathname, secret);
       if (stripped !== null) {
         tunneled = true;
