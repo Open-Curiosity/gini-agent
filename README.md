@@ -109,32 +109,23 @@ If you're working on gini-agent itself and want to test the install/update/unins
 
 This is the same as the default install except it clones from your local repo into `~/.gini/runtime`. After you commit changes locally, `gini update` will pull them in. `gini uninstall` works exactly the same as a real install (same marker, same wrapper path).
 
-## Common Commands
+## CLI
+
+The CLI covers chat, runs, tasks, approvals, memory, jobs, connectors, providers, snapshots, imports, and more. Discover commands with:
 
 ```bash
-bun run gini status
-bun run gini chat new
-bun run gini chat send <session-id> "remember Gini should keep work inspectable"
-bun run gini runs list
-bun run gini task submit "read docs and summarize the gateway"
-bun run gini approvals
-bun run gini memory recall "<query>"
-bun run gini job add heartbeat 60 "check runtime health"
-bun run gini connectors health
-bun run gini evidence
-bun run gini search "runtime memory"
-bun run gini toolsets
-bun run gini subagent spawn reviewer "review recent traces"
-bun run gini mcp add demo echo ok
-bun run gini messaging add local demo local
-bun run gini messaging add tg telegram <chat-id> --bot-token <bot-token>
-bun run gini messaging add disc discord <channel-id> --bot-token <bot-token>
-bun run gini import inspect openclaw ~/.openclaw
-bun run gini import plan openclaw                # dry-run summary
-bun run gini import apply openclaw [--force]     # migrate openclaw → gini
-bun run gini snapshot create "before trying candidate"
-bun run gini provider show
+gini --help
 ```
+
+Useful starting points:
+
+```bash
+gini status        # runtime health and URLs
+gini chat new      # start a chat session
+gini approvals     # review pending tool approvals
+```
+
+(From a repo clone, prefix with `bun run`.)
 
 ## Providers
 
