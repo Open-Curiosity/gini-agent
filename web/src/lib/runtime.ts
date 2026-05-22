@@ -126,11 +126,23 @@ export async function proxyRequest(
   pathSegments: string[],
   options: ProxyOptions
 ): Promise<Response> {
-  const guard = guardPrivilegedRequest(request, pathSegments);
+  // Canonicalize before guard + forward. Without this, a request to
+  // /api/runtime/x/%252e%252e/messaging/<bridge>/allow reaches the BFF as
+  // pathSegments ["x", "%2e%2e", "messaging", "<bridge>", "allow"] — the
+  // guard regex misses (path doesn't start with "messaging"), the BFF
+  // forwards via fetch(), which collapses the dot-segment in flight, and
+  // the gateway happily executes allowChat under the operator's bearer.
+  // Recursively decoding each segment and rejecting traversal/slash
+  // markers closes the bypass before either the regex check or the
+  // outbound URL construction.
+  const canonical = canonicalizeSegments(pathSegments);
+  if (!canonical) return Response.json({ error: "Invalid path" }, { status: 400 });
+
+  const guard = guardPrivilegedRequest(request, canonical);
   if (guard) return guard;
 
   const upstreamUrl = new URL(request.url);
-  const target = `${options.runtimeUrl}/api/${pathSegments.join("/")}${upstreamUrl.search}`;
+  const target = `${options.runtimeUrl}/api/${canonical.join("/")}${upstreamUrl.search}`;
   const headers = pickForwardHeaders(request.headers);
   headers.set("authorization", `Bearer ${options.token}`);
   const init: RequestInit = { method: request.method, headers };
@@ -161,6 +173,35 @@ export async function proxyRequest(
     status: upstream.status,
     headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" }
   });
+}
+
+// Decode each segment until stable and reject anything that would let the
+// upstream see a different path than the BFF guard does — empty segments,
+// `.` / `..`, embedded `/`, or any non-printable byte. Returns null when the
+// request must be refused outright. Used by proxyRequest to keep the regex
+// match honest about what the gateway will execute.
+const MAX_DECODE_DEPTH = 5;
+function canonicalizeSegments(segments: string[]): string[] | null {
+  const out: string[] = [];
+  for (let segment of segments) {
+    let depth = 0;
+    while (depth < MAX_DECODE_DEPTH) {
+      let next: string;
+      try {
+        next = decodeURIComponent(segment);
+      } catch {
+        return null;
+      }
+      if (next === segment) break;
+      segment = next;
+      depth += 1;
+    }
+    if (segment === "" || segment === "." || segment === "..") return null;
+    if (segment.includes("/") || segment.includes("\\")) return null;
+    if (/[\x00-\x1f\x7f]/.test(segment)) return null;
+    out.push(segment);
+  }
+  return out;
 }
 
 function guardPrivilegedRequest(request: Request, pathSegments: string[]): Response | null {
