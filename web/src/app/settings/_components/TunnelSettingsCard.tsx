@@ -80,15 +80,8 @@ export function TunnelSettingsCard() {
   // Cache-buster ties the QR fetch to the observedAt timestamp so a fresh
   // tunnel URL always pulls a fresh SVG (the cache headers say no-store
   // but a stale browser-cached image would otherwise be a footgun).
-  // The tunnel-prefix lookup mirrors the api() helper: when the page is
-  // accessed through cloudflared, the URL bar carries `/<secret>/`; we
-  // re-attach that prefix to image src so the proxy's no-secret gate
-  // doesn't 404 the QR.
-  const tunnelPrefix = typeof window !== "undefined"
-    ? window.location.pathname.match(/^(\/[A-Za-z0-9_-]{16,128})\//)?.[1] ?? ""
-    : "";
   const qrSrc = liveUrl && snapshot.data?.observedAt
-    ? `${tunnelPrefix}/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(snapshot.data.observedAt)}`
+    ? `/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(snapshot.data.observedAt)}`
     : null;
 
   return (

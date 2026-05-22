@@ -53,10 +53,23 @@ async function isProviderConfigured(): Promise<boolean | null> {
 
 // Per-instance tunnel secret. Injected by the runtime when it spawns the
 // Next.js child (see src/cli/process.ts `GINI_TUNNEL_SECRET`). Empty
-// string when the feature is not configured; in that case the
-// secret-path strip is skipped entirely and external requests are
-// 404'd.
+// string when the feature is not configured; in that case external
+// requests are 404'd.
 const TUNNEL_SECRET = process.env.GINI_TUNNEL_SECRET ?? "";
+
+// Cookie name + lifetime for the post-bootstrap tunnel session. The
+// secret in the URL is a bootstrap credential: the first request must
+// carry `/<secret>/` so the proxy can verify ownership, after which it
+// mints an HttpOnly cookie that authorizes subsequent same-origin
+// requests (page navigations, API calls, asset fetches). Without this,
+// every JS-issued `fetch("/api/runtime/...")` from a tunneled page
+// would need to know the secret and prepend it manually, which the dev
+// bundle keeps fumbling because hot-module updates don't survive
+// cloudflared (the HMR websocket is gated alongside everything else).
+const SESSION_COOKIE = "gini_tunnel_session";
+// One day — secrets rotate every gateway restart anyway, so a stale
+// cookie just stops working at next reboot.
+const SESSION_TTL_SECONDS = 60 * 60 * 24;
 
 export async function proxy(request: NextRequest): Promise<NextResponse> {
   const host = request.headers.get("host") ?? "";
@@ -64,51 +77,45 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   const { pathname } = request.nextUrl;
 
   if (!isLocalHost) {
-    // External host (cloudflared): every request must carry the secret
-    // prefix, including API calls. Previously the matcher excluded
-    // `/api/*`, which meant anyone who knew the trycloudflare hostname
-    // could reach `/api/runtime/state`, `/tasks`, `/memory`, etc. — the
-    // BFF would forward to the runtime with the operator's bearer token
-    // injected server-side. Now the proxy runs for every path (the
-    // matcher gates only on `_next/static`, `_next/image`, and
-    // `favicon.ico`), and tunneled requests without the secret prefix
-    // 404 here before any auth-bearing BFF route is reached.
+    // External host (cloudflared): one of two auth paths must be present
+    // before we'll forward anything to the BFF — which auto-injects the
+    // operator's bearer token, so passing through unauthenticated would
+    // hand authenticated /api/* access to anyone who learned the
+    // trycloudflare hostname.
+    //
+    //   1. URL contains `/<secret>/...` — initial bootstrap. We strip
+    //      the prefix and set a HttpOnly session cookie before
+    //      rewriting.
+    //   2. The session cookie matches the secret — subsequent requests
+    //      no longer need the prefix in the URL, so the page's relative
+    //      `fetch("/api/runtime/...")` calls just work.
     if (!TUNNEL_SECRET) return new NextResponse("Not Found", { status: 404 });
     const prefix = `/${TUNNEL_SECRET}`;
-    // Bare `/<secret>` (no trailing slash) — Next 16 normalizes away the
-    // trailing slash on outbound URLs, which turned a previous
-    // `redirect("/<secret>/")` into a 308 that pointed back to
-    // `/<secret>` and locked the browser in a redirect loop.
-    // Treat the bare form as an unmatched path; clients (including the
-    // QR-encoded URL) always include the trailing slash so this only
-    // affects hand-typed inputs, where a clean 404 beats a broken loop.
-    if (!pathname.startsWith(`${prefix}/`)) {
+    const hasPrefix = pathname.startsWith(`${prefix}/`);
+    const cookieAuth = request.cookies.get(SESSION_COOKIE)?.value === TUNNEL_SECRET;
+    if (!hasPrefix && !cookieAuth) {
       return new NextResponse("Not Found", { status: 404 });
     }
-    const stripped = pathname.slice(prefix.length) || "/";
-    // After strip: API calls go straight through with the secret-stripped
-    // path so the BFF routes match. Page navigations rewrite to the
-    // un-prefixed app-router path and continue through the setup gate.
-    if (stripped.startsWith("/api/")) {
-      const rewritten = request.nextUrl.clone();
-      rewritten.pathname = stripped;
-      return NextResponse.rewrite(rewritten);
+    const stripped = hasPrefix ? (pathname.slice(prefix.length) || "/") : pathname;
+
+    // Apply the same setup gate localhost requests get, but only on
+    // page navigations (not API or _next/* asset fetches that the page
+    // makes on the way in).
+    if (!stripped.startsWith("/api/") && !stripped.startsWith("/setup")) {
+      const configured = await isProviderConfigured();
+      if (configured === false) {
+        const setupUrl = new URL("/setup", request.url);
+        const setupRedirect = NextResponse.redirect(setupUrl);
+        if (hasPrefix) attachSession(setupRedirect);
+        return setupRedirect;
+      }
     }
-    // Page request: rewrite and then run the same setup gate localhost
-    // requests use, so a tunneled `/setup` flow still works.
-    if (stripped.startsWith("/setup")) {
-      const rewritten = request.nextUrl.clone();
-      rewritten.pathname = stripped;
-      return NextResponse.rewrite(rewritten);
-    }
-    const configured = await isProviderConfigured();
-    if (configured === false) {
-      const setupUrl = new URL(`${prefix}/setup`, request.url);
-      return NextResponse.redirect(setupUrl);
-    }
+
     const rewritten = request.nextUrl.clone();
     rewritten.pathname = stripped;
-    return NextResponse.rewrite(rewritten);
+    const response = NextResponse.rewrite(rewritten);
+    if (hasPrefix) attachSession(response);
+    return response;
   }
 
   // Localhost: existing setup gate.
@@ -121,6 +128,16 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     return NextResponse.redirect(setupUrl);
   }
   return NextResponse.next();
+}
+
+function attachSession(response: NextResponse): void {
+  response.cookies.set(SESSION_COOKIE, TUNNEL_SECRET, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "lax",
+    path: "/",
+    maxAge: SESSION_TTL_SECONDS
+  });
 }
 
 export const config = {
