@@ -20,13 +20,13 @@ import {
   useCreateChat,
   useUseAgent
 } from "@/src/queries";
-import { avatarColor, avatarInitial, theme } from "@/src/theme";
+import { theme } from "@/src/theme";
 import type { AgentRecord, ChatSession } from "@/src/types";
 
 // Home screen: a full-width chat list for the currently selected agent.
 // The agent picker lives in the native stack header — tapping the title
-// opens a slide-up Modal listing every agent. Settings and "+" share the
-// right side of the header.
+// opens a slide-up Modal listing every agent. The "New" and "Settings"
+// text actions share the right side of the header.
 export default function AgentsScreen() {
   const agents = useAgents();
   const useAgent = useUseAgent();
@@ -217,7 +217,7 @@ function HeaderActions({
           {creating ? (
             <ActivityIndicator color={theme.accent} />
           ) : (
-            <Text style={styles.headerPlus}>＋</Text>
+            <Text style={styles.headerActionText}>New</Text>
           )}
         </TouchableOpacity>
       ) : null}
@@ -228,7 +228,7 @@ function HeaderActions({
         accessibilityRole="button"
         accessibilityLabel="Settings"
       >
-        <Text style={styles.headerGlyph}>⚙</Text>
+        <Text style={styles.headerActionText}>Settings</Text>
       </TouchableOpacity>
     </View>
   );
@@ -379,22 +379,6 @@ function ChatRow({
       activeOpacity={0.7}
       style={styles.chatRow}
     >
-      <View style={styles.chatRowAvatar}>
-        {agent ? (
-          <View
-            style={[
-              styles.chatAvatar,
-              { backgroundColor: avatarColor(agent.id) }
-            ]}
-          >
-            <Text style={styles.chatAvatarText}>
-              {avatarInitial(agent.name)}
-            </Text>
-          </View>
-        ) : (
-          <View style={[styles.chatAvatar, { backgroundColor: theme.inputBg }]} />
-        )}
-      </View>
       <View style={styles.chatRowBody}>
         <View style={styles.chatRowTopLine}>
           <Text style={styles.chatRowTitle} numberOfLines={1}>
@@ -501,14 +485,6 @@ function AgentPickerRow({
       accessibilityLabel={`Select agent ${agent.name}`}
       accessibilityState={{ selected }}
     >
-      <View
-        style={[
-          styles.pickerAvatar,
-          { backgroundColor: avatarColor(agent.id) }
-        ]}
-      >
-        <Text style={styles.pickerAvatarText}>{avatarInitial(agent.name)}</Text>
-      </View>
       <View style={styles.pickerBody}>
         <Text style={styles.pickerTitle} numberOfLines={1}>
           {agent.name}
@@ -543,36 +519,25 @@ const styles = StyleSheet.create({
   headerChevron: { color: theme.subtle, fontSize: 14 },
   headerActions: { flexDirection: "row", alignItems: "center", gap: 4 },
   headerAction: {
-    width: 36,
     height: 36,
+    paddingHorizontal: 8,
     alignItems: "center",
     justifyContent: "center"
   },
-  headerPlus: { color: theme.accent, fontSize: 26, fontWeight: "600" },
-  headerGlyph: { color: theme.subtle, fontSize: 22 },
+  headerActionText: { color: theme.accent, fontSize: 15, fontWeight: "500" },
 
   // Chat rows.
   chatRow: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 16,
-    paddingVertical: 12,
-    gap: 12
+    paddingVertical: 12
   },
   chatRowSeparator: {
     height: StyleSheet.hairlineWidth,
     backgroundColor: theme.border,
-    marginLeft: 16 + 44 + 12 // align with title text, past the avatar
+    marginLeft: 16 // align with title text
   },
-  chatRowAvatar: { width: 44 },
-  chatAvatar: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    alignItems: "center",
-    justifyContent: "center"
-  },
-  chatAvatarText: { color: "#FFFFFF", fontSize: 16, fontWeight: "600" },
   chatRowBody: { flex: 1, gap: 2 },
   chatRowTopLine: { flexDirection: "row", alignItems: "baseline", gap: 8 },
   chatRowTitle: { flex: 1, color: theme.text, fontSize: 16, fontWeight: "600" },
@@ -642,17 +607,8 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 16,
-    paddingVertical: 12,
-    gap: 12
+    paddingVertical: 12
   },
-  pickerAvatar: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    alignItems: "center",
-    justifyContent: "center"
-  },
-  pickerAvatarText: { color: "#FFFFFF", fontSize: 16, fontWeight: "600" },
   pickerBody: { flex: 1, gap: 2 },
   pickerTitle: { color: theme.text, fontSize: 16, fontWeight: "600" },
   pickerSubtitle: { color: theme.subtle, fontSize: 13 },
