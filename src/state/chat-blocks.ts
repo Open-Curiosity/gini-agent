@@ -314,6 +314,48 @@ export function insertChatBlock(
   }
 }
 
+// Finds the latest in-flight (streaming) assistant_text block for a
+// task. Used by the cancellation path in agent.ts to flip the row to
+// `streaming: false` while preserving the partial text observed so far
+// (ADR chat-block-protocol.md risks §4). Returns the block id, full
+// accreted text, and session id so the caller can route both the
+// finalize and the follow-on system_note through the same session.
+// Returns null when the task has no chat session bound, no streaming
+// row, or the schema has no chat_blocks rows yet.
+export function findInFlightAssistantTextForTask(
+  instance: Instance,
+  taskId: string
+): { blockId: string; sessionId: string; text: string } | null {
+  const db = getMemoryDb(instance);
+  // Search for the latest assistant_text row that's still streaming and
+  // was emitted by this task. Streaming rows have `payload.streaming
+  // === true`; we use json_extract because the column lives in
+  // payload_json. There's at most one in practice (a single in-flight
+  // assistant_text per loop iteration), but ordering by ordinal DESC
+  // makes the read deterministic regardless.
+  const row = db
+    .query<ChatBlockRow, [string]>(
+      `SELECT * FROM chat_blocks
+       WHERE task_id = ? AND kind = 'assistant_text'
+         AND json_extract(payload_json, '$.streaming') = 1
+       ORDER BY ordinal DESC
+       LIMIT 1`
+    )
+    .get(taskId);
+  if (!row) return null;
+  let payload: Record<string, unknown> = {};
+  try {
+    payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+  } catch {
+    payload = {};
+  }
+  return {
+    blockId: row.id,
+    sessionId: row.session_id,
+    text: String(payload.text ?? "")
+  };
+}
+
 // Updates an existing assistant_text block's text + updated_at without
 // allocating a new ordinal. Used by the streaming-delta path: the first
 // delta inserts the block via insertChatBlock; subsequent deltas flow

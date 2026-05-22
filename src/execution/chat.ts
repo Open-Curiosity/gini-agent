@@ -5,6 +5,7 @@ import {
   createChatMessage,
   createChatSession,
   deleteChatSession,
+  insertChatBlock,
   isTerminalTaskStatus,
   mutateState,
   readState,
@@ -154,6 +155,29 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
       runRecord.updatedAt = message.createdAt;
     }
   });
+  // Dual-publish the user_text ChatBlock alongside the legacy
+  // ChatMessageRecord during the migration window (ADR
+  // chat-block-protocol.md). Both writes are best-effort independent:
+  // a SQLite open failure here must not roll back the user's message,
+  // and a JSON state failure above must not block the chat-block row
+  // (the loop's later emissions tolerate missing user_text). Errors are
+  // logged via appendLog so operators can spot drift.
+  try {
+    insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId,
+      text: content,
+      taskId: task.id,
+      runId: run.id,
+      agentId: session.agentId ?? null
+    });
+  } catch (error) {
+    appendLog(config.instance, "chat.user_block.insert_failed", {
+      sessionId,
+      taskId: task.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
   return { sessionId, runId: run.id, taskId: task.id, status: task.status };
 }
 

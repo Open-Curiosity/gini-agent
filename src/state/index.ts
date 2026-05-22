@@ -82,6 +82,7 @@ export {
   listChatBlocks,
   listChatBlocksAfter,
   deleteChatBlocksForSession,
+  findInFlightAssistantTextForTask,
   subscribeChatBlocks
 } from "./chat-blocks";
 export type { InsertChatBlockInput } from "./chat-blocks";
