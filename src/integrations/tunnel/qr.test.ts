@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { encodeQr, renderQrAnsi, renderQrSvg } from "./qr";
+import jsQR from "jsqr";
+import { encodeQr, renderQrAnsi, renderQrSvg, type QrMatrix } from "./qr";
 
 describe("qr encoder", () => {
   test("encodes a short payload into a v1 21x21 matrix with the three finder patterns", () => {
-    // 17 byte-mode bytes is the v1+ECL=L ceiling: 4 (mode) + 8 (count) +
-    // 17*8 (data) + 4 (terminator) = 152 bits = 19 codewords. Anything
+    // 14 byte-mode bytes is the v1 + ECL=M ceiling: 4 (mode) + 8 (count) +
+    // 14*8 (data) + 4 (terminator) = 128 bits = 16 codewords. Anything
     // larger spills into v2 (25-module edge).
-    const matrix = encodeQr("hello-world-12345");
+    const matrix = encodeQr("hello-world-12");
     expect(matrix.length).toBe(21);
     expect(matrix[0]!.length).toBe(21);
     // Each finder pattern is a 7x7 block with a solid border, white ring,
@@ -31,12 +32,13 @@ describe("qr encoder", () => {
     expect(matrix.length).toBeGreaterThanOrEqual(29);
   });
 
-  test("rejects payloads that exceed v10 byte-mode capacity", () => {
-    expect(() => encodeQr("a".repeat(2048))).toThrow(/Payload too large/);
+  test("rejects payloads that exceed the maximum QR capacity", () => {
+    // 3000 bytes exceeds v40 ECL=M (2331 byte-mode bytes).
+    expect(() => encodeQr("a".repeat(3000))).toThrow(/too big/);
   });
 
   test("renderQrAnsi produces 13 rows for a v1 + default padding", () => {
-    const matrix = encodeQr("hello-world-12345");
+    const matrix = encodeQr("hello-world-12");
     const ansi = renderQrAnsi(matrix);
     // 21 modules + 2*2 padding = 25 cells per edge; half-block rendering
     // packs two rows per terminal line so we expect ceil(25/2) = 13.
@@ -48,7 +50,7 @@ describe("qr encoder", () => {
   });
 
   test("renderQrSvg produces a square SVG matching matrix size", () => {
-    const matrix = encodeQr("hello-world-12345");
+    const matrix = encodeQr("hello-world-12");
     const svg = renderQrSvg(matrix, { moduleSize: 4, padding: 1 });
     // 21 + 2 padding = 23 modules; module size 4 → 92x92 SVG.
     expect(svg).toContain('width="92" height="92"');
@@ -60,50 +62,105 @@ describe("qr encoder", () => {
     expect(svg).toContain('fill="#000000"');
   });
 
+  test("renderQrSvg defaults to a 4-module quiet zone", () => {
+    // ISO/IEC 18004 §6.3.8 requires a 4-module quiet zone; iOS Camera
+    // refuses anything smaller. v1 = 21 modules, 8 px per module, 4
+    // padding modules per side → (21 + 8) * 8 = 232 px.
+    const matrix = encodeQr("hello-world-12");
+    const svg = renderQrSvg(matrix);
+    expect(svg).toContain('width="232" height="232"');
+  });
+
   test("identical payloads produce identical matrices", () => {
     const a = encodeQr("https://x.trycloudflare.com/sample-secret/");
     const b = encodeQr("https://x.trycloudflare.com/sample-secret/");
     expect(JSON.stringify(a)).toBe(JSON.stringify(b));
   });
 
-  // Golden snapshot. The matrix below was captured from the current encoder
-  // for the input `https://gini.example.com/abc` and then verified to scan
-  // correctly by a real phone camera against the rendered SVG. Any change
-  // to the encoding pipeline (mask selection, Reed-Solomon parity, data
-  // placement, format-info bits) will diff this snapshot. When the diff is
-  // intentional, regenerate the snapshot AND re-verify the new output with
-  // a physical scanner — structural checks above cannot prove
+  // Golden snapshot. The matrix below was captured from the qrcode library
+  // wrapped by encodeQr for the input `https://gini.example.com/abc` and
+  // verified to scan correctly by a real phone camera against the rendered
+  // SVG. Any change to the encoder (library version, error correction
+  // level, mask selection) will diff this snapshot. When the diff is
+  // intentional, regenerate the snapshot AND re-verify the new output
+  // with a physical scanner — structural checks above cannot prove
   // scanner-compatibility on their own.
   test("matches golden vector for a known URL payload", () => {
     const matrix = encodeQr("https://gini.example.com/abc");
     const golden = [
-      "1111111011000010101111111",
-      "1000001011011001101000001",
-      "1011101011110001101011101",
-      "1011101011011110001011101",
-      "1011101010101100101011101",
-      "1000001000100011101000001",
-      "1111111010101010101111111",
-      "0000000010011001000000000",
-      "0101011011101111011011111",
-      "1110100001010000100100010",
-      "0110111111001011000111011",
-      "1101110111111011011100001",
-      "0100101111001100111010111",
-      "1110110010110100100101010",
-      "1000001100100111110111011",
-      "1010100011101001100110001",
-      "1001111011001111111110100",
-      "0000000010110001100011000",
-      "1111111000100100101010111",
-      "1000001011110010100011001",
-      "1011101000111111111110110",
-      "1011101010111101111011111",
-      "1011101000000110100001101",
-      "1000001010100011100111001",
-      "1111111001011111011111111"
+      "11111110010111110111101111111",
+      "10000010001111111100101000001",
+      "10111010111101010001001011101",
+      "10111010100110110100001011101",
+      "10111010110010011111101011101",
+      "10000010100000000000001000001",
+      "11111110101010101010101111111",
+      "00000000110110101001100000000",
+      "10111110001110001111001111100",
+      "11100101000101110111011010001",
+      "00010011011011111100101110000",
+      "00110100110001010000111001010",
+      "00000111001000110100000001100",
+      "01001001100010011011111110001",
+      "10110010101010000010000001100",
+      "10001101110100101000100100010",
+      "11110010101100001101000001100",
+      "10111001111001110011101110101",
+      "10011011100101111110011110100",
+      "10110101011011010010010000010",
+      "10110010011000110100111110111",
+      "00000000110110011011100011111",
+      "11111110011000000111101011100",
+      "10000010101010101001100010010",
+      "10111010101010001010111110101",
+      "10111010100100110111000001100",
+      "10111010110100011101111111110",
+      "10000010000111110110110101010",
+      "11111110100110110001000110100"
     ];
     const actual = matrix.map((row) => row.map((cell) => (cell ? "1" : "0")).join(""));
     expect(actual).toEqual(golden);
   });
+
+  // Round-trip: encode → rasterize → decode with jsQR (the same algorithm
+  // library scanners use). A regression in the encoder or in the SVG
+  // module-placement that bypasses ECC will fail this test even when the
+  // structural finder-pattern checks above pass. iPhone Camera was
+  // rejecting an earlier hand-rolled encoder despite finders looking
+  // right; this test would have caught it.
+  test("round-trips a realistic tunnel URL through jsQR", () => {
+    const payload = "https://lonely-loans-mitsubishi-engaging.trycloudflare.com/ugQtex3PRbzyPVG3ovPO8L8YNT2jePQC/";
+    const matrix = encodeQr(payload);
+    const { pixels, dim } = rasterize(matrix, { moduleSize: 8, padding: 4 });
+    const decoded = jsQR(pixels, dim, dim);
+    expect(decoded).not.toBeNull();
+    expect(decoded!.data).toBe(payload);
+  });
 });
+
+// Painters a QR matrix into a Uint8ClampedArray of RGBA bytes the same way
+// renderQrSvg does, so we can hand the pixels straight to jsQR without
+// going through an SVG renderer.
+function rasterize(
+  matrix: QrMatrix,
+  options: { moduleSize: number; padding: number }
+): { pixels: Uint8ClampedArray; dim: number } {
+  const { moduleSize, padding } = options;
+  const size = matrix.length;
+  const dim = (size + padding * 2) * moduleSize;
+  const pixels = new Uint8ClampedArray(dim * dim * 4);
+  for (let py = 0; py < dim; py += 1) {
+    for (let px = 0; px < dim; px += 1) {
+      const mx = Math.floor(px / moduleSize) - padding;
+      const my = Math.floor(py / moduleSize) - padding;
+      const dark = mx >= 0 && my >= 0 && mx < size && my < size && matrix[my]![mx];
+      const offset = (py * dim + px) * 4;
+      const gray = dark ? 0 : 255;
+      pixels[offset] = gray;
+      pixels[offset + 1] = gray;
+      pixels[offset + 2] = gray;
+      pixels[offset + 3] = 255;
+    }
+  }
+  return { pixels, dim };
+}
