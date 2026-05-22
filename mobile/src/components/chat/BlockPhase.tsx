@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { Animated, Easing, StyleSheet, Text, View } from "react-native";
-import { theme } from "@/src/theme";
+import { family, theme } from "@/src/theme";
 import type { PhaseBlock } from "@/src/types";
 
 // Phase indicator driven by the block's `label`. The runtime owns the
@@ -10,7 +10,9 @@ import type { PhaseBlock } from "@/src/types";
 //
 // The bouncing-dots animation only renders for non-terminal phases. A
 // completed/cancelled/failed phase is a historical marker that should
-// sit quietly in the transcript without pulling the eye.
+// sit quietly in the transcript without pulling the eye — though the
+// chat detail screen filters those out at the parent level anyway, so
+// in practice this component renders only for in-flight phases.
 const TERMINAL_LABELS = new Set<string>(["Completed", "Cancelled", "Failed"]);
 
 export function BlockPhase({ block }: { block: PhaseBlock }) {
@@ -58,7 +60,11 @@ function Dot({ delay }: { delay: number }) {
   }, [v, delay]);
   const translateY = v.interpolate({ inputRange: [0, 1], outputRange: [0, -3] });
   const opacity = v.interpolate({ inputRange: [0, 1], outputRange: [0.4, 1] });
-  return <Animated.View style={[styles.dot, { transform: [{ translateY }], opacity }]} />;
+  return (
+    <Animated.View
+      style={[styles.dot, { transform: [{ translateY }], opacity }]}
+    />
+  );
 }
 
 const styles = StyleSheet.create({
@@ -68,14 +74,18 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 8,
     paddingHorizontal: 4,
-    paddingVertical: 6
+    paddingVertical: 4
   },
-  label: { color: theme.subtle, fontSize: 13, fontStyle: "italic" },
+  label: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 13
+  },
   dots: { flexDirection: "row", alignItems: "center", gap: 4 },
   dot: {
     width: 5,
     height: 5,
     borderRadius: 2.5,
-    backgroundColor: theme.subtle
+    backgroundColor: theme.muted
   }
 });

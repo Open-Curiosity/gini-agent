@@ -1,10 +1,12 @@
 import { StyleSheet, Text, View } from "react-native";
-import { theme } from "@/src/theme";
+import { family, theme } from "@/src/theme";
 import type { UserTextBlock } from "@/src/types";
 
-// User turns sit on the right with the accent-tinted bubble that matches
-// the rest of the chat surface. No avatar — the brief explicitly avoids
-// icon decoration, and alignment is enough of a signal on its own.
+// Right-aligned dark bubble. The asymmetric corner geometry has a
+// sharper bottom-left so the bubble visually "points" toward the
+// user-bubble corner of the conversation (which is the closest edge to
+// the input bar). No author/time header — the design uses alignment
+// and color alone as the role signal.
 export function BlockUserText({ block }: { block: UserTextBlock }) {
   return (
     <View style={styles.row}>
@@ -20,18 +22,24 @@ export function BlockUserText({ block }: { block: UserTextBlock }) {
 const styles = StyleSheet.create({
   row: {
     alignSelf: "flex-end",
-    maxWidth: "85%"
+    maxWidth: "80%"
   },
   bubble: {
     backgroundColor: theme.userBubble,
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 16,
-    borderTopRightRadius: 4
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    // RN takes the four corner radii individually — top-left, top-right,
+    // bottom-right, bottom-left. The bottom-right corner is the sharp
+    // one for the user bubble (mirrors the Pencil design).
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    borderBottomRightRadius: 4,
+    borderBottomLeftRadius: 18
   },
   text: {
+    color: theme.userBubbleText,
+    fontFamily: family("HankenGrotesk", 500),
     fontSize: 16,
-    lineHeight: 22,
-    color: theme.userBubbleText
+    lineHeight: 22
   }
 });

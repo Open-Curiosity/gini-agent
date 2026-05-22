@@ -1,17 +1,21 @@
 import { StyleSheet, Text, View } from "react-native";
-import { theme } from "@/src/theme";
+import { family, theme } from "@/src/theme";
 import type { ApprovalRequestedBlock } from "@/src/types";
 
 // Approval bubble. Mobile in this round doesn't have the approve/deny
 // mutations wired (web carries the AddConnectorDialog + the
-// /approvals/:id/{approve,deny,connect} POSTs), so we render a warning
-// card with the summary and a hint to open the chat on the web. Future
-// rounds can layer the actions onto this same component.
+// /approvals/:id/{approve,deny,connect} POSTs), so we render a quiet
+// white card with the summary and a hint to open the chat on the web.
+// Future rounds can layer the actions onto this same component.
 //
 // The bubble stays in the chat log forever — the runtime never deletes
 // approval rows, and the visual treatment lets the user see the
 // historical gate decision without losing the chat narrative.
-export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBlock }) {
+export function BlockApprovalRequested({
+  block
+}: {
+  block: ApprovalRequestedBlock;
+}) {
   return (
     <View style={styles.row}>
       <View style={styles.header}>
@@ -19,47 +23,45 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
         <Text style={[styles.risk, riskStyle(block.risk)]}>{block.risk}</Text>
       </View>
       <Text style={styles.summary}>{block.summary}</Text>
-      <Text style={styles.hint}>
-        Approve or deny this on the web client.
-      </Text>
+      <Text style={styles.hint}>Approve or deny this on the web client.</Text>
     </View>
   );
 }
 
 // Color the risk pill so the user gets a quick glanceable severity cue.
-// We keep the warning amber for the card border and reserve red only for
-// high risk.
+// We keep the warning amber for medium and reserve red only for high.
 function riskStyle(risk: string) {
-  if (risk === "high") return { backgroundColor: "rgba(229, 83, 83, 0.18)", color: theme.danger };
-  if (risk === "medium") return { backgroundColor: "rgba(250, 167, 48, 0.18)", color: "#FAA730" };
-  return { backgroundColor: "rgba(123, 200, 98, 0.18)", color: "#7BC862" };
+  if (risk === "high")
+    return { backgroundColor: "rgba(255, 59, 48, 0.12)", color: theme.danger };
+  if (risk === "medium")
+    return { backgroundColor: "rgba(255, 149, 0, 0.14)", color: "#B26200" };
+  return { backgroundColor: "rgba(52, 199, 89, 0.14)", color: "#0E7A2A" };
 }
 
 const styles = StyleSheet.create({
   row: {
     alignSelf: "stretch",
-    maxWidth: "92%",
-    padding: 10,
-    borderRadius: 10,
+    backgroundColor: theme.bg,
+    padding: 12,
+    borderRadius: 12,
     borderWidth: 1,
-    borderColor: "rgba(250, 167, 48, 0.4)",
-    backgroundColor: "rgba(250, 167, 48, 0.08)"
+    borderColor: theme.inputBorder,
+    gap: 6
   },
   header: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
-    marginBottom: 4
+    gap: 8
   },
   action: {
     color: theme.text,
+    fontFamily: family("JetBrainsMono"),
     fontSize: 12,
-    fontFamily: "Menlo",
     flexShrink: 1
   },
   risk: {
+    fontFamily: family("HankenGrotesk", 700),
     fontSize: 10,
-    fontWeight: "700",
     textTransform: "uppercase",
     paddingHorizontal: 6,
     paddingVertical: 2,
@@ -68,13 +70,14 @@ const styles = StyleSheet.create({
   },
   summary: {
     color: theme.text,
-    fontSize: 13,
-    lineHeight: 18,
-    marginBottom: 6
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 14,
+    lineHeight: 19
   },
   hint: {
-    color: theme.subtle,
-    fontSize: 11,
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 12,
     fontStyle: "italic"
   }
 });

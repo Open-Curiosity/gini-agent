@@ -1,12 +1,41 @@
+import { Feather } from "@expo/vector-icons";
 import { useState } from "react";
 import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
-import { theme } from "@/src/theme";
+import { family, theme } from "@/src/theme";
 import type { ToolCallBlock, ToolResultBlock } from "@/src/types";
 
-// Single inline row for a tool dispatch. Tapping the row toggles an
-// inline preview of the matching tool_result (passed via prop from the
-// BlockRenderer dispatcher). Mirrors the web BlockToolCall behavior:
-// no status badge on the happy path, error message inline for failures.
+// Two-row layout per the Pencil design:
+//   1. small Feather icon + Hanken-Grotesk-600 label
+//   2. monospace code chip with the args preview (single line, truncate)
+// Tapping the row toggles an inline preview of the matching tool_result
+// (the chat detail screen builds the callId → result map and passes the
+// right result in via prop). The icon serves as the leading affordance,
+// so no chevron / status dot — that read as visual noise in the old
+// dark design and the new style relies on the icon to indicate what
+// kind of tool ran.
+//
+// On error / denied the row gets a red error string below the chip.
+
+type FeatherName = React.ComponentProps<typeof Feather>["name"];
+
+// Tool name → Feather icon. The runtime emits names like
+// "terminal_exec", "file_read", "browser_navigate", "web_fetch".
+// We map by leading prefix so any new tool that starts with a known
+// stem picks up the right icon without code changes.
+function iconForTool(toolName: string): FeatherName {
+  const name = toolName.toLowerCase();
+  if (name.startsWith("terminal") || name.includes("exec")) return "terminal";
+  if (name.startsWith("file_") || name.startsWith("read") || name.startsWith("write")) {
+    return "book-open";
+  }
+  if (name.startsWith("browser") || name.startsWith("web") || name.includes("fetch")) {
+    return "globe";
+  }
+  // Feather doesn't ship a "tool" icon — `package` is the closest stand-in
+  // for generic capability calls (settings doesn't read as a tool action).
+  return "package";
+}
+
 export function BlockToolCall({
   block,
   result
@@ -17,22 +46,27 @@ export function BlockToolCall({
   const [expanded, setExpanded] = useState(false);
   const failed = block.status === "error" || block.status === "denied";
   const canExpand = Boolean(result);
+  const icon = iconForTool(block.toolName);
   return (
     <View style={styles.row}>
       <TouchableOpacity
         activeOpacity={canExpand ? 0.7 : 1}
         disabled={!canExpand}
         onPress={() => canExpand && setExpanded((v) => !v)}
-        style={styles.header}
+        style={styles.body}
       >
-        <Text style={styles.chevron}>{canExpand ? (expanded ? "▾" : "▸") : "•"}</Text>
-        <Text style={styles.label} numberOfLines={1}>
-          {block.displayLabel}
-        </Text>
-        {block.argsPreview ? (
-          <Text style={styles.preview} numberOfLines={1}>
-            {block.argsPreview}
+        <View style={styles.labelRow}>
+          <Feather name={icon} size={15} color={theme.toolIcon} />
+          <Text style={styles.label} numberOfLines={1}>
+            {block.displayLabel}
           </Text>
+        </View>
+        {block.argsPreview ? (
+          <View style={styles.chip}>
+            <Text style={styles.chipText} numberOfLines={1}>
+              {block.argsPreview}
+            </Text>
+          </View>
         ) : null}
       </TouchableOpacity>
       {failed && block.errorMessage ? (
@@ -54,54 +88,51 @@ export function BlockToolCall({
 
 const styles = StyleSheet.create({
   row: {
-    alignSelf: "flex-start",
-    maxWidth: "92%",
+    alignSelf: "stretch",
     gap: 6
   },
-  header: {
+  body: { gap: 10 },
+  labelRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 6,
-    flexWrap: "wrap"
-  },
-  chevron: {
-    color: theme.subtle,
-    fontSize: 11,
-    width: 10
+    gap: 6
   },
   label: {
     color: theme.text,
+    fontFamily: family("HankenGrotesk", 600),
     fontSize: 13,
-    fontWeight: "600"
-  },
-  preview: {
-    color: theme.subtle,
-    fontSize: 11,
-    fontFamily: "Menlo",
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-    backgroundColor: theme.inputBg,
-    overflow: "hidden",
     flexShrink: 1
+  },
+  chip: {
+    alignSelf: "flex-start",
+    maxWidth: "100%",
+    backgroundColor: theme.codeChipBg,
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    borderRadius: 8
+  },
+  chipText: {
+    color: theme.codeChipText,
+    fontFamily: family("JetBrainsMono"),
+    fontSize: 12
   },
   errorMessage: {
     color: theme.danger,
-    fontSize: 12,
-    paddingLeft: 16
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 13,
+    paddingLeft: 21 // align with the label text after the 15px icon + 6px gap
   },
   resultBox: {
-    marginLeft: 16,
-    padding: 8,
-    borderRadius: 6,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: theme.border,
-    backgroundColor: theme.inputBg,
+    marginLeft: 21,
+    padding: 10,
+    borderRadius: 8,
+    backgroundColor: theme.codeChipBg,
     maxHeight: 200
   },
   resultText: {
-    color: theme.subtle,
-    fontSize: 11,
-    fontFamily: "Menlo"
+    color: theme.codeChipText,
+    fontFamily: family("JetBrainsMono"),
+    fontSize: 12,
+    lineHeight: 16
   }
 });
