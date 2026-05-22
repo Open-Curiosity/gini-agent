@@ -100,6 +100,10 @@ export class TunnelManager {
   // declaring the manager torn down. Without this, a slow osascript write
   // can land snapshot mutations after the user has stopped the manager.
   private notesRefresh: Promise<TunnelSnapshot> | null = null;
+  // AbortController fed into every osascript invocation. stop() triggers
+  // it so a hung Notes.app permission prompt cannot keep the runtime
+  // alive past its shutdown drain budget.
+  private notesAbort: AbortController | null = null;
 
   constructor(opts: TunnelManagerOptions) {
     this.instance = opts.instance;
@@ -291,6 +295,15 @@ export class TunnelManager {
       try { this.spawnAbort.abort(); } catch { /* ignore */ }
       this.spawnAbort = null;
     }
+    // Same for an in-flight osascript pipeline. Without this, a Notes
+    // permission prompt that's waiting for the user keeps the manager
+    // (and the runtime drain) alive for the full OSASCRIPT_TIMEOUT_MS,
+    // potentially overrunning SCHEDULER_DRAIN_TIMEOUT_MS in src/server.ts
+    // and orphaning the osascript child past process.exit.
+    if (this.notesAbort) {
+      try { this.notesAbort.abort(); } catch { /* ignore */ }
+      this.notesAbort = null;
+    }
     // If a start() is in flight, wait for it to settle before we begin
     // teardown. The startInner path sees `stopping === true` and stops
     // the freshly-spawned child itself, so by the time the awaited start
@@ -342,16 +355,20 @@ export class TunnelManager {
     // Notes.app, producing duplicate notes or interleaved snapshot
     // mutations.
     if (this.notesRefresh) return this.notesRefresh;
-    const refresh = this.refreshAppleNoteInner();
+    this.notesAbort = new AbortController();
+    const refresh = this.refreshAppleNoteInner(this.notesAbort.signal);
     this.notesRefresh = refresh;
     try {
       return await refresh;
     } finally {
-      if (this.notesRefresh === refresh) this.notesRefresh = null;
+      if (this.notesRefresh === refresh) {
+        this.notesRefresh = null;
+        this.notesAbort = null;
+      }
     }
   }
 
-  private async refreshAppleNoteInner(): Promise<TunnelSnapshot> {
+  private async refreshAppleNoteInner(signal?: AbortSignal): Promise<TunnelSnapshot> {
     if (!this.snapshot.publicUrl) {
       return this.getSnapshot();
     }
@@ -375,7 +392,8 @@ export class TunnelManager {
     }
     const available = await isICloudAccountAvailable({
       account: this.config.appleNotes.account,
-      run: this.osascript
+      run: this.osascript,
+      signal
     });
     this.snapshot = {
       ...this.snapshot,
@@ -407,7 +425,8 @@ export class TunnelManager {
           ...target,
           body: composeAppleNoteBody(this.snapshot)
         },
-        this.osascript
+        this.osascript,
+        { signal }
       );
       this.snapshot = {
         ...this.snapshot,

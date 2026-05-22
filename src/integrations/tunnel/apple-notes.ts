@@ -26,7 +26,17 @@ export interface UpdateAppleNoteInput extends AppleNotesTarget {
   body: string;
 }
 
-export type RunOsascript = (script: string) => Promise<{ stdout: string; stderr: string; exitCode: number | null }>;
+export interface RunOsascriptOptions {
+  /**
+   * Optional abort signal. When triggered, the osascript child is
+   * SIGKILL'd and the runner resolves with a non-zero exit code. Used
+   * by the tunnel manager so a runtime shutdown can cancel an in-flight
+   * osascript pipeline well inside the 5s SIGTERM drain budget.
+   */
+  signal?: AbortSignal;
+}
+
+export type RunOsascript = (script: string, options?: RunOsascriptOptions) => Promise<{ stdout: string; stderr: string; exitCode: number | null }>;
 
 /**
  * Default osascript runner that shells out via Bun.spawn. Tests inject a
@@ -42,23 +52,39 @@ export type RunOsascript = (script: string) => Promise<{ stdout: string; stderr:
  */
 export const OSASCRIPT_TIMEOUT_MS = 15_000;
 
-export const defaultOsascriptRunner: RunOsascript = async (script) => {
+export const defaultOsascriptRunner: RunOsascript = async (script, options) => {
   const proc = Bun.spawn(["osascript", "-l", "AppleScript", "-e", script], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe"
   });
   let timedOut = false;
+  let aborted = false;
   const timer = setTimeout(() => {
     timedOut = true;
     try { proc.kill("SIGKILL"); } catch { /* already exited */ }
   }, OSASCRIPT_TIMEOUT_MS);
+  const onAbort = () => {
+    aborted = true;
+    try { proc.kill("SIGKILL"); } catch { /* already exited */ }
+  };
+  if (options?.signal) {
+    if (options.signal.aborted) onAbort();
+    else options.signal.addEventListener("abort", onAbort, { once: true });
+  }
   try {
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
       proc.exited
     ]);
+    if (aborted) {
+      return {
+        stdout,
+        stderr: stderr || "osascript aborted by caller",
+        exitCode: exitCode ?? -1
+      };
+    }
     if (timedOut) {
       return {
         stdout,
@@ -69,6 +95,7 @@ export const defaultOsascriptRunner: RunOsascript = async (script) => {
     return { stdout, stderr, exitCode };
   } finally {
     clearTimeout(timer);
+    options?.signal?.removeEventListener("abort", onAbort);
   }
 };
 
@@ -78,14 +105,14 @@ export const defaultOsascriptRunner: RunOsascript = async (script) => {
  * Apple Notes mirroring on this host.
  */
 export async function isICloudAccountAvailable(
-  options: { account?: string; run?: RunOsascript } = {}
+  options: { account?: string; run?: RunOsascript; signal?: AbortSignal } = {}
 ): Promise<boolean> {
   if (process.platform !== "darwin") return false;
   const account = options.account ?? "iCloud";
   const run = options.run ?? defaultOsascriptRunner;
   const script = `tell application "Notes"\n  set acctNames to name of every account\n  if acctNames contains ${quoteAppleScript(account)} then\n    return "yes"\n  else\n    return "no"\n  end if\nend tell`;
   try {
-    const result = await run(script);
+    const result = await run(script, { signal: options.signal });
     if (result.exitCode !== 0) return false;
     return result.stdout.trim() === "yes";
   } catch {
@@ -100,13 +127,14 @@ export async function isICloudAccountAvailable(
  */
 export async function updateAppleNote(
   input: UpdateAppleNoteInput,
-  runner: RunOsascript = defaultOsascriptRunner
+  runner: RunOsascript = defaultOsascriptRunner,
+  options: { signal?: AbortSignal } = {}
 ): Promise<void> {
   if (process.platform !== "darwin") {
     throw new Error("updateAppleNote only runs on macOS");
   }
   const script = buildUpdateScript(input);
-  const result = await runner(script);
+  const result = await runner(script, { signal: options.signal });
   if (result.exitCode !== 0) {
     const msg = result.stderr.trim() || `osascript exited with ${result.exitCode}`;
     throw new Error(`Apple Notes update failed: ${msg}`);

@@ -37,15 +37,35 @@ async function forwardRedacted(method: "GET"): Promise<Response> {
 export function redactTunnelSnapshot(payload: unknown): unknown {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
   const record = payload as Record<string, unknown>;
-  // Strip the secret and the secret-bearing publicUrl. Leave cloudflareUrl
-  // (the bare host without the prefix) so the UI can render a label. The
-  // QR rendering uses /api/runtime/tunnel/qr.svg, which is a binary
-  // resource the browser displays as <img> but does not extract a string
-  // from in normal flows.
-  const copy: Record<string, unknown> = { ...record };
-  if ("secret" in copy) copy.secret = null;
-  if ("publicUrl" in copy) copy.publicUrl = null;
-  return copy;
+  // Allow-list projection. The upstream snapshot may grow new fields over
+  // time; this DTO opts each safe field in explicitly so any new
+  // credential-bearing field (e.g. a future signed-redirect URL) fails
+  // closed — the browser receives nothing it wasn't approved to see.
+  // `secret` and `publicUrl` are emitted as explicit nulls so legacy
+  // clients can still check `!!secret` / `!!publicUrl` against the
+  // expected shape.
+  return {
+    publicUrl: null,
+    cloudflareUrl: typeof record.cloudflareUrl === "string" ? record.cloudflareUrl : null,
+    secret: null,
+    targetUrl: typeof record.targetUrl === "string" ? record.targetUrl : null,
+    observedAt: typeof record.observedAt === "string" ? record.observedAt : null,
+    appleNotes: redactAppleNotes(record.appleNotes),
+    lastError: typeof record.lastError === "string" ? record.lastError : null
+  };
+}
+
+function redactAppleNotes(payload: unknown): Record<string, unknown> | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const record = payload as Record<string, unknown>;
+  return {
+    enabled: typeof record.enabled === "boolean" ? record.enabled : null,
+    folder: typeof record.folder === "string" ? record.folder : null,
+    noteName: typeof record.noteName === "string" ? record.noteName : null,
+    available: typeof record.available === "boolean" ? record.available : null,
+    lastSyncedAt: typeof record.lastSyncedAt === "string" ? record.lastSyncedAt : null,
+    lastError: typeof record.lastError === "string" ? record.lastError : null
+  };
 }
 
 export const GET = async (_request: NextRequest) => forwardRedacted("GET");

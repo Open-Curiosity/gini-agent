@@ -196,7 +196,12 @@ const server = Bun.serve({
       // bearer-token check the rest of the gateway relies on.
       getSecret: () => (tunnelResolved.config.enabled ? tunnelResolved.config.secret : null),
       getSnapshot: () => (tunnelResolved.config.enabled ? tunnelManager.getSnapshot() : null),
-      refreshAppleNote: () => tunnelManager.refreshAppleNote()
+      // Only expose the refresh hook when the tunnel feature is opted into.
+      // Without this gate, a disabled-tunnel runtime would still let
+      // `GET /api/tunnel` invoke the manager and return its internal
+      // snapshot (including the persisted secret), defeating the
+      // disabled-aware getSnapshot above.
+      refreshAppleNote: tunnelResolved.config.enabled ? () => tunnelManager.refreshAppleNote() : undefined
     }
   })
 });

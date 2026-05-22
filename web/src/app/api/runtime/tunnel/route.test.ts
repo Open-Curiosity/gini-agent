@@ -31,4 +31,17 @@ describe("BFF tunnel snapshot redaction", () => {
     expect(input.secret).toBe("abc");
     expect(input.publicUrl).toBe("https://x/abc/");
   });
+
+  test("allow-list drops unrecognized credential-shaped fields", () => {
+    // A hypothetical future field that contains an auth-bearing value
+    // must not slip through. The allow-list approach drops it entirely.
+    const snapshot = {
+      secret: "abc",
+      publicUrl: "https://x/abc/",
+      cloudflareUrl: "https://x",
+      hypotheticalNewSignedUrl: "https://x/another-secret-form/"
+    };
+    const out = redactTunnelSnapshot(snapshot) as Record<string, unknown>;
+    expect(out).not.toHaveProperty("hypotheticalNewSignedUrl");
+  });
 });
