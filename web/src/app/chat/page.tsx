@@ -192,8 +192,21 @@ export default function ChatPage() {
     );
   };
 
+  // Phase blocks are transient indicators — only render the latest one,
+  // and only while it's still active (non-terminal). Historical phase
+  // markers ("Thinking" mid-conversation, "Completed" at the end) are
+  // internal state transitions; surfacing them in the transcript turns
+  // them into permanent noise. Non-phase blocks always render.
+  const visibleBlocks = useMemo(() => {
+    return blocks.filter((b, i) => {
+      if (b.kind !== "phase") return true;
+      const isLast = i === blocks.length - 1;
+      return isLast && !TERMINAL_PHASE_LABELS.has(b.label);
+    });
+  }, [blocks]);
+
   const sessionTitle = selectedSession?.title || "New chat";
-  const hasBlocks = blocks.length > 0;
+  const hasBlocks = visibleBlocks.length > 0;
 
   return (
     <div className="flex flex-1 overflow-hidden">
@@ -253,7 +266,7 @@ export default function ChatPage() {
                   </div>
                 ) : (
                   <ul className="space-y-5">
-                    {blocks.map((block) => (
+                    {visibleBlocks.map((block) => (
                       <li key={block.id}>
                         <BlockRenderer block={block} />
                       </li>

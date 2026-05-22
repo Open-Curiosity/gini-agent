@@ -46,6 +46,19 @@ export default function ChatDetailScreen() {
 
   const list = useMemo<ChatBlock[]>(() => blocks.data ?? [], [blocks.data]);
 
+  // Phase blocks are transient indicators — only render the latest one,
+  // and only while it's still active (non-terminal). Historical phase
+  // markers in the persisted log would otherwise show "Thinking" /
+  // "Completed" as permanent transcript items, which is noise.
+  const visible = useMemo<ChatBlock[]>(() => {
+    return list.filter((b, i) => {
+      if (b.kind !== "phase") return true;
+      const isLast = i === list.length - 1;
+      if (!isLast) return false;
+      return b.label !== "Completed" && b.label !== "Cancelled" && b.label !== "Failed";
+    });
+  }, [list]);
+
   // Title derivation: first user_text block's excerpt, falling back to
   // "Chat" while the list is empty. Avoids a second polling call to
   // /chat/:id for the session record — the block stream carries enough
@@ -125,8 +138,8 @@ export default function ChatDetailScreen() {
             contentContainerStyle={styles.messages}
             keyboardShouldPersistTaps="handled"
           >
-            {list.length > 0 ? (
-              list.map((block) => <BlockRenderer key={block.id} block={block} />)
+            {visible.length > 0 ? (
+              visible.map((block) => <BlockRenderer key={block.id} block={block} />)
             ) : (
               <View style={styles.emptyChat}>
                 <Text style={styles.emptyChatText}>What can I help with?</Text>
