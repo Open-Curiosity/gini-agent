@@ -4,17 +4,15 @@ import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { family, theme } from "@/src/theme";
 import type { ToolCallBlock, ToolResultBlock } from "@/src/types";
 
-// Two-row layout per the Pencil design:
-//   1. small Feather icon + Hanken-Grotesk-600 label
-//   2. monospace code chip with the args preview (single line, truncate)
+// Single horizontal row per the Pencil design:
+//   [icon + Hanken-Grotesk-600 label]  [monospace code chip filling rest]
 // Tapping the row toggles an inline preview of the matching tool_result
 // (the chat detail screen builds the callId → result map and passes the
 // right result in via prop). The icon serves as the leading affordance,
-// so no chevron / status dot — that read as visual noise in the old
-// dark design and the new style relies on the icon to indicate what
-// kind of tool ran.
+// so no chevron / status dot — the new style relies on the icon to
+// indicate what kind of tool ran.
 //
-// On error / denied the row gets a red error string below the chip.
+// On error / denied the row gets a red error string below.
 
 type FeatherName = React.ComponentProps<typeof Feather>["name"];
 
@@ -55,7 +53,7 @@ export function BlockToolCall({
         onPress={() => canExpand && setExpanded((v) => !v)}
         style={styles.body}
       >
-        <View style={styles.labelRow}>
+        <View style={styles.labelGroup}>
           <Feather name={icon} size={15} color={theme.toolIcon} />
           <Text style={styles.label} numberOfLines={1}>
             {block.displayLabel}
@@ -91,21 +89,29 @@ const styles = StyleSheet.create({
     alignSelf: "stretch",
     gap: 6
   },
-  body: { gap: 10 },
-  labelRow: {
+  // Single horizontal row: icon+label group on the left, code chip
+  // filling the remaining width on the right. flexShrink 0 on the label
+  // group + flex 1 on the chip mirrors the Pencil `fill_container` chip
+  // sitting next to a `fit_content` label.
+  body: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 6
+    gap: 10
+  },
+  labelGroup: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    flexShrink: 0
   },
   label: {
     color: theme.text,
     fontFamily: family("HankenGrotesk", 600),
-    fontSize: 13,
-    flexShrink: 1
+    fontSize: 13
   },
   chip: {
-    alignSelf: "flex-start",
-    maxWidth: "100%",
+    flex: 1,
+    minWidth: 0,
     backgroundColor: theme.codeChipBg,
     paddingHorizontal: 11,
     paddingVertical: 7,
@@ -120,7 +126,7 @@ const styles = StyleSheet.create({
     color: theme.danger,
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 13,
-    paddingLeft: 21 // align with the label text after the 15px icon + 6px gap
+    paddingLeft: 21
   },
   resultBox: {
     marginLeft: 21,
