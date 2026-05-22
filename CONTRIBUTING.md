@@ -36,7 +36,7 @@ Each repo worktree gets an isolated instance derived from the directory name, so
 
 ### Branch names
 
-Use `<github-username>/<kebab-case-topic>`, e.g. `jane/fix-chat-title-overflow`.
+Use `<type>/<kebab-case-topic>`, where `<type>` is one of `feat`, `fix`, `chore`, `docs`, `refactor`, or `test`. Examples: `feat/profile-switcher`, `fix/chat-title-overflow`, `docs/release-process`.
 
 ## Verification
 
