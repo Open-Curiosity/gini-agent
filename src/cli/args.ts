@@ -46,10 +46,15 @@ export function applyGlobalEnvOverrides(values: string[], ephemeral: boolean): v
     // platform default provider is codex/gpt-5.5, which would call the
     // real codex backend and fail on any machine without codex auth.
     // Pin echo here so `gini smoke` works on every laptop and CI worker.
-    // ??= preserves explicit overrides like
-    // `GINI_PROVIDER=codex bun run gini smoke`.
-    process.env.GINI_PROVIDER ??= "echo";
-    process.env.GINI_MODEL ??= "gini-echo-v0";
+    // An explicit override like `GINI_PROVIDER=codex bun run gini smoke`
+    // still wins, but in that case we MUST NOT pin the echo model
+    // independently — otherwise smoke ends up with provider=codex and
+    // model=gini-echo-v0, which is broken. Couple the model pin to the
+    // provider pin so both move together (or neither does).
+    if (process.env.GINI_PROVIDER === undefined) {
+      process.env.GINI_PROVIDER = "echo";
+      process.env.GINI_MODEL ??= "gini-echo-v0";
+    }
     // Smoke must never pull down the local embedding model — keeps CI fast
     // and offline. The default provider is local; explicit echo keeps smoke
     // contractually unaffected by the default change.
