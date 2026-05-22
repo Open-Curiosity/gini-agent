@@ -51,7 +51,41 @@ async function isProviderConfigured(): Promise<boolean | null> {
   }
 }
 
+// Per-instance tunnel secret. Injected by the runtime when it spawns the
+// Next.js child (see src/cli/process.ts `GINI_TUNNEL_SECRET`). Empty
+// string when the feature is not configured; in that case the
+// secret-path strip is skipped entirely and external requests are
+// 404'd.
+const TUNNEL_SECRET = process.env.GINI_TUNNEL_SECRET ?? "";
+
 export async function proxy(request: NextRequest): Promise<NextResponse> {
+  // Tunneled-request handling. Cloudflared forwards the verbatim
+  // pathname, so a tunneled GET `https://<hostname>/<secret>/settings`
+  // arrives here as pathname=/<secret>/settings. We strip the prefix
+  // for downstream routing and reject any tunneled request that
+  // doesn't carry the secret. Localhost requests are passed through
+  // unchanged — the secret is only required from the public host.
+  const host = request.headers.get("host") ?? "";
+  const isLocalHost = host.startsWith("localhost") || host.startsWith("127.0.0.1");
+  if (!isLocalHost) {
+    if (!TUNNEL_SECRET) return new NextResponse("Not Found", { status: 404 });
+    const prefix = `/${TUNNEL_SECRET}`;
+    const { pathname } = request.nextUrl;
+    // Bare `/<secret>` → 308 to the slash form so relative links on the
+    // landing pages resolve under the prefix.
+    if (pathname === prefix) {
+      const url = request.nextUrl.clone();
+      url.pathname = `${prefix}/`;
+      return NextResponse.redirect(url, 308);
+    }
+    if (!pathname.startsWith(`${prefix}/`)) {
+      return new NextResponse("Not Found", { status: 404 });
+    }
+    const rewritten = request.nextUrl.clone();
+    rewritten.pathname = pathname.slice(prefix.length) || "/";
+    return NextResponse.rewrite(rewritten);
+  }
+
   const { pathname } = request.nextUrl;
   // Public surfaces that must not be gated:
   //   - /setup itself (otherwise infinite redirect)
