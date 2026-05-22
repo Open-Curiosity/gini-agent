@@ -181,13 +181,9 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   }
 
   const state = readState(config.instance);
-  // Phase C: pinned memories are also per-agent. Records without an
-  // agentId (pre-migration leftovers) are excluded — the migration in
-  // normalizeState backfills them on first read, so this filter should
-  // only drop content during the in-flight first-boot rewrite.
-  const activeMemory = state.memories.filter((memory) =>
-    memory.status === "active" && (!agentIdForMemory || memory.agentId === agentIdForMemory)
-  );
+  // `state.memories` was removed as part of the memory-surface
+  // consolidation; identity facts live in USER.md and recalled-from-
+  // Hindsight memory now. See ADR memory-surface-consolidation.md.
   // Subagent path: child tasks override the default Gini preamble with the
   // subagent's own system prompt and filter the enabled-skills block by the
   // subagent's skill whitelist (when set).
@@ -245,7 +241,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   }
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt
-    : buildAgentSystemContext(activeMemory, recalledContext, identityBlock, {
+    : buildAgentSystemContext(recalledContext, identityBlock, {
         instructionsOverride,
         soul: soulBlock,
         userProfile: userProfileBlock

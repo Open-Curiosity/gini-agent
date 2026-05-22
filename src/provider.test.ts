@@ -23,7 +23,7 @@ describe("provider", () => {
     const provider = normalizeProvider({ name: "echo", model: "" });
     expect(provider).toEqual({ name: "echo", model: "gini-echo-v0" });
 
-    const result = await generateTaskSummary(config(provider), "summarize task", []);
+    const result = await generateTaskSummary(config(provider), "summarize task");
     expect(result.text).toContain("summarize task");
   });
 
@@ -925,7 +925,7 @@ describe("provider", () => {
         model: "or-model",
         extraBody: { chat_template_kwargs: { enable_thinking: true }, provider: { order: ["mistral"] } }
       });
-      const result = await generateTaskSummary(config(provider), "hello", []);
+      const result = await generateTaskSummary(config(provider), "hello");
       expect(result.text).toBe("summary.");
       const sent = JSON.parse(String(captured!.init!.body));
       expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
@@ -977,7 +977,7 @@ describe("provider", () => {
         logRoot: stateRoot
       };
       const taskId = "task_blocked_legacy";
-      await generateTaskSummary(cfg, "hello", [], undefined, undefined, undefined, taskId);
+      await generateTaskSummary(cfg, "hello", undefined, undefined, undefined, taskId);
       const records = readTrace(instance, taskId);
       const blocked = records.find((r) => typeof r.message === "string" && r.message.includes("identity file blocked: USER.md"));
       expect(blocked).toBeDefined();
@@ -1060,7 +1060,7 @@ describe("provider", () => {
           extraBody: { stream: true }
         });
         // generateTaskSummary → callChatCompletions for openrouter
-        await generateTaskSummary(config(provider), "hi", []);
+        await generateTaskSummary(config(provider), "hi");
         // generateStructured → callStructuredChatCompletions
         await generateStructured(config(provider), {
           system: "s", user: "u", schemaName: "X", validator: { parse: (v) => v }
@@ -1167,7 +1167,7 @@ describe("provider", () => {
           extraBody: { max_tokens: 128 }
         });
         requestBodies.length = 0;
-        await generateTaskSummary(config(orProvider), "summarize", []);
+        await generateTaskSummary(config(orProvider), "summarize");
         expect(requestBodies[0]?.max_tokens).toBe(128);
       } finally {
         if (original === undefined) delete process.env.OPENROUTER_API_KEY;

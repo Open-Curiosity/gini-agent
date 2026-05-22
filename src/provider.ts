@@ -5,7 +5,7 @@ import { buildAgentSystemContext } from "./system-prompt";
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import type { CostRecord, MemoryRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
+import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -820,7 +820,6 @@ async function readResponsesToolCallingStream(
 export async function generateTaskSummary(
   config: RuntimeConfig,
   input: string,
-  memories: MemoryRecord[],
   recalledContext?: string,
   onDelta?: (text: string) => void,
   // Optional per-call override. Resolved by callers from the active agent's
@@ -836,10 +835,9 @@ export async function generateTaskSummary(
 ): Promise<ProviderResult> {
   const provider = normalizeProvider(providerOverride ?? config.provider);
   if (provider.name === "echo") {
-    const memoryText = memories.length > 0 ? ` Active memory: ${memories.map((memory) => memory.content).join(" | ")}` : "";
     return {
       provider,
-      text: `Gini handled: ${input}${memoryText}`
+      text: `Gini handled: ${input}`
     };
   }
 
@@ -862,7 +860,7 @@ export async function generateTaskSummary(
   const instructionsOverride = loadInstructions(config.instance, loadOpts) ?? undefined;
   const soulBlock = loadSoul(config.instance, activeAgentId, loadOpts) ?? undefined;
   const userProfileBlock = loadUserProfile(config.instance, loadOpts) ?? undefined;
-  const systemContext = buildAgentSystemContext(memories, recalledContext, undefined, {
+  const systemContext = buildAgentSystemContext(recalledContext, undefined, {
     instructionsOverride,
     soul: soulBlock,
     userProfile: userProfileBlock

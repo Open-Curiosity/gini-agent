@@ -7,7 +7,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AgentIdentity, IdentitySnapshotRecord, JobRecord, MemoryRecord } from "./types";
+import type { AgentIdentity, IdentitySnapshotRecord, JobRecord } from "./types";
 
 // Number of user turns in the same chat session between full identity
 // re-emissions. Below this threshold the model receives only field-level
@@ -81,9 +81,10 @@ export interface AgentSystemContextOptions {
   // instructions and the identity block.
   soul?: string;
   // Instance-scoped user profile body sourced from
-  // ~/.gini/instances/<inst>/USER.md. Sits between pinned memories and
-  // recalled long-term memory so the model encounters "who am I talking
-  // to" right before "what do I remember about prior conversations".
+  // ~/.gini/instances/<inst>/USER.md. Sits between the runtime identity
+  // block and recalled long-term memory so the model encounters
+  // "who am I talking to" right before "what do I remember about prior
+  // conversations".
   userProfile?: string;
 }
 
@@ -96,15 +97,17 @@ export interface AgentSystemContextOptions {
 //   1. INSTRUCTIONS — operating rules (file override or default).
 //   2. SOUL.md      — per-agent persona.
 //   3. identity     — runtime identity block (instance/agent/provider/...).
-//   4. pinned       — legacy MemoryRecord rows (always relevant facts).
-//   5. USER.md      — instance-scoped user profile.
-//   6. recalled     — Hindsight long-term memory.
+//   4. USER.md      — instance-scoped user profile.
+//   5. recalled     — Hindsight long-term memory.
+//
+// The legacy "Pinned memories about this user" block was removed when
+// `state.memories` was consolidated into USER.md / SOUL.md / Hindsight.
+// See ADR memory-surface-consolidation.md.
 //
 // Placing memory in the system channel (rather than the user message)
 // gives it higher-priority placement without talking the model into
 // believing it. See ADR runtime-identity-files.md.
 export function buildAgentSystemContext(
-  memories: MemoryRecord[],
   recalledContext?: string,
   identityBlock?: string,
   options?: AgentSystemContextOptions
@@ -118,10 +121,6 @@ export function buildAgentSystemContext(
   }
   if (identityBlock && identityBlock.length > 0) {
     parts.push(identityBlock);
-  }
-  if (memories.length > 0) {
-    const pinned = memories.map((memory) => `- ${memory.content}`).join("\n");
-    parts.push(`Pinned memories about this user (curated, always relevant):\n${pinned}`);
   }
   if (options?.userProfile && options.userProfile.trim().length > 0) {
     parts.push(options.userProfile);
