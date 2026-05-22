@@ -571,6 +571,12 @@ export async function recordDeniedChatAttempt(
   await mutateState(config.instance, (state) => {
     const live = state.messagingBridges.find((b) => b.id === bridgeId);
     if (!live) return;
+    // Re-check the allowlist inside the lock. The poller's authorize call
+    // happens outside mutateState, so if the operator clicks Approve in the
+    // window between that read and us getting here the chat is already
+    // allowed — silently skipping the deny write keeps the pending list from
+    // re-appearing after a successful approval.
+    if (isChatAllowed(live, attempt.chatId)) return;
     const meta = { ...(live.metadata ?? {}) };
     const existing = readRecentDeniedChats(live).filter((entry) => entry.chatId !== attempt.chatId);
     const entry: DeniedChatAttempt = {
@@ -790,6 +796,41 @@ export async function denyChat(config: RuntimeConfig, idOrName: string, chatId: 
         action: "messaging.chat.denied",
         target: live.id,
         risk: "medium",
+        evidence: { chatId }
+      },
+      { system: true }
+    );
+    return chatAllowlistView(live);
+  });
+}
+
+// Drop a chat from `recentDeniedChats` without touching the allowlist.
+// Backs the operator UI's "Reject" button on a pending pairing request —
+// the chat stays denied (the bridge keeps dropping its messages), but the
+// row is cleared from the pending list so it doesn't keep nagging the
+// operator. If the same chat sends another message after this it'll
+// re-appear in `recentDeniedChats` because there is no long-term denylist.
+export async function rejectPendingChat(config: RuntimeConfig, idOrName: string, chatId: number) {
+  if (!Number.isFinite(chatId)) throw new Error("chatId must be a finite number.");
+  return mutateState(config.instance, (state) => {
+    const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
+    if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
+    if (live.kind !== "telegram") {
+      // Reuse the existing allowlist-only prefix so statusFromErrorMessage
+      // already maps this to a 400 the way it does for allowChat / denyChat.
+      throw new Error(`Chat allowlist only applies to telegram bridges (got '${live.kind}').`);
+    }
+    const meta = { ...(live.metadata ?? {}) };
+    meta.recentDeniedChats = readRecentDeniedChats(live).filter((entry) => entry.chatId !== chatId);
+    live.metadata = meta;
+    live.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "messaging.pending.rejected",
+        target: live.id,
+        risk: "low",
         evidence: { chatId }
       },
       { system: true }
