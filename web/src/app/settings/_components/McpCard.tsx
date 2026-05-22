@@ -247,8 +247,8 @@ function AddMessagingBridgeButtons() {
         method: "POST",
         body: JSON.stringify(input)
       }),
-    onSuccess: (record) => {
-      toast.success(`${labelFor(record.kind === "discord" ? "discord" : "telegram")} bridge added.`);
+    onSuccess: (record, variables) => {
+      toast.success(`${labelFor(variables.kind)} bridge added.`);
       invalidate(["messaging", "events", "state"]);
       setResult(record);
     },
