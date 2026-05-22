@@ -217,6 +217,11 @@ describe("buildToolCatalog", () => {
       expect(desc).toContain("task progress");
       // Don't-narrate / short ack rule.
       expect(desc).toContain("Got it");
+      // USER/SOUL partition: communication preferences route here, not to
+      // edit_soul. A representative imperative-form example pins the rule
+      // so a future rewrite that drops the preference branch surfaces.
+      expect(desc).toContain("preferences");
+      expect(desc).toContain("be more concise");
     });
 
     test("edit_soul description names the H2 sections and the soft cap", () => {
@@ -228,6 +233,10 @@ describe("buildToolCatalog", () => {
       expect(desc).toContain('Prefer `action: "set"`');
       expect(desc).toContain("Voice is terse");
       expect(desc).toContain("soft cap");
+      // USER/SOUL partition: SOUL fires only on explicit persona
+      // assignment, not on USER preferences about communication.
+      expect(desc).toContain("persona");
+      expect(desc).toContain("You are");
     });
   });
 });

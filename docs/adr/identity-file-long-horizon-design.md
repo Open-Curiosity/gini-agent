@@ -95,6 +95,17 @@ INSTRUCTIONS.md and the `edit_user_profile` tool description tell the model:
 
 This is the partition documented in [memory-surface-consolidation.md](./memory-surface-consolidation.md): USER.md is always-inject identity; everything else is Hindsight's job.
 
+### USER vs SOUL partition
+
+The earlier instructions and the two tool descriptions were quietly contradictory on the USER / SOUL split: INSTRUCTIONS.md listed "communication" under USER preferences AND the SOUL rules listed imperative communication preferences ("be more concise", "always end replies with Y") as SOUL triggers. The result was that the model would routinely misclassify "I prefer concise replies" or "no pleasantries" as SOUL persona signals and either route them to `edit_soul` (gated proposals) or write them as imperative directives that re-read as system rules next session. This section sharpens the partition stated in [runtime-identity-files.md](./runtime-identity-files.md):
+
+- **USER.md is about the user.** Subject = I / the user. Two kinds of content:
+  - **Facts:** name, role, location, employer, languages, family.
+  - **Preferences:** how the user wants to be communicated with — "prefers concise replies", "no pleasantries", "use bullet points", "wants detailed technical explanations", "terse vs verbose", response length, formality.
+- **SOUL.md is about the agent.** Subject = you / the agent. Persona / character / identity assignment by the user. Examples: "You are Athena, a research assistant"; "Act as a stoic critic with strong opinions"; "You're a sardonic, witty assistant who doesn't hedge"; "Speak like a pirate". The agent's *voice* is fundamentally shaped.
+- **Imperative phrasing is not the discriminator.** Even when the user writes the imperative form ("be more concise"), if it's a preference about how the user wants replies it routes to USER.md. SOUL.md fires only when the user is explicitly sculpting WHO the agent IS, not WHAT TO DO for them.
+- **Default to USER.md when unclear.** SOUL.md is a deliberate opt-in; the test in INSTRUCTIONS.md and the tool descriptions reads "When in doubt, default to `edit_user_profile`".
+
 ## Boundary
 
 - **Soft cap is not enforced.** The model can let either file grow past 1500 chars. The runtime never truncates — that would lose human-edited content. The cap is a guideline rendered in the header; the worst case is the model sees `over cap — please consolidate` and either chooses to consolidate on the next write or not.
