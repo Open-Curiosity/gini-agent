@@ -95,7 +95,7 @@ export function MessagingCard({
                     <Button size="sm" variant="outline" disabled={disablePending || item.status === "disabled"} onClick={() => onDisable(item.id)}>Disable</Button>
                   </div>
                 </div>
-                {item.kind === "telegram" && item.status !== "disabled" ? (
+                {item.kind === "telegram" && item.status === "configured" ? (
                   <TelegramPendingRequests bridgeId={item.id} />
                 ) : null}
               </li>
