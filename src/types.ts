@@ -9,8 +9,6 @@ export type ApprovalStatus = "pending" | "approved" | "denied";
 
 export type RiskLevel = "low" | "medium" | "high";
 
-export type MemoryStatus = "proposed" | "active" | "archived" | "rejected" | "conflicted";
-
 export type SkillStatus = "enabled" | "disabled" | "archived";
 
 export type JobStatus = "active" | "paused" | "failed";
@@ -19,7 +17,7 @@ export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local";
 
 export type ImprovementStatus = "proposed" | "approved" | "rejected" | "applied";
 
-export type ImprovementKind = "memory" | "skill" | "job";
+export type ImprovementKind = "skill" | "job";
 
 export type PairingStatus = "pending" | "claimed" | "expired" | "revoked";
 
@@ -226,7 +224,6 @@ export interface RuntimeState {
   tasks: Task[];
   approvals: Approval[];
   audit: AuditEvent[];
-  memories: MemoryRecord[];
   skills: SkillRecord[];
   jobs: JobRecord[];
   connectors: ConnectorRecord[];
@@ -360,7 +357,6 @@ export interface Task {
   tracePath: string;
   auditIds: string[];
   approvalIds: string[];
-  memoryIds: string[];
   skillIds: string[];
   jobId?: string;
   parentTaskId?: string;
@@ -832,28 +828,6 @@ export interface Approval {
   risk: RiskLevel;
   reason: string;
   payload: Record<string, unknown>;
-}
-
-export interface MemoryRecord {
-  id: string;
-  instance: Instance;
-  // Per-agent isolation key. Optional in the type because legacy state
-  // files persisted before Phase C don't carry it; normalizeState
-  // backfills these by stamping the active agent at migration time.
-  agentId?: string;
-  content: string;
-  sourceTaskId?: string;
-  createdAt: string;
-  updatedAt: string;
-  lastUsedAt?: string;
-  confidence: number;
-  status: MemoryStatus;
-  sensitivity: "normal" | "sensitive";
-  provenance: string;
-  // Hindsight phase 6: bag for migration breadcrumbs (e.g.
-  // `migratedToUnitId`). Stays optional so old persisted state files don't
-  // break — readState tolerates missing fields.
-  metadata?: Record<string, unknown>;
 }
 
 export interface SkillRecord {

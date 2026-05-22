@@ -100,7 +100,7 @@ export async function install_(ctx: CliContext): Promise<void> {
     config.provider = { ...config.provider, model: envModel };
     writeFileSync(configPath(instance), `${JSON.stringify(config, null, 2)}\n`);
   }
-  install(config);
+  await install(config);
   print({ installed: true, instance: config.instance, stateRoot: config.stateRoot, port: config.port });
 }
 
@@ -122,8 +122,8 @@ export async function doctorCmd(ctx: CliContext): Promise<void> {
   print(await doctor(ctx.config, ctx.web));
 }
 
-export function reset(ctx: CliContext): void {
-  resetInstance(ctx.config);
+export async function reset(ctx: CliContext): Promise<void> {
+  await resetInstance(ctx.config);
   print({ reset: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot });
 }
 

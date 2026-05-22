@@ -118,7 +118,7 @@ bun run gini chat send <session-id> "remember Gini should keep work inspectable"
 bun run gini runs list
 bun run gini task submit "read docs and summarize the gateway"
 bun run gini approvals
-bun run gini memory list
+bun run gini memory recall "<query>"
 bun run gini job add heartbeat 60 "check runtime health"
 bun run gini connectors health
 bun run gini evidence

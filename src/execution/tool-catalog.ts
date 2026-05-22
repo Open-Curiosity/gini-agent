@@ -734,13 +734,15 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
-    // Cross-session lookup. Scans past tasks, traces, memories, skills,
-    // and audit rows for a substring match. Low-risk; read-only.
+    // Cross-session lookup. Scans past tasks, traces, skills, and audit
+    // rows for a substring match. Low-risk; read-only. (Pinned memories
+    // were dropped in the state.memories consolidation — for memory
+    // recall use `recall_memory` against the Hindsight bank instead.)
     toolset: "session_search",
     type: "function",
     function: {
       name: "search_history",
-      description: "Search past chat sessions, task traces, stored memories, skill text, and audit events for a substring. Use when the user references something they did before ('did I ever ask about X?', 'find that conversation about Y'). Returns up to `limit` snippets ordered by score, each with kind (task/trace/memory/skill/audit), title, excerpt, and taskId when applicable.",
+      description: "Search past chat sessions, task traces, skill text, and audit events for a substring. Use when the user references something they did before ('did I ever ask about X?', 'find that conversation about Y'). Returns up to `limit` snippets ordered by score, each with kind (task/trace/skill/audit), title, excerpt, and taskId when applicable. For memory recall use `recall_memory` instead — it queries the Hindsight bank where auto-retain persists facts.",
       parameters: {
         type: "object",
         properties: {
@@ -775,48 +777,6 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
-    // Add a new memory item. Defaults `status: "proposed"` — the agent
-    // doesn't pin its own memory active; the user reviews via the existing
-    // approval flow (`POST /api/memory/<id>/approve`).
-    toolset: "memory",
-    type: "function",
-    function: {
-      name: "add_memory",
-      description: "Propose a new memory item. Memory items added by the agent start as `proposed` and require user approval via the memory review flow (`POST /api/memory/<id>/approve`). Use when the user shares a stable fact about themselves or their preferences that should ride the system prompt on future tasks. Avoid noting ephemeral context (it's already in the conversation) — propose only things worth remembering across sessions.",
-      parameters: {
-        type: "object",
-        properties: {
-          content: { type: "string", description: "The memory text (1-2 sentences). Keep it concise — pinned memories cost context every turn." },
-          confidence: { type: "number", description: "Confidence in the fact, 0-1. Defaults to 1. Lower for inferred facts." },
-          sensitivity: { type: "string", enum: ["normal", "sensitive"], description: "Mark `sensitive` for items the user wouldn't want surfaced in default UI views. Defaults to `normal`." },
-          provenance: { type: "string", description: "Short note about where the fact came from (e.g. 'User said in chat'). Defaults to 'Proposed by agent'." }
-        },
-        required: ["content"]
-      }
-    }
-  },
-  {
-    // Edit an existing memory in place. Use sparingly — `add_memory` is
-    // the usual path. The audit trail records every edit; the user can
-    // archive a bad edit via `DELETE /api/memory/<id>`.
-    toolset: "memory",
-    type: "function",
-    function: {
-      name: "update_memory",
-      description: "Edit an existing memory item in place (content / confidence / sensitivity). Use sparingly — `add_memory` is the usual path. The audit trail records every edit, and the user can archive a bad edit via `DELETE /api/memory/<id>`. Supply only the fields you want to change.",
-      parameters: {
-        type: "object",
-        properties: {
-          memoryId: { type: "string", description: "Id of the memory to edit (e.g. 'mem_abc123')." },
-          content: { type: "string", description: "Optional new memory text." },
-          confidence: { type: "number", description: "Optional new confidence value, 0-1." },
-          sensitivity: { type: "string", enum: ["normal", "sensitive"], description: "Optional new sensitivity classification." }
-        },
-        required: ["memoryId"]
-      }
-    }
-  },
-  {
     // Manually trigger an existing scheduled job. Wraps the same
     // `runJobNow` entrypoint that `POST /api/jobs/<id>/run` calls. Low-risk
     // / no approval: the spawned task itself still flows through the job's
@@ -835,6 +795,64 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
           jobId: { type: "string", description: "Id of the job to fire (e.g. 'job_a3aa6707'). Get this from list_jobs." }
         },
         required: ["jobId"]
+      }
+    }
+  },
+  {
+    // Propose an edit to the active agent's SOUL.md (per-agent persona).
+    // The tool writes the new body to SOUL.md.proposed; the runtime
+    // continues to read the approved SOUL.md (if any) until the user
+    // approves the proposal via `POST /api/identity-files/soul/approve`.
+    // Always exposed alongside add_memory — the "identity" toolset is
+    // not part of the legacy default set; gating on enable would silently
+    // hide the per-agent persona surface on fresh instances.
+    // See ADR runtime-identity-files.md.
+    toolset: "identity",
+    type: "function",
+    function: {
+      name: "edit_soul",
+      description: "Propose an edit to the active agent's SOUL.md — the agent's persona / character / identity, as ASSIGNED BY THE USER. Rare: most chat sessions never call this. Only fire when the user is explicitly sculpting WHO the agent IS, not WHAT TO DO for them. Example phrasings that DO trigger this tool: \"You are Athena, a research assistant\"; \"Act as a stoic critic with strong opinions\"; \"You're a sardonic, witty assistant who doesn't hedge\"; \"Speak like a pirate from now on\". Example phrasings that DO NOT trigger this tool: \"I prefer concise replies\", \"be more concise\", \"no pleasantries\", \"use bullet points\" — those are USER preferences about how the user wants replies and route to `edit_user_profile`. When in doubt, default to `edit_user_profile`; SOUL.md is a deliberate opt-in. Prefer `action: \"set\"` with the full consolidated SOUL.md body under H2 sections (`## Voice`, `## Style`, `## Boundaries`) — the current file is visible in the system prompt above, so emit the new version with the new content integrated under the right section. Write entries as facts about the agent's identity, not directives to yourself (\"Voice is terse\" ✓ — \"Always be terse\" ✗). Aim to keep the file under the soft cap shown in the SOUL persona header (1500 chars); when near or over cap, consolidate. The proposed body lands as SOUL.md.proposed and does NOT enter the system prompt until the user approves it via `POST /api/identity-files/soul/approve`. After calling, you MAY briefly mention the approval step but do NOT otherwise narrate the tool call. `action: \"append\"` adds a new section below existing content (prefer set; append is a legacy fallback). `action: \"remove\"` drops the first paragraph containing the `needle` substring from the existing approved body; requires `needle`. Requires an active agent — there is no per-instance SOUL.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["set", "append", "remove"],
+            description: "Whether to replace the whole SOUL.md body (set), append a new section below the existing approved content (append), or drop the first paragraph containing `needle` from the existing approved content (remove).",
+            default: "set"
+          },
+          content: { type: "string", description: "The new SOUL.md body (action=set) or the section to append (action=append). Keep it concise — every turn pays for this in tokens. Not required for action=remove." },
+          needle: { type: "string", description: "Required when action=remove. A plain substring; the first paragraph in the existing approved SOUL.md that contains this substring is dropped." }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    // Edit the instance-scoped USER.md. Auto-approved: writes land at
+    // USER.md directly and ride the system prompt on the next turn.
+    // USER.md is instance-scoped so the user's identity carries across
+    // agent switches. Distinct from edit_soul (per-agent persona, still
+    // propose → approve). Always exposed. See ADR
+    // runtime-identity-files.md.
+    toolset: "identity",
+    type: "function",
+    function: {
+      name: "edit_user_profile",
+      description: "Edit the instance-scoped USER.md — facts and preferences ABOUT THE USER. Two kinds of content fire this tool: (1) facts about the user — name, role, location, employer, languages, family; (2) preferences for how the user wants you to communicate — \"I prefer concise replies\", \"be more concise\", \"no pleasantries\", \"use bullet points for lists\", \"wants detailed technical explanations\". Even when the user phrases a preference as an imperative (\"be direct with me\", \"skip the preamble\"), it is a preference about how the user wants replies → this tool, NOT `edit_soul`. If the user is talking about themselves OR about how they want replies, use this tool. `edit_soul` is reserved for the rare case where the user is explicitly assigning the agent a persona (\"You are X\", \"Act as X\"). When in doubt, default to this tool. Prefer `action: \"set\"` with the full consolidated USER.md content under H2 sections (`## Identity`, `## Preferences`, `## Background`, `## Goals`) — the current file is visible in the system prompt above, so emit the new version with the new content integrated under the right section rather than appending a chunk below. Only call when the user's CURRENT message contains a NEW durable fact or preference NOT already in USER.md. Write entries as facts ABOUT the user, not directives to yourself (\"User prefers concise replies\" ✓ — \"Always reply concisely\" ✗); imperative phrasing in USER.md gets re-read next session as a system directive. Casual chat and follow-up questions are NOT identity facts — most turns should produce ZERO calls. Aim to keep the file under the soft cap shown in the USER profile header (1500 chars); when near or over cap, consolidate. DO NOT save task progress, PR/issue/commit IDs, completed-work logs, or other transient state — those belong in long-term memory (auto-retain handles them silently). Do NOT narrate the call: just acknowledge briefly (\"Got it, X.\", \"Noted.\"). Auto-approved: writes go straight to USER.md and ride the system prompt on the next turn. USER.md is instance-scoped so the user's identity bridges across agent switches. The injection scan still gates content that trips a threat pattern. `action: \"append\"` adds a new section (legacy fallback; the storage layer de-duplicates lines that already exist); `action: \"remove\"` drops the first paragraph containing the `needle` substring (requires `needle`). Distinct from edit_soul which still requires user approval.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["set", "append", "remove"],
+            description: "Whether to replace the whole USER.md body (set), append a new section below the existing content (append), or drop the first paragraph containing `needle` from the existing content (remove).",
+            default: "set"
+          },
+          content: { type: "string", description: "The new USER.md body (action=set) or the section to append (action=append). Not required for action=remove." },
+          needle: { type: "string", description: "Required when action=remove. A plain substring; the first paragraph in the existing USER.md that contains this substring is dropped." }
+        },
+        required: []
       }
     }
   }
@@ -924,6 +942,14 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (tool.function.name === "install_skill") return true;
     if (tool.function.name === "enable_skill") return true;
     if (tool.function.name === "disable_skill") return true;
+    // Identity-file edit tools. The "identity" toolset is not part of
+    // the legacy default set; gating on enable would silently hide the
+    // per-agent SOUL.md / instance USER.md edit surface on fresh
+    // instances. The proposed-vs-approved file split (see ADR
+    // runtime-identity-files.md) keeps unreviewed content out of the
+    // prompt regardless of toolset state, so always-on here is safe.
+    if (tool.function.name === "edit_soul") return true;
+    if (tool.function.name === "edit_user_profile") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;
