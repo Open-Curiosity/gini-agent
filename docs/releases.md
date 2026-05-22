@@ -63,8 +63,15 @@ A release is a version bump, a tag, a GitHub release, and a CHANGELOG section �
 
 ### 1. Survey what changed
 
+From a clean checkout of `main`:
+
 ```bash
-git log $(git describe --tags --abbrev=0)..main --oneline
+PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null)
+if [ -n "$PREV" ]; then
+  git log "$PREV"..main --oneline
+else
+  git log main --oneline    # first release; show the full history
+fi
 ```
 
 Read the PR titles. Decide:
@@ -74,12 +81,12 @@ Read the PR titles. Decide:
 
 If you can't decide, default up.
 
-### 2. Open a release PR from `main`
+### 2. Open a release PR
 
-From a clean checkout of `main`:
+From the same checkout of `main`, branch off:
 
 ```bash
-git checkout -b release/<version>
+git checkout -b release/X.Y.Z
 ```
 
 Edit `CHANGELOG.md`:
@@ -89,44 +96,46 @@ Edit `CHANGELOG.md`:
 - Leave `## [Unreleased]` empty (don't delete the heading).
 - Update the link footnotes at the bottom of the file so `[X.Y.Z]` points at the compare URL and `[Unreleased]` points at `vX.Y.Z...HEAD`.
 
-Then bump the package version (this also creates a commit and tag locally):
+Bump the version in `package.json` by editing the `"version"` field directly (don't use `bun pm version` — it refuses on a dirty tree and would race with the CHANGELOG edit). Commit and push:
 
 ```bash
-bun pm version <patch|minor|major>
-```
-
-If you need to amend the CHANGELOG to match (`bun pm version` commits before you can stage it), instead do the bump by hand:
-
-```bash
-# edit package.json version, then:
 git add package.json CHANGELOG.md
 git commit -m "vX.Y.Z"
-git tag -a vX.Y.Z -m "vX.Y.Z"
+git push -u origin release/X.Y.Z
 ```
 
 Open the PR. Title: `vX.Y.Z`. Body: paste the new CHANGELOG section.
 
-### 3. Merge and push the tag
+### 3. Merge, then tag from `main`
 
-After the release PR is approved and merged into `main`:
+After the release PR is approved and merged (squash or merge — both work because the tag is created *after* the merge lands on `main`):
 
 ```bash
 git checkout main
 git pull
+git tag -a vX.Y.Z -m "vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-(The tag was created locally in step 2. Push it only after the release commit lands on `main`, so the tag points at a commit reachable from `main`.)
+The tag is created on the merge commit, so it's always reachable from `main`.
 
 ### 4. Create the GitHub release
 
+Extract the section from CHANGELOG and create the release in one shot:
+
 ```bash
-gh release create vX.Y.Z \
-  --title "vX.Y.Z" \
-  --notes-file <(awk "/## \\[X\\.Y\\.Z\\]/,/## \\[/{print}" CHANGELOG.md | sed '$d')
+VERSION=X.Y.Z
+NOTES=$(mktemp)
+awk -v v="$VERSION" '
+  $0 ~ "^## \\[" v "\\]" { in_section=1; next }
+  in_section && /^## \[/ { exit }
+  in_section { print }
+' CHANGELOG.md > "$NOTES"
+gh release create "v$VERSION" --title "v$VERSION" --notes-file "$NOTES"
+rm "$NOTES"
 ```
 
-Or pass `--notes` with the section pasted by hand. Don't use `--generate-notes` for the body — it duplicates work and produces lower-quality notes than the curated CHANGELOG section.
+Don't use `--generate-notes` — it duplicates work and produces lower-quality notes than the curated CHANGELOG section.
 
 ### 5. Verify
 
