@@ -1,0 +1,47 @@
+import type { ToolCallBlock, ToolCallStatus } from "@runtime/types";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
+
+// Status pill colors mirror StatusPill's vocabulary but the tool_call
+// states (`running` / `ok` / `error` / `denied`) need their own dictionary
+// because `ok` and `denied` don't appear in the global StatusPill table.
+const STATUS_TONES: Record<ToolCallStatus, string> = {
+  running: "bg-blue-500/10 text-blue-400 border-blue-500/30",
+  ok: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30",
+  error: "bg-red-500/10 text-red-400 border-red-500/30",
+  denied: "bg-red-500/10 text-red-400 border-red-500/30"
+};
+
+const STATUS_LABELS: Record<ToolCallStatus, string> = {
+  running: "running",
+  ok: "ok",
+  error: "error",
+  denied: "denied"
+};
+
+export function BlockToolCall({ block }: { block: ToolCallBlock }) {
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-xs">
+      <span className="font-medium text-foreground">{block.displayLabel}</span>
+      {block.argsPreview ? (
+        <span className="truncate font-mono text-[11px] text-muted-foreground">
+          {block.argsPreview}
+        </span>
+      ) : null}
+      <Badge
+        variant="outline"
+        className={cn(
+          "font-mono text-[10px] font-semibold uppercase tracking-wide",
+          STATUS_TONES[block.status]
+        )}
+      >
+        {STATUS_LABELS[block.status]}
+      </Badge>
+      {block.errorMessage ? (
+        <span className="basis-full pl-1 text-[11px] text-red-400/90">
+          {block.errorMessage}
+        </span>
+      ) : null}
+    </div>
+  );
+}
