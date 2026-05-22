@@ -1,61 +1,110 @@
-// Shared dark palette inspired by Telegram desktop. Used as the visual
-// default across all mobile screens. We expose a single `theme` object
-// (rather than the older light/dark pair) because the brief currently
-// ships dark as the only theme — adding light back later would mean
-// reintroducing the pair, not unwinding this module.
+// Single light iOS-style palette. The dark theme is gone — every screen
+// uses the same surface stack, so callers reference these tokens by role
+// (bg, text, etc.) instead of branching on `useColorScheme`.
 
 export const theme = {
-  // Surfaces. `bgRail` is the leftmost agent-rail column; `bg` is the
-  // wider chat-list / detail area. `rowSelected` is the highlighted-row
-  // tint used by the agent picker — a subtle step lighter than `bg` so
-  // selection reads without competing with the row text.
-  bg: "#17212B",
-  bgRail: "#0E1621",
-  rowBg: "#17212B",
-  rowSelected: "#22303C",
-  inputBg: "#242F3D",
+  // Surfaces. `bg` is the white chat / detail surface; `bgDrawer` is the
+  // soft gray panel behind the agent drawer.
+  bg: "#FFFFFF",
+  bgDrawer: "#F2F2F7",
+  surface: "#FFFFFF",
+  searchBg: "#F0F0F0",
+  inputBg: "#FFFFFF",
+  codeChipBg: "#E8E8ED",
 
-  // Text.
-  text: "#FFFFFF",
-  subtle: "#7D8E98",
+  // Text. `text` is the primary chat color; `textDrawer` is the
+  // drawer-specific primary (closer to true black). `subtle` is the
+  // secondary body color; `muted` is timestamps; `mutedFooter` is the
+  // drawer footer label; `mutedIcon` is the drawer "+" glyph color.
+  text: "#1A1A1A",
+  textDrawer: "#1C1C1E",
+  subtle: "#5A5A5A",
+  muted: "#8A8A8A",
+  mutedFooter: "#6E6E73",
+  mutedIcon: "#8E8E93",
+  placeholder: "#9A9A9A",
+  inputPlaceholder: "#9A9AA0",
+  codeChipText: "#3A3A3C",
+  toolIcon: "#4B4B4B",
 
-  // Lines, dividers, faint borders. Just a touch darker than the bg so
-  // it reads as a separator without competing with the row text.
-  border: "#0F1620",
+  // Lines. `border` is the row divider used between chat list rows and
+  // around input pills. `borderStrong` is the drawer footer divider.
+  border: "#ECECEC",
+  borderStrong: "#D1D1D6",
+  inputBorder: "#E2E2E5",
 
   // Accents.
-  accent: "#5288C1",
-  danger: "#E55353",
+  accent: "#007AFF",
+  danger: "#FF3B30",
 
-  // Buttons.
-  button: "#5288C1",
-  buttonDisabled: "#3A4A5C",
+  // Buttons. Send button is the navy circle; disabled state is a
+  // lower-opacity tint so the user still sees the icon.
+  button: "#0A1A3F",
+  buttonDisabled: "#B8BBC7",
   buttonText: "#FFFFFF",
 
-  // Chat bubbles. User bubble uses the accent; assistant uses the input
-  // surface so it sits clearly against the main bg.
-  userBubble: "#2B5278",
+  // Chat bubbles. User bubble is near-black, agent bubble is the iOS
+  // light gray; corner geometry is owned by each block component.
+  userBubble: "#0A0A0A",
   userBubbleText: "#FFFFFF",
-  assistantBubble: "#242F3D",
-  assistantBubbleText: "#FFFFFF",
-  systemBubble: "#3A2E1E",
-  systemBubbleText: "#F0C674"
+  assistantBubble: "#E9E9EB",
+  assistantBubbleText: "#1A1A1A"
 } as const;
 
 export type Theme = typeof theme;
 
-// Deterministic avatar color from an agent id so the same agent always
-// renders the same tint across sessions. Eight steps roughly matches
-// the Telegram desktop accent set without being garish.
+// `@expo-google-fonts/*` exports loaded faces named like `Inter_500Medium`,
+// `HankenGrotesk_700Bold`, `JetBrainsMono_400Regular`. React Native's
+// `fontFamily` style takes one of these face names directly; setting
+// `fontWeight` alongside doesn't switch the face for custom fonts, so
+// callers have to pick the right face string up front. `family()` is the
+// single source of truth for that mapping — pass the family + weight,
+// get back the loaded face name.
+type FamilyName = "Inter" | "HankenGrotesk" | "JetBrainsMono";
+type Weight = 400 | 500 | 600 | 700;
+
+export function family(name: FamilyName, weight: Weight = 400): string {
+  if (name === "Inter") {
+    switch (weight) {
+      case 700:
+        return "Inter_700Bold";
+      case 600:
+        return "Inter_600SemiBold";
+      case 500:
+        return "Inter_500Medium";
+      default:
+        return "Inter_400Regular";
+    }
+  }
+  if (name === "HankenGrotesk") {
+    switch (weight) {
+      case 700:
+        return "HankenGrotesk_700Bold";
+      case 600:
+        return "HankenGrotesk_600SemiBold";
+      case 500:
+        return "HankenGrotesk_500Medium";
+      default:
+        return "HankenGrotesk_400Regular";
+    }
+  }
+  // JetBrainsMono — only Regular is loaded; ignore weight.
+  return "JetBrainsMono_400Regular";
+}
+
+// Deterministic avatar color from an agent id. Kept around because a few
+// places import it defensively; the iOS-style design doesn't surface
+// avatars at the moment, but we leave the helpers in place rather than
+// chase imports across the tree.
 const AVATAR_COLORS = [
-  "#E17076", // red
-  "#EE7C2C", // orange
-  "#FAA730", // yellow
-  "#7BC862", // green
-  "#6EC9CB", // cyan
-  "#65AADD", // light blue
-  "#A695E7", // purple
-  "#EE7AAE" // pink
+  "#E17076",
+  "#EE7C2C",
+  "#FAA730",
+  "#7BC862",
+  "#6EC9CB",
+  "#65AADD",
+  "#A695E7",
+  "#EE7AAE"
 ] as const;
 
 export function avatarColor(id: string): string {
@@ -67,12 +116,8 @@ export function avatarColor(id: string): string {
   return AVATAR_COLORS[index]!;
 }
 
-// First non-whitespace letter of the agent name, uppercased. Falls back
-// to "?" so an empty name still renders something instead of a blank
-// circle.
 export function avatarInitial(name: string): string {
   const trimmed = name.trim();
   if (!trimmed) return "?";
-  const ch = trimmed.charAt(0).toUpperCase();
-  return ch;
+  return trimmed.charAt(0).toUpperCase();
 }

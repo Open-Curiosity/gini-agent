@@ -9,9 +9,9 @@ import { theme } from "@/src/theme";
 export default function Index() {
   const { status, credentials } = useAuth();
   if (status === "loading") {
-    // Solid dark surface during the (effectively zero-length) loading
-    // window keeps us from flashing white between primeCredentials()
-    // resolving and the redirect firing.
+    // Solid white surface during the (effectively zero-length) loading
+    // window keeps the cold-start visual consistent with the rest of
+    // the app while primeCredentials() resolves and the redirect fires.
     return <View style={{ flex: 1, backgroundColor: theme.bg }} />;
   }
   if (!credentials) return <Redirect href="/setup" />;

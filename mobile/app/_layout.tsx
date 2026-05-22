@@ -1,16 +1,29 @@
 import {
+  HankenGrotesk_400Regular,
+  HankenGrotesk_500Medium,
+  HankenGrotesk_600SemiBold,
+  HankenGrotesk_700Bold
+} from "@expo-google-fonts/hanken-grotesk";
+import {
+  Inter_400Regular,
+  Inter_500Medium,
+  Inter_700Bold
+} from "@expo-google-fonts/inter";
+import { JetBrainsMono_400Regular } from "@expo-google-fonts/jetbrains-mono";
+import {
   QueryClient,
   QueryClientProvider,
   useQueryClient
 } from "@tanstack/react-query";
+import { useFonts } from "expo-font";
 import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ActivityIndicator, View } from "react-native";
+import { View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { primeCredentials, useAuth } from "@/src/auth";
-import { theme } from "@/src/theme";
+import { family, theme } from "@/src/theme";
 
 // Single shared client across the tree so navigating between screens
 // keeps caches warm. Built once per app lifetime — Expo Router never
@@ -44,27 +57,43 @@ export default function RootLayout() {
     };
   }, []);
 
-  // Force the dark palette across every screen — there is no light
-  // variant in v1. Stack header tint/background come from the per-screen
-  // options to keep the rule of "the screen owns its own chrome", but
-  // the content background is set globally so the brief flash between
-  // route transitions doesn't show the OS-default white.
+  // Load all custom font faces up front. `useFonts` from `expo-font` keys
+  // each TTF by the face name we want to reference in `fontFamily` styles;
+  // the `family()` helper in theme.ts is the single source of truth for
+  // those names. The promise resolves on first run after Expo downloads
+  // and caches the files locally — subsequent launches are instant.
+  const [fontsLoaded] = useFonts({
+    Inter_400Regular,
+    Inter_500Medium,
+    Inter_700Bold,
+    HankenGrotesk_400Regular,
+    HankenGrotesk_500Medium,
+    HankenGrotesk_600SemiBold,
+    HankenGrotesk_700Bold,
+    JetBrainsMono_400Regular
+  });
+
+  // Light palette is the only theme — pin the header chrome to white +
+  // dark text and use Hanken Grotesk for the screen title font so the
+  // native stack header matches the rest of the chat surfaces.
   const screenOptions = useMemo(
     () => ({
       headerStyle: { backgroundColor: theme.bg } as const,
-      headerTitleStyle: { color: theme.text } as const,
-      headerTintColor: theme.accent,
+      headerTitleStyle: {
+        color: theme.text,
+        fontFamily: family("HankenGrotesk", 700)
+      } as const,
+      headerTintColor: theme.text,
       contentStyle: { backgroundColor: theme.bg } as const
     }),
     []
   );
 
-  if (!primed) {
-    return (
-      <View style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: theme.bg }}>
-        <ActivityIndicator color={theme.subtle} />
-      </View>
-    );
+  // Hold the first render until both AsyncStorage and the font files are
+  // ready. Blank white surface (no spinner) keeps the cold-start visual
+  // quiet — the wait should be ≤500ms once the TTFs are cached on disk.
+  if (!primed || !fontsLoaded) {
+    return <View style={{ flex: 1, backgroundColor: theme.bg }} />;
   }
 
   return (
@@ -72,18 +101,24 @@ export default function RootLayout() {
       <SafeAreaProvider>
         <QueryClientProvider client={queryClient}>
           <AuthCacheGuard />
-          {/* Dark palette is the only theme — pin the status bar text to
-              light so it stays readable against the navy header. */}
-          <StatusBar style="light" />
+          {/* Light theme — status bar text needs to be dark so it reads
+              against the white header chrome. */}
+          <StatusBar style="dark" />
           <Stack screenOptions={screenOptions}>
             <Stack.Screen name="index" options={{ headerShown: false }} />
             <Stack.Screen name="setup" options={{ title: "Connect to Gini" }} />
-            {/* agents.tsx owns its own headerTitle/headerRight via a
-                <Stack.Screen> inside the component, so the native stack
-                header stays on for safe-area + transition behavior. */}
-            <Stack.Screen name="agents" />
+            {/* agents.tsx owns its own header via a <Stack.Screen> inside
+                the component (custom left/right buttons), so we set
+                headerShown: false here and let the screen draw its own
+                hamburger + title + plus row. */}
+            <Stack.Screen name="agents" options={{ headerShown: false }} />
             <Stack.Screen name="settings" options={{ title: "Settings" }} />
-            <Stack.Screen name="chat/[sessionId]" options={{ title: "Chat" }} />
+            {/* Chat detail draws its own header (back arrow + centered
+                title). */}
+            <Stack.Screen
+              name="chat/[sessionId]"
+              options={{ headerShown: false }}
+            />
           </Stack>
         </QueryClientProvider>
       </SafeAreaProvider>

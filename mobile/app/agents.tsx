@@ -1,3 +1,4 @@
+import { Feather } from "@expo/vector-icons";
 import { router, Stack } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -16,7 +17,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApiError } from "@/src/api";
-import { relativeTime } from "@/src/format";
+import { chatListTime } from "@/src/format";
 import {
   useAgents,
   useChats,
@@ -24,14 +25,15 @@ import {
   useCreateChat,
   useUseAgent
 } from "@/src/queries";
-import { theme } from "@/src/theme";
+import { family, theme } from "@/src/theme";
 import type { AgentRecord, ChatSession } from "@/src/types";
 
 // Home screen: a full-width chat list for the currently selected agent.
-// The agent picker lives in the native stack header — tapping the title
-// opens a Slack-style left-drawer Modal listing every agent. The "+ new
-// chat" icon and "Settings" text label share the right side of the
-// header.
+// The header carries a hamburger button (drawer toggle), a centered
+// agent-name title, and a "+" button that creates a new chat. The agent
+// drawer slides in from the left and follows the iOS card layout —
+// selected agent is a white card with a blue stripe + check, others are
+// plain text rows. Footer pins a "+ New Agent" row above a divider.
 export default function AgentsScreen() {
   const agents = useAgents();
   const useAgent = useUseAgent();
@@ -44,7 +46,7 @@ export default function AgentsScreen() {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   // The picker either shows the agent list or, after the user taps "+
-  // New agent", an inline name-entry form. Resets to "list" on close.
+  // New Agent", an inline name-entry form. Resets to "list" on close.
   const [pickerMode, setPickerMode] = useState<"list" | "create">("list");
   const [newAgentName, setNewAgentName] = useState("");
   const [newAgentError, setNewAgentError] = useState<string | null>(null);
@@ -160,32 +162,54 @@ export default function AgentsScreen() {
 
   if (unauthorized) return null;
 
+  const headerTitle =
+    selectedAgent?.name ??
+    (agents.isLoading && list.length === 0
+      ? "Loading…"
+      : list.length > 0
+        ? "Select agent"
+        : "No agents");
+
   return (
-    <SafeAreaView style={styles.safe} edges={["bottom"]}>
-      <Stack.Screen
-        options={{
-          headerShown: true,
-          headerTitle: () => (
-            <HeaderTitle
-              agent={selectedAgent}
-              hasAgents={list.length > 0}
-              loading={agents.isLoading && list.length === 0}
-              onPress={() => setPickerOpen(true)}
-            />
-          ),
-          headerRight: () => (
-            <HeaderActions
-              canCreate={Boolean(agentId)}
-              creating={createChat.isPending}
-              onCreate={onNewChat}
-            />
-          )
-        }}
-      />
+    <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
+      {/* The native stack header is hidden via _layout.tsx so we draw
+          our own header row here. This lets the menu icon, centered
+          title, and plus icon sit at the exact tappable sizes the
+          design calls for without fighting React Navigation's defaults. */}
+      <Stack.Screen options={{ headerShown: false }} />
+
+      <View style={styles.header}>
+        <TouchableOpacity
+          onPress={() => setPickerOpen(true)}
+          disabled={list.length === 0}
+          hitSlop={8}
+          style={styles.headerIconButton}
+          accessibilityRole="button"
+          accessibilityLabel="Open agent drawer"
+        >
+          <Feather name="menu" size={22} color={theme.text} />
+        </TouchableOpacity>
+        <Text style={styles.headerTitle} numberOfLines={1}>
+          {headerTitle}
+        </Text>
+        <TouchableOpacity
+          onPress={onNewChat}
+          disabled={!agentId || createChat.isPending}
+          hitSlop={8}
+          style={styles.headerIconButton}
+          accessibilityRole="button"
+          accessibilityLabel="New chat"
+        >
+          {createChat.isPending ? (
+            <ActivityIndicator color={theme.text} />
+          ) : (
+            <Feather name="plus" size={22} color={theme.text} />
+          )}
+        </TouchableOpacity>
+      </View>
 
       <ChatList
         agents={list}
-        agent={selectedAgent}
         chats={orderedChats}
         isAgentsLoading={agents.isLoading}
         isAgentsError={agents.isError}
@@ -219,76 +243,8 @@ export default function AgentsScreen() {
   );
 }
 
-function HeaderTitle({
-  agent,
-  hasAgents,
-  loading,
-  onPress
-}: {
-  agent: AgentRecord | null;
-  hasAgents: boolean;
-  loading: boolean;
-  onPress: () => void;
-}) {
-  const label = agent?.name ?? (loading ? "Loading…" : hasAgents ? "Select agent" : "No agents");
-  return (
-    <Pressable
-      onPress={onPress}
-      disabled={!hasAgents}
-      hitSlop={8}
-      style={({ pressed }) => [
-        styles.headerTitle,
-        pressed && hasAgents && { opacity: 0.7 }
-      ]}
-      accessibilityRole="button"
-      accessibilityLabel="Switch agent"
-    >
-      <Text style={styles.headerTitleText} numberOfLines={1}>
-        {label}
-      </Text>
-      {hasAgents ? (
-        <Text style={styles.headerChevron}>▾</Text>
-      ) : null}
-    </Pressable>
-  );
-}
-
-function HeaderActions({
-  canCreate,
-  creating,
-  onCreate
-}: {
-  canCreate: boolean;
-  creating: boolean;
-  onCreate: () => void;
-}) {
-  return (
-    <View style={styles.headerActions}>
-      {canCreate ? (
-        <TouchableOpacity
-          onPress={onCreate}
-          disabled={creating}
-          hitSlop={8}
-          style={styles.headerAction}
-          accessibilityRole="button"
-          accessibilityLabel="New chat"
-        >
-          {creating ? (
-            <ActivityIndicator color={theme.accent} />
-          ) : (
-            <View style={styles.headerPlus}>
-              <Text style={styles.headerPlusText}>+</Text>
-            </View>
-          )}
-        </TouchableOpacity>
-      ) : null}
-    </View>
-  );
-}
-
 function ChatList({
   agents,
-  agent,
   chats,
   isAgentsLoading,
   isAgentsError,
@@ -303,7 +259,6 @@ function ChatList({
   creatingChat
 }: {
   agents: AgentRecord[];
-  agent: AgentRecord | null;
   chats: ChatSession[];
   isAgentsLoading: boolean;
   isAgentsError: boolean;
@@ -334,7 +289,7 @@ function ChatList({
   if (isAgentsLoading && agents.length === 0) {
     return (
       <View style={styles.center}>
-        <ActivityIndicator color={theme.subtle} />
+        <ActivityIndicator color={theme.muted} />
       </View>
     );
   }
@@ -368,7 +323,7 @@ function ChatList({
   if (isChatsLoading) {
     return (
       <View style={styles.center}>
-        <ActivityIndicator color={theme.subtle} />
+        <ActivityIndicator color={theme.muted} />
       </View>
     );
   }
@@ -388,79 +343,72 @@ function ChatList({
     );
   }
 
-  if (chats.length === 0) {
-    return (
-      <View style={styles.center}>
-        <Text style={styles.empty}>No chats yet</Text>
-        <TouchableOpacity
-          onPress={onNewChat}
-          disabled={creatingChat}
-          style={[styles.newButton, creatingChat && { opacity: 0.6 }]}
-        >
-          <Text style={styles.newButtonText}>Start a chat</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  }
-
   return (
     <View style={{ flex: 1 }}>
-      <View style={styles.searchBarContainer}>
-        <TextInput
-          value={query}
-          onChangeText={setQuery}
-          placeholder="Search"
-          placeholderTextColor={theme.subtle}
-          autoCapitalize="none"
-          autoCorrect={false}
-          returnKeyType="search"
-          clearButtonMode="while-editing"
-          style={styles.searchBarInput}
-          accessibilityLabel="Search chats"
-        />
-      </View>
-      <FlatList
-        data={filtered}
-        keyExtractor={(s) => s.id}
-        refreshControl={
-          <RefreshControl
-            refreshing={isChatsFetching && !isChatsLoading}
-            onRefresh={onRetryChats}
-            tintColor={theme.subtle}
+      <View style={styles.searchWrap}>
+        <View style={styles.searchPill}>
+          <Feather name="search" size={16} color={theme.placeholder} />
+          <TextInput
+            value={query}
+            onChangeText={setQuery}
+            placeholder="Search"
+            placeholderTextColor={theme.placeholder}
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="search"
+            clearButtonMode="while-editing"
+            style={styles.searchInput}
+            accessibilityLabel="Search chats"
           />
-        }
-        ItemSeparatorComponent={ChatRowSeparator}
-        renderItem={({ item }) => <ChatRow session={item} agent={agent} />}
-        ListEmptyComponent={
-          query.trim() ? (
-            <View style={styles.searchEmpty}>
-              <Text style={styles.emptySub}>No chats match “{query}”</Text>
-            </View>
-          ) : null
-        }
-      />
+        </View>
+      </View>
+      {chats.length === 0 ? (
+        <View style={styles.center}>
+          <Text style={styles.empty}>No chats yet</Text>
+          <TouchableOpacity
+            onPress={onNewChat}
+            disabled={creatingChat}
+            style={[styles.newButton, creatingChat && { opacity: 0.6 }]}
+          >
+            <Text style={styles.newButtonText}>Start a chat</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <FlatList
+          data={filtered}
+          keyExtractor={(s) => s.id}
+          contentContainerStyle={styles.chatListContent}
+          refreshControl={
+            <RefreshControl
+              refreshing={isChatsFetching && !isChatsLoading}
+              onRefresh={onRetryChats}
+              tintColor={theme.muted}
+            />
+          }
+          renderItem={({ item }) => <ChatRow session={item} />}
+          ListEmptyComponent={
+            query.trim() ? (
+              <View style={styles.searchEmpty}>
+                <Text style={styles.emptySub}>No chats match “{query}”</Text>
+              </View>
+            ) : null
+          }
+        />
+      )}
     </View>
   );
 }
 
-function ChatRowSeparator() {
-  return <View style={styles.chatRowSeparator} />;
-}
-
-function ChatRow({
-  session,
-  agent
-}: {
-  session: ChatSession;
-  agent: AgentRecord | null;
-}) {
+function ChatRow({ session }: { session: ChatSession }) {
   const title = session.title?.trim() || "New chat";
-  // Without a previewable last-message field on the wire, the cleanest
-  // secondary line is the agent name (matches Telegram's group-name
-  // subtitle convention) — falling back to the session summary if
-  // present, which the runtime fills in for some flows.
-  const subtitle = session.summary?.trim() || agent?.name || "";
-  const time = relativeTime(session.updatedAt ?? session.createdAt);
+  // Excerpt: prefer the runtime-supplied summary; the agent name
+  // fallback that the dark theme had relied on a passed `agent` prop —
+  // the new layout doesn't pipe the agent down because the design
+  // doesn't show it on the row. Empty subtitle is rendered as " " to
+  // keep the row's vertical rhythm consistent across rows with and
+  // without a summary.
+  const subtitle = session.summary?.trim() ?? "";
+  const time = chatListTime(session.updatedAt ?? session.createdAt);
 
   return (
     <TouchableOpacity
@@ -468,21 +416,19 @@ function ChatRow({
       activeOpacity={0.7}
       style={styles.chatRow}
     >
-      <View style={styles.chatRowBody}>
-        <View style={styles.chatRowTopLine}>
-          <Text style={styles.chatRowTitle} numberOfLines={1}>
-            {title}
-          </Text>
-          <Text style={styles.chatRowTime} numberOfLines={1}>
-            {time}
-          </Text>
-        </View>
-        {subtitle ? (
-          <Text style={styles.chatRowSubtitle} numberOfLines={1}>
-            {subtitle}
-          </Text>
-        ) : null}
+      <View style={styles.chatRowTopLine}>
+        <Text style={styles.chatRowTitle} numberOfLines={1}>
+          {title}
+        </Text>
+        <Text style={styles.chatRowTime} numberOfLines={1}>
+          {time}
+        </Text>
       </View>
+      {subtitle ? (
+        <Text style={styles.chatRowSubtitle} numberOfLines={1}>
+          {subtitle}
+        </Text>
+      ) : null}
     </TouchableOpacity>
   );
 }
@@ -496,6 +442,10 @@ const PICKER_DISMISS_STRIP = 40;
 // Slide animation duration in ms. Matches the React Native iOS sheet
 // animation feel.
 const PICKER_ANIM_DURATION = 220;
+// Max panel width per the design — narrower phones clamp to
+// (screenWidth - DISMISS_STRIP), wider devices cap at 360 so the panel
+// doesn't stretch across an iPad in landscape.
+const PICKER_MAX_WIDTH = 360;
 
 function AgentPickerModal({
   visible,
@@ -526,33 +476,23 @@ function AgentPickerModal({
   onCancelNewAgent: () => void;
   onClose: () => void;
 }) {
-  // Slack-style left drawer: full-height panel that slides in from the
-  // left edge. We drive the slide ourselves with Animated.View so we can
-  // reveal a thin strip of the previous screen on the right that doubles
-  // as a tap-to-dismiss target — `Modal animationType="slide"` doesn't
-  // support horizontal animation directly. The Modal itself uses
-  // `animationType="none"` and we control the open/close transitions.
+  // Slide animation driven by Animated.Value so we can reveal a thin
+  // strip of the previous screen on the right that doubles as a
+  // tap-to-dismiss target. The Modal itself uses `animationType="none"`
+  // and we control the open/close transitions ourselves.
   //
   // `mounted` decouples render lifetime from `visible` so the close
-  // animation can run to completion before the Modal unmounts. When
-  // `visible` flips true we mount immediately, snap to the off-screen
-  // position, then animate to 0. When `visible` flips false we animate
-  // back to the off-screen position and only set `mounted=false` once
-  // the animation finishes.
+  // animation can run to completion before the Modal unmounts.
   const { width: screenWidth } = useWindowDimensions();
-  const panelWidth = Math.max(0, screenWidth - PICKER_DISMISS_STRIP);
-  // Initial value is the off-screen position so first-render's slide-in
-  // starts from the left edge. The Animated.Value is created once via
-  // useRef; subsequent updates flow through setValue / Animated.timing.
+  const panelWidth = Math.max(
+    0,
+    Math.min(PICKER_MAX_WIDTH, screenWidth - PICKER_DISMISS_STRIP)
+  );
   const translateX = useRef(new Animated.Value(-panelWidth)).current;
   const [mounted, setMounted] = useState(visible);
 
   useEffect(() => {
     if (visible) {
-      // Mount the panel (no-op if already mounted) and slide it in. We
-      // snap to the off-screen position first so a re-open from
-      // mid-close starts cleanly from the left edge rather than jumping
-      // from wherever the close animation paused.
       setMounted(true);
       translateX.setValue(-panelWidth);
       const anim = Animated.timing(translateX, {
@@ -565,9 +505,6 @@ function AgentPickerModal({
         anim.stop();
       };
     }
-    // Slide out, then unmount on completion. Animating from the current
-    // value (which may be 0 or mid-slide) means the close picks up
-    // smoothly even if the user dismisses mid-open.
     const anim = Animated.timing(translateX, {
       toValue: -panelWidth,
       duration: PICKER_ANIM_DURATION,
@@ -599,22 +536,28 @@ function AgentPickerModal({
           ]}
         >
           <SafeAreaView edges={["top", "bottom"]} style={styles.modalSheetInner}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>
-                {mode === "list" ? "Agents" : "New agent"}
-              </Text>
-              <TouchableOpacity
-                onPress={onClose}
-                hitSlop={8}
-                accessibilityRole="button"
-                accessibilityLabel="Close"
-                style={styles.modalClose}
-              >
-                <Text style={styles.modalCloseText}>Done</Text>
-              </TouchableOpacity>
-            </View>
             {mode === "list" ? (
               <>
+                <View style={styles.drawerHeader}>
+                  <Text style={styles.drawerTitle}>Agents</Text>
+                  {/* Gear icon takes the user to the settings screen.
+                      The Pencil reference doesn't show it, but Settings
+                      has to live somewhere reachable — the drawer title
+                      row is the iOS-conventional spot for a sidebar's
+                      meta entry. */}
+                  <TouchableOpacity
+                    onPress={() => {
+                      onClose();
+                      router.push("/settings");
+                    }}
+                    hitSlop={8}
+                    style={styles.drawerHeaderAction}
+                    accessibilityRole="button"
+                    accessibilityLabel="Open settings"
+                  >
+                    <Feather name="settings" size={22} color={theme.mutedIcon} />
+                  </TouchableOpacity>
+                </View>
                 <FlatList
                   data={agents}
                   keyExtractor={(a) => a.id}
@@ -629,18 +572,25 @@ function AgentPickerModal({
                   )}
                   ItemSeparatorComponent={PickerRowSpacer}
                 />
-                <View style={styles.pickerFooterDivider} />
-                <NewAgentFooterRow onPress={onStartNewAgent} />
+                <View style={styles.drawerFooter}>
+                  <View style={styles.drawerFooterDivider} />
+                  <NewAgentFooterRow onPress={onStartNewAgent} />
+                </View>
               </>
             ) : (
-              <NewAgentForm
-                name={newAgentName}
-                error={newAgentError}
-                creating={creating}
-                onChangeName={onChangeNewAgentName}
-                onSubmit={onSubmitNewAgent}
-                onCancel={onCancelNewAgent}
-              />
+              <>
+                <View style={styles.drawerHeader}>
+                  <Text style={styles.drawerTitle}>New agent</Text>
+                </View>
+                <NewAgentForm
+                  name={newAgentName}
+                  error={newAgentError}
+                  creating={creating}
+                  onChangeName={onChangeNewAgentName}
+                  onSubmit={onSubmitNewAgent}
+                  onCancel={onCancelNewAgent}
+                />
+              </>
             )}
           </SafeAreaView>
         </Animated.View>
@@ -682,7 +632,7 @@ function NewAgentForm({
         value={name}
         onChangeText={onChangeName}
         placeholder="Agent name"
-        placeholderTextColor={theme.subtle}
+        placeholderTextColor={theme.placeholder}
         autoFocus
         autoCapitalize="words"
         autoCorrect={false}
@@ -694,9 +644,7 @@ function NewAgentForm({
         style={styles.newAgentInput}
         accessibilityLabel="Agent name"
       />
-      {error ? (
-        <Text style={styles.newAgentError}>{error}</Text>
-      ) : null}
+      {error ? <Text style={styles.newAgentError}>{error}</Text> : null}
       <View style={styles.newAgentActions}>
         <TouchableOpacity
           onPress={onCancel}
@@ -742,160 +690,198 @@ function AgentPickerRow({
   selected: boolean;
   onPress: () => void;
 }) {
-  // Subtitle prefers provider/model when present and falls back to the
-  // status string so the row always has a useful secondary line.
-  const subtitleParts: string[] = [];
-  if (agent.providerName) subtitleParts.push(agent.providerName);
-  if (agent.model) subtitleParts.push(agent.model);
-  const subtitle = subtitleParts.join(" · ") || agent.status;
-
+  // Selected row gets the white card treatment: rounded background, a
+  // 4px blue stripe on the left (drawn with a `View` rather than a
+  // border so it sits flush with the card's rounded edge), and a small
+  // check icon on the right. Other rows are plain — just text aligned
+  // to the card's leftmost text position.
+  if (selected) {
+    return (
+      <TouchableOpacity
+        onPress={onPress}
+        activeOpacity={0.85}
+        style={styles.pickerCardWrap}
+        accessibilityRole="button"
+        accessibilityLabel={`Selected: ${agent.name}`}
+        accessibilityState={{ selected: true }}
+      >
+        <View style={styles.pickerCard}>
+          <View style={styles.pickerCardStripe} />
+          <Text style={styles.pickerCardName} numberOfLines={1}>
+            {agent.name}
+          </Text>
+          <Feather
+            name="check-circle"
+            size={20}
+            color={theme.accent}
+            style={styles.pickerCardCheck}
+          />
+        </View>
+      </TouchableOpacity>
+    );
+  }
   return (
     <TouchableOpacity
       onPress={onPress}
       activeOpacity={0.7}
-      style={[styles.pickerRow, selected && styles.pickerRowSelected]}
+      style={styles.pickerPlainRow}
       accessibilityRole="button"
       accessibilityLabel={`Select agent ${agent.name}`}
-      accessibilityState={{ selected }}
     >
-      <View style={styles.pickerBody}>
-        <Text style={styles.pickerTitle} numberOfLines={1}>
-          {agent.name}
-        </Text>
-        {subtitle ? (
-          <Text style={styles.pickerSubtitle} numberOfLines={1}>
-            {subtitle}
-          </Text>
-        ) : null}
-      </View>
+      <Text style={styles.pickerPlainName} numberOfLines={1}>
+        {agent.name}
+      </Text>
     </TouchableOpacity>
   );
 }
 
-// The "+ New agent" row mirrors AgentPickerRow's shape (same height,
-// padding, and corner radius) so the pinned footer reads as part of the
-// same row family — just with an accent color and a leading "+". It sits
-// below a divider rather than being part of the FlatList itself, which
-// is what keeps it visually anchored to the bottom of the panel.
+// "+ New Agent" footer row. Sits below a horizontal rule so it reads as
+// an action distinct from the agent list rather than a list row itself.
+// Mirrors the design: leading `plus` icon, label in the drawer's
+// secondary text color.
 function NewAgentFooterRow({ onPress }: { onPress: () => void }) {
   return (
-    <View style={styles.pickerFooterContainer}>
-      <TouchableOpacity
-        onPress={onPress}
-        activeOpacity={0.7}
-        style={styles.pickerRow}
-        accessibilityRole="button"
-        accessibilityLabel="Create new agent"
-      >
-        <Text style={styles.pickerNewAgentText}>+ New agent</Text>
-      </TouchableOpacity>
-    </View>
+    <TouchableOpacity
+      onPress={onPress}
+      activeOpacity={0.7}
+      style={styles.drawerFooterRow}
+      accessibilityRole="button"
+      accessibilityLabel="Create new agent"
+    >
+      <Feather name="plus" size={20} color={theme.mutedIcon} />
+      <Text style={styles.drawerFooterText}>New Agent</Text>
+    </TouchableOpacity>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.bg },
 
-  // Header.
-  headerTitle: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    maxWidth: 220
-  },
-  headerTitleText: {
-    color: theme.text,
-    fontSize: 17,
-    fontWeight: "600",
-    flexShrink: 1
-  },
-  headerChevron: { color: theme.subtle, fontSize: 14 },
-  headerActions: { flexDirection: "row", alignItems: "center", gap: 4 },
-  headerAction: {
-    height: 36,
-    paddingHorizontal: 8,
-    alignItems: "center",
-    justifyContent: "center"
-  },
-  headerActionText: { color: theme.accent, fontSize: 15, fontWeight: "500" },
-  // WeChat-style circle-plus icon used for "new chat". The thin stroke
-  // and matching accent color keep it visually quiet next to the
-  // "Settings" text label that still lives in the header.
-  headerPlus: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    borderWidth: 1.5,
-    borderColor: theme.accent,
-    alignItems: "center",
-    justifyContent: "center"
-  },
-  headerPlusText: {
-    color: theme.accent,
-    fontSize: 18,
-    lineHeight: 18,
-    fontWeight: "400",
-    // Optical centering: the "+" glyph carries slightly more bottom
-    // bearing than top in most system fonts, so a tiny negative top
-    // margin pulls it into the geometric center of the circle. Without
-    // this it visually sits a hair low.
-    marginTop: -1
-  },
-
-  // Search bar — pill-shaped TextInput above the chat list.
-  searchBarContainer: { paddingHorizontal: 12, paddingVertical: 8 },
-  searchBarInput: {
-    backgroundColor: theme.inputBg,
-    color: theme.text,
-    fontSize: 15,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 12
-  },
-  searchEmpty: { padding: 24, alignItems: "center" },
-
-  // Chat rows.
-  chatRow: {
+  // Header — hamburger / centered title / plus. The title is `flex: 1`
+  // with `textAlign: "center"` so it stays visually centered even though
+  // the icon containers on either side aren't guaranteed to be equal
+  // width.
+  header: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 16,
-    paddingVertical: 12,
-    gap: 12
+    paddingVertical: 14,
+    backgroundColor: theme.bg,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.border
   },
-  // Separator starts at the row's horizontal padding (16) since rows
-  // no longer have a leading avatar column.
-  chatRowSeparator: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: theme.border,
-    marginLeft: 16
+  headerIconButton: {
+    width: 36,
+    height: 36,
+    alignItems: "center",
+    justifyContent: "center"
   },
-  chatRowBody: { flex: 1, gap: 2 },
-  chatRowTopLine: { flexDirection: "row", alignItems: "flex-start", gap: 8 },
-  chatRowTitle: { flex: 1, color: theme.text, fontSize: 16, fontWeight: "700" },
-  chatRowTime: { color: theme.subtle, fontSize: 12 },
-  chatRowSubtitle: { color: theme.subtle, fontSize: 13 },
+  headerTitle: {
+    flex: 1,
+    textAlign: "center",
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 19
+  },
+
+  // Search pill — slate-gray rounded pill with a leading search icon
+  // and a transparent TextInput.
+  searchWrap: { paddingHorizontal: 12, paddingVertical: 10 },
+  searchPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+    backgroundColor: theme.searchBg,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 9
+  },
+  searchInput: {
+    flex: 1,
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 15,
+    padding: 0
+  },
+  searchEmpty: { padding: 24, alignItems: "center" },
+
+  // Chat rows. Title + day/time on the top line, single-line subtitle
+  // below. Bottom border on each row matches the design's hairline
+  // dividers.
+  chatListContent: { paddingHorizontal: 16, paddingTop: 4 },
+  chatRow: {
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.border,
+    gap: 6
+  },
+  chatRowTopLine: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  chatRowTitle: {
+    flex: 1,
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 18
+  },
+  chatRowTime: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 12
+  },
+  chatRowSubtitle: {
+    color: theme.subtle,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 14,
+    lineHeight: 18
+  },
 
   // Generic states.
-  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24, gap: 12 },
-  empty: { color: theme.text, fontSize: 18, fontWeight: "600" },
-  emptySub: { color: theme.subtle, fontSize: 14, textAlign: "center" },
-  error: { color: theme.danger, fontSize: 14, textAlign: "center" },
+  center: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 24,
+    gap: 12
+  },
+  empty: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 18
+  },
+  emptySub: {
+    color: theme.subtle,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 14,
+    textAlign: "center"
+  },
+  error: {
+    color: theme.danger,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 14,
+    textAlign: "center"
+  },
   retry: { padding: 8 },
-  retryText: { color: theme.accent, fontSize: 14 },
+  retryText: {
+    color: theme.accent,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 14
+  },
   newButton: {
     paddingHorizontal: 18,
     paddingVertical: 12,
     borderRadius: 10,
     backgroundColor: theme.accent
   },
-  newButtonText: { color: theme.buttonText, fontSize: 15, fontWeight: "600" },
+  newButtonText: {
+    color: theme.buttonText,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 15
+  },
 
-  // Modal — Slack-style left-edge drawer. `modalRoot` lays out the
-  // animated panel (full height, almost-full width) and a thin
-  // tap-to-dismiss strip on the right that lets the previous screen
-  // peek through. The inner SafeAreaView consumes both the top notch
-  // inset and the bottom home-indicator inset so neither the title nor
-  // the pinned footer collides with system chrome.
+  // Modal — left-edge drawer over a tap-to-dismiss strip.
   modalRoot: {
     position: "absolute",
     top: 0,
@@ -906,68 +892,133 @@ const styles = StyleSheet.create({
   },
   modalPanel: {
     height: "100%",
-    backgroundColor: theme.bg
+    backgroundColor: theme.bgDrawer,
+    borderTopRightRadius: 18,
+    borderBottomRightRadius: 18,
+    // Subtle drop shadow on the right edge of the panel so the
+    // tap-to-dismiss strip reads as another layer rather than a flat
+    // continuation of the panel.
+    shadowColor: "#000",
+    shadowOffset: { width: 2, height: 0 },
+    shadowOpacity: 0.08,
+    shadowRadius: 6,
+    elevation: 8
   },
-  modalDismissStrip: {
-    height: "100%"
-  },
-  modalSheetInner: { flex: 1 },
-  modalHeader: {
+  modalDismissStrip: { height: "100%" },
+  modalSheetInner: { flex: 1, paddingHorizontal: 20 },
+
+  // Drawer header — large "Agents" title flush left, gear icon on the
+  // right. Generous top padding so it clears the status bar even on a
+  // notched device.
+  drawerHeader: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 24,
     paddingTop: 24,
-    paddingBottom: 16
+    paddingBottom: 24
   },
-  modalTitle: { flex: 1, color: theme.text, fontSize: 28, fontWeight: "700" },
-  modalClose: { paddingHorizontal: 4, paddingVertical: 4 },
-  modalCloseText: { color: theme.accent, fontSize: 15, fontWeight: "500" },
+  drawerTitle: {
+    flex: 1,
+    color: theme.textDrawer,
+    fontFamily: family("Inter", 700),
+    fontSize: 34
+  },
+  drawerHeaderAction: {
+    width: 36,
+    height: 36,
+    alignItems: "center",
+    justifyContent: "center"
+  },
 
-  // Agent picker rows — tall, breathy rows like Slack's workspace list.
-  // Selected row gets a card-like rounded outline + filled background
-  // so it reads as the active card without dominating the list. Row
-  // text aligns with the title's left edge: header padding 24 ==
-  // row marginHorizontal 4 + row paddingHorizontal 20.
+  // Agent list.
   pickerList: { flex: 1 },
-  pickerListContent: { paddingVertical: 4 },
-  pickerRow: {
+  pickerListContent: { paddingBottom: 16 },
+  pickerRowSpacer: { height: 6 },
+
+  // Selected agent card.
+  pickerCardWrap: {
+    // Outer wrap holds the iOS-style drop shadow so it isn't clipped by
+    // the card's own overflow.
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 2
+  },
+  pickerCard: {
+    backgroundColor: theme.bg,
+    borderRadius: 12,
+    paddingVertical: 16,
+    paddingHorizontal: 16,
+    paddingLeft: 16 + 4, // leave room for the 4px stripe inside
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 20,
-    paddingVertical: 18,
-    marginHorizontal: 4,
-    minHeight: 72,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "transparent"
+    overflow: "hidden"
   },
-  pickerRowSelected: {
-    backgroundColor: theme.rowSelected,
-    borderColor: theme.border
+  pickerCardStripe: {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    bottom: 0,
+    width: 4,
+    backgroundColor: theme.accent
   },
-  pickerRowSpacer: { height: 4 },
-  pickerBody: { flex: 1, gap: 4 },
-  pickerTitle: { color: theme.text, fontSize: 17, fontWeight: "700" },
-  pickerSubtitle: { color: theme.subtle, fontSize: 14 },
-  pickerFooterDivider: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: theme.border
+  pickerCardName: {
+    flex: 1,
+    color: theme.textDrawer,
+    fontFamily: family("Inter", 500),
+    fontSize: 17
   },
-  pickerFooterContainer: { paddingVertical: 4 },
-  pickerNewAgentText: { color: theme.accent, fontSize: 17, fontWeight: "600" },
+  pickerCardCheck: { marginLeft: 8 },
 
-  // New-agent inline form. Sits inside the same full-height panel as
-  // the list, so it gets generous top padding to balance the header.
-  newAgentForm: { paddingHorizontal: 24, paddingTop: 16, paddingBottom: 24, gap: 12 },
+  // Plain (non-selected) row.
+  pickerPlainRow: {
+    paddingVertical: 16,
+    paddingHorizontal: 20
+  },
+  pickerPlainName: {
+    color: theme.textDrawer,
+    fontFamily: family("Inter", 500),
+    fontSize: 17
+  },
+
+  // Drawer footer.
+  drawerFooter: { paddingBottom: 8 },
+  drawerFooterDivider: {
+    height: 1,
+    backgroundColor: theme.borderStrong,
+    marginBottom: 8
+  },
+  drawerFooterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 18
+  },
+  drawerFooterText: {
+    color: theme.mutedFooter,
+    fontFamily: family("Inter", 500),
+    fontSize: 17
+  },
+
+  // New-agent inline form. Generous top padding to balance the title.
+  newAgentForm: { paddingTop: 8, paddingBottom: 24, gap: 12 },
   newAgentInput: {
-    backgroundColor: theme.inputBg,
+    backgroundColor: theme.bg,
     color: theme.text,
+    fontFamily: family("HankenGrotesk", 400),
     fontSize: 16,
     paddingHorizontal: 14,
     paddingVertical: 12,
-    borderRadius: 10
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: theme.inputBorder
   },
-  newAgentError: { color: theme.danger, fontSize: 13 },
+  newAgentError: {
+    color: theme.danger,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 13
+  },
   newAgentActions: { flexDirection: "row", gap: 8 },
   newAgentButton: {
     flex: 1,
@@ -976,9 +1027,17 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
-  newAgentCancel: { backgroundColor: theme.inputBg },
-  newAgentCancelText: { color: theme.text, fontSize: 15, fontWeight: "600" },
-  newAgentSubmit: { backgroundColor: theme.button },
-  newAgentSubmitText: { color: theme.buttonText, fontSize: 15, fontWeight: "600" },
+  newAgentCancel: { backgroundColor: theme.bg, borderWidth: 1, borderColor: theme.inputBorder },
+  newAgentCancelText: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 15
+  },
+  newAgentSubmit: { backgroundColor: theme.accent },
+  newAgentSubmitText: {
+    color: theme.buttonText,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 15
+  },
   newAgentButtonDisabled: { opacity: 0.5 }
 });
