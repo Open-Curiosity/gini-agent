@@ -42,21 +42,38 @@ export async function tunnel(ctx: CliContext): Promise<void> {
   }
 
   if (sub === "enable") {
-    mutateTunnelConfig(ctx, (tunnelCfg) => ({ ...tunnelCfg, enabled: true }));
-    print({ ok: true, message: "Tunnel enabled. Restart the runtime (`gini stop && gini start`) to pick up the change." });
+    const snapshot = await applyTunnelToggle(ctx, { enabled: true });
+    if (snapshot) {
+      print({ ok: true, snapshot, message: "Tunnel enabled. cloudflared is starting now." });
+    } else {
+      mutateTunnelConfig(ctx, (tunnelCfg) => ({ ...tunnelCfg, enabled: true }));
+      print({ ok: true, message: "Tunnel enabled in config.json. Start the runtime (`gini start`) to bring cloudflared up." });
+    }
     return;
   }
 
   if (sub === "disable") {
-    mutateTunnelConfig(ctx, (tunnelCfg) => ({ ...tunnelCfg, enabled: false }));
-    print({ ok: true, message: "Tunnel disabled. Restart the runtime to apply." });
+    const snapshot = await applyTunnelToggle(ctx, { enabled: false });
+    if (snapshot) {
+      print({ ok: true, snapshot, message: "Tunnel disabled. cloudflared has been torn down." });
+    } else {
+      mutateTunnelConfig(ctx, (tunnelCfg) => ({ ...tunnelCfg, enabled: false }));
+      print({ ok: true, message: "Tunnel disabled in config.json. The runtime is not currently running." });
+    }
     return;
   }
 
   if (sub === "rotate-secret") {
+    // Secret rotation stays disk-only: the PATCH /api/tunnel surface
+    // intentionally accepts only `enabled` + `appleNotes.enabled` so an
+    // attacker holding the bearer cannot rotate the secret out from
+    // under a paired device. The CLI runs locally, owns config.json,
+    // and the running gateway captured the OLD secret at boot — so the
+    // rotation only takes effect after a restart. Mention that in the
+    // message instead of pretending the live runtime has rotated.
     const newSecret = generateSecret();
     mutateTunnelConfig(ctx, (tunnelCfg) => ({ ...tunnelCfg, secret: newSecret }));
-    print({ ok: true, secret: newSecret, message: "Tunnel secret rotated. Restart the runtime to apply; the previous URL prefix becomes invalid immediately on next boot." });
+    print({ ok: true, secret: newSecret, message: "Tunnel secret rotated in config.json. Restart the runtime to apply; the previous URL prefix becomes invalid immediately on next boot." });
     return;
   }
 
@@ -76,29 +93,42 @@ export async function tunnel(ctx: CliContext): Promise<void> {
   if (sub === "apple-notes") {
     const action = cliArgs[2];
     if (action === "enable") {
-      mutateTunnelConfig(ctx, (tunnelCfg) => ({
-        ...tunnelCfg,
-        appleNotes: { ...tunnelCfg.appleNotes, enabled: true }
-      }));
-      print({ ok: true, message: "Apple Notes mirroring enabled. Restart the runtime to apply." });
+      const snapshot = await applyTunnelToggle(ctx, { appleNotes: { enabled: true } });
+      if (snapshot) {
+        print({ ok: true, snapshot, message: "Apple Notes mirroring enabled." });
+      } else {
+        mutateTunnelConfig(ctx, (tunnelCfg) => ({
+          ...tunnelCfg,
+          appleNotes: { ...tunnelCfg.appleNotes, enabled: true }
+        }));
+        print({ ok: true, message: "Apple Notes mirroring enabled in config.json. Start the runtime to apply." });
+      }
       return;
     }
     if (action === "disable") {
-      mutateTunnelConfig(ctx, (tunnelCfg) => ({
-        ...tunnelCfg,
-        appleNotes: { ...tunnelCfg.appleNotes, enabled: false }
-      }));
-      print({ ok: true, message: "Apple Notes mirroring disabled. Restart the runtime to apply." });
+      const snapshot = await applyTunnelToggle(ctx, { appleNotes: { enabled: false } });
+      if (snapshot) {
+        print({ ok: true, snapshot, message: "Apple Notes mirroring disabled." });
+      } else {
+        mutateTunnelConfig(ctx, (tunnelCfg) => ({
+          ...tunnelCfg,
+          appleNotes: { ...tunnelCfg.appleNotes, enabled: false }
+        }));
+        print({ ok: true, message: "Apple Notes mirroring disabled in config.json. Start the runtime to apply." });
+      }
       return;
     }
     if (action === "folder") {
+      // Folder name isn't part of the PATCH /api/tunnel surface (which
+      // accepts only enable toggles). It stays disk-only, picked up at
+      // the next restart. The message reflects that contract.
       const folder = cliArgs[3];
       if (!folder) throw new Error("Usage: gini tunnel apple-notes folder <folder-name>");
       mutateTunnelConfig(ctx, (tunnelCfg) => ({
         ...tunnelCfg,
         appleNotes: { ...tunnelCfg.appleNotes, folder }
       }));
-      print({ ok: true, folder, message: "Apple Notes folder updated. Restart the runtime to apply." });
+      print({ ok: true, folder, message: "Apple Notes folder updated in config.json. Restart the runtime to apply." });
       return;
     }
     throw new Error(
@@ -130,4 +160,41 @@ function mutateTunnelConfig(
   };
   raw.tunnel = mutate(normalized);
   writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`);
+}
+
+// Prefer the live runtime PATCH path so a `gini tunnel enable` against a
+// running gateway brings cloudflared up immediately (and the inverse
+// disable tears it down) without waiting for a restart. We probe with a
+// short-timeout GET /api/tunnel; if the runtime is reachable, hand the
+// update over to its applyConfig hook which serializes through
+// pendingApply in src/server.ts. If the gateway is not running, return
+// null so the caller falls back to the direct disk mutation — same
+// disk shape, same key set, so the next start picks up where the
+// runtime would have left off.
+async function applyTunnelToggle(
+  ctx: CliContext,
+  update: { enabled?: boolean; appleNotes?: { enabled?: boolean } }
+): Promise<unknown | null> {
+  const { config } = ctx;
+  // Short-circuit on a quick probe so an offline runtime fails fast
+  // instead of blocking on the full PATCH timeout. /api/status is
+  // bearer-token gated AND in-memory, so a healthy gateway answers
+  // sub-ms on localhost.
+  try {
+    const probe = await fetch(`http://127.0.0.1:${config.port}/api/status`, {
+      headers: { authorization: `Bearer ${config.token}` },
+      signal: AbortSignal.timeout(750)
+    });
+    if (!probe.ok) return null;
+  } catch {
+    return null;
+  }
+  try {
+    return await api(config, "/api/tunnel", {
+      method: "PATCH",
+      body: JSON.stringify(update)
+    });
+  } catch {
+    return null;
+  }
 }
