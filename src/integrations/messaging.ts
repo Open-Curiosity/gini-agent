@@ -1136,21 +1136,31 @@ export async function removeMessagingBridge(config: RuntimeConfig, idOrName: str
     (item) => item.id === idOrName || item.name === idOrName
   );
   if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
+  // Secret cleanup is idempotent (deleteConnectorSecrets silently skips
+  // missing namespaces) so it stays outside the state lock.
   deleteConnectorSecrets(config.instance, bridgeSecretNamespace(bridge.id));
   return mutateState(config.instance, (state) => {
     const index = state.messagingBridges.findIndex((item) => item.id === bridge.id);
-    if (index >= 0) state.messagingBridges.splice(index, 1);
+    if (index < 0) {
+      // A concurrent caller landed inside the mutateState lock first and
+      // already removed this bridge + wrote the audit row. Returning
+      // removed:false here is what keeps the audit log from carrying a
+      // duplicate `messaging.removed` entry for one logical removal.
+      return { id: bridge.id, removed: false } as const;
+    }
+    const live = state.messagingBridges[index];
+    state.messagingBridges.splice(index, 1);
     addAudit(
       state,
       {
         actor: "user",
         action: "messaging.removed",
-        target: bridge.id,
+        target: live.id,
         risk: "medium",
-        evidence: { kind: bridge.kind, name: bridge.name }
+        evidence: { kind: live.kind, name: live.name }
       },
       { system: true }
     );
-    return { id: bridge.id, removed: true } as const;
+    return { id: live.id, removed: true } as const;
   });
 }

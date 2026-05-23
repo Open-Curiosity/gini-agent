@@ -779,6 +779,40 @@ describe("messaging telegram wiring", () => {
     expect(live?.id).toBe(bridge.id);
   });
 
+  test("concurrent removeMessagingBridge calls emit a single audit row", async () => {
+    // Two callers racing on the same bridge id both pass the pre-lock
+    // existence check (readState is unsynchronized). Before the fix, both
+    // mutators would unconditionally write a `messaging.removed` audit row
+    // and return removed:true, so the audit trail carried duplicates for
+    // one logical removal. Now the second mutator sees index<0 inside the
+    // lock and returns removed:false, leaving a single audit row.
+    const config = testConfig("telegram-remove-concurrent");
+    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
+    const { removeMessagingBridge } = await import("./messaging");
+    const { readState: readStateLocal } = await import("../state");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+
+    const [first, second] = await Promise.all([
+      removeMessagingBridge(config, bridge.id),
+      removeMessagingBridge(config, bridge.id)
+    ]);
+    const outcomes = [first.removed, second.removed].sort();
+    expect(outcomes).toEqual([false, true]);
+
+    const state = readStateLocal(config.instance);
+    expect(state.messagingBridges.find((b) => b.id === bridge.id)).toBeUndefined();
+    const removalAudits = state.audit.filter(
+      (entry) => entry.action === "messaging.removed" && entry.target === bridge.id
+    );
+    expect(removalAudits.length).toBe(1);
+  });
+
   test("sendMessagingOutput rejects a disabled bridge up front (closes the disable-vs-send race)", async () => {
     // Without the status guard, sendMessagingOutput would proceed
     // to the photo-parse + agent-filter work and ultimately fail
