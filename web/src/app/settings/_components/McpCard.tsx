@@ -166,9 +166,16 @@ function TelegramPendingRequests({ bridgeId }: { bridgeId: string }) {
   });
 
   const pending = chats.data?.recentDeniedChats ?? [];
+  const allowedCount = chats.data?.allowedChatIds.length ?? 0;
   const busy = approve.isPending || reject.isPending;
 
   if (pending.length === 0) {
+    // Quiet the idle "Listening…" indicator once at least one chat
+    // is on the allowlist — the operator has confirmed they're done
+    // onboarding and shouldn't have to look at a permanent hint band.
+    // A new unrecognized chat that DMs the bot still mints a pending
+    // row here; the row is what surfaces, not this empty state.
+    if (allowedCount > 0) return null;
     return (
       <div className="mt-1 flex items-center gap-2 rounded-xl bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
         <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-sky-500" aria-hidden />
