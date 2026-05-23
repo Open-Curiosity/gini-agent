@@ -377,4 +377,3 @@ describe("backfillDefaultAgentToolsets", () => {
     expect(audits.length).toBe(0);
   });
 });
-

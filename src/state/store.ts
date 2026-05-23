@@ -876,4 +876,3 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   expirePairingCodes(state);
   return state;
 }
-
