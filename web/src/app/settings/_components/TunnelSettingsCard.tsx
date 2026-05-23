@@ -85,12 +85,19 @@ export function TunnelSettingsCard() {
 
   // Toggling the tunnel off while the operator is currently accessing the
   // gateway through that same tunnel is inherently self-defeating: the
-  // runtime tears cloudflared down before our PATCH gets a response, so
-  // the fetch hangs forever. We apply a 1.5s ceiling ONLY for that
-  // narrow case (disabling the tunnel while the browser is on a non-
-  // localhost host). Every other PATCH — enabling, the entire Notes
-  // mirror toggle, or disabling from localhost — propagates real
-  // errors to onError so a failed request actually surfaces in the UI.
+  // runtime tears cloudflared down before our PATCH gets a response. In
+  // practice the browser sees either (a) a long hang or (b) a fast
+  // network rejection — both are the EXPECTED outcome of a successful
+  // self-severing disable, because the server processed the request
+  // and wrote config.json BEFORE cloudflared closed the connection.
+  //
+  // For the self-severing case both shapes resolve to optimistic
+  // success: ceiling-fired or fetch-rejected both mean "the response
+  // never arrived but the disable likely committed". The 5s refetch
+  // interval is the eventual truth source either way. Every other
+  // PATCH — enabling, the entire Notes mirror toggle, or disabling
+  // from localhost — propagates real errors to onError so a failed
+  // request actually surfaces in the UI.
   const toggleTunnel = useMutation({
     mutationFn: async (enabled: boolean) => {
       const selfSevering = !enabled && isExternalHost();
@@ -104,8 +111,7 @@ export function TunnelSettingsCard() {
         setTimeout(() => resolve(ceilingFired), 1500)
       );
       const result = await Promise.race([fetchPromise.catch((error) => error), ceiling]);
-      if (result === ceilingFired) return null;
-      if (result instanceof Error) throw result;
+      if (result === ceilingFired || result instanceof Error) return null;
       return result;
     },
     onMutate: async (enabled: boolean) => {

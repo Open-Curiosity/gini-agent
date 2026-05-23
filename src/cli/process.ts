@@ -311,7 +311,15 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // anyone hitting the gateway through the tunnel. Running `next start`
   // against the prebuilt output avoids HMR entirely.
   const webMode = process.env.GINI_WEB_MODE === "production" ? "start" : "dev";
-  const command = ["run", webMode, "--", "-p", String(port)];
+  // Bind to loopback explicitly. Next 16 defaults to 0.0.0.0, which
+  // would make the BFF reachable from any host on the LAN — and
+  // proxy.ts uses the client-controlled Host header to decide
+  // "localhost", so a spoofed `Host: localhost:<port>` from a LAN
+  // client would skip the tunnel-secret gate and reach `/api/*` under
+  // the operator's bearer. Pinning to 127.0.0.1 ensures the only
+  // public entrypoint is cloudflared, which is the path proxy.ts
+  // actually authenticates.
+  const command = ["run", webMode, "--", "-p", String(port), "-H", "127.0.0.1"];
   // detached: true puts the child in its own process group so we can SIGTERM
   // the entire group on stop (`bun run dev` re-execs into Next.js, leaving an
   // orphaned grandchild if we only kill the recorded pid).

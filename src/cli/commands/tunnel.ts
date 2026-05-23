@@ -146,15 +146,31 @@ export async function tunnel(ctx: CliContext): Promise<void> {
     }
     if (action === "folder") {
       // Folder name isn't part of the PATCH /api/tunnel surface (which
-      // accepts only enable toggles). It stays disk-only, picked up at
-      // the next restart. The message reflects that contract.
+      // accepts only enable toggles). The disk write would race the
+      // runtime's serialized PATCH chain — an in-flight enable/disable
+      // can read disk, then we write `folder`, then the runtime writes
+      // back its pre-folder snapshot and silently clobbers our change.
+      // Refuse the mutation while the runtime is reachable; the
+      // operator's workflow is `gini stop` → folder change → `gini
+      // start`. Atomic writes don't help here because the race is on
+      // the read-modify-write window, not the file syscall.
       const folder = cliArgs[3];
       if (!folder) throw new Error("Usage: gini tunnel apple-notes folder <folder-name>");
+      let runtimeReachable = false;
+      try {
+        await api(config, "/api/tunnel");
+        runtimeReachable = true;
+      } catch { /* runtime offline — disk-only write is safe */ }
+      if (runtimeReachable) {
+        throw new Error(
+          "Refusing to update the Apple Notes folder while the runtime is running. Run `gini stop` first, then `gini tunnel apple-notes folder <name>`, then `gini start`. The PATCH surface does not accept folder changes, so the disk write would race the runtime's in-memory state."
+        );
+      }
       mutateTunnelConfig(ctx, (tunnelCfg) => ({
         ...tunnelCfg,
         appleNotes: { ...tunnelCfg.appleNotes, folder }
       }));
-      print({ ok: true, folder, message: "Apple Notes folder updated in config.json. Restart the runtime to apply." });
+      print({ ok: true, folder, message: "Apple Notes folder updated in config.json. Next `gini start` will pick it up." });
       return;
     }
     throw new Error(
@@ -215,12 +231,14 @@ async function applyTunnelToggle(
   } catch {
     return null;
   }
-  try {
-    return await api(config, "/api/tunnel", {
-      method: "PATCH",
-      body: JSON.stringify(update)
-    });
-  } catch {
-    return null;
-  }
+  // The probe confirmed the runtime is up. From here the PATCH should
+  // either succeed or surface its failure verbatim — silently falling
+  // back to disk mutation would hide real errors ("cloudflared binary
+  // missing", "web target unresolved") and leave the runtime out of
+  // sync with disk. Let the api() helper's thrown Error propagate so
+  // the CLI prints it and the operator can act.
+  return await api(config, "/api/tunnel", {
+    method: "PATCH",
+    body: JSON.stringify(update)
+  });
 }

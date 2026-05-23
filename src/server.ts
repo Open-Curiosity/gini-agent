@@ -252,6 +252,14 @@ async function probeWebHealthy(webUrl: string): Promise<boolean> {
 // PATCH.
 let pendingApply: Promise<void> = Promise.resolve();
 
+// Guards both the SIGTERM handler (against concurrent signals) and the
+// PATCH-enable path (against spawning cloudflared after shutdown has
+// begun). A PATCH that's sitting in `await resolveWebTarget()` when
+// SIGTERM arrives must NOT proceed to manager.start() afterwards —
+// the drain handler called manager.stop() already, found nothing to
+// stop, and would now leak a child past the shutdown deadline.
+let shutdownStarted = false;
+
 async function runApplyConfig(
   update: { enabled?: boolean; appleNotes?: { enabled?: boolean } }
 ): Promise<ReturnType<typeof tunnelManager.getSnapshot>> {
@@ -344,11 +352,24 @@ async function runApplyConfig(
       });
     }
     if (resolvedTarget !== null) {
-      await tunnelManager.start().catch((error) => {
-        appendLog(config.instance, "tunnel.start.error", {
-          error: error instanceof Error ? error.message : String(error)
+      if (shutdownStarted) {
+        // The SIGTERM drain landed while we were polling
+        // resolveWebTarget. Spawning cloudflared now would leak a
+        // child past the drain deadline (manager.stop() ran earlier
+        // and found nothing because start() hadn't been called yet).
+        // Abort the apply silently; the on-disk enabled=true the
+        // PATCH already persisted will pick up cloudflared at the
+        // next boot, which is the correct semantics.
+        appendLog(config.instance, "tunnel.start.aborted", {
+          reason: "shutdown in progress"
         });
-      });
+      } else {
+        await tunnelManager.start().catch((error) => {
+          appendLog(config.instance, "tunnel.start.error", {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        });
+      }
     } else if (resolveError !== null) {
       // Propagate the target-resolution failure to the PATCH caller so
       // the client gets a real error (500) with a useful message
@@ -582,14 +603,11 @@ const discordDone: Promise<void> = (async function discordReconcileLoop(): Promi
   }
 })();
 
-// Guard against concurrent SIGTERMs. launchctl bootout, `kill`, and our
-// own self-signal from src/runtime/autostart-refresh.ts can all arrive
-// in quick succession; we only want to drain + consume the refresh
-// marker once. Without this flag, two SIGTERMs racing the same drain
-// would call `server.stop(false)` twice and then run the marker-consume
-// twice — best case a wasted spawn, worst case a double-bootstrap that
-// confuses launchd.
-let shutdownStarted = false;
+// shutdownStarted is hoisted earlier in the file so runApplyConfig
+// can also consult it before spawning cloudflared. Two SIGTERMs in
+// rapid succession (launchctl bootout, kill, autostart-refresh self-
+// signal) would otherwise race the drain and consume the marker
+// twice — best case a wasted spawn, worst case a double-bootstrap.
 
 process.on("SIGTERM", async () => {
   if (shutdownStarted) return;
