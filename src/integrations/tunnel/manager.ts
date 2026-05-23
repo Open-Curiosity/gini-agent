@@ -152,6 +152,19 @@ export class TunnelManager {
   }
 
   /**
+   * Record a startup-flow failure (e.g., resolveWebTarget timed out
+   * before cloudflared could be spawned, or the spawn itself crashed
+   * outside the normal start() catch). The runtime's boot-time
+   * tunnel bring-up sits in a fire-and-forget IIFE that only
+   * appendLog'd its errors before — operators saw "Connecting…" in
+   * the Settings card forever with no diagnostic surfaced over
+   * /api/tunnel. Now the same error reaches the snapshot.
+   */
+  recordStartFailure(message: string): void {
+    this.snapshot = { ...this.snapshot, lastError: message };
+  }
+
+  /**
    * Mutate the live config a running manager observes. Used by the
    * runtime's `applyConfig` hook so flipping `enabled` or the Apple
    * Notes toggle from the web UI takes effect immediately for any

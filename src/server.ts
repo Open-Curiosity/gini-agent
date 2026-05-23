@@ -548,9 +548,14 @@ if (tunnelResolved.config.enabled) {
       await tunnelManager.start();
       currentWebTarget = target;
     } catch (error) {
-      appendLog(config.instance, "tunnel.start.error", {
-        error: error instanceof Error ? error.message : String(error)
-      });
+      const message = error instanceof Error ? error.message : String(error);
+      appendLog(config.instance, "tunnel.start.error", { error: message });
+      // Surface the failure on the snapshot so a GET /api/tunnel
+      // immediately after boot shows the operator why cloudflared
+      // never came up. Previously the error was only in the log
+      // file, so the Settings card would sit on "Connecting…"
+      // indefinitely with no diagnostic.
+      tunnelManager.recordStartFailure(message);
     }
   })();
 }

@@ -146,15 +146,24 @@ shape that depends on memorising the URL breaks at the next reboot.
 
 ## Trust model
 
-- **Localhost bearer token**: unchanged. Still the only way to reach
-  `/api/pairing/claim` and the only way for direct callers.
-- **Tunnel secret-path**: same surface area as the bearer-token path.
-  `/api/pairing/claim` is reachable both directly (no bearer required,
-  the existing pairing bootstrap) and over the tunnel after the
-  secret-path strip; the prefix is still required for any tunneled
-  request, so a stranger without the URL cannot reach claim through
-  the tunnel. Anyone in possession of the full secret-path URL has
-  full operator-level access until the next restart.
+- **Localhost bearer token**: unchanged. The only path that can mint a
+  fresh pairing code via `POST /api/pairing` — the runtime refuses
+  that endpoint over the tunnel, and the BFF refuses it via the
+  cookie-authed path too, because a tunnel-secret holder could
+  otherwise chain `POST /api/runtime/pairing` → `POST /api/pairing/claim`
+  into a durable bearer credential that outlives the next secret
+  rotation. Percent-encoded variants of the path
+  (`/api/runtime/%70airing`) are canonicalized at the proxy before
+  the deny check so encoding tricks can't bypass it.
+- **Tunnel secret-path**: same surface area as the bearer-token path
+  except for `POST /api/pairing` (see above). `/api/pairing/claim`
+  is still reachable both directly (no bearer required, the existing
+  pairing bootstrap) and over the tunnel after the secret-path
+  strip — but only when the operator already produced a code by
+  hitting `/api/pairing` from localhost. Anyone in possession of the
+  full secret-path URL has full operator-level access (read state,
+  toggle settings, run agent tasks) until the next restart, minus
+  the ability to mint new long-lived credentials.
 - **No password auth**: by design. The URL is the credential. The secret
   is generated with `crypto.getRandomValues(24 bytes)` — 192 bits of
   entropy — so an attacker cannot guess the path without already knowing
