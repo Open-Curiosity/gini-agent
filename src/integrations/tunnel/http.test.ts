@@ -246,10 +246,11 @@ describe("tunnel HTTP integration", () => {
     expect(calls[0]).toEqual({ appleNotes: { enabled: false } });
   });
 
-  test("PATCH /api/tunnel ignores non-boolean fields silently", async () => {
-    // Defensive: the toggle component only ever sends booleans, but a
-    // hand-rolled curl could pass a string. The runtime treats those as
-    // no-ops rather than throwing.
+  test("PATCH /api/tunnel rejects non-boolean fields with 400", async () => {
+    // A hand-rolled curl that passes a string for `enabled` should
+    // hear about the type mismatch instead of getting a 200 with no
+    // observable effect. The earlier shape silently dropped malformed
+    // fields; this asserts the new contract.
     const config = testConfig("tunnel-http-patch-typesafe");
     const calls: Array<{ enabled?: boolean; appleNotes?: { enabled?: boolean } }> = [];
     const handler = createHandler(config, {
@@ -262,15 +263,23 @@ describe("tunnel HTTP integration", () => {
         }
       }
     });
-    const response = await handler(
+    const stringEnabled = await handler(
       new Request("http://127.0.0.1:7337/api/tunnel", {
         method: "PATCH",
         headers: { authorization: `Bearer ${config.token}`, "content-type": "application/json" },
-        body: JSON.stringify({ enabled: "true", appleNotes: { enabled: 1 } })
+        body: JSON.stringify({ enabled: "true" })
       })
     );
-    expect(response.status).toBe(200);
-    expect(calls[0]).toEqual({});
+    expect(stringEnabled.status).toBe(400);
+    const numberNotes = await handler(
+      new Request("http://127.0.0.1:7337/api/tunnel", {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${config.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ appleNotes: { enabled: 1 } })
+      })
+    );
+    expect(numberNotes.status).toBe(400);
+    expect(calls).toHaveLength(0);
   });
 
   test("PATCH /api/tunnel returns 501 when applyConfig hook is absent", async () => {

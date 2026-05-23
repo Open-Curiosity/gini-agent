@@ -146,9 +146,26 @@ export function createHandler(
     ["PATCH", /^\/api\/tunnel$/, async (request) => {
       if (!tunnel?.applyConfig) return json({ error: "tunnel patch not supported" }, 501);
       const payload = await body(request);
-      const enabledRaw = (payload as { enabled?: unknown }).enabled;
-      const notesPayload = (payload as { appleNotes?: { enabled?: unknown } }).appleNotes;
-      const notesEnabledRaw = notesPayload?.enabled;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        return json({ error: "PATCH body must be a JSON object" }, 400);
+      }
+      const record = payload as Record<string, unknown>;
+      const enabledRaw = record.enabled;
+      const notesPayload = record.appleNotes;
+      // Reject malformed shapes instead of silently dropping. A
+      // client that PATCHes `{enabled: "true"}` (string) or
+      // `{appleNotes: "on"}` should hear about the mistake, not get
+      // a 200 with no observable change.
+      if (enabledRaw !== undefined && typeof enabledRaw !== "boolean") {
+        return json({ error: "`enabled` must be a boolean" }, 400);
+      }
+      if (notesPayload !== undefined && (typeof notesPayload !== "object" || notesPayload === null || Array.isArray(notesPayload))) {
+        return json({ error: "`appleNotes` must be an object" }, 400);
+      }
+      const notesEnabledRaw = (notesPayload as { enabled?: unknown } | undefined)?.enabled;
+      if (notesEnabledRaw !== undefined && typeof notesEnabledRaw !== "boolean") {
+        return json({ error: "`appleNotes.enabled` must be a boolean" }, 400);
+      }
       const update: { enabled?: boolean; appleNotes?: { enabled?: boolean } } = {};
       if (typeof enabledRaw === "boolean") update.enabled = enabledRaw;
       if (typeof notesEnabledRaw === "boolean") {

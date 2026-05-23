@@ -53,16 +53,23 @@ reachable from any device on any network. Authorization is by URL prefix
 across restarts even though Cloudflare rotates the public hostname.
 
 ```sh
-bun run gini tunnel enable        # flip the persistent config flag
-bun run gini stop && bun run gini start   # pick up the flag
+bun run gini tunnel enable        # live PATCH if the gateway is up; otherwise flips the persistent config
 bun run gini tunnel status        # current URL + secret + Apple Notes status
 bun run gini tunnel qr            # ANSI QR for the current URL
+bun run gini tunnel sync-notes    # POST refresh trigger after granting Automation permission
 ```
 
-The CLI prints the full `https://<random>.trycloudflare.com/<secret>/`
-URL. Scan the QR with a phone camera or open the URL in any browser —
-the runtime renders a small landing page that links into `/api/status`,
-`/api/state`, and `/api/tunnel/qr.svg`.
+The CLI prints the full `https://<random>.trycloudflare.com/<secret>`
+URL. Scan the QR with a phone camera or open the URL in any browser
+and the proxy redirects to `/` after minting a session cookie, so the
+operator lands on the full Settings/Chat UI served by the Next.js web
+process. cloudflared targets the web port (not the raw runtime), so
+the public surface is what the operator sees on localhost.
+
+The tunnel can also be toggled live from the Settings page — the UI's
+"Enable"/"Disable" buttons hit the same `PATCH /api/tunnel` endpoint
+the CLI uses when the runtime is up. No restart needed in either
+direction.
 
 `cloudflared` must be on PATH (`brew install cloudflared` on macOS). With
 the binary missing the tunnel snapshot stays empty and the rest of the
