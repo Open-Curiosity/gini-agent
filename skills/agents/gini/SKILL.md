@@ -216,12 +216,24 @@ instance behind NAT works the same as one on a public host.
    ```http
    POST /api/messaging/my-bot/allow
 
-   { "chatId": 123456789 }
+   { "chatId": 123456789, "expectedCode": "AB-1A-22" }
    ```
 
-   Group chat IDs are negative integers — that is correct, not an error.
+   Pass the `expectedCode` you confirmed in step 4. The server re-checks
+   that it still matches the live `verificationCode` on the pending row
+   and hasn't expired, so a code that rotated (the user re-DM'd and
+   minted a new one) or aged past its TTL between fetch and approve
+   returns `409 Conflict` instead of silently allow-listing the chat.
+
+   Group chat IDs are negative integers — that is correct, not an
+   error. Group chats have no `verificationCode` (no per-user channel
+   to deliver one through), so omit `expectedCode` when allow-listing a
+   negative chat ID.
 
    Human-operator CLI mirror: `gini messaging allow my-bot <chatId>`.
+   The CLI omits the code because the explicit invocation on the
+   operator's machine already proves intent; the API path is the one
+   that needs the code-rotation check.
 
 6. **Send a message** to confirm round-trip:
 
