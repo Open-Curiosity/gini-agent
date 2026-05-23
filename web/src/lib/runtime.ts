@@ -247,7 +247,18 @@ function parseTrustedOrigins(raw: string | undefined): ReadonlySet<string> | nul
   return out;
 }
 
-const TRUSTED_ORIGINS = parseTrustedOrigins(process.env.GINI_TRUSTED_ORIGINS);
+// Read process.env each call rather than caching at module import. The
+// allowlist is short and the parse is trivial — re-running it per
+// privileged POST costs a few microseconds, the requests aren't a hot
+// path, and tests can now drive the guard's behavior by setting or
+// deleting GINI_TRUSTED_ORIGINS in the test process without restarting
+// the module loader. Without this, integration tests that exercise the
+// BFF guard via proxyRequest would behave differently depending on
+// whether the operator's dev shell had the env var exported — a real
+// test-environment dependency, not just a theoretical one.
+function trustedOrigins(): ReadonlySet<string> | null {
+  return parseTrustedOrigins(process.env.GINI_TRUSTED_ORIGINS);
+}
 
 // Loopback hostnames the guard's local-dev fallback accepts when no
 // allowlist is configured. Anything else is DNS-rebindable from a public
@@ -289,9 +300,10 @@ function guardPrivilegedRequest(request: Request, pathSegments: string[]): Respo
     // every entry was malformed (empty Set), we fail closed — refuse
     // every privileged POST — rather than silently downgrading to the
     // rebindable fallback.
-    if (TRUSTED_ORIGINS) {
+    const allowlist = trustedOrigins();
+    if (allowlist) {
       const normalized = `${originUrl.protocol}//${originUrl.host}`;
-      if (!TRUSTED_ORIGINS.has(normalized)) {
+      if (!allowlist.has(normalized)) {
         return Response.json({ error: "Forbidden" }, { status: 403 });
       }
     } else {
