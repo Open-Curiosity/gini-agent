@@ -114,23 +114,48 @@ export const defaultOsascriptRunner: RunOsascript = async (script, options) => {
 };
 
 /**
- * Returns true when the iCloud account is signed in and Notes.app exposes
- * it under the given display name. Used to decide whether to enable the
- * Apple Notes mirroring on this host.
+ * Result of probing whether the iCloud account is signed in and exposed
+ * to Notes.app. `available` is the yes/no outcome the manager uses to
+ * gate the mirror write; `reason` carries the human-readable failure
+ * cause when `available` is false — distinguishing "TCC denied" or
+ * "osascript timed out" from "iCloud not configured" so the snapshot's
+ * `lastError` field can guide the operator to the right fix instead
+ * of always blaming a missing iCloud account.
+ */
+export interface ICloudAvailability {
+  available: boolean;
+  reason: string | null;
+}
+
+/**
+ * Returns availability info for the iCloud account in Notes.app.
+ * Includes the failure reason when the probe couldn't confirm "yes".
  */
 export async function isICloudAccountAvailable(
   options: { account?: string; run?: RunOsascript; signal?: AbortSignal } = {}
-): Promise<boolean> {
-  if (process.platform !== "darwin") return false;
+): Promise<ICloudAvailability> {
+  if (process.platform !== "darwin") {
+    return { available: false, reason: "Apple Notes mirror runs only on macOS hosts." };
+  }
   const account = options.account ?? "iCloud";
   const run = options.run ?? defaultOsascriptRunner;
   const script = `tell application "Notes"\n  set acctNames to name of every account\n  if acctNames contains ${quoteAppleScript(account)} then\n    return "yes"\n  else\n    return "no"\n  end if\nend tell`;
   try {
     const result = await run(script, { signal: options.signal });
-    if (result.exitCode !== 0) return false;
-    return result.stdout.trim() === "yes";
-  } catch {
-    return false;
+    if (result.exitCode !== 0) {
+      const trimmed = (result.stderr ?? "").trim();
+      const reason = trimmed
+        || `osascript failed with exit code ${result.exitCode}`;
+      return { available: false, reason };
+    }
+    if (result.stdout.trim() === "yes") return { available: true, reason: null };
+    return {
+      available: false,
+      reason: `iCloud account "${account}" is not visible in Notes.app — open Notes once and sign in if needed.`
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { available: false, reason: `osascript invocation failed: ${message}` };
   }
 }
 

@@ -49,7 +49,7 @@ describe("apple-notes scripting helpers", () => {
 });
 
 describe("apple-notes runtime gating", () => {
-  test("isICloudAccountAvailable returns false on non-macOS without invoking osascript", async () => {
+  test("isICloudAccountAvailable returns unavailable on non-macOS without invoking osascript", async () => {
     const originalPlatform = process.platform;
     Object.defineProperty(process, "platform", { value: "linux" });
     try {
@@ -59,23 +59,33 @@ describe("apple-notes runtime gating", () => {
         return { stdout: "", stderr: "", exitCode: 0 };
       };
       const result = await isICloudAccountAvailable({ run: stub });
-      expect(result).toBe(false);
+      expect(result.available).toBe(false);
+      expect(result.reason).toContain("macOS");
       expect(invoked).toBe(false);
     } finally {
       Object.defineProperty(process, "platform", { value: originalPlatform });
     }
   });
 
-  test("isICloudAccountAvailable surfaces the osascript yes/no answer when on macOS", async () => {
+  test("isICloudAccountAvailable surfaces the osascript yes/no answer with reason on macOS", async () => {
     const originalPlatform = process.platform;
     Object.defineProperty(process, "platform", { value: "darwin" });
     try {
       const yes: RunOsascript = async () => ({ stdout: "yes\n", stderr: "", exitCode: 0 });
       const no: RunOsascript = async () => ({ stdout: "no\n", stderr: "", exitCode: 0 });
-      const broken: RunOsascript = async () => ({ stdout: "", stderr: "boom", exitCode: 1 });
-      expect(await isICloudAccountAvailable({ run: yes })).toBe(true);
-      expect(await isICloudAccountAvailable({ run: no })).toBe(false);
-      expect(await isICloudAccountAvailable({ run: broken })).toBe(false);
+      const broken: RunOsascript = async () => ({ stdout: "", stderr: "TCC denied: not authorized", exitCode: 1 });
+      const yesResult = await isICloudAccountAvailable({ run: yes });
+      expect(yesResult.available).toBe(true);
+      expect(yesResult.reason).toBeNull();
+      const noResult = await isICloudAccountAvailable({ run: no });
+      expect(noResult.available).toBe(false);
+      expect(noResult.reason).toContain("not visible");
+      const brokenResult = await isICloudAccountAvailable({ run: broken });
+      expect(brokenResult.available).toBe(false);
+      // The actual osascript stderr text reaches the caller — operators
+      // staring at a stuck mirror need the real reason, not a generic
+      // "iCloud not found" fallback.
+      expect(brokenResult.reason).toBe("TCC denied: not authorized");
     } finally {
       Object.defineProperty(process, "platform", { value: originalPlatform });
     }

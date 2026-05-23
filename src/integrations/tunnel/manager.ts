@@ -465,7 +465,7 @@ export class TunnelManager {
       };
       return this.getSnapshot();
     }
-    const available = await isICloudAccountAvailable({
+    const probe = await isICloudAccountAvailable({
       account: this.config.appleNotes.account,
       run: this.osascript,
       signal
@@ -474,7 +474,7 @@ export class TunnelManager {
       ...this.snapshot,
       appleNotes: {
         ...this.snapshot.appleNotes,
-        available
+        available: probe.available
       }
     };
     // Re-check the enabled flag after the osascript await. A PATCH that
@@ -485,13 +485,18 @@ export class TunnelManager {
     if (!this.config.appleNotes.enabled || this.disableAppleNotes) {
       return this.getSnapshot();
     }
-    if (!available) {
+    if (!probe.available) {
+      // Surface the actual reason — TCC denial, osascript timeout,
+      // iCloud not configured, etc. — rather than always blaming a
+      // missing iCloud account. The probe distinguishes the cause so
+      // the operator's first instinct ("which permission do I need to
+      // grant?") gets useful data instead of a generic fallback.
       this.snapshot = {
         ...this.snapshot,
         appleNotes: {
           ...this.snapshot.appleNotes,
           lastError: this.config.appleNotes.enabled
-            ? "iCloud account not found in Notes.app — skipping mirror"
+            ? (probe.reason ?? "iCloud account not found in Notes.app — skipping mirror")
             : null
         }
       };
