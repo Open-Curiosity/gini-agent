@@ -64,16 +64,33 @@ export async function tunnel(ctx: CliContext): Promise<void> {
   }
 
   if (sub === "rotate-secret") {
-    // Secret rotation stays disk-only: the PATCH /api/tunnel surface
-    // intentionally accepts only `enabled` + `appleNotes.enabled` so an
-    // attacker holding the bearer cannot rotate the secret out from
-    // under a paired device. The CLI runs locally, owns config.json,
-    // and the running gateway captured the OLD secret at boot — so the
-    // rotation only takes effect after a restart. Mention that in the
-    // message instead of pretending the live runtime has rotated.
+    // Secret rotation stays disk-only: PATCH /api/tunnel intentionally
+    // accepts only `enabled` + `appleNotes.enabled`, so an attacker
+    // holding the bearer can't rotate the secret out from under a
+    // paired device. The CLI runs locally and owns config.json.
+    //
+    // But: the BFF (web/src/lib/runtime.ts:runtimeTunnelState) reads
+    // config.json on every request, so a rotation while the tunnel is
+    // up immediately 404s the live URL — the BFF demands the new
+    // secret, while the QR / Apple Notes / browser cookies still
+    // carry the old one. Refuse rotation in that state and tell the
+    // operator to disable the tunnel first.
+    let liveSnapshot: { enabled?: boolean } | null = null;
+    try {
+      liveSnapshot = (await api(config, "/api/tunnel")) as { enabled?: boolean };
+    } catch { /* runtime not reachable — disk-only rotation is safe */ }
+    if (liveSnapshot && liveSnapshot.enabled === true) {
+      throw new Error(
+        "Refusing to rotate the tunnel secret while the tunnel is live — the new secret would 404 every active session and the existing QR. Run `gini tunnel disable` first, then `gini tunnel rotate-secret`, then `gini tunnel enable` to bring it back up under the new secret."
+      );
+    }
     const newSecret = generateSecret();
     mutateTunnelConfig(ctx, (tunnelCfg) => ({ ...tunnelCfg, secret: newSecret }));
-    print({ ok: true, secret: newSecret, message: "Tunnel secret rotated in config.json. Restart the runtime to apply; the previous URL prefix becomes invalid immediately on next boot." });
+    print({
+      ok: true,
+      secret: newSecret,
+      message: "Tunnel secret rotated in config.json. Next `gini tunnel enable` will mint a QR / Apple Notes entry under the new secret."
+    });
     return;
   }
 

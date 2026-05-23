@@ -86,17 +86,27 @@ export function TunnelSettingsCard() {
   // Toggling the tunnel off while the operator is currently accessing the
   // gateway through that same tunnel is inherently self-defeating: the
   // runtime tears cloudflared down before our PATCH gets a response, so
-  // the fetch hangs and the button looks frozen. Optimistic updates
-  // flip the visible state the instant the user clicks; the PATCH races
-  // against a short ceiling so the mutation can't pend forever.
+  // the fetch hangs forever. We apply a 1.5s ceiling ONLY for that
+  // narrow case (disabling the tunnel while the browser is on a non-
+  // localhost host). Every other PATCH — enabling, the entire Notes
+  // mirror toggle, or disabling from localhost — propagates real
+  // errors to onError so a failed request actually surfaces in the UI.
   const toggleTunnel = useMutation({
     mutationFn: async (enabled: boolean) => {
+      const selfSevering = !enabled && isExternalHost();
       const fetchPromise = api<TunnelSnapshot>("/tunnel", {
         method: "PATCH",
         body: JSON.stringify({ enabled })
-      }).catch(() => null);
-      const ceiling = new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500));
-      return Promise.race([fetchPromise, ceiling]);
+      });
+      if (!selfSevering) return fetchPromise;
+      const ceilingFired = Symbol("ceiling");
+      const ceiling = new Promise<typeof ceilingFired>((resolve) =>
+        setTimeout(() => resolve(ceilingFired), 1500)
+      );
+      const result = await Promise.race([fetchPromise.catch((error) => error), ceiling]);
+      if (result === ceilingFired) return null;
+      if (result instanceof Error) throw result;
+      return result;
     },
     onMutate: async (enabled: boolean) => {
       await queryClient.cancelQueries({ queryKey: ["tunnel"] });
@@ -128,15 +138,15 @@ export function TunnelSettingsCard() {
     }
   });
 
+  // No ceiling here — flipping the Apple Notes mirror never tears down
+  // cloudflared, so a hanging PATCH would be a real bug worth surfacing
+  // rather than something to mask with optimistic success.
   const toggleNotes = useMutation({
-    mutationFn: async (enabled: boolean) => {
-      const fetchPromise = api<TunnelSnapshot>("/tunnel", {
+    mutationFn: async (enabled: boolean) =>
+      api<TunnelSnapshot>("/tunnel", {
         method: "PATCH",
         body: JSON.stringify({ appleNotes: { enabled } })
-      }).catch(() => null);
-      const ceiling = new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500));
-      return Promise.race([fetchPromise, ceiling]);
-    },
+      }),
     onMutate: async (enabled: boolean) => {
       await queryClient.cancelQueries({ queryKey: ["tunnel"] });
       const previous = queryClient.getQueryData<TunnelSnapshot>(["tunnel"]);
@@ -155,6 +165,15 @@ export function TunnelSettingsCard() {
       if (context?.previous) queryClient.setQueryData(["tunnel"], context.previous);
     }
   });
+
+  // True when the page is loaded through cloudflared (or any non-loopback
+  // host). Used to scope the self-severing fetch ceiling to disable-from-
+  // tunnel — the one case where the response can't arrive.
+  function isExternalHost(): boolean {
+    if (typeof window === "undefined") return false;
+    const host = window.location.hostname;
+    return host !== "localhost" && host !== "127.0.0.1" && host !== "::1";
+  }
 
   // Cache-buster ties the QR fetch to the observedAt timestamp so a
   // fresh tunnel URL pulls a fresh SVG.
@@ -222,7 +241,11 @@ export function TunnelSettingsCard() {
               <Button
                 size="sm"
                 variant="outline"
-                disabled={!tunnelEnabled || notesAvailable === false || toggleNotes.isPending}
+                disabled={
+                  !tunnelEnabled
+                  || (!notesEnabled && notesAvailable === false)
+                  || toggleNotes.isPending
+                }
                 onClick={() => toggleNotes.mutate(!notesEnabled)}
               >
                 {notesEnabled ? "Disable" : "Enable"}

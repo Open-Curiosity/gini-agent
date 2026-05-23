@@ -166,6 +166,7 @@ export class TunnelManager {
       this.snapshot = { ...this.snapshot, enabled: update.enabled };
     }
     if (update.appleNotes) {
+      const wasEnabled = this.config.appleNotes.enabled;
       (this.config as { appleNotes: TunnelConfig["appleNotes"] }).appleNotes = {
         ...this.config.appleNotes,
         ...update.appleNotes
@@ -179,6 +180,14 @@ export class TunnelManager {
           noteName: this.config.appleNotes.noteName
         }
       };
+      // If the operator just disabled the mirror, abort any in-flight
+      // osascript pipeline so the long isICloudAccountAvailable +
+      // updateAppleNote awaits don't land a write after the disable.
+      // refreshAppleNoteInner also re-checks the enabled flag after
+      // each await as a belt-and-suspenders guard.
+      if (wasEnabled && !this.config.appleNotes.enabled && this.notesAbort) {
+        try { this.notesAbort.abort(); } catch { /* ignore */ }
+      }
     }
   }
 
@@ -452,6 +461,14 @@ export class TunnelManager {
         available
       }
     };
+    // Re-check the enabled flag after the osascript await. A PATCH that
+    // disables the mirror while we were sitting in `isICloudAccountAvailable`
+    // would otherwise land a stale write below — the entry-time check at
+    // line 431 is by itself insufficient because osascript pipelines can
+    // take hundreds of milliseconds.
+    if (!this.config.appleNotes.enabled || this.disableAppleNotes) {
+      return this.getSnapshot();
+    }
     if (!available) {
       this.snapshot = {
         ...this.snapshot,

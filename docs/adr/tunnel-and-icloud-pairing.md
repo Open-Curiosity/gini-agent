@@ -27,7 +27,13 @@ shape that depends on memorising the URL breaks at the next reboot.
 
 1. The runtime spawns `cloudflared tunnel --no-autoupdate --url http://127.0.0.1:<webPort>`
    as a managed subprocess when `tunnel.enabled` is true (or
-   `GINI_TUNNEL=1` is set on the boot environment). cloudflared targets
+   `GINI_TUNNEL=1` is set on the boot environment, in which case
+   the runtime persists the env-derived flag to `config.json` so
+   the BFF reads the same truth). The tunnel can also be toggled
+   live via `PATCH /api/tunnel` from the Settings UI without a
+   restart; the runtime applies the flip in-memory, persists it
+   atomically (tmp + rename) to `config.json`, and spawns or tears
+   down cloudflared accordingly. cloudflared targets
    the **Next.js web port** rather than the raw gateway. The web layer
    already proxies `/api/*` to the runtime through the BFF and serves
    the full settings/chat/etc. UI, so tunnelling the web port lets a
@@ -142,7 +148,12 @@ the prompt:
    message; the rest of the snapshot stays valid and the public URL is
    still served unchanged.
 4. The operator can grant the permission manually and trigger a
-   re-sync by hitting `GET /api/tunnel` (or by restarting the runtime).
+   re-sync by hitting `GET /api/tunnel?refreshNotes=1` (or running
+   `gini tunnel sync-notes`, or by restarting the runtime). Plain
+   `GET /api/tunnel` is read-only by default — the Settings card
+   polls the snapshot every 5s, and queuing an osascript pipeline
+   on every poll would saturate Notes.app writes and burn TCC
+   timeouts on permission-denied hosts.
 
 ## Consequences
 

@@ -260,10 +260,11 @@ async function runApplyConfig(
   if (update.appleNotes) {
     next.appleNotes = { ...(next.appleNotes ?? {}), ...update.appleNotes };
   }
-  config.tunnel = next;
-  // Persist alongside the in-memory mutation so the next boot
-  // sees the change even if the runtime exits before any other
-  // settings write fires.
+  // Persist BEFORE mutating in-memory state so a write failure (disk
+  // full, perms, torn JSON on read-back) aborts the PATCH with a real
+  // 5xx instead of returning success + losing the toggle on next
+  // restart. Atomic tmp+rename means a reader sees either the prior
+  // or next state, never both.
   try {
     const onDisk = JSON.parse(readFileSync(configPath(config.instance), "utf8")) as Record<string, unknown>;
     onDisk.tunnel = next;
@@ -272,13 +273,25 @@ async function runApplyConfig(
     appendLog(config.instance, "tunnel.config.persist.error", {
       error: error instanceof Error ? error.message : String(error)
     });
+    throw error instanceof Error ? error : new Error(String(error));
   }
+  config.tunnel = next;
   // Update the live manager. Two paths:
   //  - Just-enabled: spin cloudflared up now.
   //  - Just-disabled: tear it down.
   //  - Enabled + appleNotes flipped: nothing process-level to do.
   const becameEnabled = next.enabled === true && tunnelResolved.config.enabled !== true;
   const becameDisabled = next.enabled === false && tunnelResolved.config.enabled === true;
+  // Detect Apple Notes mirror flipping ON. If the tunnel was already
+  // running, a flip from false→true via PATCH must immediately push
+  // the current URL to the note — otherwise the user toggles "Enable"
+  // in the UI and the note stays empty until the next URL rotation
+  // (i.e. the next runtime restart). The `becameEnabled` branch
+  // already triggers a refresh via TunnelManager.startInner's fire-
+  // and-forget, so we only need this branch for the
+  // tunnel-already-up case.
+  const becameNotesEnabled = update.appleNotes?.enabled === true
+    && tunnelResolved.config.appleNotes.enabled !== true;
   tunnelResolved.config = {
     ...tunnelResolved.config,
     enabled: next.enabled ?? tunnelResolved.config.enabled,
@@ -321,6 +334,19 @@ async function runApplyConfig(
   }
   if (becameDisabled) {
     await tunnelManager.stop();
+  }
+  // Notes-enabled-while-tunnel-up: refresh now so the note carries the
+  // current URL without waiting for a rotation. Fire-and-forget — the
+  // operator's PATCH response shouldn't wait for an osascript pipeline,
+  // and refresh errors are surfaced in `appleNotes.lastError` on the
+  // next GET. Skip when becameEnabled is also true: the manager's
+  // startInner already fires its own refresh after cloudflared comes up.
+  if (becameNotesEnabled && !becameEnabled && tunnelResolved.config.enabled) {
+    void tunnelManager.refreshAppleNote().catch((error) => {
+      appendLog(config.instance, "tunnel.notes.refresh.error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
   }
   return tunnelManager.getSnapshot();
 }
