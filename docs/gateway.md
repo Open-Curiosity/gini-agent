@@ -73,13 +73,19 @@ The `default` instance is pinned to memorable ports — web `7777`, runtime `777
 
 The gateway uses per-instance bearer tokens. Paired devices can receive their own tokens through pairing endpoints. Tokens are stored in the instance `config.json`; the Next.js BFF reads the token server-side and does not expose it to client JavaScript.
 
-Privileged BFF routes (mutating POSTs like `messaging/add`, `messaging/<id>/remove`, `runtime/update`) carry a CSRF guard that compares the `Origin` header against the request `Host`. For local development that's sufficient, but operators exposing the BFF on a tailnet or public hostname should lock the guard down by setting `GINI_TRUSTED_ORIGINS` in the BFF process environment. It's a comma-separated list of full origins (scheme + host + port), e.g.
+Privileged BFF routes (mutating POSTs like `messaging/add`, `messaging/<id>/remove`, `runtime/update`) carry a CSRF guard that uses one of two policies:
 
-```
-GINI_TRUSTED_ORIGINS=https://gini-server.tail-xyz.ts.net,http://localhost:3000
-```
+1. **`GINI_TRUSTED_ORIGINS` set** — comma-separated list of full origins (scheme + host + port), e.g.
 
-When set, the guard accepts an `Origin` only if it exactly matches one of the listed entries. This blocks the DNS-rebinding shape where an attacker page sets `Origin` to a hostname they control but rebinds DNS to the BFF's loopback / tailnet IP — the rebound host equals itself, so a Host-comparison passes, but the explicit allowlist does not. When `GINI_TRUSTED_ORIGINS` is unset the legacy Host-equality fallback applies.
+   ```
+   GINI_TRUSTED_ORIGINS=https://gini-server.tail-xyz.ts.net,http://localhost:3000
+   ```
+
+   The guard accepts an `Origin` only if it exactly matches one of the listed entries. This is the required posture for any BFF exposed beyond loopback (tailnet, tunnel, public DNS). If you set the env var but every entry is malformed, the guard fails closed and refuses every privileged POST until you fix the value — a typo bricks privileged routes loudly rather than silently downgrading.
+
+2. **`GINI_TRUSTED_ORIGINS` unset** — local-dev fallback. The guard accepts requests only when both the request `Host` is loopback (`localhost`, `127.0.0.1`, or `[::1]`) and the `Origin` matches `Host`. Any non-loopback Host is refused without an explicit allowlist, so a BFF run on a tailnet hostname without `GINI_TRUSTED_ORIGINS` will see every privileged POST 403'd — set the env var or bind the BFF to loopback only.
+
+Closing the non-loopback fallback path blocks the DNS-rebinding shape where an attacker page sets `Origin` to a hostname they control but rebinds DNS to the BFF's loopback / tailnet IP — the rebound host equals itself, so a Host-comparison alone would pass. The allowlist (or the loopback restriction) takes that codepath off the table.
 
 ## Lifecycle Commands
 

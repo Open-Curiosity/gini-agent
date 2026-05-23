@@ -221,8 +221,16 @@ function canonicalizeSegments(segments: string[]): string[] | null {
 // complete origin; bare hostnames are rejected. The Set is built once per
 // import — operators set the env var at startup and don't rotate it without
 // restarting the BFF.
+//
+// Tri-state return:
+//   null  → env var is unset; loopback-only Host-equality fallback applies.
+//   Set   → at least one valid origin parsed; the Set is the allowlist.
+//   empty → operator set the env var but every entry was malformed; the guard
+//           fails closed (refuses every privileged POST). This is the
+//           defense-in-depth posture for a typo in a control that exists
+//           specifically to lock down the trust boundary.
 function parseTrustedOrigins(raw: string | undefined): ReadonlySet<string> | null {
-  if (!raw) return null;
+  if (!raw || !raw.trim()) return null;
   const out = new Set<string>();
   for (const candidate of raw.split(",")) {
     const trimmed = candidate.trim();
@@ -231,16 +239,29 @@ function parseTrustedOrigins(raw: string | undefined): ReadonlySet<string> | nul
       const parsed = new URL(trimmed);
       out.add(`${parsed.protocol}//${parsed.host}`);
     } catch {
-      // Skip malformed entries silently rather than crash boot — surfacing
-      // a bad env var as a 403 on every privileged POST is louder than a
-      // dropped allowlist entry, and operators iterating on the env value
-      // should not have the process refuse to start.
+      // Skip malformed entries individually; the outer caller decides what
+      // to do when every entry is bad. A single bad entry alongside good
+      // ones still produces a usable allowlist.
     }
   }
-  return out.size > 0 ? out : null;
+  return out;
 }
 
 const TRUSTED_ORIGINS = parseTrustedOrigins(process.env.GINI_TRUSTED_ORIGINS);
+
+// Loopback hostnames the guard's local-dev fallback accepts when no
+// allowlist is configured. Anything else is DNS-rebindable from a public
+// origin and must be locked down with GINI_TRUSTED_ORIGINS.
+function isLoopbackHost(host: string): boolean {
+  // Strip the optional :port suffix. IPv6 literals are wrapped in brackets,
+  // so look at everything up to the last ":" only when no closing bracket
+  // follows. URL.host normalizes IPv6 to "[::1]:port" form.
+  const closeBracket = host.lastIndexOf("]");
+  const hostnameOnly = closeBracket >= 0
+    ? host.slice(0, closeBracket + 1)
+    : host.includes(":") ? host.slice(0, host.indexOf(":")) : host;
+  return hostnameOnly === "localhost" || hostnameOnly === "127.0.0.1" || hostnameOnly === "[::1]";
+}
 
 function guardPrivilegedRequest(request: Request, pathSegments: string[]): Response | null {
   if (request.method !== "POST") return null;
@@ -264,7 +285,10 @@ function guardPrivilegedRequest(request: Request, pathSegments: string[]): Respo
     // alone cannot — the browser legitimately sends Host equal to
     // attacker.example after a rebind, and the Host comparison accepts
     // it. The allowlist takes that codepath off the table for any
-    // operator who configures it.
+    // operator who configures it. If the operator set the env var but
+    // every entry was malformed (empty Set), we fail closed — refuse
+    // every privileged POST — rather than silently downgrading to the
+    // rebindable fallback.
     if (TRUSTED_ORIGINS) {
       const normalized = `${originUrl.protocol}//${originUrl.host}`;
       if (!TRUSTED_ORIGINS.has(normalized)) {
@@ -273,19 +297,18 @@ function guardPrivilegedRequest(request: Request, pathSegments: string[]): Respo
     } else {
       // Local-dev fallback when GINI_TRUSTED_ORIGINS is unset. Compare the
       // browser-supplied Origin host against the Host header the browser
-      // actually used. Next.js dev (and most reverse-proxy / tunnel
-      // setups) carry a stale internal hostname in `request.url` —
-      // typically `localhost:<port>` — so the strict
-      // `Origin === new URL(request.url).origin` comparison rejected
-      // every legitimate non-localhost client. Matching against Host
-      // preserves the bulk of the CSRF defense for browser-driven
-      // attackers (a cross-origin attacker page has a different Origin
-      // host than the BFF's own Host header) while letting tailnet /
-      // tunnel / hostname access through during dev. DNS rebinding is
-      // the residual hazard this fallback does NOT cover — operators
-      // who expose the BFF beyond loopback should set
-      // GINI_TRUSTED_ORIGINS to lock the guard down.
+      // actually used. Restrict the fallback to loopback Host values
+      // (localhost, 127.0.0.1, [::1]) so a BFF exposed on tailnet /
+      // tunnel / public-DNS hostname cannot be approached by a DNS-
+      // rebinding page that legitimately sets both Origin and Host to
+      // an attacker-controlled name. Operators running on a non-
+      // loopback hostname MUST set GINI_TRUSTED_ORIGINS — without it,
+      // the guard refuses every privileged POST so the rebindable path
+      // is fully closed.
       const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
+      if (!isLoopbackHost(expectedHost)) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
       if (originUrl.host !== expectedHost) {
         return Response.json({ error: "Forbidden" }, { status: 403 });
       }
