@@ -534,41 +534,57 @@ if (tunnelResolved.config.enabled) {
 // file replace, we re-resolve the live target, and if it diverges we
 // stop+start the manager so the public URL points at the new port.
 //
-// Only relevant while the tunnel is enabled. The watcher itself is
-// cheap and stays attached across enable/disable cycles; the gate is
-// inside the handler so disable+re-enable goes through the same
-// resolveWebTarget path as the boot flow.
-try {
-  webPortWatcher = watch(webPortPath(config.instance), { persistent: false }, () => {
-    void (async () => {
-      if (shutdownStarted) return;
-      if (!tunnelResolved.config.enabled) return;
-      try {
-        const target = await resolveWebTarget();
-        if (target === currentWebTarget) return;
-        appendLog(config.instance, "tunnel.target.changed", {
-          from: currentWebTarget,
-          to: target
-        });
-        await tunnelManager.stop();
-        if (shutdownStarted || !tunnelResolved.config.enabled) return;
-        tunnelManager.setTargetUrl(target);
-        await tunnelManager.start();
-        currentWebTarget = target;
-      } catch (error) {
-        appendLog(config.instance, "tunnel.target.recycle.error", {
-          error: error instanceof Error ? error.message : String(error)
-        });
-      }
-    })();
-  });
-} catch {
-  // The file may not exist yet — fs.watch on a missing path throws on
-  // some platforms. The boot block above is what populates the initial
-  // resolveWebTarget; subsequent rotations only matter once the file
-  // exists, and operators who `gini start` after the runtime is up will
-  // re-create it, triggering this branch's path on next runtime boot.
-}
+// `gini start` spawns the runtime BEFORE the web child writes
+// web.port, so the file doesn't exist yet at this point in boot.
+// fs.watch throws ENOENT on a missing path; we retry every 500ms
+// until either the file appears (the typical case) or shutdown
+// begins.
+//
+// The handler is serialized through an in-flight flag so two rapid
+// `change` events can't race on `stop()` and `start()` — without it,
+// the second invocation could observe `currentWebTarget` mid-reset
+// and run setTargetUrl + start against a manager whose stop is
+// still in flight.
+let recycleInFlight = false;
+const tryRegisterWebPortWatcher = (): void => {
+  if (webPortWatcher !== null) return;
+  if (shutdownStarted) return;
+  try {
+    webPortWatcher = watch(webPortPath(config.instance), { persistent: false }, () => {
+      void (async () => {
+        if (shutdownStarted) return;
+        if (!tunnelResolved.config.enabled) return;
+        if (recycleInFlight) return;
+        recycleInFlight = true;
+        try {
+          const target = await resolveWebTarget();
+          if (target === currentWebTarget) return;
+          appendLog(config.instance, "tunnel.target.changed", {
+            from: currentWebTarget,
+            to: target
+          });
+          await tunnelManager.stop();
+          if (shutdownStarted || !tunnelResolved.config.enabled) return;
+          tunnelManager.setTargetUrl(target);
+          await tunnelManager.start();
+          currentWebTarget = target;
+        } catch (error) {
+          appendLog(config.instance, "tunnel.target.recycle.error", {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        } finally {
+          recycleInFlight = false;
+        }
+      })();
+    });
+  } catch {
+    // File doesn't exist yet (common at boot — gini start spawns
+    // the runtime before writing web.port). Schedule a retry; the
+    // chain stops once the file appears or SIGTERM lands.
+    setTimeout(tryRegisterWebPortWatcher, 500).unref?.();
+  }
+};
+tryRegisterWebPortWatcher();
 
 // Self-rescheduling scheduler loop. We await runDueJobs(config) before
 // scheduling the next tick so a slow tick (e.g. spawning N script jobs

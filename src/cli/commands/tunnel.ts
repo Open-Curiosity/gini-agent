@@ -231,9 +231,18 @@ function mutateTunnelConfig(
 // error instead of silently bypassing the serialized chain.
 function isConnectionRefused(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
+  // Bun's fetch sets `error.code = "ConnectionRefused"` directly (no
+  // nested `cause`), and the message reads "Unable to connect. Is the
+  // computer able to access the url?". Node sets `error.cause.code =
+  // "ECONNREFUSED"`. We accept either shape so the CLI's
+  // disk-fallback path works on both runtimes.
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === "string" && (code === "ConnectionRefused" || code === "ECONNREFUSED")) {
+    return true;
+  }
   const cause = (error as Error & { cause?: { code?: string } }).cause;
   if (cause && typeof cause.code === "string" && cause.code === "ECONNREFUSED") return true;
-  return /ECONNREFUSED|connection refused|fetch failed/i.test(error.message);
+  return /ECONNREFUSED|connection refused|unable to connect|fetch failed/i.test(error.message);
 }
 
 async function applyTunnelToggle(

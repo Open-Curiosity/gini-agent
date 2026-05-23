@@ -145,7 +145,18 @@ export function createHandler(
     // into a shell.
     ["PATCH", /^\/api\/tunnel$/, async (request) => {
       if (!tunnel?.applyConfig) return json({ error: "tunnel patch not supported" }, 501);
-      const payload = await body(request);
+      // body() throws on invalid JSON; without this catch the route
+      // loop's outer handler treats the parse error as an internal
+      // 500. The client deserves a 4xx so it can diagnose its
+      // own bug instead of suspecting a server fault.
+      let payload: unknown;
+      try {
+        payload = await body(request);
+      } catch (error) {
+        return json({
+          error: `Invalid JSON body: ${error instanceof Error ? error.message : String(error)}`
+        }, 400);
+      }
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
         return json({ error: "PATCH body must be a JSON object" }, 400);
       }
@@ -837,6 +848,19 @@ export function createHandler(
         } catch (error) {
           return json({ error: error instanceof Error ? error.message : String(error) }, 400);
         }
+      }
+      // Credential-minting routes MUST NOT be reachable via the
+      // tunnel-secret bypass. POST /api/pairing creates a code that
+      // POST /api/pairing/claim trades for a durable device token —
+      // an attacker who learned the tunnel secret (from a QR
+      // screenshot, an Apple Notes mirror leak, etc) could otherwise
+      // chain the two endpoints into a permanent bearer credential
+      // that survives the next secret rotation. The local CLI and
+      // already-paired devices still mint codes via the bearer path
+      // below; this just keeps the tunnel from being a credential
+      // factory.
+      if (tunneled && request.method === "POST" && effectivePathname === "/api/pairing") {
+        return json({ error: "Pairing creation requires direct bearer auth, not the tunnel secret." }, 403);
       }
       if (!tunneled && !await authorized(request, config)) return json({ error: "Unauthorized" }, 401);
       const routedRequest = tunneled ? rewriteRequestPath(request, url, effectivePathname) : request;
