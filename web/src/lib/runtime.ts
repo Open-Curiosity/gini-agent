@@ -6,14 +6,7 @@ import { join, resolve } from "node:path";
 // is critical for SSE reconnect dedup (see src/http.ts:eventStream) — without
 // it, every reconnect re-replays the entire event log.
 const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control", "last-event-id"]);
-// Routes the BFF must gate behind origin + sec-fetch-site checks.
-// The default forwarding path injects the gateway bearer token
-// server-side, so a cross-origin POST from a victim's browser
-// reaches the gateway authenticated. Without this guard, an
-// attacker page can trigger any non-listed POST as the operator.
-// `embedding/reembed` is destructive enough to belong here even
-// though it doesn't lose data — `allBanks: true` runs an expensive
-// embedding pass against every bank in the instance, a DoS vector
+
 // Cache the file-read values across requests but invalidate on mtime change,
 // so a gateway respawn that picks a different port doesn't strand the BFF
 // pointing at the old port. We cache for 2s minimum to avoid stat'ing on
