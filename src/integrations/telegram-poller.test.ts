@@ -89,6 +89,23 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 2000
   throw new Error(`Timed out waiting for: ${label}`);
 }
 
+// Wait until the poller has armed (pushed a deferred into the queue),
+// then pop and return it. Each test was previously doing
+// `queue.shift()?.resolve(...)`, which silently no-ops if the queue is
+// empty — the poller's first getUpdates is scheduled by reconcile()
+// but only enqueued on the next microtask tick, so the optional chain
+// hid a real race on slow schedulers. Throwing on empty after the
+// waitFor closes that race loudly.
+async function popPending<T extends { resolve: unknown }>(
+  q: T[],
+  label = "poller armed"
+): Promise<T> {
+  await waitFor(() => q.length > 0, label, 3000);
+  const pending = q.shift();
+  if (!pending) throw new Error(`queue empty after waitFor (${label}) — poller did not arm`);
+  return pending;
+}
+
 describe("telegram poller supervisor", () => {
   afterEach(() => {
     resetMessagingDeps();
@@ -208,7 +225,7 @@ describe("telegram poller supervisor", () => {
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
-    updateQueue.shift()?.resolve([
+    (await popPending(updateQueue, "typing-test poller armed")).resolve([
       {
         update_id: 5,
         message: { message_id: 1, date: 0, chat: { id: 88, type: "private" }, text: "hello" }
@@ -272,7 +289,7 @@ describe("telegram poller supervisor", () => {
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
-    queue.shift()?.resolve([
+    (await popPending(queue, "photo-update poller armed")).resolve([
       {
         update_id: 20,
         message: {
@@ -370,7 +387,7 @@ describe("telegram poller supervisor", () => {
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
-    queue.shift()?.resolve([
+    (await popPending(queue, "update-50 poller armed")).resolve([
       {
         update_id: 50,
         message: {
@@ -460,7 +477,7 @@ describe("telegram poller supervisor", () => {
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
-    queue.shift()?.resolve([
+    (await popPending(queue, "update-70 poller armed")).resolve([
       {
         update_id: 70,
         message: {
@@ -536,7 +553,7 @@ describe("telegram poller supervisor", () => {
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
-    queue.shift()?.resolve([
+    (await popPending(queue, "update-90 poller armed")).resolve([
       {
         update_id: 90,
         message: {
