@@ -182,9 +182,9 @@ instance behind NAT works the same as one on a public host.
    }
    ```
 
-   The response carries a `metadata.pairingCode`. The bot's username is
-   not resolved yet — run the health probe next to learn the actual
-   handle.
+   The response carries the bridge id and an initial status. The bot's
+   username isn't resolved yet — run the health probe next to learn the
+   actual handle.
 
    Human-operator CLI mirror: `gini messaging add my-bot telegram --bot-token <BOT_TOKEN>`.
 
@@ -201,27 +201,39 @@ instance behind NAT works the same as one on a public host.
 
    Human-operator CLI mirror: `gini messaging health my-bot`.
 
-4. **Pair the user's chat.** The user DMs the bot the pairing code from
-   their personal Telegram account. The bridge records the chat ID. To
-   request a fresh code:
-
-   ```http
-   POST /api/messaging/my-bot/pair
-   ```
-
-   Human-operator CLI mirror: `gini messaging pair my-bot`.
+4. **Enroll the user's chat.** Have the user DM the bot anything
+   (including `/start`). The runtime mints a short verification code
+   (`AB-1A-22` format, 10-minute TTL), records it on
+   `bridge.metadata.recentDeniedChats[].verificationCode` for the
+   originating chat, and DMs the same code back to the user. Fetch the
+   pending list with `GET /api/messaging/my-bot/chats`, confirm the
+   `verificationCode` matches what the user reports receiving, then
+   allow-list the chat in the next step. A DM after the code expires
+   mints a fresh one and replaces the row.
 
 5. **Allow-list the chat ID** so the bridge will deliver messages there:
 
    ```http
    POST /api/messaging/my-bot/allow
 
-   { "chatId": 123456789 }
+   { "chatId": 123456789, "expectedCode": "AB-1A-22" }
    ```
 
-   Group chat IDs are negative integers — that is correct, not an error.
+   Pass the `expectedCode` you confirmed in step 4. The server re-checks
+   that it still matches the live `verificationCode` on the pending row
+   and hasn't expired, so a code that rotated (the user re-DM'd and
+   minted a new one) or aged past its TTL between fetch and approve
+   returns `409 Conflict` instead of silently allow-listing the chat.
+
+   Group chat IDs are negative integers — that is correct, not an
+   error. Group chats have no `verificationCode` (no per-user channel
+   to deliver one through), so omit `expectedCode` when allow-listing a
+   negative chat ID.
 
    Human-operator CLI mirror: `gini messaging allow my-bot <chatId>`.
+   The CLI omits the code because the explicit invocation on the
+   operator's machine already proves intent; the API path is the one
+   that needs the code-rotation check.
 
 6. **Send a message** to confirm round-trip:
 
@@ -245,9 +257,9 @@ auto-approves with a full audit trail, `yolo` skips the queue).
 ### Inspecting state
 
 API: `GET /api/messaging`, `GET /api/messaging/<id>/{chats,messages}`,
-`POST /api/messaging/<id>/{health,disable}`.
+`POST /api/messaging` (create), `POST /api/messaging/<id>/{health,disable,remove,allow,deny,reject-pending,send,receive}`.
 
-Human-operator CLI mirror: `gini messaging {list|chats|messages|health|disable|deny}`.
+Human-operator CLI mirror: `gini messaging {list|add|health|disable|remove|receive|send|messages|allow|deny|reject-pending|chats}`. `disable` keeps the bridge row with status `"disabled"`; `remove` drops it. Telegram per-chat enrollment uses `allow`/`deny`/`reject-pending`/`chats`; Discord uses channel-as-auth via `deliveryTargets` (no per-chat allowlist).
 
 ## MCP Servers
 
