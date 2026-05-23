@@ -72,17 +72,18 @@ honestly attacker-controlled because the URL bar is attacker-controlled.
   tunnel, public DNS) must set `GINI_TRUSTED_ORIGINS` to the list of
   hostnames they expect to be reached from. Without it, the guard
   refuses every privileged POST.
-- A typo in `GINI_TRUSTED_ORIGINS` is loud (every privileged POST 403s)
+- A typo in `GINI_TRUSTED_ORIGINS` is loud (every request 403s)
   rather than silent (downgrade to rebindable fallback). The fail-closed
   posture is the defense-in-depth default for a CSRF-style control.
 - The env var is read on every request. The parse cost is negligible
   (short comma-separated string) and the request shape isn't a hot path,
   so the simpler dynamic semantics win over a cached constant.
-- The BFF guard is a strict superset-safety projection of the gateway's
-  POST surface, listed in `web/src/lib/runtime.ts`. The gateway's own
-  route table is the dispatch source of truth; the BFF list answers
-  "which routes need CSRF protection before bearer injection". The two
-  lists are intentionally separate concerns.
+- The BFF guard runs on every `/api/runtime/*` request — readable GETs
+  (which leak RuntimeState contents under DNS rebinding) and mutating
+  POST/PUT/PATCH/DELETEs alike. The gateway's route table is the
+  dispatch source of truth; the BFF guard is a single chokepoint that
+  validates Origin/Host before injecting the bearer, regardless of
+  which gateway route a request targets.
 
 ## Alternatives considered
 

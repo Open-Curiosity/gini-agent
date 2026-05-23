@@ -957,11 +957,11 @@ describe("messaging telegram wiring", () => {
 
   test("concurrent removeMessagingBridge calls emit a single audit row", async () => {
     // Two callers racing on the same bridge id both pass the pre-lock
-    // existence check (readState is unsynchronized). Before the fix, both
-    // mutators would unconditionally write a `messaging.removed` audit row
-    // and return removed:true, so the audit trail carried duplicates for
-    // one logical removal. Now the second mutator sees index<0 inside the
-    // lock and returns removed:false, leaving a single audit row.
+    // existence check because readState is unsynchronized. The function
+    // re-checks index existence inside mutateState so the second mutator
+    // sees the row already gone and returns removed:false, leaving the
+    // audit trail with exactly one `messaging.removed` entry for one
+    // logical removal.
     const config = testConfig("telegram-remove-concurrent");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });
     const { removeMessagingBridge } = await import("./messaging");
