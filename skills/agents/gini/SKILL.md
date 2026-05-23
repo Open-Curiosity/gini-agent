@@ -182,9 +182,9 @@ instance behind NAT works the same as one on a public host.
    }
    ```
 
-   The response carries a `metadata.pairingCode`. The bot's username is
-   not resolved yet — run the health probe next to learn the actual
-   handle.
+   The response carries the bridge id and an initial status. The bot's
+   username isn't resolved yet — run the health probe next to learn the
+   actual handle.
 
    Human-operator CLI mirror: `gini messaging add my-bot telegram --bot-token <BOT_TOKEN>`.
 
@@ -201,15 +201,15 @@ instance behind NAT works the same as one on a public host.
 
    Human-operator CLI mirror: `gini messaging health my-bot`.
 
-4. **Pair the user's chat.** The user DMs the bot the pairing code from
-   their personal Telegram account. The bridge records the chat ID. To
-   request a fresh code:
-
-   ```http
-   POST /api/messaging/my-bot/pair
-   ```
-
-   Human-operator CLI mirror: `gini messaging pair my-bot`.
+4. **Enroll the user's chat.** Have the user DM the bot anything
+   (including `/start`). The runtime mints a short verification code
+   (`AB-1A-22` format, 10-minute TTL), records it on
+   `bridge.metadata.recentDeniedChats[].verificationCode` for the
+   originating chat, and DMs the same code back to the user. Fetch the
+   pending list with `GET /api/messaging/my-bot/chats`, confirm the
+   `verificationCode` matches what the user reports receiving, then
+   allow-list the chat in the next step. A DM after the code expires
+   mints a fresh one and replaces the row.
 
 5. **Allow-list the chat ID** so the bridge will deliver messages there:
 
