@@ -747,7 +747,7 @@ export async function deliverVerificationCode(
   const minutesRemaining = Number.isFinite(expiresAtRaw)
     ? Math.max(1, Math.round((expiresAtRaw - Date.now()) / 60_000))
     : Math.round(VERIFICATION_CODE_TTL_MS / 60_000);
-  const text = `Enrollment code: ${payload.code}\n\nExpires in ${minutesRemaining} minute${minutesRemaining === 1 ? "" : "s"}. Share it with the operator to be approved.`;
+  const text = `Enrollment code: ${payload.code}\n\nShow this code to the operator so they can confirm it's you and approve. Expires in ${minutesRemaining} minute${minutesRemaining === 1 ? "" : "s"}.`;
   return sendMessagingOutputWithRetries(config, bridgeId, {
     text,
     target: String(payload.chatId)
