@@ -628,6 +628,19 @@ describe("messaging telegram wiring", () => {
 
     expect(second?.verificationCode).toBe(first?.verificationCode);
     expect(second?.verificationCodeExpiresAt).toBe(first?.verificationCodeExpiresAt);
+    // The poller uses mintedFreshCode to skip the outbound Telegram
+    // send on the reuse leg — otherwise a single chat spamming DMs
+    // would burn outbound quota and inflate audit / message rows.
+    expect(first?.mintedFreshCode).toBe(true);
+    expect(second?.mintedFreshCode).toBe(false);
+    // mintedFreshCode is a caller-side hint, not persisted state.
+    const { readState: readStateLocal } = await import("../state");
+    const live = readStateLocal(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    const stored = (live?.metadata?.recentDeniedChats as Array<Record<string, unknown>>)?.find(
+      (e) => e.chatId === 4242
+    );
+    expect(stored).toBeDefined();
+    expect("mintedFreshCode" in (stored ?? {})).toBe(false);
   });
 
   test("recordDeniedChatAttempt mints a fresh code after the previous one expired", async () => {

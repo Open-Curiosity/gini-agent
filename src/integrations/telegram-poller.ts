@@ -245,7 +245,15 @@ async function runLoop(
           // the user never received — they can choose to deny and
           // wait for the user to DM again (which mints a fresh code
           // if the previous one expired in the meantime).
-          if (entry?.verificationCode) {
+          //
+          // Gate the send on `mintedFreshCode`: repeated DMs from the
+          // same chat within the 10-minute TTL window reuse the prior
+          // code and skip the outbound message. Without this, an
+          // attacker spamming the bot's @handle could drive arbitrary
+          // Telegram outbound quota burn and inflate the messages /
+          // audit tables one row per DM. The user can always reload
+          // the original DM to see the same code they were sent.
+          if (entry?.verificationCode && entry.mintedFreshCode) {
             const result = await deliverVerificationCode(config, bridgeId, {
               chatId: incoming.chatId,
               code: entry.verificationCode,

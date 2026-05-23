@@ -580,7 +580,7 @@ export async function recordDeniedChatAttempt(
   config: RuntimeConfig,
   bridgeId: string,
   attempt: { chatId: number; chatType: string; sender?: string }
-): Promise<DeniedChatAttempt | undefined> {
+): Promise<(DeniedChatAttempt & { mintedFreshCode: boolean }) | undefined> {
   return mutateState(config.instance, (state) => {
     const live = state.messagingBridges.find((b) => b.id === bridgeId);
     if (!live) return undefined;
@@ -623,7 +623,14 @@ export async function recordDeniedChatAttempt(
     meta.recentDeniedChats = [entry, ...filtered].slice(0, MAX_RECENT_DENIED_CHATS);
     live.metadata = meta;
     live.updatedAt = entry.lastAttemptAt;
-    return entry;
+    // Caller-side hint: the poller uses mintedFreshCode to gate the
+    // outbound DM. True only for private DMs where we just generated a
+    // new code — repeated DMs within the TTL window reuse the prior code
+    // and skip the send so an attacker spamming the bot's @handle can't
+    // burn Telegram outbound quota or inflate audit/message rows.
+    // mintedFreshCode is NOT persisted (the cloned entry above is what
+    // lives on recentDeniedChats).
+    return { ...entry, mintedFreshCode: isPrivate && !canReuse };
   });
 }
 

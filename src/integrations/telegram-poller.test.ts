@@ -567,6 +567,100 @@ describe("telegram poller supervisor", () => {
     await supervisor.stopAll();
   });
 
+  test("a second denied DM from the same chat within the TTL window does not re-send the verification code", async () => {
+    // Without the mintedFreshCode gate, a chat spamming the bot would
+    // drive one verification-code send per inbound DM — burning Telegram
+    // outbound quota and inflating the messages + audit tables one row
+    // per attempt. The user only needs the code once; subsequent DMs
+    // can reuse what they already received.
+    const config = testConfig("poller-verify-no-resend");
+    type Pending = { resolve: (u: import("./telegram").TelegramUpdate[]) => void };
+    const queue: Pending[] = [];
+    const sendCalls: Array<{ chatId: string | number; text: string }> = [];
+    const client: TelegramClient = {
+      async getMe() { return { id: 1, is_bot: true, username: "gini_agent_bot" }; },
+      async sendMessage(chatId, text) {
+        sendCalls.push({ chatId, text });
+        return { message_id: 70, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendPhoto(chatId) {
+        return { message_id: 71, date: 0, chat: { id: Number(chatId), type: "private" } };
+      },
+      async sendChatAction() { return true as const; },
+      async getFile(fileId) { return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` }; },
+      async downloadFile() { return new Uint8Array().buffer; },
+      getUpdates(_offset, _timeout, signal) {
+        return new Promise((resolve, reject) => {
+          queue.push({ resolve });
+          signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+
+    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    supervisor.reconcile();
+
+    queue.shift()?.resolve([
+      {
+        update_id: 100,
+        message: {
+          message_id: 1,
+          date: 0,
+          chat: { id: 4242, type: "private" },
+          text: "hi",
+          from: { id: 9, is_bot: false, first_name: "Alice", username: "alice" }
+        }
+      }
+    ]);
+
+    await waitFor(() => sendCalls.length === 1, "first verification code reply dispatched", 3000);
+    const firstCode = sendCalls[0]?.text.match(/[0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2}/)?.[0];
+    expect(firstCode).toBeDefined();
+
+    // Second DM from the same chat — within the TTL window so the prior
+    // code is still valid. The poller mints nothing new and skips the
+    // outbound send.
+    queue.shift()?.resolve([
+      {
+        update_id: 101,
+        message: {
+          message_id: 2,
+          date: 0,
+          chat: { id: 4242, type: "private" },
+          text: "still waiting",
+          from: { id: 9, is_bot: false, first_name: "Alice", username: "alice" }
+        }
+      }
+    ]);
+
+    // Wait long enough for a second poll cycle to land if it were going
+    // to. Without this delay the test would race against the gate.
+    await waitFor(
+      () => readState(config.instance).messagingBridges.find((b) => b.id === bridge.id)?.metadata?.lastOffset === 102,
+      "second update processed",
+      3000
+    );
+    expect(sendCalls.length).toBe(1);
+
+    // The pending entry on metadata still carries the original code
+    // (untouched expiry) so the operator UI doesn't churn.
+    const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    const pending = (live?.metadata?.recentDeniedChats as Array<{ chatId: number; verificationCode?: string }>)?.find(
+      (entry) => entry.chatId === 4242
+    );
+    expect(pending?.verificationCode).toBe(firstCode);
+
+    await supervisor.stopAll();
+  });
+
   test("reply mirror logs reply_skip_non_terminal and threads abort into sendChatAction when the task wait cap fires", async () => {
     // Pre-populate a stuck task + chat session, run the mirror with a
     // 50ms cap, and confirm
