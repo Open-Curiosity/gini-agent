@@ -7,7 +7,8 @@ import { logDir } from "../paths";
 import { addMessagingBridge, resetMessagingDeps, setMessagingDeps } from "./messaging";
 import {
   createTelegramPollerSupervisor,
-  __internalsForTests as telegramInternals
+  __internalsForTests as telegramInternals,
+  type PollerSupervisor
 } from "./telegram-poller";
 import { setMaxTaskWaitMsForTests } from "./messaging-poller-helpers";
 import type { TelegramClient, TelegramUpdate } from "./telegram";
@@ -107,7 +108,30 @@ async function popPending<T extends { resolve: unknown }>(
 }
 
 describe("telegram poller supervisor", () => {
-  afterEach(() => {
+  // Track every supervisor a test creates so a failed assertion before
+  // the in-body stopAll() can't strand a poll loop. Without this, a
+  // leaked loop would keep calling getUpdates against the previous
+  // test's stub client and racing against the next test's state
+  // teardown (testConfig() rmSyncs the instance dir each call).
+  const liveSupervisors: PollerSupervisor[] = [];
+  function createTrackedSupervisor(
+    ...args: Parameters<typeof createTelegramPollerSupervisor>
+  ): PollerSupervisor {
+    const s = createTelegramPollerSupervisor(...args);
+    liveSupervisors.push(s);
+    return s;
+  }
+
+  afterEach(async () => {
+    // Stop newest-first so the most-recently-created loop unwinds first,
+    // matching the LIFO shape the tests would have used with their own
+    // in-body stopAll() at the bottom.
+    while (liveSupervisors.length > 0) {
+      const s = liveSupervisors.pop();
+      if (s) {
+        try { await s.stopAll(); } catch { /* shutdown best-effort */ }
+      }
+    }
     resetMessagingDeps();
     // Belt-and-suspenders reset: if a test crashes mid-flight or a
     // future change moves to `bun test --concurrent`, a process-global
@@ -126,7 +150,7 @@ describe("telegram poller supervisor", () => {
       botToken: "TOK"
     });
 
-    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => deferredClient().client });
+    const supervisor = createTrackedSupervisor(config, { clientFactory: () => deferredClient().client });
     supervisor.reconcile();
     expect(supervisor.size()).toBe(1);
 
@@ -153,7 +177,7 @@ describe("telegram poller supervisor", () => {
     const { allowChat } = await import("./messaging");
     await allowChat(config, bridge.id, 42);
 
-    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    const supervisor = createTrackedSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
     nextUpdates([
@@ -222,7 +246,7 @@ describe("telegram poller supervisor", () => {
     const { allowChat: allowChatTyping } = await import("./messaging");
     await allowChatTyping(config, bridgeForTyping.id, 88);
 
-    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    const supervisor = createTrackedSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
     (await popPending(updateQueue, "typing-test poller armed")).resolve([
@@ -286,7 +310,7 @@ describe("telegram poller supervisor", () => {
     const { allowChat: allowChatPhoto } = await import("./messaging");
     await allowChatPhoto(config, bridge.id, 77);
 
-    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    const supervisor = createTrackedSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
     (await popPending(queue, "photo-update poller armed")).resolve([
@@ -384,7 +408,7 @@ describe("telegram poller supervisor", () => {
     // below read sendCalls[0] as the actual mirrored reply.
     sendCalls.length = 0;
 
-    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    const supervisor = createTrackedSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
     (await popPending(queue, "update-50 poller armed")).resolve([
@@ -474,7 +498,7 @@ describe("telegram poller supervisor", () => {
     await allowChat(config, bridge.id, 11);
     sendCalls.length = 0;
 
-    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    const supervisor = createTrackedSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
     (await popPending(queue, "update-70 poller armed")).resolve([
@@ -550,7 +574,7 @@ describe("telegram poller supervisor", () => {
       botToken: "TOK"
     });
 
-    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    const supervisor = createTrackedSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
     (await popPending(queue, "update-90 poller armed")).resolve([
@@ -622,7 +646,7 @@ describe("telegram poller supervisor", () => {
       botToken: "TOK"
     });
 
-    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    const supervisor = createTrackedSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
     // Wait for the first getUpdates promise to land in the queue before
@@ -828,7 +852,7 @@ describe("telegram poller supervisor", () => {
       botToken: "TOK"
     });
 
-    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => deferredClient().client });
+    const supervisor = createTrackedSupervisor(config, { clientFactory: () => deferredClient().client });
     supervisor.reconcile();
     expect(supervisor.size()).toBe(1);
 
