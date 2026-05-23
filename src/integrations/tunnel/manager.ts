@@ -158,12 +158,28 @@ export class TunnelManager {
    * subsequent refresh — the manager is constructed once at boot and
    * persists across HTTP requests.
    */
-  updateConfig(update: { enabled?: boolean; appleNotes?: TunnelConfig["appleNotes"] }): void {
+  updateConfig(update: {
+    enabled?: boolean;
+    secret?: string;
+    appleNotes?: TunnelConfig["appleNotes"];
+  }): void {
     if (typeof update.enabled === "boolean") {
       (this.config as { enabled: boolean }).enabled = update.enabled;
       // Mirror onto the snapshot so the UI sees the toggle change
       // immediately, even if cloudflared has not yet been torn down.
       this.snapshot = { ...this.snapshot, enabled: update.enabled };
+    }
+    // Allow the runtime to plumb a freshly-rotated secret through.
+    // `gini tunnel rotate-secret` writes the new secret to disk but
+    // the manager captured the boot-time value at construction;
+    // without this path, manager.start() rebuilds publicUrl from the
+    // stale secret while the BFF demands the new one, 404ing every
+    // tunneled request. Always mirror to the snapshot so any client
+    // reading the snapshot (CLI status, integration tests) sees the
+    // current value too.
+    if (typeof update.secret === "string" && update.secret.length > 0) {
+      (this.config as { secret: string }).secret = update.secret;
+      this.snapshot = { ...this.snapshot, secret: update.secret };
     }
     if (update.appleNotes) {
       const wasEnabled = this.config.appleNotes.enabled;

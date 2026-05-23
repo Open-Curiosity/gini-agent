@@ -69,19 +69,27 @@ export async function tunnel(ctx: CliContext): Promise<void> {
     // holding the bearer can't rotate the secret out from under a
     // paired device. The CLI runs locally and owns config.json.
     //
-    // But: the BFF (web/src/lib/runtime.ts:runtimeTunnelState) reads
-    // config.json on every request, so a rotation while the tunnel is
-    // up immediately 404s the live URL — the BFF demands the new
-    // secret, while the QR / Apple Notes / browser cookies still
-    // carry the old one. Refuse rotation in that state and tell the
-    // operator to disable the tunnel first.
-    let liveSnapshot: { enabled?: boolean } | null = null;
+    // But: the CLI's disk write races the runtime's serialized PATCH
+    // chain. While the runtime is up, two read-modify-write paths
+    // touch the same `tunnel.secret` slot — a PATCH enable mid-flight
+    // can read the pre-rotation secret, write it back after the CLI
+    // rotation, and silently undo the rotation. Refuse to rotate
+    // while the runtime is reachable. The operator's workflow is:
+    //
+    //   bun run gini stop
+    //   bun run gini tunnel rotate-secret
+    //   bun run gini start
+    //
+    // Three commands but no in-memory/on-disk divergence at any
+    // point.
+    let runtimeReachable = false;
     try {
-      liveSnapshot = (await api(config, "/api/tunnel")) as { enabled?: boolean };
+      await api(config, "/api/tunnel");
+      runtimeReachable = true;
     } catch { /* runtime not reachable — disk-only rotation is safe */ }
-    if (liveSnapshot && liveSnapshot.enabled === true) {
+    if (runtimeReachable) {
       throw new Error(
-        "Refusing to rotate the tunnel secret while the tunnel is live — the new secret would 404 every active session and the existing QR. Run `gini tunnel disable` first, then `gini tunnel rotate-secret`, then `gini tunnel enable` to bring it back up under the new secret."
+        "Refusing to rotate the tunnel secret while the runtime is running. Run `gini stop` first to avoid racing the runtime's in-memory tunnel state, then `gini tunnel rotate-secret`, then `gini start`."
       );
     }
     const newSecret = generateSecret();
@@ -89,7 +97,7 @@ export async function tunnel(ctx: CliContext): Promise<void> {
     print({
       ok: true,
       secret: newSecret,
-      message: "Tunnel secret rotated in config.json. Next `gini tunnel enable` will mint a QR / Apple Notes entry under the new secret."
+      message: "Tunnel secret rotated in config.json. Next `gini start` will mint a QR / Apple Notes entry under the new secret."
     });
     return;
   }

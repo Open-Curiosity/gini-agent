@@ -148,12 +148,19 @@ the prompt:
    message; the rest of the snapshot stays valid and the public URL is
    still served unchanged.
 4. The operator can grant the permission manually and trigger a
-   re-sync by hitting `GET /api/tunnel?refreshNotes=1` (or running
-   `gini tunnel sync-notes`, or by restarting the runtime). Plain
-   `GET /api/tunnel` is read-only by default — the Settings card
-   polls the snapshot every 5s, and queuing an osascript pipeline
-   on every poll would saturate Notes.app writes and burn TCC
-   timeouts on permission-denied hosts.
+   re-sync by `POST /api/tunnel/refresh-notes` (which `gini tunnel
+   sync-notes` does for you), or by restarting the runtime.
+   `GET /api/tunnel` is strictly read-only — the Settings card
+   polls the snapshot every 5s, and an osascript pipeline on every
+   poll would saturate Notes.app writes and burn TCC timeouts on
+   permission-denied hosts. The trigger is POST (not GET) on
+   purpose: `SameSite=Lax` session cookies attach on cross-site
+   top-level GET, so making the side-effecting re-sync a GET would
+   give any page on any origin that learned the trycloudflare
+   hostname a one-click CSRF into osascript on the operator's host.
+   POST is not in the Lax cookie attach set, and the BFF additionally
+   verifies the Origin/Referer header matches the request Host so a
+   co-tenant localhost POST cannot fire the side effect either.
 
 ## Consequences
 

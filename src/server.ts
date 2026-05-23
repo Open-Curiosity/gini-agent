@@ -308,11 +308,17 @@ async function runApplyConfig(
     enabled: next.enabled ?? tunnelResolved.config.enabled,
     appleNotes: { ...tunnelResolved.config.appleNotes, ...(next.appleNotes ?? {}) }
   };
-  // The manager observes the same config object reference, but
-  // appleNotes.enabled lives inside it and needs to be mirrored
-  // forward for the next refresh.
+  // Pull the secret from disk in case `gini tunnel rotate-secret`
+  // wrote a new value while the runtime was alive. Without this,
+  // manager.start() would build publicUrl with the stale boot-time
+  // secret while the BFF (which reads config.json per request)
+  // demands the new value — every QR/Notes URL would 404. `next`
+  // was sourced from a fresh on-disk read above, so it carries the
+  // rotated value.
+  tunnelResolved.config = { ...tunnelResolved.config, secret: next.secret ?? tunnelResolved.config.secret };
   tunnelManager.updateConfig({
     enabled: tunnelResolved.config.enabled,
+    secret: tunnelResolved.config.secret,
     appleNotes: tunnelResolved.config.appleNotes
   });
   if (becameEnabled) {
