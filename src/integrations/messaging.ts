@@ -779,7 +779,7 @@ export async function allowChat(
     //
     // Idempotency check runs BEFORE the expectedCode validation: a
     // second allow call (UI double-click, refetch-then-click race)
-    // would otherwise fail the pending-row lookup at line 770 because
+    // would otherwise fail the pending-row lookup further down because
     // the first allow already cleared the pending entry. Returning
     // early on alreadyAllowed lets the second call succeed as a no-op
     // instead of surfacing as a confusing 400 to the operator who
