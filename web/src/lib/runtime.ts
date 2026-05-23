@@ -14,23 +14,6 @@ const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control", "las
 // `embedding/reembed` is destructive enough to belong here even
 // though it doesn't lose data — `allBanks: true` runs an expensive
 // embedding pass against every bank in the instance, a DoS vector
-// for any operator who's paying per-token for embeddings.
-// `messaging/<bridge>/<verb>` covers the operator-only bot allowlist
-// surface (allow / deny / reject-pending / disable / remove /
-// health / send / receive) — any of those forwarded cross-origin
-// would let an attacker page mutate the bot's allowlist or fire
-// outbound messages as the operator. The bare `messaging` POST
-// creates a brand-new bridge (with a bot token) under the operator's
-// identity, so it has to land in the same guard or a cross-origin
-// page can plant attacker-supplied ingress.
-const PRIVILEGED_POST_ROUTES: ReadonlyArray<RegExp> = [
-  /^update$/,
-  /^update\/check$/,
-  /^embedding\/reembed$/,
-  /^messaging$/,
-  /^messaging\/[^/]+\/(allow|deny|reject-pending|disable|remove|health|send|receive)$/
-];
-
 // Cache the file-read values across requests but invalidate on mtime change,
 // so a gateway respawn that picks a different port doesn't strand the BFF
 // pointing at the old port. We cache for 2s minimum to avoid stat'ing on
@@ -138,7 +121,7 @@ export async function proxyRequest(
   const canonical = canonicalizeSegments(pathSegments);
   if (!canonical) return Response.json({ error: "Invalid path" }, { status: 400 });
 
-  const guard = guardPrivilegedRequest(request, canonical);
+  const guard = guardCsrf(request, canonical);
   if (guard) return guard;
 
   const upstreamUrl = new URL(request.url);
@@ -288,25 +271,31 @@ function isLoopbackHost(host: string): boolean {
   return hostnameOnly === "localhost" || hostnameOnly === "127.0.0.1" || hostnameOnly === "[::1]";
 }
 
-function guardPrivilegedRequest(request: Request, pathSegments: string[]): Response | null {
-  if (request.method !== "POST") return null;
-  const route = pathSegments.join("/");
-  if (!PRIVILEGED_POST_ROUTES.some((pattern) => pattern.test(route))) return null;
+// Tier the guard by method:
+// - Unsafe methods (POST/PUT/PATCH/DELETE): require Origin. Modern browsers
+//   always send it; absence indicates a non-browser client (curl/scripts/
+//   misconfigured proxies) and those should talk to the gateway directly
+//   with their own token, not the BFF's bearer-injection surface.
+// - Safe methods (GET/HEAD): allow missing Origin. Non-browser clients
+//   doing read-only inspection via the BFF (legacy callers) keep working.
+//   When Origin IS present (browser fetch), it's still checked — a DNS-
+//   rebinding page sends Origin honestly to the attacker-controlled host,
+//   so the allowlist/loopback check still catches it.
+//
+// The guard runs on every request, not just the prior PRIVILEGED_POST_ROUTES
+// list — readable surfaces like /state and the bare /pairing/claim POST
+// that mints device tokens were previously un-guarded and DNS-rebindable.
+const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
-  // Fail closed when Origin is missing. Modern browsers always send Origin
-  // on POST, so a request without it is either an older browser (pre-2018)
-  // or a non-browser client (curl/scripts/misconfigured proxies that strip
-  // Origin/service-worker bugs). None of those should be talking to the
-  // BFF's privileged surface — the BFF's purpose is to inject the gateway
-  // bearer for the operator's browser. Non-browser clients should hit the
-  // gateway directly with their own token. Without this gate, an attacker
-  // who could induce an Origin-less POST against an exposed BFF would have
-  // the privileged route execute under the operator's bearer.
+function guardCsrf(request: Request, _pathSegments: string[]): Response | null {
   const origin = request.headers.get("origin");
+  const isUnsafe = UNSAFE_METHODS.has(request.method);
   if (!origin) {
-    return Response.json({ error: "Forbidden" }, { status: 403 });
-  }
-  {
+    if (isUnsafe) {
+      return Response.json({ error: "Forbidden" }, { status: 403 });
+    }
+    // Safe method without Origin (curl/scripts/legacy): allow through.
+  } else {
     let originUrl: URL;
     try {
       originUrl = new URL(origin);
@@ -316,16 +305,16 @@ function guardPrivilegedRequest(request: Request, pathSegments: string[]): Respo
     // GINI_TRUSTED_ORIGINS is the production-shape defense against DNS
     // rebinding. When set, only requests whose Origin exactly matches one
     // of the listed scheme+host[+port] entries pass. A rebinding attack
-    // would still set Origin to the attacker-controlled hostname (the
-    // browser sets Origin honestly to the URL the operator visited), so
-    // an explicit allowlist breaks the bypass that a Host-equality check
+    // sets Origin honestly to the attacker-controlled hostname (the
+    // browser sets Origin to the URL the operator visited), so an
+    // explicit allowlist breaks the bypass that a Host-equality check
     // alone cannot — the browser legitimately sends Host equal to
     // attacker.example after a rebind, and the Host comparison accepts
     // it. The allowlist takes that codepath off the table for any
     // operator who configures it. If the operator set the env var but
     // every entry was malformed (empty Set), we fail closed — refuse
-    // every privileged POST — rather than silently downgrading to the
-    // rebindable fallback.
+    // every request — rather than silently downgrading to the rebindable
+    // fallback.
     const allowlist = trustedOrigins();
     if (allowlist) {
       const normalized = `${originUrl.protocol}//${originUrl.host}`;
@@ -341,8 +330,8 @@ function guardPrivilegedRequest(request: Request, pathSegments: string[]): Respo
       // rebinding page that legitimately sets both Origin and Host to
       // an attacker-controlled name. Operators running on a non-
       // loopback hostname MUST set GINI_TRUSTED_ORIGINS — without it,
-      // the guard refuses every privileged POST so the rebindable path
-      // is fully closed.
+      // the guard refuses every request so the rebindable path is
+      // fully closed.
       const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
       if (!isLoopbackHost(expectedHost)) {
         return Response.json({ error: "Forbidden" }, { status: 403 });

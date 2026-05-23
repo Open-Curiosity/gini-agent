@@ -54,7 +54,7 @@ describe("runtime proxy", () => {
     });
     const request = new Request("http://localhost/api/runtime/tasks", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", origin: "http://localhost" },
       body: JSON.stringify({ input: "hello" })
     });
     const response = await proxyRequest(request, ["tasks"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
@@ -176,6 +176,40 @@ describe("runtime proxy", () => {
     expect(response.status).toBe(403);
   });
 
+  test("rejects GETs whose Origin doesn't match Host on non-loopback hosts (DNS-rebinding for read-only state)", async () => {
+    // Before the wider guard, GETs bypassed the CSRF check entirely.
+    // A DNS-rebound page on attacker.example fetching /api/runtime/state
+    // would have Origin=Host=attacker.example, the BFF would inject the
+    // bearer, and the response would be readable same-origin under the
+    // attacker's page. The guard now runs on every request and rejects
+    // a non-loopback Host without an explicit allowlist.
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://gini-server.tail.ts.net/api/runtime/state", {
+      method: "GET",
+      headers: { origin: "http://gini-server.tail.ts.net", host: "gini-server.tail.ts.net" }
+    });
+    const response = await proxyRequest(request, ["state"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    expect(response.status).toBe(403);
+  });
+
+  test("rejects non-listed POSTs (pairing/claim) that previously bypassed the guard", async () => {
+    // /pairing and /pairing/claim used to live outside PRIVILEGED_POST_ROUTES,
+    // so a rebound page could drive token-minting under the operator's
+    // bearer. The guard now runs on every POST regardless of route.
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://gini-server.tail.ts.net/api/runtime/pairing", {
+      method: "POST",
+      headers: { origin: "http://gini-server.tail.ts.net", host: "gini-server.tail.ts.net", "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    const response = await proxyRequest(request, ["pairing"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    expect(response.status).toBe(403);
+  });
+
   test("allowlist entries with a path or query are rejected so the operator's intent isn't silently broadened", async () => {
     // An operator who pastes a full URL — say https://host/some-path —
     // would otherwise silently get an allowlist for the entire host
@@ -204,10 +238,13 @@ describe("runtime proxy", () => {
     });
     const patchRequest = new Request("http://localhost/api/runtime/memory/m_1", {
       method: "PATCH",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", origin: "http://localhost" },
       body: JSON.stringify({ content: "x" })
     });
-    const deleteRequest = new Request("http://localhost/api/runtime/memory/m_1", { method: "DELETE" });
+    const deleteRequest = new Request("http://localhost/api/runtime/memory/m_1", {
+      method: "DELETE",
+      headers: { origin: "http://localhost" }
+    });
     await proxyRequest(patchRequest, ["memory", "m_1"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
     await proxyRequest(deleteRequest, ["memory", "m_1"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
 
