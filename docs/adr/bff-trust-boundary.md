@@ -1,23 +1,34 @@
-# ADR: BFF trust boundary for privileged POSTs
+# ADR: BFF trust boundary for bearer-injected requests
 
 ## Decision
 
-The Next.js BFF guards privileged mutating POST routes (`runtime/update`,
-`runtime/update/check`, `messaging/...`, `embedding/reembed`) before
-injecting the gateway bearer token. The guard has two policies, chosen by
-the `GINI_TRUSTED_ORIGINS` environment variable read at request time:
+The Next.js BFF guards every `/api/runtime/*` request before injecting
+the gateway bearer token. The guard is method-tiered and runs on every
+proxied request, not just a curated allowlist of mutating routes. The
+behavior is chosen by the `GINI_TRUSTED_ORIGINS` environment variable
+read at request time:
 
 - **`GINI_TRUSTED_ORIGINS` set** — comma-separated list of full origins
-  (scheme + host + optional port). The guard accepts an `Origin` only if
-  it exactly matches a parsed entry. If every entry is malformed (a typo
-  that leaves zero parseable origins) the guard fails closed and refuses
-  every privileged POST until the operator fixes the env var.
+  (scheme + host + optional port). When `Origin` is present, it must
+  exactly match a parsed entry. When `Origin` is absent (browsers may
+  omit it on same-origin safe GETs), the guard fails closed because
+  there is nothing to compare. If every entry is malformed (a typo
+  that leaves zero parseable origins) the guard fails closed for all
+  requests until the operator fixes the env var.
 
-- **`GINI_TRUSTED_ORIGINS` unset** — local-dev fallback. The guard
-  accepts a request only when both the `Host` header is loopback
-  (`localhost`, `127.0.0.1`, or `[::1]`) and the `Origin` host matches
-  `Host`. Any non-loopback `Host` is refused without an explicit
-  allowlist.
+- **`GINI_TRUSTED_ORIGINS` unset** — local-dev fallback. When `Origin`
+  is present, both the `Host` header must be loopback (`localhost`,
+  `127.0.0.1`, or `[::1]`) AND the `Origin` host must match `Host`.
+  When `Origin` is absent (typical for non-browser callers like curl,
+  or browser same-origin GETs), the guard still requires the `Host`
+  to be loopback — a non-loopback Host without an allowlist is
+  refused regardless of method.
+
+Method-tiered fail-closed behavior: unsafe methods (POST, PUT, PATCH,
+DELETE) additionally require `Origin` to be present at all. A modern
+browser always sends Origin on unsafe methods, so the only callers
+that omit it are non-browsers (which should hit the gateway directly
+with their own token).
 
 `Sec-Fetch-Site` is checked as a secondary signal — it must be
 `same-origin`, `none`, or absent.

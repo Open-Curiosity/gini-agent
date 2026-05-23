@@ -176,6 +176,40 @@ describe("runtime proxy", () => {
     expect(response.status).toBe(403);
   });
 
+  test("rejects Origin-less GETs on non-loopback hosts (browser may omit Origin on same-origin safe requests)", async () => {
+    // Some browsers omit Origin on same-origin GET. A DNS-rebound page
+    // that thinks it's same-origin to attacker.example produces exactly
+    // this shape: no Origin, Host = attacker.example. The fallback's
+    // host validation must run even without Origin so a non-loopback
+    // host without an allowlist 403s.
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://gini-server.tail.ts.net/api/runtime/state", {
+      method: "GET",
+      headers: { host: "gini-server.tail.ts.net" }
+    });
+    const response = await proxyRequest(request, ["state"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    expect(response.status).toBe(403);
+  });
+
+  test("rejects Origin-less GETs when GINI_TRUSTED_ORIGINS is set (no Origin to validate)", async () => {
+    // With an allowlist configured, the operator opted in to strict
+    // Origin-based validation. There's no Origin to compare on, so the
+    // safest call is to refuse and let non-browser callers go directly
+    // to the gateway with their own token.
+    process.env.GINI_TRUSTED_ORIGINS = "http://localhost:3000";
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://localhost:3000/api/runtime/state", {
+      method: "GET",
+      headers: { host: "localhost:3000" }
+    });
+    const response = await proxyRequest(request, ["state"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    expect(response.status).toBe(403);
+  });
+
   test("rejects GETs whose Origin doesn't match Host on non-loopback hosts (DNS-rebinding for read-only state)", async () => {
     // Before the wider guard, GETs bypassed the CSRF check entirely.
     // A DNS-rebound page on attacker.example fetching /api/runtime/state

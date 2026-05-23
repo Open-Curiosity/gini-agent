@@ -73,7 +73,7 @@ The `default` instance is pinned to memorable ports — web `7777`, runtime `777
 
 The gateway uses per-instance bearer tokens. Paired devices can receive their own tokens through pairing endpoints. Tokens are stored in the instance `config.json`; the Next.js BFF reads the token server-side and does not expose it to client JavaScript.
 
-Privileged BFF routes (mutating POSTs like `messaging/add`, `messaging/<id>/remove`, `runtime/update`) carry a CSRF guard that uses one of two policies:
+Every BFF request to `/api/runtime/*` carries a CSRF guard before the gateway bearer is injected — both read-only GETs (which would otherwise leak RuntimeState contents under DNS rebinding) and mutating POST/PUT/PATCH/DELETEs. The guard uses one of two policies:
 
 1. **`GINI_TRUSTED_ORIGINS` set** — comma-separated list of full origins (scheme + host + port), e.g.
 

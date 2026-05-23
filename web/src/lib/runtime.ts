@@ -294,7 +294,27 @@ function guardCsrf(request: Request, _pathSegments: string[]): Response | null {
     if (isUnsafe) {
       return Response.json({ error: "Forbidden" }, { status: 403 });
     }
-    // Safe method without Origin (curl/scripts/legacy): allow through.
+    // Safe method (GET/HEAD) without Origin. Browsers may omit Origin on
+    // same-origin safe requests, which is the exact shape a DNS-rebound
+    // page produces (the browser thinks it's same-origin to attacker.
+    // example post-rebind). Validate the Host here so a non-loopback
+    // exposure still requires GINI_TRUSTED_ORIGINS to be set — Origin-
+    // less GETs from a rebound page hitting a tailnet/tunnel BFF will
+    // 403 because Host is non-loopback. Non-browser callers on
+    // loopback (curl, scripts) keep working.
+    const allowlist = trustedOrigins();
+    if (allowlist) {
+      // Operator opted into the strict allowlist. There's no Origin to
+      // compare, so we can't tell whether this is a legitimate same-
+      // origin GET or a rebound page that omitted Origin. Fail closed:
+      // any non-browser caller can hit the gateway directly with its
+      // own token, and a browser would have sent Origin.
+      return Response.json({ error: "Forbidden" }, { status: 403 });
+    }
+    const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
+    if (!isLoopbackHost(expectedHost)) {
+      return Response.json({ error: "Forbidden" }, { status: 403 });
+    }
   } else {
     let originUrl: URL;
     try {
