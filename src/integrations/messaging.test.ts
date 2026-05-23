@@ -523,6 +523,51 @@ describe("messaging telegram wiring", () => {
     expect(updatedAtAfterSecond).toBe(updatedAtAfterFirst);
   });
 
+  test("allowChat with expectedCode is idempotent — second call returns the same view even after the pending entry was cleared", async () => {
+    // The first allow drops the pending row from recentDeniedChats.
+    // Without the idempotency check running BEFORE the expectedCode
+    // validation block, a second call with the same expectedCode would
+    // throw "No pending request for chat ..." (the pending row is
+    // gone) and surface as a 400/409 to the operator who already
+    // approved the chat — confusing UX for a no-op. Pin that the
+    // second call succeeds and the audit/greeting stays at 1.
+    const config = testConfig("telegram-allow-expectedcode-idempotent");
+    const { client, calls } = stubClient();
+    setMessagingDeps({ telegramClientFactory: () => client });
+    const { allowChat, recordDeniedChatAttempt } = await import("./messaging");
+    const { readState: readStateLocal } = await import("../state");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+    const pending = await recordDeniedChatAttempt(config, bridge.id, {
+      chatId: 7777,
+      chatType: "private",
+      sender: "@user"
+    });
+    expect(pending?.verificationCode).toBeTruthy();
+
+    const first = await allowChat(config, bridge.id, 7777, { expectedCode: pending!.verificationCode! });
+    expect(first.allowedChatIds).toContain(7777);
+    const auditAfterFirst = readStateLocal(config.instance).audit.filter(
+      (entry) => entry.action === "messaging.chat.allowed" && entry.target === bridge.id
+    ).length;
+    const sendCallsAfterFirst = calls.filter((c) => c.method === "sendMessage").length;
+
+    // Second allow with the SAME expectedCode value the operator's
+    // browser still has cached. The pending row was dropped by the
+    // first call. This used to throw; now it returns the same view.
+    const second = await allowChat(config, bridge.id, 7777, { expectedCode: pending!.verificationCode! });
+    expect(second.allowedChatIds).toContain(7777);
+    expect(readStateLocal(config.instance).audit.filter(
+      (entry) => entry.action === "messaging.chat.allowed" && entry.target === bridge.id
+    ).length).toBe(auditAfterFirst);
+    expect(calls.filter((c) => c.method === "sendMessage").length).toBe(sendCallsAfterFirst);
+  });
+
   test("rejectPendingChat clears the row from recentDeniedChats without granting allowlist access", async () => {
     const config = testConfig("telegram-reject-pending-keeps-allowlist");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });

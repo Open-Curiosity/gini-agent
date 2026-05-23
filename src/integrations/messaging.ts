@@ -764,6 +764,19 @@ export async function allowChat(
     // current pending entry. Callers that don't supply a code
     // (legacy CLI `gini messaging allow`) keep the prior trust
     // model — the explicit CLI call already proves operator intent.
+    //
+    // Idempotency check runs BEFORE the expectedCode validation: a
+    // second allow call (UI double-click, refetch-then-click race)
+    // would otherwise fail the pending-row lookup at line 770 because
+    // the first allow already cleared the pending entry. Returning
+    // early on alreadyAllowed lets the second call succeed as a no-op
+    // instead of surfacing as a confusing 400 to the operator who
+    // already approved the chat.
+    const allowedBefore = readAllowedChatIds(live);
+    const alreadyAllowed = allowedBefore.includes(chatId);
+    if (alreadyAllowed) {
+      return { bridgeId: live.id, view: chatAllowlistView(live), alreadyAllowed };
+    }
     if (options.expectedCode !== undefined) {
       const pending = readRecentDeniedChats(live).find((entry) => entry.chatId === chatId);
       if (!pending) {
@@ -779,16 +792,6 @@ export async function allowChat(
       if (pending.verificationCode.toLowerCase() !== options.expectedCode.trim().toLowerCase()) {
         throw new Error(`Verification code mismatch — the pending request's code has rotated. Reload the page and confirm again before approving.`);
       }
-    }
-    const allowedBefore = readAllowedChatIds(live);
-    const alreadyAllowed = allowedBefore.includes(chatId);
-    // Idempotency: a second allow call (operator double-click, UI race
-    // refreshing the pending list) finds the chat already enrolled and
-    // exits without writing another audit row or bumping updatedAt. The
-    // outer wrapper checks the flag before sending the greeting so the
-    // user doesn't receive duplicate "Paired" messages either.
-    if (alreadyAllowed) {
-      return { bridgeId: live.id, view: chatAllowlistView(live), alreadyAllowed };
     }
     const meta = { ...(live.metadata ?? {}) };
     const allowed = [...allowedBefore, chatId];
