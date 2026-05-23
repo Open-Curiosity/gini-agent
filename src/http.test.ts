@@ -1708,6 +1708,85 @@ describe("runtime api", () => {
     }
   });
 
+  test("POST /api/messaging/:id/allow with a mismatched verification code returns 409 (not 500)", async () => {
+    // allowChat throws "Verification code mismatch — ..." when the
+    // operator's UI snapshot lost a race against a fresher DM that
+    // rotated the pending code. The HTTP layer must map that to 409
+    // Conflict (stale-view), not the previous catch-all 500.
+    const config = testConfig("messaging-allow-code-mismatch");
+    const handler = createHandler(config);
+    const { addMessagingBridge, recordDeniedChatAttempt } = await import("./integrations/messaging");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+    await recordDeniedChatAttempt(config, bridge.id, { chatId: 42, chatType: "private" });
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/messaging/${bridge.id}/allow`,
+      {
+        method: "POST",
+        body: JSON.stringify({ chatId: 42, expectedCode: "ZZ-ZZ-ZZ" })
+      },
+      config.token
+    );
+    expect(response.status).toBe(409);
+    const body = await response.json();
+    expect(body.error).toMatch(/Verification code mismatch/);
+  });
+
+  test("POST /api/messaging/:id/allow with an expired verification code returns 409 (not 500)", async () => {
+    // allowChat throws "Verification code for chat ${chatId} has expired
+    // ..." when the pending code aged past its TTL between page load and
+    // click. Same 409 contract as the mismatch case so the UI can
+    // distinguish stale-view conflicts from generic server errors.
+    const { mutateState } = await import("./state/store");
+    const config = testConfig("messaging-allow-code-expired");
+    const handler = createHandler(config);
+    const { addMessagingBridge, recordDeniedChatAttempt } = await import("./integrations/messaging");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+    const pending = await recordDeniedChatAttempt(config, bridge.id, {
+      chatId: 99,
+      chatType: "private"
+    });
+    expect(pending?.verificationCode).toBeTruthy();
+    await mutateState(config.instance, (state) => {
+      const live = state.messagingBridges.find((b) => b.id === bridge.id);
+      if (!live) return;
+      const meta = { ...(live.metadata ?? {}) };
+      const list = Array.isArray(meta.recentDeniedChats) ? [...meta.recentDeniedChats] : [];
+      const idx = list.findIndex((entry: { chatId?: number }) => entry?.chatId === 99);
+      if (idx < 0) return;
+      list[idx] = {
+        ...list[idx],
+        verificationCodeExpiresAt: new Date(Date.now() - 60_000).toISOString()
+      };
+      meta.recentDeniedChats = list;
+      live.metadata = meta;
+    });
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/messaging/${bridge.id}/allow`,
+      {
+        method: "POST",
+        body: JSON.stringify({ chatId: 99, expectedCode: pending!.verificationCode })
+      },
+      config.token
+    );
+    expect(response.status).toBe(409);
+    const body = await response.json();
+    expect(body.error).toMatch(/has expired/);
+  });
+
   test("POST /api/messaging/:id/reject-pending with a malformed chatId returns 400 (not 500)", async () => {
     // Same parseChatIdStrict guard as /allow — pin it here so the new
     // route doesn't regress to 500 on bad input as the surface grows.

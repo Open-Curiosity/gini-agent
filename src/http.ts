@@ -790,7 +790,12 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Telegram inbound target must be")) return 400;
   if (message.startsWith("Discord inbound target")) return 400;
   if (message.startsWith("Outbound message requires")) return 400;
-  if (message.startsWith("Pairing codes only apply")) return 400;
+  // Verification-code race surfaces from `allowChat` when the operator's UI
+  // snapshot lost to the server: the code rotated (a fresher DM minted a new
+  // one) or aged past its TTL between page load and click. 409 Conflict
+  // signals "your view is stale, refresh and retry" — the UI can then prompt
+  // a re-fetch of the pending row rather than show a generic server error.
+  if (message.startsWith("Verification code")) return 409;
   if (message.startsWith("Chat allowlist only applies")) return 400;
   if (message.startsWith("chatId must be")) return 400;
   if (/^Target '.+' not permitted by active agent/.test(message)) return 400;
