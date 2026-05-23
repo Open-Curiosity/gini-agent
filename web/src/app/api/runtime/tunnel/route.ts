@@ -81,8 +81,37 @@ function redactAppleNotes(payload: unknown): Record<string, unknown> | null {
   };
 }
 
+function originHostMatchesRequest(request: NextRequest): boolean {
+  const host = request.headers.get("host");
+  if (!host) return false;
+  const originRaw = request.headers.get("origin") ?? request.headers.get("referer");
+  if (!originRaw) return false;
+  try {
+    const origin = new URL(originRaw);
+    const originHost = origin.port
+      ? `${origin.hostname}:${origin.port}`
+      : origin.hostname;
+    return originHost === host || origin.host === host;
+  } catch {
+    return false;
+  }
+}
+
 export const GET = async (_request: NextRequest) => forwardRedacted("GET");
+
+// PATCH toggles cloudflared and the Apple Notes mirror state. The BFF
+// auto-injects the runtime bearer on every forward, so without an
+// Origin/Referer guard a co-tenant process on localhost could POST
+// `{enabled: true}` here and the runtime would spin cloudflared up —
+// the operator never consented. The refresh-notes endpoint has the
+// same shape; mirror its check rather than inventing a new policy.
+// Legitimate callers (the Settings card same-origin fetch from the
+// operator's own browser) always carry an Origin matching the Host;
+// the CLI bypasses the BFF entirely and hits the runtime directly.
 export const PATCH = async (request: NextRequest) => {
+  if (!originHostMatchesRequest(request)) {
+    return new Response("Forbidden", { status: 403 });
+  }
   let body = "";
   try { body = await request.text(); } catch { body = ""; }
   return forwardRedacted("PATCH", body || "{}");

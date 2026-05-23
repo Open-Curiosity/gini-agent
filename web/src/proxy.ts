@@ -115,18 +115,24 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     // /api/runtime/pairing creates a code that the public
     // /api/pairing/claim trades for a durable device token; chaining
     // them on a tunnel-secret-authorized session yields a permanent
-    // credential that outlives the next secret rotation. The runtime
-    // itself ALSO refuses direct tunneled pairing creation, but only
-    // when it observes `tunneled === true` — the BFF strips the
-    // prefix before forwarding so the runtime sees a plain bearer
-    // request. We have to close it here, before the BFF gets to
-    // forward.
+    // credential that outlives the next secret rotation.
+    //
+    // Compare against a canonicalized form because the BFF catch-all
+    // (web/src/lib/runtime.ts:canonicalizeSegments) recursively
+    // `decodeURIComponent`s before forwarding, so a literal-string
+    // check would miss percent-encoded variants like
+    // `/api/runtime/%70airing` (decodes to "pairing"). Recursive
+    // decode + traversal-marker rejection here matches the BFF's
+    // semantics so any encoding that reaches the runtime as
+    // `pairing` is blocked at the proxy first.
+    const canonicalStripped = canonicalizeForGate(stripped);
     if (
       request.method === "POST"
-      && (stripped === "/api/runtime/pairing" || stripped === "/api/runtime/pairing/")
+      && canonicalStripped !== null
+      && (canonicalStripped === "/api/runtime/pairing" || canonicalStripped === "/api/runtime/pairing/")
     ) {
       return new NextResponse(
-        JSON.stringify({ error: "Pairing creation is not available through the tunnel. Run `gini tunnel apple-notes ...` or pair from localhost." }),
+        JSON.stringify({ error: "Pairing creation is not available through the tunnel. Pair from localhost or an already-paired device." }),
         { status: 403, headers: { "content-type": "application/json" } }
       );
     }
@@ -183,6 +189,35 @@ function attachSession(response: NextResponse, secret: string): void {
     path: "/",
     maxAge: SESSION_TTL_SECONDS
   });
+}
+
+// Recursive `decodeURIComponent` of every path segment, rejecting any
+// segment that contains a path separator, `..`, or non-printable bytes
+// after decoding. Mirrors the canonicalization the BFF's proxyRequest
+// applies before forwarding to the runtime, so a deny-list check at
+// the proxy sees the same shape the runtime will eventually receive.
+// Returns null when the path can't be canonicalized safely (e.g.,
+// embeds traversal markers); callers should treat null as "do not
+// proceed" but the current call site only consults the gate for the
+// pairing deny, so a null result falls through to normal handling.
+const MAX_DECODE_DEPTH = 5;
+function canonicalizeForGate(pathname: string): string | null {
+  const parts = pathname.split("/");
+  const out: string[] = [];
+  for (const part of parts) {
+    let current = part;
+    let stabilized = false;
+    for (let depth = 0; depth < MAX_DECODE_DEPTH; depth += 1) {
+      let next: string;
+      try { next = decodeURIComponent(current); } catch { return null; }
+      if (next === current) { stabilized = true; break; }
+      current = next;
+    }
+    if (!stabilized) return null;
+    if (current.includes("/") || current === ".." || current === ".") return null;
+    out.push(current);
+  }
+  return out.join("/");
 }
 
 // Detect a localhost-shaped Host header. Previously matched with naive
