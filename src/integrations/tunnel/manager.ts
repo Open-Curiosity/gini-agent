@@ -614,8 +614,17 @@ export function resolveTunnelConfig(
   const notesRaw = raw?.appleNotes;
   const notesEnabledDefault = process.platform === "darwin";
   const rawNotesEnabled = typeof notesRaw?.enabled === "boolean" ? notesRaw.enabled : undefined;
+  // When notesRaw.enabled is explicitly present but not a boolean
+  // (e.g., a hand-edited `"false"` string), fail closed instead of
+  // falling back to the macOS default-on. The operator clearly
+  // intended SOMETHING; default-on would override their intent and
+  // start writing the secret-bearing URL into iCloud Notes. Also
+  // flag mutated so server.ts persists the normalized form back.
+  const notesEnabledMalformed = notesRaw?.enabled !== undefined && rawNotesEnabled === undefined;
+  if (notesEnabledMalformed) mutated = true;
   const appleNotes = {
-    enabled: rawNotesEnabled ?? notesEnabledDefault,
+    enabled: rawNotesEnabled
+      ?? (notesEnabledMalformed ? false : notesEnabledDefault),
     folder: notesRaw?.folder ?? "gini",
     noteName: notesRaw?.noteName ?? `gini-tunnel-${config.instance}`,
     account: notesRaw?.account ?? "iCloud"
