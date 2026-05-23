@@ -68,7 +68,26 @@ export function MessagingCard({
                   <div className="flex items-center gap-2">
                     <StatusPill value={item.status} />
                     <Button size="sm" variant="outline" disabled={healthPending} onClick={() => onHealth(item.id)}>Health</Button>
-                    <Button size="sm" variant="outline" disabled={removePending} onClick={() => onRemove(item.id)}>Remove</Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={removePending}
+                      onClick={() => {
+                        // Hard-delete the bridge: drops the bridge row from
+                        // state, deletes the encrypted bot-token secret, and
+                        // leaves historical messages in place (the UI gates
+                        // their rendering on bridge existence). The Remove
+                        // button sits next to Health — a misclick would
+                        // otherwise instantly destroy the bridge with no
+                        // intervening signal. Match the same window.confirm
+                        // pattern the skills page uses for connector disconnect.
+                        if (window.confirm(`Remove ${item.name}?\nThis deletes the bridge and its bot token. Past messages stay in history.`)) {
+                          onRemove(item.id);
+                        }
+                      }}
+                    >
+                      Remove
+                    </Button>
                   </div>
                 </div>
                 {item.kind === "telegram" && item.status === "configured" ? (
@@ -313,6 +332,17 @@ function AddMessagingBridgeButtons() {
       {
         onSuccess: (record) => {
           if (sessionRef.current !== submittingSession) return;
+          // Drop the entered values from React state the moment the server
+          // confirms the bridge was created. The token is already persisted
+          // in the per-instance encrypted secret store and the name has
+          // been echoed back on `record`, so the form state is redundant
+          // by this point. Holding the token in component state until the
+          // 150ms-after-close reset would leave it inspectable in React
+          // DevTools or any future debug log/error overlay for the
+          // duration of the summary view — bad hygiene for a credential.
+          setName("");
+          setBotToken("");
+          setDeliveryTargets("");
           setResult(record);
         },
         onSettled: () => {
