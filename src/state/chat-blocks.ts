@@ -456,12 +456,21 @@ export function listChatBlocks(instance: Instance, sessionId: string): ChatBlock
     .map(rowToBlock);
 }
 
-// Returns blocks added (or last-updated, for assistant_text) AFTER the
-// given block id. Used by the SSE handler to honor Last-Event-ID so a
-// reconnecting client gets only what it missed. When `afterBlockId` is
-// not found in the table (rolled-out / wrong session), returns the full
-// list — best-effort recovery, mirroring the legacy eventStream ring-
-// buffer behavior in src/http.ts.
+// Returns blocks added (or last-updated, for assistant_text and tool_call)
+// AFTER the given block id. Used by the SSE handler to honor Last-Event-ID
+// so a reconnecting client gets only what it missed. When `afterBlockId`
+// is not found in the table (rolled-out / wrong session), returns the
+// full list — best-effort recovery, mirroring the legacy eventStream
+// ring-buffer behavior in src/http.ts.
+//
+// In-place updates (`upsertAssistantTextBlock`, `updateToolCallBlock`)
+// mutate the row's `updated_at` without changing its `ordinal`, so an
+// ordinal-only cursor would miss every delta to the cursor block itself
+// after a reconnect. The query below therefore also returns rows whose
+// `updated_at` is newer than the cursor row's `updated_at` snapshot,
+// excluding the cursor row itself. Insert-only kinds keep working
+// because their `updated_at` always equals `created_at` and never
+// advances after the row is written.
 export function listChatBlocksAfter(
   instance: Instance,
   sessionId: string,
@@ -470,8 +479,8 @@ export function listChatBlocksAfter(
   if (!afterBlockId) return listChatBlocks(instance, sessionId);
   const db = getMemoryDb(instance);
   const cutoff = db
-    .query<{ ordinal: number }, [string, string]>(
-      "SELECT ordinal FROM chat_blocks WHERE id = ? AND session_id = ?"
+    .query<{ ordinal: number; updated_at: string }, [string, string]>(
+      "SELECT ordinal, updated_at FROM chat_blocks WHERE id = ? AND session_id = ?"
     )
     .get(afterBlockId, sessionId);
   if (!cutoff) {
@@ -479,10 +488,13 @@ export function listChatBlocksAfter(
     return listChatBlocks(instance, sessionId);
   }
   return db
-    .query<ChatBlockRow, [string, number]>(
-      "SELECT * FROM chat_blocks WHERE session_id = ? AND ordinal > ? ORDER BY ordinal ASC"
+    .query<ChatBlockRow, [string, number, string, string]>(
+      `SELECT * FROM chat_blocks
+       WHERE session_id = ?
+         AND (ordinal > ? OR (updated_at > ? AND id <> ?))
+       ORDER BY ordinal ASC`
     )
-    .all(sessionId, cutoff.ordinal)
+    .all(sessionId, cutoff.ordinal, cutoff.updated_at, afterBlockId)
     .map(rowToBlock);
 }
 

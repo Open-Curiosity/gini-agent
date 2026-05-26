@@ -211,6 +211,82 @@ describe("chat-blocks persistence", () => {
     expect(afterNull.map((row) => row.id)).toEqual([a.id, b.id, c.id]);
   });
 
+  test("listChatBlocksAfter replays in-place updates after the cursor", async () => {
+    // A reconnecting client carries a Last-Event-ID equal to the most
+    // recent block it observed. The resume query compares each row's
+    // current updated_at against the cursor row's current updated_at,
+    // and includes any other row whose updated_at moved forward later.
+    // This lets upsert-style mutations (assistant_text deltas, tool_call
+    // status flips) on earlier-ordinal blocks replay on reconnect.
+    //
+    // The cursor row itself is excluded via `id <> ?`; clients already
+    // hold its most recent state in their local cache.
+    const instance = "chat-blocks-resume-upserts";
+    const stream = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_r",
+      text: "Hi",
+      streaming: true
+    });
+    const call = insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: "chat_r",
+      toolName: "file_read",
+      displayLabel: "Read file",
+      argsPreview: "x.md",
+      argsFull: { path: "x.md" },
+      status: "running",
+      callId: "call_resume"
+    });
+    const phase = insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: "chat_r",
+      label: "Working: file_read"
+    });
+
+    // Client disconnects holding cursor = stream.id. It has Hi/running.
+    // Sleep so subsequent now() calls produce later ISO timestamps.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    // Tool_call flips to ok in place; the cursor row is untouched, so
+    // its updated_at stays older than this upsert's.
+    updateToolCallBlock(instance, "call_resume", "chat_r", { status: "ok" });
+
+    // Resume from cursor=stream.id: ordinal-only filter would only see
+    // the phase block. With the updated_at fan-in, the in-place tool_call
+    // flip also replays.
+    const replay = listChatBlocksAfter(instance, "chat_r", stream.id);
+    const replayedIds = replay.map((row) => row.id).sort();
+    expect(replayedIds).toEqual([call.id, phase.id].sort());
+
+    const replayedCall = replay.find((row) => row.id === call.id);
+    if (replayedCall?.kind === "tool_call") {
+      expect(replayedCall.status).toBe("ok");
+    }
+
+    // Cursor block is excluded even though its updated_at is, by
+    // definition, not greater than itself.
+    expect(replay.map((row) => row.id)).not.toContain(stream.id);
+
+    // Same shape for assistant_text deltas to an earlier-ordinal block.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    upsertAssistantTextBlock(instance, stream.id, {
+      text: "Hi there",
+      streaming: false
+    });
+    // New cursor = phase.id (latest ordinal). Earlier-ordinal blocks
+    // with newer updated_at must replay — both the assistant_text upsert
+    // we just did and the still-newer tool_call ok flip from earlier.
+    const replay2 = listChatBlocksAfter(instance, "chat_r", phase.id);
+    const ids2 = replay2.map((row) => row.id).sort();
+    expect(ids2).toEqual([stream.id, call.id].sort());
+    const text = replay2.find((row) => row.id === stream.id);
+    if (text?.kind === "assistant_text") {
+      expect(text.text).toBe("Hi there");
+      expect(text.streaming).toBe(false);
+    }
+  });
+
   test("subscribers fire on insert and upsert, then stop after unsubscribe", () => {
     const instance = "chat-blocks-subscribe";
     const events: ChatBlock[] = [];
