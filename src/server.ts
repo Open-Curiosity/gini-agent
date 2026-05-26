@@ -345,6 +345,19 @@ const WEB_HEALTH_FAIL_THRESHOLD = 2;
 let webHealthInterval: ReturnType<typeof setInterval> | null = null;
 let webHealthFailureStreak = 0;
 
+// Set by the health poll path to tell runRecycle "skip your same-port
+// elide on the next iteration." Without this signal, runRecycle's
+// cheap elide (which compares the web.port file's content to
+// currentWebTarget and the live cloudflareUrl) defeats the entire
+// silent-web-death recovery path: a SIGSEGV-ed Next.js doesn't
+// rewrite web.port and currentWebTarget still points at the dead
+// port, so the elide skips every health-triggered recycle and the
+// tunnel keeps forwarding to a freed port that any co-tenant could
+// squat. The flag is read-and-cleared at the top of each recycle
+// loop iteration so a subsequent file-watcher event (the normal
+// path) still benefits from the elide.
+let recycleSkipElide = false;
+
 const startWebHealthPolling = (): void => {
   if (webHealthInterval !== null) return;
   webHealthFailureStreak = 0;
@@ -379,6 +392,13 @@ const startWebHealthPolling = (): void => {
           streak: webHealthFailureStreak
         });
         webHealthFailureStreak = 0;
+        // Signal to runRecycle that the same-port elide must be
+        // bypassed: the port file hasn't changed (silent death
+        // leaves it stale) but the tunnel needs to tear down so the
+        // next resolveWebTarget can re-probe and either land on the
+        // restarted web child or surface a stranded state through
+        // the recycle's lastError.
+        recycleSkipElide = true;
         pendingApply = pendingApply.then(runRecycle, () => undefined);
       }
     }).catch(() => { probeInFlight = false; });
@@ -534,6 +554,18 @@ async function runApplyConfig(
         // next boot, which is the correct semantics.
         appendLog(config.instance, "tunnel.start.aborted", {
           reason: "shutdown in progress"
+        });
+      } else if (pendingDisable) {
+        // A disable PATCH arrived while we were sitting in
+        // resolveWebTarget's polling loop. resolveWebTarget checks
+        // pendingDisable at the top of each iteration but not after
+        // probeWebHealthy resolves, so a disable flipping the latch
+        // during the probe's await window lets us reach this point
+        // with a resolved target. Bail out symmetrically with the
+        // boot path's check — the queued runApplyConfig for the
+        // disable will run next and reconcile state.
+        appendLog(config.instance, "tunnel.start.aborted", {
+          reason: "disable requested mid-resolve"
         });
       } else {
         let startError: Error | null = null;
@@ -706,6 +738,18 @@ const server = Bun.serve({
         }
         const next = pendingApply.then(() => runApplyConfig(update));
         pendingApply = next.then(() => undefined, () => undefined);
+        // Clear pendingDisable on rejection so the latch doesn't stay
+        // stuck true after a persist failure. The fire-and-forget
+        // stop() above already tore the tunnel down; runApplyConfig
+        // hitting writeConfigAtomic and throwing prevents its
+        // becameDisabled branch from clearing the latch the success
+        // path would. Without this catch, the latch would suppress
+        // every subsequent recycle/boot for the rest of the process
+        // lifetime (a follow-up enable PATCH would unstick it, but
+        // operators don't always reach for that).
+        next.catch(() => {
+          if (update?.enabled === false) pendingDisable = false;
+        });
         return next;
       }
     }
@@ -864,11 +908,19 @@ const runRecycle = async (): Promise<void> => {
       // different case — a stale recycle queued before the file
       // changed but executed after the current target was already
       // updated by an interleaved PATCH or another recycle.
+      // Read-and-clear the health-poll bypass signal so this iteration
+      // forces a full stop/resolve/start even when the file content
+      // matches the current target. The flag covers the silent web
+      // death case (Next.js SIGSEGV without rewriting web.port) — see
+      // the recycleSkipElide declaration above.
+      const skipElide = recycleSkipElide;
+      recycleSkipElide = false;
       try {
         const currentFileContent = readFileSync(webPortPath(config.instance), "utf8").trim();
         const cachedUrl = currentWebTarget;
         if (
-          cachedUrl !== null
+          !skipElide
+          && cachedUrl !== null
           && cachedUrl === `http://127.0.0.1:${currentFileContent}`
           && tunnelManager.getSnapshot().cloudflareUrl !== null
         ) {
