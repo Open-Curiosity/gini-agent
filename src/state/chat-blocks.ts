@@ -619,4 +619,39 @@ export function subscribeChatBlocks(
 
 function publish(instance: Instance, block: ChatBlock): void {
   emitter.emit(subscriptionKey(instance, block.sessionId), block);
+  // Fan out to instance-wide subscribers too — the APNs dispatcher
+  // listens here so it sees every block for the instance without
+  // having to enumerate sessions and re-subscribe as they spawn.
+  emitter.emit(instanceKey(instance), block);
+}
+
+function instanceKey(instance: Instance): string {
+  return `${instance}::*`;
+}
+
+// Subscribe to every block emitted on this instance, across all
+// sessions. Returns an unsubscribe function. Used by long-lived
+// observers (e.g. the APNs push dispatcher) that need a fan-out point
+// independent of which session is active. Per-session SSE handlers
+// continue to use subscribeChatBlocks(instance, sessionId, handler) so
+// they only see their own traffic.
+export function subscribeAllChatBlocks(
+  instance: Instance,
+  handler: (block: ChatBlock) => void
+): () => void {
+  const key = instanceKey(instance);
+  const wrapped = (block: ChatBlock): void => {
+    try {
+      handler(block);
+    } catch (error) {
+      console.warn(
+        `[chat-blocks] instance subscriber for ${key} threw:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  };
+  emitter.on(key, wrapped);
+  return () => {
+    emitter.off(key, wrapped);
+  };
 }

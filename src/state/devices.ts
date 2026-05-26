@@ -98,6 +98,22 @@ export function listDevicesForCredential(instance: Instance, credentialId: strin
     .map(rowToDevice);
 }
 
+// Returns every registered device on this instance. The runtime is
+// single-tenant — chat sessions don't carry a per-credential owner —
+// so the APNs dispatcher fans `approval_requested` out to every iOS
+// install on this instance regardless of which credential registered
+// it. Kept distinct from listDevicesForCredential so future multi-
+// tenant work has a clear place to narrow the broadcast.
+export function listAllDevices(instance: Instance): PushDevice[] {
+  const db = getMemoryDb(instance);
+  return db
+    .query<PushDeviceRow, []>(
+      "SELECT * FROM devices ORDER BY registered_at ASC"
+    )
+    .all()
+    .map(rowToDevice);
+}
+
 export function getDevice(instance: Instance, token: string): PushDevice | null {
   const db = getMemoryDb(instance);
   const row = db

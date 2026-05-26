@@ -84,12 +84,14 @@ export {
   deleteChatBlocksForSession,
   findInFlightAssistantTextForTask,
   getLatestMessagesBySession,
-  subscribeChatBlocks
+  subscribeChatBlocks,
+  subscribeAllChatBlocks
 } from "./chat-blocks";
 export type { InsertChatBlockInput } from "./chat-blocks";
 export {
   upsertDevice,
   listDevicesForCredential,
+  listAllDevices,
   getDevice,
   removeDevice,
   removeDeviceForCredential

@@ -1,0 +1,184 @@
+// Unit tests for the APNs dispatcher. Pins:
+//   - approval_requested blocks fan out to every registered device
+//     with the right payload + topic
+//   - non-approval blocks (user_text, assistant_text, etc.) are
+//     ignored — no push, no device list scan
+//   - a 410 Unregistered response triggers token cleanup so the
+//     dead token can't keep accruing pushes
+//   - a non-410 failure (BadDeviceToken, apns_not_configured) leaves
+//     the token in place — operator may recover the configuration
+
+import { describe, expect, test } from "bun:test";
+import { createApnsDispatcher, buildApprovalPayload } from "./dispatcher";
+import type { APNsClient, APNsPayload, APNsSendOptions, APNsSendResult } from "./client";
+import type { ChatBlock, Instance } from "../../types";
+import type { PushDevice } from "../../state";
+
+function approvalBlock(overrides?: Partial<Extract<ChatBlock, { kind: "approval_requested" }>>): Extract<ChatBlock, { kind: "approval_requested" }> {
+  return {
+    id: "block_abc",
+    sessionId: "chat_xyz",
+    instance: "test-instance" as Instance,
+    ordinal: 4,
+    createdAt: new Date().toISOString(),
+    kind: "approval_requested",
+    approvalId: "appr_1",
+    action: "terminal_exec",
+    risk: "medium",
+    summary: "Run `rm -rf foo`",
+    ...overrides
+  };
+}
+
+function buildFakeClient(): { client: APNsClient; calls: Array<{ token: string; payload: APNsPayload; opts: APNsSendOptions }>; programResults: Map<string, APNsSendResult>; } {
+  const calls: Array<{ token: string; payload: APNsPayload; opts: APNsSendOptions }> = [];
+  const programResults = new Map<string, APNsSendResult>();
+  const client: APNsClient = {
+    async sendPush(token, payload, opts) {
+      calls.push({ token, payload, opts });
+      return programResults.get(token) ?? { ok: true, status: 200 };
+    },
+    close(): void { /* noop */ }
+  };
+  return { client, calls, programResults };
+}
+
+function buildDevice(overrides?: Partial<PushDevice>): PushDevice {
+  return {
+    token: overrides?.token ?? "tok",
+    credentialId: overrides?.credentialId ?? "cred_a",
+    platform: "ios",
+    bundleId: overrides?.bundleId ?? "ai.lilaclabs.gini.mobile",
+    registeredAt: overrides?.registeredAt ?? new Date().toISOString(),
+    lastSeenAt: overrides?.lastSeenAt ?? new Date().toISOString()
+  };
+}
+
+describe("apns dispatcher", () => {
+  test("fans approval_requested out to every registered device with the privacy-safe payload", async () => {
+    const { client, calls } = buildFakeClient();
+    const devices = [
+      buildDevice({ token: "tok_a", bundleId: "ai.lilaclabs.gini.mobile" }),
+      buildDevice({ token: "tok_b", bundleId: "ai.lilaclabs.gini.mobile.dev" })
+    ];
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => devices,
+      subscribe: () => () => { /* noop unsubscribe */ }
+    });
+
+    await dispatcher.dispatch(approvalBlock());
+
+    expect(calls.length).toBe(2);
+    const byToken = new Map(calls.map((c) => [c.token, c]));
+    const a = byToken.get("tok_a");
+    const b = byToken.get("tok_b");
+    expect(a).toBeDefined();
+    expect(b).toBeDefined();
+    // Topic is per-device bundle id — prod and dev TestFlight installs
+    // route to different APNs topics even with one set of creds.
+    expect(a?.opts.topic).toBe("ai.lilaclabs.gini.mobile");
+    expect(b?.opts.topic).toBe("ai.lilaclabs.gini.mobile.dev");
+    expect(a?.opts.pushType).toBe("alert");
+    expect(a?.opts.priority).toBe(10);
+    expect(a?.opts.collapseId).toBe("appr_1");
+    // Privacy: payload carries ids + generic title only, never the
+    // approval summary or chat content.
+    expect(a?.payload.sessionId).toBe("chat_xyz");
+    expect(a?.payload.blockId).toBe("block_abc");
+    expect(a?.payload.approvalId).toBe("appr_1");
+    expect(a?.payload.event).toBe("approval_requested");
+    const aps = a?.payload.aps as Record<string, unknown>;
+    expect((aps.alert as Record<string, unknown>).title).toBe("Gini needs your approval");
+    expect((aps.alert as Record<string, unknown>).body).toBe("Tap to review");
+    expect(aps.category).toBe("APPROVAL_REQUEST");
+    expect(aps["thread-id"]).toBe("chat_xyz");
+    // Defensive: nothing carrying the summary or action verb leaked
+    // into the wire payload.
+    const serialized = JSON.stringify(a?.payload);
+    expect(serialized).not.toContain("Run `rm -rf foo`");
+    expect(serialized).not.toContain("terminal_exec");
+
+    dispatcher.stop();
+  });
+
+  test("ignores non-approval blocks", async () => {
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "b1",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 1,
+      createdAt: new Date().toISOString(),
+      kind: "user_text",
+      text: "hi"
+    });
+    await dispatcher.dispatch({
+      id: "b2",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 2,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      kind: "assistant_text",
+      text: "hello",
+      streaming: true
+    });
+
+    expect(calls.length).toBe(0);
+    dispatcher.stop();
+  });
+
+  test("410 Unregistered triggers token cleanup", async () => {
+    const { client, programResults } = buildFakeClient();
+    programResults.set("dead_tok", { ok: false, status: 410, reason: "Unregistered" });
+    programResults.set("live_tok", { ok: true, status: 200 });
+    const invalidated: Array<{ instance: Instance; token: string }> = [];
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "dead_tok" }), buildDevice({ token: "live_tok" })],
+      onTokenInvalidated: (instance, token) => invalidated.push({ instance, token }),
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch(approvalBlock());
+
+    expect(invalidated).toEqual([{ instance: "test-inst" as Instance, token: "dead_tok" }]);
+  });
+
+  test("non-410 failures leave the token in place", async () => {
+    const { client, programResults } = buildFakeClient();
+    programResults.set("bad_tok", { ok: false, status: 400, reason: "BadDeviceToken" });
+    const invalidated: Array<{ instance: Instance; token: string }> = [];
+    const warnings: string[] = [];
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "bad_tok" })],
+      onTokenInvalidated: (instance, token) => invalidated.push({ instance, token }),
+      warn: (msg) => warnings.push(msg),
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch(approvalBlock());
+
+    expect(invalidated.length).toBe(0);
+    expect(warnings.some((w) => w.includes("BadDeviceToken"))).toBe(true);
+  });
+
+  test("buildApprovalPayload produces a stable, privacy-safe shape", () => {
+    const block = approvalBlock();
+    const payload = buildApprovalPayload(block);
+    // Top-level keys: aps + the four routing fields.
+    expect(Object.keys(payload).sort()).toEqual(["approvalId", "aps", "blockId", "event", "sessionId"]);
+    expect(payload.sessionId).toBe(block.sessionId);
+    expect(payload.blockId).toBe(block.id);
+    expect(payload.approvalId).toBe(block.approvalId);
+    expect(payload.event).toBe("approval_requested");
+  });
+});
