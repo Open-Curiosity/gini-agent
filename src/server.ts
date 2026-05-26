@@ -326,6 +326,77 @@ let bootRecoveryRecycleInFlight = false;
 // proceed normally.
 let pendingDisable = false;
 
+// Periodic re-probe so a silent Next.js death (no fs.watch event,
+// since web.port wasn't rewritten) doesn't leave cloudflared
+// forwarding to a freed port that a co-tenant could squat on and
+// intercept secret-bearing requests. The fs.watch path only fires on
+// web.port changes; an OOM/SIGSEGV/panic in the web child can free
+// the port WITHOUT rewriting the marker file, so no recycle is
+// triggered and the public tunnel keeps forwarding traffic to
+// whatever now answers on that port. The probe re-runs
+// probeWebHealthy(currentWebTarget) on a fixed cadence; on
+// WEB_HEALTH_FAIL_THRESHOLD consecutive failures (one transient blip
+// is allowed) it enqueues a runRecycle through pendingApply. The
+// recycle's own stop-before-resolve invariant then takes the public
+// tunnel down before re-probing the freed port, so the worst case is
+// a brief 502 rather than forwarding to a squatter.
+const WEB_HEALTH_INTERVAL_MS = 30_000;
+const WEB_HEALTH_FAIL_THRESHOLD = 2;
+let webHealthInterval: ReturnType<typeof setInterval> | null = null;
+let webHealthFailureStreak = 0;
+
+const startWebHealthPolling = (): void => {
+  if (webHealthInterval !== null) return;
+  webHealthFailureStreak = 0;
+  // Single-flight latch so a probe that runs slower than the
+  // interval (1s healthz timeout + scheduling jitter) can't overlap
+  // with the next tick's probe. Without this, two concurrent
+  // failing probes could each bump the streak past the threshold
+  // and double-enqueue a recycle.
+  let probeInFlight = false;
+  webHealthInterval = setInterval(() => {
+    if (shutdownStarted || currentWebTarget === null) {
+      stopWebHealthPolling();
+      return;
+    }
+    if (probeInFlight) return;
+    // If the tunnel is already down (recovery interval will handle
+    // it, or the operator disabled), there's nothing for the probe
+    // to defend — skip until cloudflared is back up.
+    if (tunnelManager.getSnapshot().cloudflareUrl === null) return;
+    probeInFlight = true;
+    const target = currentWebTarget;
+    probeWebHealthy(target).then((healthy) => {
+      probeInFlight = false;
+      if (healthy) {
+        webHealthFailureStreak = 0;
+        return;
+      }
+      webHealthFailureStreak += 1;
+      if (webHealthFailureStreak >= WEB_HEALTH_FAIL_THRESHOLD) {
+        appendLog(config.instance, "tunnel.web.unhealthy", {
+          target,
+          streak: webHealthFailureStreak
+        });
+        webHealthFailureStreak = 0;
+        pendingApply = pendingApply.then(runRecycle, () => undefined);
+      }
+    }).catch(() => { probeInFlight = false; });
+  }, WEB_HEALTH_INTERVAL_MS);
+  // Detach from the event loop so the interval can't keep the
+  // process alive past SIGTERM drain. The SIGTERM handler clears
+  // the interval explicitly; unref() is the belt to that suspenders.
+  webHealthInterval.unref?.();
+};
+
+const stopWebHealthPolling = (): void => {
+  if (webHealthInterval !== null) {
+    clearInterval(webHealthInterval);
+    webHealthInterval = null;
+  }
+  webHealthFailureStreak = 0;
+};
+
 async function runApplyConfig(
   update: { enabled?: boolean; appleNotes?: { enabled?: boolean } }
 ): Promise<ReturnType<typeof tunnelManager.getSnapshot>> {
@@ -503,6 +574,11 @@ async function runApplyConfig(
           bootRecoveryInterval = null;
         }
         bootFailureRecorded = false;
+        // Start the periodic web-health probe now that cloudflared
+        // is forwarding to a live target. The probe guards against
+        // a silent web death that wouldn't trip the fs.watch
+        // recycle path (e.g. OOM/SIGSEGV without a port rewrite).
+        startWebHealthPolling();
       }
     } else if (resolveError !== null) {
       // Propagate the target-resolution failure to the PATCH caller so
@@ -516,6 +592,10 @@ async function runApplyConfig(
     }
   }
   if (becameDisabled) {
+    // Stop the periodic web-health probe BEFORE tearing cloudflared
+    // down so a tick mid-disable can't observe a still-live snapshot
+    // and enqueue a recycle that races the disable.
+    stopWebHealthPolling();
     await tunnelManager.stop();
     // Clear the synchronous preemption latch now that the disable has
     // landed. A subsequent enable PATCH would clear it too via the
@@ -687,6 +767,10 @@ if (tunnelResolved.config.enabled) {
       tunnelManager.setTargetUrl(target);
       await tunnelManager.start();
       currentWebTarget = target;
+      // Start the periodic web-health probe now that cloudflared
+      // is forwarding to a live target. Guards against a silent
+      // web death that wouldn't trip the fs.watch recycle path.
+      startWebHealthPolling();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       appendLog(config.instance, "tunnel.start.error", { error: message });
@@ -820,6 +904,12 @@ const runRecycle = async (): Promise<void> => {
       tunnelManager.setTargetUrl(target);
       await tunnelManager.start();
       currentWebTarget = target;
+      // Restart the periodic web-health probe against the fresh
+      // target. A prior probe was reset by stopWebHealthPolling()
+      // in the becameDisabled branch (if reached) or is harmlessly
+      // idempotent here; either way, ensure the probe is running
+      // against the current target after a recycle succeeds.
+      startWebHealthPolling();
     } while (recyclePending && !shutdownStarted && tunnelResolved.config.enabled && !pendingDisable);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1213,7 +1303,12 @@ process.on("SIGTERM", async () => {
           clearInterval(bootRecoveryInterval);
           bootRecoveryInterval = null;
         }
-      })
+      }),
+      // Stop the periodic web-health probe. Same rationale as the
+      // boot-recovery interval: the probe self-terminates on its
+      // next tick when it observes shutdownStarted, but an explicit
+      // clear during drain avoids an extra event-loop wake.
+      Promise.resolve().then(() => { stopWebHealthPolling(); })
     ]),
     Bun.sleep(SCHEDULER_DRAIN_TIMEOUT_MS)
   ]);
