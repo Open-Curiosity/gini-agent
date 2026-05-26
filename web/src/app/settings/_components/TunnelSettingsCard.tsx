@@ -77,7 +77,14 @@ export function TunnelSettingsCard() {
 
   const notesAvailable = snapshot.data?.appleNotes?.available;
   const notesEnabled = snapshot.data?.appleNotes?.enabled === true;
-  const notesUnavailableReason = notesAvailable === false
+  // Only surface an unavailable reason while the mirror is enabled. When
+  // the operator has disabled the mirror, `refreshAppleNoteInner` stops
+  // running fresh iCloud probes (see manager.ts) so any previously cached
+  // `available: false` becomes a stale value the operator can't refute
+  // from the UI. Treating it as a live error would both lie about the
+  // current state and (when wired into the button's disabled gate) latch
+  // the operator out of re-enabling without a runtime restart.
+  const notesUnavailableReason = notesEnabled && notesAvailable === false
     ? snapshot.data?.appleNotes?.lastError ?? "iCloud account not found in Notes.app on this host."
     : null;
   const notesStatus = !tunnelEnabled || !notesEnabled
@@ -259,11 +266,7 @@ export function TunnelSettingsCard() {
               <Button
                 size="sm"
                 variant="outline"
-                disabled={
-                  !tunnelEnabled
-                  || (!notesEnabled && notesAvailable === false)
-                  || toggleNotes.isPending
-                }
+                disabled={!tunnelEnabled || toggleNotes.isPending}
                 onClick={() => toggleNotes.mutate(!notesEnabled)}
               >
                 {notesEnabled ? "Disable" : "Enable"}
