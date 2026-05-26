@@ -1768,12 +1768,14 @@ describe("provider", () => {
     }
   });
 
-  test("codex tool-calling does NOT retry when session-expired arrives after partial output", async () => {
+  test("codex tool-calling does NOT retry when session-expired arrives after onDelta fired", async () => {
     // Mid-stream rotation can't be transparently retried — the caller has
-    // already shown partial output via onDelta, and a retry would
+    // already received partial output via onDelta and a retry would
     // double-deliver. Surface the error generically and let the agent
-    // loop decide what to do.
-    const { restore } = installCodexAuth("codex-session-no-retry-after-output");
+    // loop decide what to do. The retry guard hinges on onDelta actually
+    // firing, not on internal buffering, so this test wires up a real
+    // onDelta callback to assert that path.
+    const { restore } = installCodexAuth("codex-session-no-retry-after-ondelta");
     const originalFetch = globalThis.fetch;
     let attempts = 0;
     globalThis.fetch = (() => {
@@ -1802,12 +1804,140 @@ describe("provider", () => {
         type: "function",
         function: { name: "noop", description: "", parameters: { type: "object" } }
       }];
+      const deltas: string[] = [];
       await expect(generateToolCallingResponse(
         config(provider),
         [{ role: "user", content: "hi" }],
-        tools
+        tools,
+        (chunk) => deltas.push(chunk)
       )).rejects.toThrow(/session expired/i);
       expect(attempts).toBe(1);
+      expect(deltas).toEqual(["partial "]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex tool-calling DOES retry when text was buffered without onDelta", async () => {
+    // Non-streaming caller (no onDelta) never sees mid-stream bytes — the
+    // text only reaches them via the final return value. So a session-
+    // expired event after internal text buffering is safely retryable;
+    // attempt 2's text replaces attempt 1's, no double-delivery occurs.
+    const { restore } = installCodexAuth("codex-session-retry-buffered-text");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          if (attempts === 1) {
+            controller.enqueue(enc.encode(
+              `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "partial " })}\n\n`
+            ));
+            controller.enqueue(enc.encode(
+              `event: error\ndata: ${JSON.stringify({ type: "error", message: "Your ChatGPT session expired before this request finished." })}\n\n`
+            ));
+            controller.close();
+            return;
+          }
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex tool-calling DOES retry when only tool-call args were buffered", async () => {
+    // Function-call argument deltas are never streamed to the caller —
+    // they're accumulated into callsById and only surfaced as part of
+    // ToolCallingResult on success. A session-expired event after such
+    // buffering must still trigger a transparent retry; attempt 2's
+    // tool calls replace attempt 1's, no double-delivery occurs.
+    const { restore } = installCodexAuth("codex-session-retry-buffered-tool-call");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          if (attempts === 1) {
+            controller.enqueue(enc.encode(
+              `event: response.output_item.added\ndata: ${JSON.stringify({
+                type: "response.output_item.added",
+                item: { type: "function_call", id: "item-1", call_id: "call-1", name: "noop", arguments: "" }
+              })}\n\n`
+            ));
+            controller.enqueue(enc.encode(
+              `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({
+                type: "response.function_call_arguments.delta",
+                item_id: "item-1",
+                delta: "{\"x\":1"
+              })}\n\n`
+            ));
+            controller.enqueue(enc.encode(
+              `event: error\ndata: ${JSON.stringify({ type: "error", message: "Your ChatGPT session expired before this request finished." })}\n\n`
+            ));
+            controller.close();
+            return;
+          }
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
     } finally {
       globalThis.fetch = originalFetch;
       restore();

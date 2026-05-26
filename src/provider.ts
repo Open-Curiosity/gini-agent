@@ -642,6 +642,11 @@ async function readResponsesToolCallingStream(
   let responseId: string | undefined;
   let usage: Record<string, unknown> | undefined;
   let finalOutput: unknown[] | undefined;
+  // True once onDelta has actually fired with a text chunk. textParts
+  // and callsById are internal accumulation — nothing in them reaches
+  // the caller until this function returns successfully — so they
+  // do NOT count as emitted output for the safe-retry decision.
+  let emittedToCaller = false;
 
   const handleEvent = (block: string): void => {
     const lines = block.split(/\r?\n/);
@@ -672,16 +677,15 @@ async function readResponsesToolCallingStream(
 
     // Backend-emitted error events (session rotation mid-stream, request-
     // level failures, content-policy aborts). Throwing here unwinds the
-    // SSE consumer loop; if nothing has been pushed to textParts or
-    // captured into callsById yet, withCodexSessionRetry can re-read
-    // auth.json and retry transparently. Once partial output has landed
-    // we can't safely retry without double-emitting, so the generic
-    // Error path runs even on session-expired mid-stream.
+    // SSE consumer loop; if onDelta has not yet fired (no caller-visible
+    // bytes), withCodexSessionRetry can re-read auth.json and retry
+    // transparently. Once a delta has landed in the caller's UI we can't
+    // safely retry without double-emitting, so the generic Error path
+    // runs even on session-expired mid-stream.
     if (eventType === "error" || type === "error" || type === "response.failed") {
       const message = extractStreamErrorMessage(payload)
         ?? `Codex tool-calling stream errored before completion (${type ?? "unknown"}).`;
-      const emittedAnyOutput = textParts.length > 0 || callsById.size > 0;
-      if (isCodexSessionExpiredMessage(message) && !emittedAnyOutput) {
+      if (isCodexSessionExpiredMessage(message) && !emittedToCaller) {
         throw new CodexSessionExpiredError(message);
       }
       throw new Error(message);
@@ -692,6 +696,7 @@ async function readResponsesToolCallingStream(
       if (delta.length > 0) {
         textParts.push(delta);
         if (onDelta) {
+          emittedToCaller = true;
           try {
             onDelta(delta);
           } catch {
@@ -1584,6 +1589,11 @@ async function readCodexStream(
   const finalTextParts: string[] = [];
   let responseId: string | undefined;
   let usage: Record<string, unknown> | undefined;
+  // True once onDelta has actually fired with a delta chunk.
+  // deltaTextParts and finalTextParts are internal accumulation —
+  // nothing in them reaches the caller until this function returns —
+  // so they do NOT count as emitted output for the safe-retry decision.
+  let emittedToCaller = false;
 
   // Consume the SSE stream incrementally. Each event is delimited by `\n\n`;
   // we split off complete events from the rolling buffer and push the rest
@@ -1609,16 +1619,14 @@ async function readCodexStream(
 
     // Backend-emitted error events (session rotation, request-level
     // failures, content-policy aborts). Throwing here unwinds the SSE
-    // consumer loop; if nothing has been pushed to deltaTextParts /
-    // finalTextParts yet, withCodexSessionRetry can re-read auth.json and
-    // retry transparently. Otherwise we'd risk double-emitting partial
-    // output, so the generic Error path runs even on session-expired
-    // mid-stream.
+    // consumer loop; if onDelta has not yet fired (no caller-visible
+    // bytes), withCodexSessionRetry can re-read auth.json and retry
+    // transparently. Otherwise we'd risk double-emitting partial output,
+    // so the generic Error path runs even on session-expired mid-stream.
     if (eventType === "error" || payloadType === "error" || payloadType === "response.failed") {
       const message = extractStreamErrorMessage(payload)
         ?? `Codex stream errored before completion (${payloadType ?? "unknown"}).`;
-      const emittedAnyOutput = deltaTextParts.length > 0 || finalTextParts.length > 0;
-      if (isCodexSessionExpiredMessage(message) && !emittedAnyOutput) {
+      if (isCodexSessionExpiredMessage(message) && !emittedToCaller) {
         throw new CodexSessionExpiredError(message);
       }
       throw new Error(message);
@@ -1630,6 +1638,7 @@ async function readCodexStream(
     if (typeof payload.delta === "string") {
       deltaTextParts.push(payload.delta);
       if (onDelta) {
+        emittedToCaller = true;
         try {
           onDelta(payload.delta);
         } catch {
