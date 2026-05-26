@@ -32,7 +32,7 @@
 //      success despite a missed resume.
 
 import type { Approval, RuntimeConfig } from "../types";
-import { resolveApproval } from "../agent";
+import { failTask, resolveApproval } from "../agent";
 import { addAudit, appendTrace, mutateState, readState } from "../state";
 import { browserFillByLocator, peekCurrentBrowserUrl } from "../tools/browser";
 import { isTerminalTaskStatus } from "../state";
@@ -249,12 +249,16 @@ export async function runFillSecretConnect(
     try {
       await resumeChatTask(config, taskId, toolCallId, resumeResult);
     } catch (resumeError) {
-      // resumeChatTask failures are bookkeeping — the next external
-      // trigger reconciles task state. Audit row already records
-      // the fill outcome. Log the throw to the task's trace so a
-      // future debugger asking "why didn't chat resume after my
-      // fill?" can find the cause; without the trace the error is
-      // unobservable.
+      // resumeChatTask flips task.status to "running" then re-enters
+      // the chat-task loop. A throw from inside that loop (model
+      // provider rate limit, dispatch error, etc.) leaves the task
+      // in status="running" with no live executor, no in-flight
+      // registry entry, and no scheduler to retry — orphaning the
+      // task. Mirror the recovery the resolveApproval path uses
+      // (src/agent.ts: `failTask` on executeApprovedAction throw)
+      // by failing the task here too. Audit row already records
+      // the fill outcome; failTask is idempotent so a concurrent
+      // cancel that beat us doesn't double-emit.
       appendTrace(config.instance, taskId, {
         type: "error",
         message: "resumeChatTask threw during fill_secret completion",
@@ -264,6 +268,13 @@ export async function runFillSecretConnect(
           error: resumeError instanceof Error ? resumeError.message : String(resumeError)
         }
       });
+      try {
+        await failTask(config, taskId, resumeError);
+      } catch {
+        // failTask's own throw must not mask the original — the
+        // next external trigger (user message, supervisor) will
+        // reconcile via the task row's current status.
+      }
     }
   }
 

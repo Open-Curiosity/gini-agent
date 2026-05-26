@@ -1161,6 +1161,20 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
   // "more interactive elements exist on the page, just hidden" apart
   // from "snapshot text was clipped at the char budget".
   if (hiddenTotal > hiddenEmitted) text += "\n[...hidden truncated]";
+  // Defense in depth: redact any literal occurrence of a known
+  // data-gini-secret value from the assembled snapshot text. The
+  // walker's element-local redaction only catches the stamped
+  // element itself — a page that JS-copies the typed value into
+  // another DOM node (a "you typed: ..." preview, password-strength
+  // widget echo, password-match indicator, hidden mirror input)
+  // would otherwise emit the copy verbatim through the unmarked
+  // element's name / textContent. Post-processing the assembled
+  // snapshot text against the live secret list closes this gap
+  // with the same primitive browserConsole and browserVision use.
+  const secretValues = await collectSecretValuesFromPageWithSession(page);
+  if (secretValues.length > 0) {
+    text = redactSecretValuesFromString(text, secretValues);
+  }
   return { text, refs, elementCount, truncated };
 }
 
@@ -1275,30 +1289,14 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
 // Collects the values of every element on the live page that
 // carries the data-gini-secret attribute (stamped by
 // browserFillByLocator after a successful fill_secret submission).
-// Used by browser_console and browser_vision to redact secret bytes
-// from their tool results: the snapshot walker handles
-// browser_snapshot, but the agent can still call console.eval with
-// `document.querySelector('input').value` to read the same value,
-// or screenshot a non-password input filled via fill_secret and
-// have the vision model OCR it out. Collecting the values stays
-// inside the playwright session — the values never leave the
-// gateway process except through the post-redaction tool result.
-async function collectSecretValuesFromPage(taskId: string): Promise<string[]> {
-  try {
-    return await withSession(taskId, async (session) => collectSecretValuesFromPageWithSession(session.page));
-  } catch {
-    // No active session yet, or evaluate failed — no secrets to
-    // redact. Return empty so the redactor is a no-op.
-    return [];
-  }
-}
-
-// Same query without acquiring a new withSession lock. Useful when
-// the caller already holds the lock (e.g. browserConsole and
-// browserVision pre-collect inside their own withSession callback
-// to keep the secret-list snapshot in closure scope BEFORE
-// running the eval / screenshot — so a navigation triggered by the
-// eval itself can't empty the secret list mid-call).
+// Used by browser_console, browser_vision, and the snapshot walker
+// to redact literal occurrences of typed credentials from any
+// tool result that flows back to the LLM. Callers pass their
+// already-acquired playwright Page so the collection inherits the
+// surrounding withSession lock and the secret-list snapshot lives
+// in closure scope BEFORE the agent-controlled side effect runs
+// (eval, screenshot, walk) — so an agent-supplied expression that
+// navigates the page can't empty the secret list mid-call.
 async function collectSecretValuesFromPageWithSession(page: import("playwright-core").Page): Promise<string[]> {
   try {
     return await page.evaluate(() => {
@@ -1397,11 +1395,11 @@ export async function browserFillByLocator(
       // expectedUrl skip the check (existing browser tool callers
       // that don't need the binding).
       //
-      // expectedUrl is origin+pathname (matching the producer-side
-      // approvedUrl on the approval payload and the central
-      // sanitizeUrlForAuditTarget helper). The name is "URL" not
-      // "origin" because it includes the pathname — web-platform
-      // `origin` is protocol+host+port only.
+      // expectedUrl is the page origin (protocol+host+port), the
+      // same shape the producer-side approvedUrl on the approval
+      // payload carries (both flow through sanitizeUrlForAuditTarget,
+      // which strips pathname/query/fragment because reset and
+      // magic-link URLs can carry tokens in the path).
       if (args.expectedUrl) {
         const liveUrl = sanitizeUrlForAuditTarget(session.page.url());
         if (liveUrl !== args.expectedUrl) {

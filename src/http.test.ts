@@ -1088,13 +1088,15 @@ describe("runtime api", () => {
   });
 
   test("POST /api/approvals/<id>/connect refuses fill_secret when page navigated away from approved origin", async () => {
-    // The approval.target encodes the origin+pathname the user
-    // consented to fill into. If the page has navigated (agent
-    // action, user click, JS redirect, phishing redirect) between
-    // approval creation and Submit, the live URL no longer matches
-    // and we refuse with 409 so a fresh approval is required for
-    // the new destination. In this test the browser session was
-    // never opened so peekCurrentBrowserUrl returns undefined,
+    // The approval.target encodes the origin the user consented
+    // to fill into (protocol+host+port; pathname is stripped by
+    // sanitizeUrlForAuditTarget). If the page has navigated to a
+    // different origin (agent action, user click, JS redirect,
+    // phishing redirect) between approval creation and Submit,
+    // the live URL no longer matches and we refuse with 409 so a
+    // fresh approval is required for the new destination. In
+    // this test the browser session was never opened so
+    // peekCurrentBrowserUrl returns undefined,
     // which the handler treats as "no live page to fill" — same
     // refusal path.
     const config = testConfig("connect-fill-secret-origin-mismatch");

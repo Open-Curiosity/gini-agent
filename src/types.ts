@@ -314,8 +314,18 @@ export interface ApprovalRequestedBlock extends ChatBlockBase {
   kind: "approval_requested";
   approvalId: string;
   // Approval action (`file.write`, `terminal.exec`, `connector.request`,
-  // etc.). Lets clients branch on `connector.request` to render the
-  // Connect dialog vs the standard Approve/Deny pair.
+  // `browser.fill_secret`, etc.). Clients branch on `action` to render
+  // the right card variant:
+  //   - `connector.request` → Connect dialog (collects OAuth/API
+  //     creds via /api/approvals/<id>/connect).
+  //   - `browser.fill_secret` → inline Submit form with one input
+  //     per slot in approval.payload.slots; Submit POSTs the per-slot
+  //     values to /api/approvals/<id>/connect with body
+  //     `{ secrets: { <slot.name>: <value>, ... } }`. The generic
+  //     /approve endpoint refuses this action — Deny is still valid.
+  //     See docs/adr/browser-fill-secret.md.
+  //   - everything else → standard Approve / Deny pair (POST to
+  //     /api/approvals/<id>/{approve,deny}).
   action: string;
   risk: string;
   summary: string;

@@ -2595,12 +2595,15 @@ async function browserFillSecretsTool(
       // Structural fields the /connect handler reads:
       //   - slots: which DOM elements to fill (kept; parsed by
       //     parseFillSecretSlots at every consumer).
-      //   - approvedUrl: the origin+pathname captured at dispatch
-      //     time, used as the load-bearing equality check against
-      //     the live page URL before any .fill() runs. Stored
-      //     structurally (not encoded in target's substring) so a
-      //     future tweak to target formatting can't silently weaken
-      //     the safety check.
+      //   - approvedUrl: the origin (protocol+host+port) captured
+      //     at dispatch time, used as the load-bearing equality
+      //     check against the live page URL before any .fill()
+      //     runs. Stored structurally (not encoded in target's
+      //     substring) so a future tweak to target formatting
+      //     can't silently weaken the safety check. Pathname is
+      //     stripped by sanitizeUrlForAuditTarget because
+      //     reset/magic-link URLs can carry tokens in the path
+      //     component.
       //   - toolCallId: the originating tool_call_id the chat-task
       //     loop uses to thread the resume tool result.
       payload: { slots, reason, toolCallId, approvedUrl }

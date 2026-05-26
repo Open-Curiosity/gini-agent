@@ -531,7 +531,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
               type: "object",
               properties: {
                 name: { type: "string", description: "Slot identifier (e.g. 'username', 'password', 'otp'). Used as the secrets-dict key on submit; not shown to the user." },
-                locator: { type: "string", description: "Playwright selector (CSS, text=, etc.) or @-ref from a recent browser_snapshot. The gateway will call browser_type with this locator at fill time." },
+                locator: { type: "string", description: "Playwright selector (CSS, text=, etc.) or @-ref from a recent browser_snapshot. The gateway fills this locator via playwright at fill time." },
                 label: { type: "string", description: "Human-readable label rendered next to the input in chat (e.g. 'GitHub password')." },
                 kind: { type: "string", enum: ["text", "password", "email", "tel", "number", "url"], description: "HTML input type for the rendered field. Use 'password' to mask the value while the user types. Defaults to 'text'." }
               },
