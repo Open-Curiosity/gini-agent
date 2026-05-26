@@ -191,7 +191,7 @@ describe("BFF tunnel error-forwarding scrubs trycloudflare URLs", () => {
     stubFetchReturning(500, leakyBody);
     const request = new NextRequest(new URL("http://127.0.0.1:3072/api/runtime/tunnel"), {
       method: "GET",
-      headers: { host: "127.0.0.1:3072" }
+      headers: { host: "127.0.0.1:3072", origin: "http://127.0.0.1:3072" }
     });
     const response = await GET(request);
     expect(response.status).toBe(500);
@@ -206,12 +206,22 @@ describe("BFF tunnel error-forwarding scrubs trycloudflare URLs", () => {
     stubFetchReturning(503, benignBody);
     const request = new NextRequest(new URL("http://127.0.0.1:3072/api/runtime/tunnel"), {
       method: "GET",
-      headers: { host: "127.0.0.1:3072" }
+      headers: { host: "127.0.0.1:3072", origin: "http://127.0.0.1:3072" }
     });
     const response = await GET(request);
     expect(response.status).toBe(503);
     const text = await response.text();
     expect(text).toBe(benignBody);
+  });
+
+  test("GET /api/runtime/tunnel rejects mismatched Origin with 403", async () => {
+    stubFetchReturning(200, JSON.stringify({}));
+    const request = new NextRequest(new URL("http://127.0.0.1:3072/api/runtime/tunnel"), {
+      method: "GET",
+      headers: { host: "127.0.0.1:3072", origin: "https://attacker.example" }
+    });
+    const response = await GET(request);
+    expect(response.status).toBe(403);
   });
 
   test("POST /api/runtime/tunnel/refresh-notes scrubs trycloudflare URLs from a 500 body before forwarding", async () => {

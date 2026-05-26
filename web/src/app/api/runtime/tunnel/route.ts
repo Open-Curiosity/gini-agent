@@ -166,11 +166,29 @@ export function scrubTunnelUrlPattern(text: string): string {
   // here. The optional path segment captures the `/<secret>/...` suffix
   // that turns the bare host into an auth-bypass credential — without
   // it the regex would leave the secret behind.
-  const pattern = /https?:\/\/[a-z0-9][a-z0-9-]*\.trycloudflare\.com(?:\/[^\s'"<>]*)?/gi;
+  // Exclude `\` from the path class so the regex stops at the backslash
+  // a JSON encoder placed before a closing escape pair. Without that
+  // exclusion, a body like {"error":"...<a href=\"https://abc.trycloudflare
+  // .com/SECRET/\">link</a>"} gets the trailing backslash consumed by the
+  // path match — the remaining `"` then escapes the JSON string and the
+  // browser fails to JSON.parse the response.
+  const pattern = /https?:\/\/[a-z0-9][a-z0-9-]*\.trycloudflare\.com(?:\/[^\s'"<>\\]*)?/gi;
   return text.replace(pattern, "[redacted-tunnel-url]");
 }
 
-export const GET = async (_request: NextRequest) => forwardRedacted("GET");
+// Gate GET with the same Origin/Host (or allowlist) check the PATCH uses.
+// Next.js dispatches /api/runtime/tunnel to this dedicated route before the
+// catch-all, so the catch-all's guardCsrf never runs — without our own
+// guard a DNS-rebound external page would receive the redacted snapshot
+// (cloudflareUrl, targetUrl, Apple Notes folder/note name, lastSyncedAt).
+// Those aren't credentials but they ARE operational metadata the
+// catch-all's allowlist+loopback policy is designed to deny.
+export const GET = async (request: NextRequest) => {
+  if (!originHostMatchesRequest(request)) {
+    return Response.json({ error: "Origin/Referer must match Host for tunnel reads." }, { status: 403 });
+  }
+  return forwardRedacted("GET");
+};
 
 // PATCH toggles cloudflared and the Apple Notes mirror state. The BFF
 // auto-injects the runtime bearer on every forward, so without an
