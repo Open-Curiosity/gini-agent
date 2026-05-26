@@ -12,7 +12,7 @@ import {
   readTrace,
   subscribeChatBlocks
 } from "./state";
-import { browserNavigate, browserType, safetyCheck } from "./tools/browser";
+import { browserFillByLocator, browserNavigate, safetyCheck } from "./tools/browser";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -247,17 +247,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         for (const slot of slots) {
           const value = secrets[slot.name];
           if (typeof value !== "string") continue;
-          const result = await browserType(taskId, { ref: slot.locator, text: value });
-          // browserType returns a JSON string with success/error
-          try {
-            const parsed = JSON.parse(result) as { success?: boolean; error?: string };
-            if (parsed.success === true) {
-              filledSlots.push(slot.name);
-            } else {
-              errors.push({ slot: slot.name, error: parsed.error ?? "fill failed" });
-            }
-          } catch {
-            errors.push({ slot: slot.name, error: "browserType returned non-JSON" });
+          // browserFillByLocator takes a raw playwright selector
+          // (CSS, text=, etc.) or an "@<id>" ARIA-ref token. The
+          // tool's own browser_type goes through a session-ref map
+          // that only knows about tokens from the latest snapshot
+          // and would reject a raw selector; this entrypoint
+          // bypasses that.
+          const result = await browserFillByLocator(taskId, { locator: slot.locator, value });
+          if (result.ok) {
+            filledSlots.push(slot.name);
+          } else {
+            errors.push({ slot: slot.name, error: result.error });
           }
         }
         // Audit row carries only metadata (slot names + per-slot

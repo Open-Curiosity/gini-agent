@@ -852,12 +852,18 @@ interface SnapshotResult {
   truncated: boolean;
 }
 
+// Marker attribute stamped on snapshot-rendered elements so the
+// "@<id>" ref tokens the LLM sees in a snapshot can be translated
+// back into playwright locators by callers outside snapshot() —
+// principally browserFillByLocator below.
+const REF_ATTR_GLOBAL = "data-gini-ref";
+
 // Walk the page in the browser and return a flat list of "interesting"
 // nodes plus a unique CSS-attribute ref we can use to resolve a Locator
 // later. Built in a single page.evaluate so we minimize round-trips and
 // reuse one DOM walk for both the snapshot text and the locator map.
 async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
-  const REF_ATTR = "data-gini-ref";
+  const REF_ATTR = REF_ATTR_GLOBAL;
   // First, clear stale refs from prior snapshots so id allocation stays
   // stable across calls.
   await page.evaluate((attr) => {
@@ -1225,6 +1231,38 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// browser.fill_secret slot writer. Takes a raw playwright selector
+// (CSS, text=, role=, or an ARIA snapshot ref token like "@e2"
+// which resolveLocator translates to [data-gini-ref="e2"]) plus the
+// value to type. Used exclusively by the POST /api/approvals/<id>/connect
+// browser.fill_secret branch; never called via the tool catalog.
+// Skips the post-fill snapshot that browser_type takes because the
+// agent will re-snapshot on its own when it resumes — and because
+// the fill might be one of several in the same submit batch, so
+// taking a snapshot per slot is wasted work.
+export async function browserFillByLocator(
+  taskId: string,
+  args: { locator: string; value: string }
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (typeof args.locator !== "string" || args.locator.length === 0) {
+    return { ok: false, error: "Missing required string argument: locator" };
+  }
+  if (typeof args.value !== "string") {
+    return { ok: false, error: "Missing required string argument: value" };
+  }
+  try {
+    return await withSession(taskId, async (session) => {
+      const selector = args.locator.startsWith("@")
+        ? `[${REF_ATTR_GLOBAL}="${args.locator.slice(1)}"]`
+        : args.locator;
+      await session.page.locator(selector).fill(args.value, { timeout: 10_000 });
+      return { ok: true } as const;
+    });
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
