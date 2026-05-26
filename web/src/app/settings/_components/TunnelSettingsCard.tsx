@@ -13,7 +13,7 @@ import {
   DialogTitle
 } from "@/components/ui/dialog";
 import { StatusPill } from "@/components/StatusPill";
-import { api } from "@/lib/api";
+import { api, HttpError } from "@/lib/api";
 
 interface AppleNotesStatus {
   enabled: boolean | null;
@@ -110,13 +110,17 @@ export function TunnelSettingsCard() {
   // self-severing disable, because the server processed the request
   // and wrote config.json BEFORE cloudflared closed the connection.
   //
-  // For the self-severing case both shapes resolve to optimistic
-  // success: ceiling-fired or fetch-rejected both mean "the response
-  // never arrived but the disable likely committed". The 5s refetch
-  // interval is the eventual truth source either way. Every other
-  // PATCH — enabling, the entire Notes mirror toggle, or disabling
-  // from localhost — propagates real errors to onError so a failed
-  // request actually surfaces in the UI.
+  // For the self-severing case the ceiling firing or a NETWORK-level
+  // rejection (no HTTP response — TypeError / abort / DNS / connection
+  // reset) both mean "the response never arrived but the disable
+  // likely committed", so we resolve them as optimistic success. An
+  // HttpError (4xx/5xx body from the BFF or runtime) is a REAL failure
+  // — the server reached us with a status code and an error message —
+  // so it must propagate to onError instead of being swallowed by the
+  // race. The 5s refetch interval is the eventual truth source either
+  // way. Every other PATCH — enabling, the entire Notes mirror
+  // toggle, or disabling from localhost — propagates real errors to
+  // onError so a failed request actually surfaces in the UI.
   const toggleTunnel = useMutation({
     mutationFn: async (enabled: boolean) => {
       const selfSevering = !enabled && isExternalHost();
@@ -125,13 +129,7 @@ export function TunnelSettingsCard() {
         body: JSON.stringify({ enabled })
       });
       if (!selfSevering) return fetchPromise;
-      const ceilingFired = Symbol("ceiling");
-      const ceiling = new Promise<typeof ceilingFired>((resolve) =>
-        setTimeout(() => resolve(ceilingFired), 1500)
-      );
-      const result = await Promise.race([fetchPromise.catch((error) => error), ceiling]);
-      if (result === ceilingFired || result instanceof Error) return null;
-      return result;
+      return resolveSelfSeveringDisable(fetchPromise);
     },
     onMutate: async (enabled: boolean) => {
       await queryClient.cancelQueries({ queryKey: ["tunnel"] });
@@ -323,4 +321,36 @@ function Row({ label, description, children }: RowProps) {
       <div>{children}</div>
     </div>
   );
+}
+
+// Race the in-flight PATCH against a 1.5s ceiling. The disable-from-
+// tunnel case can sever the response channel before the browser sees
+// a reply, so we treat two shapes as optimistic success:
+//
+//   1. The ceiling fires first — the response never arrived.
+//   2. The fetch rejected with a NETWORK-level error (no HTTP
+//      response — TypeError / abort / DNS / connection reset).
+//
+// An HttpError (4xx/5xx body from the BFF or runtime) is a REAL
+// server failure and MUST propagate to onError — capturing it as
+// success would falsely toast "Tunnel disabled" while the server
+// rejected the request and the tunnel is still up. Exported for
+// unit testing the error-distinction logic without rendering the
+// component.
+export async function resolveSelfSeveringDisable<T>(
+  fetchPromise: Promise<T>,
+  ceilingMs: number = 1500
+): Promise<T | null> {
+  const ceilingFired = Symbol("ceiling");
+  const ceiling = new Promise<typeof ceilingFired>((resolve) =>
+    setTimeout(() => resolve(ceilingFired), ceilingMs)
+  );
+  // Capture the rejection as a VALUE (not a thrown error) so
+  // Promise.race doesn't reject before the ceiling has a chance to
+  // win. We then sort by type afterwards.
+  const result = await Promise.race([fetchPromise.catch((error) => error), ceiling]);
+  if (result === ceilingFired) return null;
+  if (result instanceof HttpError) throw result;
+  if (result instanceof Error) return null;
+  return result as T;
 }
