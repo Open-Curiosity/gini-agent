@@ -47,6 +47,7 @@ export type PolicyAction =
   | "code.exec"
   | "browser.upload_file"
   | "browser.connect"
+  | "browser.fill_secret"
   | "messaging.send";
 
 export interface TerminalExecPayload {
