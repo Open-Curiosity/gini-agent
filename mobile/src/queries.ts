@@ -194,18 +194,31 @@ export function useChatBlocks(sessionId: string | null): {
   isPending: boolean;
   error: Error | null;
 } {
-  const [data, setData] = useState<ChatBlock[] | undefined>(undefined);
+  // Block state is tagged with the sessionId it was loaded for so a
+  // chat A → chat B switch doesn't paint chat A's blocks under chat B's
+  // header for one frame. The reset useEffect only runs after render,
+  // so without this gate the very first render after sessionId changes
+  // would still see the previous chat's blocks in state. Reading via
+  // `forSessionId === sessionId ? blocks : undefined` collapses that
+  // window to a single empty paint, matching the loading skeleton.
+  type BlockState = {
+    forSessionId: string | null;
+    blocks: ChatBlock[] | undefined;
+  };
+  const [state, setState] = useState<BlockState>({
+    forSessionId: null,
+    blocks: undefined
+  });
   const [error, setError] = useState<Error | null>(null);
-  const [isPending, setIsPending] = useState<boolean>(Boolean(sessionId));
 
   // Latest setters live in refs so the long-lived effect closures (SSE
   // listeners, AppState subscription) don't get torn down on every state
   // update. Without this, every block delta would unsubscribe and
   // reopen the EventSource, defeating the point of streaming.
-  const dataRef = useRef<ChatBlock[] | undefined>(undefined);
+  const dataRef = useRef<BlockState>({ forSessionId: null, blocks: undefined });
   useEffect(() => {
-    dataRef.current = data;
-  }, [data]);
+    dataRef.current = state;
+  }, [state]);
 
   // Tracks the id of the most recent block observed so we can carry
   // Last-Event-ID across every EventSource reconstruction — react-native-sse
@@ -222,11 +235,12 @@ export function useChatBlocks(sessionId: string | null): {
     // (chat A → chat B) doesn't leave chat A's blocks rendered until
     // chat B's seed resolves. The previous effect's cleanup tears down
     // the old subscription; this clears the view so the next paint
-    // doesn't briefly mix the two chats' contents.
-    setData(undefined);
+    // doesn't briefly mix the two chats' contents. Tagging the state
+    // with `forSessionId = sessionId` lets the render-time read return
+    // `undefined` until the seed for the new chat lands.
+    setState({ forSessionId: sessionId, blocks: undefined });
     setError(null);
-    setIsPending(Boolean(sessionId));
-    dataRef.current = undefined;
+    dataRef.current = { forSessionId: sessionId, blocks: undefined };
     lastSeenIdRef.current = null;
 
     if (!sessionId) return;
@@ -241,19 +255,29 @@ export function useChatBlocks(sessionId: string | null): {
     // upsert by id so the final list contains one entry per block, with
     // the latest payload. Other kinds also upsert (tool_call status
     // flips reuse the call's block id, etc.) — see chat-block-protocol.md.
-    const upsert = (block: ChatBlock): void => {
-      const current = dataRef.current ?? [];
+    //
+    // Race guard: if a stale event from chat A arrives after the
+    // sessionId effect has reset to chat B (or vice versa), drop it.
+    // dataRef.current.forSessionId is the source of truth — it's set
+    // synchronously at the top of this effect, before any async work.
+    //
+    // `wireEventId` is the raw `id:` line value (e.g. `<block_id>:<ts>`),
+    // distinct from `block.id` (the JSON payload's id field). We store
+    // the wire form so the next Last-Event-ID header carries the
+    // gateway's updated_at snapshot suffix; the gateway parses that
+    // suffix to detect in-place upserts to the cursor row.
+    const upsert = (block: ChatBlock, wireEventId: string | null): void => {
+      if (dataRef.current.forSessionId !== sessionId) return;
+      if (block.sessionId !== sessionId) return;
+      const current = dataRef.current.blocks ?? [];
       const idx = current.findIndex((b) => b.id === block.id);
       const next =
         idx >= 0
           ? current.map((b, i) => (i === idx ? block : b))
           : [...current, block];
-      dataRef.current = next;
-      // The SSE wire id matches the block id, so updating the resume
-      // cursor on every event keeps the cursor pinned to the latest
-      // delivered frame — even for upsert-style mutations.
-      lastSeenIdRef.current = block.id;
-      setData(next);
+      dataRef.current = { forSessionId: sessionId, blocks: next };
+      if (wireEventId) lastSeenIdRef.current = wireEventId;
+      setState({ forSessionId: sessionId, blocks: next });
     };
 
     const openStream = (): void => {
@@ -286,7 +310,7 @@ export function useChatBlocks(sessionId: string | null): {
         if (!ev.data) return;
         try {
           const block = JSON.parse(ev.data) as ChatBlock;
-          upsert(block);
+          upsert(block, ev.lastEventId ?? null);
         } catch {
           // Drop malformed frames; the server controls this format and a
           // parse failure here is a wire-protocol bug, not a user one.
@@ -365,25 +389,28 @@ export function useChatBlocks(sessionId: string | null): {
         // /blocks response; overwriting would drop them. Seeded rows
         // win for their own ids; any extra ids already in dataRef are
         // preserved at the tail.
-        const existing = dataRef.current ?? [];
+        const existing = dataRef.current.blocks ?? [];
         const seededIds = new Set(blocks.map((b) => b.id));
         const merged: ChatBlock[] = [
           ...blocks,
           ...existing.filter((b) => !seededIds.has(b.id))
         ];
-        dataRef.current = merged;
+        dataRef.current = { forSessionId: sessionId, blocks: merged };
         // Seed the resume cursor so the very first SSE open skips
         // the redundant full replay listChatBlocksAfter(null) emits.
+        // The /blocks REST response only carries the block's id (no
+        // updated_at suffix), so we stash the bare id; the gateway's
+        // listChatBlocksAfter falls back to reading the row's current
+        // updated_at when the suffix is absent. Subsequent SSE frames
+        // will rewrite this with the wire `<id>:<ts>` form.
         lastSeenIdRef.current = merged[merged.length - 1]?.id ?? null;
-        setData(merged);
+        setState({ forSessionId: sessionId, blocks: merged });
         setError(null);
-        setIsPending(false);
         seeded = true;
         maybeOpenStream();
       } catch (err) {
         if (cancelled) return;
         setError(err as Error);
-        setIsPending(false);
         // Don't open the stream on a 401 — the screen redirects to setup.
         if (!(err instanceof ApiError && err.status === 401)) {
           // Mark as seeded even on transport failure so a foregrounding
@@ -416,6 +443,17 @@ export function useChatBlocks(sessionId: string | null): {
       if (appStateSub) appStateSub.remove();
     };
   }, [sessionId]);
+
+  // Gate the rendered value on the loaded-for sessionId. Between the
+  // moment `sessionId` flips (chat A → chat B) and the reset effect
+  // running, render-time `state` still carries chat A's blocks; the
+  // gate returns `undefined` for that one paint so the screen shows
+  // the empty/loading state instead of the previous chat's history.
+  const data: ChatBlock[] | undefined =
+    state.forSessionId === sessionId ? state.blocks : undefined;
+  const isPending: boolean =
+    Boolean(sessionId) &&
+    (state.forSessionId !== sessionId || state.blocks === undefined);
 
   return { data, isPending, error };
 }
