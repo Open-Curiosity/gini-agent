@@ -226,6 +226,7 @@ export function useChatBlocks(sessionId: string | null): {
     }
 
     let cancelled = false;
+    let seeded = false;
     let es: EventSource<"chat_block"> | null = null;
     let appStateSub: { remove(): void } | null = null;
 
@@ -309,6 +310,19 @@ export function useChatBlocks(sessionId: string | null): {
       }
     };
 
+    // Gated open: we must never spin up an EventSource before the seed
+    // has resolved (so the seed merge sees an authoritative baseline) or
+    // while the app is backgrounded (iOS will tear the XHR down anyway).
+    // The AppState callback and the seed completion both route through
+    // here so neither path can race past the other.
+    const maybeOpenStream = (): void => {
+      if (!seeded) return;
+      if (cancelled) return;
+      if (es) return;
+      if (AppState.currentState !== "active") return;
+      openStream();
+    };
+
     // Seed the list before opening the stream so the chat renders with
     // its persisted history immediately. After seeding, the EventSource
     // sends Last-Event-ID = <most-recent-block-id> on its first connect
@@ -321,21 +335,38 @@ export function useChatBlocks(sessionId: string | null): {
       try {
         const blocks = await api<ChatBlock[]>(`/chat/${sessionId}/blocks`);
         if (cancelled) return;
-        dataRef.current = blocks;
+        // Merge by id rather than overwrite. If the AppState handler or
+        // any other path opened a stream while the seed was in flight,
+        // dataRef may already hold deltas that arrived ahead of the
+        // /blocks response; overwriting would drop them. Seeded rows
+        // win for their own ids; any extra ids already in dataRef are
+        // preserved at the tail.
+        const existing = dataRef.current ?? [];
+        const seededIds = new Set(blocks.map((b) => b.id));
+        const merged: ChatBlock[] = [
+          ...blocks,
+          ...existing.filter((b) => !seededIds.has(b.id))
+        ];
+        dataRef.current = merged;
         // Seed the resume cursor so the very first SSE open skips
         // the redundant full replay listChatBlocksAfter(null) emits.
-        lastSeenIdRef.current = blocks[blocks.length - 1]?.id ?? null;
-        setData(blocks);
+        lastSeenIdRef.current = merged[merged.length - 1]?.id ?? null;
+        setData(merged);
         setError(null);
         setIsPending(false);
-        openStream();
+        seeded = true;
+        maybeOpenStream();
       } catch (err) {
         if (cancelled) return;
         setError(err as Error);
         setIsPending(false);
         // Don't open the stream on a 401 — the screen redirects to setup.
         if (!(err instanceof ApiError && err.status === 401)) {
-          openStream();
+          // Mark as seeded even on transport failure so a foregrounding
+          // user can retry via the AppState handler; the gateway will
+          // backfill via listChatBlocksAfter(null) on first connect.
+          seeded = true;
+          maybeOpenStream();
         }
       }
     })();
@@ -348,7 +379,7 @@ export function useChatBlocks(sessionId: string | null): {
     const onAppState = (state: AppStateStatus): void => {
       if (cancelled) return;
       if (state === "active") {
-        openStream();
+        maybeOpenStream();
       } else if (state === "background" || state === "inactive") {
         closeStream();
       }
