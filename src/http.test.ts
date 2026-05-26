@@ -1143,9 +1143,75 @@ describe("runtime api", () => {
     expect(response.status).toBe(409);
     const body = await response.json();
     expect(body.ok).toBe(false);
-    expect(body.message).toContain("navigated");
+    // The browser session was never opened, so peekCurrentBrowserUrl
+    // returns undefined and the /connect handler takes the
+    // "session expired" branch (distinct from the "page navigated"
+    // branch where a live session exists but its URL differs from
+    // approvedUrl). Without that split the operator would see
+    // "page navigated" after a 5-minute walk-away — misleading.
+    expect(body.message).toContain("Browser session expired");
     expect(body.message).toContain("https://example.com");
     // Approval stayed pending — no resolveApproval call ran.
+    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
+  });
+
+  test("POST /api/approvals/<id>/connect: distinct 409 when live session exists but page navigated to a different origin", async () => {
+    // Pin the OTHER 409 branch: a live session whose current URL no
+    // longer matches the approved origin. This is the genuine
+    // page-navigated case (agent click, JS redirect, phishing
+    // redirect), distinct from the session-expired idle-sweep case
+    // covered by the previous test.
+    const config = testConfig("connect-fill-secret-real-navigation");
+    const handler = createHandler(config);
+    const { createTask, upsertTask, createApproval } = await import("./state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "real navigation test");
+      upsertTask(state, task);
+      return task.id;
+    });
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        taskId,
+        action: "browser.fill_secret",
+        target: "https://example.com",
+        risk: "high",
+        reason: "Sign in",
+        payload: {
+          slots: [
+            { name: "username", locator: "@e1", label: "Username", kind: "text" },
+            { name: "password", locator: "@e2", label: "Password", kind: "password" }
+          ],
+          reason: "Sign in",
+          toolCallId: "call_fill",
+          approvedUrl: "https://example.com"
+        }
+      })
+    );
+    const { __test: browserTest } = await import("./tools/browser");
+    // Live session exists but the page URL is on a different origin
+    // than what the approval captured — should take the "page
+    // navigated" branch, NOT the "session expired" branch.
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://evil.example.org/phishing",
+      close: () => Promise.resolve()
+    } as Partial<import("playwright-core").Page>);
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/connect`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { username: "tomsmith", password: "SuperSecretPassword!" } })
+      },
+      config.token
+    );
+    expect(response.status).toBe(409);
+    const body = await response.json();
+    expect(body.ok).toBe(false);
+    expect(body.message).toContain("Page navigated");
+    expect(body.message).toContain("https://example.com");
+    expect(body.message).toContain("https://evil.example.org");
     const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });

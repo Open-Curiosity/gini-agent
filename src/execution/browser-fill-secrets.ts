@@ -106,13 +106,29 @@ export async function runFillSecretConnect(
       }
     };
   }
-  const liveSanitized = sanitizeUrlForAuditTarget(peekCurrentBrowserUrl(taskId));
+  const livePageUrl = peekCurrentBrowserUrl(taskId);
+  const liveSanitized = sanitizeUrlForAuditTarget(livePageUrl);
+  if (!livePageUrl) {
+    // The browser session is gone entirely. The most common cause
+    // is the idle sweeper (src/tools/browser.ts:IDLE_TIMEOUT_MS,
+    // 5 min) closing the session while the user was reading the
+    // amber chat card. The "page navigated" message would mislead;
+    // tell the operator the session expired so the agent can
+    // re-navigate and re-request.
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        message: `Browser session expired since the approval was created (approved origin: ${approvedUrl}). The agent must browser_navigate back to the page before submitting again.`
+      }
+    };
+  }
   if (!liveSanitized || liveSanitized !== approvedUrl) {
     return {
       status: 409,
       body: {
         ok: false,
-        message: `Page navigated since the approval was created (approved: ${approvedUrl}, live: ${liveSanitized ?? "no session"}). Refusing to fill on an unapproved origin.`
+        message: `Page navigated since the approval was created (approved: ${approvedUrl}, live: ${liveSanitized ?? "invalid"}). Refusing to fill on an unapproved origin.`
       }
     };
   }

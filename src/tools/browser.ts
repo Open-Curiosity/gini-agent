@@ -122,6 +122,42 @@ let pendingAdmissions = 0;
 // call than to wedge disconnect forever waiting on a hung page.goto.
 const DISCONNECT_DRAIN_DEADLINE_MS = 5_000;
 const sessions = new Map<string, Session>();
+// Per-task registry of literal secret values that browserFillByLocator
+// has typed into the page. Populated BEFORE the .fill() call so a
+// page that synchronously clears or copies the input on the `input`
+// event still has its typed bytes recorded — without this, a page
+// that clears its own input post-fill would leave the
+// data-gini-secret-stamped element empty and the live-DOM-only
+// collector at collectSecretValuesFromPageWithSession would return
+// nothing for that task, defeating redaction in subsequent
+// browser_console / browser_snapshot / browser_vision calls. Read
+// alongside the live-DOM collector to catch BOTH (a) values typed
+// via fill_secret that the page has since cleared/moved, and
+// (b) values the page itself populated into data-gini-secret-stamped
+// elements (e.g. server-side prefilled credentials revealed via
+// hover). The registry is per-task so closing a session
+// (closeSession or sweep) deletes the entry, bounding memory.
+const filledSecretValues = new Map<string, Set<string>>();
+// Record a secret value typed for a task. Called by
+// browserFillByLocator immediately before .fill() runs. Empty
+// strings are not recorded so the redactor's empty-string guard
+// stays safe.
+function recordFilledSecret(taskId: string, value: string): void {
+  if (typeof value !== "string" || value.length === 0) return;
+  let set = filledSecretValues.get(taskId);
+  if (!set) {
+    set = new Set<string>();
+    filledSecretValues.set(taskId, set);
+  }
+  set.add(value);
+}
+// Drop the per-task registry when the task's session closes (idle
+// sweep, explicit close, or browser disconnect). The redactor is a
+// no-op when the registry is missing, so this is a memory-bound
+// cleanup, not a security boundary.
+function clearFilledSecrets(taskId: string): void {
+  filledSecretValues.delete(taskId);
+}
 // Set at runtime startup via setBrowserInstance(). Lets ensureBrowser()
 // look up state.browser to decide between connectOverCDP() and launch().
 // Stays undefined in standalone test contexts that import the tools
@@ -532,6 +568,11 @@ async function closeSession(taskId: string): Promise<void> {
   if (!session) return;
   sessions.delete(taskId);
   consoleLogs.delete(taskId);
+  // Drop the per-task secret-redaction registry when the session
+  // closes. The DOM is gone (the page closes below), so the
+  // registry would never be consulted again for this task —
+  // keeping it would just leak memory across many tasks.
+  clearFilledSecrets(taskId);
   try {
     // Shared context (persistent/cdp): close every page the agent opened
     // during this task. The user's window, tabs the user opened
@@ -863,7 +904,7 @@ const REF_ATTR_GLOBAL = "data-gini-ref";
 // nodes plus a unique CSS-attribute ref we can use to resolve a Locator
 // later. Built in a single page.evaluate so we minimize round-trips and
 // reuse one DOM walk for both the snapshot text and the locator map.
-async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
+async function snapshot(page: Page, full: boolean, taskId?: string): Promise<SnapshotResult> {
   const REF_ATTR = REF_ATTR_GLOBAL;
   // First, clear stale refs from prior snapshots so id allocation stays
   // stable across calls.
@@ -1171,7 +1212,7 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
   // element's name / textContent. Post-processing the assembled
   // snapshot text against the live secret list closes this gap
   // with the same primitive browserConsole and browserVision use.
-  const secretValues = await collectSecretValuesFromPageWithSession(page);
+  const secretValues = await collectSecretValuesFromPageWithSession(page, taskId);
   if (secretValues.length > 0) {
     text = redactSecretValuesFromString(text, secretValues);
   }
@@ -1203,7 +1244,7 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
   try {
     return await withSession(taskId, async (session) => {
       const response = await session.page.goto(url, { waitUntil: "domcontentloaded" });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1223,7 +1264,7 @@ export async function browserSnapshot(taskId: string, args: Record<string, unkno
   const full = bool(args.full, false);
   try {
     return await withSession(taskId, async (session) => {
-      const snap = await snapshot(session.page, full);
+      const snap = await snapshot(session.page, full, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1247,7 +1288,7 @@ export async function browserClick(taskId: string, args: Record<string, unknown>
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.click({ timeout: 10_000 });
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1272,7 +1313,7 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
       const locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.fill(text, { timeout: 10_000 });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1288,7 +1329,13 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
 
 // Collects the values of every element on the live page that
 // carries the data-gini-secret attribute (stamped by
-// browserFillByLocator after a successful fill_secret submission).
+// browserFillByLocator after a successful fill_secret submission)
+// AND merges in the per-task secret registry populated BEFORE the
+// fill. The registry catches values the page has since cleared,
+// detached, or copied to an unstamped element on the input handler
+// — without it, those bytes would not appear in the live DOM under
+// any stamped element and the redactor would let them through.
+//
 // Used by browser_console, browser_vision, and the snapshot walker
 // to redact literal occurrences of typed credentials from any
 // tool result that flows back to the LLM. Callers pass their
@@ -1297,9 +1344,14 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
 // in closure scope BEFORE the agent-controlled side effect runs
 // (eval, screenshot, walk) — so an agent-supplied expression that
 // navigates the page can't empty the secret list mid-call.
-async function collectSecretValuesFromPageWithSession(page: import("playwright-core").Page): Promise<string[]> {
+//
+// taskId is optional so the existing browser-tool call sites can
+// be incrementally migrated; when omitted, only the live-DOM
+// collection runs (legacy behavior).
+async function collectSecretValuesFromPageWithSession(page: import("playwright-core").Page, taskId?: string): Promise<string[]> {
+  let liveValues: string[] = [];
   try {
-    return await page.evaluate(() => {
+    liveValues = await page.evaluate(() => {
       const nodes = Array.from(document.querySelectorAll("[data-gini-secret]"));
       const values: string[] = [];
       for (const el of nodes) {
@@ -1318,8 +1370,25 @@ async function collectSecretValuesFromPageWithSession(page: import("playwright-c
       return values;
     });
   } catch {
-    return [];
+    liveValues = [];
   }
+  // Merge in the per-task registry of secrets typed via
+  // browserFillByLocator (records typed value BEFORE .fill, so the
+  // registry survives a page handler that synchronously cleared
+  // the input). The DOM collection still adds value because the
+  // page may carry server-prefilled values on stamped elements
+  // that this session never typed.
+  if (typeof taskId === "string") {
+    const registered = filledSecretValues.get(taskId);
+    if (registered && registered.size > 0) {
+      const out: string[] = [...liveValues];
+      for (const v of registered) {
+        if (!out.includes(v)) out.push(v);
+      }
+      return out;
+    }
+  }
+  return liveValues;
 }
 
 // Replace every occurrence of any secret value in `text` with
@@ -1413,6 +1482,15 @@ export async function browserFillByLocator(
         ? `[${REF_ATTR_GLOBAL}="${args.locator.slice(1)}"]`
         : args.locator;
       const locator = session.page.locator(selector);
+      // Record the value in the per-task secret registry BEFORE the
+      // fill so a page that synchronously clears the input on its
+      // `input` handler still has the typed bytes available to the
+      // redactor. Recording is best-effort; even if the .fill
+      // below throws (origin mismatch, timeout), the registry
+      // entry is fine to keep — the value was about to land in
+      // the DOM and any later snapshot that captured it pre-throw
+      // still needs redaction.
+      recordFilledSecret(taskId, args.value);
       await locator.fill(args.value, { timeout: 10_000 });
       // Stamp the element with data-gini-secret so subsequent
       // browser_snapshot calls redact its value (see snapshot
@@ -1466,7 +1544,7 @@ export async function browserPress(taskId: string, args: Record<string, unknown>
     return await withSession(taskId, async (session) => {
       await session.page.keyboard.press(key);
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1489,7 +1567,7 @@ export async function browserScroll(taskId: string, args: Record<string, unknown
     return await withSession(taskId, async (session) => {
       const dy = direction === "down" ? 600 : -600;
       await session.page.evaluate((delta) => window.scrollBy(0, delta), dy);
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1507,7 +1585,7 @@ export async function browserBack(taskId: string, _args: Record<string, unknown>
   try {
     return await withSession(taskId, async (session) => {
       const response = await session.page.goBack({ waitUntil: "domcontentloaded" });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1557,7 +1635,7 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       // snapshots the secret list into closure scope so the
       // redactor's input is stable regardless of subsequent page
       // state.
-      const secretValues = await collectSecretValuesFromPageWithSession(session.page);
+      const secretValues = await collectSecretValuesFromPageWithSession(session.page, taskId);
       let evalResult: unknown = undefined;
       let evalError: string | undefined;
       if (expression) {
@@ -1610,7 +1688,7 @@ export async function browserHover(taskId: string, args: Record<string, unknown>
       const locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.hover({ timeout: 10_000 });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1641,7 +1719,7 @@ export async function browserDrag(taskId: string, args: Record<string, unknown>)
       if (!toLoc) return fail(`Unknown ref ${toRef}. Take a fresh snapshot first.`);
       await fromLoc.dragTo(toLoc, { timeout: 10_000 });
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1726,7 +1804,7 @@ export async function browserSelectOption(taskId: string, args: Record<string, u
         return fail("Missing required argument: provide either 'value' (string) or 'values' (string[]).");
       }
       await locator.selectOption(selection, { timeout: 10_000 });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1795,7 +1873,7 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
         }
         return fail(message);
       }
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1862,7 +1940,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         session.refs = new Map();
         session.page = page;
         await page.bringToFront().catch(() => undefined);
-        const snap = await snapshot(session.page, false);
+        const snap = await snapshot(session.page, false, taskId);
         session.refs = snap.refs;
         return ok({
           url: session.page.url(),
@@ -1881,7 +1959,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         session.refs = new Map();
         session.page = target;
         await target.bringToFront().catch(() => undefined);
-        const snap = await snapshot(session.page, false);
+        const snap = await snapshot(session.page, false, taskId);
         session.refs = snap.refs;
         return ok({
           url: session.page.url(),
@@ -1926,7 +2004,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         // with the wasActive branch.
         session.refs = new Map();
       }
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1987,7 +2065,7 @@ export async function browserVision(
       // (extremely rare) or page cleanup between screenshot and
       // collection would empty the secret list and skip the
       // belt-and-braces post-OCR redaction.
-      const secretValues = await collectSecretValuesFromPageWithSession(session.page);
+      const secretValues = await collectSecretValuesFromPageWithSession(session.page, taskId);
       // Blur every data-gini-secret element before the screenshot so
       // the vision model can't OCR a credential the user typed via
       // fill_secret. Native browser rendering already masks
@@ -2160,7 +2238,7 @@ export async function browserUploadFile(
       const locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -2205,7 +2283,7 @@ export async function browserUploadFileApproved(
       const locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
