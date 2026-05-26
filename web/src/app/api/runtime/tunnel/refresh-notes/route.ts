@@ -22,7 +22,7 @@
 
 import { NextRequest } from "next/server";
 import { runtimeToken, runtimeUrl } from "@/lib/runtime";
-import { redactTunnelSnapshot } from "../route";
+import { redactTunnelSnapshot, scrubTunnelUrlPattern } from "../route";
 import { originHostMatchesRequest } from "../guard";
 
 export const runtime = "nodejs";
@@ -37,7 +37,15 @@ export const POST = async (request: NextRequest): Promise<Response> => {
     headers: { authorization: `Bearer ${runtimeToken()}` }
   });
   if (!upstream.ok) {
-    return new Response(await upstream.text(), {
+    // See the matching branch in ../route.ts for why error bodies need
+    // the same scrubbing pass the success path runs through
+    // `redactTunnelSnapshot`. osascript surfaces AppleScript runtime
+    // errors that can echo the `body:` attribute (which carries the
+    // bodyHtml fragment with the publicUrl); the manager already
+    // sanitises before storing into the snapshot but the BFF runs
+    // the regex strip again as defence in depth.
+    const upstreamText = await upstream.text();
+    return new Response(scrubTunnelUrlPattern(upstreamText), {
       status: upstream.status,
       headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" }
     });

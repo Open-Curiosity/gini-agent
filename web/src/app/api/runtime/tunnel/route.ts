@@ -32,7 +32,20 @@ async function forwardRedacted(
     body
   });
   if (!upstream.ok) {
-    return new Response(await upstream.text(), {
+    // Non-2xx upstream bodies were forwarded verbatim, which is unsafe:
+    // `runApplyConfig` wraps a cloudflared startup failure in
+    // `Failed to start cloudflared: <message>` while the secret-bearing
+    // publicUrl is still alive in `this.config`, and any future error
+    // path that quotes that string (an osascript echo, a tooling tweak,
+    // a third-party module change) would leak the credential through
+    // this BFF. The success path already scrubs known secret values
+    // via `scrubSecrets`; mirror the same defence here without having
+    // to plumb the live secret into this route — a regex strip of any
+    // `*.trycloudflare.com[/path]` substring catches the publicUrl
+    // form (cloudflareUrl + secret path) regardless of which secret
+    // is currently configured.
+    const upstreamText = await upstream.text();
+    return new Response(scrubTunnelUrlPattern(upstreamText), {
       status: upstream.status,
       headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" }
     });
@@ -128,6 +141,33 @@ export function scrubSecrets(message: string, secrets: readonly string[]): strin
     result = `${result} (secret values redacted)`;
   }
   return result;
+}
+
+/**
+ * Strip any `https?://<host>.trycloudflare.com[/path]` substring from a
+ * blob of text and replace it with `[redacted-tunnel-url]`. Used on the
+ * BFF error-forwarding path where the upstream response body is forwarded
+ * verbatim and the route does not have the live tunnel secret in scope to
+ * pass into `scrubSecrets`. The cloudflared public URL is the only secret
+ * form that can land in a server error string (the bare `secret` value
+ * never appears outside the `secret/` path segment of the publicUrl), so
+ * stripping the URL pattern is sufficient to keep the credential off the
+ * wire.
+ *
+ * Conservative on purpose: matches only the trycloudflare host suffix and
+ * stops at whitespace/quote characters that conventionally delimit URLs
+ * inside JSON or plain-text error messages. Exported for unit tests so
+ * the regex shape can be pinned without spinning up the full forward
+ * pipeline.
+ */
+export function scrubTunnelUrlPattern(text: string): string {
+  // Host portion mirrors the parser used by the runtime
+  // (`extractTunnelUrl`) so the same hostnames it accepts are stripped
+  // here. The optional path segment captures the `/<secret>/...` suffix
+  // that turns the bare host into an auth-bypass credential — without
+  // it the regex would leave the secret behind.
+  const pattern = /https?:\/\/[a-z0-9][a-z0-9-]*\.trycloudflare\.com(?:\/[^\s'"<>]*)?/gi;
+  return text.replace(pattern, "[redacted-tunnel-url]");
 }
 
 export const GET = async (_request: NextRequest) => forwardRedacted("GET");
