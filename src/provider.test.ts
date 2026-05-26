@@ -2304,6 +2304,79 @@ describe("provider", () => {
     }
   });
 
+  test("codex retry re-reads auth.json so attempt 2 sends the rotated bearer", async () => {
+    // The whole point of the retry is to pick up a freshly-rotated
+    // token on attempt 2. The existing retry tests only assert
+    // attempt count, so a regression that hoists the bearer outside
+    // the `make` closure (or caches it across attempts) would slip
+    // through. Pin the contract by rewriting auth.json between the
+    // two fetches and asserting attempt 2's Authorization header
+    // reflects the new token.
+    const { authPath, restore } = installCodexAuth("codex-bearer-rotates-on-retry");
+    const originalFetch = globalThis.fetch;
+    const seenAuthorization: string[] = [];
+    let attempts = 0;
+    globalThis.fetch = ((_input: RequestInfo | URL, init: RequestInit = {}) => {
+      attempts += 1;
+      const headers = (init.headers ?? {}) as Record<string, string>;
+      seenAuthorization.push(headers.authorization ?? "");
+      if (attempts === 1) {
+        // Simulate the codex CLI's out-of-band rotation: a fresh
+        // auth.json lands between attempt 1's 401 and attempt 2's
+        // pre-fetch bearer read.
+        writeFileSync(authPath, JSON.stringify({
+          auth_mode: "chatgpt",
+          tokens: {
+            access_token: "rotated-codex-access-token",
+            refresh_token: "rotated-codex-refresh-token"
+          }
+        }));
+        return Promise.resolve(new Response(
+          JSON.stringify({ error: { message: "Unauthorized: session expired" } }),
+          { status: 401, headers: { "content-type": "application/json" } }
+        ));
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+      expect(seenAuthorization).toHaveLength(2);
+      expect(seenAuthorization[0]).toBe("Bearer test-codex-access-token");
+      expect(seenAuthorization[1]).toBe("Bearer rotated-codex-access-token");
+      expect(seenAuthorization[0]).not.toBe(seenAuthorization[1]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
   test("codex User-Agent header does not carry the Gini-identifying suffix", async () => {
     // The previous `codex_cli_rs/0.0.0 (Gini Agent)` tail was a backend-
     // visible fingerprint distinguishing daemon traffic from interactive
