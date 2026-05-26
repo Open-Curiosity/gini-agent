@@ -130,8 +130,11 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       // Submit value never leaves this function's request scope.
       // The /connect endpoint detects action=browser.fill_secret and
       // pipes each entry's value into playwright.fill on the live
-      // page. Local state is cleared on success so the value never
-      // lingers in React state past the click.
+      // page. Local state is cleared in onSettled below regardless of
+      // outcome so the value never lingers in React state past the
+      // click — including on partial-fail (where the gateway has
+      // already resolved the approval and retry is meaningless) and
+      // on network/abort errors.
       const response = await api<{ ok: boolean; message?: string; filledSlots?: string[] }>(
         `/approvals/${block.approvalId}/connect`,
         {
@@ -142,14 +145,28 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       return response;
     },
     onSuccess: (result) => {
-      if (result.ok) {
-        setFillValues({});
-        invalidate(["approvals", "tasks", "task", "chat", "events", "audit"]);
-      } else {
-        toast.error(result.message ?? "Fill failed; please try again.");
+      if (!result.ok) {
+        toast.error(result.message ?? "Fill failed; the agent will decide whether to retry.");
       }
+      // Always invalidate approvals: the gateway resolves the
+      // approval atomically before running fills, so on both ok and
+      // !ok paths the approval status has flipped out of "pending"
+      // and the card needs to re-render with isPending=false (Submit
+      // disabled, inputs hidden). Without this, ok:false would leave
+      // a stale "pending" cache and the Submit button would stay
+      // enabled offering a retry that the gateway would 410-Gone.
+      invalidate(["approvals", "tasks", "task", "chat", "events", "audit"]);
     },
-    onError: (error: Error) => toast.error(error.message)
+    onError: (error: Error) => toast.error(error.message),
+    onSettled: () => {
+      // Belt-and-braces: clear typed credentials from React state
+      // regardless of outcome (success, partial-fail, network error,
+      // abort). The card stays mounted across the chat session for
+      // history-completeness, so without this hook a stale value
+      // would linger in the React fiber tree (and React DevTools)
+      // for the duration of the session.
+      setFillValues({});
+    }
   });
   const fillReady = isBrowserFillSecret
     && fillSlots.length > 0
