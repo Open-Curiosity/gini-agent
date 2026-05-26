@@ -1,5 +1,5 @@
 import { writeFileSync } from "node:fs";
-import type { ApprovalMode, RuntimeConfig } from "./types";
+import type { ApprovalMode, ChatBlock, RuntimeConfig } from "./types";
 import { cancelTask, decideApproval, resolveApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import {
@@ -1182,20 +1182,33 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
       //     every frame. Skipping by id here was the previous bug —
       //     terminal `streaming: false` flips never reached the
       //     client.
-      const enqueueFrame = (block: { id: string }): void => {
+      const enqueueFrame = (block: ChatBlock): void => {
+        // Event id is `<block_id>:<ts>` where `ts` is the row's
+        // updated_at when the block kind exposes one (assistant_text,
+        // tool_call) and createdAt otherwise — these two fields hold
+        // the same ISO string for insert-only kinds, so the wire format
+        // is uniform across kinds. The mobile client stores this string
+        // verbatim and replays it via Last-Event-ID; the gateway parses
+        // the suffix in listChatBlocksAfter to detect in-place updates
+        // that happened on the cursor row itself (e.g. an assistant_text
+        // streaming:false flip) since the client last saw it.
+        const ts =
+          block.kind === "assistant_text" || block.kind === "tool_call"
+            ? block.updatedAt
+            : block.createdAt;
         controller.enqueue(
           encoder.encode(
-            `id: ${block.id}\nevent: chat_block\ndata: ${JSON.stringify(block)}\n\n`
+            `id: ${block.id}:${ts}\nevent: chat_block\ndata: ${JSON.stringify(block)}\n\n`
           )
         );
       };
-      const enqueueBackfill = (block: { id: string }): void => {
+      const enqueueBackfill = (block: ChatBlock): void => {
         if (closed) return;
         if (seen.has(block.id)) return;
         seen.add(block.id);
         enqueueFrame(block);
       };
-      const enqueueLive = (block: { id: string }): void => {
+      const enqueueLive = (block: ChatBlock): void => {
         if (closed) return;
         // Mark live-delivered blocks so a hypothetical mid-stream
         // backfill (we don't issue one today, but the wiring is

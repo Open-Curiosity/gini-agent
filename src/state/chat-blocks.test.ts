@@ -196,31 +196,60 @@ describe("chat-blocks persistence", () => {
       text: "tick"
     });
 
-    const afterA = listChatBlocksAfter(instance, "chat_c", a.id);
-    expect(afterA.map((row) => row.id)).toEqual([b.id, c.id]);
+    // Cursor format: `<id>:<ts>`. Use each block's createdAt as the
+    // client snapshot — for insert-only kinds it equals updated_at.
+    // The resume query returns blocks at-or-after the snapshot ordinal
+    // *or* timestamp; the cursor itself replays via the >= comparison
+    // (the mobile client's id-keyed upsert collapses it).
+    const afterA = listChatBlocksAfter(
+      instance,
+      "chat_c",
+      `${a.id}:${a.createdAt}`
+    );
+    expect(afterA.map((row) => row.id)).toEqual([a.id, b.id, c.id]);
 
-    const afterC = listChatBlocksAfter(instance, "chat_c", c.id);
-    expect(afterC).toHaveLength(0);
+    // Cursor pinned at the tail with a far-future timestamp: ordinal
+    // branch never matches (no later rows) and the timestamp branch
+    // never matches (all rows are older than the snapshot). Result is
+    // empty. We pin an explicit timestamp rather than using c.createdAt
+    // because the three inserts above land in the same millisecond, so
+    // their updated_at strings tie and the >= comparison would include
+    // every row.
+    const afterTail = listChatBlocksAfter(
+      instance,
+      "chat_c",
+      `${c.id}:2099-01-01T00:00:00.000Z`
+    );
+    expect(afterTail).toHaveLength(0);
 
     // Unknown cursor: best-effort fall back to the full session list.
-    const afterUnknown = listChatBlocksAfter(instance, "chat_c", "block_does_not_exist");
+    const afterUnknown = listChatBlocksAfter(
+      instance,
+      "chat_c",
+      "block_does_not_exist:2099-01-01T00:00:00.000Z"
+    );
     expect(afterUnknown.map((row) => row.id)).toEqual([a.id, b.id, c.id]);
 
     // Null cursor (initial subscribe): equivalent to listChatBlocks.
     const afterNull = listChatBlocksAfter(instance, "chat_c", null);
     expect(afterNull.map((row) => row.id)).toEqual([a.id, b.id, c.id]);
+
+    // Legacy client (no `:<ts>` suffix): falls back to comparing against
+    // the cursor row's current updated_at. Same `>=` semantics so the
+    // cursor still replays, but in-place updates to the cursor row
+    // itself are missed — kept for back-compat with shipped clients.
+    const afterALegacy = listChatBlocksAfter(instance, "chat_c", a.id);
+    expect(afterALegacy.map((row) => row.id)).toEqual([a.id, b.id, c.id]);
   });
 
-  test("listChatBlocksAfter replays in-place updates after the cursor", async () => {
-    // A reconnecting client carries a Last-Event-ID equal to the most
-    // recent block it observed. The resume query compares each row's
-    // current updated_at against the cursor row's current updated_at,
-    // and includes any other row whose updated_at moved forward later.
-    // This lets upsert-style mutations (assistant_text deltas, tool_call
-    // status flips) on earlier-ordinal blocks replay on reconnect.
-    //
-    // The cursor row itself is excluded via `id <> ?`; clients already
-    // hold its most recent state in their local cache.
+  test("listChatBlocksAfter replays in-place updates after the cursor", () => {
+    // A reconnecting client carries a Last-Event-ID equal to the wire
+    // event id the SSE emitter sent: `<block_id>:<updated_at_snapshot>`.
+    // The resume query splits the cursor, looks up the row by id, then
+    // returns every row whose ordinal moved past the cursor OR whose
+    // updated_at is at-or-after the client snapshot. This lets in-place
+    // upserts to the cursor row itself (assistant_text delta on the
+    // in-flight reply, tool_call status flip) replay on reconnect.
     const instance = "chat-blocks-resume-upserts";
     const stream = insertChatBlock(instance, {
       kind: "assistant_text",
@@ -228,6 +257,8 @@ describe("chat-blocks persistence", () => {
       text: "Hi",
       streaming: true
     });
+    const streamTsOld =
+      stream.kind === "assistant_text" ? stream.updatedAt : stream.createdAt;
     const call = insertChatBlock(instance, {
       kind: "tool_call",
       sessionId: "chat_r",
@@ -244,47 +275,141 @@ describe("chat-blocks persistence", () => {
       label: "Working: file_read"
     });
 
-    // Client disconnects holding cursor = stream.id. It has Hi/running.
-    // Sleep so subsequent now() calls produce later ISO timestamps.
-    await new Promise((resolve) => setTimeout(resolve, 5));
-
-    // Tool_call flips to ok in place; the cursor row is untouched, so
-    // its updated_at stays older than this upsert's.
+    // Tool_call flips to ok in place — its updated_at moves forward.
     updateToolCallBlock(instance, "call_resume", "chat_r", { status: "ok" });
 
-    // Resume from cursor=stream.id: ordinal-only filter would only see
-    // the phase block. With the updated_at fan-in, the in-place tool_call
-    // flip also replays.
-    const replay = listChatBlocksAfter(instance, "chat_r", stream.id);
+    // Resume from cursor=stream.id with the old ts snapshot. The cursor
+    // row itself replays via the same-ms tie (updated_at >= streamTsOld);
+    // the tool_call (ordinal 2) and phase (3) replay via the ordinal
+    // branch. The mobile client's id-keyed upsert collapses any
+    // re-replay of the unchanged cursor row.
+    const replay = listChatBlocksAfter(
+      instance,
+      "chat_r",
+      `${stream.id}:${streamTsOld}`
+    );
     const replayedIds = replay.map((row) => row.id).sort();
-    expect(replayedIds).toEqual([call.id, phase.id].sort());
+    expect(replayedIds).toEqual([stream.id, call.id, phase.id].sort());
 
     const replayedCall = replay.find((row) => row.id === call.id);
     if (replayedCall?.kind === "tool_call") {
       expect(replayedCall.status).toBe("ok");
     }
 
-    // Cursor block is excluded even though its updated_at is, by
-    // definition, not greater than itself.
-    expect(replay.map((row) => row.id)).not.toContain(stream.id);
-
     // Same shape for assistant_text deltas to an earlier-ordinal block.
-    await new Promise((resolve) => setTimeout(resolve, 5));
     upsertAssistantTextBlock(instance, stream.id, {
       text: "Hi there",
       streaming: false
     });
-    // New cursor = phase.id (latest ordinal). Earlier-ordinal blocks
-    // with newer updated_at must replay — both the assistant_text upsert
-    // we just did and the still-newer tool_call ok flip from earlier.
-    const replay2 = listChatBlocksAfter(instance, "chat_r", phase.id);
+    // New cursor = phase.id (latest ordinal) at phase's createdAt.
+    // Earlier-ordinal blocks with newer updated_at must replay — both
+    // the assistant_text upsert we just did and the still-newer tool_call
+    // ok flip from earlier.
+    const replay2 = listChatBlocksAfter(
+      instance,
+      "chat_r",
+      `${phase.id}:${phase.createdAt}`
+    );
     const ids2 = replay2.map((row) => row.id).sort();
-    expect(ids2).toEqual([stream.id, call.id].sort());
+    // Phase itself is included via the updated_at >= clientTs branch
+    // (same-ms tie). Both upserted rows replay.
+    expect(ids2).toEqual([stream.id, call.id, phase.id].sort());
     const text = replay2.find((row) => row.id === stream.id);
     if (text?.kind === "assistant_text") {
       expect(text.text).toBe("Hi there");
       expect(text.streaming).toBe(false);
     }
+  });
+
+  test("listChatBlocksAfter replays the cursor block when it was upserted in place", () => {
+    // The canonical streaming case: cursor is the in-flight assistant_text
+    // block, and while the client was offline the row was upserted with
+    // new text (and eventually streaming:false). With the richer cursor
+    // (`<id>:<ts_old>`) the row's current updated_at is > ts_old, so the
+    // resume query returns the upserted block.
+    //
+    // The wire-format invariant we pin: the upserted text is what the
+    // resuming client sees on the cursor row (not the pre-upsert text).
+    // We deterministically pin timestamps via direct UPDATEs so the test
+    // doesn't ride on `Date.now()` resolution.
+    const instance = "chat-blocks-resume-cursor-self";
+    const stream = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_s",
+      text: "Hi",
+      streaming: true
+    });
+
+    // Force the row's updated_at to a known pre-upsert snapshot. We
+    // pick a deliberately old timestamp so the in-place upsert below
+    // (stamped with `now()`) lands strictly after it — regardless of
+    // the system clock or per-test scheduling jitter.
+    const tsOld = "2000-01-01T00:00:00.000Z";
+    const db = getMemoryDb(instance);
+    db.run("UPDATE chat_blocks SET updated_at = ? WHERE id = ?", [
+      tsOld,
+      stream.id
+    ]);
+
+    // In-place upsert. `upsertAssistantTextBlock` stamps updated_at via
+    // `now()`, which will be much later than tsOld.
+    const upserted = upsertAssistantTextBlock(instance, stream.id, {
+      text: "Hi there, friend",
+      streaming: false
+    });
+    expect(upserted?.kind).toBe("assistant_text");
+
+    const replay = listChatBlocksAfter(
+      instance,
+      "chat_s",
+      `${stream.id}:${tsOld}`
+    );
+    const replayedStream = replay.find((row) => row.id === stream.id);
+    expect(replayedStream).toBeDefined();
+    if (replayedStream?.kind === "assistant_text") {
+      expect(replayedStream.text).toBe("Hi there, friend");
+      expect(replayedStream.streaming).toBe(false);
+    }
+  });
+
+  test("listChatBlocksAfter replays same-ms ties via >= comparison", () => {
+    // Two events emitted in the same millisecond get the same ISO
+    // timestamp string. The client's cursor pins one of them; the resume
+    // query must still return the other. The `updated_at >= client_ts`
+    // comparison handles the tie — a strict `>` would silently drop the
+    // sibling. The mobile client collapses any redundant replay of the
+    // cursor itself via its id-keyed upsert.
+    const instance = "chat-blocks-resume-tie";
+    // Insert two blocks; we then force their updated_at to the SAME ISO
+    // string to simulate a same-ms emit. Bun's bun:sqlite returns rows
+    // by the row's actual updated_at, so this models the wire scenario
+    // without relying on the system clock to actually collide.
+    const a = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: "chat_t",
+      text: "a"
+    });
+    const b = insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: "chat_t",
+      label: "Thinking"
+    });
+    const tiedAt = "2099-01-01T00:00:00.000Z";
+    const db = getMemoryDb(instance);
+    db.run(
+      "UPDATE chat_blocks SET updated_at = ? WHERE session_id = ? AND id IN (?, ?)",
+      [tiedAt, "chat_t", a.id, b.id]
+    );
+
+    // Client cursor: it observed `a` with timestamp tiedAt. Resume must
+    // return `b` (same ts, larger ordinal).
+    const replay = listChatBlocksAfter(
+      instance,
+      "chat_t",
+      `${a.id}:${tiedAt}`
+    );
+    const ids = replay.map((row) => row.id);
+    expect(ids).toContain(b.id);
   });
 
   test("subscribers fire on insert and upsert, then stop after unsubscribe", () => {

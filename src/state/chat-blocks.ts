@@ -457,44 +457,75 @@ export function listChatBlocks(instance: Instance, sessionId: string): ChatBlock
 }
 
 // Returns blocks added (or last-updated, for assistant_text and tool_call)
-// AFTER the given block id. Used by the SSE handler to honor Last-Event-ID
-// so a reconnecting client gets only what it missed. When `afterBlockId`
-// is not found in the table (rolled-out / wrong session), returns the
-// full list — best-effort recovery, mirroring the legacy eventStream
+// AFTER the given Last-Event-ID cursor. Used by the SSE handler so a
+// reconnecting client gets only what it missed. When the cursor row is
+// not found in the table (rolled out / wrong session), returns the full
+// list — best-effort recovery, mirroring the legacy eventStream
 // ring-buffer behavior in src/http.ts.
 //
-// In-place updates (`upsertAssistantTextBlock`, `updateToolCallBlock`)
-// mutate the row's `updated_at` without changing its `ordinal`, so an
-// ordinal-only cursor would miss every delta to the cursor block itself
-// after a reconnect. The query below therefore also returns rows whose
-// `updated_at` is newer than the cursor row's `updated_at` snapshot,
-// excluding the cursor row itself. Insert-only kinds keep working
-// because their `updated_at` always equals `created_at` and never
-// advances after the row is written.
+// Cursor format: the SSE emitter writes `id: <block_id>:<ts>` where `ts`
+// is the row's `updated_at` snapshot at emit time. On reconnect the
+// client (react-native-sse or any compliant EventSource) round-trips
+// that string as `Last-Event-ID`. Parsing it back gives us:
+//   - `cursor_id`  — used to read the cursor row's current `ordinal`
+//                     (so the >ordinal half of the resume filter keeps
+//                     working for late-arriving insert-only kinds)
+//   - `client_ts`  — the timestamp the client actually saw, NOT the
+//                     row's current `updated_at`. This is what makes
+//                     in-place mutations (assistant_text deltas,
+//                     tool_call status flips) on the cursor row itself
+//                     replay correctly — the row's updated_at moved
+//                     forward while the client was offline, and the
+//                     comparison must be against the older snapshot.
+//
+// Back-compat: an old client without the `:<ts>` suffix falls back to
+// reading the cursor row's current `updated_at` as `client_ts`. That
+// preserves the prior behavior (in-place updates to the cursor row are
+// missed) but doesn't regress for clients that already shipped.
+//
+// Resume filter: `(ordinal > cursor.ordinal OR updated_at >= client_ts)`.
+// The `>=` handles same-ms ties — two events sharing an ISO timestamp
+// would otherwise cause one to be skipped. The client's id-keyed upsert
+// collapses any benign re-replay of the unchanged cursor row.
 export function listChatBlocksAfter(
   instance: Instance,
   sessionId: string,
   afterBlockId: string | null
 ): ChatBlock[] {
   if (!afterBlockId) return listChatBlocks(instance, sessionId);
+  // Parse the optional `:<ts>` suffix off the cursor. ISO timestamps
+  // never contain `:` outside the time portion, so we split on the FIRST
+  // `:` to separate the block id from the remainder; the block id format
+  // (`block_<random>`) does not contain `:` either.
+  const colonIdx = afterBlockId.indexOf(":");
+  const cursorId =
+    colonIdx === -1 ? afterBlockId : afterBlockId.slice(0, colonIdx);
+  const clientTsFromCursor =
+    colonIdx === -1 ? null : afterBlockId.slice(colonIdx + 1);
+
   const db = getMemoryDb(instance);
   const cutoff = db
     .query<{ ordinal: number; updated_at: string }, [string, string]>(
       "SELECT ordinal, updated_at FROM chat_blocks WHERE id = ? AND session_id = ?"
     )
-    .get(afterBlockId, sessionId);
+    .get(cursorId, sessionId);
   if (!cutoff) {
     // Cursor is unknown to this session — replay everything we have.
     return listChatBlocks(instance, sessionId);
   }
+  // If the client sent a snapshot timestamp, use it; otherwise (legacy
+  // client) compare against the cursor row's current updated_at. The
+  // legacy fallback misses in-place updates to the cursor row itself,
+  // but keeps the rest of the resume semantics intact.
+  const clientTs = clientTsFromCursor ?? cutoff.updated_at;
   return db
-    .query<ChatBlockRow, [string, number, string, string]>(
+    .query<ChatBlockRow, [string, number, string]>(
       `SELECT * FROM chat_blocks
        WHERE session_id = ?
-         AND (ordinal > ? OR (updated_at > ? AND id <> ?))
+         AND (ordinal > ? OR updated_at >= ?)
        ORDER BY ordinal ASC`
     )
-    .all(sessionId, cutoff.ordinal, cutoff.updated_at, afterBlockId)
+    .all(sessionId, cutoff.ordinal, clientTs)
     .map(rowToBlock);
 }
 
