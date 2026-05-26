@@ -2175,6 +2175,71 @@ describe("provider", () => {
     }
   });
 
+  test("codex waits briefly before retrying so a mid-write auth.json can settle", async () => {
+    // The codex CLI rewrites ~/.codex/auth.json non-atomically (truncate +
+    // write, no temp+rename), so an immediate retry can race that writer
+    // and observe an empty or partial JSON. Pin the small pre-retry wait
+    // by spying on setTimeout; existing retry tests don't care about
+    // timing so they wouldn't catch a regression that removes the delay.
+    const { restore } = installCodexAuth("codex-retry-rewrite-delay");
+    const originalFetch = globalThis.fetch;
+    const originalSetTimeout = globalThis.setTimeout;
+    const delays: number[] = [];
+    globalThis.setTimeout = ((handler: TimerHandler, ms?: number, ...rest: unknown[]) => {
+      if (typeof ms === "number") delays.push(ms);
+      return originalSetTimeout(handler as () => void, ms, ...rest);
+    }) as typeof globalThis.setTimeout;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      if (attempts === 1) {
+        return Promise.resolve(new Response(
+          JSON.stringify({ error: { message: "Unauthorized: session expired" } }),
+          { status: 401, headers: { "content-type": "application/json" } }
+        ));
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+      // The retry path schedules exactly one 50ms wait before attempt 2.
+      // Other code in the test (Bun internals, stream plumbing) doesn't
+      // happen to use that exact value, so asserting inclusion is enough.
+      expect(delays).toContain(50);
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.setTimeout = originalSetTimeout;
+      restore();
+    }
+  });
+
   test("codex cancels attempt 1's reader before retrying", async () => {
     // Before the try/finally wrap was added, a session-expired throw
     // inside the SSE handler unwound out of the reading loop and left

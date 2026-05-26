@@ -1845,6 +1845,15 @@ function extractStreamErrorMessage(payload: Record<string, unknown>): string | u
   return undefined;
 }
 
+// Brief pause before a codex retry. The codex CLI writes
+// ~/.codex/auth.json non-atomically (truncate + write, no temp+rename —
+// see codex-rs/login/src/auth/storage.rs FileAuthStorage::save), so a
+// reader observing the file between the truncate and the flush can
+// see an empty or partial JSON document. An immediate retry would race
+// that writer; a small wait lets the rewrite settle so the second
+// attempt reads a complete file.
+const CODEX_RETRY_REWRITE_DELAY_MS = 50;
+
 // Single-retry wrapper for codex /responses calls. The codex CLI rotates
 // access tokens out-of-band; a request in flight at the moment of
 // rotation gets a server-side "session expired before this request
@@ -1853,12 +1862,14 @@ function extractStreamErrorMessage(payload: Record<string, unknown>): string | u
 // a second attempt picks up the freshly-rotated token without any other
 // plumbing. We retry exactly once — a second consecutive session-expired
 // usually means the CLI hasn't yet refreshed, and looping would just
-// burn quota.
+// burn quota. A short delay before the retry avoids racing the writer
+// (see CODEX_RETRY_REWRITE_DELAY_MS).
 async function withCodexSessionRetry<T>(make: () => Promise<T>): Promise<T> {
   try {
     return await make();
   } catch (err) {
     if (!(err instanceof CodexSessionExpiredError)) throw err;
+    await new Promise<void>((resolve) => setTimeout(resolve, CODEX_RETRY_REWRITE_DELAY_MS));
     return await make();
   }
 }
