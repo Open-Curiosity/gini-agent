@@ -147,6 +147,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
     case "request_connector":
       return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
+    case "browser_fill_secrets":
+      return await browserFillSecretsTool(config, taskId, toolCallId, args);
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -2456,6 +2458,92 @@ async function requestConnectorTool(
       type: "approval",
       message: "Approval requested for connector connect (chat-task)",
       data: { approvalId: approval.id, provider: provider.id, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
+}
+
+// Browser-fill-secrets tool. Mints a browser.fill_secret approval
+// whose payload carries the slots the agent wants the user to fill.
+// Same chat-block emission path as request_connector — the chat-task
+// loop's pending-approval handler emits an approval_requested block
+// into the chat stream as soon as this returns { kind: "pending" }.
+// The card renders inline. On Submit, the BFF forwards to
+// POST /api/approvals/<id>/connect, which detects the action and
+// runs the playwright-fill branch (see src/http.ts). Values are
+// never written to state, audit, or trace payloads.
+async function browserFillSecretsTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  const rawSlots = Array.isArray(args.slots) ? args.slots : [];
+  const slots = rawSlots.flatMap((s) => {
+    if (!s || typeof s !== "object") return [];
+    const entry = s as { name?: unknown; locator?: unknown; label?: unknown; kind?: unknown };
+    if (typeof entry.name !== "string" || typeof entry.locator !== "string") return [];
+    const allowedKinds = new Set(["text", "password", "email", "tel", "number", "url"]);
+    return [{
+      name: entry.name,
+      locator: entry.locator,
+      label: typeof entry.label === "string" ? entry.label : entry.name,
+      kind: typeof entry.kind === "string" && allowedKinds.has(entry.kind) ? entry.kind : "text"
+    }];
+  });
+  if (slots.length === 0) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "browser_fill_secrets requires at least one valid slot (name + locator)."
+      })
+    };
+  }
+  const reason = typeof args.reason === "string" && args.reason.trim().length > 0
+    ? args.reason.trim()
+    : `The agent is asking you to fill ${slots.length} field${slots.length === 1 ? "" : "s"} on the current page.`;
+
+  // Build a stable target string so the approval card can show
+  // which page the fill targets. Pull the live URL from the
+  // browser session if one exists; fall back to the locator list.
+  const liveUrl = peekCurrentBrowserUrl(taskId);
+  const target = liveUrl
+    ? `${liveUrl}#${slots.map((s) => s.locator).join(",")}`
+    : slots.map((s) => s.locator).join(",");
+
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createApproval(mutable, {
+      taskId: item.id,
+      action: "browser.fill_secret",
+      target,
+      risk: "high",
+      reason,
+      payload: { slots, reason, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    // Mirror the reason into the chat session so it survives past
+    // approval resolution, same pattern as requestConnectorTool.
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for browser.fill_secret",
+      data: { approvalId: approval.id, slotCount: slots.length, toolCallId }
     });
     return approval.id;
   });
