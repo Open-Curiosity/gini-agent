@@ -1156,6 +1156,63 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
+  test("POST /api/approvals/<id>/connect refuses fill_secret slot values shorter than 4 chars", async () => {
+    // The snapshot post-redactor uses literal substring replacement;
+    // single-character (and other very short) values would shred
+    // structural tokens like [@e1] in snapshot text. The 4-char
+    // floor in src/tools/browser.ts:recordFilledSecret keeps the
+    // redactor safe, and /connect refuses values below that floor
+    // so the registry-skip-for-short-values doesn't leak the
+    // value via subsequent unredacted tool results.
+    const config = testConfig("connect-fill-secret-too-short");
+    const handler = createHandler(config);
+    const { createTask, upsertTask, createApproval } = await import("./state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "short value test");
+      upsertTask(state, task);
+      return task.id;
+    });
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        taskId,
+        action: "browser.fill_secret",
+        target: "https://example.com",
+        risk: "high",
+        reason: "Sign in",
+        payload: {
+          slots: [
+            { name: "pin", locator: "@e1", label: "PIN", kind: "number" }
+          ],
+          reason: "Sign in",
+          toolCallId: "call_fill",
+          approvedUrl: "https://example.com"
+        }
+      })
+    );
+    const { __test: browserTest } = await import("./tools/browser");
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://example.com",
+      close: () => Promise.resolve()
+    } as Partial<import("playwright-core").Page>);
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/connect`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { pin: "12" } })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.ok).toBe(false);
+    expect(body.message).toContain("too short");
+    expect(body.message).toContain("pin");
+    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
+  });
+
   test("POST /api/approvals/<id>/connect: distinct 409 when live session exists but page navigated to a different origin", async () => {
     // Pin the OTHER 409 branch: a live session whose current URL no
     // longer matches the approved origin. This is the genuine

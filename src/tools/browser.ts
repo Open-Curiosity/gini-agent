@@ -1292,7 +1292,20 @@ function ok(payload: Record<string, unknown>, _taskId?: string): string {
 }
 
 function fail(error: string): string {
-  return JSON.stringify({ success: false, error });
+  // Mirror ok()'s redaction so an error message that contains a
+  // registered secret value (playwright's "Call log: fill(...)"
+  // verbiage, or any error whose text was built from page state
+  // like a contenteditable's textContent) doesn't leak the secret
+  // into the tool result that flows back to the LLM. All browser
+  // tools' top-level catch-handlers return `fail(error.message)`,
+  // so this one place covers every browser tool's failure path
+  // — the bounded fill module's pre-redaction is now defense in
+  // depth, not the sole guard.
+  const secrets = allRegisteredSecrets();
+  const sanitized = secrets.length > 0
+    ? redactSecretValuesFromString(error, secrets)
+    : error;
+  return JSON.stringify({ success: false, error: sanitized });
 }
 
 function bool(value: unknown, fallback: boolean): boolean {

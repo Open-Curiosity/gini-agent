@@ -76,6 +76,27 @@ export async function runFillSecretConnect(
       }
     };
   }
+  // Floor on minimum value length. Values shorter than this are
+  // not registered for redaction (single-character secrets would
+  // shred snapshot @eN refs via literal substring replacement —
+  // see FILLED_SECRET_MIN_REDACTION_LENGTH in src/tools/browser.ts).
+  // Refusing them here closes the asymmetry where /connect would
+  // otherwise accept a 1-3 char value and fill it into the DOM
+  // with no subsequent redaction. Realistic credentials are
+  // always above this floor (PINs 4+, OTPs 6+, passwords 8+) so
+  // the only inputs blocked are typos / test data.
+  const tooShort = slots
+    .filter((slot) => secrets[slot.name].length < 4)
+    .map((slot) => slot.name);
+  if (tooShort.length > 0) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        message: `Slot value too short (< 4 chars): ${tooShort.join(", ")}. Re-enter a longer value.`
+      }
+    };
+  }
 
   const taskId = approval.taskId;
   if (!taskId) {
