@@ -270,14 +270,26 @@ function parseTrustedOrigins(raw: string | undefined): ReadonlySet<string> | nul
 // BFF guard via proxyRequest would behave differently depending on
 // whether the operator's dev shell had the env var exported — a real
 // test-environment dependency, not just a theoretical one.
-function trustedOrigins(): ReadonlySet<string> | null {
+//
+// Exported so the dedicated tunnel-mutation routes
+// (/api/runtime/tunnel, /api/runtime/tunnel/refresh-notes) can apply
+// the same allowlist precedence the catch-all guardCsrf does — the
+// two surfaces previously diverged, leaving the dedicated routes
+// rebindable under DNS-rebinding even when the operator had
+// configured a strict allowlist.
+export function trustedOrigins(): ReadonlySet<string> | null {
   return parseTrustedOrigins(process.env.GINI_TRUSTED_ORIGINS);
 }
 
 // Loopback hostnames the guard's local-dev fallback accepts when no
 // allowlist is configured. Anything else is DNS-rebindable from a public
 // origin and must be locked down with GINI_TRUSTED_ORIGINS.
-function isLoopbackHost(host: string): boolean {
+//
+// Exported so the dedicated tunnel-mutation guard can reuse the exact
+// same loopback definition — divergent local-dev shapes (e.g. the
+// dedicated guard accepting a non-loopback Host when Origin happens to
+// match) is precisely the inversion this module guards against.
+export function isLoopbackHost(host: string): boolean {
   // Strip the optional :port suffix. IPv6 literals are wrapped in brackets,
   // so look at everything up to the last ":" only when no closing bracket
   // follows. URL.host normalizes IPv6 to "[::1]:port" form.
@@ -298,10 +310,14 @@ function isLoopbackHost(host: string): boolean {
 // restart). We still demand Origin == Host as defense in depth — proxy.ts
 // has already vetted the request, but matching Origin to Host adds same-
 // origin verification at the BFF boundary.
-const TUNNEL_VETTED_HEADER = "x-gini-tunnel-vetted";
-const TUNNEL_VETTED_VALUE = "1";
+// Exported so proxy.ts and the dedicated tunnel-mutation routes use
+// the exact same header name/value. A divergent spelling here would
+// let an attacker pivot through the BFF on a header proxy.ts isn't
+// stamping (or, worse, isn't stripping inbound).
+export const TUNNEL_VETTED_HEADER = "x-gini-tunnel-vetted";
+export const TUNNEL_VETTED_VALUE = "1";
 
-function isTunnelVetted(request: Request): boolean {
+export function isTunnelVetted(request: Request): boolean {
   return request.headers.get(TUNNEL_VETTED_HEADER) === TUNNEL_VETTED_VALUE;
 }
 
