@@ -196,6 +196,13 @@ async function resolveWebTarget(): Promise<string> {
   const path = webPortPath(config.instance);
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
+    // Disable preemption: a PATCH {enabled: false} arriving during the
+    // poll wants to take effect now, not after the remaining deadline.
+    // Throwing here lets the caller's catch surface the abort cleanly;
+    // boot/recycle paths translate this into a no-op start.
+    if (pendingDisable) {
+      throw new Error("tunnel disable requested — aborting web target resolution");
+    }
     let port: number | null = null;
     try {
       const raw = readFileSync(path, "utf8").trim();
@@ -303,6 +310,21 @@ let bootRecoveryInterval: ReturnType<typeof setInterval> | null = null;
 // tick will re-check cloudflareUrl and either confirm recovery (clear
 // the flag, stop the interval) or schedule the next attempt.
 let bootRecoveryRecycleInFlight = false;
+
+// Synchronous latch the PATCH /api/tunnel handler flips the moment a
+// disable arrives, observable from in-flight boot/recycle starts so they
+// can bail before spawning cloudflared. Without this, the disable's
+// runApplyConfig is queued behind the boot/recycle path in pendingApply
+// and only runs after resolveWebTarget (up to 60s) plus
+// tunnelManager.start (up to cloudflared's 25s startupTimeoutMs) finish
+// — the operator's click sits idle for up to 85s while the tunnel comes
+// publicly online for cloudflared's startup window. The latch operates
+// OUTSIDE pendingApply: applyConfig sets it synchronously when the
+// update body says enabled:false (and clears it on enabled:true), then
+// the boot/recycle yield points observe it. runApplyConfig clears it
+// after the becameDisabled branch runs so a subsequent enable can
+// proceed normally.
+let pendingDisable = false;
 
 async function runApplyConfig(
   update: { enabled?: boolean; appleNotes?: { enabled?: boolean } }
@@ -495,6 +517,11 @@ async function runApplyConfig(
   }
   if (becameDisabled) {
     await tunnelManager.stop();
+    // Clear the synchronous preemption latch now that the disable has
+    // landed. A subsequent enable PATCH would clear it too via the
+    // applyConfig wrapper, but clearing here keeps the latch coherent
+    // with the persisted state for the common disable-then-no-op case.
+    pendingDisable = false;
   }
   // Notes-enabled-while-tunnel-up: refresh now so the note carries the
   // current URL without waiting for a rotation. Fire-and-forget — the
@@ -566,6 +593,15 @@ const server = Bun.serve({
       // see the FIRST caller's post-mutation state before computing its
       // own diff.
       applyConfig: (update) => {
+        // Flip the synchronous disable latch BEFORE chaining onto
+        // pendingApply so in-flight boot/recycle starts can observe it
+        // and bail. A subsequent enable PATCH clears the latch so the
+        // next boot/recycle isn't preempted by a stale signal.
+        if (update?.enabled === false) {
+          pendingDisable = true;
+        } else if (update?.enabled === true) {
+          pendingDisable = false;
+        }
         const next = pendingApply.then(() => runApplyConfig(update));
         pendingApply = next.then(() => undefined, () => undefined);
         return next;
@@ -609,7 +645,13 @@ if (tunnelResolved.config.enabled) {
       // user-visible state already says "off" — silently respawning here
       // would put the snapshot back into a live state that contradicts
       // the config and prevents the next disable-toggle from working.
-      if (!tunnelResolved.config.enabled) return;
+      // tunnelResolved.config.enabled can only flip when runApplyConfig
+      // runs, and that's queued behind this boot path in pendingApply —
+      // it can't have changed yet. pendingDisable (set synchronously by
+      // applyConfig) IS observable here, so consult both: the latch
+      // catches the in-flight preemption case, the field catches a
+      // stale resurrection of an already-disabled config.
+      if (!tunnelResolved.config.enabled || pendingDisable) return;
       // Same shutdown guard the PATCH path uses. If SIGTERM arrived
       // while resolveWebTarget was polling, the drain handler already
       // ran tunnelManager.stop() finding nothing to stop; spawning
@@ -626,6 +668,12 @@ if (tunnelResolved.config.enabled) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       appendLog(config.instance, "tunnel.start.error", { error: message });
+      // A pendingDisable-triggered abort is the operator getting what
+      // they asked for, not a startup failure to surface. Skip the
+      // snapshot lastError + recovery interval so the Settings card
+      // doesn't show "Connecting…" + a misleading error after the
+      // queued runApplyConfig completes the disable.
+      if (pendingDisable) return;
       // Surface the failure on the snapshot so a GET /api/tunnel
       // immediately after boot shows the operator why cloudflared
       // never came up. Previously the error was only in the log
@@ -671,6 +719,13 @@ let recyclePending = false;
 const runRecycle = async (): Promise<void> => {
   if (shutdownStarted) return;
   if (!tunnelResolved.config.enabled) return;
+  // Disable preemption — pendingDisable is the synchronous latch the
+  // PATCH path flips before chaining. Honoring it here lets a watcher
+  // event that landed in pendingApply ahead of the disable runApplyConfig
+  // bail out rather than running a doomed stop/start that the disable
+  // would immediately undo. Without this, every queued recycle would
+  // wait for resolveWebTarget + spawn to settle.
+  if (pendingDisable) return;
   if (recycleInFlight) {
     // A change landed while we were already recycling. Flag the
     // re-run so the in-flight handler picks it up on completion;
@@ -733,22 +788,29 @@ const runRecycle = async (): Promise<void> => {
       await tunnelManager.stop();
       const previousTarget = currentWebTarget;
       currentWebTarget = null;
-      if (shutdownStarted || !tunnelResolved.config.enabled) return;
+      if (shutdownStarted || !tunnelResolved.config.enabled || pendingDisable) return;
       const target = await resolveWebTarget();
       appendLog(config.instance, "tunnel.target.changed", {
         from: previousTarget,
         to: target
       });
-      if (shutdownStarted || !tunnelResolved.config.enabled) return;
+      if (shutdownStarted || !tunnelResolved.config.enabled || pendingDisable) return;
       tunnelManager.setTargetUrl(target);
       await tunnelManager.start();
       currentWebTarget = target;
-    } while (recyclePending && !shutdownStarted && tunnelResolved.config.enabled);
+    } while (recyclePending && !shutdownStarted && tunnelResolved.config.enabled && !pendingDisable);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     appendLog(config.instance, "tunnel.target.recycle.error", {
       error: message
     });
+    // A pendingDisable-triggered abort is the operator getting what
+    // they asked for, not a recycle failure. The queued
+    // runApplyConfig will complete the disable in its own frame; no
+    // need to flag the snapshot or start the recovery interval (which
+    // would immediately self-terminate on the disable anyway, but the
+    // misleading lastError on the snapshot would linger).
+    if (pendingDisable) return;
     // Mirror the boot-failure recovery path. The recycle ran `stop()`
     // before `resolveWebTarget()` to preserve the stop-before-resolve
     // invariant; if resolve (or the subsequent start) threw, the
