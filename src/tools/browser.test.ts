@@ -318,6 +318,32 @@ describe("browser disconnect lifecycle", () => {
 // hand-built fake document. The walker only relies on a small slice of DOM
 // APIs (tagName, attributes, children, computed style, bounding rect), so
 // the stubs stay compact.
+describe("browserFillByLocator error redaction", () => {
+  // Pin the playwright-error-leaks-typed-value gap. Playwright's
+  // locator.fill embeds the typed value in its timeout error
+  // message via "Call log: fill(\"<value>\")". If that error.message
+  // returned verbatim from browserFillByLocator's catch, the
+  // bounded module would persist it to the unredacted trace JSONL
+  // (errors[] in appendTrace data) and pass it to the agent via
+  // resumeChatTask. The catch must run error.message through
+  // redactSecretValuesFromString against the per-task registry.
+  test("redacts known secrets out of a playwright-style error message", () => {
+    // Simulate playwright's actual error shape:
+    // Timeout 10000ms exceeded.
+    // Call log:
+    //   fill("<value>")
+    //   waiting for element to be visible, enabled and editable
+    const errorWithValue = 'Timeout 10000ms exceeded.\nCall log:\n  fill("hunter2-LEAK-MARKER")\n  waiting for element to be visible, enabled and editable';
+    const redacted = redactSecretValuesFromString(errorWithValue, ["hunter2-LEAK-MARKER"]);
+    expect(redacted).not.toContain("hunter2-LEAK-MARKER");
+    expect(redacted).toContain("[redacted]");
+    // Surrounding diagnostic context survives so the agent still
+    // sees the failure reason.
+    expect(redacted).toContain("Timeout 10000ms exceeded");
+    expect(redacted).toContain("waiting for element");
+  });
+});
+
 describe("redactSecretValuesFromString", () => {
   test("replaces every occurrence of every secret with [redacted]", () => {
     const text = "Login attempt with username=tomsmith and password=SuperSecret123. Retried with SuperSecret123 again.";

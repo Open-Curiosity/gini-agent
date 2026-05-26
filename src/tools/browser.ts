@@ -652,6 +652,11 @@ export async function disconnectSharedBrowser(): Promise<void> {
     for (const id of ids) {
       const session = sessions.get(id);
       sessions.delete(id);
+      // Clear the per-task secret-redaction registry along with
+      // the session — the DOM is going away. Without this, the
+      // registry would leak across many disconnects, bounded only
+      // by process exit.
+      clearFilledSecrets(id);
       if (!session) continue;
       try {
         // Persistent and cdp both share a single context — close just the
@@ -720,6 +725,9 @@ export async function closeAll(): Promise<void> {
   for (const id of ids) {
     const session = sessions.get(id);
     sessions.delete(id);
+    // Match closeSession / disconnectSharedBrowser: drop the
+    // per-task secret-redaction registry alongside the session.
+    clearFilledSecrets(id);
     if (!session) continue;
     try {
       // Close every agent-owned page. In CDP mode this is the only thing
@@ -1533,7 +1541,26 @@ export async function browserFillByLocator(
       return { ok: true } as const;
     });
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    // CRITICAL: Playwright's locator.fill embeds the typed value
+    // into its timeout-error message via "Call log: fill(\"<value>\")"
+    // (see coreBundle.js fill instrumentation). If the fill times
+    // out (disabled input, slow SPA hydration, contenteditable
+    // mismatch), the raw error.message contains the secret in
+    // plaintext. Returning it verbatim would route the value
+    // through:
+    //   - browser-fill-secrets.ts: errors[].error → appendTrace
+    //     data (NOT redacted:true → persisted to per-task JSONL)
+    //   - browser-fill-secrets.ts: resumeChatTask resumeResult
+    //     → tool_result block → LLM context
+    // Redact every literal occurrence of any registered secret
+    // for this task before returning. The registry was populated
+    // pre-fill, so even a clear-on-input page hostile script
+    // can't unregister the value.
+    const raw = error instanceof Error ? error.message : String(error);
+    const registered = filledSecretValues.get(taskId);
+    const secretList = registered ? Array.from(registered) : [];
+    const sanitized = redactSecretValuesFromString(raw, secretList);
+    return { ok: false, error: sanitized };
   }
 }
 
@@ -2438,6 +2465,11 @@ export const __test = {
   },
   clearFakeSessionsForTest(): void {
     sessions.clear();
+    // Match the real session-teardown contract: also drop the
+    // per-task secret-redaction registry so tests that install
+    // fake sessions then call this helper don't leak state into
+    // subsequent tests.
+    filledSecretValues.clear();
   },
   // Expose the in-page walker for direct unit testing. Callers supply a
   // fake Page whose `evaluate(fn, arg)` runs `fn(arg)` locally against
