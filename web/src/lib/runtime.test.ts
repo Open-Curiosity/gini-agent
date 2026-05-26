@@ -282,6 +282,99 @@ describe("guardCsrf via proxyRequest", () => {
     expect(called()).toBe(1);
   });
 
+  test("origin-less tunneled GET WITH vetted header is accepted", async () => {
+    // Browsers OMIT Origin on same-origin GET/HEAD per the Fetch spec,
+    // so the tunneled SPA's own fetch("/api/...") arrives at the BFF
+    // without an Origin header. The vetted marker (stamped by proxy.ts
+    // after the secret-path or session-cookie check) is the
+    // authorization signal that lets the request through.
+    const { fetcher, called } = stubFetcher();
+    const request = new Request("https://abc.trycloudflare.com/api/runtime/state", {
+      method: "GET",
+      headers: {
+        host: "abc.trycloudflare.com",
+        "x-gini-tunnel-vetted": "1"
+      }
+    });
+    const response = await proxyRequest(request, ["state"], {
+      runtimeUrl: "http://127.0.0.1:7778",
+      token: "test-token",
+      fetcher
+    });
+    expect(response.status).toBe(200);
+    expect(called()).toBe(1);
+  });
+
+  test("origin-less tunneled GET WITHOUT vetted header is rejected", async () => {
+    // The same shape as the test above but without the vetted marker
+    // — a non-browser caller that happens to learn the tunnel
+    // hostname must not pivot through the BFF's bearer injection.
+    const { fetcher, called } = stubFetcher();
+    const request = new Request("https://abc.trycloudflare.com/api/runtime/state", {
+      method: "GET",
+      headers: {
+        host: "abc.trycloudflare.com"
+      }
+    });
+    const response = await proxyRequest(request, ["state"], {
+      runtimeUrl: "http://127.0.0.1:7778",
+      token: "test-token",
+      fetcher
+    });
+    expect(response.status).toBe(403);
+    expect(called()).toBe(0);
+  });
+
+  test("origin-less tunneled POST WITH vetted header is rejected (unsafe method)", async () => {
+    // Defense in depth: unsafe methods MUST carry Origin per the
+    // Fetch spec. A missing Origin on POST/PUT/PATCH/DELETE is
+    // anomalous and we refuse even when the vetted marker is set —
+    // an Origin-less unsafe request has no same-origin signal we can
+    // verify against the marker.
+    const { fetcher, called } = stubFetcher();
+    const request = new Request("https://abc.trycloudflare.com/api/runtime/chats", {
+      method: "POST",
+      headers: {
+        host: "abc.trycloudflare.com",
+        "x-gini-tunnel-vetted": "1",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ title: "test" })
+    });
+    const response = await proxyRequest(request, ["chats"], {
+      runtimeUrl: "http://127.0.0.1:7778",
+      token: "test-token",
+      fetcher
+    });
+    expect(response.status).toBe(403);
+    expect(called()).toBe(0);
+  });
+
+  test("origin-less GET with allowlist set is rejected even when vetted", async () => {
+    // GINI_TRUSTED_ORIGINS is an explicit operator opt-in to the
+    // strict allowlist. With no Origin to compare against the
+    // allowlist, we cannot tell legitimate same-origin GET from a
+    // rebound page that omitted Origin. The vetted marker must not
+    // override the operator's explicit security posture — the
+    // allowlist always wins.
+    process.env.GINI_TRUSTED_ORIGINS = "https://tail.example";
+    const { fetcher, called } = stubFetcher();
+    const request = new Request("https://abc.trycloudflare.com/api/runtime/state", {
+      method: "GET",
+      headers: {
+        host: "abc.trycloudflare.com",
+        "x-gini-tunnel-vetted": "1"
+      }
+    });
+    const response = await proxyRequest(request, ["state"], {
+      runtimeUrl: "http://127.0.0.1:7778",
+      token: "test-token",
+      fetcher
+    });
+    expect(response.status).toBe(403);
+    expect(called()).toBe(0);
+  });
+
   test("the vetted header is NOT forwarded to the runtime", async () => {
     // pickForwardHeaders allow-lists `content-type`, `accept`,
     // `cache-control`, and `last-event-id`. The vetted marker is an

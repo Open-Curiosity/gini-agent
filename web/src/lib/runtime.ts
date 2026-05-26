@@ -7,19 +7,12 @@ import { join, resolve } from "node:path";
 // it, every reconnect re-replays the entire event log.
 const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control", "last-event-id"]);
 
-// Always read the file fresh. The earlier mtime[+size]-keyed cache
-// kept returning stale values in three reachable scenarios:
-//   - coarse-resolution filesystems (HFS+, FAT, some SMB/NFS mounts)
-//     report mtime at second-level granularity.
-//   - even on APFS, two rapid writes can round to the same fractional
-//     mtimeMs float.
-//   - same-byte-length rewrites (a 32-char secret rotation in the same
-//     config shape) collide on size too.
-// With no TTL, a stale cache entry survives indefinitely until something
-// changes the mtime+size tuple, which on a quiescent config file might
-// be never. A bare readFileSync on a small local file is sub-ms — the
-// "cache" was a TTL-era optimization that no longer pulls its weight.
-function readFileWithMtimeCache(path: string): string | null {
+// Read the file fresh on every call and return the trimmed contents
+// (or null if the file is missing, empty, or unreadable). A bare
+// readFileSync on a small local config file is sub-ms; no caching is
+// warranted, and caching has historically masked rotations of the
+// port/token/tunnel-secret values these helpers read.
+function readFileFreshTrim(path: string): string | null {
   if (!existsSync(path)) return null;
   try {
     const value = readFileSync(path, "utf8").trim();
@@ -48,7 +41,7 @@ export function runtimeInstance(): string {
 export function runtimeUrl(): string {
   if (process.env.GINI_RUNTIME_URL) return process.env.GINI_RUNTIME_URL;
   const portFile = join(stateRoot(), "instances", runtimeInstance(), "runtime.port");
-  const port = readFileWithMtimeCache(portFile);
+  const port = readFileFreshTrim(portFile);
   if (port) return `http://127.0.0.1:${port}`;
   return "http://127.0.0.1:7778";
 }
@@ -64,7 +57,7 @@ export function runtimeUrl(): string {
 export function runtimeToken(): string {
   if (process.env.GINI_TOKEN) return process.env.GINI_TOKEN;
   const configPath = join(stateRoot(), "instances", runtimeInstance(), "config.json");
-  const raw = readFileWithMtimeCache(configPath);
+  const raw = readFileFreshTrim(configPath);
   if (!raw) return "";
   try {
     const parsed = JSON.parse(raw) as { token?: unknown };
@@ -96,7 +89,7 @@ export interface TunnelRuntimeState {
 
 export function runtimeTunnelState(): TunnelRuntimeState {
   const configPath = join(stateRoot(), "instances", runtimeInstance(), "config.json");
-  const raw = readFileWithMtimeCache(configPath);
+  const raw = readFileFreshTrim(configPath);
   if (!raw) return { enabled: false, secret: "" };
   try {
     const parsed = JSON.parse(raw) as { tunnel?: { enabled?: unknown; secret?: unknown } };
@@ -333,35 +326,52 @@ function guardCsrf(request: Request, _pathSegments: string[]): Response | null {
   const isUnsafe = UNSAFE_METHODS.has(request.method);
   const vetted = isTunnelVetted(request);
   if (!origin) {
+    // Unsafe methods (POST/PUT/PATCH/DELETE) without Origin are always
+    // rejected. Per the Fetch spec, browsers ALWAYS send Origin on
+    // unsafe requests; absence indicates a non-browser caller (curl,
+    // scripts, misconfigured proxies) that should authenticate to the
+    // gateway directly with its own token. Even with the tunnel-vetted
+    // marker, an Origin-less unsafe request has no same-origin handle
+    // we can verify, so we keep the 403 as defense in depth.
     if (isUnsafe) {
       return Response.json({ error: "Forbidden" }, { status: 403 });
     }
-    // Safe method (GET/HEAD) without Origin. Browsers may omit Origin on
-    // same-origin safe requests, which is the exact shape a DNS-rebound
-    // page produces (the browser thinks it's same-origin to attacker.
-    // example post-rebind). Validate the Host here so a non-loopback
-    // exposure still requires GINI_TRUSTED_ORIGINS to be set — Origin-
-    // less GETs from a rebound page hitting a tailnet/tunnel BFF will
-    // 403 because Host is non-loopback. Non-browser callers on
-    // loopback (curl, scripts) keep working.
+    // Safe method (GET/HEAD) without Origin. Browsers OMIT Origin on
+    // same-origin GET/HEAD per the Fetch spec, so the tunneled SPA's
+    // own fetch("/api/...") legitimately lands here with no Origin.
+    // Authorization comes from one of two signals:
+    //   - GINI_TRUSTED_ORIGINS configured → fail closed (we have no
+    //     Origin to compare against the allowlist, and the operator's
+    //     explicit allowlist must win over any other signal).
+    //   - Tunnel-vetted marker present → accept. proxy.ts only stamps
+    //     this header after the tunnel-secret or session-cookie check
+    //     and unconditionally strips any inbound value first, so it is
+    //     an authoritative "this request already passed auth." The
+    //     allowlist branch above runs first to preserve operator
+    //     opt-in precedence.
+    //   - Loopback Host → accept (local-dev). Non-browser callers on
+    //     localhost (curl, scripts) keep working.
+    // Anything else (non-loopback Host with no allowlist and no
+    // vetted marker) 403s — a DNS-rebound page hitting a tailnet/
+    // tunnel BFF lands here, and the loopback Host check rejects it.
     const allowlist = trustedOrigins();
     if (allowlist) {
-      // Operator opted into the strict allowlist. There's no Origin to
-      // compare, so we can't tell whether this is a legitimate same-
-      // origin GET or a rebound page that omitted Origin. Fail closed:
-      // any non-browser caller can hit the gateway directly with its
-      // own token, and a browser would have sent Origin.
+      // Operator opted into the strict allowlist. With no Origin to
+      // compare we cannot tell legitimate same-origin GET from a
+      // rebound page that omitted Origin. Fail closed; a non-browser
+      // caller can hit the gateway directly with its own token.
       return Response.json({ error: "Forbidden" }, { status: 403 });
     }
-    const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
-    // Tunnel-vetted Origin-less safe requests are rejected: an Origin-less
-    // GET has no same-origin verification we could pair with the proxy's
-    // vetting, so accepting it would widen the surface to non-browser
-    // callers that happen to learn the tunnel hostname. Legitimate
-    // browsers on the tunnel always send Origin on cross-process API
-    // fetches.
-    if (!isLoopbackHost(expectedHost)) {
-      return Response.json({ error: "Forbidden" }, { status: 403 });
+    if (vetted) {
+      // proxy.ts has already vetted the request via the tunnel-secret
+      // path or the session cookie. The marker is BFF-internal and
+      // cannot be forged (proxy.ts strips any inbound value before
+      // stamping its own). Skip the loopback check.
+    } else {
+      const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
+      if (!isLoopbackHost(expectedHost)) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
     }
   } else {
     let originUrl: URL;
