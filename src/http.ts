@@ -58,6 +58,7 @@ import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueN
 import { getSetupStatus, setSetupProvider } from "./runtime/setup-api";
 import { createSkillFromInput, getSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
+import { resumeChatTask } from "./execution/chat-task";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
@@ -277,6 +278,27 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         if (!taskId) {
           return json({ ok: false, message: "Approval is not bound to a task; cannot fill." }, 400);
         }
+        // Close the deny-mid-fill race by resolving the approval
+        // atomically BEFORE the per-slot loop. resolveApproval flips
+        // pending → approved inside a single mutateState callback (see
+        // src/agent.ts:resolveApproval); after this returns successfully,
+        // any concurrent decideApproval(deny) will fail with
+        // "Approval is already approved" instead of letting the fill
+        // loop keep writing secrets to the DOM while the operator's
+        // deny mutates state in parallel. We pass resumeChatTask:false
+        // so runApprovedAction does NOT resume the chat-task loop
+        // here — the fills haven't happened yet, and the agent must
+        // see the actual filled/errored outcome, not a synthesized
+        // success message. We call resumeChatTask manually after
+        // fills + audit below.
+        try {
+          await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: false });
+        } catch (error) {
+          // Race lost (another path already resolved this approval).
+          // Surface as 410 Gone so the client knows to re-fetch.
+          const message = error instanceof Error ? error.message : String(error);
+          return json({ ok: false, message: `Could not lock approval for fill: ${message}` }, 410);
+        }
         const filledSlots: string[] = [];
         const errors: { slot: string; error: string }[] = [];
         for (const slot of slots) {
@@ -316,13 +338,34 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
             { taskId }
           );
         });
+        // Resume the chat-task loop with a result string that
+        // reflects what actually happened. The approval is already
+        // resolved (above) so resume MUST run — otherwise the task
+        // hangs in waiting_approval forever. Build the tool result
+        // here rather than re-using the synthesized string from
+        // runApprovedAction so the agent learns about partial fills
+        // and per-slot errors via the same tool_result it would
+        // normally read.
+        const filledList = filledSlots.length > 0 ? filledSlots.join(", ") : "(none)";
+        const errorList = errors.length > 0
+          ? errors.map((e) => `${e.slot} (${e.error})`).join("; ")
+          : "";
+        const resumeResult = errors.length === 0
+          ? `User submitted values for slots ${filledList}. The fields are now filled on the page. Take a fresh browser_snapshot before deciding the next action.`
+          : `User submitted values; filled slots ${filledList}. ${errors.length} slot(s) failed: ${errorList}. Take a fresh browser_snapshot to see the current state before retrying.`;
+        const toolCallId = typeof approval.payload.toolCallId === "string"
+          ? approval.payload.toolCallId
+          : undefined;
+        if (toolCallId) {
+          await resumeChatTask(config, taskId, toolCallId, resumeResult);
+        }
         if (errors.length > 0) {
           return json({
             ok: false,
-            message: `Fill failed for ${errors.length} slot(s): ${errors.map((e) => `${e.slot} (${e.error})`).join("; ")}`
+            message: `Fill failed for ${errors.length} slot(s): ${errorList}`,
+            filledSlots
           });
         }
-        await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
         return json({ ok: true, filledSlots });
       }
 

@@ -867,6 +867,19 @@ export async function completeLowRiskToolTask(
 // path is the right one to reach for, not this function.
 export async function decideApproval(config: RuntimeConfig, approvalId: string, decision: "approve" | "deny"): Promise<Approval> {
   if (decision === "approve") {
+    // browser.fill_secret approvals can only be resolved via /connect
+    // with the per-slot values. Routing through resolveApproval would
+    // flip status to approved but no DOM fill ever ran (the side
+    // effect lives inside POST /api/approvals/<id>/connect), and the
+    // chat-task loop would either hang in waiting_approval (if
+    // runApprovedAction's branch returns undefined) or resume with a
+    // false "fields filled" message. Refuse early so the contract
+    // holds across every caller (HTTP /approve, CLI, /permissions UI,
+    // future API clients).
+    const existing = readState(config.instance).approvals.find((a) => a.id === approvalId);
+    if (existing?.action === "browser.fill_secret") {
+      throw new Error("browser.fill_secret approvals must be resolved via /connect with the per-slot values, not /approve.");
+    }
     const { approval } = await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
     return approval;
   }
@@ -1402,38 +1415,22 @@ async function runApprovedAction(
   }
 
   if (approval.action === "browser.fill_secret") {
-    // Side effect (the per-slot playwright fill) already ran inside
-    // POST /api/approvals/<id>/connect via browserFillByLocator. By
-    // the time we reach here the approval is approved and the DOM is
-    // updated. All this branch does is synthesize the tool result so
-    // the chat-task loop resumes from the parked browser_fill_secrets
-    // call and the agent can decide what to do next — typically
-    // re-snapshot, then click whatever submit/login button follows.
-    // The slot values themselves never reach this branch; the result
-    // string enumerates slot NAMES only, which are non-secret by
-    // design (the model supplied them on the original tool call).
+    // The /connect handler owns the entire fill_secret lifecycle now:
+    // it calls resolveApproval(resumeChatTask:false) to atomically
+    // close the deny race BEFORE per-slot playwright fills, then runs
+    // the fills, writes the redacted audit row, and calls
+    // resumeChatTask with a result string that reflects actual filled
+    // / errored slots. By the time resolveApproval invokes this
+    // branch the agent has not yet been told what happened — and we
+    // can't synthesize a truthful result here because the fills come
+    // AFTER this point. Return undefined; /connect handles resume.
+    // The /approve route refuses fill_secret (see src/http.ts), so
+    // /connect is the only resolver and this branch is the
+    // resolveApproval-side no-op for that single path.
     void extraEvidence;
-    const slots = Array.isArray(approval.payload.slots) ? approval.payload.slots : [];
-    const filledSlots: string[] = [];
-    for (const s of slots) {
-      if (s && typeof s === "object") {
-        const entry = s as { name?: unknown };
-        if (typeof entry.name === "string") filledSlots.push(entry.name);
-      }
-    }
-    if (approval.taskId) {
-      appendTrace(config.instance, approval.taskId, {
-        type: "tool",
-        message: "Form fields filled via browser.fill_secret",
-        data: { slots: filledSlots, approvalId: approval.id }
-      });
-    }
-    const slotList = filledSlots.length > 0 ? filledSlots.join(", ") : "(unknown)";
-    const result = `User submitted values for slots ${slotList}. The fields are now filled on the page. Take a fresh browser_snapshot before deciding the next action.`;
-    if (shouldResumeChat && chatToolCallId && approval.taskId) {
-      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
-    }
-    return result;
+    void shouldResumeChat;
+    void chatToolCallId;
+    return undefined;
   }
 
   if (approval.action === "file.write") {
