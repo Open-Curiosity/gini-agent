@@ -733,9 +733,18 @@ const server = Bun.serve({
               error: error instanceof Error ? error.message : String(error)
             });
           });
-        } else if (update?.enabled === true) {
-          pendingDisable = false;
         }
+        // Don't clear pendingDisable on enable — that's the disable's
+        // runApplyConfig job (its becameDisabled branch clears the
+        // latch authoritatively). If a disable is queued ahead of this
+        // enable in pendingApply, clearing the latch synchronously here
+        // would let an EARLIER in-flight start (an enable from before
+        // the disable arrived, sitting in resolveWebTarget) resume past
+        // its pendingDisable check and spawn cloudflared against the
+        // disable signal. The persist-failure catch on the chained
+        // promise also clears the latch if the disable's runApplyConfig
+        // throws, so a stuck-true latch is recovered through that path
+        // rather than swept under by a later enable's wrapper.
         const next = pendingApply.then(() => runApplyConfig(update));
         pendingApply = next.then(() => undefined, () => undefined);
         // Clear pendingDisable on rejection so the latch doesn't stay

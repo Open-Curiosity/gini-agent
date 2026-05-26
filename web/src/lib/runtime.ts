@@ -96,7 +96,13 @@ export function runtimeTunnelState(): TunnelRuntimeState {
     const tunnel = parsed.tunnel ?? {};
     return {
       enabled: tunnel.enabled === true,
-      secret: typeof tunnel.secret === "string" ? tunnel.secret : ""
+      // Mirror the runtime's normalizeSecret() trim. The on-disk
+      // config can carry surrounding whitespace after a hand-edit,
+      // and the runtime trims on read; without the matching trim
+      // here, the BFF proxy's URL-prefix compare would never match
+      // what the QR URL (built from the trimmed secret) tells the
+      // operator's phone to send.
+      secret: typeof tunnel.secret === "string" ? tunnel.secret.trim() : ""
     };
   } catch {
     return { enabled: false, secret: "" };
