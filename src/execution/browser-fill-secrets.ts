@@ -34,7 +34,7 @@
 import type { Approval, RuntimeConfig } from "../types";
 import { failTask, resolveApproval } from "../agent";
 import { addAudit, appendTrace, mutateState, readState } from "../state";
-import { browserFillByLocator, peekCurrentBrowserUrl } from "../tools/browser";
+import { FILLED_SECRET_MIN_REDACTION_LENGTH, browserFillByLocator, peekCurrentBrowserUrl } from "../tools/browser";
 import { isTerminalTaskStatus } from "../state";
 import { resumeChatTask } from "./chat-task";
 import { parseFillSecretSlots, sanitizeUrlForAuditTarget } from "./browser-fill-secrets-types";
@@ -76,24 +76,54 @@ export async function runFillSecretConnect(
       }
     };
   }
-  // Floor on minimum value length. Values shorter than this are
-  // not registered for redaction (single-character secrets would
-  // shred snapshot @eN refs via literal substring replacement —
-  // see FILLED_SECRET_MIN_REDACTION_LENGTH in src/tools/browser.ts).
-  // Refusing them here closes the asymmetry where /connect would
-  // otherwise accept a 1-3 char value and fill it into the DOM
-  // with no subsequent redaction. Realistic credentials are
-  // always above this floor (PINs 4+, OTPs 6+, passwords 8+) so
-  // the only inputs blocked are typos / test data.
+  // Floor on minimum value length. Values shorter than
+  // FILLED_SECRET_MIN_REDACTION_LENGTH are not registered for
+  // redaction (single-character secrets would shred snapshot @eN
+  // refs via literal substring replacement). The constant lives
+  // in src/tools/browser.ts alongside the redactor; importing it
+  // here keeps the gate and the registry in sync — if the floor
+  // is ever bumped, /connect refusal and recordFilledSecret
+  // change together. Refusing short values here closes the
+  // asymmetry where /connect would otherwise accept a value
+  // below the floor and fill it into the DOM with no subsequent
+  // redaction. Realistic credentials are always above this floor
+  // (PINs 4+, OTPs 6+, passwords 8+) so the only inputs blocked
+  // are typos / test data; CVV-style 3-digit codes don't fit
+  // fill_secret's threat model (they belong on connector
+  // pathways).
   const tooShort = slots
-    .filter((slot) => secrets[slot.name].length < 4)
+    .filter((slot) => secrets[slot.name].length < FILLED_SECRET_MIN_REDACTION_LENGTH)
     .map((slot) => slot.name);
   if (tooShort.length > 0) {
     return {
       status: 400,
       body: {
         ok: false,
-        message: `Slot value too short (< 4 chars): ${tooShort.join(", ")}. Re-enter a longer value.`
+        message: `Slot value too short (< ${FILLED_SECRET_MIN_REDACTION_LENGTH} chars): ${tooShort.join(", ")}. Re-enter a longer value.`
+      }
+    };
+  }
+  // Belt-and-braces duplicate-name check. The dispatcher's
+  // browserFillSecretsTool refuses duplicates up-front, so the
+  // approval row is normally minted with unique names — but a
+  // state-edit, replay, or any future code path that mints a
+  // browser.fill_secret approval without going through the
+  // dispatch validator would bypass that gate. Mirror the
+  // dispatch check here so /connect's per-slot fill loop never
+  // sees duplicates (which would silently fill the same value
+  // into two distinct DOM locators).
+  const dupeSeen = new Set<string>();
+  const dupes: string[] = [];
+  for (const slot of slots) {
+    if (dupeSeen.has(slot.name)) dupes.push(slot.name);
+    else dupeSeen.add(slot.name);
+  }
+  if (dupes.length > 0) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        message: `Approval payload has duplicate slot names: ${Array.from(new Set(dupes)).join(", ")}. Refusing to fill.`
       }
     };
   }

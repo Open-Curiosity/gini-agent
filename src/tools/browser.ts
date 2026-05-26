@@ -147,7 +147,7 @@ const filledSecretValues = new Map<string, Set<string>>();
 // vanishingly unlikely to collide with structural snapshot
 // tokens. Real credentials are always ≥ this length in
 // practice (PINs are typically 4+, OTPs 6+, passwords 8+).
-const FILLED_SECRET_MIN_REDACTION_LENGTH = 4;
+export const FILLED_SECRET_MIN_REDACTION_LENGTH = 4;
 // Record a secret value typed for a task. Called by
 // browserFillByLocator immediately before .fill() runs. Empty
 // strings and short strings are not recorded so the redactor's
