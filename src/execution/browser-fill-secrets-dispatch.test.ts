@@ -23,6 +23,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { dispatchToolCall, sanitizeUrlForAuditTarget } from "./tool-dispatch";
 import { createChatSession, createTask, mutateState, readState, upsertTask } from "../state";
+import { __test as browserTest } from "../tools/browser";
 import type { RuntimeConfig } from "../types";
 
 const ROOT = "/tmp/gini-browser-fill-secrets-dispatch-test";
@@ -160,10 +161,38 @@ describe("browser_fill_secrets dispatch surface guard", () => {
     expect(sanitizeUrlForAuditTarget(undefined)).toBeUndefined();
   });
 
-  test("mints a pending approval when chat session has no messaging source (web chat)", async () => {
-    const config = makeConfig("fill-secrets-web");
-    // Omit `source` — that's how the web chat path creates sessions.
+  test("refuses dispatch when no live browser session exists", async () => {
+    // The dispatcher captures peekCurrentBrowserUrl(taskId) into the
+    // approval payload's approvedUrl so /connect's origin guard has
+    // something to compare against. Without a session, no URL can be
+    // captured, so the only safe behavior is to refuse and tell the
+    // agent to navigate first.
+    const config = makeConfig("fill-secrets-no-session");
     const taskId = await seedTaskWithSession(config, undefined);
+
+    const result = await dispatchToolCall(config, taskId, "browser_fill_secrets", "call_1", VALID_ARGS);
+
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("active browser session");
+    expect(parsed.error).toContain("browser_navigate");
+
+    const state = readState(config.instance);
+    expect(state.approvals.length).toBe(0);
+  });
+
+  test("mints a pending approval when a browser session is bound to the task", async () => {
+    const config = makeConfig("fill-secrets-with-session");
+    const taskId = await seedTaskWithSession(config, undefined);
+    // Inject a fake playwright session so peekCurrentBrowserUrl
+    // returns a URL the dispatcher can capture into approvedUrl.
+    const fakePage = {
+      url: () => "https://example.com/login?next=/dashboard",
+      close: () => Promise.resolve()
+    };
+    browserTest.installFakeSessionWithPageForTest(taskId, fakePage);
 
     const result = await dispatchToolCall(config, taskId, "browser_fill_secrets", "call_1", VALID_ARGS);
 
@@ -175,5 +204,8 @@ describe("browser_fill_secrets dispatch surface guard", () => {
     const approval = state.approvals.find((a) => a.id === result.approvalId);
     expect(approval).toBeDefined();
     expect(approval?.action).toBe("browser.fill_secret");
+    // approvedUrl is stripped of query string by sanitizeUrlForAuditTarget.
+    expect(approval?.payload.approvedUrl).toBe("https://example.com/login");
+    expect(approval?.target).toBe("https://example.com/login");
   });
 });

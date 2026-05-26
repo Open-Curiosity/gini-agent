@@ -83,19 +83,33 @@ export async function runFillSecretConnect(
   // the dispatcher minted the approval without a live URL (no browser
   // session at dispatch time).
   const approvedUrl = typeof approval.payload.approvedUrl === "string"
+    && approval.payload.approvedUrl.length > 0
     ? approval.payload.approvedUrl
     : undefined;
-  if (approvedUrl) {
-    const liveSanitized = sanitizeUrlForAuditTarget(peekCurrentBrowserUrl(taskId));
-    if (!liveSanitized || liveSanitized !== approvedUrl) {
-      return {
-        status: 409,
-        body: {
-          ok: false,
-          message: `Page navigated since the approval was created (approved: ${approvedUrl}, live: ${liveSanitized ?? "no session"}). Refusing to fill on an unapproved origin.`
-        }
-      };
-    }
+  // Refuse if no approved URL was captured. The dispatcher rejects
+  // browser_fill_secrets when no browser session exists at
+  // approval-creation time, but we belt-and-braces the gate here too
+  // so a legacy approval (or any future code path that mints an
+  // approval without going through browserFillSecretsTool) can't
+  // bypass the origin check.
+  if (!approvedUrl) {
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        message: "Approval has no approved page URL; refusing to fill on an unbound origin."
+      }
+    };
+  }
+  const liveSanitized = sanitizeUrlForAuditTarget(peekCurrentBrowserUrl(taskId));
+  if (!liveSanitized || liveSanitized !== approvedUrl) {
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        message: `Page navigated since the approval was created (approved: ${approvedUrl}, live: ${liveSanitized ?? "no session"}). Refusing to fill on an unapproved origin.`
+      }
+    };
   }
 
   // Atomic check-and-flip closes the deny-mid-fill race.

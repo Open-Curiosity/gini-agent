@@ -50,7 +50,18 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       // /permissions and /activity rely on the React Query cache.
       invalidate(["approvals", "tasks", "task", "chat", "events", "audit"]);
     },
-    onError: (error: Error) => toast.error(error.message)
+    onError: (error: Error) => toast.error(error.message),
+    onSettled: () => {
+      // Clear any typed credentials regardless of outcome. The Deny
+      // button on a fill_secret card never invokes fillSubmit (and
+      // therefore never hits fillSubmit's onSettled clear), so
+      // without this hook a user who typed a credential and then
+      // clicked Deny would leave the typed value sitting in React
+      // state until the chat view unmounts. Cheap on every other
+      // approval action — setFillValues({}) is a no-op when the
+      // record is already empty.
+      setFillValues({});
+    }
   });
 
   const connect = useMutation({

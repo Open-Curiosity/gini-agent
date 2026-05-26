@@ -2561,7 +2561,25 @@ async function browserFillSecretsTool(
   // `target` intact.
   const liveUrl = peekCurrentBrowserUrl(taskId);
   const approvedUrl = sanitizeUrlForAuditTarget(liveUrl);
-  const target = approvedUrl ?? "(no live page)";
+  // Refuse dispatch when no live browser session exists. Without a
+  // captured origin, the user has no way to consent to a specific
+  // page, and the /connect origin guard has nothing to compare
+  // against — secrets typed into the chat card would land on
+  // whatever page the session points at by /connect time, which
+  // may not be the page the agent intended (or the page the user
+  // would have approved if they could see it). The agent should
+  // browser_navigate to the form's page first, then call
+  // browser_fill_secrets with locators from the resulting snapshot.
+  if (!approvedUrl) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "browser_fill_secrets requires an active browser session on the page being filled. Call browser_navigate (and browser_snapshot if needed) first, then re-issue this tool with locators from the snapshot."
+      })
+    };
+  }
+  const target = approvedUrl;
 
   const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
     const item = findTask(mutable, taskId);

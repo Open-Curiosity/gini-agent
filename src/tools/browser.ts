@@ -1275,21 +1275,32 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
 // gateway process except through the post-redaction tool result.
 async function collectSecretValuesFromPage(taskId: string): Promise<string[]> {
   try {
-    return await withSession(taskId, async (session) => {
-      const values = await session.page.evaluate(() => {
-        const nodes = Array.from(document.querySelectorAll("[data-gini-secret]"));
-        return nodes
-          .map((el) => {
-            const value = (el as HTMLInputElement).value;
-            return typeof value === "string" ? value : "";
-          })
-          .filter((v) => v.length > 0);
-      });
-      return values;
-    });
+    return await withSession(taskId, async (session) => collectSecretValuesFromPageWithSession(session.page));
   } catch {
     // No active session yet, or evaluate failed — no secrets to
     // redact. Return empty so the redactor is a no-op.
+    return [];
+  }
+}
+
+// Same query without acquiring a new withSession lock. Useful when
+// the caller already holds the lock (e.g. browserConsole and
+// browserVision pre-collect inside their own withSession callback
+// to keep the secret-list snapshot in closure scope BEFORE
+// running the eval / screenshot — so a navigation triggered by the
+// eval itself can't empty the secret list mid-call).
+async function collectSecretValuesFromPageWithSession(page: import("playwright-core").Page): Promise<string[]> {
+  try {
+    return await page.evaluate(() => {
+      const nodes = Array.from(document.querySelectorAll("[data-gini-secret]"));
+      return nodes
+        .map((el) => {
+          const value = (el as HTMLInputElement).value;
+          return typeof value === "string" ? value : "";
+        })
+        .filter((v) => v.length > 0);
+    });
+  } catch {
     return [];
   }
 }
@@ -1308,6 +1319,30 @@ export function redactSecretValuesFromString(text: string, secrets: readonly str
     // secret may contain regex metacharacters that would otherwise
     // need escaping.
     out = out.split(s).join("[redacted]");
+  }
+  return out;
+}
+
+// Deep-walk any JSON-serializable value and redact secret bytes
+// from every string leaf, including string-typed values inside
+// arrays and objects. Used by browser_console where the agent's
+// eval expression can wrap a secret in a container
+// (`[input.value]`, `{v: input.value}`) to escape a string-only
+// redactor. Primitives that aren't strings are passed through;
+// circular structures are guarded so a `{ self: self }` reference
+// cycle doesn't infinite-loop.
+export function redactSecretValuesDeep(value: unknown, secrets: readonly string[], seen: WeakSet<object> = new WeakSet()): unknown {
+  if (secrets.length === 0) return value;
+  if (typeof value === "string") return redactSecretValuesFromString(value, secrets);
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value as object)) return "[circular]";
+  seen.add(value as object);
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSecretValuesDeep(item, secrets, seen));
+  }
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    out[k] = redactSecretValuesDeep(v, secrets, seen);
   }
   return out;
 }
@@ -1478,6 +1513,16 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       if (clear) {
         consoleLogs.set(taskId, []);
       }
+      // Collect data-gini-secret values BEFORE the eval. If we
+      // collected after, an agent-supplied expression that itself
+      // navigates (`location.href='...'; document.querySelector('input').value`)
+      // or clears the form would empty the secret list — leaving
+      // the captured evalResult (which read the value pre-navigation)
+      // unredacted on the way back to the LLM. Pre-collection
+      // snapshots the secret list into closure scope so the
+      // redactor's input is stable regardless of subsequent page
+      // state.
+      const secretValues = await collectSecretValuesFromPageWithSession(session.page);
       let evalResult: unknown = undefined;
       let evalError: string | undefined;
       if (expression) {
@@ -1492,27 +1537,24 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       }
       const messages = consoleLogs.get(taskId) ?? [];
       // Redact data-gini-secret values from anywhere they could
-      // surface to the LLM. The agent could otherwise call
-      // `document.querySelector("input").value` to read a
-      // credential filled via fill_secret, or read a console.log
-      // line that the page itself printed containing the value.
-      // Collecting the live secrets inside the same playwright
-      // session keeps them in gateway memory; the redactor walks
-      // the response strings before they leave this function. The
-      // snapshot walker's redaction handles the structured snapshot
-      // path; this catches the eval/console-log paths.
-      const secretValues = await collectSecretValuesFromPage(taskId);
+      // surface to the LLM. The snapshot walker's redaction handles
+      // the structured snapshot path; this catches the eval /
+      // console-log paths. Deep-redact non-string evalResult values
+      // — the agent can wrap a secret in a container like
+      // `[input.value]` or `{v: input.value}` to escape a string-only
+      // redactor, but redactSecretValuesDeep walks every string leaf
+      // inside arrays and objects.
       const redactedMessages = messages.map((m) => ({
         ...m,
         text: redactSecretValuesFromString(m.text, secretValues)
       }));
-      const evalResultString = typeof evalResult === "string"
-        ? redactSecretValuesFromString(evalResult, secretValues)
-        : (evalResult === undefined ? null : evalResult);
+      const redactedEvalResult = evalResult === undefined
+        ? null
+        : redactSecretValuesDeep(evalResult, secretValues);
       return ok({
         url: session.page.url(),
         messages: redactedMessages,
-        evalResult: evalResultString,
+        evalResult: redactedEvalResult,
         evalError: evalError ? redactSecretValuesFromString(evalError, secretValues) : null
       });
     });
@@ -1905,6 +1947,12 @@ export async function browserVision(
       // a disconnect mid-await would otherwise slip past the post-fetch
       // check and let us forward stale bytes from a torn-down browser.
       const capturedGeneration = currentDisconnectGeneration();
+      // Pre-collect data-gini-secret values BEFORE the screenshot.
+      // If we collected after, a screenshot that itself navigates
+      // (extremely rare) or page cleanup between screenshot and
+      // collection would empty the secret list and skip the
+      // belt-and-braces post-OCR redaction.
+      const secretValues = await collectSecretValuesFromPageWithSession(session.page);
       // Blur every data-gini-secret element before the screenshot so
       // the vision model can't OCR a credential the user typed via
       // fill_secret. Native browser rendering already masks
@@ -1914,28 +1962,39 @@ export async function browserVision(
       // immediately before the screenshot and restored immediately
       // after — the user's actual page never sees the blur because
       // the headless render happens in the same DOM frame.
-      await session.page.evaluate(() => {
-        const els = document.querySelectorAll("[data-gini-secret]");
-        for (const el of Array.from(els)) {
-          const h = el as HTMLElement;
-          h.dataset.giniBlurRestore = h.style.filter || "";
-          h.style.filter = "blur(12px)";
+      // Both evaluate calls are tolerant of synthetic / mocked
+      // pages that may not implement page.evaluate at all (the
+      // browserVision unit tests use a stripped-down page mock).
+      try {
+        if (typeof session.page.evaluate === "function") {
+          await session.page.evaluate(() => {
+            const els = document.querySelectorAll("[data-gini-secret]");
+            for (const el of Array.from(els)) {
+              const h = el as HTMLElement;
+              h.dataset.giniBlurRestore = h.style.filter || "";
+              h.style.filter = "blur(12px)";
+            }
+          });
         }
-      }).catch(() => { /* best-effort */ });
+      } catch { /* best-effort blur */ }
       let buf: Buffer;
       try {
         buf = await session.page.screenshot({ type: "png", fullPage: full });
       } finally {
         // Always restore even if screenshot threw — otherwise the
         // page would be left visibly blurred for the user.
-        await session.page.evaluate(() => {
-          const els = document.querySelectorAll("[data-gini-secret]");
-          for (const el of Array.from(els)) {
-            const h = el as HTMLElement;
-            h.style.filter = h.dataset.giniBlurRestore ?? "";
-            delete h.dataset.giniBlurRestore;
+        try {
+          if (typeof session.page.evaluate === "function") {
+            await session.page.evaluate(() => {
+              const els = document.querySelectorAll("[data-gini-secret]");
+              for (const el of Array.from(els)) {
+                const h = el as HTMLElement;
+                h.style.filter = h.dataset.giniBlurRestore ?? "";
+                delete h.dataset.giniBlurRestore;
+              }
+            });
           }
-        }).catch(() => { /* best-effort */ });
+        } catch { /* best-effort restore */ }
       }
       if (buf.length > MAX_SCREENSHOT_BYTES) {
         return fail(
@@ -1960,7 +2019,7 @@ export async function browserVision(
       // secret value — covers a model that pre-cached the value
       // from an earlier turn or somehow recovered it from a
       // partial blur (very small screenshot, tiny font, etc.).
-      const secretValues = await collectSecretValuesFromPage(taskId);
+      // secretValues was snapshotted pre-screenshot above.
       const redactedAnswer = redactSecretValuesFromString(result.text, secretValues);
       return ok({
         url: session.page.url(),

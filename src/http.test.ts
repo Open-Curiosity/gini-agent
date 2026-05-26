@@ -920,10 +920,20 @@ describe("runtime api", () => {
     const config = testConfig("connect-rejects-partial-fill-secret");
     const handler = createHandler(config);
     const { createApproval } = await import("./state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const { createTask, upsertTask } = require("./state") as typeof import("./state");
+      const task = createTask(state.instance, "partial-test");
+      upsertTask(state, task);
+      return task.id;
+    });
+    // Seed approvedUrl so the origin guard's "no live page" refusal
+    // doesn't fire before the missing-slot check; this test is about
+    // partial submission, not origin binding.
     const approval = await mutateState(config.instance, (state) =>
       createApproval(state, {
+        taskId,
         action: "browser.fill_secret",
-        target: "https://example.com/login#@e1,@e2",
+        target: "https://example.com/login",
         risk: "high",
         reason: "Sign in to the test site",
         payload: {
@@ -932,11 +942,16 @@ describe("runtime api", () => {
             { name: "password", locator: "@e2", label: "Password", kind: "password" }
           ],
           reason: "Sign in",
-          toolCallId: "call_fill"
-        },
-        taskId: undefined
+          toolCallId: "call_fill",
+          approvedUrl: "https://example.com/login"
+        }
       })
     );
+    const { __test: browserTest } = await import("./tools/browser");
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://example.com/login",
+      close: () => Promise.resolve()
+    } as Partial<import("playwright-core").Page>);
     const response = await rawCall(
       handler,
       config,
@@ -973,15 +988,18 @@ describe("runtime api", () => {
       upsertTask(state, task);
       return task.id;
     });
-    // Approval target carries only the locator list (no URL) so the
-    // page-binding origin check is bypassed; the test exercises the
-    // audit / trace / log writers, not the origin guard which is
-    // covered by its own test.
+    // Seed approvedUrl on the payload AND install a matching fake
+    // session so the origin guard passes and the fill loop actually
+    // runs. The fills will error per-slot because the fake page's
+    // .locator() returns nothing useful — what we care about is that
+    // the audit row is written with redacted: true and the markers
+    // never reach state/trace/log even when the runtime tries to
+    // record what happened.
     const approval = await mutateState(config.instance, (state) =>
       createApproval(state, {
         taskId,
         action: "browser.fill_secret",
-        target: "@e1,@e2",
+        target: "https://example.com/login",
         risk: "high",
         reason: "Sign in to the test site",
         payload: {
@@ -990,10 +1008,23 @@ describe("runtime api", () => {
             { name: "password", locator: "@e2", label: "Password", kind: "password" }
           ],
           reason: "Sign in",
-          toolCallId: "call_fill"
+          toolCallId: "call_fill",
+          approvedUrl: "https://example.com/login"
         }
       })
     );
+    const { __test: browserTest } = await import("./tools/browser");
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://example.com/login",
+      // Fake locator that no-ops on fill; the audit-row write still
+      // happens regardless of whether the fill succeeded. Cast as
+      // Partial<Page> since the fake only implements what
+      // browserFillByLocator touches.
+      locator: ((_sel: string) => ({
+        fill: async () => { throw new Error("fake session, no real DOM"); }
+      })) as unknown as import("playwright-core").Page["locator"],
+      close: () => Promise.resolve()
+    } as Partial<import("playwright-core").Page>);
     const USERNAME_MARKER = "tomsmith-LEAK-MARKER-zzzzz";
     const PASSWORD_MARKER = "SuperSecretPassword-LEAK-MARKER-zzzzz";
     await rawCall(
