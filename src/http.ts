@@ -282,19 +282,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // Bind the fill to the page the user actually approved. The
         // approval.target encodes the origin+pathname captured at
         // approval creation (see sanitizeUrlForAuditTarget in
-        // src/execution/tool-dispatch.ts). Between then and now the
-        // page can navigate (agent action, user click on a card-side
-        // link, JS-driven redirect, a phishing redirect from the
-        // same window). Compare against the live page URL — if the
+        // src/execution/tool-dispatch.ts) joined to the locator list
+        // with a "#" separator. Between then and now the page can
+        // navigate (agent action, user click on a card-side link,
+        // JS-driven redirect, a phishing redirect from the same
+        // window). Compare against the live page URL — if the
         // origin+pathname no longer match what the user approved,
         // refuse: a fresh approval would be needed to authorize the
-        // new destination. Without this check the user's typed
-        // credential could land on whatever origin the page happens
-        // to be on at fill time, not the origin they consented to.
+        // new destination. Targets minted without a live URL (the
+        // dispatcher's fallback when no browser session existed yet)
+        // skip the check because there's no approved origin to
+        // compare against; the fill loop's own missing-session error
+        // becomes the authoritative refusal in that path.
         const approvedTargetUrl = (() => {
           const t = approval.target ?? "";
           const hashIndex = t.indexOf("#");
-          return hashIndex >= 0 ? t.slice(0, hashIndex) : t;
+          const urlPart = hashIndex >= 0 ? t.slice(0, hashIndex) : "";
+          return sanitizeUrlForAuditTarget(urlPart);
         })();
         if (approvedTargetUrl) {
           const liveUrl = peekCurrentBrowserUrl(taskId);

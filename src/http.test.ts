@@ -956,6 +956,103 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
+  test("POST /api/approvals/<id>/connect: submitted fill_secret values never appear in state.json, trace JSONL, or runtime.jsonl", async () => {
+    // End-to-end absence pin for the ADR's secret-handling guarantee:
+    // submitted credential values must flow request-scope only and
+    // never reach any persisted artifact. Without this test the only
+    // protection is manual code review of every audit/trace/log write
+    // touching the fill_secret path. Distinct marker strings let us
+    // grep the raw bytes after the request — partial matches would
+    // catch even an attempt to serialize a wrapper object containing
+    // the value.
+    const config = testConfig("fill-secret-no-state-leak");
+    const handler = createHandler(config);
+    const { createTask, upsertTask, createApproval } = await import("./state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "fill secret leak guard");
+      upsertTask(state, task);
+      return task.id;
+    });
+    // Approval target carries only the locator list (no URL) so the
+    // SEC-2 origin check is bypassed; the test exercises the audit /
+    // trace / log writers, not the page-binding guard which is
+    // covered by its own test.
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        taskId,
+        action: "browser.fill_secret",
+        target: "@e1,@e2",
+        risk: "high",
+        reason: "Sign in to the test site",
+        payload: {
+          slots: [
+            { name: "username", locator: "@e1", label: "Username", kind: "text" },
+            { name: "password", locator: "@e2", label: "Password", kind: "password" }
+          ],
+          reason: "Sign in",
+          toolCallId: "call_fill"
+        }
+      })
+    );
+    const USERNAME_MARKER = "tomsmith-LEAK-MARKER-zzzzz";
+    const PASSWORD_MARKER = "SuperSecretPassword-LEAK-MARKER-zzzzz";
+    await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/connect`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { username: USERNAME_MARKER, password: PASSWORD_MARKER } })
+      },
+      config.token
+    );
+    // No browser session exists, so browserFillByLocator returns
+    // errors for both slots and the audit row evidence carries
+    // `errors[]` (no values) + filledSlots = []. The approval is
+    // still resolved (atomic resolveApproval-before-fill from
+    // RACE-1) so the deny race is closed; the agent gets a
+    // partial-fill error result via resumeChatTask.
+
+    // Raw state.json bytes must not contain either marker.
+    const stateJsonPath = `${config.stateRoot}/state.json`;
+    const rawState = readFileSync(stateJsonPath, "utf8");
+    expect(rawState).not.toContain(USERNAME_MARKER);
+    expect(rawState).not.toContain(PASSWORD_MARKER);
+
+    // Trace JSONL (per-task) must not contain either marker. The
+    // file may not exist if no trace events fired for this task —
+    // an empty file is fine, the test only fails on a leak.
+    const traceJsonlPath = `${config.stateRoot}/traces/${taskId}.jsonl`;
+    if (existsSync(traceJsonlPath)) {
+      const rawTrace = readFileSync(traceJsonlPath, "utf8");
+      expect(rawTrace).not.toContain(USERNAME_MARKER);
+      expect(rawTrace).not.toContain(PASSWORD_MARKER);
+    }
+
+    // runtime.jsonl is the cross-task log file — also greppable.
+    const runtimeLogPath = `${config.logRoot}/runtime.jsonl`;
+    if (existsSync(runtimeLogPath)) {
+      const rawLog = readFileSync(runtimeLogPath, "utf8");
+      expect(rawLog).not.toContain(USERNAME_MARKER);
+      expect(rawLog).not.toContain(PASSWORD_MARKER);
+    }
+
+    // The audit row itself: defense-in-depth. Both `evidence` (would
+    // be undefined after redaction) and `target` must not contain
+    // the markers. `target` is preserved across redaction; this pin
+    // catches a future regression that would forget to sanitize URLs
+    // (SEC-3) or stuff secrets into the target field.
+    const auditRows = readState(config.instance).audit.filter(
+      (a) => a.action === "browser.fill_secret" && a.approvalId === approval.id
+    );
+    expect(auditRows.length).toBe(1);
+    const row = auditRows[0]!;
+    expect(row.redacted).toBe(true);
+    expect(row.evidence).toBeUndefined();
+    expect(row.target ?? "").not.toContain(USERNAME_MARKER);
+    expect(row.target ?? "").not.toContain(PASSWORD_MARKER);
+  });
+
   test("POST /api/approvals/<id>/connect refuses fill_secret when page navigated away from approved origin", async () => {
     // The approval.target encodes the origin+pathname the user
     // consented to fill into. If the page has navigated (agent
