@@ -985,7 +985,32 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
           el.setAttribute(attr, ref.slice(1));
           let value = "";
           if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
-            value = (el as HTMLInputElement).value ?? "";
+            // Suppress sensitive input values so a user-typed
+            // credential filled via browser.fill_secret does not
+            // round-trip back into the LLM through the next
+            // browser_snapshot. Trigger conditions:
+            //   - type="password" (matches what the rendered
+            //     browser visually masks)
+            //   - autocomplete hints that the field is a credential
+            //     or one-time code (covers cases where the page uses
+            //     a custom text input + JS reveal)
+            //   - data-gini-secret attribute stamped by
+            //     browserFillByLocator after a successful fill, so a
+            //     filled field stays masked even if the page swaps
+            //     out the type (some SPAs flip type=text after fill
+            //     to show the value visually)
+            const input = el as HTMLInputElement;
+            const inputType = (input.type || "").toLowerCase();
+            const autocomplete = (input.getAttribute("autocomplete") || "").toLowerCase();
+            const isSecretField = inputType === "password"
+              || autocomplete === "current-password"
+              || autocomplete === "new-password"
+              || autocomplete === "one-time-code"
+              || input.hasAttribute("data-gini-secret");
+            const rawValue = input.value ?? "";
+            value = isSecretField
+              ? (rawValue.length > 0 ? "[redacted]" : "")
+              : rawValue;
           } else if (el.tagName === "SELECT") {
             value = (el as HTMLSelectElement).value ?? "";
           }
@@ -1258,7 +1283,25 @@ export async function browserFillByLocator(
       const selector = args.locator.startsWith("@")
         ? `[${REF_ATTR_GLOBAL}="${args.locator.slice(1)}"]`
         : args.locator;
-      await session.page.locator(selector).fill(args.value, { timeout: 10_000 });
+      const locator = session.page.locator(selector);
+      await locator.fill(args.value, { timeout: 10_000 });
+      // Stamp the element with data-gini-secret so subsequent
+      // browser_snapshot calls redact its value (see
+      // snapshot walker's secret-field branch). type="password"
+      // already triggers redaction on its own; this covers fields
+      // the page may flip from password→text post-fill (some SPAs
+      // do this to show the value in their own custom UI) and
+      // generic credential fields that aren't explicitly password
+      // type but were filled via fill_secret. evaluate is wrapped
+      // in a try/catch on the page-side because losing the
+      // attribute stamp must not fail the fill itself.
+      await locator.evaluate((el) => {
+        try {
+          (el as Element).setAttribute("data-gini-secret", "true");
+        } catch {
+          /* attribute set best-effort */
+        }
+      });
       return { ok: true } as const;
     });
   } catch (error) {
