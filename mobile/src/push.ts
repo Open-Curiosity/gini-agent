@@ -26,7 +26,58 @@
 import { Platform } from "react-native";
 import { router } from "expo-router";
 import * as Notifications from "expo-notifications";
-import { api } from "./api";
+import { api, ApiError } from "./api";
+
+// Foreground presentation rule. Silent (content-available) pushes
+// must never surface a banner or play a sound — the badge update is
+// what they're for, and we manage that explicitly via refreshBadge
+// rather than letting APS set it. Alert payloads (currently the
+// approval_requested flow) keep their banner so the user notices the
+// prompt without unlocking the device. Setting this once at module
+// load means every received notification is classified at delivery.
+Notifications.setNotificationHandler({
+  handleNotification: async (notification) => {
+    const aps = (notification.request.content.data as { aps?: { "content-available"?: unknown } })?.aps;
+    const isSilent = aps?.["content-available"] === 1;
+    if (isSilent) {
+      return {
+        shouldShowAlert: false,
+        shouldPlaySound: false,
+        shouldSetBadge: false,
+        // SDK 54's NotificationBehavior added the banner / list flags
+        // alongside shouldShowAlert; the older field is preserved for
+        // back-compat but the new ones are what iOS actually reads.
+        shouldShowBanner: false,
+        shouldShowList: false
+      };
+    }
+    return {
+      shouldShowAlert: true,
+      shouldPlaySound: true,
+      shouldSetBadge: false,
+      shouldShowBanner: true,
+      shouldShowList: true
+    };
+  }
+});
+
+// Fetch the latest unread total from the gateway and apply it as the
+// app icon's badge count. Used as the side-effect of a silent push and
+// once on initial mount (so a cold launch picks up everything that
+// landed while the app was killed).
+export async function refreshBadge(): Promise<void> {
+  if (Platform.OS !== "ios") return;
+  try {
+    const { unread } = await api<{ unread: number }>("/badge");
+    await Notifications.setBadgeCountAsync(unread);
+  } catch (error) {
+    // 401 means we lost auth — leave the badge alone (the next /chat
+    // navigation will route to setup). Other errors are transient
+    // network blips; the next event-driven refresh will catch up.
+    if (error instanceof ApiError && error.status === 401) return;
+    // swallow — badge accuracy is best-effort
+  }
+}
 
 // Tracks whether we've already started the registration flow this
 // process. The chat detail screen mounts on every navigation; we
@@ -41,6 +92,7 @@ let registrationStarted = false;
 // `router.push` twice for every notification tap).
 let tokenSub: Notifications.Subscription | null = null;
 let responseSub: Notifications.Subscription | null = null;
+let receivedSub: Notifications.Subscription | null = null;
 
 export interface RegisterPushOptions {
   // Override the bundle id reported to the gateway — useful for
@@ -118,6 +170,29 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
         }
       });
     }
+
+    // Foreground delivery listener — fires for every received push,
+    // including silent ones (where `setNotificationHandler` returned
+    // shouldShow=false). We branch on the event discriminator from the
+    // payload's data block: `phase_completed` / `phase_failed` are the
+    // silent wakes the gateway fires when a task finishes and the user
+    // isn't actively watching. The badge refetch is the side-effect.
+    // If the relevant chat detail is already mounted, its SSE stream
+    // will deliver the same block — no imperative refetch needed from
+    // here.
+    if (!receivedSub) {
+      receivedSub = Notifications.addNotificationReceivedListener((notification) => {
+        const data = notification.request.content.data as
+          | { event?: string; sessionId?: string; aps?: { "content-available"?: unknown } }
+          | undefined;
+        if (!data) return;
+        const isSilent = data.aps?.["content-available"] === 1;
+        if (!isSilent) return;
+        if (data.event === "phase_completed" || data.event === "phase_failed") {
+          void refreshBadge();
+        }
+      });
+    }
   } catch {
     // Permission/token retrieval can fail on first launch in
     // unusual states (e.g. iOS Simulator without a Apple ID). Allow
@@ -158,4 +233,5 @@ export function __resetForTests(): void {
   registrationStarted = false;
   if (tokenSub) { tokenSub.remove(); tokenSub = null; }
   if (responseSub) { responseSub.remove(); responseSub = null; }
+  if (receivedSub) { receivedSub.remove(); receivedSub = null; }
 }

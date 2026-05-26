@@ -14,9 +14,9 @@ import {
   View
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { ApiError } from "@/src/api";
+import { api, ApiError } from "@/src/api";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
-import { registerForPushAsync } from "@/src/push";
+import { refreshBadge, registerForPushAsync } from "@/src/push";
 import {
   isTaskInFlight,
   useChatBlocks,
@@ -59,6 +59,34 @@ export default function ChatDetailScreen() {
   }, []);
 
   const list = useMemo<ChatBlock[]>(() => blocks.data ?? [], [blocks.data]);
+
+  // Mark the chat as read once we know which block id is latest.
+  // Debounced by `lastReadBlockIdRef` — we only POST when the tail
+  // block id changes, so streaming assistant_text deltas (which reuse
+  // the same id but advance updatedAt) don't fire a request per token.
+  // The badge refetch chases the write so the icon dot clears
+  // immediately.
+  const lastReadBlockIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!sessionId) return;
+    if (list.length === 0) return;
+    const latestId = list[list.length - 1]!.id;
+    if (lastReadBlockIdRef.current === latestId) return;
+    lastReadBlockIdRef.current = latestId;
+    void (async () => {
+      try {
+        await api(`/chat/${sessionId}/read`, {
+          method: "POST",
+          body: JSON.stringify({ lastReadBlockId: latestId })
+        });
+        await refreshBadge();
+      } catch {
+        // Best-effort — read state is rebuilt on the next navigation,
+        // and refreshBadge has its own swallow. A failure here only
+        // delays the badge clearing until the next event.
+      }
+    })();
+  }, [list, sessionId]);
 
   // Phase blocks are transient indicators — only render the latest one,
   // and only while it's still active (non-terminal). Historical phase

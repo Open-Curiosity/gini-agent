@@ -23,6 +23,7 @@ import { View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { primeCredentials, useAuth } from "@/src/auth";
+import { refreshBadge } from "@/src/push";
 import { family, theme } from "@/src/theme";
 
 // Single shared client across the tree so navigating between screens
@@ -147,6 +148,16 @@ function AuthCacheGuard() {
       qc.clear();
     }
     prevKeyRef.current = identity;
+    // Sync the app icon badge once per (newly-authed) identity. The
+    // gateway computes the unread total from chat_read_state across
+    // every session for the credential, so a cold launch that opened
+    // straight to setup picks up everything that arrived while the
+    // app was killed. Subsequent badge updates ride on silent pushes
+    // (push.ts:refreshBadge in the receive handler) and on chat-detail
+    // mount.
+    if (identity) {
+      void refreshBadge();
+    }
   }, [identity, qc]);
 
   return null;
