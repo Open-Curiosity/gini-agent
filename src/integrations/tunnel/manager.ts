@@ -442,7 +442,18 @@ export class TunnelManager {
     // would invoke osascript concurrently and race two writes against
     // Notes.app, producing duplicate notes or interleaved snapshot
     // mutations.
-    if (this.notesRefresh) return this.notesRefresh;
+    //
+    // Exception: if the in-flight refresh's signal has already been
+    // aborted (the operator just disabled the mirror via PATCH), don't
+    // piggyback on it — the aborted run is racing to no-op out without
+    // writing. A subsequent re-enable + refresh would otherwise return
+    // that aborted promise's stale snapshot instead of scheduling the
+    // fresh osascript pipeline the re-enable expects. Schedule a new
+    // refresh on a fresh AbortController so the upcoming write runs
+    // against the post-re-enable config.
+    if (this.notesRefresh && this.notesAbort && !this.notesAbort.signal.aborted) {
+      return this.notesRefresh;
+    }
     this.notesAbort = new AbortController();
     const refresh = this.refreshAppleNoteInner(this.notesAbort.signal);
     this.notesRefresh = refresh;
@@ -548,16 +559,64 @@ export class TunnelManager {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      // osascript surfaces AppleScript runtime errors with literal source
+      // text quoted in the message (e.g. `Can't get folder "..."`). When
+      // the failure touches the `body:` attribute, that source can
+      // include the bodyHtml fragment carrying the secret-bearing
+      // publicUrl. Scrub every known secret-value substring before the
+      // message lands in the snapshot — the BFF redacts again as defence
+      // in depth, but the in-process snapshot is the canonical source
+      // and must not carry the credential in plain text either.
+      const sanitized = sanitizeError(message, [
+        this.snapshot.publicUrl,
+        this.snapshot.secret,
+        this.snapshot.cloudflareUrl
+      ]);
       this.snapshot = {
         ...this.snapshot,
         appleNotes: {
           ...this.snapshot.appleNotes,
-          lastError: message
+          lastError: sanitized
         }
       };
     }
     return this.getSnapshot();
   }
+}
+
+/**
+ * Strip any secret-bearing substring from an error message. Returns the
+ * original message untouched when no sensitive values were found; appends
+ * a `(secret values redacted)` suffix when at least one substring was
+ * scrubbed so operators reading the snapshot or logs know the message was
+ * sanitised rather than truncated.
+ *
+ * Exported for unit tests and for the BFF redactor — both layers run this
+ * helper as defence in depth so a regression in one cannot leak through
+ * the other.
+ */
+export function sanitizeError(
+  message: string,
+  secrets: ReadonlyArray<string | null | undefined>
+): string {
+  let result = message;
+  let scrubbed = false;
+  // Sort by descending length so the publicUrl (which contains the
+  // secret as a substring) is replaced before the bare secret value.
+  // Otherwise the secret pass would leave behind the `${cloudflareUrl}/`
+  // prefix while the publicUrl pass would no longer match.
+  const candidates = secrets
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .sort((a, b) => b.length - a.length);
+  for (const value of candidates) {
+    if (!result.includes(value)) continue;
+    result = result.split(value).join("[redacted]");
+    scrubbed = true;
+  }
+  if (scrubbed && !result.endsWith("(secret values redacted)")) {
+    result = `${result} (secret values redacted)`;
+  }
+  return result;
 }
 
 /**
@@ -630,6 +689,23 @@ export function resolveTunnelConfig(
   // form back to disk.
   const notesEnabledMalformed = notesRaw?.enabled !== undefined && rawNotesEnabled === undefined;
   if (notesEnabledMalformed) mutated = true;
+  // Strict string coercion for the three Apple Notes label fields.
+  // `??` only substitutes on null/undefined, so a hand-edited
+  // `appleNotes.folder: 42` (number) or `account: true` (boolean)
+  // would slip through, get typed as `string` via the
+  // Required<PersistedAppleNotesConfig> contract, then crash
+  // downstream at apple-notes.ts:231 with "value.replace is not a
+  // function". Coerce non-strings to the default and flag mutated
+  // so server.ts persists the cleaned-up value on the next write.
+  const folderRaw = typeof notesRaw?.folder === "string" ? notesRaw.folder : undefined;
+  const folderMalformed = notesRaw?.folder !== undefined && folderRaw === undefined;
+  if (folderMalformed) mutated = true;
+  const noteNameRaw = typeof notesRaw?.noteName === "string" ? notesRaw.noteName : undefined;
+  const noteNameMalformed = notesRaw?.noteName !== undefined && noteNameRaw === undefined;
+  if (noteNameMalformed) mutated = true;
+  const accountRaw = typeof notesRaw?.account === "string" ? notesRaw.account : undefined;
+  const accountMalformed = notesRaw?.account !== undefined && accountRaw === undefined;
+  if (accountMalformed) mutated = true;
   const appleNotes = {
     // Both the malformed-input branch and the absent-input branch
     // resolve to `false` (notesEnabledDefault === false), but we
@@ -637,9 +713,9 @@ export function resolveTunnelConfig(
     // semantics for malformed values flagged above.
     enabled: rawNotesEnabled
       ?? (notesEnabledMalformed ? false : notesEnabledDefault),
-    folder: notesRaw?.folder ?? "gini",
-    noteName: notesRaw?.noteName ?? `gini-tunnel-${config.instance}`,
-    account: notesRaw?.account ?? "iCloud"
+    folder: folderRaw ?? "gini",
+    noteName: noteNameRaw ?? `gini-tunnel-${config.instance}`,
+    account: accountRaw ?? "iCloud"
   };
   return {
     config: {

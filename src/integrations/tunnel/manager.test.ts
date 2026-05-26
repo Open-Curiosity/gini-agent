@@ -5,6 +5,7 @@ import {
   composeAppleNoteBody,
   renderSnapshotQr,
   resolveTunnelConfig,
+  sanitizeError,
   TunnelManager,
   type TunnelManagerOptions
 } from "./manager";
@@ -88,6 +89,49 @@ describe("resolveTunnelConfig", () => {
       Object.defineProperty(process, "platform", { value: originalPlatform });
     }
   });
+
+  test("malformed appleNotes.folder (number) falls back to default and flags mutated", () => {
+    // `??` only substitutes on null/undefined, so a hand-edited
+    // number would slip through into the resolved string-typed
+    // field and crash apple-notes.ts:231 (`value.replace is not a
+    // function`). Coerce non-strings to the default and flag
+    // mutated so the bad disk value gets cleaned up on next write.
+    const config = baseConfig();
+    config.tunnel = {
+      secret: "abcdefghij1234567890",
+      appleNotes: { folder: 42 as unknown as string }
+    };
+    const result = resolveTunnelConfig(config);
+    expect(result.config.appleNotes.folder).toBe("gini");
+    expect(result.mutated).toBe(true);
+  });
+
+  test("malformed appleNotes.noteName (null) falls back to default and flags mutated", () => {
+    // `null` would already substitute under `??`, but the explicit
+    // `typeof === "string"` check pins it as non-string and routes
+    // it through the same cleanup-write path as other malformed
+    // primitives. The disk value gets normalized to the default
+    // on the next persist.
+    const config = baseConfig();
+    config.tunnel = {
+      secret: "abcdefghij1234567890",
+      appleNotes: { noteName: null as unknown as string }
+    };
+    const result = resolveTunnelConfig(config);
+    expect(result.config.appleNotes.noteName).toBe("gini-tunnel-tunnel-test");
+    expect(result.mutated).toBe(true);
+  });
+
+  test("malformed appleNotes.account (boolean) falls back to default and flags mutated", () => {
+    const config = baseConfig();
+    config.tunnel = {
+      secret: "abcdefghij1234567890",
+      appleNotes: { account: false as unknown as string }
+    };
+    const result = resolveTunnelConfig(config);
+    expect(result.config.appleNotes.account).toBe("iCloud");
+    expect(result.mutated).toBe(true);
+  });
 });
 
 describe("TunnelManager", () => {
@@ -143,6 +187,78 @@ describe("TunnelManager", () => {
       expect(contents).not.toContain(snapshot.secret);
     }
     await manager.stop();
+  });
+
+  test("Apple Notes catch sanitises the publicUrl out of lastError", async () => {
+    // osascript surfaces AppleScript runtime errors with the literal
+    // source script text quoted in the message. A failure touching the
+    // `body:` attribute can echo the bodyHtml fragment carrying the
+    // secret-bearing publicUrl — that string must never land on the
+    // snapshot in plain text.
+    setupInstanceDir("tunnel-manager-notes-error-redaction");
+    const secret = "abcd1234efgh5678ijkl9012mnop3456";
+    const manager = new TunnelManager({
+      instance: "tunnel-manager-notes-error-redaction",
+      config: {
+        enabled: true,
+        secret,
+        appleNotes: { enabled: true, folder: "g", noteName: "n", account: "iCloud" }
+      },
+      targetUrl: "http://127.0.0.1:7778",
+      spawn: () => scriptedChild(["INF https://leaky-tunnel-1.trycloudflare.com\n"]),
+      osascript: async (script) => {
+        if (script.includes("name of every account")) {
+          return { stdout: "yes\n", stderr: "", exitCode: 0 };
+        }
+        // Simulate AppleScript echoing the body fragment, including the
+        // publicUrl, into the error message — the exact failure mode
+        // the manager has to defend against.
+        throw new Error(
+          `osascript: execution error: Can't get folder "x". body was https://leaky-tunnel-1.trycloudflare.com/${secret} (-1728)`
+        );
+      }
+    });
+    await manager.start();
+    await manager.flushNotes();
+    const snapshot = manager.getSnapshot();
+    expect(snapshot.appleNotes.lastError).not.toBeNull();
+    expect(snapshot.appleNotes.lastError).not.toContain(secret);
+    expect(snapshot.appleNotes.lastError).not.toContain(
+      `https://leaky-tunnel-1.trycloudflare.com/${secret}`
+    );
+    // The redacted marker tells operators the message was sanitised
+    // rather than truncated — without it, an operator might miss that
+    // the error was modified at all.
+    expect(snapshot.appleNotes.lastError).toContain("(secret values redacted)");
+    await manager.stop();
+  });
+
+  test("sanitizeError leaves messages with no secrets untouched", () => {
+    const out = sanitizeError("permission denied to access Notes.app", [
+      "abcdefg",
+      "https://x.trycloudflare.com/abcdefg",
+      "https://x.trycloudflare.com"
+    ]);
+    expect(out).toBe("permission denied to access Notes.app");
+    expect(out).not.toContain("(secret values redacted)");
+  });
+
+  test("sanitizeError tolerates null/undefined/empty secret slots", () => {
+    // `recordStartFailure` and pre-spawn errors can fire before the
+    // publicUrl is observed — the secrets array will contain null
+    // entries. The helper must silently ignore those and still scrub
+    // whatever real values are present.
+    const out = sanitizeError("body=https://x.trycloudflare.com/sss with sss inside", [
+      null,
+      undefined,
+      "",
+      "sss",
+      "https://x.trycloudflare.com/sss",
+      "https://x.trycloudflare.com"
+    ]);
+    expect(out).not.toContain("sss");
+    expect(out).not.toContain("https://x.trycloudflare.com");
+    expect(out).toContain("(secret values redacted)");
   });
 
   test("refreshAppleNote skips osascript entirely when appleNotes.enabled is false", async () => {
@@ -304,6 +420,96 @@ describe("TunnelManager", () => {
     // Both must dedup onto a fresh single-flight, not the stale one.
     expect(await second).toBe(await third);
     expect((await second).appleNotes.lastSyncedAt).not.toBeNull();
+    await manager.stop();
+  });
+
+  test("refreshAppleNote after a disable-triggered abort schedules a fresh write", async () => {
+    setupInstanceDir("tunnel-manager-notes-abort-rescheduling");
+    // Track how many distinct osascript pipelines actually invoke the
+    // write phase. Without the fresh-schedule guard, a re-enable that
+    // races the aborted refresh piggybacks on the aborted promise and
+    // the write never runs against the new config.
+    let writePhaseCalls = 0;
+    // Per-refresh probe gates. Each refreshAppleNote() pulls the next
+    // gate from this queue; the test feeds gates so it can control
+    // when each refresh's probe completes (and thus when the outer
+    // refreshAppleNote await clears the notesRefresh latch).
+    type Releaser = (mode: "ok" | "abort") => void;
+    const probeGates: Array<{ promise: Promise<"ok" | "abort">; release: Releaser }> = [];
+    const enqueueGate = (): Releaser => {
+      const { promise, resolve } = Promise.withResolvers<"ok" | "abort">();
+      probeGates.push({ promise, release: resolve });
+      return resolve;
+    };
+    const manager = new TunnelManager({
+      instance: "tunnel-manager-notes-abort-rescheduling",
+      config: {
+        enabled: true,
+        secret: "abcd1234efgh5678ijkl9012mnop3456",
+        appleNotes: { enabled: true, folder: "g", noteName: "n", account: "iCloud" }
+      },
+      targetUrl: "http://127.0.0.1:7778",
+      spawn: () => scriptedChild(["INF https://abort-resched-1.trycloudflare.com\n"]),
+      osascript: async (script, options) => {
+        if (script.includes("name of every account")) {
+          // Pop the next queued gate. If none queued, the probe
+          // resolves immediately (used for refreshes the test doesn't
+          // need to interleave with).
+          const gate = probeGates.shift();
+          if (gate) {
+            const abortPromise = new Promise<"abort">((resolve) => {
+              options?.signal?.addEventListener("abort", () => resolve("abort"), { once: true });
+            });
+            const mode = await Promise.race([gate.promise, abortPromise]);
+            if (mode === "abort" || options?.signal?.aborted) {
+              return { stdout: "", stderr: "aborted", exitCode: 137 };
+            }
+          }
+          return { stdout: "yes\n", stderr: "", exitCode: 0 };
+        }
+        // The write-phase script (set body of note) — count it so the
+        // test can assert a fresh refresh actually ran.
+        writePhaseCalls += 1;
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+    });
+    // Gate the start()-time fire-and-forget refresh so we don't race
+    // it against the test's own refresh calls below.
+    const startReleaser = enqueueGate();
+    await manager.start();
+    startReleaser("ok");
+    await manager.flushNotes();
+    expect(writePhaseCalls).toBe(1);
+    // Queue a gate for the refresh that will be aborted. Do NOT release
+    // it — the disable's abort signal is what unblocks the probe.
+    enqueueGate();
+    const aborted = manager.refreshAppleNote();
+    // Yield so refreshAppleNoteInner enters the probe and registers
+    // its abort listener before we trigger the disable.
+    await Bun.sleep(0);
+    // Disable WITHOUT awaiting the aborted refresh. This pins the bug:
+    // notesRefresh is still set to the aborted promise (it hasn't yet
+    // unwound through its finally), and the upcoming re-enable +
+    // refreshAppleNote() call must NOT return that stale promise.
+    manager.updateConfig({ appleNotes: { enabled: false, folder: "g", noteName: "n", account: "iCloud" } });
+    // Re-enable IMMEDIATELY (in the same task) so the test never gives
+    // the aborted refresh a chance to clear notesRefresh via its
+    // finally. With the bug, refreshAppleNote() sees a non-null
+    // notesRefresh and short-circuits, returning the aborted promise.
+    manager.updateConfig({ appleNotes: { enabled: true, folder: "g", noteName: "n", account: "iCloud" } });
+    const reEnabled = manager.refreshAppleNote();
+    // Now release everything: the aborted refresh finishes with no
+    // write (because !enabled was true during its inner re-check), and
+    // the re-enabled refresh runs the write phase against the freshly
+    // restored config.
+    await aborted;
+    const reEnabledSnapshot = await reEnabled;
+    // With the fix: aborted promise was bypassed; a fresh refresh
+    // ran and called the write phase. Without the fix:
+    // refreshAppleNote() returned the aborted promise and no second
+    // write fired.
+    expect(writePhaseCalls).toBe(2);
+    expect(reEnabledSnapshot.appleNotes.lastSyncedAt).not.toBeNull();
     await manager.stop();
   });
 
