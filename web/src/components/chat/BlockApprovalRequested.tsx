@@ -4,11 +4,39 @@ import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { RiskPill } from "@/components/StatusPill";
 import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
 import { api } from "@/lib/api";
 import { useApprovals, useInvalidate, useProviders } from "@/lib/queries";
 import type { Approval, ApprovalRequestedBlock } from "@runtime/types";
+
+// Allowed HTML input-type hints for browser.fill_secret slots. Any
+// other value on the payload falls back to "text" so a malformed
+// payload (or a future field we haven't taught the UI about) can't
+// widen the rendered input type.
+const ALLOWED_KINDS = new Set(["text", "password", "email", "tel", "number", "url"]);
+
+interface FillSecretSlot {
+  name: string;
+  locator: string;
+  label: string;
+  kind: "text" | "password" | "email" | "tel" | "number" | "url";
+}
+
+function pickFillSecretSlots(raw: unknown): FillSecretSlot[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const e = entry as { name?: unknown; locator?: unknown; label?: unknown; kind?: unknown };
+    if (typeof e.name !== "string" || typeof e.locator !== "string") return [];
+    const kind = typeof e.kind === "string" && ALLOWED_KINDS.has(e.kind)
+      ? (e.kind as FillSecretSlot["kind"])
+      : "text";
+    const label = typeof e.label === "string" ? e.label : e.name;
+    return [{ name: e.name, locator: e.locator, label, kind }];
+  });
+}
 
 // Inline Approve / Deny / Connect actions for an approval_requested block.
 // The block itself carries `approvalId`, `action`, `risk`, and `summary`
@@ -84,6 +112,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
   });
 
   const isConnectorRequest = block.action === "connector.request";
+  const isBrowserFillSecret = block.action === "browser.fill_secret";
   const providerId = isConnectorRequest && approval
     ? String(approval.payload?.provider ?? "")
     : "";
@@ -92,6 +121,39 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       ? (approval.payload.providerLabel as string)
       : providerId
     : "";
+  const fillSlots: FillSecretSlot[] = isBrowserFillSecret && approval
+    ? pickFillSecretSlots(approval.payload?.slots)
+    : [];
+  const [fillValues, setFillValues] = useState<Record<string, string>>({});
+  const fillSubmit = useMutation({
+    mutationFn: async () => {
+      // Submit value never leaves this function's request scope.
+      // The /connect endpoint detects action=browser.fill_secret and
+      // pipes each entry's value into playwright.fill on the live
+      // page. Local state is cleared on success so the value never
+      // lingers in React state past the click.
+      const response = await api<{ ok: boolean; message?: string; filledSlots?: string[] }>(
+        `/approvals/${block.approvalId}/connect`,
+        {
+          method: "POST",
+          body: JSON.stringify({ secrets: fillValues })
+        }
+      );
+      return response;
+    },
+    onSuccess: (result) => {
+      if (result.ok) {
+        setFillValues({});
+        invalidate(["approvals", "tasks", "task", "chat", "events", "audit"]);
+      } else {
+        toast.error(result.message ?? "Fill failed; please try again.");
+      }
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+  const fillReady = isBrowserFillSecret
+    && fillSlots.length > 0
+    && fillSlots.every((s) => typeof fillValues[s.name] === "string" && fillValues[s.name].length > 0);
 
   return (
     <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
@@ -111,6 +173,31 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
         <pre className="mt-2 max-h-48 overflow-auto rounded-md border border-border bg-background/40 p-2 font-mono text-[10px]">
           {JSON.stringify(approval.payload, null, 2)}
         </pre>
+      ) : null}
+      {isBrowserFillSecret && fillSlots.length > 0 && isPending ? (
+        <div className="mt-2 space-y-2">
+          {fillSlots.map((slot) => (
+            <div key={slot.name} className="space-y-1">
+              <label className="block text-[11px] text-muted-foreground" htmlFor={`${block.approvalId}-${slot.name}`}>
+                {slot.label}
+              </label>
+              <Input
+                id={`${block.approvalId}-${slot.name}`}
+                type={slot.kind}
+                value={fillValues[slot.name] ?? ""}
+                onChange={(e) => setFillValues((prev) => ({ ...prev, [slot.name]: e.target.value }))}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
+                data-1p-ignore="true"
+                data-lpignore="true"
+                data-form-type="other"
+                disabled={fillSubmit.isPending}
+              />
+            </div>
+          ))}
+        </div>
       ) : null}
       <div className="mt-2 flex gap-2">
         {isConnectorRequest ? (
@@ -132,6 +219,24 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
               onClick={() => decide.mutate({ op: "deny" })}
             >
               Cancel
+            </Button>
+          </>
+        ) : isBrowserFillSecret ? (
+          <>
+            <Button
+              size="sm"
+              disabled={fillSubmit.isPending || !isPending || !fillReady}
+              onClick={() => fillSubmit.mutate()}
+            >
+              Submit
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={decide.isPending || !isPending}
+              onClick={() => decide.mutate({ op: "deny" })}
+            >
+              Deny
             </Button>
           </>
         ) : (
