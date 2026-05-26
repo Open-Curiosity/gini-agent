@@ -612,17 +612,29 @@ export function resolveTunnelConfig(
   if (rawEnabled === undefined && enabled !== false) mutated = true;
   if (raw?.enabled !== undefined && typeof raw.enabled !== "boolean") mutated = true;
   const notesRaw = raw?.appleNotes;
-  const notesEnabledDefault = process.platform === "darwin";
+  // Default off on every platform. We previously defaulted on for
+  // darwin, but the Apple Notes mirror writes the secret-bearing
+  // tunnel URL into iCloud — that URL bypasses bearer auth, so any
+  // iCloud-signed device on the same account can reach the tunnel.
+  // Shipping that surface without explicit operator consent is an
+  // unauth-bypass we don't want by default. The operator opts in
+  // via the Settings card toggle (PATCH /api/tunnel sets
+  // appleNotes.enabled=true).
+  const notesEnabledDefault = false;
   const rawNotesEnabled = typeof notesRaw?.enabled === "boolean" ? notesRaw.enabled : undefined;
   // When notesRaw.enabled is explicitly present but not a boolean
-  // (e.g., a hand-edited `"false"` string), fail closed instead of
-  // falling back to the macOS default-on. The operator clearly
-  // intended SOMETHING; default-on would override their intent and
-  // start writing the secret-bearing URL into iCloud Notes. Also
-  // flag mutated so server.ts persists the normalized form back.
+  // (e.g., a hand-edited `"false"` string), fail closed rather than
+  // applying the default. The operator clearly intended SOMETHING,
+  // and we'd rather refuse to write the secret URL to iCloud than
+  // guess. Also flag mutated so server.ts persists the normalized
+  // form back to disk.
   const notesEnabledMalformed = notesRaw?.enabled !== undefined && rawNotesEnabled === undefined;
   if (notesEnabledMalformed) mutated = true;
   const appleNotes = {
+    // Both the malformed-input branch and the absent-input branch
+    // resolve to `false` (notesEnabledDefault === false), but we
+    // keep them distinct to preserve the `mutated = true` write-back
+    // semantics for malformed values flagged above.
     enabled: rawNotesEnabled
       ?? (notesEnabledMalformed ? false : notesEnabledDefault),
     folder: notesRaw?.folder ?? "gini",

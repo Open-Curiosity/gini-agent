@@ -67,12 +67,16 @@ describe("resolveTunnelConfig", () => {
     expect(result.config.enabled).toBe(false);
   });
 
-  test("apple notes enabled defaults to true on darwin and false elsewhere", () => {
+  test("apple notes enabled defaults to false on every platform", () => {
+    // The Notes mirror writes the secret-bearing tunnel URL to
+    // iCloud, which bypasses bearer auth. We require explicit
+    // operator consent before that surface exists, regardless of
+    // host platform — pin default-off on both darwin and non-darwin.
     const originalPlatform = process.platform;
     Object.defineProperty(process, "platform", { value: "darwin" });
     try {
       const a = resolveTunnelConfig(baseConfig());
-      expect(a.config.appleNotes.enabled).toBe(true);
+      expect(a.config.appleNotes.enabled).toBe(false);
     } finally {
       Object.defineProperty(process, "platform", { value: originalPlatform });
     }
