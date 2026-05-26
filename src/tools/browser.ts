@@ -1556,6 +1556,23 @@ export async function browserFillByLocator(
   if (typeof args.value !== "string") {
     return { ok: false, code: "validation-error", error: "Missing required string argument: value" };
   }
+  // Capture the live secret list into closure scope BEFORE the
+  // session work runs. disconnectSharedBrowser has a bounded
+  // DISCONNECT_DRAIN_DEADLINE_MS (5s) but locator.fill has a
+  // 10s timeout — so a disconnect that fires mid-fill can run
+  // clearFilledSecrets and empty the global registry BEFORE the
+  // fill catch runs. A purely-global-read in the catch would
+  // then redact against an empty set and leak the typed value
+  // via the Playwright "Call log: fill(...)" verbiage. The
+  // local snapshot survives teardown; we include the about-to-
+  // be-recorded value in case recordFilledSecret hasn't run
+  // yet (or skipped the value for being below the redaction
+  // floor — registering it locally for THIS error path is safe
+  // because the local list never escapes this function).
+  const secretsForCatch: string[] = [...allRegisteredSecrets()];
+  if (typeof args.value === "string" && args.value.length > 0 && !secretsForCatch.includes(args.value)) {
+    secretsForCatch.push(args.value);
+  }
   try {
     return await withSession(taskId, async (session) => {
       // Per-slot URL re-check immediately before the playwright
@@ -1654,13 +1671,17 @@ export async function browserFillByLocator(
     // pre-fill, so even a clear-on-input page hostile script
     // can't unregister the value.
     const raw = error instanceof Error ? error.message : String(error);
-    // Union across every active task's registry — see ok() / the
-    // shared-BrowserContext comment above. Another task's typed
-    // value may appear in this task's error message via the
-    // Call log: fill("...") path if the agent is, e.g., copying
-    // a value from one page to another.
+    // Redact against the locally-captured secret list (snapshotted
+    // BEFORE the fill, so it survives disconnect's bounded drain
+    // deadline). Falling back to the live global registry would
+    // miss the typed value if disconnectSharedBrowser fired and
+    // cleared the registry mid-fill — see the secretsForCatch
+    // capture above. The local list also defends against
+    // recordFilledSecret skipping short values (the floor would
+    // bar the registry entry but the local capture still gets
+    // redacted for this error path only).
     void taskId;
-    const sanitized = redactSecretValuesFromString(raw, allRegisteredSecrets());
+    const sanitized = redactSecretValuesFromString(raw, secretsForCatch);
     return { ok: false, code: "fill-error", error: sanitized };
   }
 }
