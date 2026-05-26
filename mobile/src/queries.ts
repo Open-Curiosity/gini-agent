@@ -217,13 +217,18 @@ export function useChatBlocks(sessionId: string | null): {
   const lastSeenIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!sessionId) {
-      setData(undefined);
-      setError(null);
-      setIsPending(false);
-      dataRef.current = undefined;
-      return;
-    }
+    // Reset unconditionally before branching so a sessionId change
+    // (chat A → chat B) doesn't leave chat A's blocks rendered until
+    // chat B's seed resolves. The previous effect's cleanup tears down
+    // the old subscription; this clears the view so the next paint
+    // doesn't briefly mix the two chats' contents.
+    setData(undefined);
+    setError(null);
+    setIsPending(Boolean(sessionId));
+    dataRef.current = undefined;
+    lastSeenIdRef.current = null;
+
+    if (!sessionId) return;
 
     let cancelled = false;
     let seeded = false;
