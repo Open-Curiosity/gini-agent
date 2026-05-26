@@ -285,10 +285,18 @@ export function useChatBlocks(sessionId: string | null): {
           // parse failure here is a wire-protocol bug, not a user one.
         }
       });
-      source.addEventListener("error", () => {
-        // The library handles reconnect via pollingInterval; we don't
-        // surface transient errors to the UI to avoid flicker. Last-Event-
-        // ID resumes the stream on the next open.
+      source.addEventListener("error", (ev) => {
+        if (cancelled) return;
+        // 401 means our bearer token was rejected — the library will
+        // happily keep retrying with the same dead token, so we surface
+        // it to the screen (which already routes 401s to the setup flow)
+        // and tear the connection down. Other errors are transient
+        // network blips; let the library reconnect on its polling
+        // interval, where Last-Event-ID will resume the stream.
+        if (ev.type === "error" && "xhrStatus" in ev && ev.xhrStatus === 401) {
+          setError(new ApiError(401, "Unauthorized"));
+          closeStream();
+        }
       });
       es = source;
     };
