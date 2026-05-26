@@ -1,0 +1,134 @@
+// Tests for the browser_fill_secrets dispatch surface.
+//
+// The amber approval card that fill_secret relies on is web-only React
+// UI; the messaging bridge mirrors (Telegram, Discord) only forward
+// assistant_text after the task reaches a terminal status. If the tool
+// were allowed to mint an approval while the conversation was
+// originating from Telegram/Discord, the task would park in
+// awaiting_approval and the mirror would skip with
+// reply_skip_non_terminal — the messaging-surface user would see a
+// typing indicator that eventually stops and never any card.
+//
+// The dispatch refuses the tool synchronously when the owning chat
+// session has a messaging source, so the agent gets a structured error
+// it can verbalize back as plain assistant text ("open the web chat to
+// enter credentials"), which IS something the mirror relays.
+//
+// Tests below pin:
+//   - Telegram-sourced session => sync error envelope, no approval row
+//   - Discord-sourced session  => sync error envelope, no approval row
+//   - Web-only session (no source) => pending approval as before
+
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
+import { dispatchToolCall } from "./tool-dispatch";
+import { createChatSession, createTask, mutateState, readState, upsertTask } from "../state";
+import type { RuntimeConfig } from "../types";
+
+const ROOT = "/tmp/gini-browser-fill-secrets-dispatch-test";
+
+beforeAll(() => {
+  rmSync(ROOT, { recursive: true, force: true });
+  process.env.GINI_STATE_ROOT = ROOT;
+  process.env.GINI_LOG_ROOT = `${ROOT}-logs`;
+});
+
+afterAll(() => {
+  rmSync(ROOT, { recursive: true, force: true });
+});
+
+function makeConfig(instance: string): RuntimeConfig {
+  return {
+    instance,
+    port: 0,
+    token: "test",
+    provider: { name: "echo", model: "gini-echo-v0" },
+    workspaceRoot: ROOT,
+    stateRoot: ROOT,
+    logRoot: `${ROOT}-logs`
+  };
+}
+
+async function seedTaskWithSession(
+  config: RuntimeConfig,
+  source?: Parameters<typeof createChatSession>[2]
+): Promise<string> {
+  return mutateState(config.instance, (state) => {
+    const session = createChatSession(state, "test session", source);
+    const task = createTask(state.instance, "test");
+    task.chatSessionId = session.id;
+    upsertTask(state, task);
+    session.taskIds.push(task.id);
+    return task.id;
+  });
+}
+
+const VALID_ARGS = JSON.stringify({
+  slots: [{ name: "username", locator: "@e1", label: "Username", kind: "text" }],
+  reason: "Login"
+});
+
+describe("browser_fill_secrets dispatch surface guard", () => {
+  test("returns sync error when chat session originates from Telegram", async () => {
+    const config = makeConfig("fill-secrets-telegram");
+    const taskId = await seedTaskWithSession(config, {
+      kind: "telegram",
+      bridgeId: "bridge_t",
+      chatId: 123,
+      target: "123"
+    });
+
+    const result = await dispatchToolCall(config, taskId, "browser_fill_secrets", "call_1", VALID_ARGS);
+
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("only works in the web chat");
+    expect(parsed.error).toContain("telegram");
+
+    // No approval row should have been created — the guard fires before
+    // mutateState/createApproval runs.
+    const state = readState(config.instance);
+    expect(state.approvals.length).toBe(0);
+  });
+
+  test("returns sync error when chat session originates from Discord", async () => {
+    const config = makeConfig("fill-secrets-discord");
+    const taskId = await seedTaskWithSession(config, {
+      kind: "discord",
+      bridgeId: "bridge_d",
+      channelId: "999",
+      target: "999"
+    });
+
+    const result = await dispatchToolCall(config, taskId, "browser_fill_secrets", "call_1", VALID_ARGS);
+
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("only works in the web chat");
+    expect(parsed.error).toContain("discord");
+
+    const state = readState(config.instance);
+    expect(state.approvals.length).toBe(0);
+  });
+
+  test("mints a pending approval when chat session has no messaging source (web chat)", async () => {
+    const config = makeConfig("fill-secrets-web");
+    // Omit `source` — that's how the web chat path creates sessions.
+    const taskId = await seedTaskWithSession(config, undefined);
+
+    const result = await dispatchToolCall(config, taskId, "browser_fill_secrets", "call_1", VALID_ARGS);
+
+    expect(result.kind).toBe("pending");
+    if (result.kind !== "pending") throw new Error("unreachable");
+    expect(typeof result.approvalId).toBe("string");
+
+    const state = readState(config.instance);
+    const approval = state.approvals.find((a) => a.id === result.approvalId);
+    expect(approval).toBeDefined();
+    expect(approval?.action).toBe("browser.fill_secret");
+  });
+});

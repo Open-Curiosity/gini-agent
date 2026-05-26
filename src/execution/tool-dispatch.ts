@@ -2479,6 +2479,33 @@ async function browserFillSecretsTool(
   toolCallId: string,
   args: Record<string, unknown>
 ): Promise<DispatchResult> {
+  // Surface guard: the amber approval card is React UI on the BFF, and
+  // the messaging bridge mirrors (telegram-poller, discord-poller) only
+  // relay assistant_text after the task reaches a terminal status.
+  // Minting a fill_secret approval would park the task in
+  // awaiting_approval, the mirror would skip with
+  // reply_skip_non_terminal, and the user on Telegram/Discord would see
+  // a typing indicator that eventually stops — no error, no card, no
+  // way to submit. Fail the tool synchronously so the agent gets a
+  // tool_result it can verbalize back as a plain assistant message
+  // ("open the web chat to enter credentials"), which the mirror will
+  // relay once the task settles.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind;
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `browser_fill_secrets only works in the web chat (this conversation is over ${surfaceKind}). Reply to the user in text asking them to open the web chat to enter their credentials, then continue once they confirm.`
+      })
+    };
+  }
+
   const rawSlots = Array.isArray(args.slots) ? args.slots : [];
   const slots = rawSlots.flatMap((s) => {
     if (!s || typeof s !== "object") return [];
