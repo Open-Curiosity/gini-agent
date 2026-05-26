@@ -6,6 +6,11 @@
     "orientation": "portrait",
     "scheme": "gini",
     "userInterfaceStyle": "automatic",
+    "runtimeVersion": { "policy": "appVersion" },
+    "updates": {
+      "url": "https://u.expo.dev/REPLACE_AFTER_EAS_INIT",
+      "fallbackToCacheTimeout": 0
+    },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "ai.lilaclabs.gini.mobile"
@@ -20,7 +25,8 @@
       "bundler": "metro"
     },
     "plugins": [
-      "expo-router"
+      "expo-router",
+      "expo-updates"
     ],
     "experiments": {
       "typedRoutes": true
