@@ -81,7 +81,18 @@ export async function spawnQuickTunnel(options: SpawnTunnelOptions): Promise<Tun
     }
   }
 
-  const urlPromise = parseUrlFromStderr(child.stderr, logHandle);
+  // The parser resolves with the URL plus a `drained` promise that
+  // settles when the background drainer finishes reading stderr. We
+  // need to await that drainer before closing the log handle on exit,
+  // otherwise the last few stderr lines (usually the most diagnostic
+  // info about why cloudflared crashed) get dropped because the
+  // drainer's pending `log.write()` throws "file closed" after we
+  // close the handle.
+  let drained: Promise<void> = Promise.resolve();
+  const urlPromise = parseUrlFromStderr(child.stderr, logHandle).then((result) => {
+    drained = result.drained;
+    return result.url;
+  });
   const timeoutMs = options.startupTimeoutMs ?? 25_000;
 
   // Externally-aborted spawn: the parent runtime can cancel before
@@ -139,11 +150,18 @@ export async function spawnQuickTunnel(options: SpawnTunnelOptions): Promise<Tun
   const handle: TunnelHandle = {
     url,
     pid: child.pid,
-    exited: child.exited.finally(() => {
+    exited: child.exited.finally(async () => {
       if (logHandle) {
-        // Best-effort flush; the file handle stays open across exit so the
-        // tail of stderr lands. Failure to close is non-fatal.
-        void logHandle.close().catch(() => {});
+        // Wait for the background drainer to finish before closing the
+        // log handle, so the tail of stderr — which often carries the
+        // most diagnostic info about why cloudflared crashed — actually
+        // lands in the log. Bounded to 1s so a misbehaving cloudflared
+        // can't block gateway shutdown indefinitely.
+        try {
+          await Promise.race([drained, Bun.sleep(1_000)]);
+        } catch { /* drainer errors are already swallowed */ }
+        // Best-effort close; failure is non-fatal.
+        try { await logHandle.close(); } catch { /* ignore */ }
         logHandle = null;
       }
     }),
@@ -171,7 +189,8 @@ export async function readTunnelUrlFromStream(
   stream: ReadableStream<Uint8Array> | null
 ): Promise<string> {
   if (!stream) throw new Error("cloudflared stderr is not piped");
-  return parseUrlFromStderr(stream, null);
+  const result = await parseUrlFromStderr(stream, null);
+  return result.url;
 }
 
 /**
@@ -190,7 +209,7 @@ export function extractTunnelUrl(line: string): string | null {
 async function parseUrlFromStderr(
   stream: ReadableStream<Uint8Array> | null,
   log: FileHandle | null
-): Promise<string> {
+): Promise<{ url: string; drained: Promise<void> }> {
   if (!stream) throw new Error("cloudflared stderr is not piped");
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -213,8 +232,8 @@ async function parseUrlFromStderr(
         // cloudflared's writer blocks, eventually deadlocking the
         // subprocess.
         try { reader.releaseLock(); } catch { /* ignore */ }
-        keepDraining(stream, log);
-        return url;
+        const drained = keepDraining(stream, log);
+        return { url, drained };
       }
       nl = buffer.indexOf("\n");
     }
@@ -222,12 +241,14 @@ async function parseUrlFromStderr(
   throw new Error("cloudflared stderr closed before a URL appeared");
 }
 
-function keepDraining(stream: ReadableStream<Uint8Array>, log: FileHandle | null): void {
+function keepDraining(stream: ReadableStream<Uint8Array>, log: FileHandle | null): Promise<void> {
   // Continue reading stderr without blocking startup. When a log handle
   // is provided we copy bytes into it; without one we discard. Errors
   // are swallowed so a closed log or stream can't keep the process
-  // alive after exit.
-  void (async () => {
+  // alive after exit. The returned promise settles when the stream
+  // closes (or errors), so callers can await it before closing the log
+  // handle to avoid losing the tail of stderr.
+  return (async () => {
     try {
       const reader = stream.getReader();
       while (true) {

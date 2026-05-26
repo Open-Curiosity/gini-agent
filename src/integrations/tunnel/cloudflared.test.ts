@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   extractTunnelUrl,
   readTunnelUrlFromStream,
@@ -121,6 +124,64 @@ describe("spawnQuickTunnel", () => {
       Bun.sleep(1000).then(() => "leaked" as const)
     ]);
     expect(winner).toBe("exited");
+  });
+
+  test("late stderr bytes land in the log before the handle closes", async () => {
+    // Simulates the buffer-drain lag: cloudflared exits first, then the
+    // OS pipe surfaces the final stderr line a tick later. The fix
+    // makes the log-close path await the drainer (bounded by 1s), so
+    // this trailing line should survive into the log file.
+    const scratch = mkdtempSync(join(tmpdir(), "gini-cf-drain-"));
+    const logPath = join(scratch, "cloudflared.log");
+    try {
+      const encoder = new TextEncoder();
+      const exitResolvers = Promise.withResolvers<number>();
+      let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+      const stderr = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controllerRef = controller;
+          // Emit the URL banner immediately so spawnQuickTunnel returns.
+          controller.enqueue(
+            encoder.encode("INF |  https://drain-test-99.trycloudflare.com  |\n")
+          );
+        }
+      });
+      const fakeChild = {
+        stderr,
+        exited: exitResolvers.promise,
+        pid: 4321,
+        kill() {
+          // Resolve `exited` first, then queue the trailing stderr line
+          // and stream close. This reproduces the race: the parent
+          // observes child.exited before the buffered final line drains.
+          exitResolvers.resolve(0);
+          setTimeout(() => {
+            try {
+              controllerRef?.enqueue(
+                encoder.encode("ERR cloudflared crashed: out of fds\n")
+              );
+              controllerRef?.close();
+            } catch { /* already closed */ }
+          }, 50);
+        }
+      };
+      const spawnStub: SpawnTunnelOptions["spawn"] = () => fakeChild;
+      const handle = await spawnQuickTunnel({
+        targetUrl: "http://127.0.0.1:7778",
+        spawn: spawnStub,
+        startupTimeoutMs: 1000,
+        logPath
+      });
+      expect(handle.url).toBe("https://drain-test-99.trycloudflare.com");
+      await handle.stop();
+      // Awaiting the `exited` promise on the handle drives the
+      // log-close finally, which (with the fix) waits for the drainer.
+      await handle.exited;
+      const contents = readFileSync(logPath, "utf8");
+      expect(contents).toContain("ERR cloudflared crashed: out of fds");
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
   });
 });
 
