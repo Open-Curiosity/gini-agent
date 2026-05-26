@@ -20,15 +20,20 @@ read at request time:
   is present, both the `Host` header must be loopback (`localhost`,
   `127.0.0.1`, or `[::1]`) AND the `Origin` host must match `Host`.
   When `Origin` is absent (typical for non-browser callers like curl,
-  or browser same-origin GETs), the guard still requires the `Host`
-  to be loopback — a non-loopback Host without an allowlist is
-  refused regardless of method.
+  or browser same-origin GETs), a loopback `Host` accepts the request
+  and a non-loopback `Host` is normally refused — *except* when the
+  request carries the internal `x-gini-tunnel-vetted: 1` marker, which
+  authorizes safe-method Origin-less GET/HEAD on a non-loopback host.
+  See [Tunnel-vetted marker](#tunnel-vetted-marker) below for the
+  bypass rules and why they cannot be forged.
 
 Method-tiered fail-closed behavior: unsafe methods (POST, PUT, PATCH,
 DELETE) additionally require `Origin` to be present at all. A modern
 browser always sends Origin on unsafe methods, so the only callers
 that omit it are non-browsers (which should hit the gateway directly
-with their own token).
+with their own token). The tunnel-vetted marker does *not* relax this
+requirement — an Origin-less unsafe request is rejected even when
+vetted, because there is no same-origin handle to verify.
 
 `Sec-Fetch-Site` is checked as a secondary signal — it must be
 `same-origin`, `none`, or absent.
@@ -36,6 +41,54 @@ with their own token).
 The browser never receives the gateway bearer token; the BFF reads it
 server-side from the per-instance `config.json` and adds it to the
 forwarded request only after the guard passes.
+
+## Tunnel-vetted marker
+
+When the operator opts into the Cloudflare quick tunnel, the BFF
+receives requests on a `<random>.trycloudflare.com` hostname that
+cloudflared mints fresh on every restart — so the rotating hostname
+can't be put in `GINI_TRUSTED_ORIGINS`, and the `Host` header is
+honestly non-loopback. Both of the policies above would refuse the
+request, even though it has already been authorized at a layer the
+guard doesn't see.
+
+The Next.js proxy (`web/src/proxy.ts`) bridges the two layers by
+stamping the internal header `x-gini-tunnel-vetted: 1` onto every
+tunneled request that passed the secret-path or session-cookie gate,
+and `guardCsrf` (`web/src/lib/runtime.ts:isTunnelVetted`) reads the
+marker as an authoritative "this request was already vetted by the
+proxy."
+
+**Why it cannot be forged.** The proxy strips any inbound value of
+the header *before* deciding whether to stamp its own:
+
+- `vettedHeaders` (`web/src/proxy.ts`) clones the request headers,
+  deletes any inbound `x-gini-tunnel-vetted`, and sets `1` — the
+  delete-then-set order means a remote caller's value is always
+  overwritten on the tunnel branch.
+- `strippedHeaders` (`web/src/proxy.ts`) clones and deletes without
+  setting; this runs on the loopback branch, so a co-tenant process
+  on `127.0.0.1` cannot inject the marker either.
+
+**When it grants access.** The marker only matters on the
+`GINI_TRUSTED_ORIGINS`-unset fallback path. It grants access in two
+shapes:
+
+- *Safe-method, Origin-less request* (browser same-origin GET/HEAD on
+  the tunneled SPA): the loopback-Host check is skipped. The
+  allowlist branch runs first, so an operator who configured
+  `GINI_TRUSTED_ORIGINS` keeps the strict policy even on tunneled
+  traffic.
+- *Origin-present request* with `Origin == Host`: the loopback-Host
+  check is skipped, but same-origin verification is still required.
+  A DNS-rebound page with a forged Origin would mismatch and be
+  refused.
+
+See [Cloudflare Quick Tunnel With Secret-Path Auth And iCloud Notes
+Mirror](tunnel-and-icloud-pairing.md) for the tunnel surface as a
+whole — the trust model around secret-path auth, secret rotation, and
+the proxy's responsibilities for stripping the secret prefix before
+the BFF runs.
 
 ## Context
 
