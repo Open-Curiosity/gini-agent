@@ -2165,6 +2165,140 @@ describe("runtime api", () => {
       expect(repeatDelete.status).toBe(404);
     });
 
+    test("POST /api/chat/:id/read records the cursor and GET /api/badge surfaces the unread total", async () => {
+      const config = testConfig("chat-read-badge");
+      const handler = createHandler(config);
+
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "read state" })
+      });
+      // Plant two visible blocks via the persistence layer — the read
+      // endpoint validates the block id, but the unread aggregate is
+      // what we're measuring here.
+      const { insertChatBlock } = await import("./state");
+      const b1 = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "hi"
+      });
+      insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "follow up"
+      });
+
+      // Fresh credential: no read state yet, both blocks unread.
+      const before = await call(handler, config, "/api/badge");
+      expect(before.unread).toBe(2);
+
+      const marked = await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST",
+        body: JSON.stringify({ lastReadBlockId: b1.id })
+      });
+      expect(marked.ok).toBe(true);
+      expect(marked.readState.lastReadBlockId).toBe(b1.id);
+
+      const after = await call(handler, config, "/api/badge");
+      expect(after.unread).toBe(1);
+    });
+
+    test("POST /api/chat/:id/read rejects bad input and cross-session ids", async () => {
+      const config = testConfig("chat-read-validate");
+      const handler = createHandler(config);
+      const sessionA = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "A" })
+      });
+      const sessionB = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "B" })
+      });
+      const { insertChatBlock } = await import("./state");
+      const bA = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: sessionA.id,
+        text: "in A"
+      });
+
+      // Missing lastReadBlockId.
+      const missing = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionA.id}/read`,
+        { method: "POST", body: JSON.stringify({}) },
+        config.token
+      );
+      expect(missing.status).toBe(400);
+
+      // Block belongs to A — POSTing it on B's cursor is rejected.
+      const cross = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionB.id}/read`,
+        { method: "POST", body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        config.token
+      );
+      expect(cross.status).toBe(400);
+
+      // Unknown session: 404.
+      const noSession = await rawCall(
+        handler,
+        config,
+        "/api/chat/chat_nonexistent/read",
+        { method: "POST", body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        config.token
+      );
+      expect(noSession.status).toBe(404);
+    });
+
+    test("read state is scoped to the calling credential", async () => {
+      const config = testConfig("chat-read-credential");
+      const handler = createHandler(config);
+      const pairing = await call(handler, config, "/api/pairing", {
+        method: "POST",
+        body: JSON.stringify({ ttlSeconds: 60 })
+      });
+      const claimed = await callPublic(handler, config, "/api/pairing/claim", {
+        method: "POST",
+        body: JSON.stringify({ code: pairing.code, deviceName: "Phone" })
+      });
+
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "shared" })
+      });
+      const { insertChatBlock } = await import("./state");
+      const block = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "hello"
+      });
+
+      // Owner marks read; their badge drops to 0. The phone's badge is
+      // still 1 because read state is per-credential.
+      await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST",
+        body: JSON.stringify({ lastReadBlockId: block.id })
+      });
+      const ownerBadge = await call(handler, config, "/api/badge");
+      const phoneBadge = await callWithToken(handler, config, claimed.token, "/api/badge");
+      expect(ownerBadge.unread).toBe(0);
+      expect(phoneBadge.unread).toBe(1);
+    });
+
+    test("read + badge endpoints require authentication", async () => {
+      const config = testConfig("chat-read-auth");
+      const handler = createHandler(config);
+      const read = await rawCall(handler, config, "/api/chat/chat_x/read", {
+        method: "POST",
+        body: JSON.stringify({ lastReadBlockId: "block_x" })
+      });
+      expect(read.status).toBe(401);
+      const badge = await rawCall(handler, config, "/api/badge");
+      expect(badge.status).toBe(401);
+    });
+
     test("push device endpoints require authentication", async () => {
       const config = testConfig("push-devices-auth");
       const handler = createHandler(config);

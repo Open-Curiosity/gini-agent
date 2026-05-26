@@ -92,14 +92,17 @@ describe("chat-read-state", () => {
       sessionId: "chat_a",
       callId: "call_1",
       toolName: "echo",
-      argsJson: "{}",
+      displayLabel: "Echo",
+      argsPreview: "{}",
+      argsFull: {},
       status: "running"
     });
     insertChatBlock(instance, {
       kind: "tool_result",
       sessionId: "chat_a",
       callId: "call_1",
-      output: "done"
+      preview: "done",
+      truncated: false
     });
     // 3 raw rows, but tool_result doesn't count → unread = 2.
     expect(unreadCountForCredential(instance, "cred_x")).toBe(2);

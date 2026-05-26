@@ -8,11 +8,13 @@ import {
   appendTrace,
   listChatBlocks,
   listChatBlocksAfter,
+  markRead,
   mutateState,
   readState,
   readTrace,
   removeDeviceForCredential,
   subscribeChatBlocks,
+  unreadCountForCredential,
   upsertDevice
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
@@ -669,6 +671,45 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // either leaks information about other credentials' devices.
       if (!removed) return json({ error: "Device not found" }, 404);
       return json({ ok: true });
+    }],
+    // Chat read-state + badge endpoints. The mobile app POSTs to
+    // /read every time the user lands on a chat detail so the gateway
+    // can compute the cross-session badge count; GET /badge returns
+    // the total unread block count for the caller's credential.
+    // Credential scoping happens on every read/write so a paired
+    // device can never see or mutate another credential's cursor.
+    ["POST", /^\/api\/chat\/([^/]+)\/read$/, async (request, params) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const sessionId = params[0];
+      const state = readState(config.instance);
+      if (!state.chatSessions.some((s) => s.id === sessionId)) {
+        return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      }
+      const payload = await body(request);
+      const lastReadBlockId =
+        typeof payload.lastReadBlockId === "string" ? payload.lastReadBlockId.trim() : "";
+      if (!lastReadBlockId) {
+        return json({ error: "lastReadBlockId is required" }, 400);
+      }
+      // Validate the block belongs to this session — the cursor would
+      // be meaningless otherwise, and accepting cross-session ids would
+      // let a client smuggle a foreign block into another credential's
+      // read state.
+      const blockBelongs = listChatBlocks(config.instance, sessionId).some(
+        (b) => b.id === lastReadBlockId
+      );
+      if (!blockBelongs) {
+        return json({ error: "Block does not belong to this session" }, 400);
+      }
+      const result = markRead(config.instance, sessionId, credential, lastReadBlockId);
+      return json({ ok: true, readState: result });
+    }],
+    ["GET", /^\/api\/badge$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const unread = unreadCountForCredential(config.instance, credential);
+      return json({ unread });
     }],
     ["GET", /^\/api\/promotions$/, () => json(readState(config.instance).promotions)],
     ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],
