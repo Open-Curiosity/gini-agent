@@ -777,93 +777,103 @@ async function readResponsesToolCallingStream(
     }
   };
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (value) buffer += decoder.decode(value, { stream: true });
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const block = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      if (block.trim().length > 0) handleEvent(block);
-      boundary = buffer.indexOf("\n\n");
-    }
-    if (done) break;
-  }
-  buffer += decoder.decode();
-  if (buffer.trim().length > 0) handleEvent(buffer);
-
-  // Backstop: if SSE delivery missed function_call items but the final
-  // `response.completed` event carries them, reconstruct from there.
-  if (finalOutput) {
-    let backstopText = "";
-    for (const item of finalOutput) {
-      if (!isRecord(item)) continue;
-      if (item.type === "function_call") {
-        const itemId = typeof item.id === "string" ? item.id : "";
-        const callId = typeof item.call_id === "string" ? item.call_id : itemId;
-        const name = typeof item.name === "string" ? item.name : "";
-        const args = typeof item.arguments === "string" ? item.arguments : "";
-        const key = itemId || callId;
-        if (!key) continue;
-        const existing = callsById.get(key);
-        if (!existing) {
-          callsById.set(key, { id: callId, name, arguments: args, order: nextOrder++ });
-        } else {
-          if (!existing.id && callId) existing.id = callId;
-          if (!existing.name && name) existing.name = name;
-          if (existing.arguments.length === 0 && args.length > 0) existing.arguments = args;
-        }
+  // Stream consumption wraps in try/finally so a throw from handleEvent
+  // (e.g. session-expired classification mid-stream) cancels the reader
+  // before withCodexSessionRetry constructs attempt 2. Without this,
+  // attempt 1's reader stays locked to the response body and the
+  // underlying socket can linger while a parallel attempt is already
+  // in flight.
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (block.trim().length > 0) handleEvent(block);
+        boundary = buffer.indexOf("\n\n");
       }
-      // Some responses also embed assistant text in output items as
-      // { type: "message", content: [{ type: "output_text", text }] }
-      if (item.type === "message" && Array.isArray(item.content)) {
-        for (const c of item.content) {
-          if (isRecord(c) && c.type === "output_text" && typeof c.text === "string") {
-            backstopText += c.text;
+      if (done) break;
+    }
+    buffer += decoder.decode();
+    if (buffer.trim().length > 0) handleEvent(buffer);
+
+    // Backstop: if SSE delivery missed function_call items but the final
+    // `response.completed` event carries them, reconstruct from there.
+    if (finalOutput) {
+      let backstopText = "";
+      for (const item of finalOutput) {
+        if (!isRecord(item)) continue;
+        if (item.type === "function_call") {
+          const itemId = typeof item.id === "string" ? item.id : "";
+          const callId = typeof item.call_id === "string" ? item.call_id : itemId;
+          const name = typeof item.name === "string" ? item.name : "";
+          const args = typeof item.arguments === "string" ? item.arguments : "";
+          const key = itemId || callId;
+          if (!key) continue;
+          const existing = callsById.get(key);
+          if (!existing) {
+            callsById.set(key, { id: callId, name, arguments: args, order: nextOrder++ });
+          } else {
+            if (!existing.id && callId) existing.id = callId;
+            if (!existing.name && name) existing.name = name;
+            if (existing.arguments.length === 0 && args.length > 0) existing.arguments = args;
+          }
+        }
+        // Some responses also embed assistant text in output items as
+        // { type: "message", content: [{ type: "output_text", text }] }
+        if (item.type === "message" && Array.isArray(item.content)) {
+          for (const c of item.content) {
+            if (isRecord(c) && c.type === "output_text" && typeof c.text === "string") {
+              backstopText += c.text;
+            }
           }
         }
       }
+      // Only use backstop text if streaming missed all of it.
+      if (textParts.length === 0 && backstopText.length > 0) {
+        textParts.push(backstopText);
+      }
     }
-    // Only use backstop text if streaming missed all of it.
-    if (textParts.length === 0 && backstopText.length > 0) {
-      textParts.push(backstopText);
+
+    const ordered = [...callsById.values()].sort((a, b) => a.order - b.order);
+    const toolCalls: ToolCall[] = [];
+    for (const call of ordered) {
+      if (!call.id || !call.name) continue;
+      toolCalls.push({
+        id: call.id,
+        type: "function",
+        function: { name: call.name, arguments: call.arguments }
+      });
     }
-  }
 
-  const ordered = [...callsById.values()].sort((a, b) => a.order - b.order);
-  const toolCalls: ToolCall[] = [];
-  for (const call of ordered) {
-    if (!call.id || !call.name) continue;
-    toolCalls.push({
-      id: call.id,
-      type: "function",
-      function: { name: call.name, arguments: call.arguments }
-    });
-  }
+    // Backstop: codex sometimes emits tool calls as literal `<tool_call>`
+    // markup in the assistant text channel instead of (or in addition to)
+    // structured function_call items. Recover those so the chat-task loop
+    // can dispatch them. The structured shape wins on dedup, so a model
+    // that emits both an SSE function_call and a text mirror only fires
+    // the call once.
+    const joinedText = textParts.join("");
+    const extracted = extractTextToolCallsFromAssistantText(joinedText, toolCalls);
+    for (const call of extracted.calls) {
+      toolCalls.push(call);
+    }
+    const finalText = extracted.residual;
 
-  // Backstop: codex sometimes emits tool calls as literal `<tool_call>`
-  // markup in the assistant text channel instead of (or in addition to)
-  // structured function_call items. Recover those so the chat-task loop
-  // can dispatch them. The structured shape wins on dedup, so a model
-  // that emits both an SSE function_call and a text mirror only fires
-  // the call once.
-  const joinedText = textParts.join("");
-  const extracted = extractTextToolCallsFromAssistantText(joinedText, toolCalls);
-  for (const call of extracted.calls) {
-    toolCalls.push(call);
+    const finishReason: ToolCallingResult["finishReason"] = toolCalls.length > 0 ? "tool_calls" : "stop";
+    return {
+      provider,
+      text: finalText.trim(),
+      toolCalls,
+      finishReason,
+      responseId,
+      usage,
+      cost: estimateCost(provider, usage)
+    };
+  } finally {
+    try { await reader.cancel(); } catch {}
   }
-  const finalText = extracted.residual;
-
-  const finishReason: ToolCallingResult["finishReason"] = toolCalls.length > 0 ? "tool_calls" : "stop";
-  return {
-    provider,
-    text: finalText.trim(),
-    toolCalls,
-    finishReason,
-    responseId,
-    usage,
-    cost: estimateCost(provider, usage)
-  };
 }
 
 // Codex tool-call-as-text backstop. The Responses-API parser handles the
@@ -1654,34 +1664,44 @@ async function readCodexStream(
     }
   };
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (value) buffer += decoder.decode(value, { stream: true });
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const block = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      if (block.trim().length > 0) handleEvent(block);
-      boundary = buffer.indexOf("\n\n");
+  // Stream consumption wraps in try/finally so a throw from handleEvent
+  // (e.g. session-expired classification mid-stream) cancels the reader
+  // before withCodexSessionRetry constructs attempt 2. Without this,
+  // attempt 1's reader stays locked to the response body and the
+  // underlying socket can linger while a parallel attempt is already
+  // in flight.
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (block.trim().length > 0) handleEvent(block);
+        boundary = buffer.indexOf("\n\n");
+      }
+      if (done) break;
     }
-    if (done) break;
-  }
-  // Flush any trailing event that wasn't followed by a blank-line terminator.
-  buffer += decoder.decode();
-  if (buffer.trim().length > 0) handleEvent(buffer);
+    // Flush any trailing event that wasn't followed by a blank-line terminator.
+    buffer += decoder.decode();
+    if (buffer.trim().length > 0) handleEvent(buffer);
 
-  const text = (deltaTextParts.length > 0 ? deltaTextParts.join("") : finalTextParts.join("")).trim();
-  if (!text) {
-    throw new Error("Codex stream completed without text output.");
-  }
+    const text = (deltaTextParts.length > 0 ? deltaTextParts.join("") : finalTextParts.join("")).trim();
+    if (!text) {
+      throw new Error("Codex stream completed without text output.");
+    }
 
-  return {
-    provider,
-    text,
-    responseId,
-    usage,
-    cost: estimateCost(provider, usage)
-  };
+    return {
+      provider,
+      text,
+      responseId,
+      usage,
+      cost: estimateCost(provider, usage)
+    };
+  } finally {
+    try { await reader.cancel(); } catch {}
+  }
 }
 
 function codexHeaders(accessToken: string): Record<string, string> {

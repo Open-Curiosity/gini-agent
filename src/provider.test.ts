@@ -2175,6 +2175,70 @@ describe("provider", () => {
     }
   });
 
+  test("codex cancels attempt 1's reader before retrying", async () => {
+    // Before the try/finally wrap was added, a session-expired throw
+    // inside the SSE handler unwound out of the reading loop and left
+    // attempt 1's reader locked to its response body. Pin that the
+    // underlying-source `cancel` callback fires when the retry path
+    // unwinds — that's the signal the socket can actually be released.
+    const { restore } = installCodexAuth("codex-reader-cleanup-on-retry");
+    const originalFetch = globalThis.fetch;
+    let cancelCalls = 0;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          if (attempts === 1) {
+            controller.enqueue(enc.encode(
+              `event: error\ndata: ${JSON.stringify({ type: "error", message: "Your ChatGPT session expired before this request finished." })}\n\n`
+            ));
+            // Intentionally leave the stream open after the error event;
+            // a real backend keeps the socket up until we cancel.
+            return;
+          }
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        },
+        cancel() {
+          cancelCalls += 1;
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+      // Attempt 1's reader cancel runs in the finally block; attempt 2
+      // closes naturally so cancel-after-done is a spec no-op (no extra
+      // source-cancel callback). Either way >= 1 proves cleanup ran.
+      expect(cancelCalls).toBeGreaterThanOrEqual(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
   test("codex User-Agent header does not carry the Gini-identifying suffix", async () => {
     // The previous `codex_cli_rs/0.0.0 (Gini Agent)` tail was a backend-
     // visible fingerprint distinguishing daemon traffic from interactive
