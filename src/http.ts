@@ -14,6 +14,7 @@ import {
 } from "./state";
 import { browserFillByLocator, browserNavigate, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
 import { sanitizeUrlForAuditTarget } from "./execution/tool-dispatch";
+import { parseFillSecretSlots } from "./execution/browser-fill-secrets-types";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -245,18 +246,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // for each. The submitted values exist only in this handler's
         // request scope — they are NOT written to state, the
         // connector store, or the audit evidence column.
-        const rawSlots = Array.isArray(approval.payload.slots) ? approval.payload.slots : [];
-        const slots = rawSlots.flatMap((s) => {
-          if (!s || typeof s !== "object") return [];
-          const entry = s as { name?: unknown; locator?: unknown; label?: unknown; kind?: unknown };
-          if (typeof entry.name !== "string" || typeof entry.locator !== "string") return [];
-          return [{
-            name: entry.name,
-            locator: entry.locator,
-            label: typeof entry.label === "string" ? entry.label : entry.name,
-            kind: typeof entry.kind === "string" ? entry.kind : "text"
-          }];
-        });
+        // Parse via the shared parser so the kind allowlist enforced
+        // here matches what the dispatcher minted onto the approval
+        // payload AND what the chat card uses to type the <input>
+        // element. A divergence between layers could let an
+        // attacker-supplied payload widen the rendered input type
+        // past what the UI's own allowlist would permit.
+        const slots = parseFillSecretSlots(approval.payload.slots);
         // Enforce the full-submission contract at the runtime boundary,
         // not the web client. fillReady in the React card is just UX;
         // any client (CLI, mobile, script, direct API) could POST a

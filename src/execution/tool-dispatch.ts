@@ -71,6 +71,7 @@ import {
   peekCurrentBrowserUrl,
   resolveUploadPath
 } from "../tools/browser";
+import { parseFillSecretSlots } from "./browser-fill-secrets-types";
 
 export type DispatchResult =
   | { kind: "sync"; result: string }
@@ -2506,19 +2507,7 @@ async function browserFillSecretsTool(
     };
   }
 
-  const rawSlots = Array.isArray(args.slots) ? args.slots : [];
-  const slots = rawSlots.flatMap((s) => {
-    if (!s || typeof s !== "object") return [];
-    const entry = s as { name?: unknown; locator?: unknown; label?: unknown; kind?: unknown };
-    if (typeof entry.name !== "string" || typeof entry.locator !== "string") return [];
-    const allowedKinds = new Set(["text", "password", "email", "tel", "number", "url"]);
-    return [{
-      name: entry.name,
-      locator: entry.locator,
-      label: typeof entry.label === "string" ? entry.label : entry.name,
-      kind: typeof entry.kind === "string" && allowedKinds.has(entry.kind) ? entry.kind : "text"
-    }];
-  });
+  const slots = parseFillSecretSlots(args.slots);
   if (slots.length === 0) {
     return {
       kind: "sync",

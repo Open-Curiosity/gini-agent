@@ -10,33 +10,7 @@ import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddCo
 import { api } from "@/lib/api";
 import { useApprovals, useInvalidate, useProviders } from "@/lib/queries";
 import type { Approval, ApprovalRequestedBlock } from "@runtime/types";
-
-// Allowed HTML input-type hints for browser.fill_secret slots. Any
-// other value on the payload falls back to "text" so a malformed
-// payload (or a future field we haven't taught the UI about) can't
-// widen the rendered input type.
-const ALLOWED_KINDS = new Set(["text", "password", "email", "tel", "number", "url"]);
-
-interface FillSecretSlot {
-  name: string;
-  locator: string;
-  label: string;
-  kind: "text" | "password" | "email" | "tel" | "number" | "url";
-}
-
-function pickFillSecretSlots(raw: unknown): FillSecretSlot[] {
-  if (!Array.isArray(raw)) return [];
-  return raw.flatMap((entry) => {
-    if (!entry || typeof entry !== "object") return [];
-    const e = entry as { name?: unknown; locator?: unknown; label?: unknown; kind?: unknown };
-    if (typeof e.name !== "string" || typeof e.locator !== "string") return [];
-    const kind = typeof e.kind === "string" && ALLOWED_KINDS.has(e.kind)
-      ? (e.kind as FillSecretSlot["kind"])
-      : "text";
-    const label = typeof e.label === "string" ? e.label : e.name;
-    return [{ name: e.name, locator: e.locator, label, kind }];
-  });
-}
+import { parseFillSecretSlots, type FillSecretSlot } from "@runtime/execution/browser-fill-secrets-types";
 
 // Inline Approve / Deny / Connect actions for an approval_requested block.
 // The block itself carries `approvalId`, `action`, `risk`, and `summary`
@@ -122,7 +96,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       : providerId
     : "";
   const fillSlots: FillSecretSlot[] = isBrowserFillSecret && approval
-    ? pickFillSecretSlots(approval.payload?.slots)
+    ? parseFillSecretSlots(approval.payload?.slots)
     : [];
   const [fillValues, setFillValues] = useState<Record<string, string>>({});
   const fillSubmit = useMutation({
