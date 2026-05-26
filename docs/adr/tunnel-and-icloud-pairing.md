@@ -41,10 +41,29 @@ shape that depends on memorising the URL breaks at the next reboot.
    bare landing the runtime would otherwise serve. The web port is
    written to `~/.gini/instances/<inst>/web.port` once Next.js comes
    up; the manager polls that file with a 60s ceiling that covers a
-   cold Next.js compile. The subprocess lifetime matches the gateway
-   lifetime exactly: it's started after Next.js reports a port, and
-   torn down inside the SIGTERM drain alongside the scheduler, the
-   browser sessions, and the messaging supervisors.
+   cold Next.js compile. If that ceiling fires DURING BOOT (e.g. a
+   slow cold compile pushing past 60s on the boot IIFE that runs only
+   when `tunnel.enabled` is already true at process start), the
+   runtime records the failure on the snapshot and starts a periodic
+   recovery interval that retries the bring-up every 5 seconds —
+   single-flighted so a slow retry can't pile up queued recycles in
+   front of a `PATCH /api/tunnel disable` — until cloudflared reports
+   a live URL, the operator disables the tunnel, or shutdown begins.
+   The interval is also cancelled synchronously when a `PATCH
+   /api/tunnel { enabled: true }` succeeds (covers the case where
+   the operator re-enables explicitly while boot recovery is mid-
+   retry); the PATCH path itself does not arm the interval — a PATCH
+   that hits its own `resolveWebTarget` ceiling returns 500 to the
+   client, who can retry. An `fs.watch` on the same web.port file
+   recycles cloudflared (stop before resolve, so a co-tenant can't
+   squat the freed port mid-transition) when the web layer rebinds
+   while the runtime is still alive; the watcher dedupes APFS
+   rename+change pairs by comparing the new file content against the
+   last value it saw, so a single write doesn't rotate the public URL
+   twice. The subprocess lifetime matches the gateway lifetime
+   exactly: it's started after Next.js reports a port, and torn down
+   inside the SIGTERM drain alongside the scheduler, the browser
+   sessions, and the messaging supervisors.
 
 2. The cloudflared stderr banner is parsed to obtain the public URL. The
    manager keeps that URL in an in-memory snapshot exposed over
@@ -208,8 +227,11 @@ the prompt:
 
 ## Consequences
 
-- **One new dependency**: requires `cloudflared` on PATH. The runtime
-  degrades silently when the binary is missing — tunnel snapshot stays
+- **New dependencies**: `cloudflared` on PATH (binary, not npm),
+  `qrcode@^1.5.4` (runtime dep) for the QR encoder, plus
+  `jsqr@^1.4.0` and `@types/qrcode@^1.5.6` (dev deps) for the QR
+  round-trip test and type definitions. The runtime degrades silently
+  when the `cloudflared` binary is missing — tunnel snapshot stays
   empty, gateway keeps working over bearer-token localhost.
 - **One new persisted field**: `config.json` gains
   `tunnel: { enabled, secret, appleNotes }`. Existing config files
@@ -227,15 +249,19 @@ the prompt:
 - **CLI surface**: `gini tunnel status|qr|enable|disable|rotate-secret|sync-notes|apple-notes ...`
   exposes the snapshot, prints the ANSI QR, flips the persistent
   config, and rotates the secret.
-- **Test surface**: dedicated unit tests cover the QR encoder
-  (versions 1-10 byte mode, all eight masks, finder + format-info
-  placement), the cloudflared stderr parser (banner + structured-log
-  shape, EOF and timeout failure modes), the secret-path strip,
-  the AppleScript builder (escaping, folder/note upsert), and the
-  manager orchestrator (with injected spawner + osascript runner). The
-  HTTP layer has an integration test that exercises the secret-path
-  guard, the landing page, both QR endpoints, and the bearer-token
-  path.
+- **Test surface**: dedicated unit tests cover the QR encoder wrapper
+  around the `qrcode` library (which handles version selection,
+  masking, and ECC internally) — verifying matrix dimensions, finder
+  pattern presence, ANSI half-block render dimensions, SVG quiet zone,
+  deterministic encoding, a golden vector for a known URL payload,
+  and a jsQR round-trip through a rasterized matrix to catch
+  regressions a structural check alone would miss. Additional tests
+  cover the cloudflared stderr parser (banner + structured-log shape,
+  EOF and timeout failure modes), the secret-path strip, the
+  AppleScript builder (escaping, folder/note upsert), and the manager
+  orchestrator (with injected spawner + osascript runner). The HTTP
+  layer has an integration test that exercises the secret-path guard,
+  the landing page, both QR endpoints, and the bearer-token path.
 
 ## Alternatives considered
 
