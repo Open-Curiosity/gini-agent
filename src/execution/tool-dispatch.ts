@@ -2528,6 +2528,32 @@ async function browserFillSecretsTool(
       })
     };
   }
+  // Slot names are the map key the chat card uses for both the React
+  // list key and the fillValues record (BlockApprovalRequested.tsx); the
+  // /connect handler also looks up secrets by name. Duplicate names
+  // would silently share a single user-entered value across multiple
+  // distinct DOM locators — picture an agent emitting two "password"
+  // slots whose locators target username + password fields — so the
+  // user types one value and both inputs receive it. Reject up-front
+  // with a clear error.
+  const seenNames = new Set<string>();
+  const duplicates: string[] = [];
+  for (const slot of slots) {
+    if (seenNames.has(slot.name)) {
+      duplicates.push(slot.name);
+    } else {
+      seenNames.add(slot.name);
+    }
+  }
+  if (duplicates.length > 0) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `browser_fill_secrets slot names must be unique. Duplicates: ${Array.from(new Set(duplicates)).join(", ")}.`
+      })
+    };
+  }
   const reason = typeof args.reason === "string" && args.reason.trim().length > 0
     ? args.reason.trim()
     : `The agent is asking you to fill ${slots.length} field${slots.length === 1 ? "" : "s"} on the current page.`;

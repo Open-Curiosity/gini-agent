@@ -115,6 +115,30 @@ describe("browser_fill_secrets dispatch surface guard", () => {
     expect(state.approvals.length).toBe(0);
   });
 
+  test("rejects duplicate slot names with a sync error", async () => {
+    const config = makeConfig("fill-secrets-dupe");
+    const taskId = await seedTaskWithSession(config, undefined);
+    const dupeArgs = JSON.stringify({
+      slots: [
+        { name: "password", locator: "@e1", label: "Username", kind: "text" },
+        { name: "password", locator: "@e2", label: "Password", kind: "password" }
+      ],
+      reason: "Login"
+    });
+
+    const result = await dispatchToolCall(config, taskId, "browser_fill_secrets", "call_1", dupeArgs);
+
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("must be unique");
+    expect(parsed.error).toContain("password");
+
+    const state = readState(config.instance);
+    expect(state.approvals.length).toBe(0);
+  });
+
   test("mints a pending approval when chat session has no messaging source (web chat)", async () => {
     const config = makeConfig("fill-secrets-web");
     // Omit `source` — that's how the web chat path creates sessions.

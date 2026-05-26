@@ -182,7 +182,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const approvals = readState(config.instance).approvals;
       return json(agentId ? approvals.filter((a) => a.agentId === agentId) : approvals);
     }],
-    ["POST", /^\/api\/approvals\/([^/]+)\/approve$/, async (_request, params) => json(await decideApproval(config, params[0], "approve"))],
+    ["POST", /^\/api\/approvals\/([^/]+)\/approve$/, async (_request, params) => {
+      // browser.fill_secret cannot be resolved through the generic
+      // /approve path: the side-effecting fill happens inside /connect's
+      // request handler from the per-slot `secrets` body, so /approve
+      // would resolve the approval with status=approved while no DOM
+      // fill ever ran — the agent would then be told "fields filled"
+      // (synthesized in agent.ts:runApprovedAction) over an empty form.
+      // Refuse early so the only resolution path for fill_secret is
+      // /connect with values.
+      const approvalId = params[0];
+      const approval = readState(config.instance).approvals.find((a) => a.id === approvalId);
+      if (approval?.action === "browser.fill_secret") {
+        return json({
+          error: "browser.fill_secret approvals must be resolved via /connect with the per-slot values, not /approve."
+        }, 400);
+      }
+      return json(await decideApproval(config, approvalId, "approve"));
+    }],
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
     // Connect endpoint for `connector.request` approvals. The chat UI's
     // Connect button POSTs here with the user-entered secrets. The
@@ -222,8 +239,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (approval.action === "browser.fill_secret") {
         // browser.fill_secret path: each secrets entry's key is a slot
         // name declared at approval creation. Look up the slot's
-        // locator in approval.payload.slots and call browserType for
-        // each. The submitted values exist only in this handler's
+        // locator in approval.payload.slots and call browserFillByLocator
+        // for each. The submitted values exist only in this handler's
         // request scope — they are NOT written to state, the
         // connector store, or the audit evidence column.
         const rawSlots = Array.isArray(approval.payload.slots) ? approval.payload.slots : [];
@@ -238,6 +255,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
             kind: typeof entry.kind === "string" ? entry.kind : "text"
           }];
         });
+        // Enforce the full-submission contract at the runtime boundary,
+        // not the web client. fillReady in the React card is just UX;
+        // any client (CLI, mobile, script, direct API) could POST a
+        // partial body. Reject if any declared slot is missing a
+        // non-empty string in `secrets`. This is the gate, not a hint —
+        // without it /connect could resolve with some slots silently
+        // unfilled, and the agent's synthesized result string in
+        // agent.ts:runApprovedAction would still report every declared
+        // slot as filled, lying to the model.
+        const missing = slots
+          .filter((slot) => typeof secrets[slot.name] !== "string" || secrets[slot.name].length === 0)
+          .map((slot) => slot.name);
+        if (missing.length > 0) {
+          return json({
+            ok: false,
+            message: `Missing value for slot(s): ${missing.join(", ")}. All declared slots must be submitted.`
+          }, 400);
+        }
         const taskId = approval.taskId;
         if (!taskId) {
           return json({ ok: false, message: "Approval is not bound to a task; cannot fill." }, 400);

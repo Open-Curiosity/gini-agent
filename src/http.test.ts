@@ -868,6 +868,94 @@ describe("runtime api", () => {
     expect(body.error).toContain("does not take a /connect submission");
   });
 
+  test("POST /api/approvals/<id>/approve refuses browser.fill_secret action", async () => {
+    // The generic /approve route would flip status=approved and trigger
+    // runApprovedAction's browser.fill_secret branch, which synthesizes a
+    // "fields filled" tool result for the agent even though no DOM fill
+    // ever happened (the side effect lives inside /connect's per-slot
+    // loop). Refuse early so the only resolution path for fill_secret is
+    // /connect with values.
+    const config = testConfig("approve-refuses-fill-secret");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "browser.fill_secret",
+        target: "https://example.com/login#@e1,@e2",
+        risk: "high",
+        reason: "Sign in to the test site",
+        payload: {
+          slots: [
+            { name: "username", locator: "@e1", label: "Username", kind: "text" },
+            { name: "password", locator: "@e2", label: "Password", kind: "password" }
+          ],
+          reason: "Sign in",
+          toolCallId: "call_fill"
+        }
+      })
+    );
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/approve`,
+      { method: "POST" },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("/connect");
+    expect(body.error).toContain("not /approve");
+    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
+  });
+
+  test("POST /api/approvals/<id>/connect refuses partial browser.fill_secret submissions", async () => {
+    // fillReady in BlockApprovalRequested.tsx only disables the web
+    // Submit button; CLI / mobile / direct API clients can still POST a
+    // partial body. The gateway must enforce that every declared slot
+    // has a non-empty value before any DOM fill happens — otherwise
+    // /connect would resolve with some slots silently unfilled and the
+    // agent would be told (in agent.ts:runApprovedAction) that every
+    // declared slot was filled.
+    const config = testConfig("connect-rejects-partial-fill-secret");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "browser.fill_secret",
+        target: "https://example.com/login#@e1,@e2",
+        risk: "high",
+        reason: "Sign in to the test site",
+        payload: {
+          slots: [
+            { name: "username", locator: "@e1", label: "Username", kind: "text" },
+            { name: "password", locator: "@e2", label: "Password", kind: "password" }
+          ],
+          reason: "Sign in",
+          toolCallId: "call_fill"
+        },
+        taskId: undefined
+      })
+    );
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/connect`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { username: "tomsmith" } })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.ok).toBe(false);
+    expect(body.message).toContain("password");
+    expect(body.message).toContain("Missing");
+    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
+  });
+
   // Round-1 review fix: browser-connect throws with prefixes that the
   // gateway's catch-all previously mapped to 500. The webapp needs them as
   // 4xx so it can render the original message instead of "internal error".
