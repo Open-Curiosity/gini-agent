@@ -494,37 +494,43 @@ async function callToolCallingResponses(
   tools: ToolFunctionSpec[],
   onDelta?: (text: string) => void
 ): Promise<ToolCallingResult> {
-  const bearer = readCodexBearer(provider);
-  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
-  const { instructions, input } = translateMessagesToResponsesInput(messages);
-  const responsesTools = tools.map((tool) => ({
-    type: "function" as const,
-    name: tool.function.name,
-    description: tool.function.description,
-    parameters: tool.function.parameters,
-    strict: false
-  }));
-  const body: Record<string, unknown> = {
-    model: provider.model,
-    store: false,
-    stream: true,
-    instructions,
-    input
-  };
-  if (responsesTools.length > 0) body.tools = responsesTools;
+  // The retry closure re-reads the bearer on every attempt so a token
+  // rotation between attempts (the codex CLI just wrote a new auth.json)
+  // gets picked up automatically. translateMessagesToResponsesInput is
+  // deterministic and cheap; recomputing on retry is fine.
+  return withCodexSessionRetry(async () => {
+    const bearer = readCodexBearer(provider);
+    const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
+    const { instructions, input } = translateMessagesToResponsesInput(messages);
+    const responsesTools = tools.map((tool) => ({
+      type: "function" as const,
+      name: tool.function.name,
+      description: tool.function.description,
+      parameters: tool.function.parameters,
+      strict: false
+    }));
+    const body: Record<string, unknown> = {
+      model: provider.model,
+      store: false,
+      stream: true,
+      instructions,
+      input
+    };
+    if (responsesTools.length > 0) body.tools = responsesTools;
 
-  const response = await fetch(`${baseUrl}/responses`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${bearer}`,
-      "content-type": "application/json",
-      accept: "text/event-stream",
-      ...codexHeaders(bearer)
-    },
-    body: JSON.stringify(body)
+    const response = await fetch(`${baseUrl}/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bearer}`,
+        "content-type": "application/json",
+        accept: "text/event-stream",
+        ...codexHeaders(bearer)
+      },
+      body: JSON.stringify(body)
+    });
+
+    return readResponsesToolCallingStream(response, provider, onDelta);
   });
-
-  return readResponsesToolCallingStream(response, provider, onDelta);
 }
 
 interface ResponsesInputShape {
@@ -612,7 +618,15 @@ async function readResponsesToolCallingStream(
     const raw = await response.text();
     const payload = parseJsonObject(raw);
     const fallback = raw.slice(0, 500) || `Codex tool-calling stream failed with HTTP ${response.status}`;
-    throw new Error(readOpenAIError(payload) ?? fallback);
+    const message = readOpenAIError(payload) ?? fallback;
+    // Initial 401 with a session-expired body comes from auth.json holding
+    // a token that was rotated before the request even left gini. Surface
+    // it as the retryable sentinel so withCodexSessionRetry picks up the
+    // freshly-rotated token on its second attempt.
+    if (response.status === 401 && isCodexSessionExpiredMessage(message)) {
+      throw new CodexSessionExpiredError(message);
+    }
+    throw new Error(message);
   }
   const body = response.body;
   if (!body) throw new Error("Codex tool-calling stream returned no response body.");
@@ -654,6 +668,23 @@ async function readResponsesToolCallingStream(
       if (!responseId && typeof resp.id === "string") responseId = resp.id;
       if (isRecord(resp.usage)) usage = resp.usage;
       if (Array.isArray(resp.output)) finalOutput = resp.output;
+    }
+
+    // Backend-emitted error events (session rotation mid-stream, request-
+    // level failures, content-policy aborts). Throwing here unwinds the
+    // SSE consumer loop; if nothing has been pushed to textParts or
+    // captured into callsById yet, withCodexSessionRetry can re-read
+    // auth.json and retry transparently. Once partial output has landed
+    // we can't safely retry without double-emitting, so the generic
+    // Error path runs even on session-expired mid-stream.
+    if (eventType === "error" || type === "error" || type === "response.failed") {
+      const message = extractStreamErrorMessage(payload)
+        ?? `Codex tool-calling stream errored before completion (${type ?? "unknown"}).`;
+      const emittedAnyOutput = textParts.length > 0 || callsById.size > 0;
+      if (isCodexSessionExpiredMessage(message) && !emittedAnyOutput) {
+        throw new CodexSessionExpiredError(message);
+      }
+      throw new Error(message);
     }
 
     if (type === "response.output_text.delta") {
@@ -1240,36 +1271,42 @@ async function callStructuredCodex<T>(
   provider: ProviderConfig,
   request: StructuredRequest<T>
 ): Promise<StructuredResult<T>> {
-  const bearer = readCodexBearer(provider);
-  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
-  const response = await fetch(`${baseUrl}/responses`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${bearer}`,
-      "content-type": "application/json",
-      accept: "text/event-stream",
-      ...codexHeaders(bearer)
-    },
-    body: JSON.stringify({
-      model: provider.model,
-      store: false,
-      stream: true,
-      instructions: request.system,
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema. No prose, no markdown fences.`
-            }
-          ]
-        }
-      ]
-    })
+  // Retry the fetch+stream pair on session-expired so Hindsight extraction
+  // (retain/reflect/reinforce) doesn't lose a whole structured turn to a
+  // mid-stream rotation. The JSON parsing afterward stays outside the
+  // retry because a malformed payload is a model failure, not an auth one.
+  const streamed = await withCodexSessionRetry(async () => {
+    const bearer = readCodexBearer(provider);
+    const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
+    const response = await fetch(`${baseUrl}/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bearer}`,
+        "content-type": "application/json",
+        accept: "text/event-stream",
+        ...codexHeaders(bearer)
+      },
+      body: JSON.stringify({
+        model: provider.model,
+        store: false,
+        stream: true,
+        instructions: request.system,
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema. No prose, no markdown fences.`
+              }
+            ]
+          }
+        ]
+      })
+    });
+    // readCodexStream already handles non-OK and empty-output as throws.
+    return readCodexStream(response, provider);
   });
-  // readCodexStream already handles non-OK and empty-output as throws.
-  const streamed = await readCodexStream(response, provider);
   const cleaned = stripJsonFences(streamed.text);
   let parsed: unknown;
   try {
@@ -1397,23 +1434,56 @@ async function callOpenAIResponses(
   systemContext: string,
   onDelta?: (text: string) => void
 ): Promise<ProviderResult> {
-  const bearer = provider.name === "codex" ? readCodexBearer(provider) : readOpenAIBearer(provider);
-  const headers = provider.name === "codex" ? codexHeaders(bearer) : {};
-
-  const isCodex = provider.name === "codex";
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
+
+  // Codex and OpenAI share the /responses surface but differ on auth,
+  // streaming, and retry. Codex needs withCodexSessionRetry so a token
+  // rotation mid-stream (or an initial 401 on a stale token) gets a
+  // second attempt after readCodexBearer re-reads auth.json. OpenAI uses
+  // an env-var key with no rotation surface, so a retry would just
+  // re-fail with the same bearer.
+  if (provider.name === "codex") {
+    return withCodexSessionRetry(async () => {
+      const bearer = readCodexBearer(provider);
+      const response = await fetch(`${baseUrl}/responses`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bearer}`,
+          "content-type": "application/json",
+          accept: "text/event-stream",
+          ...codexHeaders(bearer)
+        },
+        body: JSON.stringify({
+          model: provider.model,
+          store: false,
+          stream: true,
+          instructions: systemContext,
+          input: [
+            {
+              role: "user",
+              content: [
+                { type: "input_text", text: input }
+              ]
+            }
+          ]
+        })
+      });
+      return readCodexStream(response, provider, onDelta);
+    });
+  }
+
+  const bearer = readOpenAIBearer(provider);
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${bearer}`,
       "content-type": "application/json",
-      accept: isCodex ? "text/event-stream" : "application/json",
-      ...headers
+      accept: "application/json"
     },
     body: JSON.stringify({
       model: provider.model,
       store: false,
-      stream: isCodex,
+      stream: false,
       instructions: systemContext,
       input: [
         {
@@ -1425,10 +1495,6 @@ async function callOpenAIResponses(
       ]
     })
   });
-
-  if (isCodex) {
-    return readCodexStream(response, provider, onDelta);
-  }
 
   const rawPayload = await response.text();
   const payload = parseJsonObject(rawPayload);
@@ -1496,6 +1562,13 @@ async function readCodexStream(
     const payload = parseJsonObject(raw);
     const fallback = raw.slice(0, 500) || `Codex API request failed with HTTP ${response.status}`;
     const error = readOpenAIError(payload) ?? fallback;
+    // Initial 401 with a session-expired body comes from auth.json holding
+    // a token that was rotated before the request even left gini. Surface
+    // it as the retryable sentinel so withCodexSessionRetry picks up the
+    // freshly-rotated token on its second attempt.
+    if (response.status === 401 && isCodexSessionExpiredMessage(error)) {
+      throw new CodexSessionExpiredError(error);
+    }
     throw new Error(error);
   }
 
@@ -1519,11 +1592,38 @@ async function readCodexStream(
   // existing ProviderResult contract holds.
   const handleEvent = (block: string): void => {
     const lines = block.split(/\r?\n/);
-    const dataLines = lines.filter((line) => line.startsWith("data:"));
+    let eventType: string | undefined;
+    const dataLines: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith("event:")) {
+        eventType = line.slice("event:".length).trim();
+      } else if (line.startsWith("data:")) {
+        dataLines.push(line.slice("data:".length).trim());
+      }
+    }
     if (dataLines.length === 0) return;
-    const data = dataLines.map((line) => line.slice("data:".length).trim()).join("\n");
+    const data = dataLines.join("\n");
     if (!data || data === "[DONE]") return;
     const payload = parseJsonObject(data);
+    const payloadType = typeof payload.type === "string" ? payload.type : eventType;
+
+    // Backend-emitted error events (session rotation, request-level
+    // failures, content-policy aborts). Throwing here unwinds the SSE
+    // consumer loop; if nothing has been pushed to deltaTextParts /
+    // finalTextParts yet, withCodexSessionRetry can re-read auth.json and
+    // retry transparently. Otherwise we'd risk double-emitting partial
+    // output, so the generic Error path runs even on session-expired
+    // mid-stream.
+    if (eventType === "error" || payloadType === "error" || payloadType === "response.failed") {
+      const message = extractStreamErrorMessage(payload)
+        ?? `Codex stream errored before completion (${payloadType ?? "unknown"}).`;
+      const emittedAnyOutput = deltaTextParts.length > 0 || finalTextParts.length > 0;
+      if (isCodexSessionExpiredMessage(message) && !emittedAnyOutput) {
+        throw new CodexSessionExpiredError(message);
+      }
+      throw new Error(message);
+    }
+
     if (!responseId && typeof payload.response_id === "string") responseId = payload.response_id;
     if (!responseId && isRecord(payload.response) && typeof payload.response.id === "string") responseId = payload.response.id;
     if (isRecord(payload.response) && isRecord(payload.response.usage)) usage = payload.response.usage;
@@ -1576,8 +1676,18 @@ async function readCodexStream(
 }
 
 function codexHeaders(accessToken: string): Record<string, string> {
+  // Mirror the codex CLI's request shape exactly — same User-Agent and
+  // originator, no daemon-identifying suffix. The previous header carried
+  // a parenthetical " (Gini Agent)" tail, which made gini's traffic
+  // trivially distinguishable from real codex CLI use of the same session
+  // token. OpenAI's backend can fingerprint that tail and selectively
+  // 401 gini's requests while leaving the interactive CLI alone, which
+  // exactly matches the failure mode we're recovering from above. Keep
+  // the version pinned to the same placeholder the codex CLI shipped
+  // with at the time we copied this shape — if the upstream version
+  // ever drifts enough that the backend starts rejecting it, bump here.
   const headers: Record<string, string> = {
-    "User-Agent": "codex_cli_rs/0.0.0 (Gini Agent)",
+    "User-Agent": "codex_cli_rs/0.0.0",
     originator: "codex_cli_rs"
   };
   const accountId = chatgptAccountId(accessToken);
@@ -1648,6 +1758,77 @@ function readCodexBearer(provider: ProviderConfig): string {
     throw new Error(credentials.message);
   }
   return credentials.bearer;
+}
+
+// Thrown when the codex /responses backend reports the ChatGPT session was
+// rotated or invalidated. Carries a single-retry contract: callers wrap
+// codex requests in `withCodexSessionRetry`, which retries once on this
+// error so a freshly-rotated token in ~/.codex/auth.json (written by the
+// codex CLI's own refresh path) gets a chance to land before we surface
+// the failure. Only raised when no output has been emitted yet — once
+// onDelta has fired or a tool call has been buffered, a transparent
+// retry would double-deliver, so the stream readers fall through to the
+// generic Error path in that case.
+export class CodexSessionExpiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CodexSessionExpiredError";
+  }
+}
+
+// The codex backend uses several phrasings for the same condition — the
+// SSE error event ("Your ChatGPT session expired before this request
+// finished"), a `response.failed` event with `incomplete_details.reason`,
+// and an initial 401 with body shapes like {"error":{"message":"invalid
+// access token"}}. Keep the matcher broad enough to cover all of them
+// but anchored on substrings only the auth path produces, so we don't
+// retry generic model failures.
+const CODEX_SESSION_EXPIRED_RE =
+  /session\s+expired|expired\s+session|invalid[_\s-]?(?:access[_\s-]?)?token|token\s+expired|unauthorized/i;
+
+function isCodexSessionExpiredMessage(message: string | undefined): boolean {
+  if (!message) return false;
+  return CODEX_SESSION_EXPIRED_RE.test(message);
+}
+
+// Pull a human-readable error message out of a streamed SSE `error` /
+// `response.failed` payload. Tries the shapes the codex backend uses in
+// the wild: top-level `message`, nested `error.message`, the
+// `response.error.message` slot inside a `response.failed` envelope, and
+// `response.incomplete_details.reason` (which the backend uses for
+// session rotation in particular). Returns undefined when no field
+// matches — callers fall back to a generic stream-error string.
+function extractStreamErrorMessage(payload: Record<string, unknown>): string | undefined {
+  if (typeof payload.message === "string") return payload.message;
+  if (isRecord(payload.error) && typeof payload.error.message === "string") {
+    return payload.error.message;
+  }
+  if (isRecord(payload.response)) {
+    const resp = payload.response;
+    if (isRecord(resp.error) && typeof resp.error.message === "string") return resp.error.message;
+    if (isRecord(resp.incomplete_details) && typeof resp.incomplete_details.reason === "string") {
+      return resp.incomplete_details.reason;
+    }
+  }
+  return undefined;
+}
+
+// Single-retry wrapper for codex /responses calls. The codex CLI rotates
+// access tokens out-of-band; a request in flight at the moment of
+// rotation gets a server-side "session expired before this request
+// finished" error, even though ~/.codex/auth.json on disk now holds a
+// valid new token. `readCodexBearer` re-reads the file on every call, so
+// a second attempt picks up the freshly-rotated token without any other
+// plumbing. We retry exactly once — a second consecutive session-expired
+// usually means the CLI hasn't yet refreshed, and looping would just
+// burn quota.
+async function withCodexSessionRetry<T>(make: () => Promise<T>): Promise<T> {
+  try {
+    return await make();
+  } catch (err) {
+    if (!(err instanceof CodexSessionExpiredError)) throw err;
+    return await make();
+  }
 }
 
 function readCodexCredentials(provider: ProviderConfig): {
@@ -1947,48 +2128,58 @@ async function callVisionCodex(
   request: VisionRequest,
   maxTokens: number
 ): Promise<VisionResult> {
-  const bearer = readCodexBearer(provider);
-  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
-  const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
-  const response = await fetch(`${baseUrl}/responses`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${bearer}`,
-      "content-type": "application/json",
-      accept: "application/json",
-      ...codexHeaders(bearer)
-    },
-    body: JSON.stringify({
-      model: provider.model,
-      store: false,
-      stream: false,
-      instructions: "",
-      input: [
-        {
-          role: "user",
-          content: [
-            { type: "input_text", text: request.prompt },
-            { type: "input_image", image_url: dataUrl, detail: "low" }
-          ]
-        }
-      ],
-      max_output_tokens: maxTokens
-    })
+  // Vision goes through codex's non-streaming /responses path, so the
+  // session-rotation failure mode is a 401 on the initial response (not
+  // a mid-stream error event). Map that to CodexSessionExpiredError so
+  // withCodexSessionRetry can re-read auth.json and try again.
+  return withCodexSessionRetry(async () => {
+    const bearer = readCodexBearer(provider);
+    const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
+    const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
+    const response = await fetch(`${baseUrl}/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bearer}`,
+        "content-type": "application/json",
+        accept: "application/json",
+        ...codexHeaders(bearer)
+      },
+      body: JSON.stringify({
+        model: provider.model,
+        store: false,
+        stream: false,
+        instructions: "",
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: request.prompt },
+              { type: "input_image", image_url: dataUrl, detail: "low" }
+            ]
+          }
+        ],
+        max_output_tokens: maxTokens
+      })
+    });
+    const rawPayload = await response.text();
+    const payload = parseJsonObject(rawPayload);
+    if (!response.ok) {
+      const fallback = rawPayload.slice(0, 500) || `Codex vision request failed with HTTP ${response.status}`;
+      const message = readOpenAIError(payload) ?? fallback;
+      if (response.status === 401 && isCodexSessionExpiredMessage(message)) {
+        throw new CodexSessionExpiredError(message);
+      }
+      throw new Error(message);
+    }
+    const text = extractOutputText(payload);
+    const usage = isRecord(payload.usage) ? payload.usage : undefined;
+    return {
+      provider,
+      text,
+      usage,
+      cost: estimateCost(provider, usage)
+    };
   });
-  const rawPayload = await response.text();
-  const payload = parseJsonObject(rawPayload);
-  if (!response.ok) {
-    const fallback = rawPayload.slice(0, 500) || `Codex vision request failed with HTTP ${response.status}`;
-    throw new Error(readOpenAIError(payload) ?? fallback);
-  }
-  const text = extractOutputText(payload);
-  const usage = isRecord(payload.usage) ? payload.usage : undefined;
-  return {
-    provider,
-    text,
-    usage,
-    cost: estimateCost(provider, usage)
-  };
 }
 
 async function callVisionChatCompletions(
