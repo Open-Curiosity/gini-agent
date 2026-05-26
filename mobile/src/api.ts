@@ -76,3 +76,28 @@ function safeParse(text: string): unknown {
     return text;
   }
 }
+
+// Resolve the absolute gateway URL + auth headers for an SSE subscription.
+// react-native-sse opens its own XHR, so we can't reuse the `api()` fetcher;
+// this helper centralizes origin normalization and bearer injection so the
+// streaming hook doesn't reimplement either. Throws ApiError(401) when no
+// credentials are configured — the caller surfaces that the same way the
+// /blocks fetch does so the chat detail screen's redirect-to-setup effect
+// still fires.
+export function resolveStreamEndpoint(path: string): {
+  url: string;
+  headers: Record<string, string>;
+} {
+  const creds = readCachedCredentials();
+  if (!creds) throw new ApiError(401, "No credentials configured");
+  let origin: string;
+  try {
+    origin = new URL(creds.baseUrl).origin;
+  } catch {
+    throw new ApiError(0, "Stored base URL is invalid.");
+  }
+  return {
+    url: `${origin}/api${path}`,
+    headers: { authorization: `Bearer ${creds.token}` }
+  };
+}
