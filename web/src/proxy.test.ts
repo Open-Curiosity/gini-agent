@@ -114,6 +114,23 @@ describe("proxy", () => {
     expect(setCookie).toContain("Max-Age=86400");
   });
 
+  test("external host bootstrap Location uses Host header, not Next's loopback request.url", async () => {
+    // Reproduces the production shape: Next binds to 127.0.0.1 via
+    // `-H 127.0.0.1`, so its NextRequest.url is synthesized as
+    // http://127.0.0.1:<port>/<path> regardless of what cloudflared
+    // forwarded. Without rebuilding the redirect Location off the Host
+    // header, a phone that scanned the QR would receive Location:
+    // http://127.0.0.1:.../ and follow it to an unreachable loopback URL.
+    const secret = "abcdefghij0123456789";
+    writeTunnelConfig({ enabled: true, secret });
+    const request = new NextRequest(new URL(`http://127.0.0.1:3000/${secret}`), {
+      headers: { host: "tunnel.example.com" }
+    });
+    const response = await proxy(request);
+    expect([307, 308]).toContain(response.status);
+    expect(response.headers.get("location")).toBe("https://tunnel.example.com/");
+  });
+
   test("external host bootstrap to /<secret>/settings rewrites with Set-Cookie", async () => {
     const secret = "abcdefghij0123456789";
     writeTunnelConfig({ enabled: true, secret });

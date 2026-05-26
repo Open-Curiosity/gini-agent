@@ -176,13 +176,26 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
       );
     }
 
+    // Build redirect Locations off the tunnel-facing Host (the
+    // trycloudflare hostname cloudflared forwarded) rather than
+    // request.url. Next is bound to 127.0.0.1 with `-H` (see
+    // src/cli/process.ts), so `request.url` resolves to
+    // `http://127.0.0.1:<port>/...` regardless of what cloudflared
+    // received — handing that to NextResponse.redirect would tell the
+    // scanning phone's browser to follow Location: http://127.0.0.1...
+    // which is unreachable from a phone on the mobile network. The
+    // external branch has already verified Host is non-loopback and
+    // either the secret-prefix or the session cookie authorized this
+    // request, so the Host header is the right public origin to use.
+    const externalOrigin = `https://${host}`;
+
     // Apply the same setup gate localhost requests get, but only on
     // page navigations (not API or _next/* asset fetches that the page
     // makes on the way in).
     if (!stripped.startsWith("/api/") && !stripped.startsWith("/setup")) {
       const configured = await isProviderConfigured();
       if (configured === false) {
-        const setupUrl = new URL("/setup", request.url);
+        const setupUrl = new URL("/setup", externalOrigin);
         const setupRedirect = NextResponse.redirect(setupUrl);
         if (hasPrefix) attachSession(setupRedirect, secret);
         return setupRedirect;
@@ -197,7 +210,7 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     // rewriting because a redirect there would drop the user's intended
     // deep-link destination.
     if (hasPrefix && stripped === "/") {
-      const homeRedirect = NextResponse.redirect(new URL("/", request.url));
+      const homeRedirect = NextResponse.redirect(new URL("/", externalOrigin));
       attachSession(homeRedirect, secret);
       return homeRedirect;
     }
