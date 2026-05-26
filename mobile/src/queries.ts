@@ -309,11 +309,29 @@ export function useChatBlocks(sessionId: string | null): {
     };
 
     const closeStream = (): void => {
-      if (es) {
-        es.removeAllEventListeners();
-        es.close();
-        es = null;
-      }
+      if (!es) return;
+      // react-native-sse schedules a reconnect poll AFTER our error
+      // handler returns: on a non-2xx XHR finish the library dispatches
+      // 'error', then unconditionally calls `_pollAgain(interval)` which
+      // sets `_pollTimer = setTimeout(open, interval)`. Our inline
+      // `close()` clears `_pollTimer` BEFORE the library has set it, so
+      // an orphan timer would later fire `open()` and resurrect the
+      // dead connection (re-hitting /stream with the same dead bearer
+      // token on 401). Capture the dying instance, run the inline
+      // teardown, and schedule a deferred `close()` that runs AFTER the
+      // library's `_pollAgain` so the post-dispatch timer gets cleared.
+      const dying = es;
+      es = null;
+      dying.removeAllEventListeners();
+      dying.close();
+      setTimeout(() => {
+        try {
+          dying.close();
+        } catch {
+          // close() is idempotent in react-native-sse; the catch is
+          // belt-and-suspenders against a future internal change.
+        }
+      }, 0);
     };
 
     // Gated open: we must never spin up an EventSource before the seed
