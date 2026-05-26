@@ -1778,13 +1778,16 @@ export class CodexSessionExpiredError extends Error {
 
 // The codex backend uses several phrasings for the same condition — the
 // SSE error event ("Your ChatGPT session expired before this request
-// finished"), a `response.failed` event with `incomplete_details.reason`,
+// finished"), a `response.failed` event with `incomplete_details.reason`
+// carrying snake_case enum codes like `session_expired` / `token_expired`,
 // and an initial 401 with body shapes like {"error":{"message":"invalid
 // access token"}}. Keep the matcher broad enough to cover all of them
 // but anchored on substrings only the auth path produces, so we don't
-// retry generic model failures.
+// retry generic model failures. The separator class `[_\s-]+` accepts
+// whitespace, underscores, and hyphens so the human-readable and
+// enum-coded forms both match.
 const CODEX_SESSION_EXPIRED_RE =
-  /session\s+expired|expired\s+session|invalid[_\s-]?(?:access[_\s-]?)?token|token\s+expired|unauthorized/i;
+  /session[_\s-]+expired|expired[_\s-]+session|invalid[_\s-]?(?:access[_\s-]?)?token|token[_\s-]+expired|unauthorized/i;
 
 function isCodexSessionExpiredMessage(message: string | undefined): boolean {
   if (!message) return false;

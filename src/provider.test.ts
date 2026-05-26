@@ -1954,6 +1954,64 @@ describe("provider", () => {
     }
   });
 
+  test("codex tool-calling retries when response.failed carries a snake_case reason (session_expired / token_expired)", async () => {
+    // The backend also delivers session rotation as an enum-coded value
+    // in `response.incomplete_details.reason` — `session_expired` and
+    // `token_expired` are the documented forms. The matcher must accept
+    // underscores between session/token and expired so these don't slip
+    // through as unretryable generic stream errors.
+    const { restore } = installCodexAuth("codex-session-retry-snake-case");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          if (attempts === 1) {
+            controller.enqueue(enc.encode(
+              `event: response.failed\ndata: ${JSON.stringify({
+                type: "response.failed",
+                response: { id: "r1", incomplete_details: { reason: "session_expired" } }
+              })}\n\n`
+            ));
+            controller.close();
+            return;
+          }
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
   test("codex retry caps at exactly one attempt (no infinite loop on repeated session errors)", async () => {
     // If the codex CLI hasn't rotated yet by the time we re-read auth,
     // the second attempt also fails. We must NOT loop further — just
