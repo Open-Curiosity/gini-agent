@@ -702,12 +702,11 @@ export function resolveTunnelConfig(
   if (rawEnabled === undefined && enabled !== false) mutated = true;
   if (raw?.enabled !== undefined && typeof raw.enabled !== "boolean") mutated = true;
   const notesRaw = raw?.appleNotes;
-  // Default off on every platform. We previously defaulted on for
-  // darwin, but the Apple Notes mirror writes the secret-bearing
-  // tunnel URL into iCloud — that URL bypasses bearer auth, so any
-  // iCloud-signed device on the same account can reach the tunnel.
-  // Shipping that surface without explicit operator consent is an
-  // unauth-bypass we don't want by default. The operator opts in
+  // Default off on every platform. The Apple Notes mirror writes the
+  // secret-bearing tunnel URL into iCloud, and that URL bypasses bearer
+  // auth — any iCloud-signed device on the same account can reach the
+  // tunnel. Shipping that surface without explicit operator consent is
+  // an unauth-bypass we won't enable by default. The operator opts in
   // via the Settings card toggle (PATCH /api/tunnel sets
   // appleNotes.enabled=true).
   const notesEnabledDefault = false;

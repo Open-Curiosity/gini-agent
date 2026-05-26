@@ -1,19 +1,17 @@
 // QR code generation for the tunnel landing URL.
 //
-// Backed by the `qrcode` npm library (battle-tested against every major
-// scanner, including iOS Camera which is the strictest about quiet-zone
-// width and mask selection). The library returns a bit matrix; the SVG
-// and ANSI renderers below paint it.
+// Backed by the `qrcode` npm library — battle-tested against every major
+// scanner including iOS Camera, which is the strictest about quiet-zone
+// width, format-info placement, and mask selection. Hand-rolled encoders
+// frequently fail iOS Camera's format-info validation even when more
+// lenient decoders accept them, so we depend on a library rather than
+// reimplement the spec. The library returns a bit matrix; the SVG and
+// ANSI renderers below paint it.
 //
 // Error correction level M is chosen over L because phone cameras need
 // the extra redundancy when the scan happens through a screen at an
 // angle. The default quiet-zone padding is 4 modules per ISO/IEC 18004
 // §6.3.8 — iOS Camera silently refuses anything smaller.
-//
-// Note on history: an earlier hand-rolled implementation lived here.
-// It had subtle bugs in the format-info placement that iOS scanners
-// rejected even though more lenient decoders accepted it. The library
-// trades a small dependency for correctness against every scanner.
 
 import QRCode from "qrcode";
 
