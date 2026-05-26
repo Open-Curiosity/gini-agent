@@ -2188,7 +2188,7 @@ describe("provider", () => {
     globalThis.setTimeout = ((handler: TimerHandler, ms?: number, ...rest: unknown[]) => {
       if (typeof ms === "number") delays.push(ms);
       return originalSetTimeout(handler as () => void, ms, ...rest);
-    }) as typeof globalThis.setTimeout;
+    }) as unknown as typeof globalThis.setTimeout;
     let attempts = 0;
     globalThis.fetch = (() => {
       attempts += 1;
