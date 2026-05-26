@@ -2070,6 +2070,115 @@ describe("runtime api", () => {
       expect(result.reason).toBe("no snapshot");
     });
   });
+
+  describe("push device endpoints", () => {
+    test("POST /api/push/devices upserts a token scoped to the caller's credential", async () => {
+      const config = testConfig("push-devices-upsert");
+      const handler = createHandler(config);
+      // Two distinct credentials: the runtime "owner" (config.token)
+      // and a paired mobile device that gets its own credential id.
+      const pairing = await call(handler, config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 60 }) });
+      const claimed = await callPublic(handler, config, "/api/pairing/claim", {
+        method: "POST",
+        body: JSON.stringify({ code: pairing.code, deviceName: "Phone" })
+      });
+
+      const ownerReg = await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const phoneReg = await callWithToken(handler, config, claimed.token, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_phone", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+
+      expect(ownerReg.ok).toBe(true);
+      expect(ownerReg.device.credentialId).toBe("owner");
+      expect(ownerReg.device.token).toBe("tok_owner");
+      expect(phoneReg.ok).toBe(true);
+      expect(phoneReg.device.credentialId).toBe(claimed.device.id);
+      expect(phoneReg.device.token).toBe("tok_phone");
+
+      // Re-register the same token under the owner — idempotent rebind.
+      const rebind = await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile.dev" })
+      });
+      expect(rebind.device.bundleId).toBe("ai.lilaclabs.gini.mobile.dev");
+      expect(rebind.device.credentialId).toBe("owner");
+    });
+
+    test("POST /api/push/devices validates inputs", async () => {
+      const config = testConfig("push-devices-validate");
+      const handler = createHandler(config);
+
+      const missingToken = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      }, config.token);
+      expect(missingToken.status).toBe(400);
+
+      const wrongPlatform = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok", platform: "android", bundleId: "ai.lilaclabs.gini.mobile" })
+      }, config.token);
+      expect(wrongPlatform.status).toBe(400);
+
+      const missingBundle = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok", platform: "ios" })
+      }, config.token);
+      expect(missingBundle.status).toBe(400);
+    });
+
+    test("DELETE /api/push/devices/:token removes only the caller's tokens", async () => {
+      const config = testConfig("push-devices-delete");
+      const handler = createHandler(config);
+      const pairing = await call(handler, config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 60 }) });
+      const claimed = await callPublic(handler, config, "/api/pairing/claim", {
+        method: "POST",
+        body: JSON.stringify({ code: pairing.code, deviceName: "Phone" })
+      });
+
+      // Register two tokens — one per credential.
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await callWithToken(handler, config, claimed.token, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_phone", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+
+      // Owner cannot delete the paired device's token — 404 (we
+      // intentionally don't surface which of "missing" vs "wrong
+      // owner" so credentials can't probe each other).
+      const crossDelete = await rawCall(handler, config, "/api/push/devices/tok_phone", { method: "DELETE" }, config.token);
+      expect(crossDelete.status).toBe(404);
+
+      // The paired device deleting its own token succeeds.
+      const ownDelete = await callWithToken(handler, config, claimed.token, "/api/push/devices/tok_phone", { method: "DELETE" });
+      expect(ownDelete.ok).toBe(true);
+
+      // Second delete of the same token: 404.
+      const repeatDelete = await rawCall(handler, config, "/api/push/devices/tok_phone", { method: "DELETE" }, claimed.token);
+      expect(repeatDelete.status).toBe(404);
+    });
+
+    test("push device endpoints require authentication", async () => {
+      const config = testConfig("push-devices-auth");
+      const handler = createHandler(config);
+
+      const post = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      expect(post.status).toBe(401);
+
+      const del = await rawCall(handler, config, "/api/push/devices/tok", { method: "DELETE" });
+      expect(del.status).toBe(401);
+    });
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

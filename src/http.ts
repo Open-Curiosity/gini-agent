@@ -10,7 +10,9 @@ import {
   mutateState,
   readState,
   readTrace,
-  subscribeChatBlocks
+  removeDeviceForCredential,
+  subscribeChatBlocks,
+  upsertDevice
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
 import { mobileBootstrap, publicState } from "./runtime/views";
@@ -23,7 +25,7 @@ import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embeddin
 import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
-import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./governance/pairing";
+import { authorizedBearer, claimPairing, createPairing, resolveCredentialFromBearer, revokePairedDevice } from "./governance/pairing";
 import { proposePromotion, reviewPromotion } from "./governance/promotions";
 import { status, updateAutoApproveSettings } from "./runtime";
 import { searchSessions } from "./execution/search";
@@ -621,6 +623,41 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/devices$/, () => json(publicState(config).devices)],
     ["POST", /^\/api\/devices\/([^/]+)\/revoke$/, async (_request, params) => json(await revokePairedDevice(config, params[0]))],
     ["POST", /^\/api\/pairing$/, async (request) => json(await createPairing(config, await body(request)), 201)],
+    // Push-device registry endpoints. The mobile app POSTs its APNs
+    // token here on first launch (and on rotation via
+    // addPushTokenListener); DELETE prunes a token when the app
+    // signs out. Both routes scope the row to the calling credential
+    // — a paired device id (from the pairing claim flow) or the
+    // literal "owner" for the runtime config token. The CHECK
+    // constraint on the devices table pins platform to "ios" for now.
+    ["POST", /^\/api\/push\/devices$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const payload = await body(request);
+      const token = typeof payload.token === "string" ? payload.token.trim() : "";
+      const platform = typeof payload.platform === "string" ? payload.platform.trim() : "";
+      const bundleId = typeof payload.bundleId === "string" ? payload.bundleId.trim() : "";
+      if (!token) return json({ error: "token is required" }, 400);
+      if (platform !== "ios") return json({ error: "platform must be 'ios'" }, 400);
+      if (!bundleId) return json({ error: "bundleId is required" }, 400);
+      const device = upsertDevice(config.instance, {
+        token,
+        credentialId: credential,
+        platform: "ios",
+        bundleId
+      });
+      return json({ ok: true, device });
+    }],
+    ["DELETE", /^\/api\/push\/devices\/([^/]+)$/, async (request, params) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const removed = removeDeviceForCredential(config.instance, params[0], credential);
+      // 404 distinguishes "token does not exist OR belongs to a
+      // different credential" — we don't surface which because
+      // either leaks information about other credentials' devices.
+      if (!removed) return json({ error: "Device not found" }, 404);
+      return json({ ok: true });
+    }],
     ["GET", /^\/api\/promotions$/, () => json(readState(config.instance).promotions)],
     ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],
     ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, async (_request, params) => json(await reviewPromotion(config, params[0], "approve"))],
@@ -989,6 +1026,15 @@ async function authorized(request: Request, config: RuntimeConfig): Promise<bool
   const queryToken = new URL(request.url).searchParams.get("token");
   const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : queryToken;
   return authorizedBearer(config, bearer ?? undefined);
+}
+
+// Pull the bearer off a request the same way `authorized` does so
+// per-route credential lookups stay consistent with the gate above.
+function bearerFromRequest(request: Request): string | undefined {
+  const header = request.headers.get("authorization") ?? "";
+  const queryToken = new URL(request.url).searchParams.get("token");
+  const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : queryToken;
+  return bearer ?? undefined;
 }
 
 function json(value: unknown, statusCode = 200): Response {
