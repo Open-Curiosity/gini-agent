@@ -85,7 +85,16 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
   // disk. The redactor reads the live secret from `config.json` (cheap,
   // cached briefly) so a rotate-secret on a running gateway picks up the
   // new value within the cache window. See PLAN.md "Log redaction".
-  const redactForLog = fileName === "web.log" ? makeWebLogRedactor(instance) : null;
+  // One redactor per stream. Sharing a single carry buffer across
+  // stdout AND stderr would prepend stdout's held-back tail onto the
+  // next stderr chunk (and vice versa), re-routing bytes across streams
+  // and leaving the close-time flush going to whichever process.stream
+  // was wired in the close handler regardless of where the tail
+  // originated. Two redactors keep each stream's carry isolated; both
+  // still share the same secret/priorSecret values via the file-cache
+  // inside makeWebLogRedactor.
+  const redactStdout = fileName === "web.log" ? makeWebLogRedactor(instance) : null;
+  const redactStderr = fileName === "web.log" ? makeWebLogRedactor(instance) : null;
   if (foreground) {
     // Foreground: open a write stream and tee child.stdout/stderr to both the
     // user's terminal and the log file. Stream is closed when the child's stdio
@@ -104,23 +113,32 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
       stdio: ["inherit", "pipe", "pipe"],
       onSpawned: (child) => {
         child.stdout?.on("data", (chunk: Buffer | string) => {
-          const redacted = redactForLog ? redactForLog(chunk) : chunk;
+          const redacted = redactStdout ? redactStdout(chunk) : chunk;
           process.stdout.write(redacted);
           stream.write(redacted);
         });
         child.stderr?.on("data", (chunk: Buffer | string) => {
-          const redacted = redactForLog ? redactForLog(chunk) : chunk;
+          const redacted = redactStderr ? redactStderr(chunk) : chunk;
           process.stderr.write(redacted);
           stream.write(redacted);
         });
         const close = () => {
           // Flush any held-back redactor carry bytes before ending the
           // stream — otherwise the tail of the child's output is lost when
-          // the process exits without a trailing newline.
-          if (redactForLog) {
-            const tail = redactForLog.flush();
+          // the process exits without a trailing newline. Per-stream
+          // flushes write the tail to the matching process.std<x> so
+          // stderr's last bytes never end up on stdout (and vice versa).
+          if (redactStdout) {
+            const tail = redactStdout.flush();
             if (tail) {
               try { process.stdout.write(tail); } catch { /* ignore */ }
+              try { stream.write(tail); } catch { /* ignore */ }
+            }
+          }
+          if (redactStderr) {
+            const tail = redactStderr.flush();
+            if (tail) {
+              try { process.stderr.write(tail); } catch { /* ignore */ }
               try { stream.write(tail); } catch { /* ignore */ }
             }
           }

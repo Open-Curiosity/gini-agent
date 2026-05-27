@@ -76,7 +76,19 @@ export function useDeepLinkAuth(): void {
       "Connect to Gini gateway?",
       `Switch this device to use:\n\n${displayHost}\n\nDo not approve if you didn't expect this link.`,
       [
-        { text: "Cancel", style: "cancel" },
+        {
+          text: "Cancel",
+          style: "cancel",
+          onPress: () => {
+            // Move the user OFF the /connect placeholder so they don't sit
+            // on a spinner forever after dismissing the prompt. The auth
+            // gate at app/index.tsx routes based on persisted credentials:
+            // existing-auth → /agents, no-auth → /setup. Either is fine —
+            // both are reachable surfaces with their own navigation.
+            if (!active) return;
+            router.replace("/");
+          }
+        },
         {
           text: "Connect",
           onPress: () => {
