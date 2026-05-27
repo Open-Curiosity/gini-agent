@@ -1,18 +1,30 @@
 import * as Linking from "expo-linking";
 import { useEffect } from "react";
+import { Alert } from "react-native";
 import { router } from "expo-router";
 import { saveCredentials } from "@/src/auth";
 
 // Handles `gini://connect?api=<base-url>&token=<bearer>` deep links by
-// persisting the credentials and navigating into the app. The connect
-// interstitial page on the web side constructs the URL; this hook
-// consumes it.
+// prompting the user, then persisting the credentials and navigating
+// into the app on approval. The connect interstitial page on the web
+// side constructs the URL; this hook consumes it.
 //
 // Triggered for both cold starts (app launched by tapping the deep link
 // while not running) and warm hand-offs (app already running in
 // background, then iOS routes the URL to it). `Linking.useURL()` covers
 // both cases — it returns the launch URL on cold start, then updates
 // whenever a new URL is dispatched to the app.
+//
+// Security: ANY app or web page can construct a `gini://connect?...` URL
+// (the scheme is registered on the device, not gated by ownership). A
+// phishing SMS or pasteboard contents containing a crafted link would
+// otherwise silently pivot the device to attacker-controlled gateway +
+// bearer. Defense: show an `Alert` with the destination host and require
+// explicit Connect approval before `saveCredentials` runs. The fuller
+// nonce / PKCE-style challenge protocol (the web /connect page mints a
+// short-lived challenge that the mobile app verifies against state it
+// already holds) is tracked as a follow-up; this confirmation closes
+// the silent-overwrite vector today.
 
 const CONNECT_PATH = "connect";
 
@@ -50,24 +62,50 @@ export function useDeepLinkAuth(): void {
     let active = true;
     const creds = parseConnectUrl(url);
     if (!creds) return;
-    // `saveCredentials` runs URL normalization and broadcasts to every
-    // mounted `useAuth` listener — the auth gate in `app/index.tsx`
-    // notices the new identity and the user lands on /agents on the
-    // next render tick. We still call `router.replace` explicitly so a
-    // user who tapped the deep link while sitting on /setup is moved
-    // off it immediately instead of waiting for state propagation.
-    saveCredentials(creds)
-      .then(() => {
-        if (!active) return;
-        router.replace("/agents");
-      })
-      .catch(() => {
-        // Saving can fail if the base URL fails normalization. The
-        // setup screen is the right recovery surface — bounce the user
-        // there so they can paste/correct by hand.
-        if (!active) return;
-        router.replace("/setup");
-      });
+    // Surface the destination host (not the raw URL — Alert lines wrap
+    // unpredictably on long strings, and the host is the actually
+    // load-bearing thing for the user's decision). Fall back to the raw
+    // base URL if `new URL` can't parse for any reason.
+    let displayHost: string;
+    try {
+      displayHost = new URL(creds.baseUrl).host;
+    } catch {
+      displayHost = creds.baseUrl;
+    }
+    Alert.alert(
+      "Connect to Gini gateway?",
+      `Switch this device to use:\n\n${displayHost}\n\nDo not approve if you didn't expect this link.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Connect",
+          onPress: () => {
+            if (!active) return;
+            // `saveCredentials` runs URL normalization and broadcasts to
+            // every mounted `useAuth` listener — the auth gate in
+            // `app/index.tsx` notices the new identity and the user
+            // lands on /agents on the next render tick. We still call
+            // `router.replace` explicitly so a user who tapped the deep
+            // link while sitting on /setup is moved off it immediately
+            // instead of waiting for state propagation.
+            saveCredentials(creds)
+              .then(() => {
+                if (!active) return;
+                router.replace("/agents");
+              })
+              .catch(() => {
+                // Saving can fail if the base URL fails normalization.
+                // The setup screen is the right recovery surface —
+                // bounce the user there so they can paste/correct by
+                // hand.
+                if (!active) return;
+                router.replace("/setup");
+              });
+          }
+        }
+      ],
+      { cancelable: true }
+    );
     return () => {
       active = false;
     };
