@@ -358,6 +358,16 @@ let webHealthFailureStreak = 0;
 // path) still benefits from the elide.
 let recycleSkipElide = false;
 
+// Single-flight latch for the health-driven recycle. True from the
+// moment the health interval enqueues a runRecycle onto pendingApply
+// until that recycle settles. Mirrors bootRecoveryRecycleInFlight:
+// without it, a recycle that takes longer than the 30s health
+// interval lets the next tick's failing probe enqueue a SECOND
+// forced recycle (recycleSkipElide is still true from the first
+// enqueue) — which would rotate the public cloudflared URL a second
+// time despite the first recycle having already landed the recovery.
+let healthRecycleInFlight = false;
+
 const startWebHealthPolling = (): void => {
   if (webHealthInterval !== null) return;
   webHealthFailureStreak = 0;
@@ -397,6 +407,15 @@ const startWebHealthPolling = (): void => {
       }
       webHealthFailureStreak += 1;
       if (webHealthFailureStreak >= WEB_HEALTH_FAIL_THRESHOLD) {
+        if (healthRecycleInFlight) {
+          // A prior health-driven recycle is still queued or
+          // executing. Skip this enqueue; the next tick will re-
+          // check probeWebHealthy (which the queued recycle's
+          // re-resolve has had a chance to make healthy by then),
+          // and only enqueue another forced recycle if the failure
+          // persists.
+          return;
+        }
         appendLog(config.instance, "tunnel.web.unhealthy", {
           target,
           streak: webHealthFailureStreak
@@ -409,7 +428,10 @@ const startWebHealthPolling = (): void => {
         // restarted web child or surface a stranded state through
         // the recycle's lastError.
         recycleSkipElide = true;
-        pendingApply = pendingApply.then(runRecycle, () => undefined);
+        healthRecycleInFlight = true;
+        pendingApply = pendingApply
+          .then(runRecycle, () => undefined)
+          .finally(() => { healthRecycleInFlight = false; });
       }
     }).catch(() => { probeInFlight = false; });
   }, WEB_HEALTH_INTERVAL_MS);
