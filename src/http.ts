@@ -14,7 +14,7 @@ import {
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
 import { runFillSecretConnect } from "./execution/browser-fill-secrets";
-import { resumeChatTask } from "./execution/chat-task";
+import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -253,102 +253,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         : {};
 
       if (approval.action === "messaging.add_bridge") {
-        // Chat-side equivalent of the settings page's Add Telegram /
-        // Add Discord dialog. The card's Submit button POSTs the
-        // name + bot-token via the `secrets` envelope; we route them
-        // straight into addMessagingBridge (the shared CLI / settings
-        // path).
-        //
-        // Ordering mirrors runFillSecretConnect
-        // (src/execution/browser-fill-secrets.ts): atomic
-        // resolveApproval(resumeChatTask:false) FIRST so a concurrent
-        // /deny (or task cancel cascade) cannot leave an orphan
-        // bridge + encrypted secret on disk after the user has
-        // already abandoned the prompt. addMessagingBridge runs
-        // AFTER the lock-in; the chat-task resume is fired manually
-        // from this handler so the agent loop gets a result string
-        // reflecting what actually happened.
-        const kind = approval.payload.kind === "telegram" || approval.payload.kind === "discord"
-          ? (approval.payload.kind as "telegram" | "discord")
-          : undefined;
-        if (!kind) {
-          return json({ ok: false, message: "Approval payload missing kind (telegram|discord); refusing to create bridge." }, 400);
-        }
-        const submittedName = typeof secrets.name === "string" ? secrets.name.trim() : "";
-        const submittedToken = typeof secrets.botToken === "string" ? secrets.botToken.trim() : "";
-        const deliveryTargets = Array.isArray(payload.deliveryTargets)
-          ? payload.deliveryTargets.map(String).map((t) => t.trim()).filter((t) => t.length > 0)
-          : [];
-        // Field validations run BEFORE the atomic resolve so a
-        // missing-field POST doesn't burn the approval — the chat
-        // card stays pending and the user can resubmit with the
-        // correct values.
-        if (!submittedName) {
-          return json({ ok: false, message: "Bridge name is required." });
-        }
-        if (!submittedToken) {
-          return json({ ok: false, message: "Bot token is required." });
-        }
-        if (kind === "discord" && deliveryTargets.length === 0) {
-          return json({ ok: false, message: "Discord bridges require at least one channel id under deliveryTargets." });
-        }
-        try {
-          await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: false });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          return json({ ok: false, message: `Could not lock approval for bridge create: ${message}` }, 410);
-        }
-        const toolCallId = typeof approval.payload.toolCallId === "string"
-          ? approval.payload.toolCallId
-          : undefined;
-        const kindLabel = kind === "telegram" ? "Telegram" : "Discord";
-        let bridge;
-        try {
-          bridge = await addMessagingBridge(config, {
-            name: submittedName,
-            kind,
-            botToken: submittedToken,
-            deliveryTargets
-          });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          // Approval is already resolved at this point — the chat
-          // card will rerender with the resolved status pill and
-          // can no longer be retried. Resume the chat-task loop
-          // with the failure so the agent verbalizes the error
-          // back to the user (matching browser.fill_secret's
-          // post-resolve error pattern).
-          if (approval.taskId && toolCallId) {
-            try {
-              await resumeChatTask(
-                config,
-                approval.taskId,
-                toolCallId,
-                `Could not create ${kindLabel} bridge: ${message}. Tell the user about the failure so they can retry from the settings page.`
-              );
-            } catch {
-              // Best-effort resume — the user-facing error already
-              // surfaced via the ok:false body; a resume failure
-              // on top of that has no extra information to add.
-            }
-          }
-          return json({ ok: false, message });
-        }
-        if (approval.taskId && toolCallId) {
-          try {
-            await resumeChatTask(
-              config,
-              approval.taskId,
-              toolCallId,
-              `${kindLabel} bridge added: ${bridge.name}. Tell the user it's ready and walk them through enrolling a chat (DM the bot, share the verification code, you approve from the settings page) if relevant.`
-            );
-          } catch {
-            // Bridge already exists on disk; a resume failure
-            // doesn't undo that. The user sees the success body
-            // and the bridge in the settings page.
-          }
-        }
-        return json({ ok: true, bridge });
+        // Thin delegate to the bounded module — mirrors the
+        // browser.fill_secret branch's two-line shape. The lifecycle
+        // (kind parsing, pre-resolve field + token-format validation,
+        // atomic resolve, addMessagingBridge, resumeChatTask with
+        // failTask recovery) lives in src/execution/messaging-bridge-connect.ts
+        // so it can be unit-tested in isolation and so http.ts stays
+        // a routing layer per the AGENTS.md boundary rule.
+        const result = await runMessagingBridgeConnect(config, approval, secrets, payload.deliveryTargets);
+        return json(result.body, result.status);
       }
 
       if (approval.action === "browser.fill_secret") {

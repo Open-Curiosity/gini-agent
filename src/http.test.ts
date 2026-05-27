@@ -1057,6 +1057,42 @@ describe("runtime api", () => {
     expect(readState(config.instance).approvals.find((a) => a.id === approval.id)?.status).toBe("pending");
   });
 
+  test("POST /api/approvals/<id>/connect rejects malformed messaging.add_bridge tokens BEFORE resolving the approval", async () => {
+    // Token-format pre-check fix: addMessagingBridge runs
+    // assertHeaderSafeToken internally, and the chat card disappears
+    // once the approval flips out of pending state. Without
+    // pre-resolve token validation, a malformed token would burn the
+    // approval and the user could not retype from the same card.
+    // The bounded module now calls assertHeaderSafeToken BEFORE
+    // resolveApproval; this test pins that ordering by submitting a
+    // token with a control character and asserting the approval
+    // stays pending.
+    const config = testConfig("connect-bridge-bad-token-stays-pending");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        risk: "high",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "bad-token", toolCallId: "call_bridge_bad_token" }
+      })
+    );
+    const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+      method: "POST",
+      // Control character in the token — assertHeaderSafeToken
+      // refuses any byte outside printable ASCII [\x21-\x7E].
+      body: JSON.stringify({ secrets: { name: "bad-token", botToken: "1234:abc\ndef" } })
+    });
+    expect(response.ok).toBe(false);
+    expect(typeof response.message).toBe("string");
+
+    const after = readState(config.instance);
+    expect(after.approvals.find((a) => a.id === approval.id)?.status).toBe("pending");
+    expect(after.messagingBridges.length).toBe(0);
+  });
+
   test("POST /api/approvals/<id>/connect returns ok:false when messaging.add_bridge is missing a name or token", async () => {
     // The chat card disables Submit until both inputs are non-empty,
     // but a CLI/API caller could POST a partial body. The gateway
