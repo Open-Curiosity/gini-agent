@@ -5,6 +5,7 @@ import { launchCloudflared, type CloudflaredLaunch } from "./cloudflared";
 import { probeNotesAvailable, writeNote, clearNote } from "./apple-notes";
 import { ensureTunnelConfig, patchTunnelConfig, readTunnelConfig } from "./config-store";
 import { atomicWriteFile } from "../../atomic-write";
+import { isSupervisedWebChild } from "../health-probe";
 import { generateTunnelSecret, secretRevision } from "./secret";
 import { instanceRoot } from "../../paths";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
@@ -157,6 +158,20 @@ class TunnelManager {
     if (this.shuttingDown) {
       return { ok: false, error: "Tunnel manager shutting down" };
     }
+    // Re-probe `/__healthz` inside the apply-chain slot, immediately
+    // before the spawn. The PATCH handler already probed before calling
+    // enable(), but the supervised Next.js child could have died between
+    // that probe and now (queue backpressure: a 15s Notes osascript
+    // might have been queued ahead of us, plus the prev.stop() below
+    // can take up to 5s on its SIGKILL fallback). If a different local
+    // process binds the now-free port in that window, cloudflared
+    // would forward to a stranger instead of our gateway. The re-probe
+    // closes that race; the cost is one 1500ms-bounded fetch per
+    // enable/recycle, paid only once per transition.
+    const healthy = await isSupervisedWebChild(this.config.instance, webPort);
+    if (!healthy) {
+      return { ok: false, error: redact(`web port ${webPort} no longer identifies as the supervised gini-web child`) };
+    }
     if (this.cloudflared) {
       const prev = this.cloudflared;
       this.cloudflared = null;
@@ -185,12 +200,19 @@ class TunnelManager {
       const url = await launch.publicUrl;
       // Belt-and-suspenders: process.once fires on the next event-loop
       // tick, so a same-tick exit between the await resolving and our
-      // snapshot stamp would slip past. Sync exitCode catches that gap.
-      if (launch.process.exitCode !== null) {
+      // snapshot stamp would slip past. Check both `exitCode` (normal
+      // exits set this to a number; signal exits leave it null per the
+      // Node child_process docs) AND `signalCode` (set on signal-driven
+      // termination — SIGKILL/SIGTERM/etc) so a signal-killed cloudflared
+      // doesn't get treated as live.
+      if (launch.process.exitCode !== null || launch.process.signalCode !== null) {
         this.cloudflared = null;
         try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
         setRedactionPublicUrl(null);
-        const msg = redact(`cloudflared exited (code ${launch.process.exitCode}) during banner parse`);
+        const reason = launch.process.exitCode !== null
+          ? `code ${launch.process.exitCode}`
+          : `signal ${launch.process.signalCode}`;
+        const msg = redact(`cloudflared exited (${reason}) during banner parse`);
         this.snapshot = { ...this.snapshot, publicUrl: null, lastError: msg };
         return { ok: false, error: msg };
       }

@@ -72,6 +72,7 @@ import { projectRoot, webPortPath } from "./paths";
 import { existsSync, readFileSync } from "node:fs";
 import { tunnelManager, bootstrapUrl, renderQrSvg, renderQrAnsi } from "./runtime/tunnel";
 import type { RedactedTunnelSnapshot, TunnelSnapshot } from "./runtime/tunnel/types";
+import { isSupervisedWebChild } from "./runtime/health-probe";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
@@ -102,18 +103,11 @@ function readWebPort(instance: string): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-async function isSupervisedWebChild(instance: string, port: number): Promise<boolean> {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/api/runtime/__healthz`, {
-      signal: AbortSignal.timeout(1500)
-    });
-    if (!res.ok) return false;
-    const body = (await res.json()) as { service?: unknown; instance?: unknown };
-    return body.service === "gini-web" && body.instance === instance;
-  } catch {
-    return false;
-  }
-}
+// `isSupervisedWebChild` extracted to `./runtime/health-probe` so the
+// TunnelManager can re-run the same identity check inside its apply
+// chain — closing the port-recycle race where the supervised Next.js
+// child dies between this handler's probe and the manager's cloudflared
+// spawn and an opportunistic local process binds the freed port.
 
 export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
   const routes: Array<[string, RegExp, Handler]> = [
