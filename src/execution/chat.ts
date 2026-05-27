@@ -116,19 +116,17 @@ export function getChatSession(config: RuntimeConfig, id: string) {
         (m) => m.role === "assistant" && m.taskId === task.id && m.kind === "approval_reason"
       );
       if (hasPersistedApprovalReason) continue;
-      // browser.connect approvals render their own self-describing card in
-      // chat ("Connect to agent's browser" + the reason + Connect/Cancel). A
-      // generic "Waiting for approval..." bubble next to that card is
-      // redundant noise — the card already conveys what's pending. Skip the
-      // placeholder when the pending approval(s) for this task are all
-      // browser.connect.
-      const pendingApprovals = state.approvals.filter(
+      // SetupRequest cards render their own self-describing UI (Connect /
+      // credential inputs / Submit) — a generic "Waiting for approval..."
+      // bubble next to that card is redundant. Skip the placeholder when
+      // the pending gates for this task are all SetupRequests.
+      const pendingAuthorizations = state.authorizations.filter(
         (a) => a.taskId === task.id && a.status === "pending"
       );
-      if (
-        pendingApprovals.length > 0 &&
-        pendingApprovals.every((a) => a.action === "browser.connect")
-      ) {
+      const pendingSetupRequests = state.setupRequests.filter(
+        (s) => s.taskId === task.id && s.status === "pending"
+      );
+      if (pendingAuthorizations.length === 0 && pendingSetupRequests.length > 0) {
         continue;
       }
       content = task.currentStep || "Waiting for approval...";

@@ -328,7 +328,8 @@ function applyMigrations(db: Database): void {
       ordinal INTEGER NOT NULL,
       kind TEXT NOT NULL CHECK (kind IN (
         'user_text','assistant_text','tool_call','tool_result',
-        'phase','approval_requested','system_note'
+        'phase','approval_requested','authorization_requested',
+        'setup_requested','system_note'
       )),
       payload_json TEXT NOT NULL,
       task_id TEXT,

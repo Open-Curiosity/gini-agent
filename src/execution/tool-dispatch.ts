@@ -16,14 +16,15 @@ import {
   addAudit,
   appendTrace,
   assertInsideWorkspace,
-  createApproval,
+  createAuthorization,
+  createSetupRequest,
   createChatMessage,
   isTerminalTaskStatus,
   mutateState,
   now,
   readState
 } from "../state";
-import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveApproval, runTerminalCommand } from "../agent";
+import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveAuthorization, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
@@ -204,15 +205,14 @@ export async function dispatchToolCall(
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
       return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
-    case "browser_connect":
-      // Spawning a managed Chrome surfaces a desktop window and
-      // creates a persistent per-instance profile dir — the
-      // trust-establishment moment that gates every subsequent
-      // browser action. Route through the approval gate so the
-      // user sees an explicit "open a browser window for X" card.
-      // The policy seam falls through to `{ mode: "gate" }` for
-      // this action under "auto" mode (yolo still auto-approves).
-      return pendingOrAuto(config, "browser.connect", undefined, (reason) => requestBrowserConnect(config, taskId, toolCallId, args, reason));
+    case "browser_connect": {
+      // browser.connect is a SetupRequest (user-actor): the user opens the
+      // visible browser, signs in, then clicks Connect. There is no
+      // "auto-approve" path — the user has to perform the action — so
+      // bypass pendingOrAuto and always return the pending approval id.
+      const approvalId = await requestBrowserConnect(config, taskId, toolCallId, args);
+      return { kind: "pending", approvalId };
+    }
     case "file_write":
       return pendingOrAuto(config, "file.write", undefined, (reason) => requestFileWrite(config, taskId, toolCallId, args, reason));
     case "file_patch":
@@ -2061,7 +2061,7 @@ async function requestFileWrite(
     if (isTerminalTaskStatus(item.status)) {
       throw new TaskAlreadyTerminalError(taskId, item.status);
     }
-    const approval = createApproval(state, {
+    const approval = createAuthorization(state, {
       taskId: item.id,
       action: "file.write",
       target,
@@ -2111,7 +2111,7 @@ async function requestBrowserUpload(
     if (isTerminalTaskStatus(item.status)) {
       throw new TaskAlreadyTerminalError(taskId, item.status);
     }
-    const approval = createApproval(state, {
+    const approval = createAuthorization(state, {
       taskId: item.id,
       action: "browser.upload_file",
       target: resolved.displayPath,
@@ -2169,14 +2169,13 @@ async function requestBrowserConnect(
     if (isTerminalTaskStatus(item.status)) {
       throw new TaskAlreadyTerminalError(taskId, item.status);
     }
-    const approval = createApproval(state, {
+    const approval = createSetupRequest(state, {
       taskId: item.id,
       action: "browser.connect",
-      // Use the reason as the target so the approval card surfaces
+      // Use the reason as the target so the setup card surfaces
       // it prominently. The web UI also reads evidence.reason for
       // the body when rendering a browser.connect card.
       target: reason,
-      risk: "medium",
       reason: reasonOverride ?? "Opening a managed browser window requires explicit approval.",
       payload: { reason, toolCallId, headless, url }
     });
@@ -2211,7 +2210,7 @@ async function requestFilePatch(
     if (isTerminalTaskStatus(item.status)) {
       throw new TaskAlreadyTerminalError(taskId, item.status);
     }
-    const approval = createApproval(state, {
+    const approval = createAuthorization(state, {
       taskId: item.id,
       action: "file.patch",
       target,
@@ -2285,7 +2284,7 @@ async function requestSendMessage(
         `Invalid input: target '${target}' is not on bridge '${bridge.id}' allow-list (delivery targets: ${bridge.deliveryTargets.join(", ") || "<none>"})`
       );
     }
-    const approval = createApproval(state, {
+    const approval = createAuthorization(state, {
       taskId: item.id,
       action: "messaging.send",
       target: bridge.id,
@@ -2420,11 +2419,10 @@ async function requestConnectorTool(
     if (isTerminalTaskStatus(item.status)) {
       throw new TaskAlreadyTerminalError(taskId, item.status);
     }
-    const approval = createApproval(mutable, {
+    const approval = createSetupRequest(mutable, {
       taskId: item.id,
       action: "connector.request",
       target: provider.id,
-      risk: "low",
       reason,
       payload: {
         provider: provider.id,
@@ -2562,7 +2560,7 @@ async function browserFillSecretsTool(
   // Build a stable target string so the approval card can show
   // which page the fill targets. The structural copy of the
   // approved URL lives on `payload.approvedUrl` (see the
-  // createApproval call below) — the safety check in
+  // createSetupRequest call below) — the safety check in
   // src/execution/browser-fill-secrets.ts reads from there, NOT
   // from a parseable substring of target. `target` is the
   // human-readable label that flows into the audit row. Strip
@@ -2598,11 +2596,10 @@ async function browserFillSecretsTool(
     if (isTerminalTaskStatus(item.status)) {
       throw new TaskAlreadyTerminalError(taskId, item.status);
     }
-    const approval = createApproval(mutable, {
+    const approval = createSetupRequest(mutable, {
       taskId: item.id,
       action: "browser.fill_secret",
       target,
-      risk: "high",
       reason,
       // Structural fields the /connect handler reads:
       //   - slots: which DOM elements to fill (kept; parsed by
@@ -2736,7 +2733,7 @@ async function requestTerminalExec(
     if (isTerminalTaskStatus(item.status)) {
       throw new TaskAlreadyTerminalError(taskId, item.status);
     }
-    const approval = createApproval(state, {
+    const approval = createAuthorization(state, {
       taskId: item.id,
       action: "terminal.exec",
       target: command,
@@ -2769,7 +2766,7 @@ async function requestCodeExecPrebuilt(
     if (isTerminalTaskStatus(item.status)) {
       throw new TaskAlreadyTerminalError(taskId, item.status);
     }
-    const approval = createApproval(state, {
+    const approval = createAuthorization(state, {
       taskId: item.id,
       action: "terminal.exec",
       target: `code.${language}`,
@@ -2855,7 +2852,7 @@ async function pendingOrAuto(
   }
   if (decision.mode === "gate") return { kind: "pending", approvalId };
   try {
-    const { approval, toolResult } = await resolveApproval(config, approvalId, {
+    const { approval, toolResult } = await resolveAuthorization(config, approvalId, {
       actor: "runtime",
       resumeChatTask: false,
       evidenceExtra: { autoApproved: true, autoApprovedReason: decision.reason }
