@@ -65,38 +65,27 @@ to the agent picker.
 
 ## Fork & re-skin
 
-Gini is open source — the iOS app is yours to fork, rebrand, and ship under
-your own Apple developer account. Three layers to touch:
+Gini is open source — the iOS app is yours to fork, rebrand, and ship
+under your own Apple developer account. Edit two files, then prebuild.
 
-**1. Branding constants in `app.config.ts`** (committed):
+**1. Constants at the top of `mobile/app.config.ts`:**
 
 - `IOS_BUNDLE_ID` / `ANDROID_PACKAGE` — your reverse-DNS bundle id.
 - `APP_NAME` — what users see on the home screen.
 - `APP_SLUG` — the EAS slug (lowercase, hyphenated).
 - `APP_SCHEME` — your deep-link scheme (e.g. `myagent://`).
+- `EAS_PROJECT_ID` — run `eas init` in `mobile/` to get one.
+- `EXPO_OWNER` — your Expo account or org (`expo whoami`).
+- `APPLE_TEAM_ID` — developer.apple.com → Membership → Team ID.
 
-The NSE bundle id and OTA updates URL are derived, so you only edit
-one place.
+The NSE bundle id and the OTA updates URL are derived from the values
+above, so you only edit one place.
 
-**2. Org credentials in `mobile/.env`** (gitignored). Copy `.env.example`
-and fill in. These live outside the repo because no fork shares
-permission to use them:
-
-| Var               | Where to get it                                      |
-|-------------------|------------------------------------------------------|
-| `EAS_PROJECT_ID`  | `eas init` in `mobile/`. The OTA URL derives from it. |
-| `EXPO_OWNER`      | `expo whoami` — your Expo account or org.            |
-| `APPLE_TEAM_ID`   | developer.apple.com → Membership → Team ID.          |
-
-The config loads `.env` via `dotenv/config`, so every Expo / EAS command
-(`expo start`, `expo prebuild`, `eas init`, `eas build`, `eas update`)
-sees the values without extra setup.
-
-**3. `eas.json` submit profile** (committed) — replace `appleTeamId` and
+**2. `mobile/eas.json` submit profile:** replace `appleTeamId` and
 `ascAppId` under `submit.production.ios` with your own before running
 `eas submit`.
 
-After editing, regenerate the native project:
+Then regenerate the native project:
 
 ```bash
 cd mobile && bunx expo prebuild --platform ios --clean
