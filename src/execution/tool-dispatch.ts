@@ -2819,6 +2819,29 @@ async function requestMessagingPairingTool(
   toolCallId: string,
   args: Record<string, unknown>
 ): Promise<DispatchResult> {
+  // Surface guard — same rationale as requestMessagingBridgeTool /
+  // browserFillSecretsTool. The approval card renders only in the
+  // web chat; a task spawned from a Telegram (or Discord) bridge
+  // that minted this approval would park in awaiting_approval
+  // forever, and the telegram-poller would skip relay via
+  // reply_skip_non_terminal. Refuse early so the agent can fall
+  // back to plain text ("open the web chat to approve the pairing").
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `request_messaging_pairing only works in the web chat (this conversation is over ${surfaceKind}). Tell the user to open the web chat to approve the pairing.`
+      })
+    };
+  }
+
   const bridgeIdOrName = typeof args.bridge === "string" ? args.bridge.trim() : "";
   if (!bridgeIdOrName) {
     return {
@@ -2944,6 +2967,26 @@ async function requestRemoveMessagingBridgeTool(
   toolCallId: string,
   args: Record<string, unknown>
 ): Promise<DispatchResult> {
+  // Surface guard — same rationale as the other request_ tools.
+  // The destructive confirmation card renders only in the web chat;
+  // a task spawned from a Telegram (or Discord) bridge that minted
+  // this approval would park in awaiting_approval forever.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `request_remove_messaging_bridge only works in the web chat (this conversation is over ${surfaceKind}). Tell the user to open the web chat to confirm bridge removal.`
+      })
+    };
+  }
+
   const bridgeIdOrName = typeof args.bridge === "string" ? args.bridge.trim() : "";
   if (!bridgeIdOrName) {
     return {

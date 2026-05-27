@@ -565,6 +565,66 @@ describe("request_connector dispatch", () => {
     }
   });
 
+  test("request_messaging_pairing AND request_remove_messaging_bridge: refuse minting from telegram/discord-sourced chat tasks", async () => {
+    // Surface guard pin. If the agent calls either tool while
+    // running inside a chat-task whose owning session was spawned
+    // from a Telegram (or Discord) bridge, the resulting passthrough
+    // card would only render in the web chat — the task would park
+    // in awaiting_approval and the telegram-poller would
+    // reply_skip_non_terminal, leaving the Telegram user with a
+    // typing indicator that never resolves. Matches the existing
+    // guard on requestMessagingBridgeTool and browserFillSecretsTool.
+    const instance = `req-messaging-surface-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    // Seed a chat session whose source is telegram, then bind the
+    // task's chatSessionId to it.
+    await mutateState(instance, (state) => {
+      const { createChatSession } = require("../state") as typeof import("../state");
+      const session = createChatSession(state, "tg session", {
+        kind: "telegram",
+        bridgeId: "bridge_x",
+        chatId: 1,
+        target: "1"
+      });
+      const task = state.tasks.find((t) => t.id === taskId);
+      if (task) task.chatSessionId = session.id;
+    });
+
+    const pairing = await dispatchToolCall(
+      config,
+      taskId,
+      "request_messaging_pairing",
+      "call_pairing_tg",
+      JSON.stringify({ bridge: "tg", chatId: 1 })
+    );
+    expect(pairing.kind).toBe("sync");
+    if (pairing.kind === "sync") {
+      const parsed = JSON.parse(pairing.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("web chat");
+      expect(parsed.error).toContain("telegram");
+    }
+
+    const remove = await dispatchToolCall(
+      config,
+      taskId,
+      "request_remove_messaging_bridge",
+      "call_remove_tg",
+      JSON.stringify({ bridge: "tg" })
+    );
+    expect(remove.kind).toBe("sync");
+    if (remove.kind === "sync") {
+      const parsed = JSON.parse(remove.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("web chat");
+      expect(parsed.error).toContain("telegram");
+    }
+    // No approval rows minted on either refused path.
+    const state = readState(instance);
+    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+  });
+
   test("request_remove_messaging_bridge: refuses unknown bridge synchronously", async () => {
     const instance = `req-remove-unknown-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance);

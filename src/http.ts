@@ -232,15 +232,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(await decideApproval(config, approvalId, "approve"));
     }],
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
-    // Connect endpoint: the shared three-action seam for any
-    // approval whose card asks the user to type a value (or a set of
-    // named values). The chat UI's Submit/Connect/Add button POSTs
-    // here with the user-entered secrets. The endpoint:
+    // Connect endpoint: the shared five-action seam for any
+    // approval whose card asks the user to type a value (or
+    // confirm a side effect with structured payload context). The
+    // chat UI's Submit/Connect/Add/Approve/Remove button POSTs
+    // here with the user-entered secrets or confirmation body. The
+    // endpoint:
     //   1. Validates the approval exists, is pending, and carries
-    //      one of the three /connect-eligible actions:
+    //      one of the five /connect-eligible actions:
     //        - `connector.request` (request_connector tool)
     //        - `browser.fill_secret` (browser_fill_secrets tool)
     //        - `messaging.add_bridge` (request_messaging_bridge tool)
+    //        - `messaging.approve_pairing` (request_messaging_pairing tool)
+    //        - `messaging.remove_bridge` (request_remove_messaging_bridge tool)
     //   2. Dispatches per action:
     //        - connector.request: createConnector + checkConnector
     //          inline below; on probe failure returns ok:false so the
@@ -249,12 +253,18 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     //          (src/execution/browser-fill-secrets.ts).
     //        - messaging.add_bridge: delegates to
     //          runMessagingBridgeConnect (src/execution/messaging-bridge-connect.ts).
-    //   3. The two bounded modules return a {status, body} envelope
-    //      that this handler forwards verbatim. Both follow the
+    //        - messaging.approve_pairing: delegates to
+    //          runMessagingPairingConnect (src/execution/messaging-pairing-connect.ts);
+    //          body's `reject:true` flips Approve vs Reject.
+    //        - messaging.remove_bridge: delegates to
+    //          runMessagingRemoveConnect (src/execution/messaging-remove-connect.ts).
+    //   3. The four bounded modules return a {status, body} envelope
+    //      that this handler forwards verbatim. All follow the
     //      atomic-resolve-then-side-effect pattern: resolveApproval
     //      runs first so a concurrent /deny can't leave an orphan
-    //      side effect; the bounded module then runs the create
-    //      and fires resumeChatTask itself with the outcome string.
+    //      side effect; the bounded module then runs the create /
+    //      enroll / reject / remove and fires resumeChatTask itself
+    //      via safeResume (shared trace + failTask recovery).
     ["POST", /^\/api\/approvals\/([^/]+)\/connect$/, async (request, params) => {
       const approvalId = params[0];
       const state = readState(config.instance);

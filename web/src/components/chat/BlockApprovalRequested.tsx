@@ -303,6 +303,16 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
   // (which is just `approved` in both cases — Reject is also a
   // /connect call, not a /deny).
   const [pairingOutcome, setPairingOutcome] = useState<"approved" | "rejected" | null>(null);
+  // Sticky ok/message marker mirroring bridgeResultOk. The /connect
+  // handler resolves the approval BEFORE allowChat / rejectPendingChat
+  // runs, so a server-side failure (e.g. rotated verification code,
+  // already-enrolled chat) returns ok:false with approval.status
+  // already flipped to approved. Without this state, the past-tense
+  // summary would unconditionally read "Pairing resolved." on every
+  // approved row — masking real failures. The displaySummary branch
+  // reads this to render "Pairing failed: ..." truthfully.
+  const [pairingResultOk, setPairingResultOk] = useState<boolean | null>(null);
+  const [pairingResultMessage, setPairingResultMessage] = useState<string | null>(null);
   const pairingSubmittingRef = useRef(false);
   const pairingSubmit = useMutation({
     mutationFn: async (variant: { reject: boolean }) => {
@@ -321,6 +331,8 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       // to flip the card out of pending state. Same precedent as the
       // bridge submitter and fillSubmit.
       invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
+      setPairingResultOk(response.ok);
+      setPairingResultMessage(response.message ?? null);
       if (!response.ok) {
         setPairingError(response.message ?? "Could not resolve pairing.");
         return;
@@ -331,6 +343,8 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
     },
     onError: (error: Error) => {
       setPairingError(error.message);
+      setPairingResultOk(false);
+      setPairingResultMessage(error.message);
       invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
     },
     onSettled: () => {
@@ -416,15 +430,22 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
           : block.summary
       : !isPending && approval && isMessagingApprovePairing
         ? approval.status === "approved"
-          // Same resolve-before-side-effect ordering means we can't
-          // read "approved" → "pairing approved". The pairing outcome
-          // ref distinguishes Approve vs Reject (both POST /connect)
-          // from the failed-after-resolve case.
-          ? pairingOutcome === "rejected"
-            ? `Pairing rejected. (${block.summary})`
-            : pairingOutcome === "approved"
-              ? `Pairing approved. (${block.summary})`
-              : `Pairing resolved. (${block.summary})`
+          // Same resolve-before-side-effect ordering as add_bridge:
+          // approval flips to approved AT resolveApproval time,
+          // BEFORE allowChat/rejectPendingChat runs. A server-side
+          // failure (rotated code, already-enrolled chat, etc.)
+          // returns ok:false while the approval is already approved.
+          // Trust pairingResultOk first so the past-tense summary
+          // reflects the actual outcome; fall back to pairingOutcome
+          // only when the server returned ok:true (i.e. the side
+          // effect actually completed).
+          ? pairingResultOk === false
+            ? `Pairing failed${pairingResultMessage ? `: ${pairingResultMessage}` : ""}. (${block.summary})`
+            : pairingOutcome === "rejected"
+              ? `Pairing rejected. (${block.summary})`
+              : pairingOutcome === "approved"
+                ? `Pairing approved. (${block.summary})`
+                : `Pairing resolved. (${block.summary})`
           : approval.status === "denied"
             ? `Request denied. (${block.summary})`
             : block.summary
