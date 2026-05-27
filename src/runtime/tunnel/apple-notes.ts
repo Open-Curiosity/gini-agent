@@ -43,12 +43,33 @@ export async function writeNote(opts: NotesWriteOptions): Promise<void> {
   if (process.platform !== "darwin") {
     throw new Error("Apple Notes mirror only supported on macOS.");
   }
+  await runOsascript(buildWriteNoteScript(opts));
+}
+
+/** Build the AppleScript that finds-or-creates the folder + note, then
+ *  sets its body. Exported for testing — assert that the script always
+ *  embeds the noteName as the first line of the body so Notes' auto-derived
+ *  title stays stable across the create + update paths (see comment below).
+ *
+ *  Why the body shape matters: Notes derives a note's title from the
+ *  first line of its body, and AppleScript's `set body of note` overwrites
+ *  the entire body — including the auto-prepended title that `make new
+ *  note ... name:` injects on the create path. Without a title line
+ *  embedded in the body, the second write (e.g. after rotateSecret) ends
+ *  up with a body of just the URL, Notes renames the note to the URL,
+ *  and the next `if exists note "X"` lookup fails because "X" no longer
+ *  matches the (now URL-shaped) title. Building the body as explicit
+ *  HTML with the noteName in its own <div> keeps the auto-derived title
+ *  stable across create + update paths and renders cleanly in Notes
+ *  (newlines in the AppleScript string can be collapsed when Notes
+ *  parses the body, so <div> wrappers are safer than `\n`). */
+export function buildWriteNoteScript(opts: NotesWriteOptions): string {
   const folder = applescriptEscape(opts.folder);
   const noteName = applescriptEscape(opts.noteName);
-  const body = applescriptEscape(opts.body);
-  // Find or create the folder + note, then update its body. Notes.app is
-  // forgiving about idempotent runs.
-  const script = `
+  const titleHtml = `<div>${escapeHtml(opts.noteName)}</div>`;
+  const bodyHtml = `<div>${escapeHtml(opts.body)}</div>`;
+  const body = applescriptEscape(`${titleHtml}${bodyHtml}`);
+  return `
 tell application "Notes"
   tell account "iCloud"
     if not (exists folder "${folder}") then
@@ -64,7 +85,6 @@ tell application "Notes"
   end tell
 end tell
 `;
-  await runOsascript(script);
 }
 
 export async function clearNote(folder: string, noteName: string): Promise<void> {
@@ -87,6 +107,15 @@ end tell
 
 function applescriptEscape(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function runOsascript(script: string): Promise<string> {
