@@ -417,8 +417,28 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       let navigateError: string | undefined;
       if (targetUrl && approval.taskId) {
         try {
-          await browserNavigate(approval.taskId, { url: targetUrl });
-          openedUrl = targetUrl;
+          // browserNavigate returns a JSON envelope rather than
+          // throwing on a soft failure (safetyCheck refusal of a
+          // loopback redirect target, an unsupported URL, etc.).
+          // The previous code only caught throws and set openedUrl
+          // unconditionally — so a refused navigation falsely
+          // reported "user landed on the page." Parse the envelope
+          // and treat success:false as an error path so the
+          // approval row records the navigateError truthfully.
+          const navResult = await browserNavigate(approval.taskId, { url: targetUrl });
+          let parsed: { success?: boolean; error?: string } | undefined;
+          try {
+            parsed = JSON.parse(navResult) as { success?: boolean; error?: string };
+          } catch {
+            // Non-JSON return: treat as success for back-compat
+            // with any caller that might not stringify.
+            parsed = { success: true };
+          }
+          if (parsed && parsed.success === false) {
+            navigateError = parsed.error ?? "browser navigation refused";
+          } else {
+            openedUrl = targetUrl;
+          }
         } catch (error) {
           navigateError = error instanceof Error ? error.message : String(error);
         }
