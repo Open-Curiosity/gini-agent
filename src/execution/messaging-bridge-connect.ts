@@ -27,11 +27,11 @@
 //      waiting indefinitely.
 
 import type { Approval, MessagingBridgeRecord, RuntimeConfig } from "../types";
-import { failTask, resolveApproval } from "../agent";
+import { resolveApproval } from "../agent";
 import { addMessagingBridge, assertHeaderSafeToken } from "../integrations/messaging";
 import { sanitizeBridgeStatusMessage } from "../integrations/messaging-poller-helpers";
-import { addAudit, appendTrace, mutateState } from "../state";
-import { resumeChatTask } from "./chat-task";
+import { addAudit, mutateState } from "../state";
+import { safeResume } from "./safe-resume";
 
 export interface MessagingBridgeConnectResult {
   status: number;
@@ -153,12 +153,12 @@ export async function runMessagingBridgeConnect(
     // user. Recover an orphaned task via failTask if the resume
     // itself throws (mirrors browser-fill-secrets.ts:318-347).
     if (taskId && toolCallId) {
-      await resumeOrFail(
+      await safeResume(
         config,
         taskId,
         toolCallId,
         `Could not create ${kindLabel} bridge: ${message}. Tell the user about the failure so they can retry from the settings page.`,
-        approval.id
+        { context: "messaging.add_bridge", approvalId: approval.id }
       );
     }
     return { status: 200, body: { ok: false, message } };
@@ -199,50 +199,13 @@ export async function runMessagingBridgeConnect(
   });
 
   if (taskId && toolCallId) {
-    await resumeOrFail(
+    await safeResume(
       config,
       taskId,
       toolCallId,
       `${kindLabel} bridge added: ${bridge.name}. Tell the user it's ready and walk them through enrolling a chat (DM the bot, share the verification code, you approve from the settings page) if relevant.`,
-      approval.id
+      { context: "messaging.add_bridge", approvalId: approval.id }
     );
   }
   return { status: 200, body: { ok: true, bridge } };
-}
-
-// Wrap resumeChatTask so a terminal-task throw inside the chat-task
-// loop (provider rate limit, dispatch error, etc.) doesn't leave the
-// task in status="running" with no live executor — a real
-// orphan-task hazard since the resume call flips the task to running
-// before re-entering the loop. Mirrors browser-fill-secrets.ts's
-// resumeChatTask wrapper: trace the failure, then failTask to flip
-// the task out of running. failTask's own throw is swallowed
-// silently — the next external trigger (user message, supervisor)
-// will reconcile from the task row's current status.
-async function resumeOrFail(
-  config: RuntimeConfig,
-  taskId: string,
-  toolCallId: string,
-  result: string,
-  approvalId: string
-): Promise<void> {
-  try {
-    await resumeChatTask(config, taskId, toolCallId, result);
-  } catch (resumeError) {
-    appendTrace(config.instance, taskId, {
-      type: "error",
-      message: "resumeChatTask threw during messaging.add_bridge completion",
-      data: {
-        approvalId,
-        toolCallId,
-        error: resumeError instanceof Error ? resumeError.message : String(resumeError)
-      }
-    });
-    try {
-      await failTask(config, taskId, resumeError);
-    } catch {
-      // Best-effort recovery — the next external trigger will
-      // observe whatever status failTask managed to land.
-    }
-  }
 }
