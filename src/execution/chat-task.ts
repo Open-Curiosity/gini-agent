@@ -57,7 +57,8 @@ import type { EffectiveContext } from "./effective-context";
 import { updateRunFromTask } from "./runs";
 import { buildToolCatalog, hashCatalog, toProviderTools } from "./tool-catalog";
 import {
-  emitApprovalRequested,
+  emitAuthorizationRequested,
+  emitSetupRequested,
   emitAssistantTextStart,
   emitPhase,
   emitSystemNote,
@@ -1136,21 +1137,29 @@ async function runLoop(
           // are skipped — their side effects must not race the
           // user's approval decision.
           pausedThisTurn = true;
-          // Re-read the approval row to surface action/risk/summary on
-          // the approval_requested block. The dispatch returns just
-          // the id; the full row is the source of truth for these
-          // fields (and `action` lets clients pick connector.request
-          // vs the standard Approve/Deny pair).
-          const approvalRow = readState(config.instance).approvals.find(
-            (a) => a.id === dispatch.approvalId
-          );
-          if (approvalRow) {
-            emitApprovalRequested(emitCtx, {
-              approvalId: approvalRow.id,
-              action: approvalRow.action,
-              risk: approvalRow.risk,
-              summary: approvalRow.reason ?? approvalRow.target
+          // Re-read the gate row to surface action/summary on the right
+          // block kind. Authorizations carry risk and render with an
+          // Approve/Deny pair; SetupRequests are user-actor and render
+          // with action-specific layouts (Connect / credential inputs /
+          // Submit). See docs/adr/authorization-vs-setup-request.md.
+          const stateForBlock = readState(config.instance);
+          const authRow = stateForBlock.authorizations.find((a) => a.id === dispatch.approvalId);
+          if (authRow) {
+            emitAuthorizationRequested(emitCtx, {
+              authorizationId: authRow.id,
+              action: authRow.action,
+              risk: authRow.risk,
+              summary: authRow.reason ?? authRow.target
             });
+          } else {
+            const setupRow = stateForBlock.setupRequests.find((s) => s.id === dispatch.approvalId);
+            if (setupRow) {
+              emitSetupRequested(emitCtx, {
+                setupRequestId: setupRow.id,
+                action: setupRow.action,
+                summary: setupRow.reason ?? setupRow.target
+              });
+            }
           }
           // Approval-gated tools haven't actually run yet, but from the
           // UI's perspective the agent is no longer "dispatching" this

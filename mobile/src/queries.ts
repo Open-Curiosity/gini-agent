@@ -129,9 +129,10 @@ const TERMINAL_PHASE_LABELS = new Set<string>(["Completed", "Cancelled", "Failed
 //     (e.g. the model said "Thinking" while a long-running parallel tool
 //     is still going). callId pairs the running entry with its terminal
 //     status, so we count distinct callIds with no later non-running row.
-//   - An approval_requested block whose tool_call still reads "running"
-//     means we're paused on the user — the composer stays busy until
-//     the eventual approve/deny flip arrives on the stream.
+//   - An authorization_requested or setup_requested block whose
+//     tool_call still reads "running" means we're paused on the user —
+//     the composer stays busy until the eventual approve/deny/complete
+//     flip arrives on the stream.
 export function isTaskInFlight(blocks: ChatBlock[]): boolean {
   if (blocks.length === 0) return false;
 

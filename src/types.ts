@@ -5,7 +5,17 @@ export type Instance = "default" | string;
 
 export type TaskStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
 
-export type ApprovalStatus = "pending" | "approved" | "denied";
+// Authorization (agent-actor): user approves/denies, runtime then performs
+// the action. SetupRequest (user-actor): user performs a setup step in the
+// browser or with credentials, runtime resumes once they signal complete.
+// See docs/adr/authorization-vs-setup-request.md.
+export type AuthorizationStatus = "pending" | "approved" | "denied";
+export type SetupRequestStatus = "pending" | "completed" | "cancelled";
+
+// Deprecated alias retained so legacy code paths (and any external consumer
+// that imported the enum) keep type-checking during the split. New code
+// should use AuthorizationStatus directly.
+export type ApprovalStatus = AuthorizationStatus;
 
 export type RiskLevel = "low" | "medium" | "high";
 
@@ -237,7 +247,8 @@ export type ChatBlockKind =
   | "tool_call"
   | "tool_result"
   | "phase"
-  | "approval_requested"
+  | "authorization_requested"
+  | "setup_requested"
   | "system_note";
 
 interface ChatBlockBase {
@@ -310,24 +321,31 @@ export interface PhaseBlock extends ChatBlockBase {
   label: string;
 }
 
-export interface ApprovalRequestedBlock extends ChatBlockBase {
-  kind: "approval_requested";
-  approvalId: string;
-  // Approval action (`file.write`, `terminal.exec`, `connector.request`,
-  // `browser.fill_secret`, etc.). Clients branch on `action` to render
-  // the right card variant:
-  //   - `connector.request` → Connect dialog (collects OAuth/API
-  //     creds via /api/approvals/<id>/connect).
-  //   - `browser.fill_secret` → inline Submit form with one input
-  //     per slot in approval.payload.slots; Submit POSTs the per-slot
-  //     values to /api/approvals/<id>/connect with body
-  //     `{ secrets: { <slot.name>: <value>, ... } }`. The generic
-  //     /approve endpoint refuses this action — Deny is still valid.
-  //     See docs/adr/browser-fill-secret.md.
-  //   - everything else → standard Approve / Deny pair (POST to
-  //     /api/approvals/<id>/{approve,deny}).
-  action: string;
-  risk: string;
+// Agent-actor: user approves or denies; runtime then performs the action.
+// Renders with a risk pill + Approve/Deny buttons. POSTs to
+// /api/authorizations/<id>/{approve,deny}.
+export interface AuthorizationRequestedBlock extends ChatBlockBase {
+  kind: "authorization_requested";
+  authorizationId: string;
+  action: AuthorizationAction;
+  risk: RiskLevel;
+  summary: string;
+}
+
+// User-actor: user performs a setup step. No risk pill. Card layout is
+// chosen by `action`:
+//   - `browser.connect` → "Connect" button that opens visible Chrome
+//     (POST /api/setup-requests/<id>/open-browser), then signals complete.
+//   - `connector.request` → credential dialog. Submit POSTs the credential
+//     payload to /api/setup-requests/<id>/complete.
+//   - `browser.fill_secret` → inline credential inputs with destination URL
+//     prominent. Submit POSTs `{ secrets: { <slot>: <value> } }` to
+//     /api/setup-requests/<id>/complete.
+// Cancel always POSTs to /api/setup-requests/<id>/cancel.
+export interface SetupRequestedBlock extends ChatBlockBase {
+  kind: "setup_requested";
+  setupRequestId: string;
+  action: SetupRequestAction;
   summary: string;
 }
 
@@ -342,7 +360,8 @@ export type ChatBlock =
   | ToolCallBlock
   | ToolResultBlock
   | PhaseBlock
-  | ApprovalRequestedBlock
+  | AuthorizationRequestedBlock
+  | SetupRequestedBlock
   | SystemNoteBlock;
 
 export interface RuntimeState {
@@ -351,7 +370,12 @@ export interface RuntimeState {
   createdAt: string;
   updatedAt: string;
   tasks: Task[];
-  approvals: Approval[];
+  // Agent-actor gates: approved/denied by the user, then the runtime
+  // performs the action.
+  authorizations: Authorization[];
+  // User-actor gates: the user performs a setup step (browser sign-in,
+  // credential entry), then the runtime resumes.
+  setupRequests: SetupRequest[];
   audit: AuditEvent[];
   skills: SkillRecord[];
   jobs: JobRecord[];
@@ -964,19 +988,59 @@ export interface AuditEvent {
   redacted?: boolean;
 }
 
-export interface Approval {
+// Agent-actor gate: the user approves or denies; the runtime then performs
+// the side-effecting action. See docs/adr/authorization-vs-setup-request.md.
+export type AuthorizationAction =
+  | "file.write"
+  | "file.patch"
+  | "terminal.exec"
+  | "memory.activate"
+  | "skill.enable"
+  | "connector.enable"
+  | "browser.upload_file"
+  | "messaging.send";
+
+export interface Authorization {
   id: string;
   instance: Instance;
   // Requesting agent. Optional — backfilled by normalizeState; system-driven
-  // approvals without an active agent leave it undefined.
+  // authorizations without an active agent leave it undefined.
   agentId?: string;
-  status: ApprovalStatus;
+  status: AuthorizationStatus;
   createdAt: string;
   updatedAt: string;
   taskId?: string;
-  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.enable" | "connector.enable" | "connector.request" | "browser.upload_file" | "browser.connect" | "browser.fill_secret" | "messaging.send";
+  action: AuthorizationAction;
   target: string;
   risk: RiskLevel;
+  reason: string;
+  payload: Record<string, unknown>;
+}
+
+// User-actor gate: the user performs a setup step (sign in via browser,
+// enter credentials, fill a form). The runtime resumes after the user
+// signals completion via the /setup-requests/:id/complete endpoint.
+export type SetupRequestAction =
+  | "browser.connect"
+  | "connector.request"
+  | "browser.fill_secret";
+
+export interface SetupRequest {
+  id: string;
+  instance: Instance;
+  // Requesting agent. Optional — backfilled by normalizeState; system-driven
+  // setup requests without an active agent leave it undefined.
+  agentId?: string;
+  status: SetupRequestStatus;
+  createdAt: string;
+  updatedAt: string;
+  taskId?: string;
+  action: SetupRequestAction;
+  // Trust anchor shown to the user before they complete the request: the
+  // destination URL for browser.connect / browser.fill_secret, or the
+  // provider id for connector.request.
+  target: string;
+  // Human-language ask shown to the user in the chat card.
   reason: string;
   payload: Record<string, unknown>;
 }

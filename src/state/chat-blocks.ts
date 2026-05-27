@@ -19,9 +19,12 @@
 import { EventEmitter } from "node:events";
 import type {
   AssistantTextBlock,
+  AuthorizationAction,
   ChatBlock,
   ChatBlockKind,
   Instance,
+  RiskLevel,
+  SetupRequestAction,
   ToolCallBlock,
   ToolCallStatus
 } from "../types";
@@ -71,7 +74,10 @@ interface ChatBlockRow {
   instance: string;
   agent_id: string | null;
   ordinal: number;
-  kind: ChatBlockKind;
+  // Includes "approval_requested" as a legacy value still resident in
+  // pre-split DBs (the CHECK constraint accepts it; rowToBlock migrates
+  // it on read).
+  kind: ChatBlockKind | "approval_requested";
   payload_json: string;
   task_id: string | null;
   run_id: string | null;
@@ -135,13 +141,44 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
       };
     case "phase":
       return { ...base, kind: "phase", label: String(payload.label ?? "") };
-    case "approval_requested":
+    case "approval_requested": {
+      // Legacy block kind from before the Authorization/SetupRequest split.
+      // Partition by action so old rows render with the right new card
+      // type. See docs/adr/authorization-vs-setup-request.md.
+      const action = String(payload.action ?? "");
+      if (action === "browser.connect" || action === "connector.request" || action === "browser.fill_secret") {
+        return {
+          ...base,
+          kind: "setup_requested",
+          setupRequestId: String(payload.approvalId ?? ""),
+          action: action as SetupRequestAction,
+          summary: String(payload.summary ?? "")
+        };
+      }
       return {
         ...base,
-        kind: "approval_requested",
-        approvalId: String(payload.approvalId ?? ""),
-        action: String(payload.action ?? ""),
-        risk: String(payload.risk ?? "low"),
+        kind: "authorization_requested",
+        authorizationId: String(payload.approvalId ?? ""),
+        action: action as AuthorizationAction,
+        risk: (payload.risk as RiskLevel) ?? "low",
+        summary: String(payload.summary ?? "")
+      };
+    }
+    case "authorization_requested":
+      return {
+        ...base,
+        kind: "authorization_requested",
+        authorizationId: String(payload.authorizationId ?? ""),
+        action: String(payload.action ?? "") as AuthorizationAction,
+        risk: (payload.risk as RiskLevel) ?? "low",
+        summary: String(payload.summary ?? "")
+      };
+    case "setup_requested":
+      return {
+        ...base,
+        kind: "setup_requested",
+        setupRequestId: String(payload.setupRequestId ?? ""),
+        action: String(payload.action ?? "") as SetupRequestAction,
         summary: String(payload.summary ?? "")
       };
     case "system_note":
@@ -183,11 +220,17 @@ function payloadFor(block: ChatBlock): string {
       });
     case "phase":
       return JSON.stringify({ label: block.label });
-    case "approval_requested":
+    case "authorization_requested":
       return JSON.stringify({
-        approvalId: block.approvalId,
+        authorizationId: block.authorizationId,
         action: block.action,
         risk: block.risk,
+        summary: block.summary
+      });
+    case "setup_requested":
+      return JSON.stringify({
+        setupRequestId: block.setupRequestId,
+        action: block.action,
         summary: block.summary
       });
     case "system_note":
@@ -271,13 +314,21 @@ export function insertChatBlock(
           };
         case "phase":
           return { ...base, kind: "phase", label: input.label };
-        case "approval_requested":
+        case "authorization_requested":
           return {
             ...base,
-            kind: "approval_requested",
-            approvalId: input.approvalId,
+            kind: "authorization_requested",
+            authorizationId: input.authorizationId,
             action: input.action,
             risk: input.risk,
+            summary: input.summary
+          };
+        case "setup_requested":
+          return {
+            ...base,
+            kind: "setup_requested",
+            setupRequestId: input.setupRequestId,
+            action: input.action,
             summary: input.summary
           };
         case "system_note":
