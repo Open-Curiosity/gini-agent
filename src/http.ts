@@ -53,7 +53,7 @@ import {
 } from "./runtime/identity-files";
 import { SOUL_SOFT_CAP_CHARS, USER_SOFT_CAP_CHARS, identityBudgetState } from "./system-prompt";
 import { resolveEffectiveContext } from "./execution/effective-context";
-import { connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
+import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { getSetupStatus, setSetupProvider } from "./runtime/setup-api";
@@ -368,29 +368,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
 
       if (setup.action === "browser.connect") {
-        // The visible-Chrome side effect already ran inside
-        // /open-browser. /complete swaps the same per-instance profile to
-        // headless and resumes the chat-task loop.
-        const signInStarted = setup.payload.signInStarted === true;
-        const explicitHeadless = setup.payload.headless === true;
-        const headless = signInStarted ? true : explicitHeadless;
-        let succeeded = false;
-        let result: string;
-        try {
-          const status = await connectBrowser(config, { mode: "managed", headless }, { skipAudit: true });
-          succeeded = status.connected;
-          result = JSON.stringify({
-            success: succeeded,
-            connected: status.connected,
-            mode: status.record?.mode,
-            dataDir: status.record?.dataDir,
-            headless: status.record?.headless
-          });
-        } catch (error) {
-          result = JSON.stringify({ success: false, error: error instanceof Error ? error.message : String(error) });
-        }
+        const { ok, result } = await completeBrowserConnectSetup(config, setup);
         await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result });
-        return json({ ok: succeeded });
+        return json({ ok });
       }
 
       return json({ error: `Setup request ${setupId} action not supported: ${setup.action}` }, 400);

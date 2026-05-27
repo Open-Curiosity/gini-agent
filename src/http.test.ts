@@ -489,7 +489,7 @@ describe("runtime api", () => {
       body: JSON.stringify({ input: "patch README.md :: Gini => Gini" })
     });
     const detail = await waitForTask(handler, config, task.id);
-    const approval = readState(config.instance).approvals.find((item) => item.taskId === task.id);
+    const approval = readState(config.instance).authorizations.find((item) => item.taskId === task.id);
 
     expect(detail.task.status).toBe("waiting_approval");
     expect(approval?.action).toBe("file.patch");
@@ -589,7 +589,7 @@ describe("runtime api", () => {
     const detail = await waitForTask(handler, config, submitted.id);
     expect(detail.task.status).toBe("waiting_approval");
 
-    const approval = readState(config.instance).approvals.find((item) => item.taskId === submitted.id);
+    const approval = readState(config.instance).authorizations.find((item) => item.taskId === submitted.id);
     expect(approval).toBeDefined();
     await call(handler, config, `/api/approvals/${approval!.id}/approve`, { method: "POST" });
 
@@ -770,12 +770,11 @@ describe("runtime api", () => {
     // Stage a connector.request approval row directly. Demo provider has no
     // probe, so checkConnector falls back to presence-only ⇒ healthy without
     // any network mocking.
-    const { createApproval } = await import("./state");
+    const { createAuthorization, createSetupRequest } = await import("./state");
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         action: "connector.request",
         target: "demo",
-        risk: "low",
         reason: "test connect",
         payload: {
           provider: "demo",
@@ -797,20 +796,19 @@ describe("runtime api", () => {
     expect(response.connector.health).toBe("healthy");
 
     const state = readState(config.instance);
-    const resolved = state.approvals.find((a) => a.id === approval.id);
-    expect(resolved?.status).toBe("approved");
+    const resolved = state.setupRequests.find((a) => a.id === approval.id);
+    expect(resolved?.status).toBe("completed");
     expect(state.connectors.some((c) => c.provider === "demo" && c.health === "healthy")).toBe(true);
   });
 
   test("POST /api/approvals/<id>/connect returns ok:false and leaves the approval pending on probe failure", async () => {
     const config = testConfig("approvals-connect-probe-fail");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
+    const { createAuthorization, createSetupRequest } = await import("./state");
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         action: "connector.request",
         target: "linear",
-        risk: "low",
         reason: "fetch issues",
         payload: {
           provider: "linear",
@@ -839,16 +837,16 @@ describe("runtime api", () => {
       globalThis.fetch = originalFetch;
     }
     const state = readState(config.instance);
-    const after = state.approvals.find((a) => a.id === approval.id);
+    const after = state.setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
   test("POST /api/approvals/<id>/connect rejects approvals whose action is not connector.request", async () => {
     const config = testConfig("approvals-connect-wrong-action");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
+    const { createAuthorization, createSetupRequest } = await import("./state");
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createAuthorization(state, {
         action: "file.write",
         target: "/tmp/x",
         risk: "high",
@@ -863,9 +861,7 @@ describe("runtime api", () => {
       { method: "POST", body: JSON.stringify({ secrets: {} }) },
       config.token
     );
-    expect(response.status).toBe(400);
-    const body = await response.json();
-    expect(body.error).toContain("does not take a /connect submission");
+    expect(response.status).toBe(404);
   });
 
   test("POST /api/approvals/<id>/approve refuses browser.fill_secret action", async () => {
@@ -877,12 +873,11 @@ describe("runtime api", () => {
     // /connect with values.
     const config = testConfig("approve-refuses-fill-secret");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
+    const { createAuthorization, createSetupRequest } = await import("./state");
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         action: "browser.fill_secret",
         target: "https://example.com/login#@e1,@e2",
-        risk: "high",
         reason: "Sign in to the test site",
         payload: {
           slots: [
@@ -894,6 +889,7 @@ describe("runtime api", () => {
         }
       })
     );
+    // Legacy alias /api/approvals/<id>/approve refuses fill_secret with 400.
     const response = await rawCall(
       handler,
       config,
@@ -903,9 +899,8 @@ describe("runtime api", () => {
     );
     expect(response.status).toBe(400);
     const body = await response.json();
-    expect(body.error).toContain("/connect");
-    expect(body.error).toContain("not /approve");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(body.error).toContain("/complete");
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
@@ -919,7 +914,7 @@ describe("runtime api", () => {
     // declared slot was filled.
     const config = testConfig("connect-rejects-partial-fill-secret");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
+    const { createAuthorization, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const { createTask, upsertTask } = require("./state") as typeof import("./state");
       const task = createTask(state.instance, "partial-test");
@@ -930,11 +925,10 @@ describe("runtime api", () => {
     // doesn't fire before the missing-slot check; this test is about
     // partial submission, not origin binding.
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in to the test site",
         payload: {
           slots: [
@@ -970,7 +964,7 @@ describe("runtime api", () => {
     expect(body.ok).toBe(false);
     expect(body.message).toContain("password");
     expect(body.message).toContain("Missing");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
@@ -985,7 +979,7 @@ describe("runtime api", () => {
     // the value.
     const config = testConfig("fill-secret-no-state-leak");
     const handler = createHandler(config);
-    const { createTask, upsertTask, createApproval } = await import("./state");
+    const { createTask, upsertTask, createAuthorization, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const task = createTask(state.instance, "fill secret leak guard");
       upsertTask(state, task);
@@ -999,11 +993,10 @@ describe("runtime api", () => {
     // never reach state/trace/log even when the runtime tries to
     // record what happened.
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in to the test site",
         payload: {
           slots: [
@@ -1101,18 +1094,17 @@ describe("runtime api", () => {
     // refusal path.
     const config = testConfig("connect-fill-secret-origin-mismatch");
     const handler = createHandler(config);
-    const { createTask, upsertTask, createApproval } = await import("./state");
+    const { createTask, upsertTask, createAuthorization, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const task = createTask(state.instance, "test");
       upsertTask(state, task);
       return task.id;
     });
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in",
         payload: {
           slots: [
@@ -1152,7 +1144,7 @@ describe("runtime api", () => {
     expect(body.message).toContain("Browser session expired");
     expect(body.message).toContain("https://example.com");
     // Approval stayed pending — no resolveApproval call ran.
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
@@ -1166,18 +1158,17 @@ describe("runtime api", () => {
     // value via subsequent unredacted tool results.
     const config = testConfig("connect-fill-secret-too-short");
     const handler = createHandler(config);
-    const { createTask, upsertTask, createApproval } = await import("./state");
+    const { createTask, upsertTask, createAuthorization, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const task = createTask(state.instance, "short value test");
       upsertTask(state, task);
       return task.id;
     });
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in",
         payload: {
           slots: [
@@ -1209,7 +1200,7 @@ describe("runtime api", () => {
     expect(body.ok).toBe(false);
     expect(body.message).toContain("too short");
     expect(body.message).toContain("pin");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
@@ -1221,18 +1212,17 @@ describe("runtime api", () => {
     // covered by the previous test.
     const config = testConfig("connect-fill-secret-real-navigation");
     const handler = createHandler(config);
-    const { createTask, upsertTask, createApproval } = await import("./state");
+    const { createTask, upsertTask, createAuthorization, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const task = createTask(state.instance, "real navigation test");
       upsertTask(state, task);
       return task.id;
     });
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in",
         payload: {
           slots: [
@@ -1269,7 +1259,7 @@ describe("runtime api", () => {
     expect(body.message).toContain("Page navigated");
     expect(body.message).toContain("https://example.com");
     expect(body.message).toContain("https://evil.example.org");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
@@ -1560,7 +1550,7 @@ describe("runtime api", () => {
     // created under the originating task, so it must carry the default
     // agent's id regardless of whoever is active now.
     await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
-    const approvals = readState(config.instance).approvals.filter((a) => a.taskId === task.id);
+    const approvals = readState(config.instance).authorizations.filter((a) => a.taskId === task.id);
     expect(approvals.length).toBeGreaterThan(0);
     expect(approvals.every((a) => a.agentId === defaultAgentId)).toBe(true);
     const scopedDefault = await call(handler, config, `/api/approvals?agentId=${encodeURIComponent(defaultAgentId)}`);

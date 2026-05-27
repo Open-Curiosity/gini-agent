@@ -203,7 +203,7 @@ describe("request_connector dispatch", () => {
     }
     // No approval should have been created.
     const state = readState(instance);
-    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+    expect(state.setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
   });
 
   test("creates a pending connector.request approval when no connector exists", async () => {
@@ -220,7 +220,7 @@ describe("request_connector dispatch", () => {
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
-      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
       expect(approval).toBeDefined();
       expect(approval!.action).toBe("connector.request");
       expect(approval!.target).toBe("linear");
@@ -258,7 +258,7 @@ describe("request_connector dispatch", () => {
     }
     // The gate must short-circuit BEFORE any approval row is created.
     const state = readState(instance);
-    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+    expect(state.setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
   });
 
   test("setupSkill provider: proceeds when task history contains a read_skill for the setup skill", async () => {
@@ -309,7 +309,7 @@ describe("request_connector dispatch", () => {
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
-      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
       expect(approval).toBeDefined();
       expect(approval!.action).toBe("connector.request");
       expect(approval!.target).toBe("google-oauth-desktop");
@@ -361,7 +361,7 @@ describe("request_connector dispatch", () => {
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
-      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
       expect(approval).toBeDefined();
       expect(approval!.action).toBe("connector.request");
       expect(approval!.target).toBe("google-oauth-desktop");
@@ -387,7 +387,7 @@ describe("request_connector dispatch", () => {
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
-      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
       expect(approval).toBeDefined();
       expect(approval!.action).toBe("connector.request");
       expect(approval!.target).toBe("linear");

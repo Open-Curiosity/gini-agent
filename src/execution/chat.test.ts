@@ -216,6 +216,7 @@ describe("chat session waiting-approval placeholder", () => {
       state.tasks.push(task);
       const sessionRecord = state.chatSessions.find((s) => s.id === session.id);
       if (sessionRecord) sessionRecord.taskIds.push(task.id);
+      // connector.request is a SetupRequest (user-actor) — no risk field.
       const approval = {
         id: "approval_connreq",
         instance: state.instance,
@@ -225,7 +226,6 @@ describe("chat session waiting-approval placeholder", () => {
         taskId: task.id,
         action: "connector.request" as const,
         target: "google",
-        risk: "medium" as const,
         reason: reasonText,
         payload: {
           provider: "google",
@@ -236,7 +236,7 @@ describe("chat session waiting-approval placeholder", () => {
           ]
         }
       };
-      state.approvals.push(approval);
+      state.setupRequests.push(approval);
       task.approvalIds.push(approval.id);
       // Mirror what requestConnectorTool does at dispatch time: persist
       // the reason as a real assistant message tagged approval_reason.
@@ -352,7 +352,7 @@ describe("chat session waiting-approval placeholder", () => {
         reason: "About to write a file",
         payload: { path: "x.txt", content: "x" }
       };
-      state.approvals.push(approval);
+      state.authorizations.push(approval);
       task.approvalIds.push(approval.id);
       return task.id;
     });

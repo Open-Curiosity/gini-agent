@@ -314,7 +314,7 @@ export async function cancelTask(
   return task;
 }
 
-// Centralize the abortApprovalsForTask + approval.in_flight_aborted
+// Centralize the abortApprovalsForTask + authorization.in_flight_aborted
 // audit emission so cancelTask, failTask, and decideApproval-deny
 // share the same exact behavior. Runs INSIDE the caller's mutateState
 // callback so the abort fan-out and the audit row write happen under
@@ -334,7 +334,7 @@ function recordInFlightAborted(
     state,
     {
       actor: "runtime",
-      action: "approval.in_flight_aborted",
+      action: "authorization.in_flight_aborted",
       target: task.id,
       risk: "low",
       taskId: task.id,
@@ -1253,7 +1253,7 @@ export async function resolveAuthorization(
     // Re-read the approval row to pick up any guard flip (the
     // task-terminal guard inside `executeApprovedAction` can mark
     // the approval as `denied` via the
-    // `approval.cancelled_task_terminal` path while returning
+    // `authorization.cancelled_task_terminal` path while returning
     // `toolResult === undefined`). Returning the stale pre-guard
     // `approval` object would let `pendingOrAuto` mis-report
     // success to the model on a cancelled side effect.
@@ -1474,7 +1474,7 @@ async function executeApprovedAction(
     // dispatch turn). If we kept the claim alive through resume, a
     // cancel landing during the resumed turn would fire
     // `controller.abort()` against an already-finished approval,
-    // emitting a stale `approval.in_flight_aborted` row for a side
+    // emitting a stale `authorization.in_flight_aborted` row for a side
     // effect that already wrote its normal audit row. Pass
     // `shouldResumeChat: false` to `runApprovedAction` and call
     // `resumeChatTask` AFTER releasing.

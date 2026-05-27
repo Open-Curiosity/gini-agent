@@ -487,7 +487,7 @@ describe("normalizeState approval -> authorization/setup-request migration", () 
       }
     ];
     const legacyState = state as RuntimeState & { approvals?: unknown };
-    legacyState.approvals = legacy;
+    legacyState.approvals = legacy as unknown as RuntimeState["approvals"];
     // Force the new arrays empty so the migration path runs.
     (legacyState as { authorizations?: unknown }).authorizations = undefined;
     (legacyState as { setupRequests?: unknown }).setupRequests = undefined;
