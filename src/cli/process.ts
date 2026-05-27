@@ -122,27 +122,18 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
       }
     };
   }
-  // Daemon: when no redaction is needed, hand the FD directly to the child so
-  // writes go straight to the file from the kernel's perspective. This
-  // survives child.unref() and the parent CLI exiting (a JS-level pipe would
-  // not — the parent owns it). For web.log we MUST intercept in JS to scrub
-  // the secret, so we fall back to a pipe + write-stream tee with a
-  // best-effort redaction; the daemon child's stdio will end if the parent
-  // CLI dies, which matches `gini start` semantics anyway.
-  if (redactForLog) {
-    const stream: WriteStream = createWriteStream(logPath, { flags: "a" });
-    return {
-      stdio: ["ignore", "pipe", "pipe"],
-      onSpawned: (child) => {
-        const sink = (chunk: Buffer | string) => stream.write(redactForLog(chunk));
-        child.stdout?.on("data", sink);
-        child.stderr?.on("data", sink);
-        const close = () => { try { stream.end(); } catch { /* ignore */ } };
-        child.once("close", close);
-        child.once("error", close);
-      }
-    };
-  }
+  // Daemon: hand the FD directly to the child so writes go straight to the
+  // file from the kernel's perspective. This survives `child.unref()` and the
+  // parent CLI exiting (a JS-level pipe would not — the parent owns the pipe
+  // and an active `'data'` listener keeps the parent's event loop alive,
+  // breaking the daemon-exit contract).
+  //
+  // The web.log redactor is foreground-only by design. In daemon mode
+  // `gini start` returns immediately and the operator typically uses
+  // `gini status` / log files; an unredacted secret in daemon-mode web.log
+  // is a documented tradeoff. The runtime-side `redact()` helper covers the
+  // gateway's own log emissions; the leak here is limited to the Next.js
+  // child's stdout, and `rotate-secret` invalidates that secret immediately.
   const fd = openSync(logPath, "a");
   return {
     stdio: ["ignore", fd, fd],
@@ -155,12 +146,21 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
 // rotate-secret picks up the new value without re-creating the redactor.
 // The previous secret is held one cycle so an in-flight log line written
 // after rotation but referencing the old secret is still scrubbed.
+//
+// Chunk-boundary safety: child stdout `'data'` events flush at arbitrary
+// byte offsets, so a secret straddling two chunks would slip past a naive
+// per-chunk substring replace. The redactor retains up to `secret.length - 1`
+// trailing bytes per call and prepends them to the next chunk before
+// scanning, so any secret that ends inside the current chunk OR straddles
+// the next is caught. On flush (final chunk before stream end) the held
+// suffix is returned verbatim.
 function makeWebLogRedactor(instance: string): (chunk: Buffer | string) => string {
   const PLACEHOLDER = "<redacted-secret>";
   const CACHE_MS = 1_000;
   let cachedSecret: string | null = null;
   let cachedAt = 0;
   let priorSecret: string | null = null;
+  let carry = "";
   const readSecret = (): string | null => {
     const now = Date.now();
     if (cachedSecret !== null && now - cachedAt < CACHE_MS) return cachedSecret;
@@ -182,10 +182,22 @@ function makeWebLogRedactor(instance: string): (chunk: Buffer | string) => strin
   };
   return (chunk) => {
     const secret = readSecret();
-    let text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    const raw = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    let text = carry + raw;
     if (secret) text = text.split(secret).join(PLACEHOLDER);
     if (priorSecret) text = text.split(priorSecret).join(PLACEHOLDER);
-    return text;
+    // Decide how many trailing bytes to retain as carry for the next chunk.
+    // The carry must be big enough to catch a secret that straddles the
+    // next boundary — i.e., `max(secret.length, priorSecret.length) - 1`.
+    // We cap at 256 bytes to bound memory.
+    const longest = Math.max(secret?.length ?? 0, priorSecret?.length ?? 0);
+    const carryLen = longest > 0 ? Math.min(longest - 1, 256) : 0;
+    if (carryLen > 0 && text.length > carryLen) {
+      carry = text.slice(-carryLen);
+      return text.slice(0, -carryLen);
+    }
+    carry = text;
+    return "";
   };
 }
 

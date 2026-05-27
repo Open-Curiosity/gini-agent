@@ -152,10 +152,30 @@ export async function proxyRequest(
     });
   }
   const text = await upstream.text();
-  return new Response(text, {
-    status: upstream.status,
-    headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" }
-  });
+  const outHeaders: Record<string, string> = {
+    "content-type": upstream.headers.get("content-type") ?? "application/json"
+  };
+  // Forward a small allowlist of response headers from the upstream runtime.
+  // The QR endpoints (and any future bearer-gated response that needs
+  // browser-caching control) set `Cache-Control: no-store`; without this
+  // passthrough the BFF would silently allow a browser to cache the QR
+  // pixels — which encode the bootstrap URL. Other entries are headers a
+  // BFF typically wants to forward (content-disposition for downloads,
+  // etag/last-modified for revalidation, vary for cache key correctness).
+  const PASSTHROUGH_RESPONSE_HEADERS = [
+    "cache-control",
+    "etag",
+    "last-modified",
+    "vary",
+    "content-disposition",
+    "content-language",
+    "content-encoding"
+  ];
+  for (const name of PASSTHROUGH_RESPONSE_HEADERS) {
+    const v = upstream.headers.get(name);
+    if (v) outHeaders[name] = v;
+  }
+  return new Response(text, { status: upstream.status, headers: outHeaders });
 }
 
 // Decode each segment until stable and reject anything that would let the
