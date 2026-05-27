@@ -213,19 +213,29 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(await decideApproval(config, approvalId, "approve"));
     }],
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
-    // Connect endpoint for `connector.request` approvals. The chat UI's
-    // Connect button POSTs here with the user-entered secrets. The
-    // endpoint:
-    //   1. Validates the approval exists, is pending, and was raised by
-    //      the `request_connector` tool (`action === "connector.request"`).
-    //   2. Calls createConnector with the secret payload.
-    //   3. Probes via checkConnector. On failure, returns 200 + ok:false so
-    //      the dialog can keep itself open and let the user retry without
-    //      tearing down the approval row.
-    //   4. On success, resolves the approval through resolveApproval —
-    //      that path fires executeApprovedAction (a no-op for
-    //      `connector.request`) and resumes the chat-task loop with the
-    //      synthesized "Connected to X. Proceed" tool result.
+    // Connect endpoint: the shared three-action seam for any
+    // approval whose card asks the user to type a value (or a set of
+    // named values). The chat UI's Submit/Connect/Add button POSTs
+    // here with the user-entered secrets. The endpoint:
+    //   1. Validates the approval exists, is pending, and carries
+    //      one of the three /connect-eligible actions:
+    //        - `connector.request` (request_connector tool)
+    //        - `browser.fill_secret` (browser_fill_secrets tool)
+    //        - `messaging.add_bridge` (request_messaging_bridge tool)
+    //   2. Dispatches per action:
+    //        - connector.request: createConnector + checkConnector
+    //          inline below; on probe failure returns ok:false so the
+    //          dialog can keep itself open and let the user retry.
+    //        - browser.fill_secret: delegates to runFillSecretConnect
+    //          (src/execution/browser-fill-secrets.ts).
+    //        - messaging.add_bridge: delegates to
+    //          runMessagingBridgeConnect (src/execution/messaging-bridge-connect.ts).
+    //   3. The two bounded modules return a {status, body} envelope
+    //      that this handler forwards verbatim. Both follow the
+    //      atomic-resolve-then-side-effect pattern: resolveApproval
+    //      runs first so a concurrent /deny can't leave an orphan
+    //      side effect; the bounded module then runs the create
+    //      and fires resumeChatTask itself with the outcome string.
     ["POST", /^\/api\/approvals\/([^/]+)\/connect$/, async (request, params) => {
       const approvalId = params[0];
       const state = readState(config.instance);

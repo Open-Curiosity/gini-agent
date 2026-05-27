@@ -125,6 +125,15 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
   const [bridgeName, setBridgeName] = useState("");
   const [bridgeToken, setBridgeToken] = useState("");
   const [bridgeError, setBridgeError] = useState<string | null>(null);
+  // Sticky outcome marker. The /connect handler resolves the approval
+  // BEFORE addMessagingBridge runs, so a create-after-resolve failure
+  // returns ok:false while the approval is already approved. Without
+  // this state, the past-tense summary would unconditionally read
+  // "Bridge added" on any approved row — including the failed-create
+  // case. Track the last submit's outcome so the resolved-state
+  // summary can tell the truth.
+  const [bridgeResultOk, setBridgeResultOk] = useState<boolean | null>(null);
+  const [bridgeResultMessage, setBridgeResultMessage] = useState<string | null>(null);
   // Synchronous single-flight guard for the Add-bridge click. The
   // button's `disabled={bridgeSubmit.isPending}` only flips on the
   // next React render — a same-frame double-click can fire the
@@ -215,17 +224,34 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       return response;
     },
     onSuccess: (result) => {
+      setBridgeResultOk(result.ok);
+      setBridgeResultMessage(result.message ?? null);
+      // Always invalidate approvals/tasks/chat — the gateway resolves
+      // the approval BEFORE addMessagingBridge runs, so even on
+      // ok:false the approval status has flipped out of "pending"
+      // and the card must re-render with isPending=false. Without
+      // this, a failed create would leave the Submit button enabled
+      // and a retry would be 410-Gone. Mirrors the fillSubmit
+      // precedent above.
+      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
       if (!result.ok) {
         setBridgeError(result.message ?? "Could not add bridge. Please verify the bot token and try again.");
-        invalidate(["messaging"]);
         return;
       }
       setBridgeError(null);
       toast.success(`${bridgeKindLabel} bridge added.`);
-      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
     },
     onError: (error: Error) => {
       setBridgeError(error.message);
+      setBridgeResultOk(false);
+      setBridgeResultMessage(error.message);
+      // Network/abort failures can arrive AFTER the server-side
+      // resolveApproval landed, so the cache must refresh to flip
+      // the card out of the stale pending state. The fillSubmit
+      // precedent fires its own invalidate via onSuccess on both
+      // ok and !ok paths; the onError seam is the equivalent for
+      // pre-response throws.
+      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
     },
     onSettled: () => {
       // Drop the typed bot token regardless of outcome — the token
@@ -267,7 +293,18 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
         : block.summary
     : !isPending && approval && isMessagingAddBridge
       ? approval.status === "approved"
-        ? `${bridgeKindLabel} bridge added. (${block.summary})`
+        // The /connect handler resolves the approval BEFORE
+        // addMessagingBridge runs, so a successful resolve does NOT
+        // imply the bridge exists. Trust the sticky outcome marker
+        // set by bridgeSubmit's onSuccess/onError; default to "added"
+        // only when the most recent submit actually returned ok:true,
+        // OR when there's no local outcome to consult (e.g. resumed
+        // from history). bridgeResultOk === false means the create
+        // failed after resolve — render that truthfully so the past
+        // tense doesn't lie.
+        ? bridgeResultOk === false
+          ? `Bridge create failed${bridgeResultMessage ? `: ${bridgeResultMessage}` : ""}. (${block.summary})`
+          : `${bridgeKindLabel} bridge added. (${block.summary})`
         : approval.status === "denied"
           ? `Request denied. (${block.summary})`
           : block.summary

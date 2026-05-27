@@ -978,6 +978,21 @@ describe("runtime api", () => {
     const bridge = state.messagingBridges.find((b) => b.name === "chat-test-bridge");
     expect(bridge).toBeDefined();
     expect(bridge?.kind).toBe("telegram");
+
+    // Audit-row traceability pin: the chat-card create writes a
+    // dedicated audit row with the originating approvalId AND the
+    // resulting bridge.id so operators can reconstruct
+    // "approval X via chat-card → bridge Y" from the activity feed.
+    // Without this row the chat path is indistinguishable from the
+    // CLI / settings dialog in the audit log (both write the same
+    // generic messaging.configured row via createMessagingBridgeRecord).
+    const chatAddRow = state.audit.find(
+      (e) => e.action === "messaging.add_bridge" && e.approvalId === approval.id
+    );
+    expect(chatAddRow).toBeDefined();
+    expect(chatAddRow?.target).toBe(bridge?.id);
+    expect((chatAddRow?.evidence as { kind?: string } | undefined)?.kind).toBe("telegram");
+    expect((chatAddRow?.evidence as { bridgeName?: string } | undefined)?.bridgeName).toBe("chat-test-bridge");
   });
 
   test("POST /api/approvals/<id>/connect refuses messaging.add_bridge that was already denied, and creates no bridge", async () => {

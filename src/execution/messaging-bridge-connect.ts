@@ -29,7 +29,8 @@
 import type { Approval, MessagingBridgeRecord, RuntimeConfig } from "../types";
 import { failTask, resolveApproval } from "../agent";
 import { addMessagingBridge, assertHeaderSafeToken } from "../integrations/messaging";
-import { appendTrace } from "../state";
+import { sanitizeBridgeStatusMessage } from "../integrations/messaging-poller-helpers";
+import { addAudit, appendTrace, mutateState } from "../state";
 import { resumeChatTask } from "./chat-task";
 
 export interface MessagingBridgeConnectResult {
@@ -92,13 +93,31 @@ export async function runMessagingBridgeConnect(
   }
 
   // Atomic check-and-flip closes the deny-mid-create race.
+  // CRITICAL: capture the return value — resolveApproval can succeed
+  // (no throw) but internally flip status approved → denied via
+  // executeApprovedAction's terminal-task guard. If the owning task
+  // went terminal between the chat card mounting and the submit
+  // landing, the approval comes back denied; proceeding to
+  // addMessagingBridge in that state would create a bridge for a
+  // cancelled task and audit it as approved.
+  let resolved: Approval;
   try {
-    await resolveApproval(config, approval.id, { actor: "user", resumeChatTask: false });
+    const result = await resolveApproval(config, approval.id, { actor: "user", resumeChatTask: false });
+    resolved = result.approval;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
       status: 410,
       body: { ok: false, message: `Could not lock approval for bridge create: ${message}` }
+    };
+  }
+  if (resolved.status !== "approved") {
+    return {
+      status: 410,
+      body: {
+        ok: false,
+        message: `Approval was ${resolved.status} during resolution (likely because the owning task became terminal); no bridge was created.`
+      }
     };
   }
 
@@ -117,12 +136,22 @@ export async function runMessagingBridgeConnect(
       deliveryTargets
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const raw = error instanceof Error ? error.message : String(error);
+    // Strip absolute filesystem paths and Authorization / bot-token
+    // URL substrings before the message reaches the browser, the
+    // chat-task resume, or any persisted artifact. The sibling
+    // surfaces in messaging.ts (checkMessagingBridge, sendMessagingOutput)
+    // already pipe through this sanitizer; the chat-side card now
+    // does too. Filesystem-failure messages from writeSecret /
+    // writeState can include absolute paths under <instanceRoot>,
+    // and any Telegram fetch error in addMessagingBridge would
+    // echo `/bot<token>/`.
+    const message = sanitizeBridgeStatusMessage(raw);
     // Approval already resolved — the chat card has flipped out of
-    // pending state. Resume the chat-task loop with the failure so
-    // the agent verbalizes the error back to the user. Recover an
-    // orphaned task via failTask if the resume itself throws
-    // (mirrors browser-fill-secrets.ts:318-347).
+    // pending state. Resume the chat-task loop with the sanitized
+    // failure string so the agent verbalizes the error back to the
+    // user. Recover an orphaned task via failTask if the resume
+    // itself throws (mirrors browser-fill-secrets.ts:318-347).
     if (taskId && toolCallId) {
       await resumeOrFail(
         config,
@@ -134,6 +163,40 @@ export async function runMessagingBridgeConnect(
     }
     return { status: 200, body: { ok: false, message } };
   }
+
+  // Stamp a follow-up audit row with the chat-side lineage. The
+  // shared substrate (createMessagingBridgeRecord) writes a generic
+  // `messaging.configured` row with actor:"user" and no task/approval
+  // reference, so a bridge created from CLI vs settings vs chat is
+  // indistinguishable in the audit log. Add a complementary row so
+  // operators can prove "bridge X was created from approval Y inside
+  // task Z". Mirrors browser-fill-secrets.ts:247-267 in spirit.
+  await mutateState(config.instance, (state) => {
+    // AgentContext is a discriminated union — `{taskId}` only
+    // satisfies it when taskId is a string, so narrow before
+    // passing. messaging.add_bridge approvals always carry a taskId
+    // (set in tool-dispatch.ts:requestMessagingBridgeTool), but the
+    // wire type makes Approval.taskId optional; fall through to
+    // {system: true} if a future caller mints the approval without
+    // one.
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "messaging.add_bridge",
+        target: bridge.id,
+        risk: "high",
+        taskId,
+        approvalId: approval.id,
+        evidence: {
+          kind,
+          bridgeName: bridge.name,
+          toolCallId: toolCallId ?? null
+        }
+      },
+      taskId ? { taskId } : { system: true }
+    );
+  });
 
   if (taskId && toolCallId) {
     await resumeOrFail(

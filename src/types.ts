@@ -314,8 +314,8 @@ export interface ApprovalRequestedBlock extends ChatBlockBase {
   kind: "approval_requested";
   approvalId: string;
   // Approval action (`file.write`, `terminal.exec`, `connector.request`,
-  // `browser.fill_secret`, etc.). Clients branch on `action` to render
-  // the right card variant:
+  // `browser.fill_secret`, `messaging.add_bridge`, etc.). Clients
+  // branch on `action` to render the right card variant:
   //   - `connector.request` → Connect dialog (collects OAuth/API
   //     creds via /api/approvals/<id>/connect).
   //   - `browser.fill_secret` → inline Submit form with one input
@@ -324,6 +324,14 @@ export interface ApprovalRequestedBlock extends ChatBlockBase {
   //     `{ secrets: { <slot.name>: <value>, ... } }`. The generic
   //     /approve endpoint refuses this action — Deny is still valid.
   //     See docs/adr/browser-fill-secret.md.
+  //   - `messaging.add_bridge` → inline form with name + password-masked
+  //     bot-token inputs (kind is pinned in payload). Submit POSTs
+  //     `{ secrets: { name, botToken } }` to /api/approvals/<id>/connect,
+  //     which routes into addMessagingBridge. The generic /approve
+  //     endpoint refuses this action — Deny is still valid. Other
+  //     surfaces (home page, /permissions list) render Deny + a
+  //     "resolve in chat" hint because they can't display the form.
+  //     See docs/adr/telegram-bridge.md and chat-block-protocol.md.
   //   - everything else → standard Approve / Deny pair (POST to
   //     /api/approvals/<id>/{approve,deny}).
   action: string;
