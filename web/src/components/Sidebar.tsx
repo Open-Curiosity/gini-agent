@@ -151,6 +151,17 @@ function UpdateReminder() {
     }
   }, [appliedSha, statusVersion?.git.sha, qc]);
 
+  useEffect(() => {
+    if (!appliedSha) return;
+    const timer = setTimeout(() => {
+      setAppliedSha(null);
+      toast.error("Update applied, but the runtime hasn't reported back. Reload to check.");
+      qc.invalidateQueries({ queryKey: ["status"] });
+      qc.invalidateQueries({ queryKey: ["version", "check"] });
+    }, 30_000);
+    return () => clearTimeout(timer);
+  }, [appliedSha, qc]);
+
   const update = useMutation({
     mutationFn: () => api<GiniUpdateResult>("/update", { method: "POST" }),
     onSuccess: (result) => {
