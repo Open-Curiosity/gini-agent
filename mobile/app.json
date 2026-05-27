@@ -43,6 +43,13 @@
         "./plugins/with-approval-notification-service.js",
         { "appleTeamId": "WB6Y3K67AB" }
       ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Gini uses your photo library to attach images to chat messages.",
+          "cameraPermission": "Gini uses the camera to capture images to attach to chat messages."
+        }
+      ],
       "expo-updates"
     ],
     "experiments": {
