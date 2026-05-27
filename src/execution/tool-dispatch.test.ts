@@ -12,7 +12,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:te
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mutateState, createMcpServerRecord, createTask, readState, upsertTask } from "../state";
+import { mutateState, createChatSession, createMcpServerRecord, createTask, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 import { dispatchToolCall } from "./tool-dispatch";
 
@@ -45,13 +45,17 @@ function buildConfig(instance: string): RuntimeConfig {
 async function newTask(config: RuntimeConfig): Promise<string> {
   // Build the task directly on state — submitTask would also kick off the
   // chat-task loop, and we only need the row for the dispatcher to
-  // attribute audits to. Bind a synthetic chatSessionId so the
-  // chat-card surface guards (which refuse sessionless tasks per the
-  // R8 fix) accept the dispatch — production callers that hit those
-  // tools always have a session.
+  // attribute audits to. Also seed a real chat-session row and bind
+  // it to the task so the chat-card surface guards (which refuse
+  // both missing-chatSessionId AND stale-session-ref tasks) accept
+  // the dispatch — production callers that hit those tools always
+  // have a live session.
   const task = createTask(config.instance, "dispatch test");
-  task.chatSessionId = `chat_test_${task.id.slice(0, 8)}`;
+  let sessionId = "";
   await mutateState(config.instance, (state) => {
+    const session = createChatSession(state, "dispatch test session");
+    sessionId = session.id;
+    task.chatSessionId = sessionId;
     upsertTask(state, task);
   });
   return task.id;

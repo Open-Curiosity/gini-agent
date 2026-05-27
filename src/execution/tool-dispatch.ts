@@ -656,12 +656,16 @@ async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 12_000);
-  // Strip query string + fragment before persisting the URL. A
-  // server-controlled redirect can append tokens to the Location
-  // header; logging current.toString() verbatim would carry those
-  // into trace and audit. origin + pathname keeps the destination
-  // identifiable for an operator without leaking the credentials.
-  const sanitizedUrl = `${current.protocol}//${current.host}${current.pathname}`;
+  // Log only the origin (protocol + host) in trace + audit. The
+  // path can carry tokens (signed-URL signatures, OAuth-via-path
+  // styles, the occasional poorly-designed "personal key in URL"
+  // pattern) and any server-controlled redirect can add more, so
+  // including pathname risks leaking credentials into the trace.
+  // Operators who need the exact endpoint can read the original
+  // tool_call args from the conversation transcript; the audit
+  // row's job is to attest "the agent reached this host" without
+  // revealing what it asked for.
+  const sanitizedUrl = `${current.protocol}//${current.host}`;
   appendTrace(config.instance, taskId, {
     type: "tool",
     message: "Web page fetched (chat-task)",
@@ -2679,15 +2683,18 @@ async function browserFillSecretsTool(
   // the eventual reply back through outboundMirror to Telegram).
   // Mirror finalize.ts:161's `outboundMirror ?? source` precedent.
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
-  // Chat-card tools also need a chatSessionId to surface the card.
-  // A subagent spawned with mode:"chat" (or any other caller that
-  // dispatches tools without binding a chat session) would
+  // Chat-card tools also need a live chat session to surface the
+  // card. A subagent spawned with mode:"chat" (or any other caller
+  // that dispatches tools without binding a chat session) would
   // otherwise mint an approval that emitApprovalRequested then
   // silently skips because resolveEmitContext returns undefined
-  // for sessionless tasks (chat-task-emit.ts). End result: row in
-  // state.approvals + task parked, but no UI card to act on. Refuse
-  // up-front so the model can surface a recoverable tool_result.
-  if (!surfaceTask.chatSessionId) {
+  // for sessionless tasks (chat-task-emit.ts). Same orphaning
+  // happens when chatSessionId is set but the referenced session
+  // was deleted — surfaceSession resolves to undefined either way.
+  // End result: row in state.approvals + task parked, but no UI
+  // card to act on. Refuse up-front on either shape so the model
+  // can surface a recoverable tool_result.
+  if (!surfaceSession) {
     return {
       kind: "sync",
       result: JSON.stringify({
@@ -2858,15 +2865,18 @@ async function requestMessagingBridgeTool(
     ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
     : undefined;
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
-  // Chat-card tools also need a chatSessionId to surface the card.
-  // A subagent spawned with mode:"chat" (or any other caller that
-  // dispatches tools without binding a chat session) would
+  // Chat-card tools also need a live chat session to surface the
+  // card. A subagent spawned with mode:"chat" (or any other caller
+  // that dispatches tools without binding a chat session) would
   // otherwise mint an approval that emitApprovalRequested then
   // silently skips because resolveEmitContext returns undefined
-  // for sessionless tasks (chat-task-emit.ts). End result: row in
-  // state.approvals + task parked, but no UI card to act on. Refuse
-  // up-front so the model can surface a recoverable tool_result.
-  if (!surfaceTask.chatSessionId) {
+  // for sessionless tasks (chat-task-emit.ts). Same orphaning
+  // happens when chatSessionId is set but the referenced session
+  // was deleted — surfaceSession resolves to undefined either way.
+  // End result: row in state.approvals + task parked, but no UI
+  // card to act on. Refuse up-front on either shape so the model
+  // can surface a recoverable tool_result.
+  if (!surfaceSession) {
     return {
       kind: "sync",
       result: JSON.stringify({
@@ -3143,15 +3153,18 @@ async function requestMessagingPairingTool(
     ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
     : undefined;
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
-  // Chat-card tools also need a chatSessionId to surface the card.
-  // A subagent spawned with mode:"chat" (or any other caller that
-  // dispatches tools without binding a chat session) would
+  // Chat-card tools also need a live chat session to surface the
+  // card. A subagent spawned with mode:"chat" (or any other caller
+  // that dispatches tools without binding a chat session) would
   // otherwise mint an approval that emitApprovalRequested then
   // silently skips because resolveEmitContext returns undefined
-  // for sessionless tasks (chat-task-emit.ts). End result: row in
-  // state.approvals + task parked, but no UI card to act on. Refuse
-  // up-front so the model can surface a recoverable tool_result.
-  if (!surfaceTask.chatSessionId) {
+  // for sessionless tasks (chat-task-emit.ts). Same orphaning
+  // happens when chatSessionId is set but the referenced session
+  // was deleted — surfaceSession resolves to undefined either way.
+  // End result: row in state.approvals + task parked, but no UI
+  // card to act on. Refuse up-front on either shape so the model
+  // can surface a recoverable tool_result.
+  if (!surfaceSession) {
     return {
       kind: "sync",
       result: JSON.stringify({
@@ -3296,15 +3309,18 @@ async function waitForMessagingPairTool(
     ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
     : undefined;
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
-  // Chat-card tools also need a chatSessionId to surface the card.
-  // A subagent spawned with mode:"chat" (or any other caller that
-  // dispatches tools without binding a chat session) would
+  // Chat-card tools also need a live chat session to surface the
+  // card. A subagent spawned with mode:"chat" (or any other caller
+  // that dispatches tools without binding a chat session) would
   // otherwise mint an approval that emitApprovalRequested then
   // silently skips because resolveEmitContext returns undefined
-  // for sessionless tasks (chat-task-emit.ts). End result: row in
-  // state.approvals + task parked, but no UI card to act on. Refuse
-  // up-front so the model can surface a recoverable tool_result.
-  if (!surfaceTask.chatSessionId) {
+  // for sessionless tasks (chat-task-emit.ts). Same orphaning
+  // happens when chatSessionId is set but the referenced session
+  // was deleted — surfaceSession resolves to undefined either way.
+  // End result: row in state.approvals + task parked, but no UI
+  // card to act on. Refuse up-front on either shape so the model
+  // can surface a recoverable tool_result.
+  if (!surfaceSession) {
     return {
       kind: "sync",
       result: JSON.stringify({
@@ -3492,15 +3508,18 @@ async function requestRemoveMessagingBridgeTool(
     ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
     : undefined;
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
-  // Chat-card tools also need a chatSessionId to surface the card.
-  // A subagent spawned with mode:"chat" (or any other caller that
-  // dispatches tools without binding a chat session) would
+  // Chat-card tools also need a live chat session to surface the
+  // card. A subagent spawned with mode:"chat" (or any other caller
+  // that dispatches tools without binding a chat session) would
   // otherwise mint an approval that emitApprovalRequested then
   // silently skips because resolveEmitContext returns undefined
-  // for sessionless tasks (chat-task-emit.ts). End result: row in
-  // state.approvals + task parked, but no UI card to act on. Refuse
-  // up-front so the model can surface a recoverable tool_result.
-  if (!surfaceTask.chatSessionId) {
+  // for sessionless tasks (chat-task-emit.ts). Same orphaning
+  // happens when chatSessionId is set but the referenced session
+  // was deleted — surfaceSession resolves to undefined either way.
+  // End result: row in state.approvals + task parked, but no UI
+  // card to act on. Refuse up-front on either shape so the model
+  // can surface a recoverable tool_result.
+  if (!surfaceSession) {
     return {
       kind: "sync",
       result: JSON.stringify({
