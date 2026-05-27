@@ -2798,7 +2798,31 @@ async function listMessagingPairingsTool(
   }
   try {
     const view = listAllowedChats(config, bridge);
-    return JSON.stringify({ ok: true, bridge, ...view });
+    // Redact verificationCode + verificationCodeExpiresAt from the
+    // tool envelope. The code is a security-critical token whose
+    // entire purpose is preventing TOFU enrollment race attacks
+    // (see messaging.ts `DeniedChatAttempt`); a prompt-injected
+    // agent that could read it would be able to scrape live codes
+    // and race the legitimate user. The model doesn't need the
+    // code to pair: request_messaging_pairing's dispatcher reads
+    // the same listAllowedChats view server-side when minting the
+    // approval, and the operator confirms the code by eye against
+    // what the bot DM'd them. The settings UI still gets the full
+    // view via its own /api/messaging/* path; only the model-
+    // facing tool envelope is redacted.
+    const safeRecentDeniedChats = view.recentDeniedChats.map((entry) => ({
+      chatId: entry.chatId,
+      chatType: entry.chatType,
+      sender: entry.sender,
+      lastAttemptAt: entry.lastAttemptAt
+    }));
+    return JSON.stringify({
+      ok: true,
+      bridge,
+      allowedChatIds: view.allowedChatIds,
+      ownerChatId: view.ownerChatId,
+      recentDeniedChats: safeRecentDeniedChats
+    });
   } catch (error) {
     return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
   }

@@ -620,7 +620,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "list_messaging_pairings",
-      description: "List the pending Telegram pairing requests AND the currently-allowed chats for a bridge. Returns an object with `allowedChatIds` (the chats already enrolled) and `recentDeniedChats` (each pending row's chatId, sender, chatType, verificationCode, verificationCodeExpiresAt). Call this when the user says 'any pending bots?' / 'who DM'd the bot?' / 'show pairings'; the result tells you whether to immediately call request_messaging_pairing to surface an approve card. Only telegram bridges have an allowlist; calling on a discord/demo bridge returns an error envelope.",
+      description: "List the pending Telegram pairing requests AND the currently-allowed chats for a bridge. Returns an object with `allowedChatIds` (the chats already enrolled) and `recentDeniedChats` (each pending row's chatId, sender, chatType, lastAttemptAt). Call this when the user says 'any pending bots?' / 'who DM'd the bot?' / 'show pairings'; the result tells you whether to immediately call request_messaging_pairing to surface an approve card. Verification codes are NOT returned by this tool — the operator confirms them out-of-band against the bot's DM reply, and request_messaging_pairing reads the code server-side when minting the approval. Only telegram bridges have an allowlist; calling on a discord/demo bridge returns an error envelope.",
       parameters: {
         type: "object",
         properties: {

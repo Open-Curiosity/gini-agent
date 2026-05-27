@@ -535,6 +535,65 @@ describe("request_connector dispatch", () => {
     }
   });
 
+  test("list_messaging_pairings: redacts verification codes from the read-only envelope", async () => {
+    // Verification codes are security tokens whose entire purpose is
+    // preventing TOFU enrollment race attacks (see messaging.ts
+    // DeniedChatAttempt). A prompt-injected agent that scraped them
+    // could race the legitimate user. Pin that the tool envelope
+    // surfaces chatId / chatType / sender / lastAttemptAt for the
+    // agent to route on, but never the verificationCode itself nor
+    // its expiry timestamp.
+    const instance = `list-pairings-redaction-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    await mutateState(instance, (state) => {
+      const { createMessagingBridgeRecord } = require("../state") as typeof import("../state");
+      const bridge = createMessagingBridgeRecord(state, {
+        name: "tg",
+        kind: "telegram",
+        deliveryTargets: []
+      });
+      bridge.metadata = {
+        allowedChatIds: [42],
+        recentDeniedChats: [
+          {
+            chatId: 99,
+            chatType: "private",
+            sender: "@alice",
+            lastAttemptAt: new Date().toISOString(),
+            verificationCode: "SECRET-1234",
+            verificationCodeExpiresAt: new Date(Date.now() + 60_000).toISOString()
+          }
+        ]
+      };
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "list_messaging_pairings",
+      "call_list",
+      JSON.stringify({ bridge: "tg" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(true);
+      expect(parsed.allowedChatIds).toEqual([42]);
+      expect(Array.isArray(parsed.recentDeniedChats)).toBe(true);
+      expect(parsed.recentDeniedChats.length).toBe(1);
+      const entry = parsed.recentDeniedChats[0];
+      expect(entry.chatId).toBe(99);
+      expect(entry.chatType).toBe("private");
+      expect(entry.sender).toBe("@alice");
+      expect(typeof entry.lastAttemptAt).toBe("string");
+      // The redactions: codes must NOT appear under any name.
+      expect(entry.verificationCode).toBeUndefined();
+      expect(entry.verificationCodeExpiresAt).toBeUndefined();
+      // Stringified envelope must not contain the code either.
+      expect(result.result).not.toContain("SECRET-1234");
+    }
+  });
+
   test("request_remove_messaging_bridge: mints a pending approval for an existing bridge", async () => {
     const instance = `req-remove-bridge-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance);
