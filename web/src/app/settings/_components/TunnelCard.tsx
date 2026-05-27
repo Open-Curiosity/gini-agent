@@ -113,7 +113,8 @@ export function TunnelCard() {
             </CardTitle>
             <CardDescription>
               Cloudflare quick tunnel gated by a per-instance 192-bit secret. Scan from your phone to reach this
-              gateway anywhere.
+              gateway anywhere. <strong className="font-semibold text-foreground">The QR encodes a live credential —
+              don&apos;t share, screenshot, or display it in public.</strong>
             </CardDescription>
           </div>
           {/* On a tunneled view the deny list blocks PATCH /api/runtime/tunnel
@@ -164,7 +165,10 @@ export function TunnelCard() {
               {!qrRevealed ? (
                 <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-1 bg-background/60 text-foreground backdrop-blur-sm transition group-hover:bg-background/70">
                   <EyeOff className="h-6 w-6" />
-                  <span className="text-xs font-medium">Click to reveal</span>
+                  <span className="text-xs font-semibold">Click to reveal</span>
+                  <span className="px-2 text-center text-[10px] uppercase tracking-wider text-muted-foreground">
+                    Live secret
+                  </span>
                 </div>
               ) : null}
             </button>

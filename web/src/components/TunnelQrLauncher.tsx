@@ -78,8 +78,10 @@ export function TunnelQrLauncher() {
           <DialogHeader>
             <DialogTitle>Scan with your phone</DialogTitle>
             <DialogDescription>
-              Open the camera on your phone and point it at the QR code. The link contains a one-time
-              secret — keep it private.
+              Open the camera on your phone and point it at the QR code. The link contains a{" "}
+              <strong className="font-semibold text-foreground">one-time secret</strong> — anyone who
+              scans it (or photographs your screen) gets the same access you have. <strong className="font-semibold text-foreground">Keep it
+              private</strong>; rotate from Settings if you suspect a leak.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col items-center gap-3">
@@ -99,7 +101,10 @@ export function TunnelQrLauncher() {
               {!qrRevealed ? (
                 <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 bg-background/60 text-foreground backdrop-blur-sm transition group-hover:bg-background/70">
                   <EyeOff className="h-8 w-8" />
-                  <span className="text-sm font-medium">Click to reveal</span>
+                  <span className="text-sm font-semibold">Click to reveal</span>
+                  <span className="px-3 text-center text-[10px] uppercase tracking-wider text-muted-foreground">
+                    Contains a live secret
+                  </span>
                 </div>
               ) : null}
             </button>
