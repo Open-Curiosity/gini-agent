@@ -368,6 +368,70 @@ describe("request_connector dispatch", () => {
     }
   });
 
+  test("request_messaging_bridge: creates a pending messaging.add_bridge approval with kind/suggestedName/reason in payload", async () => {
+    // Chat-side affordance for adding a Telegram bridge. The
+    // dispatcher mints a pending approval whose payload carries the
+    // structural fields the /connect handler needs (kind, name
+    // suggestion, the tool_call id to thread the resume), and the
+    // approval reason matches the model's user-facing string so the
+    // chat card shows it verbatim.
+    const instance = `req-messaging-bridge-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_messaging_bridge",
+      "call_bridge_1",
+      JSON.stringify({
+        kind: "telegram",
+        suggestedName: "my-bot",
+        reason: "Add a Telegram bot so I can DM you updates."
+      })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      expect(approval!.action).toBe("messaging.add_bridge");
+      expect(approval!.target).toBe("telegram");
+      expect(approval!.status).toBe("pending");
+      expect(approval!.payload.kind).toBe("telegram");
+      expect(approval!.payload.suggestedName).toBe("my-bot");
+      expect(approval!.payload.toolCallId).toBe("call_bridge_1");
+      expect(approval!.reason).toBe("Add a Telegram bot so I can DM you updates.");
+    }
+  });
+
+  test("request_messaging_bridge: rejects unknown kind synchronously", async () => {
+    // The chat card branches on payload.kind to pick the per-kind
+    // help text and the Submit label. A bogus kind would render an
+    // unknown bridge, fail the addMessagingBridge dispatch, and
+    // leave a stale approval row. Refuse up-front so the agent
+    // gets a recoverable tool result instead.
+    const instance = `req-messaging-bridge-badkind-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_messaging_bridge",
+      "call_bridge_bad",
+      JSON.stringify({ kind: "slack" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("telegram");
+      expect(parsed.error).toContain("discord");
+    }
+    // No approval row should have been minted on the failure path.
+    const state = readState(instance);
+    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+  });
+
   test("non-setupSkill provider: gate does not apply regardless of read_skill history", async () => {
     // Back-compat: providers without `setupSkill` (linear, generic, etc.)
     // must keep the existing direct-approval shape. The gate only fires

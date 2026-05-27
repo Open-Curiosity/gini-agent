@@ -150,6 +150,8 @@ export async function dispatchToolCall(
       return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
     case "browser_fill_secrets":
       return await browserFillSecretsTool(config, taskId, toolCallId, args);
+    case "request_messaging_bridge":
+      return await requestMessagingBridgeTool(config, taskId, toolCallId, args);
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -2638,6 +2640,107 @@ async function browserFillSecretsTool(
       type: "approval",
       message: "Approval requested for browser.fill_secret",
       data: { approvalId: approval.id, slotCount: slots.length, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
+}
+
+// Messaging-bridge add affordance. Mints a `messaging.add_bridge`
+// approval whose card surfaces a name input and a password-masked
+// bot-token input inside the chat — the same inline-card pattern
+// `browser_fill_secrets` and `request_connector` use. On Submit, the
+// BFF forwards values to POST /api/approvals/<id>/connect, which
+// routes into addMessagingBridge (the same code path the CLI and the
+// settings page already call). The bot token never enters the model
+// context, audit evidence, or the chat transcript — same hygiene as
+// browser.fill_secret.
+async function requestMessagingBridgeTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  // Surface guard — same rationale as browser_fill_secrets. The amber
+  // card renders only in the web chat; a task running over Telegram
+  // or Discord that minted this approval would park in
+  // awaiting_approval forever with no submission path. Refuse early
+  // so the agent can verbalize "open the web chat to add the bridge"
+  // back to the user.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `request_messaging_bridge only works in the web chat (this conversation is over ${surfaceKind}). Reply to the user in text asking them to open the web chat to add the bridge there.`
+      })
+    };
+  }
+
+  const rawKind = typeof args.kind === "string" ? args.kind.trim().toLowerCase() : "";
+  if (rawKind !== "telegram" && rawKind !== "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `request_messaging_bridge requires kind: "telegram" or "discord" (got ${JSON.stringify(args.kind)}).`
+      })
+    };
+  }
+  const kind = rawKind as "telegram" | "discord";
+  const kindLabel = kind === "telegram" ? "Telegram" : "Discord";
+  const suggestedName = typeof args.suggestedName === "string" && args.suggestedName.trim().length > 0
+    ? args.suggestedName.trim()
+    : `my-${kind}-bot`;
+  const reason = typeof args.reason === "string" && args.reason.trim().length > 0
+    ? args.reason.trim()
+    : `Add a ${kindLabel} bridge so this agent can talk to you on ${kindLabel}.`;
+
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createApproval(mutable, {
+      taskId: item.id,
+      action: "messaging.add_bridge",
+      target: kind,
+      risk: "high",
+      reason,
+      // Structural payload fields the /connect handler reads:
+      //   - kind: telegram | discord, drives the addMessagingBridge
+      //     branch + the per-kind help text under the form.
+      //   - suggestedName: prefilled value for the name input; the
+      //     user can change it before submitting.
+      //   - toolCallId: links the resume tool result back to the
+      //     originating tool_call in the chat-task loop.
+      payload: { kind, suggestedName, reason, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    // Mirror the reason into the chat session so it survives past
+    // approval resolution — same pattern as requestConnectorTool /
+    // browserFillSecretsTool.
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for messaging.add_bridge",
+      data: { approvalId: approval.id, kind, toolCallId }
     });
     return approval.id;
   });

@@ -909,6 +909,115 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
+  test("POST /api/approvals/<id>/approve refuses messaging.add_bridge action", async () => {
+    // The chat-side messaging.add_bridge flow needs the bridge name +
+    // bot token from the user, both of which only travel on the
+    // /connect path. The generic /approve route would flip the
+    // approval to status=approved without ever calling
+    // addMessagingBridge, and runApprovedAction's matching branch
+    // would synthesize "Bridge added" for the agent over a bridge
+    // that doesn't exist. Refuse early so /connect is the only
+    // resolution path.
+    const config = testConfig("approve-refuses-messaging-add-bridge");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        risk: "high",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "my-telegram-bot", toolCallId: "call_bridge" }
+      })
+    );
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/approve`,
+      { method: "POST" },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("/connect");
+    expect(body.error).toContain("not /approve");
+    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
+  });
+
+  test("POST /api/approvals/<id>/connect creates a messaging bridge and resolves the approval", async () => {
+    // Happy-path pin for the chat-side Add Telegram flow. The card's
+    // Submit button POSTs the name + bot token under `secrets`; the
+    // gateway routes them into addMessagingBridge (the same code path
+    // the CLI and the settings page already call) and resolves the
+    // approval so the chat-task loop can resume.
+    const config = testConfig("approvals-connect-bridge-happy");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        risk: "high",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "chat-test-bridge", toolCallId: "call_bridge_happy" }
+      })
+    );
+
+    const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { name: "chat-test-bridge", botToken: "1234:ABCDEFGHIJKLMNOPQR" } })
+    });
+    expect(response.ok).toBe(true);
+    expect(response.bridge?.name).toBe("chat-test-bridge");
+    expect(response.bridge?.kind).toBe("telegram");
+
+    const state = readState(config.instance);
+    const resolved = state.approvals.find((a) => a.id === approval.id);
+    expect(resolved?.status).toBe("approved");
+    const bridge = state.messagingBridges.find((b) => b.name === "chat-test-bridge");
+    expect(bridge).toBeDefined();
+    expect(bridge?.kind).toBe("telegram");
+  });
+
+  test("POST /api/approvals/<id>/connect returns ok:false when messaging.add_bridge is missing a name or token", async () => {
+    // The chat card disables Submit until both inputs are non-empty,
+    // but a CLI/API caller could POST a partial body. The gateway
+    // mirrors the same readiness gate as the card so a partial
+    // submission can't silently create a half-configured bridge.
+    const config = testConfig("approvals-connect-bridge-missing");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        risk: "high",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "missing-fields", toolCallId: "call_bridge_missing" }
+      })
+    );
+    const missingToken = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { name: "missing-fields" } })
+    });
+    expect(missingToken.ok).toBe(false);
+    expect(missingToken.message).toContain("Bot token");
+
+    const missingName = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { botToken: "1234:ABCDEFGHIJ" } })
+    });
+    expect(missingName.ok).toBe(false);
+    expect(missingName.message).toContain("name");
+
+    // Both rejections must leave the approval pending — otherwise the
+    // chat card would flip out of pending state and the user couldn't
+    // retry.
+    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
+  });
+
   test("POST /api/approvals/<id>/connect refuses partial browser.fill_secret submissions", async () => {
     // fillReady in BlockApprovalRequested.tsx only disables the web
     // Submit button; CLI / mobile / direct API clients can still POST a

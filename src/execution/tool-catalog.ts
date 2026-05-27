@@ -545,6 +545,44 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Messaging-bridge-request affordance. Surfaces the same inline form
+    // card used by `request_connector` / `browser_fill_secrets`, but for
+    // adding a Telegram (or Discord) bridge. The agent calls this when
+    // the user asks something like "add a telegram bot" or "wire up
+    // messaging"; the user sees a card with a name input and a bot-token
+    // input (password-masked) inside the chat. On Submit, the gateway
+    // forwards the values to addMessagingBridge — same code path the CLI
+    // (`gini messaging add`) and the settings page already go through.
+    // Bot token never enters the model context, the audit row evidence,
+    // or the chat transcript.
+    toolset: "messaging",
+    displayLabel: "Add messaging bridge",
+    type: "function",
+    function: {
+      name: "request_messaging_bridge",
+      description: "Ask the user to wire up a Telegram (or Discord) messaging bridge by entering a bot token. Use this when the user says something like 'add a telegram bot', 'connect telegram', 'set up a discord bot', or any other onboarding ask for messaging. The user sees an inline card in chat with a name input and a password-masked bot-token input; once they submit, the bridge is created on the runtime — same path as the CLI's `gini messaging add` and the settings page's Add Telegram dialog. The task pauses on this approval and resumes automatically after the user submits.",
+      parameters: {
+        type: "object",
+        properties: {
+          kind: {
+            type: "string",
+            enum: ["telegram", "discord"],
+            description: "Which bridge kind to add. Pick 'telegram' for the @BotFather flow, 'discord' for a Developer-Portal bot."
+          },
+          suggestedName: {
+            type: "string",
+            description: "Optional default name for the bridge (e.g. 'my-telegram-bot'). The user can edit this in the card before submitting. Defaults to a kind-derived placeholder when omitted."
+          },
+          reason: {
+            type: "string",
+            description: "Short user-visible text shown above the form explaining what the bridge will do (e.g. 'Add a Telegram bot so I can DM you updates.'). One line."
+          }
+        },
+        required: ["kind"]
+      }
+    }
+  },
+  {
     // Generic MCP tool invocation. The agent loop sees this as a single
     // tool entry; the dispatcher routes (server, tool, arguments) to the
     // matching McpServerRecord via src/integrations/mcp.ts. Each
@@ -1024,6 +1062,17 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // visible so the agent can always escalate to the user instead
     // of guessing a credential.
     if (tool.function.name === "browser_fill_secrets") return true;
+    // request_messaging_bridge is the in-chat affordance for adding a
+    // Telegram / Discord bridge — peer of request_connector but for
+    // outbound messaging plumbing. Always-on for the same reason: the
+    // user should be able to ask "add a telegram bot" on a fresh
+    // instance without first toggling a toolset. The owning toolset is
+    // "messaging" (same as `send_message`), but unlike send_message
+    // this is a meta-tool that surfaces a credential form card; it
+    // doesn't egress data on its own. Always exposed so the onboarding
+    // path stays reachable even when the messaging toolset is disabled
+    // by operators who don't want the agent autonomously sending DMs.
+    if (tool.function.name === "request_messaging_bridge") return true;
     // Always expose the core agent-capability meta-tools whose owning
     // toolsets aren't in the legacy defaults (`skills`, `subagents`).
     // Gating these on a toolset toggle would mean a fresh instance
@@ -1184,6 +1233,8 @@ export function chatBlockArgsPreviewFor(
       );
     case "request_connector":
       return truncatePreview(previewValue(safe.provider));
+    case "request_messaging_bridge":
+      return truncatePreview(previewValue(safe.kind));
     case "create_job":
     case "run_job":
     case "delete_job":

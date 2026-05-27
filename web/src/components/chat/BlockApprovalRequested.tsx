@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -53,14 +53,15 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => {
       // Clear any typed credentials regardless of outcome. The Deny
-      // button on a fill_secret card never invokes fillSubmit (and
-      // therefore never hits fillSubmit's onSettled clear), so
-      // without this hook a user who typed a credential and then
-      // clicked Deny would leave the typed value sitting in React
-      // state until the chat view unmounts. Cheap on every other
-      // approval action — setFillValues({}) is a no-op when the
-      // record is already empty.
+      // button on a fill_secret or messaging.add_bridge card never
+      // invokes the respective submit mutation (and therefore never
+      // hits its onSettled clear), so without this hook a user who
+      // typed a credential and then clicked Deny would leave the
+      // typed value sitting in React state until the chat view
+      // unmounts. Cheap on every other approval action — the setters
+      // are no-ops when the record / string is already empty.
       setFillValues({});
+      setBridgeToken("");
     }
   });
 
@@ -98,6 +99,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
 
   const isConnectorRequest = block.action === "connector.request";
   const isBrowserFillSecret = block.action === "browser.fill_secret";
+  const isMessagingAddBridge = block.action === "messaging.add_bridge";
   const providerId = isConnectorRequest && approval
     ? String(approval.payload?.provider ?? "")
     : "";
@@ -109,7 +111,34 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
   const fillSlots: FillSecretSlot[] = isBrowserFillSecret && approval
     ? parseFillSecretSlots(approval.payload?.slots)
     : [];
+  const bridgeKind = isMessagingAddBridge && approval
+    ? (approval.payload?.kind === "telegram" || approval.payload?.kind === "discord"
+        ? (approval.payload.kind as "telegram" | "discord")
+        : "telegram")
+    : null;
+  const bridgeKindLabel = bridgeKind === "discord" ? "Discord" : "Telegram";
+  const suggestedBridgeName = isMessagingAddBridge && approval
+    && typeof approval.payload?.suggestedName === "string"
+    ? (approval.payload.suggestedName as string)
+    : "";
   const [fillValues, setFillValues] = useState<Record<string, string>>({});
+  const [bridgeName, setBridgeName] = useState("");
+  const [bridgeToken, setBridgeToken] = useState("");
+  const [bridgeError, setBridgeError] = useState<string | null>(null);
+  // Seed the name input with the agent's suggestedName the first time
+  // the approval row resolves out of the cache. Without this, the
+  // first render fires before useApprovals() lands the row and the
+  // input would stay empty even after the suggestion arrives. Keyed
+  // on approvalId so a brand-new card (e.g. the agent re-issues the
+  // tool after a denied submission) re-seeds rather than carrying
+  // the prior session's value.
+  useEffect(() => {
+    if (!isMessagingAddBridge) return;
+    if (bridgeName.length > 0) return;
+    if (suggestedBridgeName.length === 0) return;
+    setBridgeName(suggestedBridgeName);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isMessagingAddBridge, suggestedBridgeName, block.approvalId]);
   const fillSubmit = useMutation({
     mutationFn: async () => {
       // Submit value never leaves this function's request scope.
@@ -157,6 +186,49 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
     && fillSlots.length > 0
     && fillSlots.every((s) => typeof fillValues[s.name] === "string" && fillValues[s.name].length > 0);
 
+  // Submitter for the messaging.add_bridge card. Same shape as
+  // fillSubmit above — POST /api/approvals/<id>/connect with a
+  // `secrets` envelope, clear the typed token on success/error/abort
+  // so it never lingers in the React fiber tree past the click.
+  // Failures surface inline (so the operator can retry without the
+  // card tearing down) AND invalidate the approval cache so a
+  // 410-Gone follow-up flips the card out of pending state.
+  const bridgeSubmit = useMutation({
+    mutationFn: async () => {
+      const response = await api<{ ok: boolean; message?: string; bridge?: { id?: string; name?: string } }>(
+        `/approvals/${block.approvalId}/connect`,
+        {
+          method: "POST",
+          body: JSON.stringify({ secrets: { name: bridgeName.trim(), botToken: bridgeToken } })
+        }
+      );
+      return response;
+    },
+    onSuccess: (result) => {
+      if (!result.ok) {
+        setBridgeError(result.message ?? "Could not add bridge. Please verify the bot token and try again.");
+        invalidate(["messaging"]);
+        return;
+      }
+      setBridgeError(null);
+      toast.success(`${bridgeKindLabel} bridge added.`);
+      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
+    },
+    onError: (error: Error) => {
+      setBridgeError(error.message);
+    },
+    onSettled: () => {
+      // Drop the typed bot token regardless of outcome — the token
+      // has either landed in the encrypted per-instance secret store
+      // (success) or been rejected upstream (failure), and there's
+      // no replay value in keeping it inspectable in React DevTools.
+      setBridgeToken("");
+    }
+  });
+  const bridgeReady = isMessagingAddBridge
+    && bridgeName.trim().length > 0
+    && bridgeToken.trim().length > 0;
+
   // Once the approval is no longer pending, drop the amber accent so
   // the bubble visually reads as historical rather than an active
   // prompt. The buttons still render in their resolved-state form
@@ -177,7 +249,13 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       : approval.status === "denied"
         ? `Request denied. (${block.summary})`
         : block.summary
-    : block.summary;
+    : !isPending && approval && isMessagingAddBridge
+      ? approval.status === "approved"
+        ? `${bridgeKindLabel} bridge added. (${block.summary})`
+        : approval.status === "denied"
+          ? `Request denied. (${block.summary})`
+          : block.summary
+      : block.summary;
   return (
     <div className={cardClass}>
       <div className="flex flex-wrap items-center gap-2">
@@ -257,6 +335,70 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
           ))}
         </div>
       ) : null}
+      {isMessagingAddBridge && isPending ? (
+        <div className="mt-2 space-y-2">
+          {/*
+            Kind badge mirroring the fill-secret "Fill destination"
+            band — gives the operator a non-spoofable signal of what
+            kind of bridge will be created. The agent supplies the
+            suggested name + reason text; the kind is structurally
+            pinned in the approval payload at dispatch time and is
+            the only field the model cannot rewrite at /connect time.
+          */}
+          <div className="rounded-md border border-amber-500/30 bg-background/40 px-2 py-1 text-[11px]">
+            <span className="text-muted-foreground">Bridge kind: </span>
+            <span className="font-mono">{bridgeKindLabel}</span>
+          </div>
+          <div className="space-y-1">
+            <label className="block text-[11px] text-muted-foreground" htmlFor={`${block.approvalId}-bridge-name`}>
+              Name
+            </label>
+            <Input
+              id={`${block.approvalId}-bridge-name`}
+              type="text"
+              value={bridgeName}
+              onChange={(e) => setBridgeName(e.target.value)}
+              placeholder={bridgeKind === "discord" ? "my-discord-bot" : "my-telegram-bot"}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              disabled={bridgeSubmit.isPending}
+            />
+          </div>
+          <div className="space-y-1">
+            <label className="block text-[11px] text-muted-foreground" htmlFor={`${block.approvalId}-bridge-token`}>
+              Bot token
+            </label>
+            <Input
+              id={`${block.approvalId}-bridge-token`}
+              type="password"
+              value={bridgeToken}
+              onChange={(e) => setBridgeToken(e.target.value)}
+              placeholder={bridgeKind === "discord" ? "MzA1...Ovy4MCQQ" : "123456789:ABCdef..."}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              data-1p-ignore="true"
+              data-lpignore="true"
+              data-form-type="other"
+              disabled={bridgeSubmit.isPending}
+            />
+            <p className="text-[11px] text-muted-foreground">
+              {bridgeKind === "discord"
+                ? "Open the Discord Developer Portal, create an application, add a bot, and paste its token."
+                : "Open Telegram, chat with @BotFather, run /newbot, and paste the token."}
+              {" "}Stored encrypted; never leaves your machine.
+            </p>
+          </div>
+          {bridgeError ? (
+            <p className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
+              {bridgeError}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
       <div className={isPending ? "mt-2 flex gap-2" : "hidden"}>
         {isConnectorRequest ? (
           <>
@@ -295,6 +437,27 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
               onClick={() => decide.mutate({ op: "deny" })}
             >
               Deny
+            </Button>
+          </>
+        ) : isMessagingAddBridge ? (
+          <>
+            <Button
+              size="sm"
+              disabled={bridgeSubmit.isPending || !isPending || !bridgeReady}
+              onClick={() => {
+                setBridgeError(null);
+                bridgeSubmit.mutate();
+              }}
+            >
+              Add {bridgeKindLabel}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={decide.isPending || !isPending}
+              onClick={() => decide.mutate({ op: "deny" })}
+            >
+              Cancel
             </Button>
           </>
         ) : (

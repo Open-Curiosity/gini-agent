@@ -199,6 +199,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           error: "browser.fill_secret approvals must be resolved via /connect with the per-slot values, not /approve."
         }, 400);
       }
+      if (approval?.action === "messaging.add_bridge") {
+        // Same rationale as browser.fill_secret: the side effect
+        // (addMessagingBridge) needs the name + bot-token values that
+        // only /connect carries. /approve would resolve the approval
+        // with no bridge created and the agent would be told
+        // "bridge added" over nothing.
+        return json({
+          error: "messaging.add_bridge approvals must be resolved via /connect with the bridge name + bot token, not /approve."
+        }, 400);
+      }
       return json(await decideApproval(config, approvalId, "approve"));
     }],
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
@@ -226,7 +236,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // encrypted connector record; browser.fill_secret pipes them
       // through to playwright.fill on the agent's active page and
       // discards them when the request returns.
-      if (approval.action !== "connector.request" && approval.action !== "browser.fill_secret") {
+      if (
+        approval.action !== "connector.request"
+        && approval.action !== "browser.fill_secret"
+        && approval.action !== "messaging.add_bridge"
+      ) {
         return json({ error: `Approval ${approvalId} does not take a /connect submission (${approval.action})` }, 400);
       }
       if (approval.status !== "pending") {
@@ -236,6 +250,53 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const secrets = payload.secrets && typeof payload.secrets === "object" && !Array.isArray(payload.secrets)
         ? payload.secrets as Record<string, string>
         : {};
+
+      if (approval.action === "messaging.add_bridge") {
+        // Chat-side equivalent of the settings page's Add Telegram /
+        // Add Discord dialog. The card's Submit button POSTs the
+        // name + bot-token via the `secrets` envelope; we route them
+        // straight into addMessagingBridge (the shared CLI / settings
+        // path) and resolve the approval on success.
+        //
+        // Failure (invalid token shape, addMessagingBridge throw)
+        // returns 200 + ok:false so the chat card stays mounted and
+        // the user can retry without tearing down the approval row,
+        // mirroring the connector.request retry contract.
+        const kind = approval.payload.kind === "telegram" || approval.payload.kind === "discord"
+          ? (approval.payload.kind as "telegram" | "discord")
+          : undefined;
+        if (!kind) {
+          return json({ ok: false, message: "Approval payload missing kind (telegram|discord); refusing to create bridge." }, 400);
+        }
+        const submittedName = typeof secrets.name === "string" ? secrets.name.trim() : "";
+        const submittedToken = typeof secrets.botToken === "string" ? secrets.botToken.trim() : "";
+        const deliveryTargets = Array.isArray(payload.deliveryTargets)
+          ? payload.deliveryTargets.map(String).map((t) => t.trim()).filter((t) => t.length > 0)
+          : [];
+        if (!submittedName) {
+          return json({ ok: false, message: "Bridge name is required." });
+        }
+        if (!submittedToken) {
+          return json({ ok: false, message: "Bot token is required." });
+        }
+        if (kind === "discord" && deliveryTargets.length === 0) {
+          return json({ ok: false, message: "Discord bridges require at least one channel id under deliveryTargets." });
+        }
+        let bridge;
+        try {
+          bridge = await addMessagingBridge(config, {
+            name: submittedName,
+            kind,
+            botToken: submittedToken,
+            deliveryTargets
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return json({ ok: false, message });
+        }
+        await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
+        return json({ ok: true, bridge });
+      }
 
       if (approval.action === "browser.fill_secret") {
         // The fill_secret flow is bounded inside

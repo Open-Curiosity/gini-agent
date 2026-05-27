@@ -1423,6 +1423,33 @@ async function runApprovedAction(
     return result;
   }
 
+  if (approval.action === "messaging.add_bridge") {
+    // Side effect (addMessagingBridge) already ran inside the
+    // /api/approvals/<id>/connect handler — that endpoint only
+    // resolves the approval after the bridge is created. Synthesize
+    // a tool result string the chat-task loop can feed back to the
+    // model so the conversation resumes naturally from the
+    // request_messaging_bridge call.
+    void extraEvidence;
+    const kindLabel = approval.payload.kind === "telegram"
+      ? "Telegram"
+      : approval.payload.kind === "discord"
+        ? "Discord"
+        : String(approval.payload.kind ?? "messaging");
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: "tool",
+        message: "Messaging bridge added via connect endpoint",
+        data: { kind: approval.payload.kind, approvalId: approval.id }
+      });
+    }
+    const result = `${kindLabel} bridge added. Tell the user it's ready and walk them through enrolling a chat (DM the bot, share the verification code, you approve from the settings page) if relevant.`;
+    if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
+    }
+    return result;
+  }
+
   if (approval.action === "browser.fill_secret") {
     // The /connect handler owns the entire fill_secret lifecycle now:
     // it calls resolveApproval(resumeChatTask:false) to atomically
