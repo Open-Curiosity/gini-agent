@@ -376,12 +376,6 @@ export interface RuntimeState {
   // User-actor gates: the user performs a setup step (browser sign-in,
   // credential entry), then the runtime resumes.
   setupRequests: SetupRequest[];
-  // Deprecated. Pre-split state files persisted a single `approvals` array.
-  // The read-side migration in src/state/store.ts partitions this into the
-  // two arrays above on first load and clears it. Optional so freshly
-  // written state files don't emit the field. New code must read from
-  // `authorizations` / `setupRequests`.
-  approvals?: Authorization[];
   audit: AuditEvent[];
   skills: SkillRecord[];
   jobs: JobRecord[];
@@ -1050,12 +1044,6 @@ export interface SetupRequest {
   reason: string;
   payload: Record<string, unknown>;
 }
-
-// Deprecated alias for Authorization. Retained so reads of legacy state
-// files (state.approvals) and a small number of in-flight type imports keep
-// working during the migration window. New code must use Authorization or
-// SetupRequest.
-export type Approval = Authorization;
 
 export interface SkillRecord {
   id: string;

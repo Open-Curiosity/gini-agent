@@ -487,14 +487,14 @@ describe("normalizeState approval -> authorization/setup-request migration", () 
       }
     ];
     const legacyState = state as RuntimeState & { approvals?: unknown };
-    legacyState.approvals = legacy as unknown as RuntimeState["approvals"];
+    legacyState.approvals = legacy as unknown;
     // Force the new arrays empty so the migration path runs.
     (legacyState as { authorizations?: unknown }).authorizations = undefined;
     (legacyState as { setupRequests?: unknown }).setupRequests = undefined;
 
     const normalized = normalizeState("test-approval-split", state);
 
-    expect(normalized.approvals).toBeUndefined();
+    expect((normalized as unknown as { approvals?: unknown }).approvals).toBeUndefined();
     expect(normalized.authorizations).toHaveLength(1);
     expect(normalized.authorizations[0]!.id).toBe("approval_1");
     expect(normalized.authorizations[0]!.action).toBe("file.write");
@@ -517,6 +517,6 @@ describe("normalizeState approval -> authorization/setup-request migration", () 
     const normalized = normalizeState("test-approval-noop", state);
     expect(normalized.authorizations).toEqual([]);
     expect(normalized.setupRequests).toEqual([]);
-    expect(normalized.approvals).toBeUndefined();
+    expect((normalized as unknown as { approvals?: unknown }).approvals).toBeUndefined();
   });
 });

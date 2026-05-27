@@ -148,8 +148,12 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
   }
   delete stateAny.lane;
 
-  const collectionKeys: Array<keyof RuntimeState> = [
+  const collectionKeys: Array<keyof RuntimeState | "approvals"> = [
     "tasks",
+    // Legacy collection. Pre-split state files might still carry it; the
+    // approvals→authorizations/setupRequests partitioner runs later in
+    // normalizeState, but we still strip lane fields off any rows that
+    // landed here first.
     "approvals",
     "audit",
     "skills",
@@ -180,7 +184,7 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
     "setupRequests"
   ];
   for (const key of collectionKeys) {
-    const records = state[key] as unknown;
+    const records = (state as unknown as Record<string, unknown>)[key];
     if (!Array.isArray(records)) continue;
     for (const record of records) {
       if (!record || typeof record !== "object") continue;
@@ -237,9 +241,13 @@ const SETUP_REQUEST_ACTIONS = new Set<string>([
 ]);
 
 function migrateApprovalsToAuthorizationsAndSetupRequests(state: RuntimeState): void {
-  const legacy = state.approvals;
+  // RuntimeState no longer declares `approvals`, so read it via an unknown
+  // cast — legacy state.json files persisted the field and the migration
+  // still needs to drain them.
+  const legacyHolder = state as unknown as { approvals?: Authorization[] };
+  const legacy = legacyHolder.approvals;
   if (!Array.isArray(legacy) || legacy.length === 0) {
-    delete state.approvals;
+    delete legacyHolder.approvals;
     return;
   }
   // Always partition. A mixed-shape file (both `approvals` and one of the
@@ -280,7 +288,7 @@ function migrateApprovalsToAuthorizationsAndSetupRequests(state: RuntimeState): 
     ...(state.setupRequests ?? []),
     ...setupRequests.filter((s) => !existingSetupIds.has(s.id))
   ];
-  delete state.approvals;
+  delete legacyHolder.approvals;
 }
 
 // Seed the default agent's provider fields from RuntimeConfig.provider when:
