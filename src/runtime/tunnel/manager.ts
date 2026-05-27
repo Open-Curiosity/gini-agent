@@ -428,6 +428,22 @@ class TunnelManager {
       // stale URL/secret to iCloud Notes.
       this.generation += 1;
       try {
+        // Pre-flight port re-probe BEFORE committing the new secret to
+        // disk. If the supervised web child is gone (or some other
+        // process now owns the port), we can't recycle cloudflared
+        // safely — abort the rotation entirely so the disk + snapshot
+        // stay coherent. Without this check we'd persist the new secret
+        // to disk and then bail in swapCloudflared's probe, leaving
+        // the OLD cloudflared running with the NEW disk secret (which
+        // breaks rotate-secret's panic-button contract: open SSE
+        // streams continue serving against an out-of-sync state).
+        if (this.cloudflared !== null && this.lastWebPort !== null) {
+          const healthy = await isSupervisedWebChild(this.config.instance, this.lastWebPort);
+          if (!healthy) {
+            this.snapshot = { ...this.snapshot, lastError: redact(`web port ${this.lastWebPort} not healthy — rotation aborted before commit`) };
+            return { ok: false, error: `web port ${this.lastWebPort} not healthy — rotation aborted before commit` };
+          }
+        }
         const next = this.persistTunnel( { secret: generateTunnelSecret() });
         setRedactionSecret(next.secret);
         scheduledGeneration = this.generation;

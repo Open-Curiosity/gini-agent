@@ -17,21 +17,33 @@ describe("isTunnelDenied", () => {
     expect(isTunnelDenied("/api/runtime/pairing/anything", "GET")).toBe(true);
   });
 
-  test("allows bare /api/runtime/tunnel on every method (snapshot + PATCH)", () => {
+  test("allows bare /api/runtime/tunnel on GET (snapshot) and PATCH (mutate) only", () => {
     expect(isTunnelDenied("/api/runtime/tunnel", "GET")).toBe(false);
     expect(isTunnelDenied("/api/runtime/tunnel/", "GET")).toBe(false);
     expect(isTunnelDenied("/api/runtime/tunnel", "PATCH")).toBe(false);
-    expect(isTunnelDenied("/api/runtime/tunnel/", "POST")).toBe(false);
-    expect(isTunnelDenied("/api/runtime/tunnel", "DELETE")).toBe(false);
+    expect(isTunnelDenied("/api/runtime/tunnel/", "PATCH")).toBe(false);
   });
 
-  test("allows QR endpoints — operator gates them via click-to-reveal", () => {
+  test("denies bare /api/runtime/tunnel on methods the live API doesn't support", () => {
+    expect(isTunnelDenied("/api/runtime/tunnel/", "POST")).toBe(true);
+    expect(isTunnelDenied("/api/runtime/tunnel", "DELETE")).toBe(true);
+    expect(isTunnelDenied("/api/runtime/tunnel", "PUT")).toBe(true);
+  });
+
+  test("allows QR endpoints on GET only — operator gates them via click-to-reveal", () => {
     expect(isTunnelDenied("/api/runtime/tunnel/qr.svg", "GET")).toBe(false);
     expect(isTunnelDenied("/api/runtime/tunnel/qr.txt", "GET")).toBe(false);
   });
 
-  test("allows /refresh-notes (operator drives the iCloud Notes write from either surface)", () => {
+  test("denies QR endpoints on methods other than GET", () => {
+    expect(isTunnelDenied("/api/runtime/tunnel/qr.svg", "POST")).toBe(true);
+    expect(isTunnelDenied("/api/runtime/tunnel/qr.txt", "DELETE")).toBe(true);
+  });
+
+  test("allows /refresh-notes on POST only — GET shouldn't mutate iCloud", () => {
     expect(isTunnelDenied("/api/runtime/tunnel/refresh-notes", "POST")).toBe(false);
+    expect(isTunnelDenied("/api/runtime/tunnel/refresh-notes", "GET")).toBe(true);
+    expect(isTunnelDenied("/api/runtime/tunnel/refresh-notes", "PUT")).toBe(true);
   });
 
   test("denies unknown /api/runtime/tunnel/<sub> by default", () => {

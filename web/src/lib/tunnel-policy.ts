@@ -55,14 +55,27 @@ const TUNNEL_PREFIX = "/api/runtime/tunnel";
  *    unlock.
  */
 export function isTunnelDenied(canonicalPath: string, method: string): boolean {
-  void method;
+  const upper = method.toUpperCase();
   const trimmed = withoutTrailingSlash(canonicalPath);
+  // Pairing — minting permanent device bearers — is denied on every method.
   if (trimmed === PAIRING_PREFIX) return true;
   if (canonicalPath.startsWith(`${PAIRING_PREFIX}/`)) return true;
-  if (trimmed === TUNNEL_PREFIX) return false;
-  if (trimmed === `${TUNNEL_PREFIX}/qr.svg`) return false;
-  if (trimmed === `${TUNNEL_PREFIX}/qr.txt`) return false;
-  if (trimmed === `${TUNNEL_PREFIX}/refresh-notes`) return false;
+  // Bare tunnel root: only the methods the live API supports (GET for
+  // the snapshot, PATCH for enable / disable / rotate / Apple Notes
+  // toggle). A future POST / PUT / DELETE / etc. would otherwise pass
+  // the deny list before the runtime even sees it; default-deny here
+  // forces an explicit allow when a new method gets wired up.
+  if (trimmed === TUNNEL_PREFIX) return !(upper === "GET" || upper === "PATCH");
+  // QR endpoints — GET-only by design (the bytes themselves carry the
+  // bootstrap URL; the runtime emits them with `cache-control: no-store`).
+  if (trimmed === `${TUNNEL_PREFIX}/qr.svg`) return upper !== "GET";
+  if (trimmed === `${TUNNEL_PREFIX}/qr.txt`) return upper !== "GET";
+  // Notes refresh — POST-only side effect (it triggers the runtime to
+  // write the bootstrap URL to the Apple Notes mirror, GET shouldn't
+  // mutate iCloud).
+  if (trimmed === `${TUNNEL_PREFIX}/refresh-notes`) return upper !== "POST";
+  // Any other `/api/runtime/tunnel/<sub>` path is default-deny — adding
+  // a new endpoint must be a deliberate allow, not a silent unlock.
   if (canonicalPath.startsWith(`${TUNNEL_PREFIX}/`)) return true;
   return false;
 }
