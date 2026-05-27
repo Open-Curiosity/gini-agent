@@ -32,12 +32,7 @@ import { useStatus } from "@/lib/queries";
 import { AgentSwitcher } from "@/components/AgentSwitcher";
 import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
 
-// /issues/new/choose surfaces the repo's issue-template picker, which
-// honors .github/ISSUE_TEMPLATE/config.yml — including the security
-// contact link that redirects vulnerability reports to SECURITY.md
-// instead of a public issue. Linking here (rather than straight to
-// ?template=bug_report.md) keeps that gate in front of the user.
-const REPORT_BUG_URL = "https://github.com/Lilac-Labs/gini-agent/issues/new/choose";
+const REPORT_BUG_URL = "https://github.com/Lilac-Labs/gini-agent/issues";
 
 type NavItem = { href: string; label: string; icon: LucideIcon };
 type NavGroup = readonly NavItem[];
