@@ -629,10 +629,16 @@ async function runApplyConfig(
     // and enqueue a recycle that races the disable.
     stopWebHealthPolling();
     await tunnelManager.stop();
-    // Clear the synchronous preemption latch now that the disable has
-    // landed. A subsequent enable PATCH would clear it too via the
-    // applyConfig wrapper, but clearing here keeps the latch coherent
-    // with the persisted state for the common disable-then-no-op case.
+  }
+  // Clear the synchronous preemption latch whenever a disable PATCH
+  // settles, regardless of whether it triggered an actual stop. A
+  // no-op disable (PATCH {enabled:false} while already disabled) sets
+  // the latch in the wrapper but DOES NOT reach the becameDisabled
+  // branch — so without this unconditional clear, a subsequent enable
+  // PATCH would resolveWebTarget, observe the stale latch, and throw
+  // "tunnel disable requested" against an enable the operator just
+  // issued.
+  if (update?.enabled === false) {
     pendingDisable = false;
   }
   // Notes-enabled-while-tunnel-up: refresh now so the note carries the

@@ -173,6 +173,18 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
       // surface invisible.
       const allowlist = trustedOrigins();
       if (allowlist === null) return new NextResponse("Not Found", { status: 404 });
+      // Apply the same setup gate the localhost branch enforces. A
+      // trusted-origins deployment whose operator hasn't picked a
+      // provider yet would otherwise land on `/` (a client component
+      // that assumes a provider is configured) and see a broken
+      // dashboard. Skip the gate for API and /setup paths so they can
+      // serve provider configuration without redirecting in a loop.
+      if (!pathname.startsWith("/api/") && !pathname.startsWith("/setup")) {
+        const configured = await isProviderConfigured();
+        if (configured === false) {
+          return NextResponse.redirect(new URL("/setup", `https://${host}`));
+        }
+      }
       // Strip any inbound vetted marker so a remote caller cannot
       // forge it before reaching the BFF guard. guardCsrf will then
       // enforce Origin/Host using the allowlist.
