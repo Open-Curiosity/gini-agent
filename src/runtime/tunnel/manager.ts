@@ -200,13 +200,15 @@ class TunnelManager {
           // per PLAN.md "Operational invariants" line 624: the gateway does
           // not respawn, but the snapshot must reflect the dead tunnel so
           // the operator can re-enable.
-          const launchGeneration = this.generation;
+          //
+          // Liveness is determined by OBJECT IDENTITY (`this.cloudflared
+          // !== launch`), not by `this.generation`. The Notes-refresh
+          // `this.generation` ticks on disable + rotateSecret to invalidate
+          // background Notes writes, but a `rotateSecret` does NOT replace
+          // the cloudflared subprocess — the same launch is still live and
+          // a later crash of it must still be detected.
           launch.process.once("exit", (code) => {
-            // Only act if this launch is still the live one — a disable or
-            // recycle since the spawn already nulled this.cloudflared and
-            // updated the snapshot; we mustn't override a clean disable.
             if (this.cloudflared !== launch) return;
-            if (launchGeneration !== this.generation) return;
             this.cloudflared = null;
             try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
             setRedactionPublicUrl(null);
@@ -424,6 +426,13 @@ class TunnelManager {
       return { ok: false, error: "superseded" };
     }
     if (this.shuttingDown) return { ok: false, error: "shutdown" };
+    // Re-check the mirror toggle — the operator may have flipped it off
+    // while the probe was running. A background refresh from an earlier
+    // enable() must not resurrect the note after the user explicitly
+    // disabled the mirror.
+    if (!this.snapshot.appleNotes.enabled) {
+      return { ok: false, error: "Apple Notes mirror disabled" };
+    }
     this.notesAvailable = probe.available;
     if (!probe.available) {
       const msg = redact(probe.error ?? "Notes unavailable");
@@ -435,11 +444,15 @@ class TunnelManager {
     }
     try {
       // One more guard right before the side effect — if the operator hit
-      // disable / rotate between the probe and now, drop the write.
+      // disable / rotate / Notes-off between the probe and now, drop the
+      // write.
       if (scheduledGeneration !== undefined && scheduledGeneration !== this.generation) {
         return { ok: false, error: "superseded" };
       }
       if (this.shuttingDown) return { ok: false, error: "shutdown" };
+      if (!this.snapshot.appleNotes.enabled) {
+        return { ok: false, error: "Apple Notes mirror disabled" };
+      }
       await writeNote({
         folder: NOTES_FOLDER,
         noteName: this.notesNoteName(),
