@@ -63,6 +63,73 @@ to the agent picker.
   `POST /api/chat/:id/tasks/:taskId/sync` if no paired assistant block
   materialised on its own.
 
+## iOS dev client + Notification Service Extension
+
+Lock-screen Approve / Deny buttons on approval pushes are implemented
+as an iOS Notification Service Extension (NSE), added by the Expo
+config plugin in `plugins/with-approval-notification-service.js`. This
+moves the app from a purely managed Expo workflow to a **dev client +
+prebuild** workflow on iOS.
+
+**Managed Expo Go no longer works for this app** because Expo Go
+cannot load custom NSE targets. Use the dev client locally and EAS
+Build (or `expo run:ios`) for distribution.
+
+### One-time setup
+
+```bash
+cd mobile
+bun install
+bunx expo prebuild --platform ios --clean   # generates ios/ from app.json
+bunx expo run:ios                            # builds + boots the simulator
+```
+
+`bunx expo prebuild` writes the NSE source from
+`mobile/ios-extensions/ApprovalNotificationService/NotificationService.swift`
+into `ios/ApprovalNotificationService/` and registers it as an Xcode
+target. The generated `ios/` directory is `.gitignore`'d — the
+canonical source of truth is the plugin + the Swift file under
+`ios-extensions/`. Re-running `expo prebuild --clean` is the safe
+way to pick up plugin changes.
+
+### Day-to-day
+
+After the first prebuild, normal Metro / Hot Reload works:
+
+```bash
+bun run start          # Metro
+bun run ios            # boots the previously-built dev client
+```
+
+You only need to re-run `prebuild` when the plugin, the NSE Swift
+source, or `app.json`'s plugin list changes.
+
+### Distribution
+
+EAS Build picks the plugin up automatically — `eas build --platform ios`
+runs prebuild under the hood and includes the NSE target.
+
+### What the NSE does
+
+When an APNs payload arrives with `mutable-content: 1` (set by the
+server-side dispatcher in `src/integrations/apns/dispatcher.ts` for
+`approval_requested` blocks), the OS spawns the NSE for up to 30s
+before showing the notification. The NSE attaches
+`categoryIdentifier = "APPROVAL_REQUEST"`, which pairs with the
+category the main app registers on launch via
+`Notifications.setNotificationCategoryAsync` — and that's what makes
+the Approve / Deny buttons appear on the lock screen / banner /
+notification center.
+
+When the user taps an action button, `mobile/src/push-dispatch.ts`
+posts directly to `/api/approvals/:id/approve` or `/deny` without
+foregrounding the app. The user can act without unlocking the device.
+
+The action handler runs only if the app is at least suspended; if the
+user has fully killed the app from the app switcher, iOS records the
+action but our JS never runs. There's no permanent state loss — the
+agent re-emits the approval request and the user sees a fresh push.
+
 ## Known limitations (v1)
 
 - No pairing-code flow (yet). The setup screen takes a base URL +

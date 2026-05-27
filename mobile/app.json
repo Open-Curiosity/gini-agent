@@ -21,7 +21,8 @@
     },
     "plugins": [
       "expo-router",
-      "expo-notifications"
+      "expo-notifications",
+      "./plugins/with-approval-notification-service.js"
     ],
     "experiments": {
       "typedRoutes": true
