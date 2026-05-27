@@ -738,6 +738,60 @@ describe("request_connector dispatch", () => {
     }
   });
 
+  test("wait_for_messaging_pair: skips a pending row whose verification code has expired", async () => {
+    // Without the expiry guard, an operator who left the chat tab
+    // open across the 10-minute code TTL would see an approval card
+    // whose Approve action fails at allowChat's expired-code throw.
+    // Pin that the wait predicate filters expired rows out of
+    // surfacing — the wait just keeps polling, waiting for a fresh
+    // DM to mint a new code.
+    const instance = `wait-pair-expired-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    await mutateState(instance, (state) => {
+      const { createMessagingBridgeRecord } = require("../state") as typeof import("../state");
+      const bridge = createMessagingBridgeRecord(state, {
+        name: "tg-expired",
+        kind: "telegram",
+        deliveryTargets: []
+      });
+      bridge.metadata = {
+        allowedChatIds: [],
+        recentDeniedChats: [
+          {
+            chatId: 33,
+            chatType: "private",
+            sender: "@stale",
+            lastAttemptAt: new Date().toISOString(),
+            verificationCode: "OLD-3333",
+            // Already-past timestamp.
+            verificationCodeExpiresAt: "2020-01-01T00:00:00.000Z"
+          }
+        ]
+      };
+    });
+    const dispatchPromise = dispatchToolCall(
+      config,
+      taskId,
+      "wait_for_messaging_pair",
+      "call_wait_expired",
+      JSON.stringify({ bridge: "tg-expired", timeoutSeconds: 10 })
+    );
+    // Cancel mid-wait so we don't sit out the full 10s timeout.
+    await Bun.sleep(1200);
+    await mutateState(instance, (state) => {
+      const task = state.tasks.find((t) => t.id === taskId);
+      if (task) task.status = "cancelled";
+    });
+    const result = await dispatchPromise;
+    expect(result.kind).toBe("sync");
+    // No approval was minted for the expired row.
+    const state = readState(instance);
+    expect(
+      state.approvals.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
+    ).toBe(0);
+  }, 30000);
+
   test("wait_for_messaging_pair: skips a pending row whose chat is already enrolled, then exits on task cancel", async () => {
     // Pin the second half of the new predicate: a pending row whose
     // chatId is already on the allowlist must NOT surface. Approved

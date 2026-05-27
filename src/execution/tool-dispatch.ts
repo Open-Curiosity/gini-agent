@@ -3271,13 +3271,24 @@ async function waitForMessagingPairTool(
     // Surface the first pending row that the operator can act on:
     // (a) has a verification code (groups never mint a code and
     // are not approvable via the chat-card handshake — they go
-    // through the settings page / CLI), and (b) isn't already
-    // enrolled on the bridge's allowlist. Approved rows are
-    // removed from recentDeniedChats by allowChat, so the second
-    // check is mostly defensive.
-    const newOrRotated = livePending.find(
-      (entry) => entry.verificationCode && !allowedSet.has(entry.chatId)
-    );
+    // through the settings page / CLI), (b) isn't already enrolled
+    // on the bridge's allowlist (defensive; allowChat clears
+    // recentDeniedChats on enroll), and (c) the code hasn't
+    // expired. Without (c), an operator who left the chat tab
+    // open across the 10-minute code TTL would be presented an
+    // approval card whose Approve action would fail at allowChat's
+    // expired-code throw. Mirrors the expiry guard inside
+    // requestMessagingPairingTool.
+    const nowMs = Date.now();
+    const newOrRotated = livePending.find((entry) => {
+      if (!entry.verificationCode) return false;
+      if (allowedSet.has(entry.chatId)) return false;
+      if (entry.verificationCodeExpiresAt) {
+        const expiresAt = Date.parse(entry.verificationCodeExpiresAt);
+        if (Number.isFinite(expiresAt) && expiresAt <= nowMs) return false;
+      }
+      return true;
+    });
 
     if (newOrRotated && newOrRotated.verificationCode) {
       // Delegate to the shared mintPairingApproval helper so the
