@@ -63,6 +63,41 @@ to the agent picker.
   `POST /api/chat/:id/tasks/:taskId/sync` if no paired assistant block
   materialised on its own.
 
+## Fork & re-skin
+
+Gini is open source — the iOS app is yours to fork, rebrand, and ship under
+your own Apple developer account. Two layers to touch:
+
+**1. Per-fork constants in `app.config.ts`** (committed):
+
+- `IOS_BUNDLE_ID` / `ANDROID_PACKAGE` — your reverse-DNS bundle id.
+- `APP_NAME` — what users see on the home screen.
+- `APP_SLUG` — the EAS slug (lowercase, hyphenated).
+- `APP_SCHEME` — your deep-link scheme (e.g. `myagent://`).
+
+The NSE bundle id is derived (`<bundle>.notificationservice`), so you only
+edit one place.
+
+**2. Account-specific values in `mobile/.env`** (gitignored). Copy
+`.env.example` and fill in:
+
+| Var                 | Where to get it                                           |
+|---------------------|-----------------------------------------------------------|
+| `EAS_PROJECT_ID`    | `eas init` in `mobile/`                                   |
+| `EXPO_OWNER`        | `expo whoami` (your Expo account or org)                  |
+| `EXPO_UPDATES_URL`  | `eas update:configure` output (leave blank to skip OTA)   |
+| `APPLE_TEAM_ID`     | developer.apple.com → Membership → Team ID                |
+
+**3. `eas.json` submit profile** (committed) — replace `appleTeamId` and
+`ascAppId` under `submit.production.ios` with your own before running
+`eas submit`.
+
+After editing, regenerate the native project:
+
+```bash
+cd mobile && bunx expo prebuild --platform ios --clean
+```
+
 ## iOS dev client + Notification Service Extension
 
 Lock-screen Approve / Deny buttons on approval pushes are implemented
