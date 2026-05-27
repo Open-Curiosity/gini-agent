@@ -121,6 +121,27 @@ describe("browser safetyCheck", () => {
     expect(safetyCheck("http://169.254.169.254/", { allowLoopback: true })).toBeDefined();
   });
 
+  test("IPv4-mapped IPv6 loopback respects allowLoopback (CDP attach)", () => {
+    // CDP attach can legitimately receive [::ffff:127.0.0.1]:9222
+    // because Bun normalizes various IPv6 spellings. The decoder
+    // now translates the mapped IPv6 to its IPv4 form BEFORE the
+    // loopback check, so allowLoopback applies uniformly across
+    // [127.0.0.1], [::1], [::ffff:127.0.0.1] (dot-quad), and
+    // [::ffff:7f00:1] (hex). Without the decoder, the IPv6 branch
+    // would route the mapped form through the metadata path and
+    // refuse it even under allowLoopback.
+    expect(safetyCheck("http://[::ffff:127.0.0.1]:9222/", { allowLoopback: true })).toBeUndefined();
+    expect(safetyCheck("http://[::ffff:7f00:1]:9222/", { allowLoopback: true })).toBeUndefined();
+    // Same forms WITHOUT allowLoopback are still refused (with the
+    // correct loopback message, not the legacy metadata one).
+    const blocked = safetyCheck("http://[::ffff:127.0.0.1]/");
+    expect(blocked).toBeDefined();
+    expect(blocked).toContain("loopback");
+    const blocked2 = safetyCheck("http://[::ffff:7f00:1]/");
+    expect(blocked2).toBeDefined();
+    expect(blocked2).toContain("loopback");
+  });
+
   test("blocks loopback navigation (BFF / runtime SSRF surface)", () => {
     // The BFF's catch-all /api/runtime/* proxy injects the runtime
     // bearer for safe-method loopback requests, so an agent that

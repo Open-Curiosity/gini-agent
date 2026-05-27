@@ -818,6 +818,31 @@ function isLinkLocal(host: string): boolean {
   return /^169\.254\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
+// Decode IPv4-mapped IPv6 forms to their embedded dotted-IPv4
+// representation, so downstream checks can apply uniform IPv4 logic
+// (loopback / metadata / link-local) without three separate paths
+// for the equivalent IPv6 spellings. Returns undefined when the
+// host is not an IPv4-mapped IPv6 literal.
+function decodeIpv4Mapped(host: string): string | undefined {
+  // Mixed dot-quad form: ::ffff:127.0.0.1
+  const dotQuad = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(host);
+  if (dotQuad) return dotQuad[1]!;
+  // Hex IPv4-mapped: ::ffff:wwxx:yyzz
+  const hexMapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(host);
+  // Deprecated IPv4-compatible: ::wwxx:yyzz (no ffff). Bun
+  // normalizes [::127.0.0.1] to [::7f00:1].
+  const compatHex = /^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(host);
+  const hex = hexMapped ?? compatHex;
+  if (hex) {
+    const hi = parseInt(hex[1]!, 16);
+    const lo = parseInt(hex[2]!, 16);
+    if (Number.isFinite(hi) && Number.isFinite(lo)) {
+      return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    }
+  }
+  return undefined;
+}
+
 // Lightweight IPv6 guard. WHATWG URL hands back hostnames in canonical
 // lowercase form, but `[::1]` style brackets are preserved for IPv6
 // literals. Strip the brackets, then close the explicit bypasses we know
@@ -918,7 +943,15 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
   // as equivalent to the dotless form. Without the strip,
   // host.endsWith(".localhost") would miss "localhost.", letting a
   // crafted URL bypass the loopback block.
-  const host = parsed.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  const rawHost = parsed.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  // Decode IPv4-mapped IPv6 forms to their embedded IPv4 BEFORE
+  // running any checks, so a mapped loopback (e.g. ::ffff:127.0.0.1
+  // or ::ffff:7f00:1) goes through the same loopback gate as the
+  // bare IPv4 form — and respects allowLoopback uniformly. Without
+  // this, the IPv6 branch's classifier would route mapped loopback
+  // through the metadata path and refuse it even under
+  // allowLoopback, breaking CDP attach to [::ffff:127.0.0.1]:9222.
+  const host = decodeIpv4Mapped(rawHost) ?? rawHost;
   const loopbackHosts = new Set(["127.0.0.1", "0.0.0.0", "localhost", "::1"]);
   if (loopbackHosts.has(host) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || host.endsWith(".localhost")) {
     if (options.allowLoopback) return undefined;
@@ -996,6 +1029,35 @@ const REF_ATTR_GLOBAL = "data-gini-ref";
 // later. Built in a single page.evaluate so we minimize round-trips and
 // reuse one DOM walk for both the snapshot text and the locator map.
 async function snapshot(page: Page, full: boolean, taskId?: string): Promise<SnapshotResult> {
+  // Single-point loopback check before reading page state. Any
+  // browser action — direct navigate, click, type, scroll — can
+  // settle the page on a different URL than the agent originally
+  // requested, via JS navigation / meta-refresh / link click. The
+  // R14 fix protected browser_navigate's post-redirect URL but
+  // didn't cover those other paths. Snapshotting / returning the
+  // URL of a loopback page would expose any local BFF / runtime
+  // state the page rendered. Refuse at the snapshot boundary so
+  // every caller (browser_snapshot, browser_click, browser_type,
+  // browser_back, etc.) inherits the same gate. Try to clean up
+  // by navigating the page away to about:blank — best-effort.
+  //
+  // Test mocks for the snapshot walker pass minimal page stubs
+  // (only evaluate is mocked, since the walker only needs DOM
+  // access). Guard the url()/goto() calls behind typeof checks so
+  // existing unit tests don't have to grow the mock surface.
+  if (typeof page.url === "function") {
+    const currentUrl = page.url();
+    if (currentUrl && currentUrl !== "about:blank") {
+      const blocked = safetyCheck(currentUrl);
+      if (blocked) {
+        if (typeof page.goto === "function") {
+          try { await page.goto("about:blank", { waitUntil: "domcontentloaded" }); }
+          catch { /* best-effort */ }
+        }
+        throw new Error(`${blocked} (page settled on disallowed URL after a navigation; agent must not inspect this surface)`);
+      }
+    }
+  }
   const REF_ATTR = REF_ATTR_GLOBAL;
   // First, clear stale refs from prior snapshots so id allocation stays
   // stable across calls.
