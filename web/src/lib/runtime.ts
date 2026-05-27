@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { parseTrustedOriginUrls } from "./trusted-origins";
 
 // Headers we forward verbatim from the browser to the runtime. Last-Event-ID
 // is critical for SSE reconnect dedup (see src/http.ts:eventStream) — without
@@ -225,34 +226,11 @@ function canonicalizeSegments(segments: string[]): string[] | null {
 //           defense-in-depth posture for a typo in a control that exists
 //           specifically to lock down the trust boundary.
 function parseTrustedOrigins(raw: string | undefined): ReadonlySet<string> | null {
-  if (!raw || !raw.trim()) return null;
+  const urls = parseTrustedOriginUrls(raw);
+  if (urls === null) return null;
   const out = new Set<string>();
-  for (const candidate of raw.split(",")) {
-    const trimmed = candidate.trim();
-    if (!trimmed) continue;
-    try {
-      const parsed = new URL(trimmed);
-      // Origins are scheme + host[+port] only. An operator who pasted a
-      // full URL like `https://gini-server.tail.ts.net/path?q=1` would
-      // silently get a broader allowlist than they meant (the path/query
-      // are dropped by .host). Reject those entries individually so the
-      // operator either fixes the env var or — if every entry is malformed
-      // — sees the fail-closed posture at the outer caller.
-      if (
-        (parsed.pathname !== "" && parsed.pathname !== "/")
-        || parsed.search !== ""
-        || parsed.hash !== ""
-        || parsed.username !== ""
-        || parsed.password !== ""
-      ) {
-        continue;
-      }
-      out.add(`${parsed.protocol}//${parsed.host}`);
-    } catch {
-      // Skip malformed entries individually; the outer caller decides what
-      // to do when every entry is bad. A single bad entry alongside good
-      // ones still produces a usable allowlist.
-    }
+  for (const parsed of urls) {
+    out.add(`${parsed.protocol}//${parsed.host}`);
   }
   return out;
 }

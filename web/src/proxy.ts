@@ -19,6 +19,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { runtimeToken, runtimeUrl } from "@/lib/runtime";
 import { canonicalizePath } from "@/lib/canonicalize";
+import { parseTrustedOriginUrls } from "@/lib/trusted-origins";
 import {
   TUNNEL_MARKER_HEADER,
   TUNNEL_MARKER_VALUE,
@@ -72,17 +73,18 @@ function classifyHost(hostHeader: string | null): "loopback" | "tunnel-or-truste
   if (liveHost) {
     if (hostMatches(lower, liveHost)) return "tunnel-or-trusted";
   }
-  const allowlist = (process.env.GINI_TRUSTED_ORIGINS ?? "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
-  for (const entry of allowlist) {
-    try {
-      const url = new URL(entry);
+  // Share the env-var parse + validation with the BFF CSRF guard so the
+  // two lanes can't drift apart on what counts as a valid entry (entries
+  // with paths/queries/userinfo are rejected here as well as there, per
+  // the same fail-loud-on-typo posture). The proxy matches the Host
+  // header against `.host` (with default-port equivalence); the BFF
+  // matches the Origin header against `${protocol}//${host}` — same
+  // validated input, different match field.
+  const allowlist = parseTrustedOriginUrls(process.env.GINI_TRUSTED_ORIGINS);
+  if (allowlist) {
+    for (const url of allowlist) {
       const entryHost = url.host.toLowerCase();
       if (hostMatches(lower, entryHost)) return "tunnel-or-trusted";
-    } catch {
-      // Skip malformed entries.
     }
   }
   return "unknown";
