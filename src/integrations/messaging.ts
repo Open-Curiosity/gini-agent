@@ -830,6 +830,16 @@ export async function allowChat(
       },
       { system: true }
     );
+    // Pre-create the Telegram chat session at enrollment time so it
+    // shows up in the operator's sidebar immediately — before this
+    // change, the session was only created lazily on the FIRST
+    // inbound message AFTER enrollment (receiveMessagingInput's
+    // findOrCreateTelegramChatSession call), so the operator had to
+    // wait for the user to DM again to see any sign the pairing
+    // worked. Bot-authored confirmation DMs land in this session
+    // too once they're observed by the poller, so a fresh enrollment
+    // immediately surfaces with the "Paired." greeting visible.
+    findOrCreateTelegramChatSession(state, live.id, chatId);
     return { bridgeId: live.id, view: chatAllowlistView(live), alreadyAllowed };
   });
   // Best-effort greeting back to the chat so the user knows they

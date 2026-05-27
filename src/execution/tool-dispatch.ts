@@ -48,12 +48,13 @@ import {
   type IdentityFileStatus
 } from "../runtime/identity-files";
 import { resolveEffectiveContext } from "./effective-context";
+import { emitSystemNote, resolveEmitContext } from "./chat-task-emit";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { invokeMcpTool } from "../integrations/mcp";
-import { listAllowedChats } from "../integrations/messaging";
+import { checkMessagingBridge, listAllowedChats } from "../integrations/messaging";
 import { riskForAction } from "./tool-risk";
 import {
   browserBack,
@@ -3397,6 +3398,51 @@ async function waitForMessagingPairTool(
       ? ((initialBridge.metadata ?? {}).allowedChatIds as unknown[]).map((v) => Number(v)).filter((n) => Number.isFinite(n))
       : []
   );
+
+  // Emit a guidance message to the chat BEFORE entering the poll
+  // loop so the operator knows what to do next. The "Wait for
+  // messaging pair" card on its own just shows the bridge name —
+  // no indication that the user has to open Telegram and DM the
+  // bot. Telegram requires /start before a bot can receive any
+  // messages, so spell that out explicitly. emitSystemNote inserts
+  // a real chat block (system_note kind) that the chat UI renders
+  // inline between the bridge-add card and the wait card.
+  //
+  // Resolve the bot's @username so the message points at the right
+  // Telegram account. addMessagingBridge skips getMe — botUsername
+  // is populated by checkMessagingBridge — so a freshly-added bridge
+  // has empty metadata here. Run the probe once when missing; the
+  // merged write benefits later consumers (pairing card, operator
+  // UI) too. Best-effort: a failed probe falls back to the bridge
+  // name, which still uniquely identifies the bot the user just
+  // configured.
+  const readBotUsername = (bridge: typeof initialBridge): string | undefined => {
+    const meta = (bridge.metadata ?? {}) as { botUsername?: unknown };
+    return typeof meta.botUsername === "string" ? meta.botUsername : undefined;
+  };
+  let botUsernameForGuidance = readBotUsername(initialBridge);
+  // Only probe when the bridge has an attached secret ref — without
+  // a token, checkMessagingBridge flips status to "error" with a
+  // "token missing" message, which the in-loop guard at "liveBridge.status
+  // !== 'configured'" treats as a bridge that can't receive messages.
+  // Production bridges always have a token because addMessagingBridge
+  // requires one for telegram; tests that construct bridges via
+  // createMessagingBridgeRecord directly skip this check by leaving
+  // secretRefs empty.
+  const hasSecret = (initialBridge.secretRefs ?? []).length > 0;
+  if (!botUsernameForGuidance && initialBridge.kind === "telegram" && hasSecret) {
+    try {
+      const refreshed = await checkMessagingBridge(config, initialBridge.id);
+      botUsernameForGuidance = readBotUsername(refreshed);
+    } catch {
+      // Probe failed; fall through to bridge-name fallback.
+    }
+  }
+  const guidanceText = botUsernameForGuidance
+    ? `Open Telegram and start a chat with @${botUsernameForGuidance}: tap Start (or send /start), then send any message. The approval card will appear here as soon as your DM lands.`
+    : `Open Telegram and start a chat with the bot '${initialBridge.name}': tap Start (or send /start), then send any message. The approval card will appear here as soon as your DM lands.`;
+  const guidanceCtx = resolveEmitContext(config, taskId);
+  if (guidanceCtx) emitSystemNote(guidanceCtx, guidanceText);
 
   const reasonText = typeof args.reason === "string" && args.reason.trim().length > 0
     ? args.reason.trim()

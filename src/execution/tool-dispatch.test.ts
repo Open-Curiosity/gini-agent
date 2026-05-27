@@ -976,6 +976,67 @@ describe("request_connector dispatch", () => {
     ).toBe(0);
   }, 10000);
 
+  test("wait_for_messaging_pair: emits a system_note guidance block telling the operator how to DM the bot", async () => {
+    // The wait card on its own only renders the bridge name — no
+    // instruction that the user must open Telegram, tap Start, and
+    // send a message before the poller can mint a pairing row. Pin
+    // that the wait tool drops a system_note block into the chat
+    // BEFORE the poll loop runs, with text the chat UI can render
+    // inline between the bridge-add card and the wait card. We seed
+    // a pre-existing pending row so the wait returns "pending" on
+    // the first tick — the guidance emit runs before any polling.
+    const instance = `wait-pair-guidance-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const { listChatBlocks } = await import("../state");
+    await mutateState(instance, (state) => {
+      const { createMessagingBridgeRecord } = require("../state") as typeof import("../state");
+      const bridge = createMessagingBridgeRecord(state, {
+        name: "tg-guidance",
+        kind: "telegram",
+        deliveryTargets: []
+      });
+      bridge.metadata = {
+        allowedChatIds: [],
+        recentDeniedChats: [
+          {
+            chatId: 909,
+            chatType: "private",
+            sender: "@guide",
+            lastAttemptAt: new Date().toISOString(),
+            verificationCode: "GUIDE-909",
+            verificationCodeExpiresAt: "2099-01-01T00:00:00.000Z"
+          }
+        ]
+      };
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "wait_for_messaging_pair",
+      "call_wait_guidance",
+      JSON.stringify({ bridge: "tg-guidance", timeoutSeconds: 10 })
+    );
+    // Pre-existing pending row → pending result, just confirming the
+    // dispatcher reached the poll path past the guidance emit.
+    expect(result.kind).toBe("pending");
+
+    // Pull the task's chat session and verify a system_note block
+    // landed with the guidance text. botUsername is empty (probe is
+    // gated on a secret ref, which test bridges don't have), so the
+    // text falls back to the bridge name.
+    const state = readState(instance);
+    const task = state.tasks.find((t) => t.id === taskId);
+    expect(task?.chatSessionId).toBeDefined();
+    const blocks = listChatBlocks(instance, task!.chatSessionId!);
+    const guidanceNote = blocks.find(
+      (b) => b.kind === "system_note" && b.text.includes("Open Telegram and start a chat")
+    );
+    expect(guidanceNote).toBeDefined();
+    expect(guidanceNote!.kind === "system_note" && guidanceNote.text).toContain("tg-guidance");
+    expect(guidanceNote!.kind === "system_note" && guidanceNote.text).toContain("/start");
+  });
+
   test("request_remove_messaging_bridge: mints a pending approval for an existing bridge", async () => {
     const instance = `req-remove-bridge-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance);
