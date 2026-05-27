@@ -5,7 +5,7 @@ export function Avatar({ emoji, className }: { emoji?: string; className?: strin
   return (
     <div
       className={cn(
-        "flex size-9 shrink-0 items-center justify-center rounded-full bg-muted text-base leading-none select-none overflow-hidden",
+        "flex size-9 shrink-0 items-center justify-center text-base leading-none select-none overflow-hidden",
         className
       )}
       aria-hidden="true"
