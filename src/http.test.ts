@@ -1211,6 +1211,42 @@ describe("runtime api", () => {
     expect(after.approvals.find((a) => a.id === remove.id)?.status).toBe("pending");
   });
 
+  test("POST /api/approvals/<id>/connect refuses a code-less messaging.approve_pairing approve and keeps the approval pending", async () => {
+    // allowChat's pending-row presence check is gated on `expectedCode`
+    // being defined (the legacy CLI's "operator knows what they're
+    // doing" trust model). If a chat-card approval payload arrives
+    // without verificationCode (group chat: groups intentionally
+    // never mint a code, or a stale approval whose pending row was
+    // cleared and recreated), a no-code allowChat call would bypass
+    // the pending-row check and enroll a chat that is no longer
+    // pending. Pin that messaging-pairing-connect refuses the
+    // approve branch up-front when verificationCode is missing.
+    const config = testConfig("connect-pairing-codeless-refuses");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "messaging.approve_pairing",
+        target: "bridge_codeless:7",
+        risk: "medium",
+        reason: "Confirm pairing",
+        // Deliberately omit verificationCode — the chat card normally
+        // carries one for private chats, but a stale or group-chat
+        // payload would not.
+        payload: { bridgeId: "bridge_codeless", chatId: 7, toolCallId: "call_codeless" }
+      })
+    );
+
+    const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(response.ok).toBe(false);
+    expect(response.message).toContain("code-less");
+    const after = readState(config.instance);
+    expect(after.approvals.find((a) => a.id === approval.id)?.status).toBe("pending");
+  });
+
   test("POST /api/approvals/<id>/connect removes a messaging bridge through the approval flow", async () => {
     // Happy path for the chat-side Remove bridge card. The /connect
     // handler delegates to runMessagingRemoveConnect, which resolves

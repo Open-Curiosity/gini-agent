@@ -56,6 +56,33 @@ export async function runMessagingPairingConnect(
   }
   const isReject = body.reject === true;
 
+  // Approve path needs a verification code. The legacy CLI
+  // (`gini messaging allow`) calls allowChat without expectedCode
+  // and intentionally skips allowChat's pending-row presence check —
+  // it's the operator's "I know what I'm doing" trust model. The
+  // chat-card path is the opposite of that: the approval card
+  // exists BECAUSE there's a pending row with a code, and the
+  // operator just confirmed the code matches what the bot DM'd. If
+  // verificationCode is somehow missing from the payload (group
+  // chat — groups never mint a code; or a stale approval whose
+  // pending row was cleared and recreated without one) the no-code
+  // call would bypass the pending-row check inside allowChat and
+  // enroll a chat that may no longer be pending at all. Refuse here
+  // and tell the agent to route group enrollment through the
+  // settings page / CLI where the operator's intent is explicit.
+  // Reject path doesn't need the code (rejectPendingChat just
+  // drops the row whether it's there or not), so allow that branch
+  // to proceed.
+  if (!isReject && !verificationCode) {
+    return {
+      status: 200,
+      body: {
+        ok: false,
+        message: "Cannot approve a code-less pairing from chat (group chats and code-less pending rows have no verification handshake). Use the settings page or `gini messaging allow` for those."
+      }
+    };
+  }
+
   // Atomic check-and-flip BEFORE either side effect — mirrors the
   // browser.fill_secret / messaging.add_bridge ordering.
   let resolved: Approval;
