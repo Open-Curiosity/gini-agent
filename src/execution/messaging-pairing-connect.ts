@@ -21,7 +21,7 @@ import type { Approval, RuntimeConfig } from "../types";
 import { resolveApproval } from "../agent";
 import { allowChat, rejectPendingChat } from "../integrations/messaging";
 import { sanitizeBridgeStatusMessage } from "../integrations/messaging-poller-helpers";
-import { addAudit, mutateState, readState } from "../state";
+import { addAudit, mutateState } from "../state";
 import { persistConnectOutcome, safeResume } from "./safe-resume";
 
 export interface MessagingPairingConnectResult {
@@ -113,35 +113,16 @@ export async function runMessagingPairingConnect(
     : undefined;
 
   if (isReject) {
-    // Refuse stale rejects. rejectPendingChat removes the row by
-    // (bridgeId, chatId) with no code comparison, so if the user
-    // re-DM'd the bot after this card was minted and the pending
-    // row's verificationCode rotated, the stale card's Reject
-    // would clear the FRESH request the user just made (and silently
-    // discard the new code). Compare the approval's recorded code
-    // against the current pending row's code — refuse the reject
-    // when they differ so the user has to act on the current card
-    // instead of the dead one. Only enforce when both codes are
-    // available (legacy code-less group rejects keep working).
-    if (verificationCode) {
-      const live = readState(config.instance);
-      const liveBridge = live.messagingBridges.find((b) => b.id === bridgeId);
-      const liveMeta = (liveBridge?.metadata ?? {}) as {
-        recentDeniedChats?: Array<{ chatId: number; verificationCode?: string }>;
-      };
-      const livePending = liveMeta.recentDeniedChats?.find((entry) => entry.chatId === chatId);
-      if (livePending?.verificationCode && livePending.verificationCode !== verificationCode) {
-        return {
-          status: 200,
-          body: {
-            ok: false,
-            message: `Pairing request for chat ${chatId} was re-DM'd since this card was minted — its verification code rotated. Approve or Reject the current pending card instead; this stale card no longer matches.`
-          }
-        };
-      }
-    }
     try {
-      await rejectPendingChat(config, bridgeId, chatId);
+      // Pass expectedCode so the compare-and-delete happens atomically
+      // inside rejectPendingChat's mutateState — closes the TOCTOU
+      // window a pre-mutateState lookup would leave open (fresh DM
+      // landing between the check and the delete). Also catches the
+      // "already-enrolled, you can't reject" case symmetrically.
+      // Code-less legacy rejects (no expectedCode) still work; the
+      // function's pending lookup is a no-op when both sides lack a
+      // code.
+      await rejectPendingChat(config, bridgeId, chatId, verificationCode ? { expectedCode: verificationCode } : {});
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
       const message = sanitizeBridgeStatusMessage(raw);

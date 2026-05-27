@@ -193,7 +193,7 @@ export async function runMessagingBridgeConnect(
       config,
       taskId,
       toolCallId,
-      `${kindLabel} bridge added: ${bridge.name}. Tell the user it's ready and walk them through enrolling a chat (DM the bot, share the verification code, you approve from the settings page) if relevant.`,
+      `${kindLabel} bridge added: ${bridge.name}. Now call wait_for_messaging_pair with this bridge name and tell the user to DM the bot — a verification card will pop up in this chat for them to approve. Don't tell them to use the settings page; the whole flow can finish in chat.`,
       { context: "messaging.add_bridge", approvalId: approval.id }
     ).catch(() => {});
   }
