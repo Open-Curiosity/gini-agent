@@ -26,6 +26,8 @@
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { isIP } from "node:net";
+import { lookup } from "node:dns/promises";
 import { instanceRoot } from "../paths";
 import { generateVisionAnalysis } from "../provider";
 import { assertInsideWorkspace, readState } from "../state";
@@ -1440,6 +1442,33 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
   if (blocked) return fail(blocked);
   try {
     return await withSession(taskId, async (session) => {
+      // DNS pre-flight: the literal-only safetyCheck above misses
+      // DNS aliases that resolve to loopback / private IPs (e.g.
+      // an attacker-controlled "evil.example" A record pointing
+      // at 127.0.0.1). Resolve the hostname and re-run safetyCheck
+      // on the resolved address before handing the URL to Chrome.
+      // Run AFTER withSession admission (not before) so the
+      // disconnect-bail race the test suite covers fires first
+      // and the lookup doesn't add an await boundary that shifts
+      // admission timing. The check doesn't fully close DNS
+      // rebinding (a TTL=0 swap between our lookup and Chrome's
+      // own lookup is still possible), but it catches the common
+      // case and matches what the web_fetch tool already does.
+      try {
+        const parsed = new URL(url);
+        if (isIP(parsed.hostname) === 0) {
+          const { address } = await lookup(parsed.hostname);
+          const resolvedBlocked = safetyCheck(`${parsed.protocol}//${address}/`);
+          if (resolvedBlocked) {
+            return fail(`${resolvedBlocked} (resolved from ${parsed.hostname})`);
+          }
+        }
+      } catch (err) {
+        // DNS failure (NXDOMAIN, network-down) — let Chrome's
+        // navigation surface the error organically rather than
+        // collapsing into a generic fail() here.
+        void err;
+      }
       const response = await session.page.goto(url, { waitUntil: "domcontentloaded" });
       // Re-validate after navigation completes — playwright's goto
       // follows server redirects (302/303/307/308 + meta-refresh),
@@ -1452,7 +1481,12 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
       // page away to about:blank so the loopback page doesn't sit
       // in the session's history for the next tool call to read.
       const finalUrl = session.page.url();
-      const postBlock = safetyCheck(finalUrl);
+      // about:blank is the legitimate "page is idle" state — either
+      // the goto didn't actually settle (mocked / dummy backend) or
+      // a prior cleanup landed us there. Skip the post-nav block
+      // for it; the snapshot() boundary check already special-
+      // cases it the same way.
+      const postBlock = finalUrl === "about:blank" ? undefined : safetyCheck(finalUrl);
       if (postBlock) {
         try {
           await session.page.goto("about:blank", { waitUntil: "domcontentloaded" });
