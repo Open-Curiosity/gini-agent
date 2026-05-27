@@ -276,7 +276,14 @@ export class TunnelManager {
         binary: this.binary,
         logPath: this.logPath,
         spawn: this.spawn,
-        signal: this.spawnAbort.signal
+        signal: this.spawnAbort.signal,
+        // Scrub the active secret out of cloudflared's stderr before it
+        // hits the on-disk log. cloudflared emits per-request error
+        // lines that include the full destination URL — the gateway's
+        // secret-path scheme makes that URL embed the live tunnel
+        // secret, so a "share your cloudflared.log" debug ask would
+        // leak a working credential.
+        redactStrings: this.config.secret ? [this.config.secret] : undefined
       });
     } catch (error) {
       this.snapshot = {

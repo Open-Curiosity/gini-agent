@@ -45,6 +45,33 @@ export interface SpawnTunnelOptions {
       kill(signal?: string | number): void;
       readonly pid?: number;
     };
+  /**
+   * Strings to scrub from stderr before persisting to the log file.
+   * cloudflared logs per-request error lines that include the full
+   * destination URL — when the gateway pairs cloudflared with a
+   * secret-path scheme, that URL embeds the secret. Without this
+   * redaction the on-disk log carries the live credential, which a
+   * helpful "share the log" support-debug message can leak. The
+   * TunnelManager passes the active secret here so a leaked log
+   * doesn't double as a leaked tunnel URL.
+   */
+  redactStrings?: readonly string[];
+}
+
+const REDACTED_PLACEHOLDER = "[redacted]";
+
+function redactBytes(value: Uint8Array, redactStrings: readonly string[] | undefined): Uint8Array {
+  if (!redactStrings || redactStrings.length === 0) return value;
+  // The redact strings are ASCII (base64url secret characters); decoding
+  // as UTF-8 + replace + re-encode is safe for the substrings we care
+  // about. A multi-byte UTF-8 sequence split across chunks could only
+  // affect surrounding bytes that aren't part of any redact string.
+  let text = new TextDecoder().decode(value);
+  for (const secret of redactStrings) {
+    if (!secret) continue;
+    text = text.replaceAll(secret, REDACTED_PLACEHOLDER);
+  }
+  return new TextEncoder().encode(text);
 }
 
 export interface TunnelHandle {
@@ -66,6 +93,15 @@ export interface TunnelHandle {
  * startup timeout elapses.
  */
 export async function spawnQuickTunnel(options: SpawnTunnelOptions): Promise<TunnelHandle> {
+  // Honour the abort signal BEFORE spawning. A SIGTERM or disable PATCH
+  // that landed between options being constructed and this function
+  // being entered would otherwise still cause cloudflared to spawn —
+  // the abort listener registered later would only fire after the
+  // child was already running, leaving a brief window where the
+  // public tunnel went live despite the operator's intent.
+  if (options.signal?.aborted) {
+    throw new Error("cloudflared spawn aborted");
+  }
   const binary = options.binary ?? "cloudflared";
   const command = [binary, "tunnel", "--no-autoupdate", "--url", options.targetUrl];
   const spawner = options.spawn ?? defaultSpawner;
@@ -80,6 +116,17 @@ export async function spawnQuickTunnel(options: SpawnTunnelOptions): Promise<Tun
       logHandle = null;
     }
   }
+  // Re-check the abort signal after the log-open await: the operator
+  // may have flipped disable while we awaited the file handle. The
+  // race below catches a CONCURRENT abort, but an abort that already
+  // settled by the time the race starts would otherwise be missed.
+  if (options.signal?.aborted) {
+    try { child.kill("SIGTERM"); } catch { /* ignore */ }
+    if (logHandle) {
+      try { await logHandle.close(); } catch { /* ignore */ }
+    }
+    throw new Error("cloudflared spawn aborted");
+  }
 
   // The parser resolves with the URL plus a `drained` promise that
   // settles when the background drainer finishes reading stderr. We
@@ -89,7 +136,7 @@ export async function spawnQuickTunnel(options: SpawnTunnelOptions): Promise<Tun
   // drainer's pending `log.write()` throws "file closed" after we
   // close the handle.
   let drained: Promise<void> = Promise.resolve();
-  const urlPromise = parseUrlFromStderr(child.stderr, logHandle).then((result) => {
+  const urlPromise = parseUrlFromStderr(child.stderr, logHandle, options.redactStrings).then((result) => {
     drained = result.drained;
     return result.url;
   });
@@ -189,7 +236,7 @@ export async function readTunnelUrlFromStream(
   stream: ReadableStream<Uint8Array> | null
 ): Promise<string> {
   if (!stream) throw new Error("cloudflared stderr is not piped");
-  const result = await parseUrlFromStderr(stream, null);
+  const result = await parseUrlFromStderr(stream, null, undefined);
   return result.url;
 }
 
@@ -208,7 +255,8 @@ export function extractTunnelUrl(line: string): string | null {
 
 async function parseUrlFromStderr(
   stream: ReadableStream<Uint8Array> | null,
-  log: FileHandle | null
+  log: FileHandle | null,
+  redactStrings: readonly string[] | undefined
 ): Promise<{ url: string; drained: Promise<void> }> {
   if (!stream) throw new Error("cloudflared stderr is not piped");
   const reader = stream.getReader();
@@ -217,7 +265,7 @@ async function parseUrlFromStderr(
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    if (log) await log.write(Buffer.from(value));
+    if (log) await log.write(Buffer.from(redactBytes(value, redactStrings)));
     buffer += decoder.decode(value, { stream: true });
     let nl = buffer.indexOf("\n");
     while (nl !== -1) {
@@ -232,7 +280,7 @@ async function parseUrlFromStderr(
         // cloudflared's writer blocks, eventually deadlocking the
         // subprocess.
         try { reader.releaseLock(); } catch { /* ignore */ }
-        const drained = keepDraining(stream, log);
+        const drained = keepDraining(stream, log, redactStrings);
         return { url, drained };
       }
       nl = buffer.indexOf("\n");
@@ -241,7 +289,7 @@ async function parseUrlFromStderr(
   throw new Error("cloudflared stderr closed before a URL appeared");
 }
 
-function keepDraining(stream: ReadableStream<Uint8Array>, log: FileHandle | null): Promise<void> {
+function keepDraining(stream: ReadableStream<Uint8Array>, log: FileHandle | null, redactStrings: readonly string[] | undefined): Promise<void> {
   // Continue reading stderr without blocking startup. When a log handle
   // is provided we copy bytes into it; without one we discard. Errors
   // are swallowed so a closed log or stream can't keep the process
@@ -254,7 +302,7 @@ function keepDraining(stream: ReadableStream<Uint8Array>, log: FileHandle | null
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (log) await log.write(Buffer.from(value));
+        if (log) await log.write(Buffer.from(redactBytes(value, redactStrings)));
       }
     } catch {
       /* ignore */
