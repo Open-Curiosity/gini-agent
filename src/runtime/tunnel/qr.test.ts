@@ -1,56 +1,66 @@
-// QR encoder regression tests. Verifies:
-//   1. encodeQr produces a square matrix at the right version's module count.
-//   2. Format-info bits land at the spec-mandated (x, y) coordinates per
-//      ISO/IEC 18004 section 8.9.
-//   3. The permanently-dark module is always set at (col 8, row size-8).
+// QR encoder round-trip tests. Renders the encoder output to an RGBA pixel
+// buffer and feeds it through jsQR — the same decoder iOS Camera (and
+// every commodity scanner) uses under the hood. A previous in-tree
+// encoder passed structural tests but failed decode on every real device,
+// so the test contract is decode-or-fail, not module-counts-only.
 import { describe, expect, test } from "bun:test";
+import jsQR from "jsqr";
 import { encodeQr, renderQrAnsi, renderQrSvg } from "./qr";
 
-describe("encodeQr", () => {
-  test("emits a square matrix", () => {
-    const m = encodeQr("https://example.trycloudflare.com/abc/");
-    expect(m.modules.length).toBe(m.size);
-    for (const row of m.modules) expect(row.length).toBe(m.size);
-  });
-
-  test("places the permanent dark module at (col=8, row=size-8)", () => {
-    const m = encodeQr("https://x.trycloudflare.com/abcdefghij/");
-    expect(m.modules[m.size - 8]![8]).toBe(true);
-  });
-
-  test("format-info copy 1 occupies the spec-mandated cells around the top-left finder", () => {
-    const m = encodeQr("https://x.trycloudflare.com/abcdefghij/");
-    // The format-info layout reserves specific cells; they must be DEFINED
-    // (true or false), not whatever the data-bit walker leaves there. We can
-    // detect that by encoding a known short payload twice with different
-    // mask candidates — but the public API hides the chosen mask. Instead,
-    // pin the layout structurally: the dark module at (8, size-8) is always
-    // 1, the timing column 6 above row 9 alternates 1/0/1/0/1/0, and the
-    // bottom-right corner data area's bit 0 sits at (size-1, size-1) for a
-    // small payload. These three checks together prove the format-bit
-    // placement loop didn't trample the timing pattern or the dark module.
-    const size = m.size;
-    expect(m.modules[size - 8]![8]).toBe(true);
-    // Timing column 6 between rows 8 and size-8: alternating dark/light.
-    for (let y = 8; y < size - 8; y += 1) {
-      const cell = m.modules[y]![6];
-      // Even-indexed rows (relative to the timing seed) are dark; the
-      // alternation pattern is what allows readers to lock onto module size.
-      expect(typeof cell).toBe("boolean");
+function renderToRgba(text: string, scale = 4, quiet = 4): { buf: Uint8ClampedArray; total: number } {
+  const { size, modules } = encodeQr(text);
+  const total = (size + quiet * 2) * scale;
+  const buf = new Uint8ClampedArray(total * total * 4);
+  for (let py = 0; py < total; py += 1) {
+    for (let px = 0; px < total; px += 1) {
+      const mx = Math.floor(px / scale) - quiet;
+      const my = Math.floor(py / scale) - quiet;
+      const dark = mx >= 0 && my >= 0 && mx < size && my < size && modules[my]![mx]!;
+      const v = dark ? 0 : 255;
+      const o = (py * total + px) * 4;
+      buf[o] = v; buf[o + 1] = v; buf[o + 2] = v; buf[o + 3] = 255;
     }
+  }
+  return { buf, total };
+}
+
+describe("encodeQr round-trip via jsQR", () => {
+  test("decodes a short ASCII payload", () => {
+    const input = "hi";
+    const { buf, total } = renderToRgba(input);
+    const result = jsQR(buf, total, total);
+    expect(result).not.toBeNull();
+    expect(result?.data).toBe(input);
   });
 
-  test("renderQrSvg returns a parseable SVG containing rect elements", () => {
+  test("decodes a typical bootstrap URL (32-char base64url secret + trycloudflare host)", () => {
+    const input = "https://constant-contests-rochester-concentration.trycloudflare.com/8Zea6FDRac6QQeJ7OpOPwpA_PXiZJNEB/";
+    const { buf, total } = renderToRgba(input);
+    const result = jsQR(buf, total, total);
+    expect(result).not.toBeNull();
+    expect(result?.data).toBe(input);
+  });
+
+  test("decodes URLs containing reserved characters that exercise the byte mode", () => {
+    const input = "https://example.com/path?x=1&y=2#frag";
+    const { buf, total } = renderToRgba(input);
+    const result = jsQR(buf, total, total);
+    expect(result).not.toBeNull();
+    expect(result?.data).toBe(input);
+  });
+});
+
+describe("renderQrSvg / renderQrAnsi", () => {
+  test("SVG is parseable + contains rect elements", () => {
     const svg = renderQrSvg("https://x.trycloudflare.com/abc/");
     expect(svg.startsWith("<?xml")).toBe(true);
     expect(svg).toContain("<svg");
     expect(svg).toContain("<rect");
   });
 
-  test("renderQrAnsi returns a multi-line string of half-block characters", () => {
+  test("ANSI is a multi-line string of half-block characters", () => {
     const ansi = renderQrAnsi("https://x.trycloudflare.com/abc/");
     expect(ansi.split("\n").length).toBeGreaterThan(10);
-    // Only allowed characters: full block, top half, bottom half, space.
     expect(/^[█▀▄ \n]+$/.test(ansi)).toBe(true);
   });
 });
