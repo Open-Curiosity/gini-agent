@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import {
   Activity,
   AlertTriangle,
+  Bug,
   Cog,
   Download,
   Loader2,
@@ -29,6 +30,7 @@ import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { useStatus } from "@/lib/queries";
 import { AgentSwitcher } from "@/components/AgentSwitcher";
+import { ReportBugDialog } from "@/components/ReportBugDialog";
 import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
 
 type NavItem = { href: string; label: string; icon: LucideIcon };
@@ -54,6 +56,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
   const { theme, setTheme } = useTheme();
   const mounted = useMounted();
+  const [reportBugOpen, setReportBugOpen] = useState(false);
 
   return (
     <div className="flex h-full flex-col bg-sidebar text-sidebar-foreground">
@@ -99,8 +102,19 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
             })}
           </div>
         ))}
+        <div className="mt-2 border-t border-sidebar-border pt-2">
+          <button
+            type="button"
+            onClick={() => setReportBugOpen(true)}
+            className="flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-sm font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground"
+          >
+            <Bug className="h-4 w-4" />
+            Report a bug
+          </button>
+        </div>
       </nav>
       <UpdateReminder />
+      <ReportBugDialog open={reportBugOpen} onOpenChange={setReportBugOpen} />
     </div>
   );
 }
