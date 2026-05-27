@@ -21,6 +21,7 @@ import type { Approval, RuntimeConfig } from "../types";
 import { resolveApproval } from "../agent";
 import { allowChat, rejectPendingChat } from "../integrations/messaging";
 import { sanitizeBridgeStatusMessage } from "../integrations/messaging-poller-helpers";
+import { addAudit, mutateState } from "../state";
 import { persistConnectOutcome, safeResume } from "./safe-resume";
 
 export interface MessagingPairingConnectResult {
@@ -133,6 +134,31 @@ export async function runMessagingPairingConnect(
       ok: true,
       message: `Pairing request for chat ${chatId} rejected`
     });
+    // Chat-card lineage audit row, mirroring runMessagingBridgeConnect's
+    // pattern. allowChat / rejectPendingChat write generic audit rows
+    // with `{ system: true }` and no taskId/approvalId, so without
+    // this row a chat-card-driven reject is indistinguishable from
+    // a CLI / settings-page reject. The row joins approval ↔ chat ↔ task.
+    await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "messaging.approve_pairing",
+          target: `${bridgeId}:${chatId}`,
+          risk: "medium",
+          taskId,
+          approvalId: approval.id,
+          evidence: {
+            bridgeId,
+            chatId,
+            outcome: "rejected",
+            toolCallId: toolCallId ?? null
+          }
+        },
+        taskId ? { taskId } : { system: true }
+      );
+    });
     if (taskId && toolCallId) {
       await safeResume(
         config,
@@ -168,6 +194,29 @@ export async function runMessagingPairingConnect(
   await persistConnectOutcome(config, approval.id, {
     ok: true,
     message: `Pairing approved for chat ${chatId}`
+  });
+  // Chat-card lineage audit row — same rationale as the reject
+  // branch. allowChat writes a generic messaging.chat.allowed row
+  // with `{ system: true }` and no taskId/approvalId.
+  await mutateState(config.instance, (state) => {
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "messaging.approve_pairing",
+        target: `${bridgeId}:${chatId}`,
+        risk: "medium",
+        taskId,
+        approvalId: approval.id,
+        evidence: {
+          bridgeId,
+          chatId,
+          outcome: "approved",
+          toolCallId: toolCallId ?? null
+        }
+      },
+      taskId ? { taskId } : { system: true }
+    );
   });
   if (taskId && toolCallId) {
     await safeResume(

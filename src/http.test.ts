@@ -1284,6 +1284,17 @@ describe("runtime api", () => {
     const after = readState(config.instance);
     expect(after.approvals.find((a) => a.id === approval.id)?.status).toBe("approved");
     expect(after.messagingBridges.find((b) => b.id === created.id)).toBeUndefined();
+
+    // Chat-card lineage audit row pin: the chat-card remove path
+    // writes a dedicated audit row carrying approvalId + bridgeId,
+    // so a chat-card remove is distinguishable from a CLI / settings
+    // remove in the activity feed.
+    const chatRemoveRow = after.audit.find(
+      (e) => e.action === "messaging.remove_bridge" && e.approvalId === approval.id
+    );
+    expect(chatRemoveRow).toBeDefined();
+    expect(chatRemoveRow?.target).toBe(created.id);
+    expect((chatRemoveRow?.evidence as { bridgeName?: string } | undefined)?.bridgeName).toBe("remove-me");
   });
 
   test("POST /api/approvals/<id>/connect refuses partial browser.fill_secret submissions", async () => {

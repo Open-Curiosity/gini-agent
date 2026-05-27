@@ -8,6 +8,7 @@ import type { Approval, RuntimeConfig } from "../types";
 import { resolveApproval } from "../agent";
 import { removeMessagingBridge } from "../integrations/messaging";
 import { sanitizeBridgeStatusMessage } from "../integrations/messaging-poller-helpers";
+import { addAudit, mutateState } from "../state";
 import { persistConnectOutcome, safeResume } from "./safe-resume";
 
 export interface MessagingRemoveConnectResult {
@@ -85,6 +86,30 @@ export async function runMessagingRemoveConnect(
   await persistConnectOutcome(config, approval.id, {
     ok: true,
     message: `Bridge '${bridgeName}' removed`
+  });
+  // Chat-card lineage audit row — same rationale as the pairing
+  // and bridge-create connect handlers. removeMessagingBridge writes
+  // a generic messaging.removed row with `{ system: true }` and no
+  // taskId/approvalId, so chat-card-driven removes are otherwise
+  // indistinguishable from CLI / settings-page removes.
+  await mutateState(config.instance, (state) => {
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "messaging.remove_bridge",
+        target: bridgeId,
+        risk: "high",
+        taskId,
+        approvalId: approval.id,
+        evidence: {
+          bridgeId,
+          bridgeName,
+          toolCallId: toolCallId ?? null
+        }
+      },
+      taskId ? { taskId } : { system: true }
+    );
   });
   if (taskId && toolCallId) {
     await safeResume(
