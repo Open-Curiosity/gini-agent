@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   ArrowLeftIcon,
@@ -17,7 +17,6 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
-import { useInvalidate } from "@/lib/queries";
 import { displayProviderName, type ProviderCatalogItem } from "../_components/ProviderCard";
 
 // Codex stays first so it lines up with where the Settings list shows
@@ -40,7 +39,7 @@ interface SetProviderResult {
 export default function AddProviderPage() {
   const router = useRouter();
   const params = useSearchParams();
-  const invalidate = useInvalidate();
+  const queryClient = useQueryClient();
   const preselect = params.get("provider") ?? "";
 
   const catalog = useQuery({
@@ -101,7 +100,7 @@ export default function AddProviderPage() {
         })
       });
     },
-    onSuccess: (result) => {
+    onSuccess: async (result) => {
       if (!result.ok) {
         toast.error(result.error ?? "Failed to save provider.");
         return;
@@ -111,7 +110,12 @@ export default function AddProviderPage() {
           ? "Codex OAuth verified."
           : `Provider set to ${providerName} (${selectedModel}).`
       );
-      invalidate(["status", "providers"]);
+      // Refetch providers BEFORE navigating so the settings list mounts
+      // with the row already present. We can't use useInvalidate here —
+      // it debounces 80ms and its unmount cleanup clears the pending set
+      // when this page unmounts, so the invalidation never fires.
+      queryClient.invalidateQueries({ queryKey: ["status"] });
+      await queryClient.refetchQueries({ queryKey: ["providers"] });
       router.push("/settings");
     },
     onError: (error: Error) => toast.error(error.message)
@@ -151,7 +155,7 @@ export default function AddProviderPage() {
           </div>
           <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
             {tiles.map((tile) => {
-              const visual = PROVIDER_VISUAL[tile.name] ?? { icon: SparklesIcon, description: "" };
+              const visual = PROVIDER_VISUAL[tile.name] ?? { icon: TerminalIcon, description: "" };
               const Icon = visual.icon;
               const selected = providerName === tile.name;
               return (
