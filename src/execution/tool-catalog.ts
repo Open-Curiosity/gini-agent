@@ -568,7 +568,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "request_messaging_bridge",
-      description: "Ask the user to wire up a Telegram messaging bridge by entering a bot token. Use this when the user says something like 'add a telegram bot', 'connect telegram', or any other Telegram onboarding ask. The user sees an inline card in chat with a name input and a password-masked bot-token input; once they submit, the bridge is created on the runtime — same path as the CLI's `gini messaging add` and the settings page's Add Telegram dialog. The task pauses on this approval and resumes automatically after the user submits. For Discord, point the user at the settings page (Add Discord button) because Discord bridges need a channel-ID list that this chat card does not collect.",
+      description: "Ask the user to wire up a Telegram messaging bridge by entering a bot token. Use this when the user says something like 'add a telegram bot', 'connect telegram', or any other Telegram onboarding ask. The user sees an inline card in chat with a name input and a password-masked bot-token input; once they submit, the bridge is created on the runtime — same path as the CLI's `gini messaging add` and the settings page's Add Telegram dialog. The task pauses on this approval and resumes automatically after the user submits. AFTER the bridge resolves successfully, the agent SHOULD typically chain `wait_for_messaging_pair` next so the user gets walked through the DM-the-bot → approve-the-pair handshake without context-switching — only skip the wait if the user explicitly asked to just provision the bridge without pairing right now. For Discord, point the user at the settings page (Add Discord button) because Discord bridges need a channel-ID list that this chat card does not collect.",
       parameters: {
         type: "object",
         properties: {
@@ -642,6 +642,33 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     // operator can verify the code matches what the user reports
     // before approving. Approve / Reject both go through /connect
     // (the agent doesn't run the side effect directly).
+    toolset: "messaging",
+    displayLabel: "Wait for messaging pair",
+    type: "function",
+    function: {
+      name: "wait_for_messaging_pair",
+      description: "Block server-side until an inbound Telegram pairing request arrives on the named bridge, then automatically surface the messaging.approve_pairing confirmation card so the user can Approve / Reject inline. Use this RIGHT AFTER request_messaging_bridge succeeds: the agent should stay engaged with the user through the bridge add → user DMs bot → approve dance instead of returning control and asking the user to come back. The tool blocks for up to `timeoutSeconds` (default 600) checking for a fresh pending row every second; the moment one appears it mints the approval card and pauses the task on it. On Approve/Reject the chat-task loop resumes with the outcome string and the agent continues. On timeout, returns `{ok: false, error: 'timeout'}` so the agent can ask the user whether to keep waiting.",
+      parameters: {
+        type: "object",
+        properties: {
+          bridge: {
+            type: "string",
+            description: "Bridge id or name to watch for inbound pairings. Same shape as list_messaging_pairings."
+          },
+          timeoutSeconds: {
+            type: "number",
+            description: "Max seconds to block waiting for an inbound pair. Default 600 (10 min — matches the verification code's TTL so a slow user can still complete pairing on the same code). The runtime clamps to [10, 1800]."
+          },
+          reason: {
+            type: "string",
+            description: "Optional user-visible text shown above the eventual approval card (e.g. 'Confirm the code I'm seeing matches what your bot replied with.'). One line."
+          }
+        },
+        required: ["bridge"]
+      }
+    }
+  },
+  {
     toolset: "messaging",
     displayLabel: "Approve pairing request",
     type: "function",
@@ -1199,6 +1226,7 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // toolset kill switch.
     if (tool.function.name === "list_messaging_bridges") return true;
     if (tool.function.name === "list_messaging_pairings") return true;
+    if (tool.function.name === "wait_for_messaging_pair") return true;
     if (tool.function.name === "request_messaging_pairing") return true;
     if (tool.function.name === "request_remove_messaging_bridge") return true;
     // Always expose the core agent-capability meta-tools whose owning
@@ -1366,6 +1394,8 @@ export function chatBlockArgsPreviewFor(
     case "list_messaging_bridges":
       return "";
     case "list_messaging_pairings":
+      return truncatePreview(previewValue(safe.bridge));
+    case "wait_for_messaging_pair":
       return truncatePreview(previewValue(safe.bridge));
     case "request_messaging_pairing":
       return truncatePreview(`${previewValue(safe.bridge)} chat ${previewValue(safe.chatId)}`);

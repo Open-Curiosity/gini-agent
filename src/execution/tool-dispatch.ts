@@ -157,6 +157,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await listMessagingBridgesTool(config) };
     case "list_messaging_pairings":
       return { kind: "sync", result: await listMessagingPairingsTool(config, args) };
+    case "wait_for_messaging_pair":
+      return await waitForMessagingPairTool(config, taskId, toolCallId, args);
     case "request_messaging_pairing":
       return await requestMessagingPairingTool(config, taskId, toolCallId, args);
     case "request_remove_messaging_bridge":
@@ -2953,6 +2955,205 @@ async function requestMessagingPairingTool(
     return approval.id;
   });
   return { kind: "pending", approvalId };
+}
+
+// Server-side blocking tool the agent calls right after a
+// successful request_messaging_bridge. Polls the bridge's
+// recentDeniedChats every second for up to `timeoutSeconds`; the
+// moment a fresh pending row shows up, mints a
+// messaging.approve_pairing approval bound to the agent's task and
+// returns {kind:"pending", approvalId} so the chat-task loop pauses
+// on the approval card. Lets the agent stay engaged with the user
+// through the bridge-add → user-DMs-bot → operator-approves dance
+// without returning control and asking the user to come back.
+//
+// Exit paths:
+//   - Pending row arrives → mint approval → pending DispatchResult
+//   - Task cancelled mid-wait → sync ok:false with "cancelled"
+//   - Timeout → sync ok:false with "timeout" so the agent can
+//     surface the option to keep waiting or skip
+//
+// Reuses the same surface guard as the other request_ tools: a
+// Telegram/Discord-sourced chat can't surface an approval the
+// remote user can't act on.
+async function waitForMessagingPairTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  // Surface guard.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `wait_for_messaging_pair only works in the web chat (this conversation is over ${surfaceKind}).`
+      })
+    };
+  }
+
+  const bridgeIdOrName = typeof args.bridge === "string" ? args.bridge.trim() : "";
+  if (!bridgeIdOrName) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: "wait_for_messaging_pair requires a 'bridge' (id or name)." })
+    };
+  }
+  const requestedTimeoutSeconds = typeof args.timeoutSeconds === "number" && Number.isFinite(args.timeoutSeconds)
+    ? args.timeoutSeconds
+    : 600;
+  // Clamp to a sane window. The lower bound keeps a too-short
+  // call from racing the poll interval; the upper bound caps how
+  // long we tie up the chat-task awaiting an external event.
+  const timeoutSeconds = Math.max(10, Math.min(1800, Math.round(requestedTimeoutSeconds)));
+  const deadlineMs = Date.now() + timeoutSeconds * 1000;
+  const POLL_INTERVAL_MS = 1000;
+
+  // Establish the baseline: any chatIds already in
+  // recentDeniedChats at tool-start are "old" and don't count as
+  // freshly-arrived events. A re-DM that overwrites an existing
+  // row (different verificationCodeExpiresAt) DOES count — the
+  // code rotation is itself a fresh event the operator should see.
+  const initialBridge = readState(config.instance).messagingBridges.find(
+    (b) => b.id === bridgeIdOrName || b.name === bridgeIdOrName
+  );
+  if (!initialBridge) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: `Messaging bridge not found: ${bridgeIdOrName}.` })
+    };
+  }
+  if (initialBridge.kind !== "telegram") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: `wait_for_messaging_pair only applies to telegram bridges (got '${initialBridge.kind}').` })
+    };
+  }
+  const initialMetadata = (initialBridge.metadata ?? {}) as { recentDeniedChats?: Array<{ chatId: number; verificationCodeExpiresAt?: string }> };
+  const initialPendingSnapshot = new Map<number, string | undefined>(
+    (initialMetadata.recentDeniedChats ?? []).map((entry) => [entry.chatId, entry.verificationCodeExpiresAt])
+  );
+
+  const reasonText = typeof args.reason === "string" && args.reason.trim().length > 0
+    ? args.reason.trim()
+    : undefined;
+
+  // Poll loop. readState is in-process cached, so this is cheap.
+  while (Date.now() < deadlineMs) {
+    const liveState = readState(config.instance);
+
+    // Abort if the task itself was cancelled mid-wait.
+    const liveTask = liveState.tasks.find((t) => t.id === taskId);
+    if (liveTask && isTerminalTaskStatus(liveTask.status)) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: "wait_for_messaging_pair aborted: task was cancelled."
+        })
+      };
+    }
+
+    const liveBridge = liveState.messagingBridges.find(
+      (b) => b.id === bridgeIdOrName || b.name === bridgeIdOrName
+    );
+    if (!liveBridge) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({ ok: false, error: `Messaging bridge no longer exists: ${bridgeIdOrName}.` })
+      };
+    }
+    const liveMeta = (liveBridge.metadata ?? {}) as {
+      recentDeniedChats?: Array<{
+        chatId: number;
+        chatType?: string;
+        sender?: string;
+        verificationCode?: string;
+        verificationCodeExpiresAt?: string;
+      }>;
+    };
+    const livePending = liveMeta.recentDeniedChats ?? [];
+
+    // Find the first chatId whose row is either brand-new since
+    // tool-start OR whose verificationCodeExpiresAt has rotated
+    // (a re-DM that minted a fresh code is itself a fresh event).
+    const newOrRotated = livePending.find((entry) => {
+      const initialExpiresAt = initialPendingSnapshot.get(entry.chatId);
+      if (initialExpiresAt === undefined) return true;
+      return entry.verificationCodeExpiresAt !== initialExpiresAt;
+    });
+
+    if (newOrRotated && newOrRotated.verificationCode) {
+      // Mint the messaging.approve_pairing approval bound to this
+      // task so the chat-task loop pauses on it. Reuses the
+      // payload shape requestMessagingPairingTool / the
+      // BlockApprovalRequested card already expect.
+      const metaForCard = (liveBridge.metadata ?? {}) as { botUsername?: unknown };
+      const botUsername = typeof metaForCard.botUsername === "string" ? metaForCard.botUsername : undefined;
+      const cardReason = reasonText
+        ?? `Confirm the verification code below matches what you received on Telegram before approving chat ${newOrRotated.chatId}.`;
+      const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+        const item = findTask(mutable, taskId);
+        if (isTerminalTaskStatus(item.status)) {
+          throw new TaskAlreadyTerminalError(taskId, item.status);
+        }
+        const approval = createApproval(mutable, {
+          taskId: item.id,
+          action: "messaging.approve_pairing",
+          target: `${liveBridge.id}:${newOrRotated.chatId}`,
+          risk: "medium",
+          reason: cardReason,
+          payload: {
+            bridgeId: liveBridge.id,
+            bridgeName: liveBridge.name,
+            botUsername: botUsername ?? null,
+            chatId: newOrRotated.chatId,
+            chatType: newOrRotated.chatType ?? "private",
+            sender: newOrRotated.sender ?? null,
+            verificationCode: newOrRotated.verificationCode ?? null,
+            verificationCodeExpiresAt: newOrRotated.verificationCodeExpiresAt ?? null,
+            toolCallId
+          }
+        });
+        item.approvalIds.push(approval.id);
+        item.updatedAt = now();
+        if (item.chatSessionId) {
+          createChatMessage(mutable, {
+            sessionId: item.chatSessionId,
+            role: "assistant",
+            content: cardReason,
+            taskId: item.id,
+            runId: item.runId,
+            kind: "approval_reason"
+          });
+        }
+        appendTrace(config.instance, item.id, {
+          type: "approval",
+          message: "Approval requested for messaging.approve_pairing (wait_for_messaging_pair)",
+          data: { approvalId: approval.id, bridgeId: liveBridge.id, chatId: newOrRotated.chatId, toolCallId }
+        });
+        return approval.id;
+      });
+      return { kind: "pending", approvalId };
+    }
+
+    await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+
+  return {
+    kind: "sync",
+    result: JSON.stringify({
+      ok: false,
+      error: `wait_for_messaging_pair timed out after ${timeoutSeconds}s with no inbound pair on bridge '${initialBridge.name}'. The user can DM the bot again — call wait_for_messaging_pair to retry, or move on if they're not pairing right now.`
+    })
+  };
 }
 
 // Bridge-removal affordance. Mints a messaging.remove_bridge

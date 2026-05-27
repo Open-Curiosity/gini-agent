@@ -79,6 +79,7 @@ const ALWAYS_ON = new Set([
   "request_messaging_bridge",
   "list_messaging_bridges",
   "list_messaging_pairings",
+  "wait_for_messaging_pair",
   "request_messaging_pairing",
   "request_remove_messaging_bridge",
   "cancel_task",
