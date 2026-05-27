@@ -48,6 +48,25 @@ import {
   DENY_ACTION,
   dispatchNotificationResponse
 } from "./push-dispatch";
+import {
+  bumpGeneration,
+  captureGeneration,
+  isStillCurrent
+} from "./push-registration-guard";
+import { createDeviceTokenStore, type Storage } from "./device-token-store";
+
+// AsyncStorage's API matches our Storage shape exactly — adapt with a
+// thin wrapper so the store stays unaware of the native module.
+const asyncStorageAdapter: Storage = {
+  getItem: (key) => AsyncStorage.getItem(key),
+  setItem: (key, value) => AsyncStorage.setItem(key, value),
+  removeItem: (key) => AsyncStorage.removeItem(key)
+};
+
+// Module-singleton store backed by AsyncStorage. Constructed eagerly
+// so primeDeviceTokenFromStorage / getCachedDeviceToken can read
+// through it from the first call.
+const deviceTokenStore = createDeviceTokenStore(asyncStorageAdapter);
 
 // Re-export the dispatch identifiers so existing call-sites that
 // imported from `./push` continue to compile. The pure dispatcher
@@ -198,15 +217,15 @@ export async function refreshBadge(): Promise<void> {
 // listener subscription would leak.
 let registrationStarted = false;
 
-// Generation counter bumped by __resetRegistrationForSignOut. Any
-// registration that starts in generation N must short-circuit (no
-// cache write, no listener install) if the counter has advanced by
-// the time its async work resolves. Without this guard, a sign-out
-// that races a still-in-flight registration POST would wipe the
-// credential, then the late-arriving POST handler would cache the
-// token + install listeners under the wiped credential — leaving an
-// orphaned subscription alive on the device.
-let signedOutGeneration = 0;
+// Generation counter logic lives in `./push-registration-guard` so
+// the race-guard invariants can be unit-tested without loading the
+// native surfaces. Any registration that starts in generation N must
+// short-circuit (no cache write, no listener install) if the counter
+// has advanced by the time its async work resolves. Without this
+// guard, a sign-out that races a still-in-flight registration POST
+// would wipe the credential, then the late-arriving POST handler
+// would cache the token + install listeners under the wiped
+// credential — leaving an orphaned subscription alive on the device.
 
 // Promise for the currently-running registerForPushAsync invocation,
 // if any. Sign-out awaits this (with a timeout) before bumping the
@@ -224,46 +243,24 @@ export function awaitRegistrationInFlight(): Promise<void> {
   return registrationInFlight ?? Promise.resolve();
 }
 
-// Cached APNs device token after a successful registration. The mobile
-// runtime needs this on every /read, /badge, and SSE open so the
-// gateway can scope reads + watch-state to this specific device
-// (rather than to the credential, which collapses iPhone A and
-// iPhone B onto one row). Module-scoped so the api helper can
-// import it without prop-drilling through every hook.
-let cachedDeviceToken: string | null = null;
-
-// AsyncStorage key for the device token cache. Persisted across cold
-// launches so the X-Device-Token header is available BEFORE the
-// async permission/registration flow completes. A rehydrated token
-// may be stale (rotated server-side, or paired against a different
+// The mobile runtime needs the cached APNs token on every /read,
+// /badge, and SSE open so the gateway can scope reads + watch-state to
+// this specific device (rather than to the credential, which collapses
+// iPhone A and iPhone B onto one row). The store keeps an in-memory
+// slot for synchronous header injection and persists across cold
+// launches so the X-Device-Token header is available BEFORE the async
+// permission/registration flow completes. A rehydrated token may be
+// stale (rotated server-side, or paired against a different
 // credential), but that's fine: requests still authenticate via the
 // bearer, and the eventual registerForPushAsync() re-acquires and
-// re-posts the live token, repopulating this slot.
-const DEVICE_TOKEN_STORAGE_KEY = "gini.push.device-token";
-
-async function persistDeviceToken(token: string): Promise<void> {
-  try {
-    await AsyncStorage.setItem(DEVICE_TOKEN_STORAGE_KEY, token);
-  } catch {
-    // Best-effort: if storage is unavailable the in-memory cache still
-    // covers the same-process lifetime.
-  }
-}
-
-async function clearPersistedDeviceToken(): Promise<void> {
-  try {
-    await AsyncStorage.removeItem(DEVICE_TOKEN_STORAGE_KEY);
-  } catch {
-    // ditto — clearing failures don't block sign-out.
-  }
-}
+// re-posts the live token, repopulating the slot.
 
 // Read-only accessor. Returns null until the device has registered
 // successfully — callers should tolerate that (mobile-only endpoints
 // like /badge can no-op when the token isn't set yet, since the
 // badge will refresh on the next mount once registration completes).
 export function getCachedDeviceToken(): string | null {
-  return cachedDeviceToken;
+  return deviceTokenStore.read();
 }
 
 // Rehydrate the device-token cache from AsyncStorage. Called from
@@ -274,16 +271,7 @@ export function getCachedDeviceToken(): string | null {
 // permission-gated registration flow. No-op when no token has ever
 // been persisted (e.g. fresh install pre-grant) or on read failure.
 export async function primeDeviceTokenFromStorage(): Promise<void> {
-  if (cachedDeviceToken) return;
-  try {
-    const stored = await AsyncStorage.getItem(DEVICE_TOKEN_STORAGE_KEY);
-    if (stored && typeof stored === "string" && stored.length > 0) {
-      cachedDeviceToken = stored;
-    }
-  } catch {
-    // Storage unavailable — leave cachedDeviceToken null; the next
-    // registerForPushAsync() will re-acquire.
-  }
+  await deviceTokenStore.prime();
 }
 
 // Subscription handles — kept module-scoped so a hot reload doesn't
@@ -313,7 +301,7 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
   // an `await` checks this against the current value before touching
   // the cache or installing a listener — if a sign-out happened
   // while we were suspended, the registration must abort silently.
-  const entryGeneration = signedOutGeneration;
+  const entryGeneration = captureGeneration();
 
   // Always register the approval category up-front, before any
   // permission prompt. If the user has previously granted permission,
@@ -370,22 +358,21 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
         // registration may have just persisted this token, because
         // sign-out awaits awaitRegistrationInFlight before issuing the
         // DELETE).
-        if (entryGeneration !== signedOutGeneration) return;
+        if (!isStillCurrent(entryGeneration)) return;
         // Cache after the POST succeeds so callers downstream (api
         // helper, SSE resolver) get the same token the gateway just
-        // accepted. On POST failure cachedDeviceToken stays null and
-        // those callers no-op until the next mount's retry. Persist
-        // to AsyncStorage so the next cold launch can prime the cache
-        // before registration runs again.
-        cachedDeviceToken = token.data;
-        void persistDeviceToken(token.data);
+        // accepted. On POST failure the store stays empty and those
+        // callers no-op until the next mount's retry. The store
+        // persists to AsyncStorage so the next cold launch can prime
+        // the cache before registration runs again.
+        void deviceTokenStore.cache(token.data);
       }
 
       // Re-check the generation before installing any listener. A
       // sign-out that lands here would otherwise leave the listener
       // subscribed under the wiped credential, firing into a future
       // sign-in.
-      if (entryGeneration !== signedOutGeneration) return;
+      if (!isStillCurrent(entryGeneration)) return;
 
       // Listen for token rotations. The library debounces internally,
       // so we just forward every emission straight to the gateway.
@@ -395,13 +382,12 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
           // Same generation check on the rotation path: a rotation
           // callback that resolves after sign-out must not repopulate
           // the cache under a stale credential.
-          const rotationGeneration = signedOutGeneration;
+          const rotationGeneration = captureGeneration();
           // Fire-and-forget — if the network is down the next mount's
           // initial registration will catch up.
           void postDevice(event.data, bundleId).then(() => {
-            if (rotationGeneration !== signedOutGeneration) return;
-            cachedDeviceToken = event.data;
-            void persistDeviceToken(event.data);
+            if (!isStillCurrent(rotationGeneration)) return;
+            void deviceTokenStore.cache(event.data);
           }).catch(() => { /* swallow */ });
         });
       }
@@ -415,7 +401,7 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
       // Generation re-check: the category drain is a fresh await
       // boundary, so a sign-out that arrived during it must still be
       // honoured.
-      if (entryGeneration !== signedOutGeneration) return;
+      if (!isStillCurrent(entryGeneration)) return;
 
       // Response listener: handles three cases via dispatchNotificationResponse.
       //   - Default tap (no actionIdentifier set, or
@@ -518,13 +504,12 @@ function resolveBundleId(): string | null {
 // don't double up on the next register.
 export function __resetRegistrationForSignOut(): void {
   registrationStarted = false;
-  cachedDeviceToken = null;
-  void clearPersistedDeviceToken();
+  void deviceTokenStore.clear();
   // Bump generation LAST so anything that resolves during a
   // sign-out's pre-bump drain (via awaitRegistrationInFlight) still
   // completes naturally; anything that resolves after the bump
   // short-circuits via the entryGeneration check.
-  signedOutGeneration += 1;
+  bumpGeneration();
   if (tokenSub) { tokenSub.remove(); tokenSub = null; }
   if (responseSub) { responseSub.remove(); responseSub = null; }
   if (receivedSub) { receivedSub.remove(); receivedSub = null; }
@@ -535,11 +520,10 @@ export function __resetRegistrationForSignOut(): void {
 // drive multiple registration attempts.
 export function __resetForTests(): void {
   registrationStarted = false;
-  cachedDeviceToken = null;
   registrationInFlight = null;
   categoryRegistration = null;
-  signedOutGeneration = 0;
-  void clearPersistedDeviceToken();
+  bumpGeneration();
+  void deviceTokenStore.clear();
   if (tokenSub) { tokenSub.remove(); tokenSub = null; }
   if (responseSub) { responseSub.remove(); responseSub = null; }
   if (receivedSub) { receivedSub.remove(); receivedSub = null; }
