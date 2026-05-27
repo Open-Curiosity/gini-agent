@@ -822,39 +822,119 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
 
   return async (request: Request) => {
     const url = new URL(request.url);
+    // CORS preflight: short-circuit before auth so browsers can probe
+    // protected endpoints. Returning a 401 on OPTIONS would prevent the
+    // browser from ever sending the real bearer-carrying request.
+    if (request.method === "OPTIONS" && request.headers.get("access-control-request-method")) {
+      return preflightResponse(request);
+    }
     if (url.pathname.startsWith("/api/")) {
       if (request.method === "POST" && url.pathname === "/api/pairing/claim") {
         try {
-          return json(await claimPairing(config, await body(request)), 201);
+          return withCors(request, json(await claimPairing(config, await body(request)), 201));
         } catch (error) {
-          return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+          return withCors(request, json({ error: error instanceof Error ? error.message : String(error) }, 400));
         }
       }
-      if (!await authorized(request, config)) return json({ error: "Unauthorized" }, 401);
+      if (!await authorized(request, config)) return withCors(request, json({ error: "Unauthorized" }, 401));
       for (const [method, pattern, handler] of routes) {
         const match = url.pathname.match(pattern);
         if (request.method === method && match) {
           try {
-            return await handler(request, Object.fromEntries(match.slice(1).map((value, index) => [String(index), value])));
+            return withCors(request, await handler(request, Object.fromEntries(match.slice(1).map((value, index) => [String(index), value]))));
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            return json({ error: message }, statusFromErrorMessage(message));
+            return withCors(request, json({ error: message }, statusFromErrorMessage(message)));
           }
         }
       }
-      return json({ error: "Not found" }, 404);
+      return withCors(request, json({ error: "Not found" }, 404));
     }
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
-      return json({
+      return withCors(request, json({
         name: "gini-runtime",
         instance: config.instance,
         port: config.port,
         message: "Gini runtime API. The Next.js control plane runs on a separate port; see `gini status`.",
         ui_url_hint: process.env.GINI_WEB_URL ?? null
-      });
+      }));
     }
-    return json({ error: "Not found" }, 404);
+    return withCors(request, json({ error: "Not found" }, 404));
   };
+}
+
+// CORS allowlist for browser-origin clients. The mobile app's RN-Web
+// target (Expo on :8090 or :8081) and the Next.js BFF dev server
+// (:3045) need cross-origin access to the gateway so Playwright/MCP
+// can drive the actual UI. Native iOS/Android, CLI, MCP, and the
+// Next.js BFF (which calls the gateway server-side) are NOT browser
+// origins and never trigger CORS preflight — they aren't affected.
+//
+// Allowlist-only: when the Origin header doesn't match, no CORS
+// headers are added and the browser blocks the response. No wildcard
+// is supported because we send Access-Control-Allow-Credentials: true
+// (browsers reject `*` + credentials together).
+const DEFAULT_CORS_ORIGINS = [
+  "http://localhost:3045",
+  "http://localhost:8081",
+  "http://localhost:8090",
+  "http://127.0.0.1:3045",
+  "http://127.0.0.1:8081",
+  "http://127.0.0.1:8090"
+];
+
+function allowedOrigins(): string[] {
+  const raw = process.env.GINI_CORS_ORIGINS;
+  if (raw === undefined) return DEFAULT_CORS_ORIGINS;
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function corsOriginFor(request: Request): string | undefined {
+  const origin = request.headers.get("origin");
+  if (!origin) return undefined;
+  return allowedOrigins().includes(origin) ? origin : undefined;
+}
+
+// Wrap any Response with the CORS allow-origin headers when the
+// caller's Origin matches the allowlist. Returns the response
+// untouched for non-browser callers (no Origin header) so curl/CLI
+// behavior is preserved. Errors (4xx/5xx) and SSE responses are also
+// CORS-stamped so the browser surfaces the real status to JS rather
+// than collapsing to a network error.
+function withCors(request: Request, response: Response): Response {
+  const origin = corsOriginFor(request);
+  if (!origin) return response;
+  const headers = new Headers(response.headers);
+  headers.set("Access-Control-Allow-Origin", origin);
+  headers.set("Access-Control-Allow-Credentials", "true");
+  headers.set("Vary", "Origin");
+  headers.set("Access-Control-Expose-Headers", "Last-Event-ID");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+// Preflight short-circuits the normal route matcher: the browser
+// asks "may I send a <method> with these headers?" and expects a 204
+// without auth (the actual GET/POST still requires the bearer).
+function preflightResponse(request: Request): Response {
+  const headers = new Headers();
+  const origin = corsOriginFor(request);
+  if (origin) {
+    headers.set("Access-Control-Allow-Origin", origin);
+    headers.set("Access-Control-Allow-Credentials", "true");
+    headers.set("Vary", "Origin");
+    headers.set("Access-Control-Expose-Headers", "Last-Event-ID");
+  }
+  headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Device-Token, Last-Event-ID, Accept");
+  headers.set("Access-Control-Max-Age", "600");
+  return new Response(null, { status: 204, headers });
 }
 
 // Strict parse for Telegram chat_id values on the allow/deny endpoints.

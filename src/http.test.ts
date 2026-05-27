@@ -2360,6 +2360,132 @@ describe("runtime api", () => {
       expect(del.status).toBe(401);
     });
   });
+
+  describe("cors", () => {
+    // Save/restore the env override so individual cases don't leak.
+    function withEnv(value: string | undefined, fn: () => Promise<void>): Promise<void> {
+      const prior = process.env.GINI_CORS_ORIGINS;
+      if (value === undefined) delete process.env.GINI_CORS_ORIGINS;
+      else process.env.GINI_CORS_ORIGINS = value;
+      return fn().finally(() => {
+        if (prior === undefined) delete process.env.GINI_CORS_ORIGINS;
+        else process.env.GINI_CORS_ORIGINS = prior;
+      });
+    }
+
+    test("preflight from an allowed origin returns 204 with CORS headers", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-preflight-allowed");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          method: "OPTIONS",
+          headers: {
+            origin: "http://localhost:8090",
+            "access-control-request-method": "GET",
+            "access-control-request-headers": "authorization"
+          }
+        }));
+        expect(response.status).toBe(204);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:8090");
+        expect(response.headers.get("access-control-allow-credentials")).toBe("true");
+        expect(response.headers.get("vary")).toBe("Origin");
+        expect(response.headers.get("access-control-allow-methods")).toContain("GET");
+        expect(response.headers.get("access-control-allow-methods")).toContain("POST");
+        expect(response.headers.get("access-control-allow-headers") ?? "").toContain("Authorization");
+        expect(response.headers.get("access-control-allow-headers") ?? "").toContain("X-Device-Token");
+        expect(response.headers.get("access-control-allow-headers") ?? "").toContain("Last-Event-ID");
+        expect(response.headers.get("access-control-max-age")).toBe("600");
+      });
+    });
+
+    test("preflight from a disallowed origin returns 204 without allow-origin", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-preflight-disallowed");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          method: "OPTIONS",
+          headers: {
+            origin: "http://evil.example.com",
+            "access-control-request-method": "GET"
+          }
+        }));
+        expect(response.status).toBe(204);
+        expect(response.headers.get("access-control-allow-origin")).toBeNull();
+        // The protocol-level headers still go out — they describe what
+        // the server *would* accept; the browser rejects because of the
+        // missing allow-origin.
+        expect(response.headers.get("access-control-allow-methods")).toContain("GET");
+      });
+    });
+
+    test("normal GET from an allowed origin gets CORS headers", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-get-allowed");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: {
+            origin: "http://localhost:3045",
+            authorization: `Bearer ${config.token}`
+          }
+        }));
+        expect(response.status).toBe(200);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:3045");
+        expect(response.headers.get("access-control-allow-credentials")).toBe("true");
+        expect(response.headers.get("vary")).toBe("Origin");
+        expect(response.headers.get("access-control-expose-headers")).toBe("Last-Event-ID");
+      });
+    });
+
+    test("non-browser caller without Origin gets no CORS headers", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-no-origin");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: { authorization: `Bearer ${config.token}` }
+        }));
+        expect(response.status).toBe(200);
+        expect(response.headers.get("access-control-allow-origin")).toBeNull();
+        expect(response.headers.get("vary")).toBeNull();
+      });
+    });
+
+    test("401 responses still carry CORS headers so the browser sees the status", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-401");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: { origin: "http://localhost:8090" } // no Authorization
+        }));
+        expect(response.status).toBe(401);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:8090");
+      });
+    });
+
+    test("GINI_CORS_ORIGINS env var overrides the default allowlist", async () => {
+      await withEnv("https://example.com", async () => {
+        const config = testConfig("cors-custom-env");
+        const handler = createHandler(config);
+
+        const allowed = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: {
+            origin: "https://example.com",
+            authorization: `Bearer ${config.token}`
+          }
+        }));
+        expect(allowed.headers.get("access-control-allow-origin")).toBe("https://example.com");
+
+        // The defaults (localhost:8090, etc) should NOT be honored when
+        // the env var is set — it's a full override, not an additive list.
+        const denied = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: {
+            origin: "http://localhost:8090",
+            authorization: `Bearer ${config.token}`
+          }
+        }));
+        expect(denied.headers.get("access-control-allow-origin")).toBeNull();
+      });
+    });
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
