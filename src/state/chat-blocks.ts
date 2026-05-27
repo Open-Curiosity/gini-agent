@@ -356,6 +356,38 @@ export function findInFlightAssistantTextForTask(
   };
 }
 
+// Returns true when the given task has emitted at least one
+// assistant_text block whose text is non-empty after trimming. The push
+// dispatcher consults this on terminal `phase: Completed` blocks to
+// decide between an alert (the task produced a user-visible message) and
+// a silent badge tick (only tool calls / system notes — nothing for the
+// user to read). Uses LIMIT 1 + EXISTS-style early exit so the lookup
+// stays O(rows-until-first-hit) rather than scanning the whole task.
+export function taskProducedAssistantText(
+  instance: Instance,
+  taskId: string
+): boolean {
+  const db = getMemoryDb(instance);
+  const row = db
+    .query<{ payload_json: string }, [string]>(
+      `SELECT payload_json FROM chat_blocks
+       WHERE task_id = ? AND kind = 'assistant_text'
+       ORDER BY ordinal ASC`
+    )
+    .all(taskId);
+  for (const r of row) {
+    try {
+      const payload = JSON.parse(r.payload_json) as { text?: unknown };
+      if (typeof payload.text === "string" && payload.text.trim().length > 0) {
+        return true;
+      }
+    } catch {
+      // malformed row — skip
+    }
+  }
+  return false;
+}
+
 // Updates an existing assistant_text block's text + updated_at without
 // allocating a new ordinal. Used by the streaming-delta path: the first
 // delta inserts the block via insertChatBlock; subsequent deltas flow

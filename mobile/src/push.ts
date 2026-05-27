@@ -82,10 +82,15 @@ export type {
 // Foreground presentation rule. Silent (content-available) pushes
 // must never surface a banner or play a sound — the badge update is
 // what they're for, and we manage that explicitly via refreshBadge
-// rather than letting APS set it. Alert payloads (currently the
-// approval_requested flow) keep their banner so the user notices the
-// prompt without unlocking the device. Setting this once at module
+// rather than letting APS set it. Alert payloads (approval_requested
+// and message_completed) keep their banner so the user notices the
+// signal without unlocking the device. Setting this once at module
 // load means every received notification is classified at delivery.
+//
+// The classifier branches explicitly on `silent === false` for the
+// alert path — anything else (silent === true, missing, malformed)
+// defaults to the silent presentation. That keeps a future malformed
+// payload from accidentally banner-ing the user in foreground.
 Notifications.setNotificationHandler({
   handleNotification: async (notification) => {
     // expo-notifications surfaces the remote `userInfo["body"]` object
@@ -94,25 +99,25 @@ Notifications.setNotificationHandler({
     // boolean `silent` discriminator inside `body` so the client can
     // classify without depending on aps internals.
     const data = notification.request.content.data as { silent?: unknown } | undefined;
-    const isSilent = data?.silent === true;
-    if (isSilent) {
+    const isAlert = data?.silent === false;
+    if (isAlert) {
       return {
-        shouldShowAlert: false,
-        shouldPlaySound: false,
+        shouldShowAlert: true,
+        shouldPlaySound: true,
         shouldSetBadge: false,
-        // SDK 54's NotificationBehavior added the banner / list flags
-        // alongside shouldShowAlert; the older field is preserved for
-        // back-compat but the new ones are what iOS actually reads.
-        shouldShowBanner: false,
-        shouldShowList: false
+        shouldShowBanner: true,
+        shouldShowList: true
       };
     }
     return {
-      shouldShowAlert: true,
-      shouldPlaySound: true,
+      shouldShowAlert: false,
+      shouldPlaySound: false,
       shouldSetBadge: false,
-      shouldShowBanner: true,
-      shouldShowList: true
+      // SDK 54's NotificationBehavior added the banner / list flags
+      // alongside shouldShowAlert; the older field is preserved for
+      // back-compat but the new ones are what iOS actually reads.
+      shouldShowBanner: false,
+      shouldShowList: false
     };
   }
 });

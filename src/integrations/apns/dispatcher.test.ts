@@ -9,7 +9,12 @@
 //     the token in place — operator may recover the configuration
 
 import { describe, expect, test } from "bun:test";
-import { buildApprovalPayload, buildPhaseSilentPayload, createApnsDispatcher } from "./dispatcher";
+import {
+  buildApprovalPayload,
+  buildMessageCompletedPayload,
+  buildPhaseSilentPayload,
+  createApnsDispatcher
+} from "./dispatcher";
 import type { APNsClient, APNsPayload, APNsSendOptions, APNsSendResult } from "./client";
 import type { ChatBlock, Instance } from "../../types";
 import type { PushDevice } from "../../state";
@@ -383,6 +388,213 @@ describe("apns dispatcher", () => {
     expect(wire.body.sessionId).toBe("chat_x");
     expect(wire.body.blockId).toBe("b1");
     expect(wire.body.silent).toBe(true);
+  });
+
+  test("Completed phase with assistant_text fires an alert push (message_completed)", async () => {
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      isWatching: () => false,
+      // Task produced a user-visible assistant message → alert path.
+      hasAssistantText: (_inst, taskId) => taskId === "task_with_text",
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_with_text"
+    });
+
+    expect(calls.length).toBe(1);
+    const call = calls[0]!;
+    // Alert push, not background — the user gets a banner.
+    expect(call.opts.pushType).toBe("alert");
+    expect(call.opts.priority).toBe(10);
+    expect(call.opts.collapseId).toBe("chat_xyz");
+    const aps = call.payload.aps as Record<string, unknown>;
+    const alert = aps.alert as Record<string, unknown>;
+    expect(alert.title).toBe("Gini has a new message");
+    expect(alert.body).toBe("Tap to read");
+    expect(aps.sound).toBe("default");
+    expect(aps["thread-id"]).toBe("chat_xyz");
+    expect(aps["mutable-content"]).toBe(1);
+    // No category id — these notifications only carry a tap action.
+    expect(aps.category).toBeUndefined();
+    const body = call.payload.body as Record<string, unknown>;
+    expect(body.event).toBe("message_completed");
+    expect(body.sessionId).toBe("chat_xyz");
+    expect(body.blockId).toBe("block_phase_done");
+    expect(body.silent).toBe(false);
+    dispatcher.stop();
+  });
+
+  test("Completed phase without assistant_text falls back to silent push", async () => {
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      isWatching: () => false,
+      // Task ran tools but produced no user-visible message → silent path.
+      hasAssistantText: () => false,
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_tools_only"
+    });
+
+    expect(calls.length).toBe(1);
+    const call = calls[0]!;
+    expect(call.opts.pushType).toBe("background");
+    expect(call.opts.priority).toBe(5);
+    const aps = call.payload.aps as Record<string, unknown>;
+    expect(aps["content-available"]).toBe(1);
+    expect(aps.alert).toBeUndefined();
+    const body = call.payload.body as Record<string, unknown>;
+    expect(body.event).toBe("phase_completed");
+    expect(body.silent).toBe(true);
+    dispatcher.stop();
+  });
+
+  test("Failed phase stays silent even when assistant_text exists", async () => {
+    // A failed task may have emitted partial assistant text before
+    // crashing, but failure noise shouldn't yell at the user. The badge
+    // tick is enough; opening the chat surfaces the error.
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      isWatching: () => false,
+      hasAssistantText: () => true,
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_fail",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 11,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Failed",
+      taskId: "task_with_text"
+    });
+
+    expect(calls.length).toBe(1);
+    const call = calls[0]!;
+    expect(call.opts.pushType).toBe("background");
+    const body = call.payload.body as Record<string, unknown>;
+    expect(body.event).toBe("phase_failed");
+    expect(body.silent).toBe(true);
+    dispatcher.stop();
+  });
+
+  test("alert completion push is suppressed when THIS device is watching", async () => {
+    // Per-device suppression must apply to alerts the same way it
+    // applies to silents — if the user is foregrounded on the chat over
+    // SSE, the block is already on its way down the stream.
+    const { client, calls } = buildFakeClient();
+    const watchingDevices = new Set(["tok_iphone_a"]);
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [
+        buildDevice({ token: "tok_iphone_a", credentialId: "owner" }),
+        buildDevice({ token: "tok_iphone_b", credentialId: "owner" })
+      ],
+      isWatching: (_inst, tok, sess) =>
+        watchingDevices.has(tok) && sess === "chat_xyz",
+      hasAssistantText: () => true,
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_with_text"
+    });
+
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.token).toBe("tok_iphone_b");
+    expect(calls[0]!.opts.pushType).toBe("alert");
+    dispatcher.stop();
+  });
+
+  test("Completed phase with no taskId falls back to silent (conservative)", async () => {
+    // Without a taskId we can't look up assistant_text history, so the
+    // safer default is silent. This keeps pre-task-binding callers and
+    // any edge-case emitters from spuriously banner-ing the user.
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      isWatching: () => false,
+      hasAssistantText: () => {
+        throw new Error("must not be called when taskId is absent");
+      },
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed"
+    });
+
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.opts.pushType).toBe("background");
+    dispatcher.stop();
+  });
+
+  test("buildMessageCompletedPayload omits any user-authored content", () => {
+    // Privacy assertion: the wire payload for a completion alert must
+    // carry only routing ids and the generic title. No assistant text,
+    // no tool output, nothing user-visible.
+    const payload = buildMessageCompletedPayload({
+      id: "b1",
+      sessionId: "chat_x",
+      instance: "test-inst" as Instance,
+      ordinal: 1,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed",
+      taskId: "task_x"
+    });
+    const wire = JSON.stringify(payload);
+    // Defensive: a sample of strings that must never leak into push
+    // payloads. If a future change starts forwarding chat text, these
+    // assertions catch it.
+    expect(wire).not.toContain("task_x");
+    expect(wire).not.toContain("Hello"); // common assistant lead-in
+    expect(wire).not.toContain("user_text");
+    // Routing fields surface as expected.
+    const body = payload.body as Record<string, unknown>;
+    expect(body.sessionId).toBe("chat_x");
+    expect(body.blockId).toBe("b1");
+    expect(body.event).toBe("message_completed");
+    expect(body.silent).toBe(false);
   });
 
   test("buildApprovalPayload produces a stable, privacy-safe shape", () => {

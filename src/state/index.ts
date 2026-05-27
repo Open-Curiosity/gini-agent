@@ -83,6 +83,7 @@ export {
   listChatBlocksAfter,
   deleteChatBlocksForSession,
   findInFlightAssistantTextForTask,
+  taskProducedAssistantText,
   getLatestMessagesBySession,
   subscribeChatBlocks,
   subscribeAllChatBlocks

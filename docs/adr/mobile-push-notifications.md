@@ -79,16 +79,24 @@ The chosen design uses two transports in concert:
 | Event | Push | Rationale |
 | ----- | ---- | --------- |
 | `approval_requested` | Always (alert + inline actions) | The runtime can't make progress without user input; the user may not be in the app. |
-| `phase: Completed` | Silent, only if no active SSE subscription for the credential | If the user is on the chat detail, SSE delivers the block directly; the wake-up is redundant. |
-| `phase: Failed` | Silent, only if no active SSE subscription | Same as Completed. |
+| `phase: Completed` AND the task emitted ≥1 non-empty `assistant_text` | Alert ("Gini has a new message" / "Tap to read"), only if no active SSE subscription for the device | Background and scheduled work that produces a real reply is exactly what the user wants to know about. |
+| `phase: Completed` with no `assistant_text` (only tool calls / system notes) | Silent (badge tick), only if no active SSE subscription | Nothing for the user to read — bump the badge so the chat list is accurate, but don't surface a banner. |
+| `phase: Failed` | Silent (badge tick), only if no active SSE subscription | Failure noise shouldn't yell at the user; tapping the chat surfaces the error. |
 | `phase: Cancelled` | Never | User-initiated terminal state; the user is already in the app. |
 | `assistant_text` deltas | Never | Streaming text is for the SSE path only — APNs is the wrong tool. |
 | All other block kinds | Never | Out of scope; the next foreground reconciliation picks them up. |
 
+The `message_completed` alert payload carries the same routing fields
+as the silent variant (`sessionId`, `blockId`, `event: "message_completed"`,
+`silent: false`) plus a generic `aps.alert` envelope. No `category` is
+attached — the only action is the default tap, which deep-links to the
+chat detail via the existing response listener.
+
 The "no active subscription" check is per-device, not per-credential:
 two iOS installs of the same human can be in different app states
 (one watching, one backgrounded). The backgrounded install still gets
-the silent wake to update its badge.
+the wake-up (alert or silent) so its badge and visible state stay in
+sync.
 
 ## NSE + category model
 
