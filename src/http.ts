@@ -90,6 +90,19 @@ function readWebPort(instance: string): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+async function isSupervisedWebChild(instance: string, port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/runtime/__healthz`, {
+      signal: AbortSignal.timeout(1500)
+    });
+    if (!res.ok) return false;
+    const body = (await res.json()) as { service?: unknown; instance?: unknown };
+    return body.service === "gini-web" && body.instance === instance;
+  } catch {
+    return false;
+  }
+}
+
 export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
@@ -110,6 +123,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         if (payload.enabled) {
           const port = readWebPort(config.instance);
           if (!port) return json({ error: "Web port unknown; start `gini run` first." }, 409);
+          // Symmetric with the boot reconcile in src/server.ts — probe
+          // /__healthz on the candidate port and verify the response
+          // identifies the supervised Next.js child by instance name
+          // before exposing the port via cloudflared. Without this a
+          // stale web.port file (e.g., from a partially-cleaned previous
+          // run) or a port-squat from an unrelated local process would
+          // be published to the public URL.
+          const healthy = await isSupervisedWebChild(config.instance, port);
+          if (!healthy) {
+            return json({ error: "Web port not healthy. Check `gini status` and retry." }, 409);
+          }
           const result = await mgr.enable(port);
           if (!result.ok) return json({ error: result.error }, 500);
         } else {

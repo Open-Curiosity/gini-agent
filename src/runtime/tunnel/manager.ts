@@ -67,6 +67,11 @@ class TunnelManager {
     // idempotent — subsequent boots see the existing block and skip the
     // rewrite, so config.json's mtime doesn't leak enable history.
     const persisted = ensureTunnelConfig(config.instance);
+    // Stale publicUrl from a previous boot becomes invalid the moment
+    // cloudflared rotates hostnames on restart. Remove on construction so
+    // the proxy can't equality-match against a host that no cloudflared
+    // process is actually serving.
+    try { unlinkSync(publicUrlPath(config.instance)); } catch { /* may not exist */ }
     this.snapshot = {
       enabled: persisted.enabled,
       secret: persisted.secret,
@@ -162,8 +167,19 @@ class TunnelManager {
             appendLog(this.config.instance, "tunnel.publicUrl.write-error", { error: redact(writeMsg) });
           }
           appendLog(this.config.instance, "tunnel.enabled", { generation: this.generation });
-          // Fire Notes refresh asynchronously when enabled.
-          if (this.snapshot.appleNotes.enabled) void this.refreshNotes();
+          // Fire-and-forget Notes refresh OUTSIDE the apply chain. Enqueuing
+          // refreshNotes here would put a 15s osascript timeout ahead of a
+          // follow-up disable() in the apply chain, defeating PLAN.md's
+          // 5000ms exposure cap on disable. The bare `runRefreshNotes()`
+          // call updates `this.snapshot` and `this.notesAvailable` outside
+          // the queue — that's acceptable because the only field touched
+          // (`appleNotes.lastError` / `appleNotes.notesAvailable`) doesn't
+          // gate any tunnel-transition decision, and a concurrent disable
+          // that flips the snapshot's other fields won't be clobbered (the
+          // Notes path only writes the `appleNotes` sub-object).
+          if (this.snapshot.appleNotes.enabled) {
+            void this.runRefreshNotes().catch(() => { /* surfaced in appleNotes.lastError */ });
+          }
         } catch (err) {
           // Banner-parse failure or process exit — the subprocess may still be
           // running. Calling launch.stop() here closes the orphan window
@@ -369,17 +385,21 @@ class TunnelManager {
     }
   }
 
-  /** Stop cloudflared as part of gateway shutdown. Does not modify config. */
+  /** Stop cloudflared as part of gateway shutdown. Does not modify config.
+   *  The publicUrl sibling file is unlinked BEFORE we await cloudflared.stop()
+   *  because the SIGTERM drain is bounded at 5000 ms — if cloudflared
+   *  termination overruns the cap, `process.exit(0)` fires and an
+   *  unlinkSync queued after the await would never run. The proxy reads
+   *  the file per-request; removing it first means a fresh boot can't
+   *  classify Host against the stale URL even if cloudflared is still
+   *  exiting in the background. */
   async stopForShutdown(): Promise<void> {
+    try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
     if (this.cloudflared) {
       const prev = this.cloudflared;
       this.cloudflared = null;
       await prev.stop();
     }
-    // The hostname rotates on every restart; the persisted URL is invalid
-    // after gateway exit. Remove it so the next boot's proxy doesn't equality-
-    // match against a stale host.
-    try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
   }
 
   private notesNoteName(): string {

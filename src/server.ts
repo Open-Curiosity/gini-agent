@@ -80,6 +80,14 @@ tunnelManager(config);
               await Bun.sleep(500);
               continue;
             }
+            // Re-check the persisted state AFTER the probe — the 1500ms
+            // probe window is long enough that a disable can race in
+            // between the prior check and the actual enable() call.
+            const stillEnabled = readTunnelConfig(config.instance).enabled;
+            if (!stillEnabled) {
+              appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "disabled-after-probe" });
+              return;
+            }
             const result = await tunnelManager(config).enable(port);
             appendLog(config.instance, "tunnel.boot-reconcile", { ok: result.ok });
             return;
