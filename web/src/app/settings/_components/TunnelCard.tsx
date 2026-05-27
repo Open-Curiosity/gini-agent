@@ -119,22 +119,21 @@ export function TunnelCard() {
               type="button"
               onClick={() => setQrRevealed((r) => !r)}
               aria-label={qrRevealed ? "Hide tunnel QR" : "Reveal tunnel QR"}
-              className="relative h-48 w-48 overflow-hidden rounded border bg-white p-2 transition hover:opacity-90"
+              className="group relative h-48 w-48 overflow-hidden rounded border bg-white p-2"
               data-testid="tunnel-qr-reveal-toggle"
             >
-              {qrRevealed ? (
-                <img
-                  src={`/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(data?.secretRevision ?? "")}`}
-                  alt="Tunnel QR"
-                  className="h-full w-full"
-                  data-testid="tunnel-settings-qr"
-                />
-              ) : (
-                <div className="flex h-full w-full flex-col items-center justify-center gap-2 bg-muted text-muted-foreground">
-                  <EyeOff className="h-8 w-8" />
-                  <span className="text-xs">Click to reveal</span>
+              <img
+                src={`/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(data?.secretRevision ?? "")}`}
+                alt="Tunnel QR"
+                className={`h-full w-full transition duration-200 ${qrRevealed ? "blur-0" : "blur-md"}`}
+                data-testid="tunnel-settings-qr"
+              />
+              {!qrRevealed ? (
+                <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-1 bg-background/60 text-foreground backdrop-blur-sm transition group-hover:bg-background/70">
+                  <EyeOff className="h-6 w-6" />
+                  <span className="text-xs font-medium">Click to reveal</span>
                 </div>
-              )}
+              ) : null}
             </button>
             <div className="space-y-2 text-sm">
               <div>
