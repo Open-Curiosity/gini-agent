@@ -2695,17 +2695,35 @@ async function requestMessagingBridgeTool(
   }
 
   const rawKind = typeof args.kind === "string" ? args.kind.trim().toLowerCase() : "";
-  if (rawKind !== "telegram" && rawKind !== "discord") {
+  // The chat card collects only name + bot token; Discord bridges
+  // need a deliveryTargets channel-ID list that the card doesn't
+  // surface, so an "add a discord bridge from chat" approval would
+  // be unactionable (settings dialog + CLI are the only paths that
+  // collect channel IDs). The catalog enum restricts kind to
+  // "telegram", but the model can violate the schema; refuse here
+  // with a clear message that points the user at the right surface
+  // so the agent can fall back to plain text instead of minting a
+  // dead-end approval card.
+  if (rawKind === "discord") {
     return {
       kind: "sync",
       result: JSON.stringify({
         ok: false,
-        error: `request_messaging_bridge requires kind: "telegram" or "discord" (got ${JSON.stringify(args.kind)}).`
+        error: "request_messaging_bridge cannot add a Discord bridge from chat: the card does not collect the required channel-IDs list. Tell the user to open the settings page and click \"Add Discord\" there."
       })
     };
   }
-  const kind = rawKind as "telegram" | "discord";
-  const kindLabel = kind === "telegram" ? "Telegram" : "Discord";
+  if (rawKind !== "telegram") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `request_messaging_bridge requires kind: "telegram" (got ${JSON.stringify(args.kind)}).`
+      })
+    };
+  }
+  const kind = "telegram" as const;
+  const kindLabel = "Telegram";
   const suggestedName = typeof args.suggestedName === "string" && args.suggestedName.trim().length > 0
     ? args.suggestedName.trim()
     : `my-${kind}-bot`;

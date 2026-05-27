@@ -726,9 +726,37 @@ describe("request_connector dispatch", () => {
       const parsed = JSON.parse(result.result);
       expect(parsed.ok).toBe(false);
       expect(parsed.error).toContain("telegram");
-      expect(parsed.error).toContain("discord");
     }
     // No approval row should have been minted on the failure path.
+    const state = readState(instance);
+    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+  });
+
+  test("request_messaging_bridge: rejects kind=discord with a points-to-settings error", async () => {
+    // The catalog enum already restricts kind to telegram, but the
+    // model can violate the schema. The chat card collects only
+    // name + bot token, while Discord bridges need a deliveryTargets
+    // channel-IDs list — so a discord-kind approval would render but
+    // /connect would fail with no way for the user to provide the
+    // missing field. Refuse here and point the user at the settings
+    // page so the agent can fall back to plain text.
+    const instance = `req-messaging-bridge-discord-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_messaging_bridge",
+      "call_bridge_discord",
+      JSON.stringify({ kind: "discord" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("Discord");
+      expect(parsed.error).toContain("settings page");
+    }
     const state = readState(instance);
     expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
   });
