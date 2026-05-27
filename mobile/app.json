@@ -4,6 +4,7 @@
     "slug": "gini-mobile",
     "version": "0.0.1",
     "orientation": "portrait",
+    "icon": "./assets/icon.png",
     "scheme": "gini",
     "userInterfaceStyle": "automatic",
     "runtimeVersion": {
@@ -23,6 +24,7 @@
     "android": {
       "package": "ai.lilaclabs.gini.mobile",
       "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
         "backgroundColor": "#ffffff"
       }
     },
