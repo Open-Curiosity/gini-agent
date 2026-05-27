@@ -873,7 +873,13 @@ function isBlockedIpv6(host: string): string | undefined {
 // Exported for direct unit testing in src/tools/browser.test.ts.
 // Returns undefined when the URL is allowed; otherwise a human-readable
 // reason starting with "Blocked:" or "Invalid URL:".
-export function safetyCheck(rawUrl: string): string | undefined {
+// `allowLoopback` opts out of the loopback block for callers that
+// LEGITIMATELY need loopback access. The browser-connect CDP path
+// uses this — the runtime connects to a local Chrome over CDP
+// (always 127.0.0.1:9222 or similar), and that's exactly the
+// loopback target the SSRF block was added to refuse for agent
+// navigation. Two intents, one validator.
+export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean } = {}): string | undefined {
   // Run the secret-pattern scan against the raw input *before* attempting
   // to parse the URL. A malformed-but-secret-bearing input would otherwise
   // fall through to the `Invalid URL: ${rawUrl}` branch and leak the token
@@ -907,28 +913,51 @@ export function safetyCheck(rawUrl: string): string | undefined {
     return `Blocked: only http(s) URLs are allowed (got ${parsed.protocol}).`;
   }
   // Strip IPv6 brackets so the comparisons below see the bare host.
-  const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (BLOCKED_HOSTNAMES.has(host)) {
-    // Distinguish the loopback / metadata buckets in the error
-    // message so an operator debugging a blocked navigation knows
-    // why. The buckets are merged in BLOCKED_HOSTNAMES for cheap
-    // lookup; classify by host string for the error.
-    if (host === "127.0.0.1" || host === "0.0.0.0" || host === "localhost" || host === "::1") {
-      return `Blocked: ${host} is a loopback address; the agent's browser may not reach the local BFF / runtime.`;
-    }
-    return `Blocked: ${host} is a cloud metadata endpoint.`;
-  }
-  // Loopback /8 (127.0.0.0/8 — anything 127.x.y.z, not just 127.0.0.1)
-  // and *.localhost (RFC 6761) — same rationale as the literal
-  // 127.0.0.1 entry.
-  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || host.endsWith(".localhost")) {
+  // Also strip a trailing dot — DNS roots are written with a trailing
+  // "." (e.g. "localhost." or "127.0.0.1.") and resolvers treat them
+  // as equivalent to the dotless form. Without the strip,
+  // host.endsWith(".localhost") would miss "localhost.", letting a
+  // crafted URL bypass the loopback block.
+  const host = parsed.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  const loopbackHosts = new Set(["127.0.0.1", "0.0.0.0", "localhost", "::1"]);
+  if (loopbackHosts.has(host) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || host.endsWith(".localhost")) {
+    if (options.allowLoopback) return undefined;
     return `Blocked: ${host} is a loopback address; the agent's browser may not reach the local BFF / runtime.`;
+  }
+  if (BLOCKED_HOSTNAMES.has(host)) {
+    // Loopback entries are handled above; what reaches here is
+    // cloud-metadata. (BLOCKED_HOSTNAMES still includes the loopback
+    // entries so they get blocked even when the explicit-literal path
+    // above misses an oddity, but the messaging here is cosmetic.)
+    return `Blocked: ${host} is a cloud metadata endpoint.`;
   }
   if (isLinkLocal(host)) {
     return `Blocked: ${host} is a link-local address.`;
   }
   const ipv6Block = isBlockedIpv6(host);
-  if (ipv6Block) return ipv6Block;
+  if (ipv6Block) {
+    // The IPv4-mapped IPv6 forms are loopback iff the decoded IPv4
+    // is loopback — but isBlockedIpv6 only matches metadata + link-
+    // local IPv4. Decode again here for the loopback case so
+    // [::7f00:1] (deprecated IPv4-compat for 127.0.0.1) doesn't
+    // bypass the loopback block.
+    return ipv6Block;
+  }
+  // Deprecated IPv4-compatible IPv6 form `::wwxx:yyzz` decodes to
+  // IPv4 a.b.c.d where (a<<8|b) = wwxx and (c<<8|d) = yyzz. Bun
+  // normalizes [::127.0.0.1] to [::7f00:1], so the explicit-literal
+  // path above never sees the loopback form. Reclassify the decoded
+  // IPv4 and reuse the loopback check.
+  const compatHex = /^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(host);
+  if (compatHex) {
+    const high = parseInt(compatHex[1]!, 16);
+    const low = parseInt(compatHex[2]!, 16);
+    const ipv4 = `${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`;
+    if (loopbackHosts.has(ipv4) || /^127\./.test(ipv4)) {
+      if (options.allowLoopback) return undefined;
+      return `Blocked: ${host} maps to ${ipv4}, a loopback address.`;
+    }
+  }
   return undefined;
 }
 

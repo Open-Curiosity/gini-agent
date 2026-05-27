@@ -87,6 +87,40 @@ describe("browser safetyCheck", () => {
     expect(safetyCheck("https://example.com/")).toBeUndefined();
   });
 
+  test("trailing-dot bypass: localhost. / 127.0.0.1. are still loopback", () => {
+    // DNS roots can be written with a trailing "." and resolvers
+    // treat them as equivalent to the dotless form. Without the
+    // strip, endsWith(".localhost") would miss "localhost.", and the
+    // BLOCKED_HOSTNAMES literal check would miss "127.0.0.1.".
+    for (const url of ["http://localhost./api", "http://127.0.0.1./api"]) {
+      const result = safetyCheck(url);
+      expect(result).toBeDefined();
+      expect(result).toContain("loopback");
+    }
+  });
+
+  test("IPv4-compat IPv6 hex loopback bypass: [::7f00:1] decodes to 127.0.0.1", () => {
+    // Bun's URL parser normalizes [::127.0.0.1] to [::7f00:1] (hex
+    // IPv4-compat), so the literal-match path never sees the dotted
+    // form. The hex decoder must recognize it.
+    const result = safetyCheck("http://[::7f00:1]/");
+    expect(result).toBeDefined();
+    expect(result).toContain("loopback");
+  });
+
+  test("allowLoopback opts out of the loopback block for CDP-style callers", () => {
+    // browser-connect attaches over CDP to a local Chrome. The CDP
+    // endpoint is always loopback by design — refusing it would
+    // break legitimate browser attach. Pin that the opt-out works
+    // for representative loopback variants but the OTHER blocks
+    // (metadata, link-local) still fire.
+    expect(safetyCheck("http://127.0.0.1:9222/", { allowLoopback: true })).toBeUndefined();
+    expect(safetyCheck("http://localhost:9222/", { allowLoopback: true })).toBeUndefined();
+    expect(safetyCheck("http://[::1]:9222/", { allowLoopback: true })).toBeUndefined();
+    // Metadata IP is NOT loopback — still blocked even with the opt-out.
+    expect(safetyCheck("http://169.254.169.254/", { allowLoopback: true })).toBeDefined();
+  });
+
   test("blocks loopback navigation (BFF / runtime SSRF surface)", () => {
     // The BFF's catch-all /api/runtime/* proxy injects the runtime
     // bearer for safe-method loopback requests, so an agent that
