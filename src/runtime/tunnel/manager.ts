@@ -4,7 +4,7 @@ import { setRedactionPublicUrl, setRedactionSecret, redact } from "./redact";
 import { launchCloudflared, type CloudflaredLaunch } from "./cloudflared";
 import { probeNotesAvailable, writeNote, clearNote } from "./apple-notes";
 import { ensureTunnelConfig, patchTunnelConfig, readTunnelConfig } from "./config-store";
-import { atomicWriteFile } from "./atomic-write";
+import { atomicWriteFile } from "../../atomic-write";
 import { generateTunnelSecret, secretRevision } from "./secret";
 import { instanceRoot } from "../../paths";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";

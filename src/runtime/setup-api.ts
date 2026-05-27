@@ -43,7 +43,7 @@
 // child's responsibility.
 
 import { writeFileSync } from "node:fs";
-import { configPath } from "../paths";
+import { configPath, writeRuntimeConfig } from "../paths";
 import { hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
@@ -131,7 +131,7 @@ export async function setSetupProvider(
       ? payload.model
       : (config.provider?.name === "openai" && config.provider.model ? config.provider.model : "gpt-5.4-mini");
     config.provider = normalizeProvider({ name: "openai", model });
-    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeRuntimeConfig(config);
 
     // Request plist refresh via a marker file + SIGTERM. A simpler
     // approach (setImmediate → setTimeout(200ms) → detached spawn)

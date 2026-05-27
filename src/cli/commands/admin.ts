@@ -9,7 +9,7 @@ import type { RuntimeConfig } from "../../types";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
-import { configPath, loadConfig, parseInstance } from "../../paths";
+import { configPath, loadConfig, parseInstance, writeRuntimeConfig } from "../../paths";
 import {
   awaitForegroundLogFlush,
   doctor,
@@ -89,7 +89,7 @@ export async function install_(ctx: CliContext): Promise<void> {
       model,
       apiKeyEnv: envProvider === "openai" ? "OPENAI_API_KEY" : undefined
     };
-    writeFileSync(configPath(instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeRuntimeConfig(config);
   } else if (envModel !== undefined && config.provider) {
     // Asymmetry fix: fresh configs honor GINI_MODEL alone via
     // defaultConfig(), but the existing-config branch above only fires
@@ -98,7 +98,7 @@ export async function install_(ctx: CliContext): Promise<void> {
     // current provider name and apiKeyEnv untouched so a stale
     // OPENAI_API_KEY value (or absence) survives the rewrite.
     config.provider = { ...config.provider, model: envModel };
-    writeFileSync(configPath(instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeRuntimeConfig(config);
   }
   await install(config);
   print({ installed: true, instance: config.instance, stateRoot: config.stateRoot, port: config.port });

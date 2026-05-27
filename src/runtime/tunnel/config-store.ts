@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { configPath } from "../../paths";
 import type { Instance } from "../../types";
-import { atomicWriteFile } from "./atomic-write";
+import { atomicWriteFile } from "../../atomic-write";
 import { generateTunnelSecret } from "./secret";
 import type { TunnelPersistedConfig } from "./types";
 
