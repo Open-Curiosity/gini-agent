@@ -100,7 +100,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "openai", model: "gpt-test" });
@@ -263,7 +263,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -402,7 +402,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -478,7 +478,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -578,7 +578,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -629,7 +629,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "openai", model: "gpt-test" });
@@ -684,7 +684,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "openrouter", model: "or-model" });
@@ -741,7 +741,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -788,7 +788,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -833,7 +833,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -875,7 +875,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -918,7 +918,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1008,7 +1008,7 @@ describe("provider", () => {
         id: "resp_summary_empty_tools",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "summary." } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1049,7 +1049,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "{}" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const original = process.env.OPENROUTER_API_KEY;
@@ -1097,7 +1097,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1137,7 +1137,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "{}" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1196,7 +1196,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const original = process.env.OPENAI_API_KEY;
@@ -1251,7 +1251,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const polluted = JSON.parse('{"__proto__":{"model":"hijacked"},"constructor":1,"prototype":2,"chat_template_kwargs":{"x":1}}');
@@ -1303,7 +1303,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       // Skip normalizeProvider so the empty baseUrl actually persists
@@ -1328,7 +1328,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = { name: "openrouter" as const, model: "m", baseUrl: "" };
@@ -1352,7 +1352,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = { name: "openai" as const, model: "m", baseUrl: "" };
@@ -1394,7 +1394,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = { name: "codex" as const, model: "m", baseUrl: "" };
@@ -1424,7 +1424,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1455,7 +1455,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1486,7 +1486,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1705,6 +1705,928 @@ describe("provider", () => {
     const b = extractTextToolCallsFromAssistantText(text, []);
     // Same input → same call id, so retry idempotency holds upstream.
     expect(a.calls[0]?.id).toBe(b.calls[0]?.id);
+  });
+
+  // ----- Codex session-expired retry -----
+  //
+  // The codex /responses backend tears down in-flight requests when the
+  // session token gets rotated out from under us. The fix wraps every
+  // codex call site in a single-shot retry that re-reads ~/.codex/auth.json
+  // (which the codex CLI keeps refreshed) and tries again. These tests
+  // pin every branch of that contract: retry fires on SSE error events,
+  // on response.failed events, on initial 401s, and ONLY on session-
+  // shaped errors — never on generic 5xx, never after partial output.
+
+  test("codex tool-calling retries once when SSE error event arrives before any output", async () => {
+    const { restore } = installCodexAuth("codex-session-retry-error-event");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          if (attempts === 1) {
+            controller.enqueue(enc.encode(
+              `event: error\ndata: ${JSON.stringify({ type: "error", message: "Your ChatGPT session expired before this request finished." })}\n\n`
+            ));
+            controller.close();
+            return;
+          }
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.enqueue(enc.encode("data: [DONE]\n\n"));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex tool-calling does NOT retry when session-expired arrives after onDelta fired", async () => {
+    // Mid-stream rotation can't be transparently retried — the caller has
+    // already received partial output via onDelta and a retry would
+    // double-deliver. Surface the error generically and let the agent
+    // loop decide what to do. The retry guard hinges on onDelta actually
+    // firing, not on internal buffering, so this test wires up a real
+    // onDelta callback to assert that path.
+    const { restore } = installCodexAuth("codex-session-no-retry-after-ondelta");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "partial " })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: error\ndata: ${JSON.stringify({ type: "error", message: "Your ChatGPT session expired before this request finished." })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const deltas: string[] = [];
+      await expect(generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools,
+        (chunk) => deltas.push(chunk)
+      )).rejects.toThrow(/session expired/i);
+      expect(attempts).toBe(1);
+      expect(deltas).toEqual(["partial "]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex tool-calling DOES retry when text was buffered without onDelta", async () => {
+    // Non-streaming caller (no onDelta) never sees mid-stream bytes — the
+    // text only reaches them via the final return value. So a session-
+    // expired event after internal text buffering is safely retryable;
+    // attempt 2's text replaces attempt 1's, no double-delivery occurs.
+    const { restore } = installCodexAuth("codex-session-retry-buffered-text");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          if (attempts === 1) {
+            controller.enqueue(enc.encode(
+              `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "partial " })}\n\n`
+            ));
+            controller.enqueue(enc.encode(
+              `event: error\ndata: ${JSON.stringify({ type: "error", message: "Your ChatGPT session expired before this request finished." })}\n\n`
+            ));
+            controller.close();
+            return;
+          }
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex tool-calling DOES retry when only tool-call args were buffered", async () => {
+    // Function-call argument deltas are never streamed to the caller —
+    // they're accumulated into callsById and only surfaced as part of
+    // ToolCallingResult on success. A session-expired event after such
+    // buffering must still trigger a transparent retry; attempt 2's
+    // tool calls replace attempt 1's, no double-delivery occurs.
+    const { restore } = installCodexAuth("codex-session-retry-buffered-tool-call");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          if (attempts === 1) {
+            controller.enqueue(enc.encode(
+              `event: response.output_item.added\ndata: ${JSON.stringify({
+                type: "response.output_item.added",
+                item: { type: "function_call", id: "item-1", call_id: "call-1", name: "noop", arguments: "" }
+              })}\n\n`
+            ));
+            controller.enqueue(enc.encode(
+              `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({
+                type: "response.function_call_arguments.delta",
+                item_id: "item-1",
+                delta: "{\"x\":1"
+              })}\n\n`
+            ));
+            controller.enqueue(enc.encode(
+              `event: error\ndata: ${JSON.stringify({ type: "error", message: "Your ChatGPT session expired before this request finished." })}\n\n`
+            ));
+            controller.close();
+            return;
+          }
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex tool-calling retries once on initial 401 with session-expired body", async () => {
+    // The other side of the retry: auth.json held a stale token at fetch
+    // time, so the backend rejected the request before the stream even
+    // opened. Re-reading auth.json on attempt 2 picks up the rotated
+    // token and the request succeeds.
+    const { restore } = installCodexAuth("codex-session-retry-initial-401");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      if (attempts === 1) {
+        return Promise.resolve(new Response(
+          JSON.stringify({ error: { message: "Unauthorized: access token expired" } }),
+          { status: 401, headers: { "content-type": "application/json" } }
+        ));
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex tool-calling does NOT retry on non-session errors (500 / generic)", async () => {
+    // The retry contract is narrow: only session-shaped errors trigger
+    // it. A 500 / rate-limit / content-policy error must bubble straight
+    // up so the agent loop's error surface stays accurate.
+    const { restore } = installCodexAuth("codex-no-retry-500");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      return Promise.resolve(new Response(
+        JSON.stringify({ error: { message: "Internal server error" } }),
+        { status: 500, headers: { "content-type": "application/json" } }
+      ));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      await expect(generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      )).rejects.toThrow(/Internal server error/i);
+      expect(attempts).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex tool-calling retries once on response.failed event with session-expired reason", async () => {
+    // The other SSE shape the backend uses for session rotation — the
+    // request opens as 200 and the stream begins, but the final event
+    // is `response.failed` with the rotation reason embedded in
+    // response.error.message instead of a top-level error event.
+    const { restore } = installCodexAuth("codex-session-retry-response-failed");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          if (attempts === 1) {
+            controller.enqueue(enc.encode(
+              `event: response.failed\ndata: ${JSON.stringify({ type: "response.failed", response: { id: "r1", error: { message: "Your ChatGPT session expired before this request finished." } } })}\n\n`
+            ));
+            controller.close();
+            return;
+          }
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex tool-calling retries when response.failed carries a snake_case reason (session_expired / token_expired)", async () => {
+    // The backend also delivers session rotation as an enum-coded value
+    // in `response.incomplete_details.reason` — `session_expired` and
+    // `token_expired` are the documented forms. The matcher must accept
+    // underscores between session/token and expired so these don't slip
+    // through as unretryable generic stream errors.
+    const { restore } = installCodexAuth("codex-session-retry-snake-case");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          if (attempts === 1) {
+            controller.enqueue(enc.encode(
+              `event: response.failed\ndata: ${JSON.stringify({
+                type: "response.failed",
+                response: { id: "r1", incomplete_details: { reason: "session_expired" } }
+              })}\n\n`
+            ));
+            controller.close();
+            return;
+          }
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex retry caps at exactly one attempt (no infinite loop on repeated session errors)", async () => {
+    // If the codex CLI hasn't rotated yet by the time we re-read auth,
+    // the second attempt also fails. We must NOT loop further — just
+    // surface the error and let the agent loop / caller handle it.
+    const { restore } = installCodexAuth("codex-retry-cap");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      return Promise.resolve(new Response(
+        JSON.stringify({ error: { message: "Unauthorized: session expired" } }),
+        { status: 401, headers: { "content-type": "application/json" } }
+      ));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      await expect(generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      )).rejects.toThrow(/session expired/i);
+      expect(attempts).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex retries when auth.json is mid-rewrite (partial JSON parse fails on attempt 1)", async () => {
+    // The codex CLI rewrites auth.json non-atomically (truncate + write,
+    // no temp+rename). If gini's first attempt reads the file during
+    // that window, JSON.parse fails. The parse failure used to surface
+    // as a permanent generic Error; route it through CodexAuthRaceError
+    // so the same retry helper that handles session-expired waits out
+    // the writer and re-reads on attempt 2.
+    const { authPath, restore } = installCodexAuth("codex-retry-auth-race");
+    writeFileSync(authPath, "{ not valid json");
+    const restoreValidJson = setTimeout(() => {
+      writeFileSync(authPath, JSON.stringify({
+        auth_mode: "chatgpt",
+        tokens: {
+          access_token: "post-race-codex-access-token",
+          refresh_token: "post-race-codex-refresh-token"
+        }
+      }));
+    }, 25);
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (() => {
+      fetchCalls += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      // Attempt 1 threw before fetch ran (bearer read parse failure).
+      // The 50ms retry delay let the timer above restore valid JSON,
+      // and attempt 2 succeeded — so the backend saw exactly one
+      // request.
+      expect(fetchCalls).toBe(1);
+      expect(result.text).toBe("ok");
+    } finally {
+      clearTimeout(restoreValidJson);
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex waits briefly before retrying so a mid-write auth.json can settle", async () => {
+    // The codex CLI rewrites ~/.codex/auth.json non-atomically (truncate +
+    // write, no temp+rename), so an immediate retry can race that writer
+    // and observe an empty or partial JSON. Pin the small pre-retry wait
+    // by spying on setTimeout; existing retry tests don't care about
+    // timing so they wouldn't catch a regression that removes the delay.
+    const { restore } = installCodexAuth("codex-retry-rewrite-delay");
+    const originalFetch = globalThis.fetch;
+    const originalSetTimeout = globalThis.setTimeout;
+    const delays: number[] = [];
+    globalThis.setTimeout = ((handler: TimerHandler, ms?: number, ...rest: unknown[]) => {
+      if (typeof ms === "number") delays.push(ms);
+      return originalSetTimeout(handler as () => void, ms, ...rest);
+    }) as unknown as typeof globalThis.setTimeout;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      if (attempts === 1) {
+        return Promise.resolve(new Response(
+          JSON.stringify({ error: { message: "Unauthorized: session expired" } }),
+          { status: 401, headers: { "content-type": "application/json" } }
+        ));
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+      // The retry path schedules exactly one 50ms wait before attempt 2.
+      // Other code in the test (Bun internals, stream plumbing) doesn't
+      // happen to use that exact value, so asserting inclusion is enough.
+      expect(delays).toContain(50);
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.setTimeout = originalSetTimeout;
+      restore();
+    }
+  });
+
+  test("codex generateTaskSummary retries through callOpenAIResponses on session-expired", async () => {
+    // generateTaskSummary lands in callOpenAIResponses for codex, which
+    // also wraps in withCodexSessionRetry. Pin the contract so a
+    // regression that drops the retry from the text-summary path
+    // (separate from tool-calling) gets caught.
+    const { restore } = installCodexAuth("codex-task-summary-retry");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      if (attempts === 1) {
+        return Promise.resolve(new Response(
+          JSON.stringify({ error: { message: "Unauthorized: access token expired" } }),
+          { status: 401, headers: { "content-type": "application/json" } }
+        ));
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "summary-ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const result = await generateTaskSummary(config(provider), "summarize this");
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("summary-ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex generateStructured retries through callStructuredCodex on session-expired", async () => {
+    // generateStructured for codex lands in callStructuredCodex which
+    // wraps the fetch+stream pair in withCodexSessionRetry. The JSON.parse
+    // happens AFTER the retry helper, so a malformed payload on attempt 2
+    // would still surface as a non-auth error — but the retry itself
+    // covers attempt 1's 401.
+    const { restore } = installCodexAuth("codex-structured-retry");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      if (attempts === 1) {
+        return Promise.resolve(new Response(
+          JSON.stringify({ error: { message: "Unauthorized: session expired" } }),
+          { status: 401, headers: { "content-type": "application/json" } }
+        ));
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "{\"ok\":true}" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const result = await generateStructured(config(provider), {
+        system: "be brief",
+        user: "say ok",
+        schemaName: "Ok",
+        validator: { parse: (v) => v as { ok: boolean } }
+      });
+      expect(attempts).toBe(2);
+      expect(result.data).toEqual({ ok: true });
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex generateVisionAnalysis retries through callVisionCodex on session-expired", async () => {
+    // generateVisionAnalysis for codex goes through callVisionCodex
+    // (non-streaming /responses) which also wraps in
+    // withCodexSessionRetry. The 401-with-session-expired shape is the
+    // only failure mode here (no SSE error events), so the retry path
+    // depends on classifying the initial 401 body correctly.
+    const { restore } = installCodexAuth("codex-vision-retry");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      if (attempts === 1) {
+        return Promise.resolve(new Response(
+          JSON.stringify({ error: { message: "Unauthorized: token expired" } }),
+          { status: 401, headers: { "content-type": "application/json" } }
+        ));
+      }
+      const body = {
+        id: "resp_vision_retry",
+        output: [
+          {
+            id: "msg_1",
+            type: "message",
+            content: [{ type: "output_text", text: "vision-ok" }]
+          }
+        ],
+        usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 }
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const result = await generateVisionAnalysis(config(provider), {
+        prompt: "describe",
+        imageBase64: "AAAA",
+        mimeType: "image/png"
+      });
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("vision-ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex cancels attempt 1's reader before retrying", async () => {
+    // Before the try/finally wrap was added, a session-expired throw
+    // inside the SSE handler unwound out of the reading loop and left
+    // attempt 1's reader locked to its response body. Pin that the
+    // underlying-source `cancel` callback fires when the retry path
+    // unwinds — that's the signal the socket can actually be released.
+    const { restore } = installCodexAuth("codex-reader-cleanup-on-retry");
+    const originalFetch = globalThis.fetch;
+    let cancelCalls = 0;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          if (attempts === 1) {
+            controller.enqueue(enc.encode(
+              `event: error\ndata: ${JSON.stringify({ type: "error", message: "Your ChatGPT session expired before this request finished." })}\n\n`
+            ));
+            // Intentionally leave the stream open after the error event;
+            // a real backend keeps the socket up until we cancel.
+            return;
+          }
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        },
+        cancel() {
+          cancelCalls += 1;
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+      // Attempt 1's reader cancel runs in the finally block; attempt 2
+      // closes naturally so cancel-after-done is a spec no-op (no extra
+      // source-cancel callback). Either way >= 1 proves cleanup ran.
+      expect(cancelCalls).toBeGreaterThanOrEqual(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex retry re-reads auth.json so attempt 2 sends the rotated bearer", async () => {
+    // The whole point of the retry is to pick up a freshly-rotated
+    // token on attempt 2. The existing retry tests only assert
+    // attempt count, so a regression that hoists the bearer outside
+    // the `make` closure (or caches it across attempts) would slip
+    // through. Pin the contract by rewriting auth.json between the
+    // two fetches and asserting attempt 2's Authorization header
+    // reflects the new token.
+    const { authPath, restore } = installCodexAuth("codex-bearer-rotates-on-retry");
+    const originalFetch = globalThis.fetch;
+    const seenAuthorization: string[] = [];
+    let attempts = 0;
+    globalThis.fetch = ((_input: RequestInfo | URL, init: RequestInit = {}) => {
+      attempts += 1;
+      const headers = (init.headers ?? {}) as Record<string, string>;
+      seenAuthorization.push(headers.authorization ?? "");
+      if (attempts === 1) {
+        // Simulate the codex CLI's out-of-band rotation: a fresh
+        // auth.json lands between attempt 1's 401 and attempt 2's
+        // pre-fetch bearer read.
+        writeFileSync(authPath, JSON.stringify({
+          auth_mode: "chatgpt",
+          tokens: {
+            access_token: "rotated-codex-access-token",
+            refresh_token: "rotated-codex-refresh-token"
+          }
+        }));
+        return Promise.resolve(new Response(
+          JSON.stringify({ error: { message: "Unauthorized: session expired" } }),
+          { status: 401, headers: { "content-type": "application/json" } }
+        ));
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("ok");
+      expect(seenAuthorization).toHaveLength(2);
+      expect(seenAuthorization[0]).toBe("Bearer test-codex-access-token");
+      expect(seenAuthorization[1]).toBe("Bearer rotated-codex-access-token");
+      expect(seenAuthorization[0]).not.toBe(seenAuthorization[1]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex User-Agent header does not carry the Gini-identifying suffix", async () => {
+    // The previous `codex_cli_rs/0.0.0 (Gini Agent)` tail was a backend-
+    // visible fingerprint distinguishing daemon traffic from interactive
+    // codex CLI use of the same session token. Pin the header so a
+    // regression can't silently re-introduce the suffix.
+    const { restore } = installCodexAuth("codex-ua-no-gini-tag");
+    const originalFetch = globalThis.fetch;
+    let capturedHeaders: Record<string, string> | undefined;
+    globalThis.fetch = ((_input: RequestInfo | URL, init: RequestInit = {}) => {
+      capturedHeaders = init.headers as Record<string, string>;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], tools);
+      expect(capturedHeaders).toBeDefined();
+      expect(capturedHeaders!["User-Agent"]).toBe("codex_cli_rs/0.0.0");
+      expect(capturedHeaders!.originator).toBe("codex_cli_rs");
+      expect(capturedHeaders!["User-Agent"]).not.toContain("Gini");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
   });
 });
 

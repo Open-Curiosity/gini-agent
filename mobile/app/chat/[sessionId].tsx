@@ -14,8 +14,9 @@ import {
   View
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { ApiError } from "@/src/api";
+import { api, ApiError } from "@/src/api";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
+import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
   isTaskInFlight,
   useChatBlocks,
@@ -45,7 +46,52 @@ export default function ChatDetailScreen() {
     if (unauthorized) router.replace("/setup");
   }, [unauthorized]);
 
+  // Request APNs permission + register the device token the first time
+  // the user lands on a chat detail screen. Asking here (vs. on app
+  // launch) trades a few seconds of latency for noticeably higher
+  // grant rates — the user is already invested in an actual
+  // conversation, so the prompt reads as "Gini wants to let you know
+  // when something needs your call" instead of unexplained chrome.
+  // The module is idempotent across remounts and gates iOS-only
+  // internally, so calling it unconditionally here is fine.
+  useEffect(() => {
+    void registerForPushAsync();
+  }, []);
+
   const list = useMemo<ChatBlock[]>(() => blocks.data ?? [], [blocks.data]);
+
+  // Mark the chat as read once we know which block id is latest.
+  // Debounced by `lastReadBlockIdRef` — we only POST when the tail
+  // block id changes, so streaming assistant_text deltas (which reuse
+  // the same id but advance updatedAt) don't fire a request per token.
+  // The badge refetch chases the write so the icon dot clears
+  // immediately.
+  const lastReadBlockIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!sessionId) return;
+    if (list.length === 0) return;
+    const latestId = list[list.length - 1]!.id;
+    if (lastReadBlockIdRef.current === latestId) return;
+    lastReadBlockIdRef.current = latestId;
+    // Read-state + badge are per-device on the gateway; the web target
+    // (and any client that hasn't acquired an APNs token yet) has no
+    // X-Device-Token header to send, so the call would just 400. Skip
+    // the round-trip entirely until a token is cached.
+    if (!getCachedDeviceToken()) return;
+    void (async () => {
+      try {
+        await api(`/chat/${sessionId}/read`, {
+          method: "POST",
+          body: JSON.stringify({ lastReadBlockId: latestId })
+        });
+        await refreshBadge();
+      } catch {
+        // Best-effort — read state is rebuilt on the next navigation,
+        // and refreshBadge has its own swallow. A failure here only
+        // delays the badge clearing until the next event.
+      }
+    })();
+  }, [list, sessionId]);
 
   // Phase blocks are transient indicators — only render the latest one,
   // and only while it's still active (non-terminal). Historical phase

@@ -865,7 +865,412 @@ describe("runtime api", () => {
     );
     expect(response.status).toBe(400);
     const body = await response.json();
-    expect(body.error).toContain("not a connector.request");
+    expect(body.error).toContain("does not take a /connect submission");
+  });
+
+  test("POST /api/approvals/<id>/approve refuses browser.fill_secret action", async () => {
+    // The generic /approve route would flip status=approved and trigger
+    // runApprovedAction's browser.fill_secret branch, which synthesizes a
+    // "fields filled" tool result for the agent even though no DOM fill
+    // ever happened (the side effect lives inside /connect's per-slot
+    // loop). Refuse early so the only resolution path for fill_secret is
+    // /connect with values.
+    const config = testConfig("approve-refuses-fill-secret");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "browser.fill_secret",
+        target: "https://example.com/login#@e1,@e2",
+        risk: "high",
+        reason: "Sign in to the test site",
+        payload: {
+          slots: [
+            { name: "username", locator: "@e1", label: "Username", kind: "text" },
+            { name: "password", locator: "@e2", label: "Password", kind: "password" }
+          ],
+          reason: "Sign in",
+          toolCallId: "call_fill"
+        }
+      })
+    );
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/approve`,
+      { method: "POST" },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("/connect");
+    expect(body.error).toContain("not /approve");
+    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
+  });
+
+  test("POST /api/approvals/<id>/connect refuses partial browser.fill_secret submissions", async () => {
+    // fillReady in BlockApprovalRequested.tsx only disables the web
+    // Submit button; CLI / mobile / direct API clients can still POST a
+    // partial body. The gateway must enforce that every declared slot
+    // has a non-empty value before any DOM fill happens — otherwise
+    // /connect would resolve with some slots silently unfilled and the
+    // agent would be told (in agent.ts:runApprovedAction) that every
+    // declared slot was filled.
+    const config = testConfig("connect-rejects-partial-fill-secret");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const { createTask, upsertTask } = require("./state") as typeof import("./state");
+      const task = createTask(state.instance, "partial-test");
+      upsertTask(state, task);
+      return task.id;
+    });
+    // Seed approvedUrl so the origin guard's "no live page" refusal
+    // doesn't fire before the missing-slot check; this test is about
+    // partial submission, not origin binding.
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        taskId,
+        action: "browser.fill_secret",
+        target: "https://example.com",
+        risk: "high",
+        reason: "Sign in to the test site",
+        payload: {
+          slots: [
+            { name: "username", locator: "@e1", label: "Username", kind: "text" },
+            { name: "password", locator: "@e2", label: "Password", kind: "password" }
+          ],
+          reason: "Sign in",
+          toolCallId: "call_fill",
+          // Origin only — sanitizeUrlForAuditTarget strips pathname.
+          approvedUrl: "https://example.com"
+        }
+      })
+    );
+    const { __test: browserTest } = await import("./tools/browser");
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      // The live URL can be on any path within the approved origin;
+      // the equality check is on origin only after the SEC-C fix.
+      url: () => "https://example.com/login",
+      close: () => Promise.resolve()
+    } as Partial<import("playwright-core").Page>);
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/connect`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { username: "tomsmith" } })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.ok).toBe(false);
+    expect(body.message).toContain("password");
+    expect(body.message).toContain("Missing");
+    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
+  });
+
+  test("POST /api/approvals/<id>/connect: submitted fill_secret values never appear in state.json, trace JSONL, or runtime.jsonl", async () => {
+    // End-to-end absence pin for the ADR's secret-handling guarantee:
+    // submitted credential values must flow request-scope only and
+    // never reach any persisted artifact. Without this test the only
+    // protection is manual code review of every audit/trace/log write
+    // touching the fill_secret path. Distinct marker strings let us
+    // grep the raw bytes after the request — partial matches would
+    // catch even an attempt to serialize a wrapper object containing
+    // the value.
+    const config = testConfig("fill-secret-no-state-leak");
+    const handler = createHandler(config);
+    const { createTask, upsertTask, createApproval } = await import("./state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "fill secret leak guard");
+      upsertTask(state, task);
+      return task.id;
+    });
+    // Seed approvedUrl on the payload AND install a matching fake
+    // session so the origin guard passes and the fill loop actually
+    // runs. The fills will error per-slot because the fake page's
+    // .locator() returns nothing useful — what we care about is that
+    // the audit row is written with redacted: true and the markers
+    // never reach state/trace/log even when the runtime tries to
+    // record what happened.
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        taskId,
+        action: "browser.fill_secret",
+        target: "https://example.com",
+        risk: "high",
+        reason: "Sign in to the test site",
+        payload: {
+          slots: [
+            { name: "username", locator: "@e1", label: "Username", kind: "text" },
+            { name: "password", locator: "@e2", label: "Password", kind: "password" }
+          ],
+          reason: "Sign in",
+          toolCallId: "call_fill",
+          approvedUrl: "https://example.com"
+        }
+      })
+    );
+    const { __test: browserTest } = await import("./tools/browser");
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://example.com/login",
+      // Fake locator that no-ops on fill; the audit-row write still
+      // happens regardless of whether the fill succeeded. Cast as
+      // Partial<Page> since the fake only implements what
+      // browserFillByLocator touches.
+      locator: ((_sel: string) => ({
+        fill: async () => { throw new Error("fake session, no real DOM"); }
+      })) as unknown as import("playwright-core").Page["locator"],
+      close: () => Promise.resolve()
+    } as Partial<import("playwright-core").Page>);
+    const USERNAME_MARKER = "tomsmith-LEAK-MARKER-zzzzz";
+    const PASSWORD_MARKER = "SuperSecretPassword-LEAK-MARKER-zzzzz";
+    await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/connect`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { username: USERNAME_MARKER, password: PASSWORD_MARKER } })
+      },
+      config.token
+    );
+    // No browser session exists, so browserFillByLocator returns
+    // errors for both slots and the audit row evidence carries
+    // `errors[]` (no values) + filledSlots = []. The approval is
+    // still resolved atomically before the fill loop so the deny
+    // race is closed; the agent gets a partial-fill error result
+    // via resumeChatTask.
+
+    // Raw state.json bytes must not contain either marker.
+    const stateJsonPath = `${config.stateRoot}/state.json`;
+    const rawState = readFileSync(stateJsonPath, "utf8");
+    expect(rawState).not.toContain(USERNAME_MARKER);
+    expect(rawState).not.toContain(PASSWORD_MARKER);
+
+    // Trace JSONL (per-task) must not contain either marker. The
+    // file may not exist if no trace events fired for this task —
+    // an empty file is fine, the test only fails on a leak.
+    const traceJsonlPath = `${config.stateRoot}/traces/${taskId}.jsonl`;
+    if (existsSync(traceJsonlPath)) {
+      const rawTrace = readFileSync(traceJsonlPath, "utf8");
+      expect(rawTrace).not.toContain(USERNAME_MARKER);
+      expect(rawTrace).not.toContain(PASSWORD_MARKER);
+    }
+
+    // runtime.jsonl is the cross-task log file — also greppable.
+    const runtimeLogPath = `${config.logRoot}/runtime.jsonl`;
+    if (existsSync(runtimeLogPath)) {
+      const rawLog = readFileSync(runtimeLogPath, "utf8");
+      expect(rawLog).not.toContain(USERNAME_MARKER);
+      expect(rawLog).not.toContain(PASSWORD_MARKER);
+    }
+
+    // The audit row itself: defense-in-depth. Both `evidence` (would
+    // be undefined after redaction) and `target` must not contain
+    // the markers. `target` is preserved across redaction; this pin
+    // catches a future regression that would forget to sanitize URL
+    // query strings or stuff secrets into the target field.
+    const auditRows = readState(config.instance).audit.filter(
+      (a) => a.action === "browser.fill_secret" && a.approvalId === approval.id
+    );
+    expect(auditRows.length).toBe(1);
+    const row = auditRows[0]!;
+    expect(row.redacted).toBe(true);
+    expect(row.evidence).toBeUndefined();
+    expect(row.target ?? "").not.toContain(USERNAME_MARKER);
+    expect(row.target ?? "").not.toContain(PASSWORD_MARKER);
+  });
+
+  test("POST /api/approvals/<id>/connect refuses fill_secret when page navigated away from approved origin", async () => {
+    // The approval.target encodes the origin the user consented
+    // to fill into (protocol+host+port; pathname is stripped by
+    // sanitizeUrlForAuditTarget). If the page has navigated to a
+    // different origin (agent action, user click, JS redirect,
+    // phishing redirect) between approval creation and Submit,
+    // the live URL no longer matches and we refuse with 409 so a
+    // fresh approval is required for the new destination. In
+    // this test the browser session was never opened so
+    // peekCurrentBrowserUrl returns undefined,
+    // which the handler treats as "no live page to fill" — same
+    // refusal path.
+    const config = testConfig("connect-fill-secret-origin-mismatch");
+    const handler = createHandler(config);
+    const { createTask, upsertTask, createApproval } = await import("./state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test");
+      upsertTask(state, task);
+      return task.id;
+    });
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        taskId,
+        action: "browser.fill_secret",
+        target: "https://example.com",
+        risk: "high",
+        reason: "Sign in",
+        payload: {
+          slots: [
+            { name: "username", locator: "@e1", label: "Username", kind: "text" },
+            { name: "password", locator: "@e2", label: "Password", kind: "password" }
+          ],
+          reason: "Sign in",
+          toolCallId: "call_fill",
+          // The /connect origin guard reads from the structural
+          // approvedUrl on payload — peer approval actions carry
+          // their contract fields under payload too. Stored as
+          // origin only (no pathname) since reset/magic-link
+          // URLs can carry tokens in the path.
+          approvedUrl: "https://example.com"
+        }
+      })
+    );
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/connect`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { username: "tomsmith", password: "SuperSecretPassword!" } })
+      },
+      config.token
+    );
+    expect(response.status).toBe(409);
+    const body = await response.json();
+    expect(body.ok).toBe(false);
+    // The browser session was never opened, so peekCurrentBrowserUrl
+    // returns undefined and the /connect handler takes the
+    // "session expired" branch (distinct from the "page navigated"
+    // branch where a live session exists but its URL differs from
+    // approvedUrl). Without that split the operator would see
+    // "page navigated" after a 5-minute walk-away — misleading.
+    expect(body.message).toContain("Browser session expired");
+    expect(body.message).toContain("https://example.com");
+    // Approval stayed pending — no resolveApproval call ran.
+    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
+  });
+
+  test("POST /api/approvals/<id>/connect refuses fill_secret slot values shorter than 4 chars", async () => {
+    // The snapshot post-redactor uses literal substring replacement;
+    // single-character (and other very short) values would shred
+    // structural tokens like [@e1] in snapshot text. The 4-char
+    // floor in src/tools/browser.ts:recordFilledSecret keeps the
+    // redactor safe, and /connect refuses values below that floor
+    // so the registry-skip-for-short-values doesn't leak the
+    // value via subsequent unredacted tool results.
+    const config = testConfig("connect-fill-secret-too-short");
+    const handler = createHandler(config);
+    const { createTask, upsertTask, createApproval } = await import("./state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "short value test");
+      upsertTask(state, task);
+      return task.id;
+    });
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        taskId,
+        action: "browser.fill_secret",
+        target: "https://example.com",
+        risk: "high",
+        reason: "Sign in",
+        payload: {
+          slots: [
+            { name: "pin", locator: "@e1", label: "PIN", kind: "number" }
+          ],
+          reason: "Sign in",
+          toolCallId: "call_fill",
+          approvedUrl: "https://example.com"
+        }
+      })
+    );
+    const { __test: browserTest } = await import("./tools/browser");
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://example.com",
+      close: () => Promise.resolve()
+    } as Partial<import("playwright-core").Page>);
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/connect`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { pin: "12" } })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.ok).toBe(false);
+    expect(body.message).toContain("too short");
+    expect(body.message).toContain("pin");
+    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
+  });
+
+  test("POST /api/approvals/<id>/connect: distinct 409 when live session exists but page navigated to a different origin", async () => {
+    // Pin the OTHER 409 branch: a live session whose current URL no
+    // longer matches the approved origin. This is the genuine
+    // page-navigated case (agent click, JS redirect, phishing
+    // redirect), distinct from the session-expired idle-sweep case
+    // covered by the previous test.
+    const config = testConfig("connect-fill-secret-real-navigation");
+    const handler = createHandler(config);
+    const { createTask, upsertTask, createApproval } = await import("./state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "real navigation test");
+      upsertTask(state, task);
+      return task.id;
+    });
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        taskId,
+        action: "browser.fill_secret",
+        target: "https://example.com",
+        risk: "high",
+        reason: "Sign in",
+        payload: {
+          slots: [
+            { name: "username", locator: "@e1", label: "Username", kind: "text" },
+            { name: "password", locator: "@e2", label: "Password", kind: "password" }
+          ],
+          reason: "Sign in",
+          toolCallId: "call_fill",
+          approvedUrl: "https://example.com"
+        }
+      })
+    );
+    const { __test: browserTest } = await import("./tools/browser");
+    // Live session exists but the page URL is on a different origin
+    // than what the approval captured — should take the "page
+    // navigated" branch, NOT the "session expired" branch.
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://evil.example.org/phishing",
+      close: () => Promise.resolve()
+    } as Partial<import("playwright-core").Page>);
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/connect`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { username: "tomsmith", password: "SuperSecretPassword!" } })
+      },
+      config.token
+    );
+    expect(response.status).toBe(409);
+    const body = await response.json();
+    expect(body.ok).toBe(false);
+    expect(body.message).toContain("Page navigated");
+    expect(body.message).toContain("https://example.com");
+    expect(body.message).toContain("https://evil.example.org");
+    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
   });
 
   // Round-1 review fix: browser-connect throws with prefixes that the
@@ -1868,6 +2273,66 @@ describe("runtime api", () => {
     expect(buffer).toContain("stream this");
   });
 
+  test("GET /api/chat/:id/stream emits id frames as <block_id>:<iso_ts>", async () => {
+    // Pins the SSE wire contract: each chat_block frame's `id:` line
+    // carries `<block_id>:<iso_timestamp>`. The mobile/browser client
+    // round-trips that string as Last-Event-ID on reconnect, and the
+    // gateway parses the `:<ts>` suffix to detect in-place updates on
+    // the cursor row (see listChatBlocksAfter). A regression that
+    // strips the suffix would silently break resume semantics for the
+    // streaming assistant_text case, so we pin the format at the HTTP
+    // boundary.
+    const config = testConfig("chat-blocks-stream-id-format");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "stream id format" })
+    });
+    const submitted = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "id format check" })
+    });
+    await waitForTask(handler, config, submitted.taskId);
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    if (reader) {
+      const deadline = Date.now() + 500;
+      while (Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("event: chat_block")) break;
+      }
+      await reader.cancel();
+    }
+    // Frame shape: `id: <block_id>:<iso_ts>\nevent: chat_block\n...`.
+    // Block ids are `block_<random>` (no `:`); ISO timestamps look like
+    // `YYYY-MM-DDTHH:MM:SS.sssZ`. The whole line must match this pattern.
+    const idLineMatch = buffer.match(
+      /^id: ([A-Za-z0-9_-]+):(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)$/m
+    );
+    expect(idLineMatch).not.toBeNull();
+    // Sanity: the captured block id portion does not itself contain `:`,
+    // so splitting on the first colon in listChatBlocksAfter is safe.
+    expect(idLineMatch?.[1]).not.toContain(":");
+  });
+
   test("GET /api/chat/:id/stream returns 404 for unknown sessions", async () => {
     const config = testConfig("chat-blocks-stream-404");
     const handler = createHandler(config);
@@ -2008,6 +2473,422 @@ describe("runtime api", () => {
       });
       expect(result.ok).toBe(false);
       expect(result.reason).toBe("no snapshot");
+    });
+  });
+
+  describe("push device endpoints", () => {
+    test("POST /api/push/devices upserts a token scoped to the caller's credential", async () => {
+      const config = testConfig("push-devices-upsert");
+      const handler = createHandler(config);
+      // Two distinct credentials: the runtime "owner" (config.token)
+      // and a paired mobile device that gets its own credential id.
+      const pairing = await call(handler, config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 60 }) });
+      const claimed = await callPublic(handler, config, "/api/pairing/claim", {
+        method: "POST",
+        body: JSON.stringify({ code: pairing.code, deviceName: "Phone" })
+      });
+
+      const ownerReg = await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const phoneReg = await callWithToken(handler, config, claimed.token, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_phone", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+
+      expect(ownerReg.ok).toBe(true);
+      expect(ownerReg.device.credentialId).toBe("owner");
+      expect(ownerReg.device.token).toBe("tok_owner");
+      expect(phoneReg.ok).toBe(true);
+      expect(phoneReg.device.credentialId).toBe(claimed.device.id);
+      expect(phoneReg.device.token).toBe("tok_phone");
+
+      // Re-register the same token under the owner — idempotent rebind.
+      const rebind = await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile.dev" })
+      });
+      expect(rebind.device.bundleId).toBe("ai.lilaclabs.gini.mobile.dev");
+      expect(rebind.device.credentialId).toBe("owner");
+    });
+
+    test("POST /api/push/devices validates inputs", async () => {
+      const config = testConfig("push-devices-validate");
+      const handler = createHandler(config);
+
+      const missingToken = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      }, config.token);
+      expect(missingToken.status).toBe(400);
+
+      const wrongPlatform = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok", platform: "android", bundleId: "ai.lilaclabs.gini.mobile" })
+      }, config.token);
+      expect(wrongPlatform.status).toBe(400);
+
+      const missingBundle = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok", platform: "ios" })
+      }, config.token);
+      expect(missingBundle.status).toBe(400);
+    });
+
+    test("DELETE /api/push/devices/:token removes only the caller's tokens", async () => {
+      const config = testConfig("push-devices-delete");
+      const handler = createHandler(config);
+      const pairing = await call(handler, config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 60 }) });
+      const claimed = await callPublic(handler, config, "/api/pairing/claim", {
+        method: "POST",
+        body: JSON.stringify({ code: pairing.code, deviceName: "Phone" })
+      });
+
+      // Register two tokens — one per credential.
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await callWithToken(handler, config, claimed.token, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_phone", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+
+      // Owner cannot delete the paired device's token — 404 (we
+      // intentionally don't surface which of "missing" vs "wrong
+      // owner" so credentials can't probe each other).
+      const crossDelete = await rawCall(handler, config, "/api/push/devices/tok_phone", { method: "DELETE" }, config.token);
+      expect(crossDelete.status).toBe(404);
+
+      // The paired device deleting its own token succeeds.
+      const ownDelete = await callWithToken(handler, config, claimed.token, "/api/push/devices/tok_phone", { method: "DELETE" });
+      expect(ownDelete.ok).toBe(true);
+
+      // Second delete of the same token: 404.
+      const repeatDelete = await rawCall(handler, config, "/api/push/devices/tok_phone", { method: "DELETE" }, claimed.token);
+      expect(repeatDelete.status).toBe(404);
+    });
+
+    test("POST /api/chat/:id/read records the cursor and GET /api/badge surfaces the unread total", async () => {
+      const config = testConfig("chat-read-badge");
+      const handler = createHandler(config);
+
+      // Register a device first — read/badge now key per device, not
+      // per credential, so the mobile client identifies itself via
+      // X-Device-Token on every call.
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "read state" })
+      });
+      // Plant two visible blocks via the persistence layer — the read
+      // endpoint validates the block id, but the unread aggregate is
+      // what we're measuring here.
+      const { insertChatBlock } = await import("./state");
+      const b1 = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "hi"
+      });
+      insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "follow up"
+      });
+
+      // Fresh device: no read state yet, both blocks unread.
+      const before = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(before.unread).toBe(2);
+
+      const marked = await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST",
+        headers: deviceHeader,
+        body: JSON.stringify({ lastReadBlockId: b1.id })
+      });
+      expect(marked.ok).toBe(true);
+      expect(marked.readState.lastReadBlockId).toBe(b1.id);
+
+      const after = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(after.unread).toBe(1);
+    });
+
+    test("POST /api/chat/:id/read rejects bad input and cross-session ids", async () => {
+      const config = testConfig("chat-read-validate");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+      const sessionA = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "A" })
+      });
+      const sessionB = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "B" })
+      });
+      const { insertChatBlock } = await import("./state");
+      const bA = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: sessionA.id,
+        text: "in A"
+      });
+
+      // Missing lastReadBlockId.
+      const missing = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionA.id}/read`,
+        { method: "POST", headers: deviceHeader, body: JSON.stringify({}) },
+        config.token
+      );
+      expect(missing.status).toBe(400);
+
+      // Block belongs to A — POSTing it on B's cursor is rejected.
+      const cross = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionB.id}/read`,
+        { method: "POST", headers: deviceHeader, body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        config.token
+      );
+      expect(cross.status).toBe(400);
+
+      // Unknown session: 404.
+      const noSession = await rawCall(
+        handler,
+        config,
+        "/api/chat/chat_nonexistent/read",
+        { method: "POST", headers: deviceHeader, body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        config.token
+      );
+      expect(noSession.status).toBe(404);
+
+      // Missing X-Device-Token: 400 (mobile-only endpoint).
+      const missingDevice = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionA.id}/read`,
+        { method: "POST", body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        config.token
+      );
+      expect(missingDevice.status).toBe(400);
+
+      // Foreign device token (not registered to this credential): 403.
+      const foreignDevice = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionA.id}/read`,
+        {
+          method: "POST",
+          headers: { "x-device-token": "tok_someone_else" },
+          body: JSON.stringify({ lastReadBlockId: bA.id })
+        },
+        config.token
+      );
+      expect(foreignDevice.status).toBe(403);
+    });
+
+    test("read state is scoped per device, not per credential", async () => {
+      // Two iPhones owned by the same human (both register under the
+      // "owner" credential). iPhone A reading the chat must NOT clear
+      // iPhone B's badge — that's the load-bearing per-device guarantee.
+      const config = testConfig("chat-read-device");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_a", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_b", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "shared" })
+      });
+      const { insertChatBlock } = await import("./state");
+      const block = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "hello"
+      });
+
+      // iPhone A marks read; its badge drops to 0. iPhone B's badge
+      // is still 1 because read state is per-device.
+      await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST",
+        headers: { "x-device-token": "tok_iphone_a" },
+        body: JSON.stringify({ lastReadBlockId: block.id })
+      });
+      const badgeA = await call(handler, config, "/api/badge", {
+        headers: { "x-device-token": "tok_iphone_a" }
+      });
+      const badgeB = await call(handler, config, "/api/badge", {
+        headers: { "x-device-token": "tok_iphone_b" }
+      });
+      expect(badgeA.unread).toBe(0);
+      expect(badgeB.unread).toBe(1);
+    });
+
+    test("read + badge endpoints require authentication", async () => {
+      const config = testConfig("chat-read-auth");
+      const handler = createHandler(config);
+      const read = await rawCall(handler, config, "/api/chat/chat_x/read", {
+        method: "POST",
+        body: JSON.stringify({ lastReadBlockId: "block_x" })
+      });
+      expect(read.status).toBe(401);
+      const badge = await rawCall(handler, config, "/api/badge");
+      expect(badge.status).toBe(401);
+    });
+
+    test("push device endpoints require authentication", async () => {
+      const config = testConfig("push-devices-auth");
+      const handler = createHandler(config);
+
+      const post = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      expect(post.status).toBe(401);
+
+      const del = await rawCall(handler, config, "/api/push/devices/tok", { method: "DELETE" });
+      expect(del.status).toBe(401);
+    });
+  });
+
+  describe("cors", () => {
+    // Save/restore the env override so individual cases don't leak.
+    function withEnv(value: string | undefined, fn: () => Promise<void>): Promise<void> {
+      const prior = process.env.GINI_CORS_ORIGINS;
+      if (value === undefined) delete process.env.GINI_CORS_ORIGINS;
+      else process.env.GINI_CORS_ORIGINS = value;
+      return fn().finally(() => {
+        if (prior === undefined) delete process.env.GINI_CORS_ORIGINS;
+        else process.env.GINI_CORS_ORIGINS = prior;
+      });
+    }
+
+    test("preflight from an allowed origin returns 204 with CORS headers", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-preflight-allowed");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          method: "OPTIONS",
+          headers: {
+            origin: "http://localhost:8090",
+            "access-control-request-method": "GET",
+            "access-control-request-headers": "authorization"
+          }
+        }));
+        expect(response.status).toBe(204);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:8090");
+        expect(response.headers.get("access-control-allow-credentials")).toBe("true");
+        expect(response.headers.get("vary")).toBe("Origin");
+        expect(response.headers.get("access-control-allow-methods")).toContain("GET");
+        expect(response.headers.get("access-control-allow-methods")).toContain("POST");
+        expect(response.headers.get("access-control-allow-headers") ?? "").toContain("Authorization");
+        expect(response.headers.get("access-control-allow-headers") ?? "").toContain("X-Device-Token");
+        expect(response.headers.get("access-control-allow-headers") ?? "").toContain("Last-Event-ID");
+        expect(response.headers.get("access-control-max-age")).toBe("600");
+      });
+    });
+
+    test("preflight from a disallowed origin returns 204 without allow-origin", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-preflight-disallowed");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          method: "OPTIONS",
+          headers: {
+            origin: "http://evil.example.com",
+            "access-control-request-method": "GET"
+          }
+        }));
+        expect(response.status).toBe(204);
+        expect(response.headers.get("access-control-allow-origin")).toBeNull();
+        // The protocol-level headers still go out — they describe what
+        // the server *would* accept; the browser rejects because of the
+        // missing allow-origin.
+        expect(response.headers.get("access-control-allow-methods")).toContain("GET");
+      });
+    });
+
+    test("normal GET from an allowed origin gets CORS headers", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-get-allowed");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: {
+            origin: "http://localhost:3045",
+            authorization: `Bearer ${config.token}`
+          }
+        }));
+        expect(response.status).toBe(200);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:3045");
+        expect(response.headers.get("access-control-allow-credentials")).toBe("true");
+        expect(response.headers.get("vary")).toBe("Origin");
+        expect(response.headers.get("access-control-expose-headers")).toBe("Last-Event-ID");
+      });
+    });
+
+    test("non-browser caller without Origin gets no CORS headers", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-no-origin");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: { authorization: `Bearer ${config.token}` }
+        }));
+        expect(response.status).toBe(200);
+        expect(response.headers.get("access-control-allow-origin")).toBeNull();
+        expect(response.headers.get("vary")).toBeNull();
+      });
+    });
+
+    test("401 responses still carry CORS headers so the browser sees the status", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-401");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: { origin: "http://localhost:8090" } // no Authorization
+        }));
+        expect(response.status).toBe(401);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:8090");
+      });
+    });
+
+    test("GINI_CORS_ORIGINS env var overrides the default allowlist", async () => {
+      await withEnv("https://example.com", async () => {
+        const config = testConfig("cors-custom-env");
+        const handler = createHandler(config);
+
+        const allowed = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: {
+            origin: "https://example.com",
+            authorization: `Bearer ${config.token}`
+          }
+        }));
+        expect(allowed.headers.get("access-control-allow-origin")).toBe("https://example.com");
+
+        // The defaults (localhost:8090, etc) should NOT be honored when
+        // the env var is set — it's a full override, not an additive list.
+        const denied = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: {
+            origin: "http://localhost:8090",
+            authorization: `Bearer ${config.token}`
+          }
+        }));
+        expect(denied.headers.get("access-control-allow-origin")).toBeNull();
+      });
     });
   });
 });
