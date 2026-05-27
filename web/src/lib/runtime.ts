@@ -361,7 +361,20 @@ function guardCsrf(request: Request, _pathSegments: string[]): Response | null {
     const allowlist = trustedOrigins();
     if (allowlist) {
       const normalized = `${originUrl.protocol}//${originUrl.host}`;
-      if (!allowlist.has(normalized)) {
+      // A tunneled browser session sends Origin equal to the rotating
+      // cloudflared hostname, which an operator using a stable hostname
+      // (and a separate GINI_TRUSTED_ORIGINS allowlist) won't have on the
+      // allowlist. The vetted marker is upstream-verified proof that the
+      // proxy's own Host classifier accepted the inbound Host, AND the
+      // browser's same-origin policy means Origin must already equal Host
+      // for the marker to have been stamped — see PLAN.md "CSRF policy"
+      // and the proxy's Host classifier at web/src/proxy.ts. Accept the
+      // vetted request when Origin == Host even without an allowlist
+      // entry; the allowlist still authoritatively rejects non-vetted
+      // cross-origin callers.
+      const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
+      const originMatchesHost = originUrl.host === expectedHost;
+      if (!allowlist.has(normalized) && !(vetted && originMatchesHost)) {
         return Response.json({ error: "Forbidden" }, { status: 403 });
       }
     } else {

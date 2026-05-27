@@ -58,6 +58,11 @@ class TunnelManager {
   private snapshot: TunnelSnapshot;
   private cloudflared: CloudflaredLaunch | null = null;
   private generation = 0;
+  /** Set by the SIGTERM handler before `stopForShutdown()`. Any in-flight
+   *  `enable()` task that wakes up after this is true must abort before
+   *  publishing the publicUrl file or stamping a fresh cloudflared as
+   *  active — the drain has already cleaned up. */
+  private shuttingDown = false;
   // Serialize every apply-path mutation. Promise chain serves as a queue.
   private applyChain: Promise<void> = Promise.resolve();
   private notesAvailable: boolean | null = null;
@@ -129,6 +134,12 @@ class TunnelManager {
 
   async enable(webPort: number): Promise<TunnelTransitionResult> {
     return this.enqueue(async () => {
+      // Bail before any write/spawn if shutdown has already started — the
+      // drain has already run, so finishing this task would resurrect a
+      // tunnel the SIGTERM handler just tore down.
+      if (this.shuttingDown) {
+        return { ok: false, error: "Tunnel manager shutting down" };
+      }
       try {
         // Commit enabled:true to config first. The proxy reads tunnel.enabled
         // on every request; ordering is important for the 5000 ms exposure cap.
@@ -145,6 +156,18 @@ class TunnelManager {
         this.cloudflared = launch;
         try {
           const url = await launch.publicUrl;
+          // Re-check the shutdown flag after the long await — SIGTERM may
+          // have flipped it while we were waiting for cloudflared's banner.
+          // Without this re-check we'd publish a publicUrl file the drain
+          // has already unlinked and keep cloudflared alive past the cap.
+          if (this.shuttingDown) {
+            this.cloudflared = null;
+            try { await launch.stop(); } catch { /* already gone */ }
+            try { patchTunnelConfig(this.config.instance, { enabled: false }); } catch { /* best-effort */ }
+            try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+            this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: "shutdown" };
+            return { ok: false, error: "shutdown" };
+          }
           this.snapshot = {
             ...this.snapshot,
             enabled: true,
@@ -392,8 +415,14 @@ class TunnelManager {
    *  unlinkSync queued after the await would never run. The proxy reads
    *  the file per-request; removing it first means a fresh boot can't
    *  classify Host against the stale URL even if cloudflared is still
-   *  exiting in the background. */
+   *  exiting in the background.
+   *
+   *  Setting `shuttingDown = true` first lets any in-flight `enable()`
+   *  task that's currently suspended on `await launch.publicUrl` abort
+   *  before it can republish the file or stamp a fresh cloudflared as
+   *  active. */
   async stopForShutdown(): Promise<void> {
+    this.shuttingDown = true;
     try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
     if (this.cloudflared) {
       const prev = this.cloudflared;
