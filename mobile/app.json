@@ -33,6 +33,13 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-notifications",
+        {
+          "enableBackgroundRemoteNotifications": true
+        }
+      ],
+      "./plugins/with-approval-notification-service.js",
       "expo-updates"
     ],
     "experiments": {

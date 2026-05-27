@@ -1,16 +1,22 @@
 import { writeFileSync } from "node:fs";
-import type { ApprovalMode, RuntimeConfig } from "./types";
+import type { ApprovalMode, ChatBlock, RuntimeConfig } from "./types";
 import { cancelTask, decideApproval, resolveApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import {
   addAudit,
+  addSseSubscription,
   appendTrace,
+  getDevice,
   listChatBlocks,
   listChatBlocksAfter,
+  markRead,
   mutateState,
   readState,
   readTrace,
-  subscribeChatBlocks
+  removeDeviceForCredential,
+  subscribeChatBlocks,
+  unreadCountForDevice,
+  upsertDevice
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
 import { runFillSecretConnect } from "./execution/browser-fill-secrets";
@@ -24,7 +30,7 @@ import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embeddin
 import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
-import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./governance/pairing";
+import { authorizedBearer, claimPairing, createPairing, resolveCredentialFromBearer, revokePairedDevice } from "./governance/pairing";
 import { proposePromotion, reviewPromotion } from "./governance/promotions";
 import { status, updateAutoApproveSettings } from "./runtime";
 import { searchSessions } from "./execution/search";
@@ -160,7 +166,25 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       return json(listChatBlocks(config.instance, sessionId));
     }],
-    ["GET", /^\/api\/chat\/([^/]+)\/stream$/, (request, params) => chatBlockStream(config, request, params[0])],
+    ["GET", /^\/api\/chat\/([^/]+)\/stream$/, async (request, params) => {
+      // Resolve the credential before opening the SSE stream so the
+      // optional X-Device-Token header can be validated. The
+      // `authorized` gate above already accepted the bearer, so a
+      // null here means the bearer is valid for `authorizedBearer`
+      // but not for credential resolution — treat as unauthenticated
+      // rather than falling through anonymously.
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      // X-Device-Token is optional — mobile clients send it after
+      // they've registered their APNs token via POST /push/devices, so
+      // the dispatcher can per-device suppress completion silent pushes
+      // while they're watching. Web/CLI clients don't send it (they
+      // have no APNs token); they simply aren't tracked in the
+      // suppression registry, which is correct — no push is ever sent
+      // to them anyway.
+      const deviceToken = deviceTokenFromRequest(config, request, credential);
+      return chatBlockStream(config, request, params[0], deviceToken);
+    }],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
     ["GET", /^\/api\/tasks$/, (request) => {
@@ -662,6 +686,90 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/devices$/, () => json(publicState(config).devices)],
     ["POST", /^\/api\/devices\/([^/]+)\/revoke$/, async (_request, params) => json(await revokePairedDevice(config, params[0]))],
     ["POST", /^\/api\/pairing$/, async (request) => json(await createPairing(config, await body(request)), 201)],
+    // Push-device registry endpoints. The mobile app POSTs its APNs
+    // token here on first launch (and on rotation via
+    // addPushTokenListener); DELETE prunes a token when the app
+    // signs out. Both routes scope the row to the calling credential
+    // — a paired device id (from the pairing claim flow) or the
+    // literal "owner" for the runtime config token. The CHECK
+    // constraint on the devices table pins platform to "ios" for now.
+    ["POST", /^\/api\/push\/devices$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const payload = await body(request);
+      const token = typeof payload.token === "string" ? payload.token.trim() : "";
+      const platform = typeof payload.platform === "string" ? payload.platform.trim() : "";
+      const bundleId = typeof payload.bundleId === "string" ? payload.bundleId.trim() : "";
+      if (!token) return json({ error: "token is required" }, 400);
+      if (platform !== "ios") return json({ error: "platform must be 'ios'" }, 400);
+      if (!bundleId) return json({ error: "bundleId is required" }, 400);
+      const device = upsertDevice(config.instance, {
+        token,
+        credentialId: credential,
+        platform: "ios",
+        bundleId
+      });
+      return json({ ok: true, device });
+    }],
+    ["DELETE", /^\/api\/push\/devices\/([^/]+)$/, async (request, params) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const removed = removeDeviceForCredential(config.instance, params[0], credential);
+      // 404 distinguishes "token does not exist OR belongs to a
+      // different credential" — we don't surface which because
+      // either leaks information about other credentials' devices.
+      if (!removed) return json({ error: "Device not found" }, 404);
+      return json({ ok: true });
+    }],
+    // Chat read-state + badge endpoints. The mobile app POSTs to
+    // /read every time the user lands on a chat detail so the gateway
+    // can compute the cross-session badge count; GET /badge returns
+    // the total unread block count for the caller's credential.
+    // Credential scoping happens on every read/write so a paired
+    // device can never see or mutate another credential's cursor.
+    ["POST", /^\/api\/chat\/([^/]+)\/read$/, async (request, params) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      // Read state is keyed per device, not per credential — two
+      // iPhones owned by the same human each track their own cursor.
+      // The X-Device-Token header is mandatory here; web/CLI clients
+      // don't post reads because there's no device-specific badge to
+      // sync for them.
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const sessionId = params[0];
+      const state = readState(config.instance);
+      if (!state.chatSessions.some((s) => s.id === sessionId)) {
+        return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      }
+      const payload = await body(request);
+      const lastReadBlockId =
+        typeof payload.lastReadBlockId === "string" ? payload.lastReadBlockId.trim() : "";
+      if (!lastReadBlockId) {
+        return json({ error: "lastReadBlockId is required" }, 400);
+      }
+      // Validate the block belongs to this session — the cursor would
+      // be meaningless otherwise, and accepting cross-session ids would
+      // let a client smuggle a foreign block into another device's
+      // read state.
+      const blockBelongs = listChatBlocks(config.instance, sessionId).some(
+        (b) => b.id === lastReadBlockId
+      );
+      if (!blockBelongs) {
+        return json({ error: "Block does not belong to this session" }, 400);
+      }
+      const result = markRead(config.instance, sessionId, dev.token, lastReadBlockId);
+      return json({ ok: true, readState: result });
+    }],
+    ["GET", /^\/api\/badge$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      // Badge totals are per-device (see /read endpoint comment).
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const unread = unreadCountForDevice(config.instance, dev.token);
+      return json({ unread });
+    }],
     ["GET", /^\/api\/promotions$/, () => json(readState(config.instance).promotions)],
     ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],
     ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, async (_request, params) => json(await reviewPromotion(config, params[0], "approve"))],
@@ -755,39 +863,119 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
 
   return async (request: Request) => {
     const url = new URL(request.url);
+    // CORS preflight: short-circuit before auth so browsers can probe
+    // protected endpoints. Returning a 401 on OPTIONS would prevent the
+    // browser from ever sending the real bearer-carrying request.
+    if (request.method === "OPTIONS" && request.headers.get("access-control-request-method")) {
+      return preflightResponse(request);
+    }
     if (url.pathname.startsWith("/api/")) {
       if (request.method === "POST" && url.pathname === "/api/pairing/claim") {
         try {
-          return json(await claimPairing(config, await body(request)), 201);
+          return withCors(request, json(await claimPairing(config, await body(request)), 201));
         } catch (error) {
-          return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+          return withCors(request, json({ error: error instanceof Error ? error.message : String(error) }, 400));
         }
       }
-      if (!await authorized(request, config)) return json({ error: "Unauthorized" }, 401);
+      if (!await authorized(request, config)) return withCors(request, json({ error: "Unauthorized" }, 401));
       for (const [method, pattern, handler] of routes) {
         const match = url.pathname.match(pattern);
         if (request.method === method && match) {
           try {
-            return await handler(request, Object.fromEntries(match.slice(1).map((value, index) => [String(index), value])));
+            return withCors(request, await handler(request, Object.fromEntries(match.slice(1).map((value, index) => [String(index), value]))));
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            return json({ error: message }, statusFromErrorMessage(message));
+            return withCors(request, json({ error: message }, statusFromErrorMessage(message)));
           }
         }
       }
-      return json({ error: "Not found" }, 404);
+      return withCors(request, json({ error: "Not found" }, 404));
     }
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
-      return json({
+      return withCors(request, json({
         name: "gini-runtime",
         instance: config.instance,
         port: config.port,
         message: "Gini runtime API. The Next.js control plane runs on a separate port; see `gini status`.",
         ui_url_hint: process.env.GINI_WEB_URL ?? null
-      });
+      }));
     }
-    return json({ error: "Not found" }, 404);
+    return withCors(request, json({ error: "Not found" }, 404));
   };
+}
+
+// CORS allowlist for browser-origin clients. The mobile app's RN-Web
+// target (Expo on :8090 or :8081) and the Next.js BFF dev server
+// (:3045) need cross-origin access to the gateway so Playwright/MCP
+// can drive the actual UI. Native iOS/Android, CLI, MCP, and the
+// Next.js BFF (which calls the gateway server-side) are NOT browser
+// origins and never trigger CORS preflight — they aren't affected.
+//
+// Allowlist-only: when the Origin header doesn't match, no CORS
+// headers are added and the browser blocks the response. No wildcard
+// is supported because we send Access-Control-Allow-Credentials: true
+// (browsers reject `*` + credentials together).
+const DEFAULT_CORS_ORIGINS = [
+  "http://localhost:3045",
+  "http://localhost:8081",
+  "http://localhost:8090",
+  "http://127.0.0.1:3045",
+  "http://127.0.0.1:8081",
+  "http://127.0.0.1:8090"
+];
+
+function allowedOrigins(): string[] {
+  const raw = process.env.GINI_CORS_ORIGINS;
+  if (raw === undefined) return DEFAULT_CORS_ORIGINS;
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function corsOriginFor(request: Request): string | undefined {
+  const origin = request.headers.get("origin");
+  if (!origin) return undefined;
+  return allowedOrigins().includes(origin) ? origin : undefined;
+}
+
+// Wrap any Response with the CORS allow-origin headers when the
+// caller's Origin matches the allowlist. Returns the response
+// untouched for non-browser callers (no Origin header) so curl/CLI
+// behavior is preserved. Errors (4xx/5xx) and SSE responses are also
+// CORS-stamped so the browser surfaces the real status to JS rather
+// than collapsing to a network error.
+function withCors(request: Request, response: Response): Response {
+  const origin = corsOriginFor(request);
+  if (!origin) return response;
+  const headers = new Headers(response.headers);
+  headers.set("Access-Control-Allow-Origin", origin);
+  headers.set("Access-Control-Allow-Credentials", "true");
+  headers.set("Vary", "Origin");
+  headers.set("Access-Control-Expose-Headers", "Last-Event-ID");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+// Preflight short-circuits the normal route matcher: the browser
+// asks "may I send a <method> with these headers?" and expects a 204
+// without auth (the actual GET/POST still requires the bearer).
+function preflightResponse(request: Request): Response {
+  const headers = new Headers();
+  const origin = corsOriginFor(request);
+  if (origin) {
+    headers.set("Access-Control-Allow-Origin", origin);
+    headers.set("Access-Control-Allow-Credentials", "true");
+    headers.set("Vary", "Origin");
+    headers.set("Access-Control-Expose-Headers", "Last-Event-ID");
+  }
+  headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Device-Token, Last-Event-ID, Accept, Cache-Control, X-Requested-With");
+  headers.set("Access-Control-Max-Age", "600");
+  return new Response(null, { status: 204, headers });
 }
 
 // Strict parse for Telegram chat_id values on the allow/deny endpoints.
@@ -1032,6 +1220,64 @@ async function authorized(request: Request, config: RuntimeConfig): Promise<bool
   return authorizedBearer(config, bearer ?? undefined);
 }
 
+// Pull the bearer off a request the same way `authorized` does so
+// per-route credential lookups stay consistent with the gate above.
+function bearerFromRequest(request: Request): string | undefined {
+  const header = request.headers.get("authorization") ?? "";
+  const queryToken = new URL(request.url).searchParams.get("token");
+  const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : queryToken;
+  return bearer ?? undefined;
+}
+
+// Resolve and validate the optional X-Device-Token header. Returns the
+// token string when present AND it belongs to the caller's credential;
+// returns null when absent (web/CLI clients) or when the device row
+// doesn't exist; throws nothing.
+//
+// Validation is mandatory: a malicious caller with a valid bearer
+// could otherwise smuggle another credential's APNs token into the
+// SSE registry or read-state, causing cross-account read cursors or
+// silent-push suppression bypass. The devices table's `credential_id`
+// column is the source of truth — the token only counts as "yours" if
+// upsertDevice recorded it under your credential.
+function deviceTokenFromRequest(
+  config: RuntimeConfig,
+  request: Request,
+  credentialId: string
+): string | null {
+  const raw = request.headers.get("x-device-token");
+  if (!raw) return null;
+  const token = raw.trim();
+  if (!token) return null;
+  const row = getDevice(config.instance, token);
+  if (!row) return null;
+  if (row.credentialId !== credentialId) return null;
+  return token;
+}
+
+// Variant that throws (caller catches and 403s). Used by routes where
+// the device token is mandatory (read-state writes and the badge
+// endpoint — both are mobile-only, no good fallback when the header
+// is missing or mismatched). Returns:
+//   - { ok: true, token }    when valid
+//   - { ok: false, reason }  when missing, malformed, or mismatched
+function requireDeviceToken(
+  config: RuntimeConfig,
+  request: Request,
+  credentialId: string
+): { ok: true; token: string } | { ok: false; reason: string; status: number } {
+  const raw = request.headers.get("x-device-token");
+  if (!raw || !raw.trim()) {
+    return { ok: false, reason: "X-Device-Token header is required", status: 400 };
+  }
+  const token = raw.trim();
+  const row = getDevice(config.instance, token);
+  if (!row || row.credentialId !== credentialId) {
+    return { ok: false, reason: "Device token is not registered to this credential", status: 403 };
+  }
+  return { ok: true, token };
+}
+
 function json(value: unknown, statusCode = 200): Response {
   return Response.json(value, { status: statusCode });
 }
@@ -1177,19 +1423,31 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
 }
 
 // ChatBlock SSE stream. Per ADR chat-block-protocol.md, each frame is
-// `id: <blockId>\nevent: chat_block\ndata: <json>\n\n` so a browser
-// EventSource auto-attaches Last-Event-ID on reconnect and the runtime
-// resumes from the cursor instead of re-replaying the full list.
+// `id: <block_id>:<ts>\nevent: chat_block\ndata: <json>\n\n` where `ts`
+// is the row's `updated_at` snapshot at emit time (or `created_at` for
+// insert-only kinds; they're equal at insert). The browser/EventSource
+// client auto-attaches the composite string as `Last-Event-ID` on
+// reconnect, and `listChatBlocksAfter` in src/state/chat-blocks.ts
+// parses the `:<ts>` suffix to detect in-place updates that happened on
+// the cursor row itself (e.g. an `assistant_text` streaming:false flip
+// or a `tool_call` status flip) since the client last saw it — without
+// requiring a per-row version bump or a separate ack channel.
 //
 // Differs from `eventStream` above: that route polls the global ring
 // buffer at 1s. Here we use the in-process EventEmitter wired into
 // insertChatBlock / upsertAssistantTextBlock / updateToolCallBlock —
 // inserts and upserts both fire AFTER the SQLite commit so subscribers
 // observe durable rows.
-function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: string): Response {
+function chatBlockStream(
+  config: RuntimeConfig,
+  request: Request,
+  sessionId: string,
+  deviceToken: string | null
+): Response {
   let closed = false;
   let keepalive: Timer | undefined;
   let unsubscribe: (() => void) | undefined;
+  let unregisterSubscription: (() => void) | undefined;
   const encoder = new TextEncoder();
   const seen = new Set<string>();
   const lastEventId =
@@ -1211,6 +1469,22 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
 
   const stream = new ReadableStream({
     start(controller) {
+      // Record this subscription on the active-watch registry so the
+      // APNs dispatcher can skip terminal-phase silent pushes for the
+      // device currently watching this session. Registered inside
+      // `start` (rather than at the route handler) so it always pairs
+      // with `cancel` — if the response is created but never consumed
+      // (rare, but possible on certain client disconnects), the
+      // registry doesn't pick up a phantom entry.
+      //
+      // Web/CLI clients (no X-Device-Token) skip registration: there's
+      // no APNs device behind them, so per-device suppression doesn't
+      // apply. Registering under a credential key would also incorrectly
+      // suppress pushes to a foregrounded mobile device sharing the
+      // same credential.
+      if (deviceToken) {
+        unregisterSubscription = addSseSubscription(config.instance, deviceToken, sessionId);
+      }
       // Two enqueue paths:
       //   - `enqueueBackfill` dedupes by block id so an initial replay
       //     doesn't double-send a row that we already sent (relevant
@@ -1223,20 +1497,33 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
       //     every frame. Skipping by id here was the previous bug —
       //     terminal `streaming: false` flips never reached the
       //     client.
-      const enqueueFrame = (block: { id: string }): void => {
+      const enqueueFrame = (block: ChatBlock): void => {
+        // Event id is `<block_id>:<ts>` where `ts` is the row's
+        // updated_at when the block kind exposes one (assistant_text,
+        // tool_call) and createdAt otherwise — these two fields hold
+        // the same ISO string for insert-only kinds, so the wire format
+        // is uniform across kinds. The mobile client stores this string
+        // verbatim and replays it via Last-Event-ID; the gateway parses
+        // the suffix in listChatBlocksAfter to detect in-place updates
+        // that happened on the cursor row itself (e.g. an assistant_text
+        // streaming:false flip) since the client last saw it.
+        const ts =
+          block.kind === "assistant_text" || block.kind === "tool_call"
+            ? block.updatedAt
+            : block.createdAt;
         controller.enqueue(
           encoder.encode(
-            `id: ${block.id}\nevent: chat_block\ndata: ${JSON.stringify(block)}\n\n`
+            `id: ${block.id}:${ts}\nevent: chat_block\ndata: ${JSON.stringify(block)}\n\n`
           )
         );
       };
-      const enqueueBackfill = (block: { id: string }): void => {
+      const enqueueBackfill = (block: ChatBlock): void => {
         if (closed) return;
         if (seen.has(block.id)) return;
         seen.add(block.id);
         enqueueFrame(block);
       };
-      const enqueueLive = (block: { id: string }): void => {
+      const enqueueLive = (block: ChatBlock): void => {
         if (closed) return;
         // Mark live-delivered blocks so a hypothetical mid-stream
         // backfill (we don't issue one today, but the wiring is
@@ -1270,6 +1557,9 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
       closed = true;
       if (keepalive) clearInterval(keepalive);
       if (unsubscribe) unsubscribe();
+      // Drop the active-watch entry. The cleanup helper is idempotent
+      // so a duplicate call from an error path is a no-op.
+      if (unregisterSubscription) unregisterSubscription();
     }
   });
   return new Response(stream, {
