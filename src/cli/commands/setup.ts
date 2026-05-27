@@ -349,7 +349,7 @@ async function runConfiguredFlow(config: RuntimeConfig, io: SetupIO, current: Pr
   const newModel = await selectModelForProvider(io, current, currentModel ?? null, true);
   if (newModel === null) return;
   config.provider = normalizeProvider({ name: current.id, model: newModel });
-  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  writeRuntimeConfig(config);
   io.success(`Provider set to ${current.id} (${newModel}).`);
 }
 
@@ -378,7 +378,7 @@ async function runFreshFlow(config: RuntimeConfig, io: SetupIO): Promise<void> {
   const model = await selectModelForProvider(io, provider, null, false);
   const chosenModel = model ?? provider.defaultModel;
   config.provider = normalizeProvider({ name: provider.id, model: chosenModel });
-  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  writeRuntimeConfig(config);
   io.success(`Provider set to ${provider.id} (${chosenModel}).`);
 }
 

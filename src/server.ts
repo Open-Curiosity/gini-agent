@@ -2,6 +2,7 @@ import { writeFileSync } from "node:fs";
 import { createHandler, writePid } from "./http";
 import { tunnelManager } from "./runtime/tunnel";
 import { readTunnelConfig } from "./runtime/tunnel/config-store";
+import { isSupervisedWebChild } from "./runtime/health-probe";
 import { webPortPath } from "./paths";
 import { existsSync as fileExists, readFileSync as readFileSyncFs } from "node:fs";
 import { runDueJobs } from "./jobs";
@@ -87,7 +88,7 @@ let bootReconcileAbort = false;
             // probing the BFF-side healthz endpoint. A 200 with the
             // expected JSON shape proves the port isn't a stale-file or
             // port-squat scenario.
-            const healthy = await probeNextHealthz(port).catch(() => false);
+            const healthy = await isSupervisedWebChild(config.instance, port).catch(() => false);
             if (bootReconcileAbort) {
               appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "shutdown" });
               return;
@@ -108,7 +109,7 @@ let bootReconcileAbort = false;
               appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "shutdown" });
               return;
             }
-            const result = await tunnelManager(config).enable(port);
+            const result = await tunnelManager(config).enable(port, { reconcileOnly: true });
             appendLog(config.instance, "tunnel.boot-reconcile", { ok: result.ok });
             return;
           }
@@ -118,19 +119,6 @@ let bootReconcileAbort = false;
       appendLog(config.instance, "tunnel.boot-reconcile.timeout", {});
     };
     void poll();
-  }
-}
-
-async function probeNextHealthz(port: number): Promise<boolean> {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/api/runtime/__healthz`, {
-      signal: AbortSignal.timeout(1500)
-    });
-    if (!res.ok) return false;
-    const body = (await res.json()) as { service?: unknown; instance?: unknown };
-    return body.service === "gini-web" && body.instance === config.instance;
-  } catch {
-    return false;
   }
 }
 

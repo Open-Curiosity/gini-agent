@@ -269,7 +269,7 @@ class TunnelManager {
     return promise;
   }
 
-  async enable(webPort: number): Promise<TunnelTransitionResult> {
+  async enable(webPort: number, opts: { reconcileOnly?: boolean } = {}): Promise<TunnelTransitionResult> {
     // Remember the port so rotateSecret can recycle without needing the
     // caller to thread it back through. Set OUTSIDE the queue so the
     // value is visible to a concurrent rotateSecret read-then-recycle.
@@ -280,6 +280,19 @@ class TunnelManager {
       // tunnel the SIGTERM handler just tore down.
       if (this.shuttingDown) {
         return { ok: false, error: "Tunnel manager shutting down" };
+      }
+      // Reconcile-only callers (boot reconcile, internal recycle) must
+      // re-check disk intent inside the queue slot. A user `disable()`
+      // that enqueued between the caller's pre-check and our slot
+      // would otherwise be resurrected by us — chain order
+      // disable→enable lets enable's last-writer-wins on disk. User-
+      // driven enables (`reconcileOnly` unset / false) skip this gate;
+      // explicit intent wins.
+      if (opts.reconcileOnly) {
+        const persisted = this.readPersisted();
+        if (!persisted.enabled) {
+          return { ok: false, error: "reconcile-aborted: tunnel disabled while enqueued" };
+        }
       }
       // Bump generation before any state change so any background Notes
       // write scheduled by a previous enable() (recycle path) hits the
@@ -418,29 +431,36 @@ class TunnelManager {
         const next = this.persistTunnel( { secret: generateTunnelSecret() });
         setRedactionSecret(next.secret);
         scheduledGeneration = this.generation;
+        // Stamp the new secret + revision into the snapshot BEFORE
+        // attempting the recycle. If the recycle fails (cloudflared
+        // banner timeout, port re-probe fails) the snapshot still
+        // reflects the on-disk truth — the QR launcher / settings card
+        // show the new secret instead of leaving the old in-memory
+        // value live while disk + proxy already moved to the new one.
+        // The pre-stamp's publicUrl uses the prior value; swap rewrites
+        // it (with the new URL) on success or nulls it on failure.
+        this.snapshot = {
+          ...this.snapshot,
+          secret: next.secret,
+          secretRevision: secretRevision(next.secret, this.snapshot.publicUrl)
+        };
         // If a tunnel is running, recycle cloudflared INLINE so a
         // concurrent disable() can't interleave between commit and
         // recycle. swapCloudflared assumes it's inside the apply chain.
         if (this.cloudflared !== null && this.lastWebPort !== null) {
           const swap = await this.swapCloudflared(this.lastWebPort, next.secret);
           if (!swap.ok) {
-            // Recycle failed mid-rotation. The secret is already
-            // committed; mark the tunnel down so the operator can
-            // re-enable. Persisted enabled stays true so the next
-            // boot's reconcile attempts the relaunch.
-            this.snapshot = { ...this.snapshot, lastError: swap.error };
+            // swap already stamped publicUrl=null + lastError; the
+            // pre-stamp above ensured snapshot.secret matches disk so
+            // the UI shows the rotated state truthfully even though
+            // the relaunch failed.
             return swap;
           }
           didRecycle = true;
-        } else {
-          // No running tunnel — just stamp the new secret + revision so
-          // the snapshot reflects the rotation. publicUrl stays null.
-          this.snapshot = {
-            ...this.snapshot,
-            secret: next.secret,
-            secretRevision: secretRevision(next.secret, this.snapshot.publicUrl)
-          };
         }
+        // If no tunnel was running, the pre-stamp above is the only
+        // snapshot update we need — publicUrl stays null, secret +
+        // revision reflect the rotation.
         appendLog(this.config.instance, "tunnel.secret-rotated", { recycled: didRecycle });
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
