@@ -90,7 +90,7 @@ export function ProviderCard({
       }
       toast.success(`Provider set to ${providerName} (${selectedModel}).`);
       setApiKey("");
-      invalidate(["state", "providers"]);
+      invalidate(["status", "providers"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -135,8 +135,17 @@ export function ProviderCard({
           </div>
           <div className="grid gap-2">
             <Label htmlFor="provider-model">Model</Label>
+            {/*
+              Radix Select reads the visible label from the matching SelectItem,
+              and SelectItems only mount when SelectContent is open. Setting
+              `value` programmatically while the popup is closed leaves the
+              trigger showing the placeholder. Remount the Select whenever the
+              chosen provider changes so `defaultValue` re-seeds the displayed
+              label without depending on the popup being opened.
+            */}
             <Select
-              value={selectedModel}
+              key={providerName}
+              defaultValue={selectedModel}
               onValueChange={setSelectedModel}
               disabled={!entry || setProvider.isPending}
             >
