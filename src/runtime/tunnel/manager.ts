@@ -67,6 +67,10 @@ class TunnelManager {
   // Serialize every apply-path mutation. Promise chain serves as a queue.
   private applyChain: Promise<void> = Promise.resolve();
   private notesAvailable: boolean | null = null;
+  /** Last webPort enable() was called with. Used by rotateSecret to
+   *  recycle cloudflared (close every open TCP / SSE connection) without
+   *  the caller having to know the port. Null until the first enable(). */
+  private lastWebPort: number | null = null;
 
   constructor(private readonly config: RuntimeConfig) {
     // Eagerly populate config (mints secret if missing). The on-disk write is
@@ -156,6 +160,10 @@ class TunnelManager {
   }
 
   async enable(webPort: number): Promise<TunnelTransitionResult> {
+    // Remember the port so rotateSecret can recycle without needing the
+    // caller to thread it back through. Set OUTSIDE the queue so the
+    // value is visible to a concurrent rotateSecret read-then-recycle.
+    this.lastWebPort = webPort;
     return this.enqueue(async () => {
       // Bail before any write/spawn if shutdown has already started — the
       // drain has already run, so finishing this task would resurrect a
@@ -350,10 +358,23 @@ class TunnelManager {
     });
   }
 
-  /** Mint a fresh secret atomically. The next request's cookie no longer
-   *  matches the live secret — 404 on the next hit. */
+  /** Mint a fresh secret atomically AND recycle cloudflared so every
+   *  outstanding tunneled connection drops — the panic-button contract:
+   *  rotate-secret must not leave open SSE streams reachable from a
+   *  holder whose cookie value just stopped matching the live secret.
+   *
+   *  Three things invalidate together:
+   *  - The new secret on disk: cookie-bearing FRESH requests fail at
+   *    the proxy's cookie check because cookieValue ≠ tunnel.secret.
+   *  - The recycled cloudflared subprocess: every open TCP connection
+   *    (including long-lived SSE streams that wouldn't make another
+   *    request) closes at the network layer.
+   *  - The rotated trycloudflare hostname: the host-only cookie's
+   *    binding doesn't match the new hostname either, so even a
+   *    reconnecting client with the old cookie can't piggy-back. */
   async rotateSecret(): Promise<TunnelTransitionResult> {
     let scheduledGeneration = 0;
+    let needsRecycle = false;
     const result: TunnelTransitionResult = await this.enqueue(async (): Promise<TunnelTransitionResult> => {
       // Bump the generation so any in-flight detached Notes refresh from
       // a prior enable() / rotateSecret() bails before writing the now-
@@ -364,6 +385,10 @@ class TunnelManager {
         this.snapshot = { ...this.snapshot, secret: next.secret, secretRevision: secretRevision(next.secret, this.snapshot.publicUrl) };
         setRedactionSecret(next.secret);
         scheduledGeneration = this.generation;
+        // Only recycle if a tunnel is actually running. Rotating while
+        // the tunnel is off is just a config write — no open connections
+        // to close, hostname stays absent.
+        needsRecycle = this.cloudflared !== null && this.lastWebPort !== null;
         appendLog(this.config.instance, "tunnel.secret-rotated", {});
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
@@ -372,14 +397,19 @@ class TunnelManager {
         return { ok: false, error: redact(msg) };
       }
     });
-    // Fire-and-forget the Notes refresh OUTSIDE the apply chain — same
-    // pattern enable() and setAppleNotesEnabled() use. Awaiting writeNote
-    // inside the enqueue body would sit a 15s osascript timeout in front
-    // of any follow-up disable(), defeating PLAN.md's 5000ms exposure
-    // cap. The captured scheduledGeneration gate inside runRefreshNotes
-    // bails if a concurrent disable / re-rotate / re-enable moves on
-    // before the write lands.
-    if (result.ok && this.snapshot.appleNotes.enabled && this.snapshot.publicUrl && this.notesAvailable) {
+    if (!result.ok) return result;
+    if (needsRecycle && this.lastWebPort !== null) {
+      // Recycle outside the apply chain — enable() itself enqueues, so
+      // a concurrent disable() can still preempt this. The in-progress
+      // rotation task has already returned, so a follow-up disable()
+      // gets the chain slot before the recycle's enable() body runs.
+      // enable() handles its own fire-and-forget Notes refresh, so we
+      // don't fire a second one here.
+      const port = this.lastWebPort;
+      void this.enable(port).catch(() => { /* surfaced in lastError */ });
+    } else if (this.snapshot.appleNotes.enabled && this.snapshot.publicUrl && this.notesAvailable) {
+      // Tunnel was off → no connections to close. Still refresh Notes
+      // for the new secret so the mirror reflects the rotated state.
       void this.runRefreshNotes(scheduledGeneration).catch(() => { /* surfaced in appleNotes.lastError */ });
     }
     return result;
