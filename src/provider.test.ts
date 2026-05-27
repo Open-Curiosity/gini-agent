@@ -2305,6 +2305,151 @@ describe("provider", () => {
     }
   });
 
+  test("codex generateTaskSummary retries through callOpenAIResponses on session-expired", async () => {
+    // generateTaskSummary lands in callOpenAIResponses for codex, which
+    // also wraps in withCodexSessionRetry. Pin the contract so a
+    // regression that drops the retry from the text-summary path
+    // (separate from tool-calling) gets caught.
+    const { restore } = installCodexAuth("codex-task-summary-retry");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      if (attempts === 1) {
+        return Promise.resolve(new Response(
+          JSON.stringify({ error: { message: "Unauthorized: access token expired" } }),
+          { status: 401, headers: { "content-type": "application/json" } }
+        ));
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "summary-ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const result = await generateTaskSummary(config(provider), "summarize this");
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("summary-ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex generateStructured retries through callStructuredCodex on session-expired", async () => {
+    // generateStructured for codex lands in callStructuredCodex which
+    // wraps the fetch+stream pair in withCodexSessionRetry. The JSON.parse
+    // happens AFTER the retry helper, so a malformed payload on attempt 2
+    // would still surface as a non-auth error — but the retry itself
+    // covers attempt 1's 401.
+    const { restore } = installCodexAuth("codex-structured-retry");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      if (attempts === 1) {
+        return Promise.resolve(new Response(
+          JSON.stringify({ error: { message: "Unauthorized: session expired" } }),
+          { status: 401, headers: { "content-type": "application/json" } }
+        ));
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "{\"ok\":true}" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const result = await generateStructured(config(provider), {
+        system: "be brief",
+        user: "say ok",
+        schemaName: "Ok",
+        validator: { parse: (v) => v as { ok: boolean } }
+      });
+      expect(attempts).toBe(2);
+      expect(result.data).toEqual({ ok: true });
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex generateVisionAnalysis retries through callVisionCodex on session-expired", async () => {
+    // generateVisionAnalysis for codex goes through callVisionCodex
+    // (non-streaming /responses) which also wraps in
+    // withCodexSessionRetry. The 401-with-session-expired shape is the
+    // only failure mode here (no SSE error events), so the retry path
+    // depends on classifying the initial 401 body correctly.
+    const { restore } = installCodexAuth("codex-vision-retry");
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    globalThis.fetch = (() => {
+      attempts += 1;
+      if (attempts === 1) {
+        return Promise.resolve(new Response(
+          JSON.stringify({ error: { message: "Unauthorized: token expired" } }),
+          { status: 401, headers: { "content-type": "application/json" } }
+        ));
+      }
+      const body = {
+        id: "resp_vision_retry",
+        output: [
+          {
+            id: "msg_1",
+            type: "message",
+            content: [{ type: "output_text", text: "vision-ok" }]
+          }
+        ],
+        usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 }
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const result = await generateVisionAnalysis(config(provider), {
+        prompt: "describe",
+        imageBase64: "AAAA",
+        mimeType: "image/png"
+      });
+      expect(attempts).toBe(2);
+      expect(result.text).toBe("vision-ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
   test("codex cancels attempt 1's reader before retrying", async () => {
     // Before the try/finally wrap was added, a session-expired throw
     // inside the SSE handler unwound out of the reading loop and left
