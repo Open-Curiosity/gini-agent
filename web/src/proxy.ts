@@ -206,8 +206,14 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
 }
 
 export const config = {
-  // Exclude Next.js static assets — the proxy runs at request time and
-  // re-running for every /_next/static asset would be wasteful. The match
-  // intentionally covers `/api/*` so the tunnel proxy gates BFF calls too.
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"]
+  // Exclude Next.js static assets and the dev-mode HMR endpoint — the proxy
+  // runs at request time and re-running for every /_next/static asset would
+  // be wasteful. `_next/webpack-hmr` is the dev server's WebSocket upgrade
+  // path; intercepting it as an HTTP request breaks the upgrade handshake,
+  // and the browser logs a steady stream of WS connection failures (one per
+  // reconnect attempt). Excluding it here lets Next.js's HMR WS upgrade run
+  // through to the dev server directly. The path doesn't exist in
+  // production builds. The match intentionally covers `/api/*` so the
+  // tunnel proxy gates BFF calls too.
+  matcher: ["/((?!_next/static|_next/image|_next/webpack-hmr|favicon.ico).*)"]
 };
