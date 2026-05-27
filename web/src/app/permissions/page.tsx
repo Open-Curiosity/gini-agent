@@ -7,7 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
-import { RiskPill, StatusPill } from "@/components/StatusPill";
+import { RiskPill, StatusPill, shouldHideRiskBadge } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useApprovals, useInvalidate } from "@/lib/queries";
 import type { Approval } from "@runtime/types";
@@ -144,7 +144,7 @@ function ApprovalCard({
               sign-in step, not a destructive action. All other approvals
               keep the badge.
             */}
-            {isBrowserConnect ? null : <RiskPill value={approval.risk} />}
+            {shouldHideRiskBadge(approval.action) ? null : <RiskPill value={approval.risk} />}
             <StatusPill value={approval.status} />
           </div>
         </div>
