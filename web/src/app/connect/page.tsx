@@ -31,14 +31,34 @@ function validateHttpUrl(value: string | undefined): string | undefined {
   }
 }
 
-// The scheme value lands inside JSON that gets spliced into an inline
-// <script>. JSON.stringify handles quote escaping, but we restrict the
-// allowed character set so a crafted scheme can't carry HTML or whitespace
-// that might break out of the inline block or confuse a downstream parser.
+// The scheme value lands on `window.location.href` inside the
+// ConnectClient component. A `javascript:` URL with a crafted body
+// would execute same-origin JS that can fetch `/api/runtime/*` and
+// pivot through the BFF's bearer injection. Defenses, in order:
+//
+// 1. Reject by length cap so a degenerate-long payload doesn't even
+//    enter validation.
+// 2. Explicit case-insensitive blocklist for known script-execution
+//    schemes — `javascript:`, `data:`, `vbscript:`, `file:`, `blob:`,
+//    `about:`. The blocklist runs BEFORE the regex so a percent-encoded
+//    variant like `javascript%3A...` (which decodes once via Next.js
+//    searchParams to `javascript:...`) is caught before the next step.
+// 3. Structural shape: a real deep-link scheme is `<scheme>://<path>`
+//    with the scheme starting with a lowercase letter and the post-`://`
+//    body limited to alphanumerics + `.-_/+`. `javascript:` URLs cannot
+//    pass this shape because they don't have `://` followed by a
+//    well-formed path (and `javascript://...` is also blocklisted above).
+// 4. The shape disallows `%` so a doubly-encoded payload that only
+//    decodes once can't sneak the body past the regex.
+const DANGEROUS_SCHEME_PREFIXES = ["javascript:", "data:", "vbscript:", "file:", "blob:", "about:"];
 function validateScheme(value: string | undefined, fallback: string): string {
   if (!value) return fallback;
   if (value.length > 256) return fallback;
-  if (!/^[A-Za-z0-9\-+.:/?=&%_~]+$/.test(value)) return fallback;
+  const lower = value.toLowerCase();
+  for (const bad of DANGEROUS_SCHEME_PREFIXES) {
+    if (lower.startsWith(bad)) return fallback;
+  }
+  if (!/^[a-z][a-z0-9+.\-]*:\/\/[A-Za-z0-9._\-/]+$/.test(value)) return fallback;
   return value;
 }
 

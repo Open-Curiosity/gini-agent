@@ -35,10 +35,10 @@ describe("parseTrustedOriginUrls", () => {
   });
 
   test("skips entries with non-root pathname", () => {
-    // The reviewer's specific concern: an operator pasted a full URL
-    // with a path and `.host` would silently drop it. Reject those
-    // entries so the operator sees the failure rather than a broader
-    // allowlist than they intended.
+    // An operator who pasted a full URL with a path would silently get
+    // a broader allowlist than they meant (the path/query are dropped
+    // by `.host`). Reject those entries so they get fail-loud feedback
+    // instead.
     const result = parseTrustedOriginUrls("https://gini.example.com/admin");
     expect(result).toEqual([]);
   });
