@@ -34,7 +34,7 @@ export interface UploadRef {
 export async function uploadImage(file: File): Promise<UploadRef> {
   const form = new FormData();
   form.set("file", file);
-  const response = await fetch("/api/runtime/api/uploads", {
+  const response = await fetch("/api/runtime/uploads", {
     method: "POST",
     body: form
   });
@@ -52,5 +52,5 @@ export async function uploadImage(file: File): Promise<UploadRef> {
 }
 
 export function uploadUrl(id: string): string {
-  return `/api/runtime/api/uploads/${encodeURIComponent(id)}`;
+  return `/api/runtime/uploads/${encodeURIComponent(id)}`;
 }
