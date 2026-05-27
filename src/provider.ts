@@ -1797,10 +1797,11 @@ function readCodexBearer(provider: ProviderConfig): string {
 // codex requests in `withCodexSessionRetry`, which retries once on this
 // error so a freshly-rotated token in ~/.codex/auth.json (written by the
 // codex CLI's own refresh path) gets a chance to land before we surface
-// the failure. Only raised when no output has been emitted yet — once
-// onDelta has fired or a tool call has been buffered, a transparent
-// retry would double-deliver, so the stream readers fall through to the
-// generic Error path in that case.
+// the failure. Only raised when no caller-visible bytes have been emitted —
+// once onDelta has fired, a transparent retry would double-deliver, so
+// the stream readers fall through to the generic Error path in that
+// case. Internal buffers (text accumulation, tool-call argument deltas)
+// do NOT count as emitted output; see emittedToCaller in the readers.
 class CodexSessionExpiredError extends Error {
   constructor(message: string) {
     super(message);
