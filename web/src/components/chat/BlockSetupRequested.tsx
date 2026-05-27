@@ -127,7 +127,9 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
   return (
     <div className={cardClass}>
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono text-xs text-foreground">{block.action}</span>
+        <span className="font-mono text-xs text-foreground">
+          {isBrowserConnect ? "Connect to agent's browser" : block.action}
+        </span>
         {!isPending && setup ? <StatusPill value={setup.status} /> : null}
         <button
           type="button"
