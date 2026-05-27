@@ -166,13 +166,16 @@ export function TunnelCard() {
               type="button"
               onClick={() => setQrRevealed((r) => !r)}
               aria-label={qrRevealed ? "Hide tunnel QR" : "Reveal tunnel QR"}
-              className="group relative h-48 w-48 overflow-hidden rounded border bg-white p-2"
+              className="group relative h-48 w-48 select-none overflow-hidden rounded border bg-white p-2"
               data-testid="tunnel-qr-reveal-toggle"
             >
               <img
                 src={`/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(data?.secretRevision ?? "")}`}
                 alt="Tunnel QR"
-                className={`h-full w-full transition duration-200 ${qrRevealed ? "blur-0" : "blur-md"}`}
+                draggable={false}
+                onDragStart={(e) => e.preventDefault()}
+                onContextMenu={(e) => e.preventDefault()}
+                className={`h-full w-full select-none transition duration-200 ${qrRevealed ? "blur-0" : "blur-md"}`}
                 data-testid="tunnel-settings-qr"
               />
               {!qrRevealed ? (
