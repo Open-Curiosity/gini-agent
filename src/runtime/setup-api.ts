@@ -122,7 +122,12 @@ export async function setSetupProvider(
   const envKeySpec = ENV_KEY_PROVIDERS[providerName];
   if (envKeySpec) {
     const apiKey = typeof payload.apiKey === "string" ? payload.apiKey.trim() : "";
-    if (!apiKey && !envKeySpec.allowEmptyKey) {
+    // Accept a no-key payload when the env var is already set — the Edit
+    // Provider dialog uses this to update just the default model without
+    // making the user re-type their key. Initial Add Provider still
+    // requires a key because the env var is empty there.
+    const envAlreadySet = Boolean(process.env[envKeySpec.envVar]);
+    if (!apiKey && !envKeySpec.allowEmptyKey && !envAlreadySet) {
       return {
         ok: false,
         provider: providerHealth(config),
