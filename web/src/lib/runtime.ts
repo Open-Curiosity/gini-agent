@@ -283,6 +283,14 @@ const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 function guardCsrf(request: Request, _pathSegments: string[]): Response | null {
   const origin = request.headers.get("origin");
   const isUnsafe = UNSAFE_METHODS.has(request.method);
+  // The proxy stamps `x-gini-tunnel-vetted: 1` only after passing its own
+  // Host classifier (live tunnel hostname or a GINI_TRUSTED_ORIGINS entry).
+  // When vetted=1 is set on the inbound request, the Host classifier already
+  // ran upstream; relaxing the Host check here is what lets a tunneled phone
+  // reach the BFF without setting GINI_TRUSTED_ORIGINS. Origin equality
+  // (when Origin is present) and the Sec-Fetch-Site gate below still fire
+  // independently — see PLAN.md "CSRF policy".
+  const vetted = request.headers.get("x-gini-tunnel-vetted") === "1";
   if (!origin) {
     if (isUnsafe) {
       return Response.json({ error: "Forbidden" }, { status: 403 });
@@ -295,18 +303,20 @@ function guardCsrf(request: Request, _pathSegments: string[]): Response | null {
     // less GETs from a rebound page hitting a tailnet/tunnel BFF will
     // 403 because Host is non-loopback. Non-browser callers on
     // loopback (curl, scripts) keep working.
-    const allowlist = trustedOrigins();
-    if (allowlist) {
-      // Operator opted into the strict allowlist. There's no Origin to
-      // compare, so we can't tell whether this is a legitimate same-
-      // origin GET or a rebound page that omitted Origin. Fail closed:
-      // any non-browser caller can hit the gateway directly with its
-      // own token, and a browser would have sent Origin.
-      return Response.json({ error: "Forbidden" }, { status: 403 });
-    }
-    const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
-    if (!isLoopbackHost(expectedHost)) {
-      return Response.json({ error: "Forbidden" }, { status: 403 });
+    if (!vetted) {
+      const allowlist = trustedOrigins();
+      if (allowlist) {
+        // Operator opted into the strict allowlist. There's no Origin to
+        // compare, so we can't tell whether this is a legitimate same-
+        // origin GET or a rebound page that omitted Origin. Fail closed:
+        // any non-browser caller can hit the gateway directly with its
+        // own token, and a browser would have sent Origin.
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
+      const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
+      if (!isLoopbackHost(expectedHost)) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
     }
   } else {
     let originUrl: URL;
@@ -344,9 +354,12 @@ function guardCsrf(request: Request, _pathSegments: string[]): Response | null {
       // an attacker-controlled name. Operators running on a non-
       // loopback hostname MUST set GINI_TRUSTED_ORIGINS — without it,
       // the guard refuses every request so the rebindable path is
-      // fully closed.
+      // fully closed. The vetted=1 marker bypasses the loopback-Host
+      // restriction because the proxy's Host classifier already
+      // verified the inbound Host against the live tunnel hostname or
+      // an allowlist entry — see PLAN.md "CSRF policy".
       const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
-      if (!isLoopbackHost(expectedHost)) {
+      if (!vetted && !isLoopbackHost(expectedHost)) {
         return Response.json({ error: "Forbidden" }, { status: 403 });
       }
       if (originUrl.host !== expectedHost) {

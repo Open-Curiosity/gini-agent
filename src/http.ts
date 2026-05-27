@@ -61,14 +61,98 @@ import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, s
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
-import { projectRoot } from "./paths";
+import { projectRoot, webPortPath } from "./paths";
+import { existsSync, readFileSync } from "node:fs";
+import { tunnelManager, bootstrapUrl, renderQrSvg, renderQrAnsi } from "./runtime/tunnel";
+import type { RedactedTunnelSnapshot, TunnelSnapshot } from "./runtime/tunnel/types";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
+
+function redactedSnapshot(snapshot: TunnelSnapshot): RedactedTunnelSnapshot {
+  return {
+    enabled: snapshot.enabled,
+    secret: null,
+    publicUrl: null,
+    lastError: snapshot.lastError,
+    appleNotes: {
+      enabled: snapshot.appleNotes.enabled,
+      notesAvailable: snapshot.appleNotes.notesAvailable,
+      lastError: snapshot.appleNotes.lastError
+    }
+  };
+}
+
+function readWebPort(instance: string): number | null {
+  const p = webPortPath(instance);
+  if (!existsSync(p)) return null;
+  const raw = readFileSync(p, "utf8").trim();
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
 
 export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/version$/, () => json(currentVersionInfo())],
+    // Tunnel surface. /api/tunnel is the privileged shape (secret + publicUrl);
+    // /api/tunnel/redacted is the browser-safe shape (secret=null, publicUrl=null).
+    // PLAN.md "Public surface".
+    ["GET", /^\/api\/tunnel$/, () => json(tunnelManager(config).current())],
+    ["GET", /^\/api\/tunnel\/redacted$/, () => json(redactedSnapshot(tunnelManager(config).current()))],
+    ["PATCH", /^\/api\/tunnel$/, async (request) => {
+      const payload = await body(request);
+      const mgr = tunnelManager(config);
+      if (typeof payload.rotateSecret === "boolean" && payload.rotateSecret) {
+        const result = await mgr.rotateSecret();
+        if (!result.ok) return json({ error: result.error }, 500);
+      }
+      if (typeof payload.enabled === "boolean") {
+        if (payload.enabled) {
+          const port = readWebPort(config.instance);
+          if (!port) return json({ error: "Web port unknown; start `gini run` first." }, 409);
+          const result = await mgr.enable(port);
+          if (!result.ok) return json({ error: result.error }, 500);
+        } else {
+          const result = await mgr.disable();
+          if (!result.ok) return json({ error: result.error }, 500);
+        }
+      }
+      if (payload.appleNotes && typeof payload.appleNotes === "object" && !Array.isArray(payload.appleNotes)) {
+        const desired = (payload.appleNotes as { enabled?: unknown }).enabled;
+        if (typeof desired === "boolean") {
+          const result = await mgr.setAppleNotesEnabled(desired);
+          if (!result.ok) return json({ error: result.error }, 500);
+        }
+      }
+      return json(mgr.current());
+    }],
+    ["POST", /^\/api\/tunnel\/refresh-notes$/, async () => {
+      const result = await tunnelManager(config).refreshNotes();
+      if (!result.ok) return json({ error: result.error }, 500);
+      return json(result.snapshot);
+    }],
+    ["GET", /^\/api\/tunnel\/qr\.svg$/, () => {
+      const snap = tunnelManager(config).current();
+      if (!snap.publicUrl || !snap.secret) {
+        return new Response("Tunnel not enabled", { status: 409, headers: { "content-type": "text/plain; charset=utf-8" } });
+      }
+      const svg = renderQrSvg(bootstrapUrl(snap.publicUrl, snap.secret));
+      return new Response(svg, {
+        status: 200,
+        headers: { "content-type": "image/svg+xml; charset=utf-8", "cache-control": "no-store" }
+      });
+    }],
+    ["GET", /^\/api\/tunnel\/qr\.txt$/, () => {
+      const snap = tunnelManager(config).current();
+      if (!snap.publicUrl || !snap.secret) {
+        return new Response("Tunnel not enabled", { status: 409, headers: { "content-type": "text/plain; charset=utf-8" } });
+      }
+      const ansi = renderQrAnsi(bootstrapUrl(snap.publicUrl, snap.secret));
+      return new Response(ansi, {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }
+      });
+    }],
     ["POST", /^\/api\/update\/check$/, () => json(refreshVersionInfo())],
     ["POST", /^\/api\/update$/, () => {
       assertCurrentRuntimeUpdateSupported();

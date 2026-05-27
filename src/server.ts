@@ -1,5 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { createHandler, writePid } from "./http";
+import { tunnelManager } from "./runtime/tunnel";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
@@ -33,6 +34,11 @@ const instance = parseInstance();
 const config = loadConfig(instance);
 await install(config);
 writePid(config);
+
+// Eagerly construct the tunnel manager so the 192-bit secret is generated on
+// first boot (whether or not tunnel.enabled is true) and the redaction set
+// is populated before any request lands. See PLAN.md "Persisted config".
+tunnelManager(config);
 
 // Inform the browser session manager which instance to consult for the
 // optional CDP connection record. Without this the manager falls back to
@@ -332,7 +338,14 @@ process.on("SIGTERM", async () => {
       // processes exit cleanly with the runtime instead of being reaped
       // by the OS at the very end. Errors are swallowed — a stuck
       // close shouldn't block runtime shutdown.
-      closeBrowserSessions().catch(() => {})
+      closeBrowserSessions().catch(() => {}),
+      // Tunnel: stop cloudflared so the public URL stops accepting traffic
+      // within the SIGKILL hard-cap. Configured to swallow errors — a stuck
+      // cloudflared shouldn't keep the runtime alive forever.
+      (async () => {
+        const { tunnelManager } = await import("./runtime/tunnel");
+        await tunnelManager(config).stopForShutdown();
+      })().catch(() => {})
     ]),
     Bun.sleep(SCHEDULER_DRAIN_TIMEOUT_MS)
   ]);

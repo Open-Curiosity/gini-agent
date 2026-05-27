@@ -11,6 +11,7 @@ import { McpCard, type McpRow } from "./_components/McpCard";
 import { MessagingCard, type MessagingRow } from "./_components/MessagingCard";
 import { DevicesCard, type DeviceRow } from "./_components/DevicesCard";
 import { BrowserSettingsCard } from "./_components/BrowserSettingsCard";
+import { TunnelCard } from "./_components/TunnelCard";
 
 export default function SettingsPage() {
   const invalidate = useInvalidate();
@@ -95,6 +96,8 @@ export default function SettingsPage() {
       <PageHeader title="Settings" description="Providers, browser, toolsets, integrations, devices" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
         <ProviderCard displayName={displayName} model={effectiveProviderModel} />
+
+        <TunnelCard />
 
         <BrowserSettingsCard />
 
