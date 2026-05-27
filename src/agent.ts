@@ -889,6 +889,16 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
     if (existing?.action === "browser.fill_secret") {
       throw new Error("browser.fill_secret approvals must be resolved via /connect with the per-slot values, not /approve.");
     }
+    if (existing?.action === "messaging.add_bridge") {
+      // Same defense-in-depth as browser.fill_secret: the side effect
+      // (addMessagingBridge) needs the name + bot-token values that
+      // only the /connect path carries. Routing through resolveApproval
+      // would flip the approval to approved with no bridge ever created.
+      // Holds the contract across every caller (HTTP /approve, CLI,
+      // /permissions UI, future API clients) — the HTTP refusal at
+      // src/http.ts is the outer layer; this is the load-bearing one.
+      throw new Error("messaging.add_bridge approvals must be resolved via /connect with the bridge name + bot token, not /approve.");
+    }
     const { approval } = await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
     return approval;
   }
@@ -1424,30 +1434,21 @@ async function runApprovedAction(
   }
 
   if (approval.action === "messaging.add_bridge") {
-    // Side effect (addMessagingBridge) already ran inside the
-    // /api/approvals/<id>/connect handler — that endpoint only
-    // resolves the approval after the bridge is created. Synthesize
-    // a tool result string the chat-task loop can feed back to the
-    // model so the conversation resumes naturally from the
-    // request_messaging_bridge call.
+    // The /connect handler owns the entire add_bridge lifecycle now:
+    // it calls resolveApproval(resumeChatTask:false) to atomically
+    // close the deny-mid-create race BEFORE addMessagingBridge runs,
+    // then calls resumeChatTask with the actual outcome string. By
+    // the time resolveApproval invokes this branch the bridge has
+    // not yet been created — we can't synthesize a truthful result
+    // here because the side effect comes AFTER this point. Return
+    // undefined; /connect handles resume. /approve route refuses
+    // messaging.add_bridge (see src/http.ts and the decideApproval
+    // guard above), so /connect is the only resolver and this branch
+    // is the resolveApproval-side no-op for that single path.
     void extraEvidence;
-    const kindLabel = approval.payload.kind === "telegram"
-      ? "Telegram"
-      : approval.payload.kind === "discord"
-        ? "Discord"
-        : String(approval.payload.kind ?? "messaging");
-    if (approval.taskId) {
-      appendTrace(config.instance, approval.taskId, {
-        type: "tool",
-        message: "Messaging bridge added via connect endpoint",
-        data: { kind: approval.payload.kind, approvalId: approval.id }
-      });
-    }
-    const result = `${kindLabel} bridge added. Tell the user it's ready and walk them through enrolling a chat (DM the bot, share the verification code, you approve from the settings page) if relevant.`;
-    if (shouldResumeChat && chatToolCallId && approval.taskId) {
-      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
-    }
-    return result;
+    void shouldResumeChat;
+    void chatToolCallId;
+    return undefined;
   }
 
   if (approval.action === "browser.fill_secret") {

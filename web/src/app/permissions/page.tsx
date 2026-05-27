@@ -109,6 +109,12 @@ function ApprovalCard({
   // both action buttons and point the operator at the chat card
   // where they can actually enter the credentials.
   const isBrowserFillSecret = approval.action === "browser.fill_secret";
+  // `messaging.add_bridge` is the same shape: /approve refuses it
+  // (see decideApproval), so the only resolution path is the inline
+  // chat card that collects the bridge name + bot token. Hide the
+  // Approve button on this page and leave only Deny + a pointer at
+  // the chat where the values can be entered.
+  const isMessagingAddBridge = approval.action === "messaging.add_bridge";
   // `||` (not `??`) so an empty-string reason also falls back to the
   // approval target. `??` only fires for null/undefined; a payload that
   // carried `reason: ""` would otherwise render a blank card body.
@@ -170,6 +176,19 @@ function ApprovalCard({
           <>
             <p className="text-xs text-muted-foreground">
               Open the chat session to enter credentials. Approve doesn&apos;t apply here — the values must be typed into the amber card in chat. Deny still cancels the request.
+            </p>
+            {onDecide ? (
+              <div className="flex gap-2">
+                <Button size="sm" variant="outline" disabled={pending} onClick={() => onDecide("deny")}>
+                  Deny
+                </Button>
+              </div>
+            ) : null}
+          </>
+        ) : isMessagingAddBridge ? (
+          <>
+            <p className="text-xs text-muted-foreground">
+              Open the chat session to add the bridge. Approve doesn&apos;t apply here — the bridge name and bot token must be entered into the card in chat. Deny still cancels the request.
             </p>
             {onDecide ? (
               <div className="flex gap-2">

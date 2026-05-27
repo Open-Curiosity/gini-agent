@@ -14,6 +14,7 @@ import {
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
 import { runFillSecretConnect } from "./execution/browser-fill-secrets";
+import { resumeChatTask } from "./execution/chat-task";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -256,12 +257,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // Add Discord dialog. The card's Submit button POSTs the
         // name + bot-token via the `secrets` envelope; we route them
         // straight into addMessagingBridge (the shared CLI / settings
-        // path) and resolve the approval on success.
+        // path).
         //
-        // Failure (invalid token shape, addMessagingBridge throw)
-        // returns 200 + ok:false so the chat card stays mounted and
-        // the user can retry without tearing down the approval row,
-        // mirroring the connector.request retry contract.
+        // Ordering mirrors runFillSecretConnect
+        // (src/execution/browser-fill-secrets.ts): atomic
+        // resolveApproval(resumeChatTask:false) FIRST so a concurrent
+        // /deny (or task cancel cascade) cannot leave an orphan
+        // bridge + encrypted secret on disk after the user has
+        // already abandoned the prompt. addMessagingBridge runs
+        // AFTER the lock-in; the chat-task resume is fired manually
+        // from this handler so the agent loop gets a result string
+        // reflecting what actually happened.
         const kind = approval.payload.kind === "telegram" || approval.payload.kind === "discord"
           ? (approval.payload.kind as "telegram" | "discord")
           : undefined;
@@ -273,6 +279,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         const deliveryTargets = Array.isArray(payload.deliveryTargets)
           ? payload.deliveryTargets.map(String).map((t) => t.trim()).filter((t) => t.length > 0)
           : [];
+        // Field validations run BEFORE the atomic resolve so a
+        // missing-field POST doesn't burn the approval — the chat
+        // card stays pending and the user can resubmit with the
+        // correct values.
         if (!submittedName) {
           return json({ ok: false, message: "Bridge name is required." });
         }
@@ -282,6 +292,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         if (kind === "discord" && deliveryTargets.length === 0) {
           return json({ ok: false, message: "Discord bridges require at least one channel id under deliveryTargets." });
         }
+        try {
+          await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: false });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return json({ ok: false, message: `Could not lock approval for bridge create: ${message}` }, 410);
+        }
+        const toolCallId = typeof approval.payload.toolCallId === "string"
+          ? approval.payload.toolCallId
+          : undefined;
+        const kindLabel = kind === "telegram" ? "Telegram" : "Discord";
         let bridge;
         try {
           bridge = await addMessagingBridge(config, {
@@ -292,9 +312,42 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          // Approval is already resolved at this point — the chat
+          // card will rerender with the resolved status pill and
+          // can no longer be retried. Resume the chat-task loop
+          // with the failure so the agent verbalizes the error
+          // back to the user (matching browser.fill_secret's
+          // post-resolve error pattern).
+          if (approval.taskId && toolCallId) {
+            try {
+              await resumeChatTask(
+                config,
+                approval.taskId,
+                toolCallId,
+                `Could not create ${kindLabel} bridge: ${message}. Tell the user about the failure so they can retry from the settings page.`
+              );
+            } catch {
+              // Best-effort resume — the user-facing error already
+              // surfaced via the ok:false body; a resume failure
+              // on top of that has no extra information to add.
+            }
+          }
           return json({ ok: false, message });
         }
-        await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
+        if (approval.taskId && toolCallId) {
+          try {
+            await resumeChatTask(
+              config,
+              approval.taskId,
+              toolCallId,
+              `${kindLabel} bridge added: ${bridge.name}. Tell the user it's ready and walk them through enrolling a chat (DM the bot, share the verification code, you approve from the settings page) if relevant.`
+            );
+          } catch {
+            // Bridge already exists on disk; a resume failure
+            // doesn't undo that. The user sees the success body
+            // and the bridge in the settings page.
+          }
+        }
         return json({ ok: true, bridge });
       }
 

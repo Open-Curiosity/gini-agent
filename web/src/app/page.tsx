@@ -142,6 +142,12 @@ export default function HomePage() {
                   // Hide both action buttons and point the operator to
                   // the chat session instead.
                   const isBrowserFillSecret = approval.action === "browser.fill_secret";
+                  // Same gate as fill_secret: /approve refuses
+                  // messaging.add_bridge — only the inline chat card
+                  // can resolve it. Hide Approve here and leave Deny
+                  // so the operator can still cancel from the home
+                  // list.
+                  const isMessagingAddBridge = approval.action === "messaging.add_bridge";
                   // The user-facing reason for browser.connect lives on
                   // payload.reason (set by the dispatch); fall back to the
                   // approval target (same string) if it's missing. We
@@ -185,6 +191,20 @@ export default function HomePage() {
                       <div className="flex shrink-0 flex-col items-end gap-1">
                         <span className="text-[11px] text-muted-foreground">
                           Enter credentials in chat.
+                        </span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={decide.isPending}
+                          onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
+                        >
+                          Deny
+                        </Button>
+                      </div>
+                    ) : isMessagingAddBridge ? (
+                      <div className="flex shrink-0 flex-col items-end gap-1">
+                        <span className="text-[11px] text-muted-foreground">
+                          Add the bridge in chat.
                         </span>
                         <Button
                           size="sm"

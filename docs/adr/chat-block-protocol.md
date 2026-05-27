@@ -108,7 +108,7 @@ remote previews, screen readers) would need the same translation code.
 
 - `ApprovalRequestedBlock.action` is part of the wire contract so
   clients can branch on the card variant without a cross-endpoint
-  join. Three branches:
+  join. Four branches:
   - `connector.request` — render the Connect dialog. Submit posts
     `{ secrets, scopes, name }` to `/api/approvals/<id>/connect`.
   - `browser.fill_secret` — render an inline form with one input
@@ -120,6 +120,20 @@ remote previews, screen readers) would need the same translation code.
     generic `/approve` endpoint refuses this action (only `/connect`
     completes the fill); `/deny` is still valid. See ADR
     [browser-fill-secret.md](browser-fill-secret.md).
+  - `messaging.add_bridge` — render an inline form with a name
+    input (pre-seeded from `approval.payload.suggestedName`) and a
+    password-masked bot-token input. Submit posts
+    `{ secrets: { name, botToken } }` to
+    `/api/approvals/<id>/connect`. The card reads
+    `approval.payload.kind` (currently `"telegram"`; `"discord"`
+    is reserved but the chat card does not collect channel IDs, so
+    the dispatcher tool only advertises Telegram from chat — see
+    [telegram-bridge.md](telegram-bridge.md)). The generic
+    `/approve` endpoint refuses this action (only `/connect` runs
+    the addMessagingBridge side effect); `/deny` is still valid.
+    The other resolution surfaces (home page, /permissions list)
+    therefore render only Deny + a "resolve in chat" hint for this
+    action.
   - everything else — standard Approve / Deny pair posting to
     `/api/approvals/<id>/{approve,deny}`.
 

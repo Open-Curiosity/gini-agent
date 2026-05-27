@@ -547,27 +547,35 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     // Messaging-bridge-request affordance. Surfaces the same inline form
     // card used by `request_connector` / `browser_fill_secrets`, but for
-    // adding a Telegram (or Discord) bridge. The agent calls this when
-    // the user asks something like "add a telegram bot" or "wire up
-    // messaging"; the user sees a card with a name input and a bot-token
-    // input (password-masked) inside the chat. On Submit, the gateway
-    // forwards the values to addMessagingBridge — same code path the CLI
-    // (`gini messaging add`) and the settings page already go through.
-    // Bot token never enters the model context, the audit row evidence,
-    // or the chat transcript.
+    // adding a Telegram bridge. The agent calls this when the user asks
+    // something like "add a telegram bot" or "wire up telegram"; the
+    // user sees a card with a name input and a bot-token input
+    // (password-masked) inside the chat. On Submit, the gateway
+    // forwards the values to addMessagingBridge — same code path the
+    // CLI (`gini messaging add`) and the settings page already go
+    // through. Bot token never enters the model context, the audit row
+    // evidence, or the chat transcript.
+    //
+    // Discord is deliberately NOT advertised in the kind enum: a
+    // Discord bridge requires a list of channel IDs (deliveryTargets)
+    // that the current chat card doesn't collect, so the create would
+    // always fail at the /connect handler's deliveryTargets check.
+    // Discord still flows through the CLI and the settings dialog,
+    // both of which surface the channel-ID input. When the chat card
+    // grows a channel-IDs textarea, widen the enum here.
     toolset: "messaging",
     displayLabel: "Add messaging bridge",
     type: "function",
     function: {
       name: "request_messaging_bridge",
-      description: "Ask the user to wire up a Telegram (or Discord) messaging bridge by entering a bot token. Use this when the user says something like 'add a telegram bot', 'connect telegram', 'set up a discord bot', or any other onboarding ask for messaging. The user sees an inline card in chat with a name input and a password-masked bot-token input; once they submit, the bridge is created on the runtime — same path as the CLI's `gini messaging add` and the settings page's Add Telegram dialog. The task pauses on this approval and resumes automatically after the user submits.",
+      description: "Ask the user to wire up a Telegram messaging bridge by entering a bot token. Use this when the user says something like 'add a telegram bot', 'connect telegram', or any other Telegram onboarding ask. The user sees an inline card in chat with a name input and a password-masked bot-token input; once they submit, the bridge is created on the runtime — same path as the CLI's `gini messaging add` and the settings page's Add Telegram dialog. The task pauses on this approval and resumes automatically after the user submits. For Discord, point the user at the settings page (Add Discord button) because Discord bridges need a channel-ID list that this chat card does not collect.",
       parameters: {
         type: "object",
         properties: {
           kind: {
             type: "string",
-            enum: ["telegram", "discord"],
-            description: "Which bridge kind to add. Pick 'telegram' for the @BotFather flow, 'discord' for a Developer-Portal bot."
+            enum: ["telegram"],
+            description: "Which bridge kind to add. Only 'telegram' is supported from chat today; for Discord, direct the user to the settings page."
           },
           suggestedName: {
             type: "string",

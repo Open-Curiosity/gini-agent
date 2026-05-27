@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -125,6 +125,16 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
   const [bridgeName, setBridgeName] = useState("");
   const [bridgeToken, setBridgeToken] = useState("");
   const [bridgeError, setBridgeError] = useState<string | null>(null);
+  // Synchronous single-flight guard for the Add-bridge click. The
+  // button's `disabled={bridgeSubmit.isPending}` only flips on the
+  // next React render — a same-frame double-click can fire the
+  // mutation twice before that render lands, and the runtime has no
+  // name-uniqueness check on bridges, so two creates would produce
+  // two encrypted secret files keyed off two distinct bridge ids
+  // (one of which is orphaned). Mirrors the submittingRef pattern in
+  // web/src/app/settings/_components/MessagingCard.tsx that was
+  // added for the same reason on the settings dialog.
+  const bridgeSubmittingRef = useRef(false);
   // Seed the name input with the agent's suggestedName the first time
   // the approval row resolves out of the cache. Without this, the
   // first render fires before useApprovals() lands the row and the
@@ -223,6 +233,12 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       // (success) or been rejected upstream (failure), and there's
       // no replay value in keeping it inspectable in React DevTools.
       setBridgeToken("");
+      // Release the synchronous click guard so a follow-up retry
+      // (after an ok:false from /connect) actually fires. Reset here
+      // — not in onSuccess or onError alone — so every termination
+      // path (success, server-side ok:false, network error, abort)
+      // clears the ref.
+      bridgeSubmittingRef.current = false;
     }
   });
   const bridgeReady = isMessagingAddBridge
@@ -445,6 +461,12 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
               size="sm"
               disabled={bridgeSubmit.isPending || !isPending || !bridgeReady}
               onClick={() => {
+                // Synchronous ref flip BEFORE mutate() so a
+                // same-frame second click (before React commits the
+                // disabled={isPending} render) short-circuits here
+                // instead of minting a second bridge.
+                if (bridgeSubmittingRef.current) return;
+                bridgeSubmittingRef.current = true;
                 setBridgeError(null);
                 bridgeSubmit.mutate();
               }}

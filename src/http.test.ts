@@ -980,6 +980,83 @@ describe("runtime api", () => {
     expect(bridge?.kind).toBe("telegram");
   });
 
+  test("POST /api/approvals/<id>/connect refuses messaging.add_bridge that was already denied, and creates no bridge", async () => {
+    // Race-safety pin: the messaging.add_bridge branch must call
+    // resolveApproval BEFORE addMessagingBridge so a concurrent
+    // /deny (or cancel cascade) cannot leave an orphan bridge +
+    // encrypted secret on disk after the user has already
+    // abandoned the prompt. Mirrors the resolve-first contract in
+    // src/execution/browser-fill-secrets.ts. We simulate the race
+    // by pre-denying the approval and then hitting /connect — the
+    // handler must short-circuit at the atomic resolve call, return
+    // ok:false, and never touch addMessagingBridge.
+    const config = testConfig("approvals-connect-bridge-deny-race");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        risk: "high",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "race-bridge", toolCallId: "call_bridge_race" }
+      })
+    );
+    // Pre-deny the approval as if a concurrent operator had
+    // clicked Cancel between the user's typing and the Submit
+    // landing on the server.
+    const { decideApproval } = await import("./agent");
+    await decideApproval(config, approval.id, "deny");
+    expect(readState(config.instance).approvals.find((a) => a.id === approval.id)?.status).toBe("denied");
+    const beforeBridges = readState(config.instance).messagingBridges.length;
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/connect`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { name: "race-bridge", botToken: "1234:ABCDEFGHIJKL" } })
+      },
+      config.token
+    );
+    // 410 Gone — the resolution-before-creation contract is upheld
+    // whether the refusal comes from the outer "already !pending"
+    // guard or the inner resolveApproval throw. The load-bearing
+    // invariant is the absence of any bridge / orphan secret on the
+    // other side.
+    expect(response.status).toBe(410);
+    const body = await response.json();
+    expect(body.error ?? body.message).toMatch(/denied/);
+
+    const after = readState(config.instance);
+    expect(after.messagingBridges.length).toBe(beforeBridges);
+    expect(after.approvals.find((a) => a.id === approval.id)?.status).toBe("denied");
+  });
+
+  test("decideApproval refuses messaging.add_bridge approve at the state-machine layer", async () => {
+    // Defense-in-depth pin for the same gate the HTTP /approve route
+    // enforces. Any non-HTTP caller of decideApproval (CLI, future
+    // API client, internal job runner) must hit the same refusal so
+    // the runApprovedAction branch (which has been a no-op since
+    // /connect owns the lifecycle) cannot accidentally fire over a
+    // bridge that was never created.
+    const config = testConfig("decide-refuses-messaging-add-bridge");
+    const { createApproval } = await import("./state");
+    const { decideApproval } = await import("./agent");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        risk: "high",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "decide-guard", toolCallId: "call_decide_guard" }
+      })
+    );
+    await expect(decideApproval(config, approval.id, "approve")).rejects.toThrow(/\/connect/);
+    expect(readState(config.instance).approvals.find((a) => a.id === approval.id)?.status).toBe("pending");
+  });
+
   test("POST /api/approvals/<id>/connect returns ok:false when messaging.add_bridge is missing a name or token", async () => {
     // The chat card disables Submit until both inputs are non-empty,
     // but a CLI/API caller could POST a partial body. The gateway
