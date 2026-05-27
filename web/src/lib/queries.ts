@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import type {
-  Approval,
+  Authorization,
   BrowserConnectionRecord,
   ChatBlock,
   ConnectorRecord,
@@ -11,6 +11,7 @@ import type {
   JobRunRecord,
   RuntimeEvent,
   RuntimeStatus,
+  SetupRequest,
   SkillRecord,
   SubagentRecord,
   Task,
@@ -81,12 +82,29 @@ export function useTask(id: string | null) {
   });
 }
 
-export function useApprovals() {
-  return useQuery<Approval[]>({
-    queryKey: ["approvals"],
-    queryFn: () => api<Approval[]>("/approvals"),
+export function useAuthorizations() {
+  return useQuery<Authorization[]>({
+    queryKey: ["authorizations"],
+    queryFn: () => api<Authorization[]>("/authorizations"),
     refetchInterval: 60_000
   });
+}
+
+export function useSetupRequests() {
+  return useQuery<SetupRequest[]>({
+    queryKey: ["setup-requests"],
+    queryFn: () => api<SetupRequest[]>("/setup-requests"),
+    refetchInterval: 60_000
+  });
+}
+
+// Deprecated. Kept as a temporary alias so heavy consumers (the home
+// page's pending list, the permissions page) keep compiling during the
+// migration window. New code should use useAuthorizations and
+// useSetupRequests directly. TODO: remove in the next release alongside
+// the /api/approvals alias.
+export function useApprovals() {
+  return useAuthorizations();
 }
 
 // `useMemories` was removed alongside the state.memories
