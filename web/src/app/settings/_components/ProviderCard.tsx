@@ -1,9 +1,12 @@
 "use client";
 
 import Link from "next/link";
+import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
+  ArrowLeftRightIcon,
+  CheckIcon,
   PencilIcon,
   PlusIcon,
   Terminal as TerminalIcon,
@@ -14,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
+import { EditProviderDialog } from "./EditProviderDialog";
 
 export interface ProviderCatalogItem {
   id: string;
@@ -75,6 +79,16 @@ export function ProviderCard({
     .map((name) => catalog.find((c) => c.name === name))
     .filter((c): c is ProviderCatalogItem => c !== undefined && c.configured === true);
 
+  // Staged selection. Clicking a non-active row's radio sets this; the
+  // Save Bar appears at the bottom of the list with Cancel / Save changes.
+  // Null when no switch is pending (the active row shows its purple radio
+  // fill in that state). Resets to null on save success or cancel.
+  const [pendingProvider, setPendingProvider] = useState<string | null>(null);
+  // Row whose Edit pencil opened the inline dialog. Null when closed.
+  const [editingRow, setEditingRow] = useState<ProviderCatalogItem | null>(null);
+  const switching = pendingProvider !== null && pendingProvider !== activeProviderName;
+  const pendingRow = switching ? rows.find((r) => r.name === pendingProvider) : undefined;
+
   const setActive = useMutation({
     mutationFn: async (vars: { provider: string; model: string }): Promise<SetProviderResult> =>
       api<SetProviderResult>("/setup/provider", {
@@ -87,6 +101,7 @@ export function ProviderCard({
         return;
       }
       toast.success(`Active provider: ${vars.provider} (${vars.model})`);
+      setPendingProvider(null);
       invalidate(["status", "providers"]);
     },
     onError: (error: Error) => toast.error(error.message)
@@ -123,6 +138,15 @@ export function ProviderCard({
       <ul className="flex flex-col gap-3">
         {rows.map((row) => {
           const isActive = activeProviderName === row.name;
+          const isPending = pendingProvider === row.name && !isActive;
+          // While a switch is staged the active row's radio empties out
+          // (the purple fill follows the pending row), but the green
+          // "Active" badge stays so the user can still see what's
+          // currently in effect.
+          const showRadioFill = switching ? isPending : isActive;
+          const radioBorderClass = isPending || (!switching && isActive)
+            ? "border-[#B57BBE]"
+            : "border-[#3A3A40]";
           const visual = PROVIDER_VISUAL[row.name] ?? { icon: TerminalIcon, authLabel: row.auth };
           const Icon = visual.icon;
           const model = isActive
@@ -134,14 +158,20 @@ export function ProviderCard({
               key={row.id}
               className="flex items-center gap-4 rounded-2xl border border-[#1F1F24] bg-[#141418] p-5"
             >
-              <span
-                aria-hidden
-                className={`flex size-5 items-center justify-center rounded-full border-[1.5px] ${
-                  isActive ? "border-[#B57BBE]" : "border-[#3A3A40]"
-                }`}
+              {/* Radio doubles as the row's selection control: clicking
+                  the active row clears any pending switch, clicking any
+                  other row stages it. Disabled while the mutation is in
+                  flight so a quick second click can't double-fire. */}
+              <button
+                type="button"
+                aria-label={isActive ? `${displayProviderName(row)} (active)` : `Stage ${displayProviderName(row)} as active`}
+                aria-pressed={isPending || isActive}
+                onClick={() => setPendingProvider(isActive ? null : row.name)}
+                disabled={setActive.isPending}
+                className={`flex size-5 shrink-0 items-center justify-center rounded-full border-[1.5px] transition disabled:cursor-not-allowed ${radioBorderClass}`}
               >
-                {isActive ? <span className="size-2.5 rounded-full bg-[#B57BBE]" /> : null}
-              </span>
+                {showRadioFill ? <span className="size-2.5 rounded-full bg-[#B57BBE]" /> : null}
+              </button>
               <span className="flex size-[42px] items-center justify-center rounded-[11px] bg-[#1C1C22]">
                 <Icon className="size-5 text-[#C2C2C8]" />
               </span>
@@ -164,48 +194,95 @@ export function ProviderCard({
                   <span className="font-mono">{model}</span>
                 </div>
               </div>
-              <div className="flex items-center gap-2">
-                {isActive ? null : (
+              {/*
+                Codex authenticates via codex --login → ~/.codex/auth.json,
+                so there's no key or model to edit from this UI and nothing
+                to "remove" without breaking the user's shell auth. Hide
+                both row-level actions for codex; the Verify flow on the
+                Add Provider page is the only place codex re-auth lives.
+              */}
+              {row.name === "codex" ? null : (
+                <div className="flex items-center gap-2">
                   <Button
                     type="button"
                     variant="outline"
-                    size="sm"
-                    disabled={setActive.isPending}
-                    onClick={() => setActive.mutate({ provider: row.name, model })}
+                    size="icon"
+                    aria-label={`Edit ${displayProviderName(row)}`}
+                    onClick={() => setEditingRow(row)}
                   >
-                    Set active
+                    <PencilIcon className="size-4 text-[#9A9AA0]" />
                   </Button>
-                )}
-                {/*
-                  Codex authenticates via codex --login → ~/.codex/auth.json,
-                  so there's no key or model to edit from this UI and nothing
-                  to "remove" without breaking the user's shell auth. Hide
-                  both row-level actions for codex; the Verify flow on the
-                  Add Provider page is the only place codex re-auth lives.
-                */}
-                {row.name === "codex" ? null : (
-                  <>
-                    <Button asChild type="button" variant="outline" size="icon" aria-label={`Edit ${displayProviderName(row)}`}>
-                      <Link href={`/settings/add-provider?provider=${row.name}`}>
-                        <PencilIcon className="size-4 text-[#9A9AA0]" />
-                      </Link>
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="icon"
-                      aria-label={`Remove ${displayProviderName(row)}`}
-                      disabled
-                    >
-                      <Trash2Icon className="size-4 text-[#9A9AA0]" />
-                    </Button>
-                  </>
-                )}
-              </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    aria-label={`Remove ${displayProviderName(row)}`}
+                    disabled
+                  >
+                    <Trash2Icon className="size-4 text-[#9A9AA0]" />
+                  </Button>
+                </div>
+              )}
             </li>
           );
         })}
       </ul>
+
+      {editingRow ? (
+        <EditProviderDialog
+          row={editingRow}
+          authLabel={PROVIDER_VISUAL[editingRow.name]?.authLabel ?? editingRow.auth}
+          icon={PROVIDER_VISUAL[editingRow.name]?.icon ?? TerminalIcon}
+          currentModel={editingRow.name === activeProviderName ? activeProviderModel : undefined}
+          open={Boolean(editingRow)}
+          onOpenChange={(open) => {
+            if (!open) setEditingRow(null);
+          }}
+        />
+      ) : null}
+
+      {switching && pendingRow ? (
+        <div className="flex items-center justify-between gap-4 rounded-xl border border-[#2E3650] bg-[#15171F] px-5 py-4">
+          <div className="flex items-center gap-3">
+            <span className="flex size-[30px] items-center justify-center rounded-lg bg-[#1D2333]">
+              <ArrowLeftRightIcon className="size-4 text-[#9DB4FF]" />
+            </span>
+            <div className="space-y-0.5">
+              <p className="text-sm font-semibold text-foreground">
+                Switch active provider to {displayProviderName(pendingRow)}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {activeProviderName
+                  ? `${displayProviderName(rows.find((r) => r.name === activeProviderName) ?? { displayName: activeProviderName, name: activeProviderName })} is currently active.`
+                  : "No provider is currently active."}{" "}
+                Save to apply your change.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2.5">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setPendingProvider(null)}
+              disabled={setActive.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              onClick={() =>
+                setActive.mutate({ provider: pendingRow.name, model: pendingRow.models[0] ?? "" })
+              }
+              disabled={setActive.isPending}
+            >
+              <CheckIcon className="size-4" />
+              {setActive.isPending ? "Saving…" : "Save changes"}
+            </Button>
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }
