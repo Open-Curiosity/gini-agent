@@ -524,6 +524,14 @@ function classifyHost(host: string): "loopback" | "private" | "linkLocal" | "pub
     if (parts[0] === 172 && (parts[1] ?? 0) >= 16 && (parts[1] ?? 0) <= 31) return "private";
     if (parts[0] === 192 && parts[1] === 168) return "private";
     if (parts[0] === 169 && parts[1] === 254) return "linkLocal";
+    // RFC 6598 carrier-grade NAT space: 100.64.0.0/10. Not RFC1918
+    // but treated equivalently — these are not globally routable and
+    // can be used to reach a CGN-internal service that proxies the
+    // SSRF target. Span: 100.64 through 100.127.
+    if (parts[0] === 100 && (parts[1] ?? 0) >= 64 && (parts[1] ?? 0) <= 127) return "private";
+    // RFC 2544 benchmark/test space: 198.18.0.0/15. Often routed to
+    // internal lab gear; treat as private for the same reason.
+    if (parts[0] === 198 && (parts[1] === 18 || parts[1] === 19)) return "private";
     return "public";
   }
   if (ipVersion === 6) {

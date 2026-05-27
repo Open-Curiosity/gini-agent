@@ -684,6 +684,13 @@ describe("request_connector dispatch", () => {
       "http://[fe90::1]/",
       "http://[fea0::1]/",
       "http://[febf::1]/",
+      // RFC 6598 CGN space (100.64.0.0/10) and RFC 2544 benchmark
+      // space (198.18.0.0/15) — non-globally-routable, can reach
+      // CGN-internal proxies.
+      "http://100.64.0.1/",
+      "http://100.127.0.1/",
+      "http://198.18.0.1/",
+      "http://198.19.0.1/",
       "http://example.localhost/api",
       // IPv4-mapped IPv6 hex forms — all alias the same loopback /
       // RFC1918 addresses but bypass the dot-quad-only regex if not

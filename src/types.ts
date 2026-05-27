@@ -999,15 +999,18 @@ export interface Approval {
   risk: RiskLevel;
   reason: string;
   payload: Record<string, unknown>;
-  // Set by /connect handlers (browser_fill_secret, messaging.*) after
-  // the post-approval side effect runs. `ok: true` means the side
-  // effect succeeded (bridge created, pairing approved, etc.); `ok:
-  // false` plus `message` carries the sanitized failure reason. This
-  // is the source of truth for the past-tense summary in resolved
-  // approval cards — React-component-local sticky state is cleared on
-  // reload, so without a persisted outcome a failed side effect on a
-  // status="approved" row falls back to rendering as success and lies
-  // to the operator.
+  // Set by the messaging.* /connect handlers (add_bridge, approve_pairing,
+  // remove_bridge) after the post-approval side effect runs. `ok:
+  // true` means the side effect succeeded (bridge created, pairing
+  // approved, etc.); `ok: false` plus `message` carries the
+  // sanitized failure reason. The chat card reads this as the
+  // source of truth for the past-tense summary after reload —
+  // React-component-local sticky state is cleared on reload, so
+  // without a persisted outcome a failed side effect on a
+  // status="approved" row would fall back to rendering as success.
+  // browser_fill_secret could adopt the same field; today it only
+  // tracks success via approval.status because its failure modes
+  // bounce the approval pending state instead of resolving + failing.
   connectOutcome?: { ok: boolean; message?: string };
 }
 
