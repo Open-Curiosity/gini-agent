@@ -541,6 +541,57 @@ describe("request_connector dispatch", () => {
     }
   });
 
+  test("request_messaging_pairing: refuses a code-less pending row (group chat) up-front", async () => {
+    // Group chats deliberately have no verification code; the chat-card
+    // approve handshake requires one, so messaging-pairing-connect
+    // refuses the approve call. Without an up-front refusal here, the
+    // agent would mint a card whose Approve button bounces — only
+    // Reject would clear it. Pin that the dispatcher returns ok:false
+    // with a points-to-settings message instead of minting the card.
+    const instance = `req-pairing-codeless-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    await mutateState(instance, (state) => {
+      const { createMessagingBridgeRecord } = require("../state") as typeof import("../state");
+      const bridge = createMessagingBridgeRecord(state, {
+        name: "tg-group",
+        kind: "telegram",
+        deliveryTargets: []
+      });
+      bridge.metadata = {
+        allowedChatIds: [],
+        recentDeniedChats: [
+          {
+            chatId: -1001,
+            chatType: "supergroup",
+            sender: "@grouptest",
+            lastAttemptAt: new Date().toISOString()
+            // Deliberately omit verificationCode + verificationCodeExpiresAt
+          }
+        ]
+      };
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_messaging_pairing",
+      "call_codeless_mint",
+      JSON.stringify({ bridge: "tg-group", chatId: -1001 })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("no verification code");
+      expect(parsed.error).toContain("settings page");
+    }
+    // Critically: no approval row was minted.
+    const state = readState(instance);
+    expect(
+      state.approvals.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
+    ).toBe(0);
+  });
+
   test("list_messaging_pairings: redacts verification codes from the read-only envelope", async () => {
     // Verification codes are security tokens whose entire purpose is
     // preventing TOFU enrollment race attacks (see messaging.ts

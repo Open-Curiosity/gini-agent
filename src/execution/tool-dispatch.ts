@@ -3103,6 +3103,24 @@ async function requestMessagingPairingTool(
       };
     }
   }
+  // Group chats deliberately have no verification code (the bot can't
+  // DM a per-user code through a group), and the chat-card approve
+  // path requires one for the verification handshake. messaging-
+  // pairing-connect.ts refuses code-less approves, so without this
+  // up-front check the agent would mint a card whose Approve button
+  // bounces — only Reject would work and the card would sit there
+  // until the operator gave up. Refuse the mint instead so the
+  // agent surfaces the right next step to the user (settings page
+  // or `gini messaging allow`).
+  if (!pending.verificationCode) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Chat ${chatId} on bridge '${bridge.name}' has no verification code (likely a group chat). Group enrollments don't go through the chat-card handshake — tell the user to open the settings page (or run \`gini messaging allow ${bridge.name} ${chatId}\`) to approve.`
+      })
+    };
+  }
 
   const reasonOverride = typeof args.reason === "string" && args.reason.trim().length > 0
     ? args.reason.trim()
