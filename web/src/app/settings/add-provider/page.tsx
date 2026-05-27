@@ -20,7 +20,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
-import type { ProviderCatalogItem } from "../_components/ProviderCard";
+import { displayProviderName, type ProviderCatalogItem } from "../_components/ProviderCard";
 
 const SELECTABLE_PROVIDERS = ["openai", "openrouter", "deepseek", "local"] as const;
 
@@ -157,7 +157,7 @@ export default function AddProviderPage() {
                   <span className="flex size-9 items-center justify-center rounded-lg bg-[#1C1C22]">
                     <Icon className="size-5 text-[#C2C2C8]" />
                   </span>
-                  <span className="text-sm font-semibold text-foreground">{tile.displayName}</span>
+                  <span className="text-sm font-semibold text-foreground">{displayProviderName(tile)}</span>
                   <span className="text-xs text-muted-foreground">{visual.description}</span>
                 </button>
               );
@@ -167,7 +167,7 @@ export default function AddProviderPage() {
 
         <section className="rounded-2xl border border-[#1F1F24] bg-[#141418] p-7">
           <div className="mb-5 space-y-1">
-            <h2 className="text-sm font-semibold">Configure {entry?.displayName ?? "provider"}</h2>
+            <h2 className="text-sm font-semibold">Configure {entry ? displayProviderName(entry) : "provider"}</h2>
             <p className="text-xs text-muted-foreground">
               {requiresApiKey
                 ? "Saved to ~/.gini/secrets.env (mode 0600). Not sent anywhere except the provider."
