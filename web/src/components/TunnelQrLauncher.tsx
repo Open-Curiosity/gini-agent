@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import { QrCode } from "lucide-react";
+import { EyeOff, QrCode } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -36,6 +36,13 @@ async function fetchTunnel(): Promise<TunnelSnapshot> {
 export function TunnelQrLauncher() {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
+  // QR + URL default to HIDDEN inside the modal; the operator clicks the eye
+  // overlay to reveal once they're actually about to scan. Re-hidden every
+  // time the modal closes so the next open starts safe again.
+  const [qrRevealed, setQrRevealed] = useState(false);
+  useEffect(() => {
+    if (!open) setQrRevealed(false);
+  }, [open]);
   const isSetup = pathname.startsWith("/setup");
 
   const { data } = useQuery({
@@ -76,22 +83,36 @@ export function TunnelQrLauncher() {
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col items-center gap-3">
-            <img
-              src={`/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(data.secretRevision ?? "")}`}
-              alt="Tunnel QR"
-              className="h-64 w-64 rounded border bg-white p-2"
-              data-testid="tunnel-qr-image"
-            />
-            {/* Show the FULL bootstrap URL that the QR encodes (publicUrl +
-                /<secret>/), not just publicUrl. The description above warns
-                that the link contains a one-time secret; the displayed URL
-                has to match the QR for that warning to make sense, and so
-                an operator manually copying the URL gets the working
-                bootstrap form instead of a 404. This launcher is loopback-
-                only (hidden in tunneled contexts), so surfacing the secret
-                here is the same trust boundary as the QR image itself. */}
+            <button
+              type="button"
+              onClick={() => setQrRevealed((r) => !r)}
+              aria-label={qrRevealed ? "Hide tunnel QR" : "Reveal tunnel QR"}
+              className="h-64 w-64 overflow-hidden rounded border bg-white p-2 transition hover:opacity-90"
+              data-testid="tunnel-qr-reveal-toggle"
+            >
+              {qrRevealed ? (
+                <img
+                  src={`/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(data.secretRevision ?? "")}`}
+                  alt="Tunnel QR"
+                  className="h-full w-full"
+                  data-testid="tunnel-qr-image"
+                />
+              ) : (
+                <div className="flex h-full w-full flex-col items-center justify-center gap-2 bg-muted text-muted-foreground">
+                  <EyeOff className="h-10 w-10" />
+                  <span className="text-sm">Click to reveal</span>
+                </div>
+              )}
+            </button>
+            {/* The text mirror of the bootstrap URL — also hidden until the
+                operator reveals. The launcher is loopback-only (hidden in
+                tunneled contexts) so surfacing the secret here is the same
+                trust boundary as the QR image itself; the gate is about
+                shoulder-surfing, not about cross-process authorization. */}
             <p className="break-all rounded bg-muted px-2 py-1 font-mono text-xs text-muted-foreground">
-              {data.publicUrl && data.secret ? `${data.publicUrl.replace(/\/+$/, "")}/${data.secret}` : data.publicUrl}
+              {qrRevealed && data.publicUrl && data.secret
+                ? `${data.publicUrl.replace(/\/+$/, "")}/${data.secret}`
+                : "•••••••••••••••••••••••••••••••••••"}
             </p>
           </div>
           <DialogClose asChild>

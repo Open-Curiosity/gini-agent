@@ -174,7 +174,12 @@ class TunnelManager {
             ...this.snapshot,
             enabled: true,
             secret: persisted.secret,
-            secretRevision: secretRevision(persisted.secret),
+            // Bind the revision to the publicUrl too so a disable→enable
+            // cycle (which mints a fresh trycloudflare hostname but keeps
+            // the same secret) busts the browser's QR `<img>` cache.
+            // Without this the operator sees the OLD QR pixels encoding
+            // the dead hostname and the iPhone scan hits a 1033.
+            secretRevision: secretRevision(persisted.secret, url),
             publicUrl: url,
             lastError: null
           };
@@ -328,7 +333,7 @@ class TunnelManager {
       try {
         const persisted = patchTunnelConfig(this.config.instance, {}); // ensure block exists
         const next = patchTunnelConfig(this.config.instance, { secret: cryptoSecret() });
-        this.snapshot = { ...this.snapshot, secret: next.secret, secretRevision: secretRevision(next.secret) };
+        this.snapshot = { ...this.snapshot, secret: next.secret, secretRevision: secretRevision(next.secret, this.snapshot.publicUrl) };
         setRedactionSecret(next.secret);
         // Refresh Notes if mirror is on and tunnel is up — the note carries
         // the URL which embeds the secret as the QR-encoded path.

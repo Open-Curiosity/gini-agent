@@ -1,9 +1,14 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 
 // Apple Notes mirror via osascript. Defaults OFF. Opt-in extends the
 // secret's trust radius to iCloud. PLAN.md "Apple Notes mirror".
 
 const OSASCRIPT_TIMEOUT_MS = 15_000;
+const NOTES_APP_PATHS = [
+  "/System/Applications/Notes.app",
+  "/Applications/Notes.app"
+];
 
 export interface NotesProbeResult {
   available: boolean;
@@ -14,24 +19,18 @@ export async function probeNotesAvailable(): Promise<NotesProbeResult> {
   if (process.platform !== "darwin") {
     return { available: false, error: "Apple Notes mirror only supported on macOS." };
   }
-  // Two-step probe: System Events is sandbox-permissive (no Automation TCC
-  // prompt yet), so we use it to test whether Notes.app exists on disk
-  // without launching it. Using `tell application "Notes"` directly would
-  // trigger the macOS TCC Automation prompt on first run; the probe must
-  // be silent so the operator's first signal is the enable click, not a
-  // surprise prompt at gateway boot.
-  const script = [
-    'tell application "System Events"',
-    '  set notesApp to first application file of folder ("/System/Applications" as POSIX file) whose name is "Notes.app"',
-    '  return name of notesApp',
-    'end tell'
-  ].join("\n");
-  try {
-    await runOsascript(script);
-    return { available: true, error: null };
-  } catch (err) {
-    return { available: false, error: err instanceof Error ? err.message : String(err) };
+  // Direct filesystem check — no osascript spawn, no AppleScript syntax to
+  // get wrong, no TCC Automation prompt. The probe just confirms Notes.app
+  // is installed at one of the standard locations. We defer the actual
+  // Automation-permission prompt to the first `writeNote` call (when the
+  // operator explicitly enables the mirror), so the probe stays silent at
+  // gateway boot.
+  for (const candidate of NOTES_APP_PATHS) {
+    if (existsSync(candidate)) {
+      return { available: true, error: null };
+    }
   }
+  return { available: false, error: `Notes.app not found at ${NOTES_APP_PATHS.join(" or ")}.` };
 }
 
 export interface NotesWriteOptions {

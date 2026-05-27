@@ -24,10 +24,13 @@ export interface TunnelSnapshot {
   enabled: boolean;
   secret: string | null;
   publicUrl: string | null;
-  /** 16-char hex prefix of SHA-256(secret). Safe to expose in URLs / log
-   *  lines — non-reversible to the secret. Used as a cache-buster on the
-   *  QR `<img>` src so a rotate-secret invalidates the browser's painted
-   *  image without putting the secret itself in the URL. */
+  /** 16-char hex prefix of SHA-256(`${secret}|${publicUrl ?? ""}`). Safe
+   *  to expose in URLs / log lines — non-reversible to the secret. Used
+   *  as a cache-buster on the QR `<img>` src so any of the three
+   *  state transitions that change the QR pixels (rotate-secret,
+   *  cloudflared hostname rotation on disable→enable, fresh boot)
+   *  invalidates the browser's painted image without putting the
+   *  secret itself in the URL. */
   secretRevision: string | null;
   lastError: string | null;
   appleNotes: AppleNotesState;

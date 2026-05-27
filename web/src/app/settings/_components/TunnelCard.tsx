@@ -7,7 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { api } from "@/lib/api";
-import { Loader2, RefreshCw, RotateCw } from "lucide-react";
+import { EyeOff, Loader2, RefreshCw, RotateCw } from "lucide-react";
 
 interface TunnelSnapshot {
   enabled: boolean;
@@ -69,7 +69,12 @@ export function TunnelCard() {
   const [showSecret, setShowSecret] = useState(false);
 
   const busy = enable.isPending || disable.isPending || rotate.isPending || toggleNotes.isPending || refreshNotes.isPending;
-  const showQr = Boolean(data?.enabled && data?.publicUrl);
+  const tunnelLive = Boolean(data?.enabled && data?.publicUrl);
+  // The QR encodes the bootstrap URL, which contains the live secret.
+  // Default the rendered pixels to HIDDEN — anyone looking at the operator's
+  // screen over their shoulder gets a one-shot capture otherwise. The
+  // operator clicks the eye to reveal when they're actually about to scan.
+  const [qrRevealed, setQrRevealed] = useState(false);
 
   return (
     <Card data-testid="tunnel-card">
@@ -108,14 +113,29 @@ export function TunnelCard() {
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
-        {showQr ? (
+        {tunnelLive ? (
           <div className="grid gap-4 md:grid-cols-[auto_1fr]">
-            <img
-              src={`/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(data?.secretRevision ?? "")}`}
-              alt="Tunnel QR"
-              className="h-48 w-48 rounded border bg-white p-2"
-              data-testid="tunnel-settings-qr"
-            />
+            <button
+              type="button"
+              onClick={() => setQrRevealed((r) => !r)}
+              aria-label={qrRevealed ? "Hide tunnel QR" : "Reveal tunnel QR"}
+              className="relative h-48 w-48 overflow-hidden rounded border bg-white p-2 transition hover:opacity-90"
+              data-testid="tunnel-qr-reveal-toggle"
+            >
+              {qrRevealed ? (
+                <img
+                  src={`/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(data?.secretRevision ?? "")}`}
+                  alt="Tunnel QR"
+                  className="h-full w-full"
+                  data-testid="tunnel-settings-qr"
+                />
+              ) : (
+                <div className="flex h-full w-full flex-col items-center justify-center gap-2 bg-muted text-muted-foreground">
+                  <EyeOff className="h-8 w-8" />
+                  <span className="text-xs">Click to reveal</span>
+                </div>
+              )}
+            </button>
             <div className="space-y-2 text-sm">
               <div>
                 <div className="text-muted-foreground">Public URL</div>
