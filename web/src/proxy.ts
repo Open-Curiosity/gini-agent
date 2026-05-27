@@ -215,5 +215,10 @@ export const config = {
   // through to the dev server directly. The path doesn't exist in
   // production builds. The match intentionally covers `/api/*` so the
   // tunnel proxy gates BFF calls too.
-  matcher: ["/((?!_next/static|_next/image|_next/webpack-hmr|favicon.ico).*)"]
+  // `icon.png` is the Next.js 16 metadata-route filename for the site
+  // favicon — public logo bytes, no sensitive payload. If the proxy gates
+  // it, a speculative favicon fetch from the bootstrap-redirect window
+  // (no cookie yet) 404s, and the browser caches that 404 across the
+  // session so even after auth lands the favicon stays missing.
+  matcher: ["/((?!_next/static|_next/image|_next/webpack-hmr|favicon.ico|icon.png).*)"]
 };
