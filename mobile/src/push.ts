@@ -1,5 +1,6 @@
-// APNs push registration + tap-handling for the iOS app. This module
-// is iOS-only — Android/web call sites must gate on Platform.OS first.
+// APNs push registration + tap / action handling for the iOS app.
+// This module is iOS-only — Android/web call sites must gate on
+// Platform.OS first.
 //
 // Lifecycle:
 //   1. The chat detail screen calls `registerForPushAsync()` the first
@@ -15,9 +16,21 @@
 //      `approval_requested` notifications out to it.
 //   5. Subscribe to `addPushTokenListener` so a rotated token
 //      (rare, but happens on restore-from-backup) re-registers.
-//   6. Subscribe to `addNotificationResponseReceivedListener` for tap
-//      handling: the payload carries `sessionId`, so a tap deep-links
-//      straight into the chat that needs the approval.
+//   6. Subscribe to `addNotificationResponseReceivedListener` for tap +
+//      action handling. The category registered below pairs with the
+//      NSE attached on the server-side `approval_requested` payload —
+//      the OS shows Approve / Deny buttons on the lock screen, and
+//      this listener routes each action to the right /api/approvals
+//      endpoint without forcing the app to foreground.
+//
+// Action handling caveat: `opensAppToForeground: false` means the OS
+// only invokes the response listener if the app is backgrounded
+// (suspended). If the user has fully killed the app from the app
+// switcher, the action button still posts the response, but our
+// listener never runs because there's no JS to run. Apple does not
+// expose a way around this for non-foregrounding actions. Users in
+// that state will still see the next approval push when the agent
+// re-emits — there's no permanent state loss, only a one-off retry.
 //
 // Idempotency: the gateway's POST handler is an upsert. Calling
 // register multiple times (e.g. across screen mounts) is safe — the
@@ -27,6 +40,23 @@ import { Platform } from "react-native";
 import { router } from "expo-router";
 import * as Notifications from "expo-notifications";
 import { api, ApiError } from "./api";
+import {
+  APPROVAL_CATEGORY,
+  APPROVE_ACTION,
+  DENY_ACTION,
+  dispatchNotificationResponse
+} from "./push-dispatch";
+
+// Re-export the dispatch identifiers so existing call-sites that
+// imported from `./push` continue to compile. The pure dispatcher
+// lives in `./push-dispatch` so unit tests can exercise it without
+// loading react-native / expo-notifications.
+export { APPROVAL_CATEGORY, APPROVE_ACTION, DENY_ACTION, dispatchNotificationResponse };
+export type {
+  NotificationDispatchOutcome,
+  DispatchDeps,
+  ResponseLike
+} from "./push-dispatch";
 
 // Foreground presentation rule. Silent (content-available) pushes
 // must never surface a banner or play a sound — the badge update is
@@ -60,6 +90,67 @@ Notifications.setNotificationHandler({
     };
   }
 });
+
+// Registers the APPROVAL_REQUEST notification category so the OS
+// renders inline Approve / Deny actions on lock screen and banner.
+// Both actions are non-foregrounding (`opensAppToForeground: false`)
+// — the listener below dispatches them straight to the gateway. iOS
+// caches categories per-install; calling this idempotently on app
+// launch is the documented pattern.
+//
+// Exported for tests; production callers go through the implicit
+// invocation in `registerForPushAsync`.
+export async function registerApprovalCategoryAsync(): Promise<void> {
+  if (Platform.OS !== "ios") return;
+  try {
+    await Notifications.setNotificationCategoryAsync(APPROVAL_CATEGORY, [
+      {
+        identifier: APPROVE_ACTION,
+        buttonTitle: "Approve",
+        options: {
+          opensAppToForeground: false,
+          isAuthenticationRequired: false,
+          isDestructive: false
+        }
+      },
+      {
+        identifier: DENY_ACTION,
+        buttonTitle: "Deny",
+        options: {
+          opensAppToForeground: false,
+          isAuthenticationRequired: false,
+          // Deny is the destructive choice — iOS highlights it red.
+          isDestructive: true
+        }
+      }
+    ]);
+  } catch {
+    // setNotificationCategoryAsync can throw on the very first launch
+    // before the native module is ready; the next mount will retry.
+  }
+}
+
+// Schedules an immediate local notification so the user gets a visible
+// signal when an action button failed (e.g. network down at the moment
+// of the tap). The body deliberately stays generic for privacy.
+async function notifyActionFailure(verb: "approve" | "deny"): Promise<void> {
+  if (Platform.OS !== "ios") return;
+  try {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: `Failed to ${verb}`,
+        body: "Open the app to retry.",
+        sound: "default"
+      },
+      // `null` trigger means "fire immediately".
+      trigger: null
+    });
+  } catch {
+    // Local notifications can fail in unusual states (permission
+    // revoked between original push and this callback). The /api
+    // call already failed, so there's nothing more we can do here.
+  }
+}
 
 // Fetch the latest unread total from the gateway and apply it as the
 // app icon's badge count. Used as the side-effect of a silent push and
@@ -110,6 +201,13 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
   if (registrationStarted) return;
   registrationStarted = true;
 
+  // Always register the approval category up-front, before any
+  // permission prompt. If the user has previously granted permission,
+  // the next incoming approval push needs the category in place
+  // immediately. If they reject permission below, the category
+  // registration is harmless (no notifications will arrive to use it).
+  void registerApprovalCategoryAsync();
+
   try {
     // The library's typings re-export `PermissionResponse` from 'expo'
     // for the base shape, but the 'expo' package only exports it
@@ -159,15 +257,26 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
       });
     }
 
-    // Tap handler: navigate to the chat that owns the approval.
+    // Response listener: handles three cases via dispatchNotificationResponse.
+    //   - Default tap (no actionIdentifier set, or
+    //     UNNotificationDefaultActionIdentifier) → deep-link to chat.
+    //   - APPROVE action → POST /api/approvals/:id/approve.
+    //   - DENY action → POST /api/approvals/:id/deny.
+    // Both action endpoints are existing routes (src/http.ts:201-202)
+    // — they pre-date the push surface and already enforce auth +
+    // ownership. The action handler runs in the background while the
+    // app is suspended; iOS gives ~30s of JS time which is plenty for
+    // a single POST round-trip.
     if (!responseSub) {
       responseSub = Notifications.addNotificationResponseReceivedListener((response) => {
-        const data = response.notification.request.content.data;
-        const sessionId = typeof data?.sessionId === "string" ? data.sessionId : null;
-        if (sessionId) {
-          // expo-router uses dynamic segments via the bracketed path.
-          router.push(`/chat/${sessionId}`);
-        }
+        void dispatchNotificationResponse(response, {
+          apiCall: (path, init) => api(path, init),
+          navigate: (sessionId) => {
+            // expo-router uses dynamic segments via the bracketed path.
+            router.push(`/chat/${sessionId}`);
+          },
+          notifyFailure: notifyActionFailure
+        });
       });
     }
 
