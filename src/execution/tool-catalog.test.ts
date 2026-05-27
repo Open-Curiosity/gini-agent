@@ -6,11 +6,15 @@
 // tightly scoped agents can still reach the core agent capability surface:
 // web_fetch, read_skill, spawn_subagent, the scheduled-job tools
 // (create_job, list_jobs, update_job, delete_job, run_job), mcp_call,
-// request_connector, and the agent-capability meta-tools whose toolsets
-// aren't in the defaults (cancel_task, install_skill, enable_skill,
-// disable_skill). The surface-gateway tool `send_message` (toolset
-// `messaging`) is deliberately NOT always-on so the operator's toolset
-// enable/disable kill switch keeps working.
+// request_connector, browser_fill_secrets, request_messaging_bridge,
+// and the agent-capability meta-tools whose toolsets aren't in the
+// defaults (cancel_task, install_skill, enable_skill, disable_skill,
+// edit_soul, edit_user_profile). The surface-gateway tool `send_message`
+// (toolset `messaging`) is deliberately NOT always-on so the operator's
+// toolset enable/disable kill switch keeps working; the sibling
+// `request_messaging_bridge` IS always-on because it's a meta-tool
+// (renders an onboarding card; doesn't egress data) and the chat
+// onboarding path needs to be reachable on fresh instances.
 
 import { describe, expect, test } from "bun:test";
 import { buildToolCatalog } from "./tool-catalog";
@@ -65,6 +69,12 @@ const ALWAYS_ON = new Set([
   // logic as request_connector being outside the "connectors"
   // toolset.
   "browser_fill_secrets",
+  // request_messaging_bridge is the in-chat onboarding card for
+  // Telegram bridges. Same always-on rationale as request_connector
+  // / browser_fill_secrets — the agent needs to be able to surface
+  // "add a telegram bot" on a fresh instance without the user first
+  // toggling the messaging toolset.
+  "request_messaging_bridge",
   "cancel_task",
   "install_skill",
   "enable_skill",
