@@ -76,7 +76,7 @@ export function TunnelQrLauncher() {
           </DialogHeader>
           <div className="flex flex-col items-center gap-3">
             <img
-              src="/api/runtime/tunnel/qr.svg"
+              src={`/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(data.secret ?? "")}`}
               alt="Tunnel QR"
               className="h-64 w-64 rounded border bg-white p-2"
               data-testid="tunnel-qr-image"
