@@ -21,7 +21,12 @@
     },
     "plugins": [
       "expo-router",
-      "expo-notifications",
+      [
+        "expo-notifications",
+        {
+          "enableBackgroundRemoteNotifications": true
+        }
+      ],
       "./plugins/with-approval-notification-service.js"
     ],
     "experiments": {
