@@ -102,7 +102,11 @@ function ReportBugForm({ onClose }: { onClose: () => void }) {
       await navigator.clipboard.writeText(formatIssueBody(input, buildSubmitContext()));
       toast.success("Report copied to clipboard");
     } catch {
-      toast.error("Couldn't copy. Select the text manually.");
+      // The formatted body lives only in memory — nothing in the DOM
+      // matches what we tried to copy, so we can't honestly direct the
+      // user to "select the text manually." Point them at the working
+      // path (Open issue on GitHub builds the same body into the URL).
+      toast.error("Couldn't copy. Use Open issue on GitHub instead.");
     }
   }
 
