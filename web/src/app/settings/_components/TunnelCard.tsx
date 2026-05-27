@@ -124,8 +124,18 @@ export function TunnelCard() {
               Mobile tunnel
               {isLoading ? (
                 <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-              ) : data?.enabled ? (
+              ) : tunnelLive ? (
                 <Badge variant="secondary" data-testid="tunnel-status-pill">live</Badge>
+              ) : data?.enabled ? (
+                // enabled=true with no publicUrl means cloudflared is
+                // either still coming up or has crashed mid-life; either
+                // way the operator's intent ("on") is preserved but the
+                // tunnel is not actually serving. Surface this distinctly
+                // from a plain "off" so a `live` claim is never made on
+                // a tunnel that has no URL.
+                <Badge variant="destructive" data-testid="tunnel-status-pill" title={data.lastError ?? "Tunnel enabled but no public URL"}>
+                  degraded
+                </Badge>
               ) : (
                 <Badge variant="outline" data-testid="tunnel-status-pill">off</Badge>
               )}

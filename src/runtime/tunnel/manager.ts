@@ -414,14 +414,31 @@ class TunnelManager {
   }
 
   /** Notes clear worker. Mirrors runRefreshNotes — pure body, no enqueue,
-   *  generation gate against disable / rotateSecret / re-enable interleavings. */
+   *  generation gate against disable / rotateSecret / re-enable interleavings.
+   *  Also re-checks the mirror toggle: setAppleNotesEnabled doesn't bump
+   *  generation, so a fast off→on flip could leave this fire-and-forget
+   *  clear racing a fresh writeNote from the subsequent enable. Bail if
+   *  the mirror has been re-enabled between scheduling and execution so
+   *  we don't delete a note the user just intentionally wrote. */
   private async runClearNotes(scheduledGeneration: number): Promise<TunnelTransitionResult> {
     if (scheduledGeneration !== this.generation) {
       return { ok: false, error: "superseded" };
     }
     if (this.shuttingDown) return { ok: false, error: "shutdown" };
+    if (this.snapshot.appleNotes.enabled) {
+      return { ok: false, error: "superseded by re-enable" };
+    }
     try {
       await clearNote(NOTES_FOLDER, this.notesNoteName());
+      // Re-check immediately after the osascript returns — between the
+      // pre-clear gate and the actual delete, the mirror could have
+      // flipped back on AND the new runRefreshNotes could have written
+      // a fresh note. We can't undo what clearNote already did, but we
+      // can schedule a recovery refresh so the steady-state matches the
+      // user's most recent intent.
+      if (this.snapshot.appleNotes.enabled) {
+        void this.runRefreshNotes(this.generation).catch(() => { /* surfaced in lastError */ });
+      }
       return { ok: true, snapshot: this.snapshot };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
