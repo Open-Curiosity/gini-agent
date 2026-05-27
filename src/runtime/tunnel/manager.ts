@@ -142,6 +142,13 @@ class TunnelManager {
       if (this.shuttingDown) {
         return { ok: false, error: "Tunnel manager shutting down" };
       }
+      // Bump generation before any state change so any background Notes
+      // write scheduled by a previous enable() (recycle path) hits the
+      // gen-mismatch gate inside runRefreshNotes and bails before
+      // publishing the now-stale URL/secret to iCloud. The scheduled
+      // generation we capture below for THIS enable's own Notes refresh
+      // is the post-bump value, so this enable's refresh still proceeds.
+      this.generation += 1;
       try {
         // Commit enabled:true to config first. The proxy reads tunnel.enabled
         // on every request; ordering is important for the 5000 ms exposure cap.
@@ -365,7 +372,13 @@ class TunnelManager {
   }
 
   async setAppleNotesEnabled(enabled: boolean): Promise<TunnelTransitionResult> {
-    return this.enqueue(async () => {
+    // Split the config commit (queued — must serialize with enable / disable /
+    // rotateSecret) from the actual osascript side effect (NOT queued — the
+    // 15s timeout would sit ahead of a follow-up disable() on the apply chain
+    // and break PLAN.md's 5000ms exposure cap). Pattern mirrors enable()'s
+    // fire-and-forget Notes refresh.
+    let scheduledGeneration = 0;
+    const result: TunnelTransitionResult = await this.enqueue(async (): Promise<TunnelTransitionResult> => {
       try {
         patchTunnelConfig(this.config.instance, { appleNotes: { enabled } });
         const notes: AppleNotesState = {
@@ -374,21 +387,7 @@ class TunnelManager {
           lastError: null
         };
         this.snapshot = { ...this.snapshot, appleNotes: notes };
-        if (enabled) {
-          // Call the un-enqueued worker — re-entering enqueue from inside an
-          // already-running task would deadlock the apply chain.
-          await this.runRefreshNotes();
-        } else if (this.notesAvailable) {
-          try {
-            await clearNote(NOTES_FOLDER, this.notesNoteName());
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            this.snapshot = {
-              ...this.snapshot,
-              appleNotes: { ...this.snapshot.appleNotes, lastError: redact(msg) }
-            };
-          }
-        }
+        scheduledGeneration = this.generation;
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -396,10 +395,42 @@ class TunnelManager {
         return { ok: false, error: redact(msg) };
       }
     });
+    if (!result.ok) return result;
+    if (enabled) {
+      void this.runRefreshNotes(scheduledGeneration).catch(() => { /* surfaced in appleNotes.lastError */ });
+    } else if (this.notesAvailable) {
+      void this.runClearNotes(scheduledGeneration).catch(() => { /* surfaced in appleNotes.lastError */ });
+    }
+    return result;
   }
 
   async refreshNotes(): Promise<TunnelTransitionResult> {
-    return this.enqueue(() => this.runRefreshNotes());
+    // NOT queued. The 15s osascript timeout inside runRefreshNotes would
+    // otherwise sit ahead of a follow-up disable() on the apply chain. The
+    // generation gates inside runRefreshNotes invalidate this call if a
+    // concurrent disable / rotateSecret / re-enable bumps the generation
+    // mid-write, so an out-of-band tunnel teardown is still safe.
+    return this.runRefreshNotes(this.generation);
+  }
+
+  /** Notes clear worker. Mirrors runRefreshNotes — pure body, no enqueue,
+   *  generation gate against disable / rotateSecret / re-enable interleavings. */
+  private async runClearNotes(scheduledGeneration: number): Promise<TunnelTransitionResult> {
+    if (scheduledGeneration !== this.generation) {
+      return { ok: false, error: "superseded" };
+    }
+    if (this.shuttingDown) return { ok: false, error: "shutdown" };
+    try {
+      await clearNote(NOTES_FOLDER, this.notesNoteName());
+      return { ok: true, snapshot: this.snapshot };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.snapshot = {
+        ...this.snapshot,
+        appleNotes: { ...this.snapshot.appleNotes, lastError: redact(msg) }
+      };
+      return { ok: false, error: redact(msg) };
+    }
   }
 
   /** Notes refresh worker. Pure body — DOES NOT enqueue. Public callers go
