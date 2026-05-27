@@ -429,18 +429,33 @@ export async function availablePort(preferred: number): Promise<number> {
   throw new Error(`No available port found from ${preferred} to ${preferred + PORT_SEARCH_WINDOW - 1}.`);
 }
 
-function canListen(port: number): Promise<boolean> {
-  // Probe every host we (or downstream Next.js) might bind to. Wildcard
-  // probes alone are insufficient on macOS: binding 0.0.0.0:N succeeds even
-  // when 127.0.0.1:N is already taken (different addresses, kernel doesn't
-  // refuse). We probe 127.0.0.1 (where the Bun runtime listens), ::1 (IPv6
-  // loopback), AND 0.0.0.0 (dual-stack squatters like Next.js). If any one
-  // fails, the port is unusable and we walk to the next.
-  return Promise.all([
-    probe(port, "127.0.0.1"),
-    probe(port, "::1"),
-    probe(port, "0.0.0.0")
-  ]).then((results) => results.every(Boolean));
+// Detect IPv6 availability ONCE per process by attempting to bind
+// ::1 on an OS-assigned port. Ubuntu CI runners ship with IPv6
+// disabled, and without this gate the per-port ::1 probe below
+// returns false on every port (EADDRNOTAVAIL), exhausting the
+// 1000-port search on a totally idle host. Promise resolves to
+// true if ::1 is bindable, false otherwise. Memoized so the
+// detection cost is paid once.
+const ipv6AvailablePromise: Promise<boolean> = new Promise((resolve) => {
+  const server = createServer()
+    .once("error", () => resolve(false))
+    .once("listening", () => server.close(() => resolve(true)))
+    .listen(0, "::1");
+});
+
+async function canListen(port: number): Promise<boolean> {
+  // Probe every host we (or downstream Next.js) might bind to.
+  // Wildcard probes alone are insufficient on macOS: binding
+  // 0.0.0.0:N succeeds even when 127.0.0.1:N is already taken
+  // (different addresses, kernel doesn't refuse). On v4-only
+  // hosts (CI), the ::1 probe is skipped — a v6 squatter can't
+  // exist on a host that doesn't have v6 enabled.
+  const ipv6Available = await ipv6AvailablePromise;
+  const probes = ipv6Available
+    ? [probe(port, "127.0.0.1"), probe(port, "::1"), probe(port, "0.0.0.0")]
+    : [probe(port, "127.0.0.1"), probe(port, "0.0.0.0")];
+  const results = await Promise.all(probes);
+  return results.every(Boolean);
 }
 
 function probe(port: number, host: string): Promise<boolean> {
