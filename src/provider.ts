@@ -124,9 +124,18 @@ export interface ToolCall {
 
 export type ChatMessageRole = "system" | "user" | "assistant" | "tool";
 
+// Vision-capable content part. user-role messages can carry a content
+// array mixing text and image_url parts so the provider sees both. The
+// image_url.url field carries a data URL (data:image/png;base64,...) inlined
+// at dispatch time — we do not pass a fetchable URL because the runtime
+// auth-gates upload reads and the provider can't authenticate.
+export type MessageContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 export interface ToolCallingMessage {
   role: ChatMessageRole;
-  content: string | null;
+  content: string | MessageContentPart[] | null;
   // tool result messages carry the originating call id; assistant messages
   // that triggered tool calls carry `tool_calls`.
   name?: string;
@@ -549,6 +558,18 @@ function translateMessagesToResponsesInput(messages: ToolCallingMessage[]): Resp
       continue;
     }
     if (message.role === "user") {
+      // Vision-capable user messages arrive as a parts array (text +
+      // image_url). Map text parts → input_text and image_url parts →
+      // input_image, mirroring the OpenAI Responses API content schema.
+      if (Array.isArray(message.content)) {
+        const parts: Array<Record<string, unknown>> = [];
+        for (const part of message.content) {
+          if (part.type === "text") parts.push({ type: "input_text", text: part.text });
+          else if (part.type === "image_url") parts.push({ type: "input_image", image_url: part.image_url.url });
+        }
+        input.push({ role: "user", content: parts });
+        continue;
+      }
       const text = typeof message.content === "string" ? message.content : "";
       input.push({
         role: "user",
