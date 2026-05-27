@@ -33,6 +33,16 @@ interface TunnelSnapshot {
 
 type ConfirmKind = "disable" | "rotate" | null;
 
+/** Strip the optional `:port` suffix and check if the resulting hostname is
+ *  a loopback literal. Matches the proxy's classifyHost in web/src/proxy.ts. */
+function isLoopbackHost(host: string): boolean {
+  const close = host.lastIndexOf("]");
+  const name = close >= 0
+    ? host.slice(0, close + 1)
+    : host.includes(":") ? host.slice(0, host.indexOf(":")) : host;
+  return name === "localhost" || name === "127.0.0.1" || name === "[::1]";
+}
+
 export function TunnelCard() {
   const qc = useQueryClient();
   const { data, isLoading } = useQuery({
@@ -82,11 +92,16 @@ export function TunnelCard() {
   const [confirm, setConfirm] = useState<ConfirmKind>(null);
 
   const busy = enable.isPending || disable.isPending || rotate.isPending || toggleNotes.isPending || refreshNotes.isPending;
-  // Privileged shape: this client is on loopback and the snapshot includes
-  // secret + publicUrl. Redacted shape (publicUrl=null) means the BFF
-  // rewrote our snapshot request to /api/tunnel/redacted — we're a
-  // tunnel-vetted browser caller, not the operator on loopback.
-  const isTunneledView = Boolean(data?.enabled && !data?.publicUrl);
+  // Loopback callers and tunnel-vetted browser callers both receive the
+  // privileged snapshot now (the BFF redact-rewrite was dropped because
+  // the operator opted into surfacing the tunnel-control UI on the
+  // tunneled view). The card renders identical content on both surfaces —
+  // the click-to-reveal blur, the bold "live credential" warning, and
+  // the confirm dialogs on destructive transitions are the mitigation.
+  // The `via tunnel` badge tells the operator which surface they're on
+  // so a misclick on Disable / Rotate from the phone is self-evident.
+  const isTunneledView = typeof window !== "undefined"
+    && !isLoopbackHost(window.location.host);
   const tunnelLive = Boolean(data?.enabled && data?.publicUrl);
 
   const runConfirmed = (kind: Exclude<ConfirmKind, null>) => {
@@ -117,33 +132,26 @@ export function TunnelCard() {
               don&apos;t share, screenshot, or display it in public.</strong>
             </CardDescription>
           </div>
-          {/* On a tunneled view the deny list blocks PATCH /api/runtime/tunnel
-              entirely — clicking Disable / Rotate here would just 404. Hide
-              the controls and show a localhost hint instead so the operator
-              isn't confused by buttons that don't work. The Enable / Disable /
-              Rotate buttons render only when this client is on loopback. */}
-          {isTunneledView ? null : (
-            <div className="flex gap-2">
-              {data?.enabled ? (
-                <Button size="sm" variant="outline" disabled={busy} onClick={() => setConfirm("disable")}>
-                  Disable
-                </Button>
-              ) : (
-                <Button size="sm" disabled={busy} onClick={() => enable.mutate()}>
-                  Enable
-                </Button>
-              )}
-              <Button
-                size="icon"
-                variant="ghost"
-                disabled={busy || !data?.enabled}
-                onClick={() => setConfirm("rotate")}
-                aria-label="Rotate secret"
-              >
-                <RotateCw className="h-4 w-4" />
+          <div className="flex gap-2">
+            {data?.enabled ? (
+              <Button size="sm" variant="outline" disabled={busy} onClick={() => setConfirm("disable")}>
+                Disable
               </Button>
-            </div>
-          )}
+            ) : (
+              <Button size="sm" disabled={busy} onClick={() => enable.mutate()}>
+                Enable
+              </Button>
+            )}
+            <Button
+              size="icon"
+              variant="ghost"
+              disabled={busy || !data?.enabled}
+              onClick={() => setConfirm("rotate")}
+              aria-label="Rotate secret"
+            >
+              <RotateCw className="h-4 w-4" />
+            </Button>
+          </div>
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -190,23 +198,6 @@ export function TunnelCard() {
               </div>
             </div>
           </div>
-        ) : isTunneledView ? (
-          // Tunneled view: we can't surface the QR / secret / publicUrl here
-          // (the QR endpoints are denied through the tunnel and the BFF
-          // rewrites the snapshot to the redacted shape). Show enough
-          // context so the operator knows the tunnel is live and where
-          // mutations actually have to be issued.
-          <div className="space-y-2 rounded border bg-muted/30 px-3 py-3 text-sm">
-            <p className="font-medium">You&apos;re connected via the Cloudflare tunnel.</p>
-            <p className="text-muted-foreground">
-              The QR code, public URL, and secret are only visible from the operator&apos;s localhost browser
-              — the deny list keeps tunnel-control surfaces (rotate, disable, QR endpoints, pairing) off of
-              the public path so a leaked URL can&apos;t mint a fresh claim.
-            </p>
-            <p className="text-xs text-muted-foreground">
-              Host: <code className="break-all">{typeof window !== "undefined" ? window.location.host : ""}</code>
-            </p>
-          </div>
         ) : (
           <p className="text-sm text-muted-foreground">
             Enable the tunnel to publish a Cloudflare URL. The QR contains a one-time secret and a session
@@ -220,47 +211,41 @@ export function TunnelCard() {
           </p>
         ) : null}
 
-        {/* Apple Notes mirror is a tunnel-mutation surface (PATCH
-            /api/runtime/tunnel with appleNotes payload). Tunneled clients
-            can't enable / disable / refresh it, so hide the controls on
-            the tunneled view. */}
-        {isTunneledView ? null : (
-          <div className="space-y-2 rounded border bg-muted/30 px-3 py-3 text-sm">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="font-medium">Apple Notes mirror</div>
-                <div className="text-xs text-muted-foreground">
-                  Opt-in. The live URL is written into iCloud Notes so your phone sees the new URL after a restart.
-                </div>
+        <div className="space-y-2 rounded border bg-muted/30 px-3 py-3 text-sm">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="font-medium">Apple Notes mirror</div>
+              <div className="text-xs text-muted-foreground">
+                Opt-in. The live URL is written into iCloud Notes so your phone sees the new URL after a restart.
               </div>
-              <Button
-                size="sm"
-                variant={data?.appleNotes.enabled ? "outline" : "default"}
-                disabled={busy}
-                onClick={() => toggleNotes.mutate(!data?.appleNotes.enabled)}
-              >
-                {data?.appleNotes.enabled ? "Disable" : "Enable"}
-              </Button>
             </div>
-            {data?.appleNotes.enabled ? (
-              <div className="flex items-center gap-2 text-xs">
-                {data?.appleNotes.notesAvailable === false ? (
-                  <Badge variant="destructive">Unavailable</Badge>
-                ) : data?.appleNotes.notesAvailable === true ? (
-                  <Badge variant="secondary">Available</Badge>
-                ) : (
-                  <Badge variant="outline">Probing…</Badge>
-                )}
-                <Button size="sm" variant="ghost" disabled={busy} onClick={() => refreshNotes.mutate()}>
-                  <RefreshCw className="mr-1 h-3 w-3" /> Refresh
-                </Button>
-                {data?.appleNotes.lastError ? (
-                  <span className="text-destructive">{data.appleNotes.lastError}</span>
-                ) : null}
-              </div>
-            ) : null}
+            <Button
+              size="sm"
+              variant={data?.appleNotes.enabled ? "outline" : "default"}
+              disabled={busy}
+              onClick={() => toggleNotes.mutate(!data?.appleNotes.enabled)}
+            >
+              {data?.appleNotes.enabled ? "Disable" : "Enable"}
+            </Button>
           </div>
-        )}
+          {data?.appleNotes.enabled ? (
+            <div className="flex items-center gap-2 text-xs">
+              {data?.appleNotes.notesAvailable === false ? (
+                <Badge variant="destructive">Unavailable</Badge>
+              ) : data?.appleNotes.notesAvailable === true ? (
+                <Badge variant="secondary">Available</Badge>
+              ) : (
+                <Badge variant="outline">Probing…</Badge>
+              )}
+              <Button size="sm" variant="ghost" disabled={busy} onClick={() => refreshNotes.mutate()}>
+                <RefreshCw className="mr-1 h-3 w-3" /> Refresh
+              </Button>
+              {data?.appleNotes.lastError ? (
+                <span className="text-destructive">{data.appleNotes.lastError}</span>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
       </CardContent>
 
       {/* Confirmation dialog for destructive transitions. Disable kills any

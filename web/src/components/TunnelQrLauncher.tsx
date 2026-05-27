@@ -54,12 +54,13 @@ export function TunnelQrLauncher() {
     enabled: !isSetup
   });
 
-  // Hide on /setup/* per PLAN.md "Goals". Hide when tunnel disabled or when
-  // the snapshot is the redacted shape (publicUrl null → we're tunneled, so
-  // QR endpoints would 404 anyway and we shouldn't surface them).
+  // Hide on /setup/* per PLAN.md "Goals", and when the tunnel is off (no
+  // bootstrap URL to encode). The tunneled view now receives the same
+  // privileged snapshot as loopback, so we render the icon there too —
+  // the click-to-reveal blur + bold "live credential" warning gates the
+  // QR pixels the same way it does on loopback.
   if (isSetup) return null;
-  if (!data?.enabled) return null;
-  if (!data.publicUrl) return null;
+  if (!data?.enabled || !data.publicUrl) return null;
 
   return (
     <>

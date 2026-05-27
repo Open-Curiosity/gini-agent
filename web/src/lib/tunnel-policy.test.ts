@@ -11,28 +11,33 @@ import {
 } from "./tunnel-policy";
 
 describe("isTunnelDenied", () => {
-  test("denies entire /api/runtime/pairing subtree", () => {
+  test("denies entire /api/runtime/pairing subtree on every method", () => {
     expect(isTunnelDenied("/api/runtime/pairing", "POST")).toBe(true);
     expect(isTunnelDenied("/api/runtime/pairing/", "POST")).toBe(true);
     expect(isTunnelDenied("/api/runtime/pairing/claim", "POST")).toBe(true);
     expect(isTunnelDenied("/api/runtime/pairing/anything", "GET")).toBe(true);
   });
 
-  test("allows GET on bare /api/runtime/tunnel (rewrite carve-out)", () => {
+  test("allows bare /api/runtime/tunnel on every method (snapshot + PATCH)", () => {
     expect(isTunnelDenied("/api/runtime/tunnel", "GET")).toBe(false);
     expect(isTunnelDenied("/api/runtime/tunnel/", "GET")).toBe(false);
+    expect(isTunnelDenied("/api/runtime/tunnel", "PATCH")).toBe(false);
+    expect(isTunnelDenied("/api/runtime/tunnel/", "POST")).toBe(false);
+    expect(isTunnelDenied("/api/runtime/tunnel", "DELETE")).toBe(false);
   });
 
-  test("denies non-GET on bare /api/runtime/tunnel", () => {
-    expect(isTunnelDenied("/api/runtime/tunnel", "PATCH")).toBe(true);
-    expect(isTunnelDenied("/api/runtime/tunnel/", "POST")).toBe(true);
-    expect(isTunnelDenied("/api/runtime/tunnel", "DELETE")).toBe(true);
+  test("allows QR endpoints — operator gates them via click-to-reveal", () => {
+    expect(isTunnelDenied("/api/runtime/tunnel/qr.svg", "GET")).toBe(false);
+    expect(isTunnelDenied("/api/runtime/tunnel/qr.txt", "GET")).toBe(false);
   });
 
-  test("denies the entire /api/runtime/tunnel/<sub> subtree", () => {
-    expect(isTunnelDenied("/api/runtime/tunnel/qr.svg", "GET")).toBe(true);
-    expect(isTunnelDenied("/api/runtime/tunnel/refresh-notes", "POST")).toBe(true);
+  test("allows /refresh-notes (operator drives the iCloud Notes write from either surface)", () => {
+    expect(isTunnelDenied("/api/runtime/tunnel/refresh-notes", "POST")).toBe(false);
+  });
+
+  test("denies unknown /api/runtime/tunnel/<sub> by default", () => {
     expect(isTunnelDenied("/api/runtime/tunnel/anything-new", "PATCH")).toBe(true);
+    expect(isTunnelDenied("/api/runtime/tunnel/diagnostics", "GET")).toBe(true);
   });
 
   test("allows unrelated paths", () => {
@@ -42,16 +47,10 @@ describe("isTunnelDenied", () => {
 });
 
 describe("rewriteForTunnel", () => {
-  test("rewrites bare GET /api/runtime/tunnel to /api/tunnel/redacted", () => {
-    expect(rewriteForTunnel("/api/runtime/tunnel", "GET")).toEqual(["tunnel", "redacted"]);
-    expect(rewriteForTunnel("/api/runtime/tunnel/", "GET")).toEqual(["tunnel", "redacted"]);
-  });
-
-  test("does not rewrite non-GET methods", () => {
+  test("no-op shim — vetted callers receive the full privileged snapshot", () => {
+    expect(rewriteForTunnel("/api/runtime/tunnel", "GET")).toBeNull();
+    expect(rewriteForTunnel("/api/runtime/tunnel/", "GET")).toBeNull();
     expect(rewriteForTunnel("/api/runtime/tunnel", "PATCH")).toBeNull();
-  });
-
-  test("does not rewrite sub-paths", () => {
     expect(rewriteForTunnel("/api/runtime/tunnel/qr.svg", "GET")).toBeNull();
   });
 });

@@ -24,41 +24,57 @@ export function withoutTrailingSlash(path: string): string {
 const PAIRING_PREFIX = "/api/runtime/pairing";
 const TUNNEL_PREFIX = "/api/runtime/tunnel";
 
-/** True when the request must be denied through the tunnel under PLAN.md's
- *  rules. Operates on the BFF-visible canonical form (`/api/runtime/<rest>`)
- *  and the request method. The carve-out for `GET /api/runtime/tunnel` (bare
- *  path, no sub-path) is the BFF's rewrite trigger; the bare-path rule denies
- *  EVERY method except GET. */
+/** True when the request must be denied through the tunnel. Operates on the
+ *  BFF-visible canonical form (`/api/runtime/<rest>`) and the request method.
+ *
+ *  Policy (revised from PLAN.md's original conservative deny list — the
+ *  operator explicitly opted into surfacing the tunnel-control UI on the
+ *  tunneled view, gated by the click-to-reveal blur on the QR, the bold
+ *  "live credential" warnings, and confirm dialogs on Disable / Rotate):
+ *
+ *  - Pairing subtree (`/api/runtime/pairing` + sub-paths, all methods):
+ *    DENY. Minting device bearers from a tunneled session is a real
+ *    privilege escalation — a leaked URL holder must not be able to
+ *    walk it forward into a permanent device token.
+ *  - Tunnel root (`/api/runtime/tunnel`, all methods): ALLOW. GET returns
+ *    the privileged snapshot; PATCH lets the tunneled view enable /
+ *    disable / rotate-secret / toggle Apple Notes through the confirm
+ *    dialogs.
+ *  - QR endpoints (`/api/runtime/tunnel/qr.svg`, `/qr.txt`): ALLOW. The
+ *    pixels do encode the bootstrap URL, but the operator surfaces them
+ *    behind a click-to-reveal blur + an explicit privacy warning.
+ *  - Notes refresh (`/api/runtime/tunnel/refresh-notes`): DENY. This
+ *    drives osascript on the operator's Mac and has no use case from a
+ *    tunneled phone — keep it loopback-only.
+ *  - Any future `/api/runtime/tunnel/<sub>` route: DENY by default.
+ *    Adding a new endpoint should be a deliberate ALLOW, not a silent
+ *    unlock.
+ */
 export function isTunnelDenied(canonicalPath: string, method: string): boolean {
-  const upper = method.toUpperCase();
+  void method;
   const trimmed = withoutTrailingSlash(canonicalPath);
-  // Entire pairing subtree, all methods.
   if (trimmed === PAIRING_PREFIX) return true;
   if (canonicalPath.startsWith(`${PAIRING_PREFIX}/`)) return true;
-  // Bare /api/runtime/tunnel: deny every method except GET (the rewrite
-  // carve-out).
-  if (trimmed === TUNNEL_PREFIX) return upper !== "GET";
-  // /api/runtime/tunnel/<sub>: deny every method.
-  if (canonicalPath.startsWith(`${TUNNEL_PREFIX}/`)) {
-    // Note: `/api/runtime/tunnel/` (no sub-path) was already collapsed to
-    // the bare form by `withoutTrailingSlash` above. So at this point the
-    // path has a non-empty sub-path.
-    return true;
-  }
+  if (trimmed === TUNNEL_PREFIX) return false;
+  if (trimmed === `${TUNNEL_PREFIX}/qr.svg`) return false;
+  if (trimmed === `${TUNNEL_PREFIX}/qr.txt`) return false;
+  if (trimmed === `${TUNNEL_PREFIX}/refresh-notes`) return false;
+  if (canonicalPath.startsWith(`${TUNNEL_PREFIX}/`)) return true;
   return false;
 }
 
-/** When `vetted=1` is set, GET on the bare `/api/runtime/tunnel` (with or
- *  without trailing slash) rewrites to `/api/tunnel/redacted` on the runtime.
- *  Returns the rewritten segments or null when no rewrite applies. */
+/** Path rewrite hook. Previously the BFF rewrote `GET /api/runtime/tunnel`
+ *  under vetted=1 to `/api/tunnel/redacted` so tunneled JS only saw the
+ *  redacted snapshot shape. That redaction is dropped now — vetted callers
+ *  receive the full privileged snapshot so the tunneled UI can render the
+ *  QR / publicUrl / secret with the same click-to-reveal pattern as the
+ *  loopback view. Kept as a no-op shim so the BFF catch-all wiring doesn't
+ *  need to change; returning null means "forward the path unchanged". */
 export function rewriteForTunnel(
-  canonicalPath: string,
-  method: string
+  _canonicalPath: string,
+  _method: string
 ): string[] | null {
-  if (method.toUpperCase() !== "GET") return null;
-  const trimmed = withoutTrailingSlash(canonicalPath);
-  if (trimmed !== TUNNEL_PREFIX) return null;
-  return ["tunnel", "redacted"];
+  return null;
 }
 
 /** Match a candidate secret prefix in the canonical path. Returns the secret
