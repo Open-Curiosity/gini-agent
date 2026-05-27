@@ -3427,6 +3427,22 @@ async function waitForMessagingPairTool(
         result: JSON.stringify({ ok: false, error: `Messaging bridge no longer exists: ${bridgeIdOrName}.` })
       };
     }
+    // Bridge can flip to "disabled" or "error" while the wait is
+    // polling — operator clicked Disable in settings, the bot
+    // token rotated and the health check failed, etc. Without this
+    // exit the wait would tell the user to DM a bot that won't
+    // receive their message, and time out 10 minutes later. Return
+    // a sync failure so the agent can tell the user what actually
+    // changed.
+    if (liveBridge.status !== "configured") {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: `Messaging bridge '${liveBridge.name}' is no longer in 'configured' status (now '${liveBridge.status}')${liveBridge.message ? `: ${liveBridge.message}` : ""}. Stop telling the user to DM the bot — the bridge can't receive messages until it's re-enabled.`
+        })
+      };
+    }
     const liveMeta = (liveBridge.metadata ?? {}) as {
       allowedChatIds?: unknown;
       recentDeniedChats?: Array<{

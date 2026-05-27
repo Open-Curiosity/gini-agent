@@ -1379,10 +1379,31 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
   try {
     return await withSession(taskId, async (session) => {
       const response = await session.page.goto(url, { waitUntil: "domcontentloaded" });
+      // Re-validate after navigation completes — playwright's goto
+      // follows server redirects (302/303/307/308 + meta-refresh),
+      // so a public allowed URL could land the page on a loopback
+      // origin after the pre-flight check passed. Snapshotting +
+      // returning the URL with that resolved origin would let an
+      // attacker exfiltrate /api/runtime state through a redirect
+      // chain the agent didn't directly request. Block the
+      // resolved URL with the same safetyCheck and navigate the
+      // page away to about:blank so the loopback page doesn't sit
+      // in the session's history for the next tool call to read.
+      const finalUrl = session.page.url();
+      const postBlock = safetyCheck(finalUrl);
+      if (postBlock) {
+        try {
+          await session.page.goto("about:blank", { waitUntil: "domcontentloaded" });
+        } catch {
+          // Best-effort cleanup; if even about:blank fails, the
+          // returned error still tells the operator what happened.
+        }
+        return fail(`${postBlock} (final URL after redirect from ${url})`);
+      }
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
-        url: session.page.url(),
+        url: finalUrl,
         status: response?.status() ?? null,
         title: await session.page.title(),
         snapshot: snap.text,
