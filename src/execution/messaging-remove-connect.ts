@@ -8,7 +8,7 @@ import type { Approval, RuntimeConfig } from "../types";
 import { resolveApproval } from "../agent";
 import { removeMessagingBridge } from "../integrations/messaging";
 import { sanitizeBridgeStatusMessage } from "../integrations/messaging-poller-helpers";
-import { safeResume } from "./safe-resume";
+import { persistConnectOutcome, safeResume } from "./safe-resume";
 
 export interface MessagingRemoveConnectResult {
   status: number;
@@ -69,6 +69,7 @@ export async function runMessagingRemoveConnect(
   } catch (error) {
     const raw = error instanceof Error ? error.message : String(error);
     const message = sanitizeBridgeStatusMessage(raw);
+    await persistConnectOutcome(config, approval.id, { ok: false, message });
     if (taskId && toolCallId) {
       await safeResume(
         config,
@@ -81,6 +82,10 @@ export async function runMessagingRemoveConnect(
     return { status: 200, body: { ok: false, message } };
   }
 
+  await persistConnectOutcome(config, approval.id, {
+    ok: true,
+    message: `Bridge '${bridgeName}' removed`
+  });
   if (taskId && toolCallId) {
     await safeResume(
       config,

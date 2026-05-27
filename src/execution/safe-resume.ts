@@ -19,7 +19,7 @@
 
 import type { RuntimeConfig } from "../types";
 import { failTask } from "../agent";
-import { appendTrace } from "../state";
+import { appendTrace, mutateState } from "../state";
 import { resumeChatTask } from "./chat-task";
 
 export interface SafeResumeOptions {
@@ -39,6 +39,36 @@ export interface SafeResumeOptions {
 // own throw is silently swallowed — the next external trigger
 // (user message, supervisor reconcile) will see whatever status
 // failTask managed to land and move on.
+// Persist the outcome of a /connect-style side effect onto the
+// approval row so a future reload of the resolved approval card
+// renders the truthful past-tense summary. The React component
+// keeps a sticky `setBridgeResultOk` for the in-session render,
+// but that state evaporates on reload — without a persisted
+// outcome, a failed addMessagingBridge that landed on a row whose
+// status was already flipped to "approved" by resolveApproval will
+// fall back to rendering as success and lie to the operator.
+//
+// Best-effort: a swallowed throw here is preferable to failing
+// the entire /connect response (the side effect itself already
+// happened — the outcome record is just a postscript).
+export async function persistConnectOutcome(
+  config: RuntimeConfig,
+  approvalId: string,
+  outcome: { ok: boolean; message?: string }
+): Promise<void> {
+  try {
+    await mutateState(config.instance, (state) => {
+      const approval = state.approvals.find((a) => a.id === approvalId);
+      if (!approval) return;
+      approval.connectOutcome = outcome;
+      approval.updatedAt = new Date().toISOString();
+    });
+  } catch {
+    // Outcome persistence is a UI honesty postscript, not load-
+    // bearing — swallow rather than failing the response.
+  }
+}
+
 export async function safeResume(
   config: RuntimeConfig,
   taskId: string,

@@ -993,6 +993,15 @@ describe("runtime api", () => {
     expect(chatAddRow?.target).toBe(bridge?.id);
     expect((chatAddRow?.evidence as { kind?: string } | undefined)?.kind).toBe("telegram");
     expect((chatAddRow?.evidence as { bridgeName?: string } | undefined)?.bridgeName).toBe("chat-test-bridge");
+
+    // Durable outcome pin: the /connect handler writes
+    // approval.connectOutcome so a post-reload render of the
+    // resolved card reads the truthful past-tense summary.
+    // Without this, the React component's sticky state evaporates
+    // on reload and the card would fall back to "Bridge added."
+    // even when the side effect actually failed.
+    expect(resolved?.connectOutcome?.ok).toBe(true);
+    expect(resolved?.connectOutcome?.message).toContain("chat-test-bridge");
   });
 
   test("POST /api/approvals/<id>/connect refuses messaging.add_bridge that was already denied, and creates no bridge", async () => {

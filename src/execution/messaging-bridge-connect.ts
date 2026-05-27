@@ -31,7 +31,7 @@ import { resolveApproval } from "../agent";
 import { addMessagingBridge, assertHeaderSafeToken } from "../integrations/messaging";
 import { sanitizeBridgeStatusMessage } from "../integrations/messaging-poller-helpers";
 import { addAudit, mutateState } from "../state";
-import { safeResume } from "./safe-resume";
+import { persistConnectOutcome, safeResume } from "./safe-resume";
 
 export interface MessagingBridgeConnectResult {
   status: number;
@@ -152,6 +152,7 @@ export async function runMessagingBridgeConnect(
     // failure string so the agent verbalizes the error back to the
     // user. Recover an orphaned task via failTask if the resume
     // itself throws (mirrors browser-fill-secrets.ts:318-347).
+    await persistConnectOutcome(config, approval.id, { ok: false, message });
     if (taskId && toolCallId) {
       await safeResume(
         config,
@@ -198,6 +199,10 @@ export async function runMessagingBridgeConnect(
     );
   });
 
+  await persistConnectOutcome(config, approval.id, {
+    ok: true,
+    message: `${kindLabel} bridge added: ${bridge.name}`
+  });
   if (taskId && toolCallId) {
     await safeResume(
       config,

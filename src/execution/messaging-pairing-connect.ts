@@ -21,7 +21,7 @@ import type { Approval, RuntimeConfig } from "../types";
 import { resolveApproval } from "../agent";
 import { allowChat, rejectPendingChat } from "../integrations/messaging";
 import { sanitizeBridgeStatusMessage } from "../integrations/messaging-poller-helpers";
-import { safeResume } from "./safe-resume";
+import { persistConnectOutcome, safeResume } from "./safe-resume";
 
 export interface MessagingPairingConnectResult {
   status: number;
@@ -90,6 +90,7 @@ export async function runMessagingPairingConnect(
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
       const message = sanitizeBridgeStatusMessage(raw);
+      await persistConnectOutcome(config, approval.id, { ok: false, message });
       if (taskId && toolCallId) {
         await safeResume(
           config,
@@ -101,6 +102,10 @@ export async function runMessagingPairingConnect(
       }
       return { status: 200, body: { ok: false, message } };
     }
+    await persistConnectOutcome(config, approval.id, {
+      ok: true,
+      message: `Pairing request for chat ${chatId} rejected`
+    });
     if (taskId && toolCallId) {
       await safeResume(
         config,
@@ -121,6 +126,7 @@ export async function runMessagingPairingConnect(
   } catch (error) {
     const raw = error instanceof Error ? error.message : String(error);
     const message = sanitizeBridgeStatusMessage(raw);
+    await persistConnectOutcome(config, approval.id, { ok: false, message });
     if (taskId && toolCallId) {
       await safeResume(
         config,
@@ -132,6 +138,10 @@ export async function runMessagingPairingConnect(
     }
     return { status: 200, body: { ok: false, message } };
   }
+  await persistConnectOutcome(config, approval.id, {
+    ok: true,
+    message: `Pairing approved for chat ${chatId}`
+  });
   if (taskId && toolCallId) {
     await safeResume(
       config,

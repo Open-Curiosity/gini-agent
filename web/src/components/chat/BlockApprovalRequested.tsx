@@ -400,6 +400,29 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
   const cardClass = isPending
     ? "rounded-lg border border-amber-500/30 bg-amber-500/5 p-3"
     : "rounded-lg border border-border bg-background/40 p-3";
+  // The React sticky state (bridgeResultOk, pairingResultOk,
+  // removeResultOk) only survives the current page session — on
+  // reload it re-initializes to null and the past-tense summary
+  // falls back to "Bridge added"/"Pairing approved"/"Bridge
+  // removed", which is a lie when the /connect side effect
+  // actually failed (the approval row's status flips to
+  // "approved" at resolveApproval BEFORE the side effect runs).
+  // The /connect handlers now persist their outcome onto
+  // approval.connectOutcome, so reads fall through:
+  // sticky (this session) → persisted (durable across reload).
+  const persistedOutcome = approval?.connectOutcome;
+  const effectiveBridgeOk = bridgeResultOk !== null
+    ? bridgeResultOk
+    : persistedOutcome?.ok ?? null;
+  const effectiveBridgeMessage = bridgeResultMessage ?? persistedOutcome?.message ?? null;
+  const effectivePairingOk = pairingResultOk !== null
+    ? pairingResultOk
+    : persistedOutcome?.ok ?? null;
+  const effectivePairingMessage = pairingResultMessage ?? persistedOutcome?.message ?? null;
+  const effectiveRemoveOk = removeResultOk !== null
+    ? removeResultOk
+    : persistedOutcome?.ok ?? null;
+  const effectiveRemoveMessage = removeError ?? persistedOutcome?.message ?? null;
   // Past-tense the summary once resolved so "Enter credentials..."
   // doesn't keep reading as an active ask after the user has
   // already submitted (or denied). Display-only — the underlying
@@ -415,15 +438,11 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       ? approval.status === "approved"
         // The /connect handler resolves the approval BEFORE
         // addMessagingBridge runs, so a successful resolve does NOT
-        // imply the bridge exists. Trust the sticky outcome marker
-        // set by bridgeSubmit's onSuccess/onError; default to "added"
-        // only when the most recent submit actually returned ok:true,
-        // OR when there's no local outcome to consult (e.g. resumed
-        // from history). bridgeResultOk === false means the create
-        // failed after resolve — render that truthfully so the past
-        // tense doesn't lie.
-        ? bridgeResultOk === false
-          ? `Bridge create failed${bridgeResultMessage ? `: ${bridgeResultMessage}` : ""}. (${block.summary})`
+        // imply the bridge exists. Trust the effective outcome
+        // (sticky-then-persisted); only render "added" when we
+        // have positive evidence the side effect actually completed.
+        ? effectiveBridgeOk === false
+          ? `Bridge create failed${effectiveBridgeMessage ? `: ${effectiveBridgeMessage}` : ""}. (${block.summary})`
           : `${bridgeKindLabel} bridge added. (${block.summary})`
         : approval.status === "denied"
           ? `Request denied. (${block.summary})`
@@ -435,12 +454,10 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
           // BEFORE allowChat/rejectPendingChat runs. A server-side
           // failure (rotated code, already-enrolled chat, etc.)
           // returns ok:false while the approval is already approved.
-          // Trust pairingResultOk first so the past-tense summary
-          // reflects the actual outcome; fall back to pairingOutcome
-          // only when the server returned ok:true (i.e. the side
-          // effect actually completed).
-          ? pairingResultOk === false
-            ? `Pairing failed${pairingResultMessage ? `: ${pairingResultMessage}` : ""}. (${block.summary})`
+          // Effective outcome falls through sticky → persisted so
+          // the past-tense summary stays truthful after reload.
+          ? effectivePairingOk === false
+            ? `Pairing failed${effectivePairingMessage ? `: ${effectivePairingMessage}` : ""}. (${block.summary})`
             : pairingOutcome === "rejected"
               ? `Pairing rejected. (${block.summary})`
               : pairingOutcome === "approved"
@@ -451,8 +468,8 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
             : block.summary
         : !isPending && approval && isMessagingRemoveBridge
           ? approval.status === "approved"
-            ? removeResultOk === false
-              ? `Bridge removal failed${removeError ? `: ${removeError}` : ""}. (${block.summary})`
+            ? effectiveRemoveOk === false
+              ? `Bridge removal failed${effectiveRemoveMessage ? `: ${effectiveRemoveMessage}` : ""}. (${block.summary})`
               : `Bridge removed. (${block.summary})`
             : approval.status === "denied"
               ? `Request denied. (${block.summary})`
