@@ -930,12 +930,33 @@ export async function rejectPendingChat(
       throw new Error(`Cannot reject: chat ${chatId} is already enrolled on bridge '${live.name}'. Use the settings page to remove the enrollment if you meant to revoke it.`);
     }
     const pending = readRecentDeniedChats(live).find((entry) => entry.chatId === chatId);
-    if (options.expectedCode !== undefined && pending?.verificationCode && pending.verificationCode !== options.expectedCode) {
-      // Code rotated between mint and click — the stale card would
-      // otherwise clear the fresh pending row. Atomic check-and-delete
-      // closes the TOCTOU window that a pre-mutateState lookup left
-      // open.
-      throw new Error(`Pairing request for chat ${chatId} was re-DM'd since this card was minted — its verification code rotated. Approve or Reject the current pending card instead; this stale card no longer matches.`);
+    if (options.expectedCode !== undefined) {
+      // Three stale-card cases the chat-side Reject must refuse so
+      // it doesn't silently report success:
+      //   1. pending row was already cleared (parallel operator
+      //      Reject or settings-page click) — there's nothing to
+      //      reject; the chat card is dead.
+      //   2. pending row exists but has no verificationCode (group
+      //      chat regrown from a different message after the
+      //      original code-bearing row was approved) — the chat-side
+      //      Reject doesn't apply to group rows.
+      //   3. pending row exists, has a code, but the code doesn't
+      //      match the approval's expectedCode — the user re-DM'd
+      //      and the code rotated. Rejecting now would clear the
+      //      fresh pending row.
+      if (!pending) {
+        throw new Error(`Pairing request for chat ${chatId} was already cleared (likely by a parallel Reject or a settings-page action). Nothing to do; the chat card is stale.`);
+      }
+      if (!pending.verificationCode) {
+        throw new Error(`Pairing request for chat ${chatId} now has no verification code (a different message replaced the original pending row). This chat-card Reject no longer matches.`);
+      }
+      if (pending.verificationCode !== options.expectedCode) {
+        // Code rotated between mint and click — the stale card would
+        // otherwise clear the fresh pending row. Atomic check-and-delete
+        // closes the TOCTOU window that a pre-mutateState lookup left
+        // open.
+        throw new Error(`Pairing request for chat ${chatId} was re-DM'd since this card was minted — its verification code rotated. Approve or Reject the current pending card instead; this stale card no longer matches.`);
+      }
     }
     const meta = { ...(live.metadata ?? {}) };
     meta.recentDeniedChats = readRecentDeniedChats(live).filter((entry) => entry.chatId !== chatId);
