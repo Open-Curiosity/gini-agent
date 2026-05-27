@@ -88,13 +88,14 @@ export async function runMessagingRemoveConnect(
     message: `Bridge '${bridgeName}' removed`
   });
   if (taskId && toolCallId) {
-    await safeResume(
+    // Detached — see messaging-bridge-connect.ts comment.
+    void safeResume(
       config,
       taskId,
       toolCallId,
       `Bridge '${bridgeName}' has been removed. Its bot token was deleted; past messages remain in history.`,
       { context: "messaging.remove_bridge", approvalId: approval.id }
-    );
+    ).catch(() => {});
   }
   // Chat-card lineage audit row — same rationale as the pairing
   // and bridge-create connect handlers. removeMessagingBridge writes

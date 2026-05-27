@@ -176,13 +176,26 @@ export async function runMessagingBridgeConnect(
     message: `${kindLabel} bridge added: ${bridge.name}`
   });
   if (taskId && toolCallId) {
-    await safeResume(
+    // Detached on purpose. resumeChatTask kicks the chat-task loop
+    // synchronously and the model's natural next tool call here is
+    // wait_for_messaging_pair, which is a polling loop with a
+    // default 600s deadline and a 1800s ceiling. Awaiting safeResume
+    // would block this HTTP response for that full window — the
+    // browser would see the bridge-add card spin until the
+    // verification pair lands or the wait timed out. The chat card
+    // UI observes the chat-task progress via the per-session block
+    // SSE stream + approval polling, so the /connect response only
+    // needs to confirm the side effect landed. safeResume already
+    // catches its own throws via failTask, and the trailing
+    // .catch keeps a degenerate rejection out of the unhandled-
+    // rejection handler.
+    void safeResume(
       config,
       taskId,
       toolCallId,
       `${kindLabel} bridge added: ${bridge.name}. Tell the user it's ready and walk them through enrolling a chat (DM the bot, share the verification code, you approve from the settings page) if relevant.`,
       { context: "messaging.add_bridge", approvalId: approval.id }
-    );
+    ).catch(() => {});
   }
   // Stamp a follow-up audit row with the chat-side lineage. The
   // shared substrate (createMessagingBridgeRecord) writes a generic

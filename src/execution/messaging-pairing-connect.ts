@@ -138,13 +138,16 @@ export async function runMessagingPairingConnect(
       message: `Pairing request for chat ${chatId} rejected`
     });
     if (taskId && toolCallId) {
-      await safeResume(
+      // Detached — see messaging-bridge-connect.ts comment. A
+      // resumed agent that calls a long-running tool next must
+      // not pin this HTTP response.
+      void safeResume(
         config,
         taskId,
         toolCallId,
         `Pairing request for chat ${chatId} was rejected. Tell the user the request was cleared; a fresh DM will mint a new request.`,
         { context: "messaging.approve_pairing", approvalId: approval.id }
-      );
+      ).catch(() => {});
     }
     // Chat-card lineage audit row, mirroring runMessagingBridgeConnect's
     // pattern. allowChat / rejectPendingChat write generic audit rows
@@ -204,13 +207,14 @@ export async function runMessagingPairingConnect(
     message: `Pairing approved for chat ${chatId}`
   });
   if (taskId && toolCallId) {
-    await safeResume(
+    // Detached — see messaging-bridge-connect.ts comment.
+    void safeResume(
       config,
       taskId,
       toolCallId,
       `Pairing approved: chat ${chatId} is now enrolled on the bridge. The bot has sent the user a confirmation message — they can chat with Gini now.`,
       { context: "messaging.approve_pairing", approvalId: approval.id }
-    );
+    ).catch(() => {});
   }
   // Chat-card lineage audit row — same rationale as the reject
   // branch. allowChat writes a generic messaging.chat.allowed row
