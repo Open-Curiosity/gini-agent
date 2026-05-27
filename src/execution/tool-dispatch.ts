@@ -597,12 +597,47 @@ async function assertPublicWebFetchTarget(parsed: URL): Promise<void> {
   }
 }
 
+// Cap on automatic redirect hops. Five is consistent with the
+// default browser limit and prevents a server that 302s in a loop
+// from holding the agent's tool slot.
+const WEB_FETCH_MAX_REDIRECTS = 5;
+
 async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
   const rawUrl = requireString(args, "url");
-  const parsed = new URL(rawUrl);
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("web_fetch requires an http(s) URL.");
-  await assertPublicWebFetchTarget(parsed);
-  const response = await fetch(parsed);
+  let current = new URL(rawUrl);
+  if (current.protocol !== "https:" && current.protocol !== "http:") throw new Error("web_fetch requires an http(s) URL.");
+  await assertPublicWebFetchTarget(current);
+
+  // Manual redirect handling: default fetch() follows redirects, which
+  // would let a public URL 302 into loopback / RFC1918 and bypass the
+  // pre-fetch guard. Loop with redirect:"manual" and re-validate the
+  // Location target on every hop. The fetch DNS resolution still
+  // happens inside fetch() so a full DNS-rebinding attacker (TTL=0
+  // swap between assertPublicWebFetchTarget's lookup and the actual
+  // dial) can still slip through — closing that requires dialing the
+  // resolved IP directly with hostname-in-Host-header + SNI overrides,
+  // which Bun doesn't expose cleanly today. The redirect-bypass leg
+  // is the bigger blast radius and is closed here.
+  let response: Response;
+  let hops = 0;
+  for (;;) {
+    response = await fetch(current, { redirect: "manual" });
+    if (response.status < 300 || response.status >= 400) break;
+    const location = response.headers.get("location");
+    if (!location) break;
+    if (hops >= WEB_FETCH_MAX_REDIRECTS) {
+      throw new Error(`web_fetch refused after ${WEB_FETCH_MAX_REDIRECTS} redirects from ${parsed_origin(current)} (loop or chain too long).`);
+    }
+    // Resolve relative redirects against the previous URL so we
+    // validate the actual destination, not a partial path.
+    const next = new URL(location, current);
+    if (next.protocol !== "https:" && next.protocol !== "http:") {
+      throw new Error(`web_fetch refuses redirect to non-http(s) URL: ${next.protocol}`);
+    }
+    await assertPublicWebFetchTarget(next);
+    current = next;
+    hops += 1;
+  }
   const text = (await response.text())
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
@@ -613,10 +648,17 @@ async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<
   appendTrace(config.instance, taskId, {
     type: "tool",
     message: "Web page fetched (chat-task)",
-    data: { url: parsed.toString(), status: response.status, bytes: text.length }
+    data: { url: current.toString(), status: response.status, bytes: text.length, redirects: hops }
   });
-  await recordLowRiskAudit(config, taskId, "web.fetch", parsed.toString(), { status: response.status, bytes: text.length });
-  return text || `Fetched ${parsed.toString()} with HTTP ${response.status}.`;
+  await recordLowRiskAudit(config, taskId, "web.fetch", current.toString(), { status: response.status, bytes: text.length, redirects: hops });
+  return text || `Fetched ${current.toString()} with HTTP ${response.status}.`;
+}
+
+// Tiny helper kept inline because it's only used by the redirect-cap
+// error message — avoids leaking query strings / fragments into the
+// exception while still naming the origin of the redirect chain.
+function parsed_origin(url: URL): string {
+  return `${url.protocol}//${url.host}`;
 }
 
 // Skill catalog access. Returns the full markdown body of an enabled skill

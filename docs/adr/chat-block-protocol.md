@@ -108,7 +108,8 @@ remote previews, screen readers) would need the same translation code.
 
 - `ApprovalRequestedBlock.action` is part of the wire contract so
   clients can branch on the card variant without a cross-endpoint
-  join. Four branches:
+  join. Six branches (five /connect-resolved actions plus a default
+  Approve/Deny pair for everything else):
   - `connector.request` — render the Connect dialog. Submit posts
     `{ secrets, scopes, name }` to `/api/approvals/<id>/connect`.
   - `browser.fill_secret` — render an inline form with one input
