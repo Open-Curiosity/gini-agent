@@ -83,10 +83,33 @@ export {
   listChatBlocksAfter,
   deleteChatBlocksForSession,
   findInFlightAssistantTextForTask,
+  taskProducedAssistantText,
   getLatestMessagesBySession,
-  subscribeChatBlocks
+  subscribeChatBlocks,
+  subscribeAllChatBlocks
 } from "./chat-blocks";
 export type { InsertChatBlockInput } from "./chat-blocks";
+export {
+  upsertDevice,
+  listDevicesForCredential,
+  listAllDevices,
+  getDevice,
+  removeDevice,
+  removeDeviceForCredential
+} from "./devices";
+export type { PushDevice, UpsertDeviceInput } from "./devices";
+export {
+  addSseSubscription,
+  isDeviceWatching,
+  hasAnyActiveSubscription
+} from "./sse-subscriptions";
+export {
+  markRead,
+  getLastReadByDevice,
+  getReadState,
+  unreadCountForDevice
+} from "./chat-read-state";
+export type { ChatReadState } from "./chat-read-state";
 export {
   taskCounts,
   upsertTask,

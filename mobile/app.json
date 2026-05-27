@@ -2,8 +2,9 @@
   "expo": {
     "name": "Gini",
     "slug": "gini-mobile",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "orientation": "portrait",
+    "icon": "./assets/icon.png",
     "scheme": "gini",
     "userInterfaceStyle": "automatic",
     "runtimeVersion": {
@@ -23,6 +24,7 @@
     "android": {
       "package": "ai.lilaclabs.gini.mobile",
       "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
         "backgroundColor": "#ffffff"
       }
     },
@@ -31,6 +33,16 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-notifications",
+        {
+          "enableBackgroundRemoteNotifications": true
+        }
+      ],
+      [
+        "./plugins/with-approval-notification-service.js",
+        { "appleTeamId": "WB6Y3K67AB" }
+      ],
       "expo-updates"
     ],
     "experiments": {
@@ -39,7 +51,19 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "d3a0b9e3-a377-4827-bf3c-274b519f305a"
+        "projectId": "d3a0b9e3-a377-4827-bf3c-274b519f305a",
+        "build": {
+          "experimental": {
+            "ios": {
+              "appExtensions": [
+                {
+                  "targetName": "ApprovalNotificationService",
+                  "bundleIdentifier": "ai.lilaclabs.gini.mobile.notificationservice"
+                }
+              ]
+            }
+          }
+        }
       }
     },
     "owner": "sheldenshi"

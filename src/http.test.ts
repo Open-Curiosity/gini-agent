@@ -2225,6 +2225,66 @@ describe("runtime api", () => {
     expect(buffer).toContain("stream this");
   });
 
+  test("GET /api/chat/:id/stream emits id frames as <block_id>:<iso_ts>", async () => {
+    // Pins the SSE wire contract: each chat_block frame's `id:` line
+    // carries `<block_id>:<iso_timestamp>`. The mobile/browser client
+    // round-trips that string as Last-Event-ID on reconnect, and the
+    // gateway parses the `:<ts>` suffix to detect in-place updates on
+    // the cursor row (see listChatBlocksAfter). A regression that
+    // strips the suffix would silently break resume semantics for the
+    // streaming assistant_text case, so we pin the format at the HTTP
+    // boundary.
+    const config = testConfig("chat-blocks-stream-id-format");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "stream id format" })
+    });
+    const submitted = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "id format check" })
+    });
+    await waitForTask(handler, config, submitted.taskId);
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    if (reader) {
+      const deadline = Date.now() + 500;
+      while (Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("event: chat_block")) break;
+      }
+      await reader.cancel();
+    }
+    // Frame shape: `id: <block_id>:<iso_ts>\nevent: chat_block\n...`.
+    // Block ids are `block_<random>` (no `:`); ISO timestamps look like
+    // `YYYY-MM-DDTHH:MM:SS.sssZ`. The whole line must match this pattern.
+    const idLineMatch = buffer.match(
+      /^id: ([A-Za-z0-9_-]+):(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)$/m
+    );
+    expect(idLineMatch).not.toBeNull();
+    // Sanity: the captured block id portion does not itself contain `:`,
+    // so splitting on the first colon in listChatBlocksAfter is safe.
+    expect(idLineMatch?.[1]).not.toContain(":");
+  });
+
   test("GET /api/chat/:id/stream returns 404 for unknown sessions", async () => {
     const config = testConfig("chat-blocks-stream-404");
     const handler = createHandler(config);
@@ -2365,6 +2425,422 @@ describe("runtime api", () => {
       });
       expect(result.ok).toBe(false);
       expect(result.reason).toBe("no snapshot");
+    });
+  });
+
+  describe("push device endpoints", () => {
+    test("POST /api/push/devices upserts a token scoped to the caller's credential", async () => {
+      const config = testConfig("push-devices-upsert");
+      const handler = createHandler(config);
+      // Two distinct credentials: the runtime "owner" (config.token)
+      // and a paired mobile device that gets its own credential id.
+      const pairing = await call(handler, config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 60 }) });
+      const claimed = await callPublic(handler, config, "/api/pairing/claim", {
+        method: "POST",
+        body: JSON.stringify({ code: pairing.code, deviceName: "Phone" })
+      });
+
+      const ownerReg = await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const phoneReg = await callWithToken(handler, config, claimed.token, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_phone", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+
+      expect(ownerReg.ok).toBe(true);
+      expect(ownerReg.device.credentialId).toBe("owner");
+      expect(ownerReg.device.token).toBe("tok_owner");
+      expect(phoneReg.ok).toBe(true);
+      expect(phoneReg.device.credentialId).toBe(claimed.device.id);
+      expect(phoneReg.device.token).toBe("tok_phone");
+
+      // Re-register the same token under the owner — idempotent rebind.
+      const rebind = await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile.dev" })
+      });
+      expect(rebind.device.bundleId).toBe("ai.lilaclabs.gini.mobile.dev");
+      expect(rebind.device.credentialId).toBe("owner");
+    });
+
+    test("POST /api/push/devices validates inputs", async () => {
+      const config = testConfig("push-devices-validate");
+      const handler = createHandler(config);
+
+      const missingToken = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      }, config.token);
+      expect(missingToken.status).toBe(400);
+
+      const wrongPlatform = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok", platform: "android", bundleId: "ai.lilaclabs.gini.mobile" })
+      }, config.token);
+      expect(wrongPlatform.status).toBe(400);
+
+      const missingBundle = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok", platform: "ios" })
+      }, config.token);
+      expect(missingBundle.status).toBe(400);
+    });
+
+    test("DELETE /api/push/devices/:token removes only the caller's tokens", async () => {
+      const config = testConfig("push-devices-delete");
+      const handler = createHandler(config);
+      const pairing = await call(handler, config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 60 }) });
+      const claimed = await callPublic(handler, config, "/api/pairing/claim", {
+        method: "POST",
+        body: JSON.stringify({ code: pairing.code, deviceName: "Phone" })
+      });
+
+      // Register two tokens — one per credential.
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await callWithToken(handler, config, claimed.token, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_phone", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+
+      // Owner cannot delete the paired device's token — 404 (we
+      // intentionally don't surface which of "missing" vs "wrong
+      // owner" so credentials can't probe each other).
+      const crossDelete = await rawCall(handler, config, "/api/push/devices/tok_phone", { method: "DELETE" }, config.token);
+      expect(crossDelete.status).toBe(404);
+
+      // The paired device deleting its own token succeeds.
+      const ownDelete = await callWithToken(handler, config, claimed.token, "/api/push/devices/tok_phone", { method: "DELETE" });
+      expect(ownDelete.ok).toBe(true);
+
+      // Second delete of the same token: 404.
+      const repeatDelete = await rawCall(handler, config, "/api/push/devices/tok_phone", { method: "DELETE" }, claimed.token);
+      expect(repeatDelete.status).toBe(404);
+    });
+
+    test("POST /api/chat/:id/read records the cursor and GET /api/badge surfaces the unread total", async () => {
+      const config = testConfig("chat-read-badge");
+      const handler = createHandler(config);
+
+      // Register a device first — read/badge now key per device, not
+      // per credential, so the mobile client identifies itself via
+      // X-Device-Token on every call.
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "read state" })
+      });
+      // Plant two visible blocks via the persistence layer — the read
+      // endpoint validates the block id, but the unread aggregate is
+      // what we're measuring here.
+      const { insertChatBlock } = await import("./state");
+      const b1 = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "hi"
+      });
+      insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "follow up"
+      });
+
+      // Fresh device: no read state yet, both blocks unread.
+      const before = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(before.unread).toBe(2);
+
+      const marked = await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST",
+        headers: deviceHeader,
+        body: JSON.stringify({ lastReadBlockId: b1.id })
+      });
+      expect(marked.ok).toBe(true);
+      expect(marked.readState.lastReadBlockId).toBe(b1.id);
+
+      const after = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(after.unread).toBe(1);
+    });
+
+    test("POST /api/chat/:id/read rejects bad input and cross-session ids", async () => {
+      const config = testConfig("chat-read-validate");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+      const sessionA = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "A" })
+      });
+      const sessionB = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "B" })
+      });
+      const { insertChatBlock } = await import("./state");
+      const bA = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: sessionA.id,
+        text: "in A"
+      });
+
+      // Missing lastReadBlockId.
+      const missing = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionA.id}/read`,
+        { method: "POST", headers: deviceHeader, body: JSON.stringify({}) },
+        config.token
+      );
+      expect(missing.status).toBe(400);
+
+      // Block belongs to A — POSTing it on B's cursor is rejected.
+      const cross = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionB.id}/read`,
+        { method: "POST", headers: deviceHeader, body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        config.token
+      );
+      expect(cross.status).toBe(400);
+
+      // Unknown session: 404.
+      const noSession = await rawCall(
+        handler,
+        config,
+        "/api/chat/chat_nonexistent/read",
+        { method: "POST", headers: deviceHeader, body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        config.token
+      );
+      expect(noSession.status).toBe(404);
+
+      // Missing X-Device-Token: 400 (mobile-only endpoint).
+      const missingDevice = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionA.id}/read`,
+        { method: "POST", body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        config.token
+      );
+      expect(missingDevice.status).toBe(400);
+
+      // Foreign device token (not registered to this credential): 403.
+      const foreignDevice = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionA.id}/read`,
+        {
+          method: "POST",
+          headers: { "x-device-token": "tok_someone_else" },
+          body: JSON.stringify({ lastReadBlockId: bA.id })
+        },
+        config.token
+      );
+      expect(foreignDevice.status).toBe(403);
+    });
+
+    test("read state is scoped per device, not per credential", async () => {
+      // Two iPhones owned by the same human (both register under the
+      // "owner" credential). iPhone A reading the chat must NOT clear
+      // iPhone B's badge — that's the load-bearing per-device guarantee.
+      const config = testConfig("chat-read-device");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_a", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_b", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "shared" })
+      });
+      const { insertChatBlock } = await import("./state");
+      const block = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "hello"
+      });
+
+      // iPhone A marks read; its badge drops to 0. iPhone B's badge
+      // is still 1 because read state is per-device.
+      await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST",
+        headers: { "x-device-token": "tok_iphone_a" },
+        body: JSON.stringify({ lastReadBlockId: block.id })
+      });
+      const badgeA = await call(handler, config, "/api/badge", {
+        headers: { "x-device-token": "tok_iphone_a" }
+      });
+      const badgeB = await call(handler, config, "/api/badge", {
+        headers: { "x-device-token": "tok_iphone_b" }
+      });
+      expect(badgeA.unread).toBe(0);
+      expect(badgeB.unread).toBe(1);
+    });
+
+    test("read + badge endpoints require authentication", async () => {
+      const config = testConfig("chat-read-auth");
+      const handler = createHandler(config);
+      const read = await rawCall(handler, config, "/api/chat/chat_x/read", {
+        method: "POST",
+        body: JSON.stringify({ lastReadBlockId: "block_x" })
+      });
+      expect(read.status).toBe(401);
+      const badge = await rawCall(handler, config, "/api/badge");
+      expect(badge.status).toBe(401);
+    });
+
+    test("push device endpoints require authentication", async () => {
+      const config = testConfig("push-devices-auth");
+      const handler = createHandler(config);
+
+      const post = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      expect(post.status).toBe(401);
+
+      const del = await rawCall(handler, config, "/api/push/devices/tok", { method: "DELETE" });
+      expect(del.status).toBe(401);
+    });
+  });
+
+  describe("cors", () => {
+    // Save/restore the env override so individual cases don't leak.
+    function withEnv(value: string | undefined, fn: () => Promise<void>): Promise<void> {
+      const prior = process.env.GINI_CORS_ORIGINS;
+      if (value === undefined) delete process.env.GINI_CORS_ORIGINS;
+      else process.env.GINI_CORS_ORIGINS = value;
+      return fn().finally(() => {
+        if (prior === undefined) delete process.env.GINI_CORS_ORIGINS;
+        else process.env.GINI_CORS_ORIGINS = prior;
+      });
+    }
+
+    test("preflight from an allowed origin returns 204 with CORS headers", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-preflight-allowed");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          method: "OPTIONS",
+          headers: {
+            origin: "http://localhost:8090",
+            "access-control-request-method": "GET",
+            "access-control-request-headers": "authorization"
+          }
+        }));
+        expect(response.status).toBe(204);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:8090");
+        expect(response.headers.get("access-control-allow-credentials")).toBe("true");
+        expect(response.headers.get("vary")).toBe("Origin");
+        expect(response.headers.get("access-control-allow-methods")).toContain("GET");
+        expect(response.headers.get("access-control-allow-methods")).toContain("POST");
+        expect(response.headers.get("access-control-allow-headers") ?? "").toContain("Authorization");
+        expect(response.headers.get("access-control-allow-headers") ?? "").toContain("X-Device-Token");
+        expect(response.headers.get("access-control-allow-headers") ?? "").toContain("Last-Event-ID");
+        expect(response.headers.get("access-control-max-age")).toBe("600");
+      });
+    });
+
+    test("preflight from a disallowed origin returns 204 without allow-origin", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-preflight-disallowed");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          method: "OPTIONS",
+          headers: {
+            origin: "http://evil.example.com",
+            "access-control-request-method": "GET"
+          }
+        }));
+        expect(response.status).toBe(204);
+        expect(response.headers.get("access-control-allow-origin")).toBeNull();
+        // The protocol-level headers still go out — they describe what
+        // the server *would* accept; the browser rejects because of the
+        // missing allow-origin.
+        expect(response.headers.get("access-control-allow-methods")).toContain("GET");
+      });
+    });
+
+    test("normal GET from an allowed origin gets CORS headers", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-get-allowed");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: {
+            origin: "http://localhost:3045",
+            authorization: `Bearer ${config.token}`
+          }
+        }));
+        expect(response.status).toBe(200);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:3045");
+        expect(response.headers.get("access-control-allow-credentials")).toBe("true");
+        expect(response.headers.get("vary")).toBe("Origin");
+        expect(response.headers.get("access-control-expose-headers")).toBe("Last-Event-ID");
+      });
+    });
+
+    test("non-browser caller without Origin gets no CORS headers", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-no-origin");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: { authorization: `Bearer ${config.token}` }
+        }));
+        expect(response.status).toBe(200);
+        expect(response.headers.get("access-control-allow-origin")).toBeNull();
+        expect(response.headers.get("vary")).toBeNull();
+      });
+    });
+
+    test("401 responses still carry CORS headers so the browser sees the status", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-401");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: { origin: "http://localhost:8090" } // no Authorization
+        }));
+        expect(response.status).toBe(401);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:8090");
+      });
+    });
+
+    test("GINI_CORS_ORIGINS env var overrides the default allowlist", async () => {
+      await withEnv("https://example.com", async () => {
+        const config = testConfig("cors-custom-env");
+        const handler = createHandler(config);
+
+        const allowed = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: {
+            origin: "https://example.com",
+            authorization: `Bearer ${config.token}`
+          }
+        }));
+        expect(allowed.headers.get("access-control-allow-origin")).toBe("https://example.com");
+
+        // The defaults (localhost:8090, etc) should NOT be honored when
+        // the env var is set — it's a full override, not an additive list.
+        const denied = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: {
+            origin: "http://localhost:8090",
+            authorization: `Bearer ${config.token}`
+          }
+        }));
+        expect(denied.headers.get("access-control-allow-origin")).toBeNull();
+      });
     });
   });
 });
