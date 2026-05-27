@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -105,8 +105,16 @@ export function TunnelCard() {
   // the confirm dialogs on destructive transitions are the mitigation.
   // The `via tunnel` badge tells the operator which surface they're on
   // so a misclick on Disable / Rotate from the phone is self-evident.
-  const isTunneledView = typeof window !== "undefined"
-    && !isLoopbackHost(window.location.host);
+  //
+  // Read window.location.host in a useEffect rather than during render so
+  // server-side render and client first-render both compute the same
+  // value (`false`) — otherwise React 19 logs a hydration mismatch when
+  // the page is opened on the tunneled host because SSR sees no `window`
+  // and the client immediately sees a non-loopback host.
+  const [isTunneledView, setIsTunneledView] = useState(false);
+  useEffect(() => {
+    setIsTunneledView(!isLoopbackHost(window.location.host));
+  }, []);
   const tunnelLive = Boolean(data?.enabled && data?.publicUrl);
 
   const runConfirmed = (kind: Exclude<ConfirmKind, null>) => {
