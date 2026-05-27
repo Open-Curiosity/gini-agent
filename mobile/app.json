@@ -51,7 +51,19 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "d3a0b9e3-a377-4827-bf3c-274b519f305a"
+        "projectId": "d3a0b9e3-a377-4827-bf3c-274b519f305a",
+        "build": {
+          "experimental": {
+            "ios": {
+              "appExtensions": [
+                {
+                  "targetName": "ApprovalNotificationService",
+                  "bundleIdentifier": "ai.lilaclabs.gini.mobile.notificationservice"
+                }
+              ]
+            }
+          }
+        }
       }
     },
     "owner": "sheldenshi"
