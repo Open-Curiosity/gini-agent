@@ -44,16 +44,29 @@ export function launchCloudflared(opts: LaunchOptions): CloudflaredLaunch {
   const timeoutMs = opts.bannerTimeoutMs ?? 30_000;
   const bannerTimer = setTimeout(() => rejectUrl(new Error("cloudflared banner timeout")), timeoutMs);
 
-  const parseChunk = (chunk: Buffer | string) => {
+  // Accumulate stdout + stderr into rolling buffers so the URL is still
+  // matched when cloudflared's banner is split across two `'data'` events
+  // (Node streams deliver arbitrary byte boundaries). Each buffer is capped
+  // at 64 KiB and trimmed from the front so the most-recent tail — where
+  // the URL line lives — always survives.
+  const MAX_BUFFER = 65_536;
+  let stdoutBuf = "";
+  let stderrBuf = "";
+  const onChunk = (which: "stdout" | "stderr") => (chunk: Buffer | string) => {
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-    const m = text.match(URL_REGEX);
+    if (which === "stdout") {
+      stdoutBuf = (stdoutBuf + text).slice(-MAX_BUFFER);
+    } else {
+      stderrBuf = (stderrBuf + text).slice(-MAX_BUFFER);
+    }
+    const m = stdoutBuf.match(URL_REGEX) ?? stderrBuf.match(URL_REGEX);
     if (m) {
       clearTimeout(bannerTimer);
       resolveUrl(m[0]);
     }
   };
-  proc.stdout?.on("data", parseChunk);
-  proc.stderr?.on("data", parseChunk);
+  proc.stdout?.on("data", onChunk("stdout"));
+  proc.stderr?.on("data", onChunk("stderr"));
   proc.on("error", (err) => {
     clearTimeout(bannerTimer);
     rejectUrl(err);

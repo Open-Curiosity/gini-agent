@@ -113,7 +113,19 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
           process.stderr.write(redacted);
           stream.write(redacted);
         });
-        const close = () => { try { stream.end(); } catch { /* ignore */ } };
+        const close = () => {
+          // Flush any held-back redactor carry bytes before ending the
+          // stream — otherwise the tail of the child's output is lost when
+          // the process exits without a trailing newline.
+          if (redactForLog) {
+            const tail = redactForLog.flush();
+            if (tail) {
+              try { process.stdout.write(tail); } catch { /* ignore */ }
+              try { stream.write(tail); } catch { /* ignore */ }
+            }
+          }
+          try { stream.end(); } catch { /* ignore */ }
+        };
         // `close` (not `exit`) fires after stdio has fully drained. Using `exit`
         // here let late `data` events arrive after the stream had been ended,
         // which truncates the tail.
@@ -154,7 +166,18 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
 // scanning, so any secret that ends inside the current chunk OR straddles
 // the next is caught. On flush (final chunk before stream end) the held
 // suffix is returned verbatim.
-function makeWebLogRedactor(instance: string): (chunk: Buffer | string) => string {
+interface WebLogRedactor {
+  /** Scrub the next chunk; may hold back up to 256 bytes as carry. */
+  (chunk: Buffer | string): string;
+  /** Flush any carry buffer at stream end. Returned text has already had the
+   *  final secret scan applied; the caller writes it to the stream before
+   *  closing. */
+  flush(): string;
+}
+
+const REDACTOR_CARRY_CAP = 256;
+
+function makeWebLogRedactor(instance: string): WebLogRedactor {
   const PLACEHOLDER = "<redacted-secret>";
   const CACHE_MS = 1_000;
   let cachedSecret: string | null = null;
@@ -180,7 +203,7 @@ function makeWebLogRedactor(instance: string): (chunk: Buffer | string) => strin
       return cachedSecret;
     }
   };
-  return (chunk) => {
+  const redact = (chunk: Buffer | string): string => {
     const secret = readSecret();
     const raw = typeof chunk === "string" ? chunk : chunk.toString("utf8");
     let text = carry + raw;
@@ -189,9 +212,9 @@ function makeWebLogRedactor(instance: string): (chunk: Buffer | string) => strin
     // Decide how many trailing bytes to retain as carry for the next chunk.
     // The carry must be big enough to catch a secret that straddles the
     // next boundary — i.e., `max(secret.length, priorSecret.length) - 1`.
-    // We cap at 256 bytes to bound memory.
+    // Capped at REDACTOR_CARRY_CAP bytes to bound memory.
     const longest = Math.max(secret?.length ?? 0, priorSecret?.length ?? 0);
-    const carryLen = longest > 0 ? Math.min(longest - 1, 256) : 0;
+    const carryLen = longest > 0 ? Math.min(longest - 1, REDACTOR_CARRY_CAP) : 0;
     if (carryLen > 0 && text.length > carryLen) {
       carry = text.slice(-carryLen);
       return text.slice(0, -carryLen);
@@ -199,6 +222,18 @@ function makeWebLogRedactor(instance: string): (chunk: Buffer | string) => strin
     carry = text;
     return "";
   };
+  // Final flush — applied on stream close so the carry tail isn't dropped
+  // when the Next.js child exits without a trailing newline.
+  const flush = (): string => {
+    if (!carry) return "";
+    const secret = readSecret();
+    let text = carry;
+    if (secret) text = text.split(secret).join(PLACEHOLDER);
+    if (priorSecret) text = text.split(priorSecret).join(PLACEHOLDER);
+    carry = "";
+    return text;
+  };
+  return Object.assign(redact, { flush });
 }
 
 function readRecordedPort(path: string): number | null {

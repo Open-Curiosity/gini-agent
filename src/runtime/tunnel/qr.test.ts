@@ -1,7 +1,7 @@
 // QR encoder regression tests. Verifies:
 //   1. encodeQr produces a square matrix at the right version's module count.
 //   2. Format-info bits land at the spec-mandated (x, y) coordinates per
-//      ISO/IEC 18004 section 8.9 (this is the part the reviewer flagged).
+//      ISO/IEC 18004 section 8.9.
 //   3. The permanently-dark module is always set at (col 8, row size-8).
 import { describe, expect, test } from "bun:test";
 import { encodeQr, renderQrAnsi, renderQrSvg } from "./qr";

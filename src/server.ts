@@ -43,6 +43,11 @@ writePid(config);
 // is populated before any request lands. See PLAN.md "Persisted config".
 tunnelManager(config);
 
+// Process-wide shutdown sentinel. Set by the SIGTERM handler at the bottom
+// of this file; the boot-reconcile poll polls this between awaits so it
+// never spawns a fresh cloudflared after `stopForShutdown()` has run.
+let bootReconcileAbort = false;
+
 // Boot-time reconciliation: if config.json persists `tunnel.enabled: true`,
 // the operator's expectation is that the tunnel comes back up after a restart
 // (with a new rotating hostname). The web port isn't known yet — the CLI
@@ -51,6 +56,8 @@ tunnelManager(config);
 // `gini tunnel disable` issued before web.port appears does NOT re-enable
 // when the port lands. A `__healthz` probe runs before the cloudflared
 // spawn so we never expose a stale or squatted port to the public URL.
+// The poll also checks `bootReconcileAbort` after every await so a SIGTERM
+// landing during a probe / sleep cancels the reconcile cleanly.
 // Bounded by the 60_000 ms PLAN.md ceiling on web-port discovery.
 {
   const initial = readTunnelConfig(config.instance);
@@ -58,6 +65,10 @@ tunnelManager(config);
     const deadline = Date.now() + 60_000;
     const poll = async () => {
       while (Date.now() < deadline) {
+        if (bootReconcileAbort) {
+          appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "shutdown" });
+          return;
+        }
         // Re-read the persisted state on every tick. If the operator runs
         // `gini tunnel disable` while we're polling, the next check
         // observes enabled=false and aborts the reconcile.
@@ -76,6 +87,10 @@ tunnelManager(config);
             // expected JSON shape proves the port isn't a stale-file or
             // port-squat scenario.
             const healthy = await probeNextHealthz(port).catch(() => false);
+            if (bootReconcileAbort) {
+              appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "shutdown" });
+              return;
+            }
             if (!healthy) {
               await Bun.sleep(500);
               continue;
@@ -86,6 +101,10 @@ tunnelManager(config);
             const stillEnabled = readTunnelConfig(config.instance).enabled;
             if (!stillEnabled) {
               appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "disabled-after-probe" });
+              return;
+            }
+            if (bootReconcileAbort) {
+              appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "shutdown" });
               return;
             }
             const result = await tunnelManager(config).enable(port);
@@ -351,6 +370,11 @@ let shutdownStarted = false;
 process.on("SIGTERM", async () => {
   if (shutdownStarted) return;
   shutdownStarted = true;
+  // Tell the boot-reconcile poll to bail out before its next enqueue/await
+  // wakes up. Without this the poll can call `tunnelManager.enable(port)`
+  // AFTER `stopForShutdown()` has cleaned up, spawning an orphan
+  // cloudflared the drain never awaits.
+  bootReconcileAbort = true;
   appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
   schedulerStopped = true;
   reprobeStopped = true;
