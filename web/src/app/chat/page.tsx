@@ -18,7 +18,7 @@ import {
 import { BlockRenderer } from "@/components/chat/BlockRenderer";
 import { Composer } from "@/components/chat/Composer";
 import { SessionItem } from "@/components/chat/SessionItem";
-import { api } from "@/lib/api";
+import { api, type UploadRef } from "@/lib/api";
 import {
   useCancelTask,
   useChatBlocks,
@@ -116,10 +116,10 @@ export default function ChatPage() {
   });
 
   const send = useMutation({
-    mutationFn: (content: string) =>
+    mutationFn: ({ content, images }: { content: string; images: UploadRef[] }) =>
       api<{ taskId: string }>(`/chat/${selected}/messages`, {
         method: "POST",
-        body: JSON.stringify({ content })
+        body: JSON.stringify({ content, ...(images.length > 0 ? { images } : {}) })
       }),
     onSuccess: () => {
       setText("");
@@ -136,10 +136,11 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [blocks.length, selected]);
 
-  const submit = () => {
+  const submit = (images: UploadRef[]) => {
     const trimmed = text.trim();
-    if (!trimmed || send.isPending || !selected) return;
-    send.mutate(trimmed);
+    if (send.isPending || !selected) return;
+    if (!trimmed && images.length === 0) return;
+    send.mutate({ content: trimmed, images });
   };
 
   // The in-flight task id is derived from the block stream: scan from the
