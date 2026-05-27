@@ -2679,6 +2679,23 @@ async function browserFillSecretsTool(
   // the eventual reply back through outboundMirror to Telegram).
   // Mirror finalize.ts:161's `outboundMirror ?? source` precedent.
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  // Chat-card tools also need a chatSessionId to surface the card.
+  // A subagent spawned with mode:"chat" (or any other caller that
+  // dispatches tools without binding a chat session) would
+  // otherwise mint an approval that emitApprovalRequested then
+  // silently skips because resolveEmitContext returns undefined
+  // for sessionless tasks (chat-task-emit.ts). End result: row in
+  // state.approvals + task parked, but no UI card to act on. Refuse
+  // up-front so the model can surface a recoverable tool_result.
+  if (!surfaceTask.chatSessionId) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "Approval-card tools require a web chat session, and this task isn't attached to one (subagent child, scheduled job, or other headless run). Tell the caller to route this through the parent web chat or settings page."
+      })
+    };
+  }
   if (surfaceKind === "telegram" || surfaceKind === "discord") {
     return {
       kind: "sync",
@@ -2841,6 +2858,23 @@ async function requestMessagingBridgeTool(
     ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
     : undefined;
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  // Chat-card tools also need a chatSessionId to surface the card.
+  // A subagent spawned with mode:"chat" (or any other caller that
+  // dispatches tools without binding a chat session) would
+  // otherwise mint an approval that emitApprovalRequested then
+  // silently skips because resolveEmitContext returns undefined
+  // for sessionless tasks (chat-task-emit.ts). End result: row in
+  // state.approvals + task parked, but no UI card to act on. Refuse
+  // up-front so the model can surface a recoverable tool_result.
+  if (!surfaceTask.chatSessionId) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "Approval-card tools require a web chat session, and this task isn't attached to one (subagent child, scheduled job, or other headless run). Tell the caller to route this through the parent web chat or settings page."
+      })
+    };
+  }
   if (surfaceKind === "telegram" || surfaceKind === "discord") {
     return {
       kind: "sync",
@@ -3109,6 +3143,23 @@ async function requestMessagingPairingTool(
     ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
     : undefined;
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  // Chat-card tools also need a chatSessionId to surface the card.
+  // A subagent spawned with mode:"chat" (or any other caller that
+  // dispatches tools without binding a chat session) would
+  // otherwise mint an approval that emitApprovalRequested then
+  // silently skips because resolveEmitContext returns undefined
+  // for sessionless tasks (chat-task-emit.ts). End result: row in
+  // state.approvals + task parked, but no UI card to act on. Refuse
+  // up-front so the model can surface a recoverable tool_result.
+  if (!surfaceTask.chatSessionId) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "Approval-card tools require a web chat session, and this task isn't attached to one (subagent child, scheduled job, or other headless run). Tell the caller to route this through the parent web chat or settings page."
+      })
+    };
+  }
   if (surfaceKind === "telegram" || surfaceKind === "discord") {
     return {
       kind: "sync",
@@ -3245,6 +3296,23 @@ async function waitForMessagingPairTool(
     ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
     : undefined;
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  // Chat-card tools also need a chatSessionId to surface the card.
+  // A subagent spawned with mode:"chat" (or any other caller that
+  // dispatches tools without binding a chat session) would
+  // otherwise mint an approval that emitApprovalRequested then
+  // silently skips because resolveEmitContext returns undefined
+  // for sessionless tasks (chat-task-emit.ts). End result: row in
+  // state.approvals + task parked, but no UI card to act on. Refuse
+  // up-front so the model can surface a recoverable tool_result.
+  if (!surfaceTask.chatSessionId) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "Approval-card tools require a web chat session, and this task isn't attached to one (subagent child, scheduled job, or other headless run). Tell the caller to route this through the parent web chat or settings page."
+      })
+    };
+  }
   if (surfaceKind === "telegram" || surfaceKind === "discord") {
     return {
       kind: "sync",
@@ -3424,6 +3492,23 @@ async function requestRemoveMessagingBridgeTool(
     ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
     : undefined;
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  // Chat-card tools also need a chatSessionId to surface the card.
+  // A subagent spawned with mode:"chat" (or any other caller that
+  // dispatches tools without binding a chat session) would
+  // otherwise mint an approval that emitApprovalRequested then
+  // silently skips because resolveEmitContext returns undefined
+  // for sessionless tasks (chat-task-emit.ts). End result: row in
+  // state.approvals + task parked, but no UI card to act on. Refuse
+  // up-front so the model can surface a recoverable tool_result.
+  if (!surfaceTask.chatSessionId) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "Approval-card tools require a web chat session, and this task isn't attached to one (subagent child, scheduled job, or other headless run). Tell the caller to route this through the parent web chat or settings page."
+      })
+    };
+  }
   if (surfaceKind === "telegram" || surfaceKind === "discord") {
     return {
       kind: "sync",

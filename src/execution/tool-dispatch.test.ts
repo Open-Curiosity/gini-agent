@@ -45,8 +45,12 @@ function buildConfig(instance: string): RuntimeConfig {
 async function newTask(config: RuntimeConfig): Promise<string> {
   // Build the task directly on state — submitTask would also kick off the
   // chat-task loop, and we only need the row for the dispatcher to
-  // attribute audits to.
+  // attribute audits to. Bind a synthetic chatSessionId so the
+  // chat-card surface guards (which refuse sessionless tasks per the
+  // R8 fix) accept the dispatch — production callers that hit those
+  // tools always have a session.
   const task = createTask(config.instance, "dispatch test");
+  task.chatSessionId = `chat_test_${task.id.slice(0, 8)}`;
   await mutateState(config.instance, (state) => {
     upsertTask(state, task);
   });
@@ -539,6 +543,38 @@ describe("request_connector dispatch", () => {
       expect(approval!.payload.chatId).toBe(99);
       expect(approval!.payload.verificationCode).toBe("ABCD-1234");
     }
+  });
+
+  test("request_messaging_bridge: refuses a sessionless task (subagent child) up-front", async () => {
+    // A subagent spawned with mode:"chat" can dispatch chat-card
+    // tools but the parent task may not be bound to a chatSessionId.
+    // emitApprovalRequested skips the chat-block insert when the
+    // task has no session, so a minted approval would sit
+    // unsurfaced. Refuse here so the agent gets a recoverable
+    // tool_result instead.
+    const instance = `req-bridge-sessionless-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    // Build a task WITHOUT a chatSessionId — mimics a subagent
+    // child spawned in chat-mode without binding a session.
+    const task = createTask(instance, "headless test");
+    await mutateState(instance, (state) => {
+      upsertTask(state, task);
+    });
+    const result = await dispatchToolCall(
+      config,
+      task.id,
+      "request_messaging_bridge",
+      "call_no_session",
+      JSON.stringify({ kind: "telegram", suggestedName: "my-bot" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("web chat session");
+    }
+    const state = readState(instance);
+    expect(state.approvals.filter((a) => a.taskId === task.id).length).toBe(0);
   });
 
   test("request_messaging_pairing: refuses a code-less pending row (group chat) up-front", async () => {
