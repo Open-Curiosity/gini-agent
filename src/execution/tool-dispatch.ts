@@ -11,6 +11,8 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { extname, join, relative } from "node:path";
+import { isIP } from "node:net";
+import { lookup } from "node:dns/promises";
 import type { RuntimeConfig, RuntimeState, Task } from "../types";
 import {
   addAudit,
@@ -500,10 +502,88 @@ async function accumulateBrowserVisionCost(
   });
 }
 
+// Classify a host string as one of: loopback (127/8, ::1, "localhost",
+// "0.0.0.0"), private (RFC1918 IPv4 + ULA IPv6), linkLocal (169.254/16,
+// fe80::/10), public (anything else parsable), or unknown (a hostname
+// we can't classify without DNS resolution).
+function classifyHost(host: string): "loopback" | "private" | "linkLocal" | "public" | "unknown" {
+  const stripped = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  const lower = stripped.toLowerCase();
+  // Literal hostnames that always mean loopback regardless of /etc/hosts
+  // mapping. "*.localhost" is RFC 6761 — DNS clients SHOULD treat it as
+  // local even if a public DNS server returns something else, so we
+  // refuse it pre-resolution.
+  if (lower === "localhost" || lower.endsWith(".localhost")) return "loopback";
+  const ipVersion = isIP(stripped);
+  if (ipVersion === 4) {
+    const parts = stripped.split(".").map(Number);
+    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return "unknown";
+    if (parts[0] === 127) return "loopback";
+    if (parts[0] === 0) return "loopback";
+    if (parts[0] === 10) return "private";
+    if (parts[0] === 172 && (parts[1] ?? 0) >= 16 && (parts[1] ?? 0) <= 31) return "private";
+    if (parts[0] === 192 && parts[1] === 168) return "private";
+    if (parts[0] === 169 && parts[1] === 254) return "linkLocal";
+    return "public";
+  }
+  if (ipVersion === 6) {
+    if (lower === "::1" || lower === "::" || lower === "::0") return "loopback";
+    // Unique local addresses (fc00::/7) and link-local (fe80::/10). The
+    // prefix check is loose but errs on the side of refusing more than
+    // strictly necessary, which is the right direction for an SSRF
+    // guard.
+    if (lower.startsWith("fc") || lower.startsWith("fd")) return "private";
+    if (lower.startsWith("fe80")) return "linkLocal";
+    // IPv4-mapped IPv6 form, e.g. ::ffff:127.0.0.1 — reclassify the
+    // embedded IPv4 to keep the loopback check honest.
+    const mapped = lower.match(/^::ffff:([\d.]+)$/);
+    if (mapped) return classifyHost(mapped[1] ?? "");
+    return "public";
+  }
+  return "unknown";
+}
+
+// SSRF guard for the agent's web_fetch tool. The agent might be
+// prompt-injected into fetching the local BFF
+// (http://127.0.0.1:<bff>/api/runtime/approvals) which would inject
+// the runtime bearer and return state including secrets. Refuse
+// loopback / RFC1918 / link-local destinations both at the URL
+// literal AND post-DNS so a hostname that resolves to a private
+// address can't sneak through. Doesn't defeat full DNS rebinding
+// (TTL=0 swap between resolve and fetch) — that's a separate
+// hardening layer that would require dialing the resolved IP
+// directly.
+async function assertPublicWebFetchTarget(parsed: URL): Promise<void> {
+  const literalKind = classifyHost(parsed.hostname);
+  if (literalKind === "loopback" || literalKind === "private" || literalKind === "linkLocal") {
+    throw new Error(
+      `web_fetch refuses ${literalKind} destination ${parsed.hostname}: agent tools may not reach loopback, RFC1918, or link-local addresses.`
+    );
+  }
+  if (literalKind === "unknown") {
+    // It's a hostname we couldn't classify pre-DNS. Resolve and
+    // re-classify the address.
+    try {
+      const { address } = await lookup(parsed.hostname);
+      const resolvedKind = classifyHost(address);
+      if (resolvedKind === "loopback" || resolvedKind === "private" || resolvedKind === "linkLocal") {
+        throw new Error(
+          `web_fetch refuses ${parsed.hostname} (resolves to ${resolvedKind} address ${address}).`
+        );
+      }
+    } catch (err) {
+      // DNS failure: let the subsequent fetch surface the failure
+      // organically; don't swallow our own refusal.
+      if (err instanceof Error && err.message.startsWith("web_fetch refuses")) throw err;
+    }
+  }
+}
+
 async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
   const rawUrl = requireString(args, "url");
   const parsed = new URL(rawUrl);
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("web_fetch requires an http(s) URL.");
+  await assertPublicWebFetchTarget(parsed);
   const response = await fetch(parsed);
   const text = (await response.text())
     .replace(/<script[\s\S]*?<\/script>/gi, "")

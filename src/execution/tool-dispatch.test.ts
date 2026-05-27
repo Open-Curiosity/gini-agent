@@ -606,6 +606,37 @@ describe("request_connector dispatch", () => {
     }
   });
 
+  test("web_fetch: refuses loopback / RFC1918 / link-local URLs (SSRF guard)", async () => {
+    // Without this guard, a prompt-injected agent could fetch the
+    // local BFF (e.g. http://127.0.0.1:3000/api/runtime/approvals).
+    // The BFF proxy injects the runtime bearer, which would return
+    // state including approval payloads — defense in depth alongside
+    // the read-API field redactions. Pin that the guard refuses
+    // literal loopback / private / link-local addresses pre-fetch
+    // (no live network required).
+    const instance = `web-fetch-ssrf-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const refusedTargets = [
+      "http://127.0.0.1:3082/api/runtime/approvals",
+      "http://localhost:3082/api/state",
+      "http://0.0.0.0/anything",
+      "http://10.0.0.1/internal",
+      "http://172.16.5.5/internal",
+      "http://192.168.1.1/router",
+      "http://169.254.169.254/latest/meta-data/",
+      "http://[::1]/",
+      "http://[fc00::1]/",
+      "http://[fe80::1]/",
+      "http://example.localhost/api"
+    ];
+    for (const url of refusedTargets) {
+      await expect(
+        dispatchToolCall(config, taskId, "web_fetch", `call_${url}`, JSON.stringify({ url }))
+      ).rejects.toThrow(/web_fetch refuses/);
+    }
+  });
+
   test("wait_for_messaging_pair: surfaces a pre-existing pending row immediately", async () => {
     // The earlier snapshot-diff predicate filtered out chatIds that
     // were already in recentDeniedChats at tool-start, racing the
