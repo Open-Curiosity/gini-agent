@@ -145,11 +145,17 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
   if (!alreadyRunning) {
     await install(config);
     const requestedRuntimePort = config.port;
-    const claimedPort = await availablePort(requestedRuntimePort);
-    if (claimedPort !== requestedRuntimePort && options.runtimePortPinned) {
-      // User pinned via --port / GINI_PORT; refuse to silently roll forward.
-      throw new Error(`Requested runtime port ${requestedRuntimePort} is busy. Stop the other process or pick a different --port.`);
-    }
+    // When the user pinned a port (--port / GINI_PORT) we trust the choice
+    // and skip the probe-and-walk: probing is only useful for the unpinned
+    // default, where we want to roll forward to the next free port. A
+    // pinned port that's actually busy will surface a clean EADDRINUSE
+    // from the real bind below, which is a more accurate failure than
+    // synthesizing one from net.createServer probes. Skipping the probe
+    // also dodges a class of CI failures where canListen() returns false
+    // for every port in the search window even on an idle host.
+    const claimedPort = options.runtimePortPinned
+      ? requestedRuntimePort
+      : await availablePort(requestedRuntimePort);
     config.port = claimedPort;
     await install(config);
     writeFileSync(runtimePortPath(config.instance), String(config.port));
