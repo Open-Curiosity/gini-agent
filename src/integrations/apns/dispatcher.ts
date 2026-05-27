@@ -22,7 +22,7 @@
 // token stays — they may recover or require human intervention.
 
 import {
-  isCredentialWatching,
+  isDeviceWatching,
   listAllDevices,
   removeDevice,
   subscribeAllChatBlocks
@@ -51,12 +51,12 @@ export interface DispatcherDeps {
   // returned `dispatch` function without registering against the live
   // EventEmitter.
   subscribe?: (instance: Instance, handler: (block: ChatBlock) => void) => () => void;
-  // Override the active-watch predicate — tests pin "user is watching"
-  // / "user is away" without touching the SSE registry's process state.
-  // The dispatcher passes the device's credentialId and the block's
-  // sessionId; the implementation should return true when the user
-  // is on that chat detail in any open SSE stream.
-  isWatching?: (instance: Instance, credentialId: string, sessionId: string) => boolean;
+  // Override the active-watch predicate — tests pin "device is watching"
+  // / "device is away" without touching the SSE registry's process
+  // state. The dispatcher passes the device's APNs token and the
+  // block's sessionId; the implementation should return true when
+  // that specific device has an open SSE stream on the session.
+  isWatching?: (instance: Instance, deviceToken: string, sessionId: string) => boolean;
   // One-shot logger for unexpected failures. Defaults to console.warn.
   warn?: (message: string, detail?: unknown) => void;
 }
@@ -88,9 +88,19 @@ export function buildPhaseSilentPayload(
     aps: {
       "content-available": 1
     },
-    sessionId: block.sessionId,
-    blockId: block.id,
-    event: block.label === "Failed" ? "phase_failed" : "phase_completed"
+    // expo-notifications reads remote-push custom data from
+    // userInfo["body"], not top-level userInfo keys — top-level fields
+    // are dropped on the client. Wrapping our routing payload in a
+    // single "body" object means the mobile side sees these fields
+    // exactly as written. The discriminator `silent: true` lets the
+    // client classify the payload without keying on aps internals
+    // (which expo-notifications strips before exposing data).
+    body: {
+      sessionId: block.sessionId,
+      blockId: block.id,
+      event: block.label === "Failed" ? "phase_failed" : "phase_completed",
+      silent: true
+    }
   };
 }
 
@@ -119,10 +129,20 @@ export function buildApprovalPayload(block: ChatBlock & { kind: "approval_reques
       // actions. The mobile app registers the category on launch.
       category: "APPROVAL_REQUEST"
     },
-    sessionId: block.sessionId,
-    blockId: block.id,
-    approvalId: block.approvalId,
-    event: "approval_requested"
+    // expo-notifications reads remote-push custom data from
+    // userInfo["body"], not top-level userInfo keys — top-level fields
+    // are dropped on the client. Wrapping our routing payload in a
+    // single "body" object means the mobile side (and the iOS NSE,
+    // which forwards userInfo intact) sees these fields exactly as
+    // written. `silent: false` mirrors the discriminator on silent
+    // payloads so the client can branch uniformly on `data.silent`.
+    body: {
+      sessionId: block.sessionId,
+      blockId: block.id,
+      approvalId: block.approvalId,
+      event: "approval_requested",
+      silent: false
+    }
   };
 }
 
@@ -131,7 +151,7 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
   const listDevices = deps?.listDevices ?? listAllDevices;
   const onTokenInvalidated = deps?.onTokenInvalidated ?? ((inst, token) => { removeDevice(inst, token); });
   const subscribe = deps?.subscribe ?? subscribeAllChatBlocks;
-  const isWatching = deps?.isWatching ?? isCredentialWatching;
+  const isWatching = deps?.isWatching ?? isDeviceWatching;
   const warn = deps?.warn ?? ((message: string, detail?: unknown) => {
     if (detail !== undefined) console.warn(`[apns-dispatcher] ${message}`, detail);
     else console.warn(`[apns-dispatcher] ${message}`);
@@ -219,13 +239,15 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
     if (devices.length === 0) return;
 
     const payload = buildPhaseSilentPayload(block);
-    // For each device, skip the push when its owning credential is
-    // already watching this session over SSE — the open stream will
-    // deliver the block directly and the wake-up is redundant.
-    // Active-watch is per-device because two iOS installs of the
-    // same human can be in different app states.
+    // For each device, skip the push when THIS device is already
+    // watching this session over SSE — the open stream will deliver
+    // the block directly and the wake-up is redundant. Suppression
+    // is per-device (keyed by APNs token) because two iOS installs
+    // of the same human can be in different app states; the
+    // backgrounded install still needs the silent wake to update
+    // its badge even when the foregrounded one is already watching.
     await Promise.all(devices.map((device) => {
-      if (isWatching(instance, device.credentialId, block.sessionId)) {
+      if (isWatching(instance, device.token, block.sessionId)) {
         return Promise.resolve();
       }
       return sendToDevice(device.token, device.bundleId, payload, {

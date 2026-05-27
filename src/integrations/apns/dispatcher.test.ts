@@ -83,11 +83,16 @@ describe("apns dispatcher", () => {
     expect(a?.opts.priority).toBe(10);
     expect(a?.opts.collapseId).toBe("appr_1");
     // Privacy: payload carries ids + generic title only, never the
-    // approval summary or chat content.
-    expect(a?.payload.sessionId).toBe("chat_xyz");
-    expect(a?.payload.blockId).toBe("block_abc");
-    expect(a?.payload.approvalId).toBe("appr_1");
-    expect(a?.payload.event).toBe("approval_requested");
+    // approval summary or chat content. Routing fields live under
+    // `body` because expo-notifications drops top-level userInfo keys
+    // on the client — `userInfo["body"]` is what surfaces as
+    // `content.data` in the JS layer.
+    const aBody = a?.payload.body as Record<string, unknown>;
+    expect(aBody.sessionId).toBe("chat_xyz");
+    expect(aBody.blockId).toBe("block_abc");
+    expect(aBody.approvalId).toBe("appr_1");
+    expect(aBody.event).toBe("approval_requested");
+    expect(aBody.silent).toBe(false);
     const aps = a?.payload.aps as Record<string, unknown>;
     expect((aps.alert as Record<string, unknown>).title).toBe("Gini needs your approval");
     expect((aps.alert as Record<string, unknown>).body).toBe("Tap to review");
@@ -210,9 +215,12 @@ describe("apns dispatcher", () => {
     // presence of an alert as a regular notification, defeating the
     // wake-up-only intent.
     expect(aps.alert).toBeUndefined();
-    expect(call.payload.event).toBe("phase_completed");
-    expect(call.payload.sessionId).toBe("chat_xyz");
-    expect(call.payload.blockId).toBe("block_phase_done");
+    // Routing fields live under `body` (see comment in buildApprovalPayload).
+    const body = call.payload.body as Record<string, unknown>;
+    expect(body.event).toBe("phase_completed");
+    expect(body.sessionId).toBe("chat_xyz");
+    expect(body.blockId).toBe("block_phase_done");
+    expect(body.silent).toBe(true);
     dispatcher.stop();
   });
 
@@ -236,17 +244,19 @@ describe("apns dispatcher", () => {
     });
 
     expect(calls.length).toBe(1);
-    expect(calls[0]!.payload.event).toBe("phase_failed");
+    const body = calls[0]!.payload.body as Record<string, unknown>;
+    expect(body.event).toBe("phase_failed");
+    expect(body.silent).toBe(true);
     dispatcher.stop();
   });
 
-  test("terminal-phase push is suppressed when the credential is watching the session", async () => {
+  test("terminal-phase push is suppressed when THIS device is watching the session", async () => {
     const { client, calls } = buildFakeClient();
     const dispatcher = createApnsDispatcher("test-inst" as Instance, {
       client,
-      listDevices: () => [buildDevice({ token: "tok_a", credentialId: "cred_active" })],
-      // Active SSE subscription for this credential + session → skip.
-      isWatching: (_inst, cred, sess) => cred === "cred_active" && sess === "chat_xyz",
+      listDevices: () => [buildDevice({ token: "tok_active" })],
+      // Active SSE subscription keyed by device token + session → skip.
+      isWatching: (_inst, tok, sess) => tok === "tok_active" && sess === "chat_xyz",
       subscribe: () => () => { /* noop */ }
     });
 
@@ -266,7 +276,7 @@ describe("apns dispatcher", () => {
     let watching = false;
     const dispatcher2 = createApnsDispatcher("test-inst" as Instance, {
       client,
-      listDevices: () => [buildDevice({ token: "tok_a", credentialId: "cred_active" })],
+      listDevices: () => [buildDevice({ token: "tok_active" })],
       isWatching: () => watching,
       subscribe: () => () => { /* noop */ }
     });
@@ -283,6 +293,41 @@ describe("apns dispatcher", () => {
     expect(calls.length).toBe(1);
     dispatcher.stop();
     dispatcher2.stop();
+  });
+
+  test("per-device suppression: watching iPhone is skipped, backgrounded iPhone is not", async () => {
+    // Two iPhones owned by the same human — same credential ("owner"),
+    // distinct APNs tokens. iPhone A is foregrounded on chat_xyz over
+    // SSE; iPhone B is in background. The dispatcher must skip A
+    // (redundant — its SSE will deliver the block) but still wake B
+    // so its badge can refresh.
+    const { client, calls } = buildFakeClient();
+    const watchingDevices = new Set(["tok_iphone_a"]);
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [
+        buildDevice({ token: "tok_iphone_a", credentialId: "owner" }),
+        buildDevice({ token: "tok_iphone_b", credentialId: "owner" })
+      ],
+      isWatching: (_inst, tok, sess) =>
+        watchingDevices.has(tok) && sess === "chat_xyz",
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed"
+    });
+
+    // iPhone B must receive the silent wake; iPhone A must not.
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.token).toBe("tok_iphone_b");
+    dispatcher.stop();
   });
 
   test("non-terminal phase blocks (Thinking, Working) are ignored", async () => {
@@ -332,19 +377,26 @@ describe("apns dispatcher", () => {
     expect(wire.aps.alert).toBeUndefined();
     expect(wire.aps.sound).toBeUndefined();
     expect(wire.aps.badge).toBeUndefined();
-    expect(wire.event).toBe("phase_completed");
-    expect(wire.sessionId).toBe("chat_x");
-    expect(wire.blockId).toBe("b1");
+    // Routing fields nested under `body` so expo-notifications surfaces
+    // them on the client side.
+    expect(wire.body.event).toBe("phase_completed");
+    expect(wire.body.sessionId).toBe("chat_x");
+    expect(wire.body.blockId).toBe("b1");
+    expect(wire.body.silent).toBe(true);
   });
 
   test("buildApprovalPayload produces a stable, privacy-safe shape", () => {
     const block = approvalBlock();
     const payload = buildApprovalPayload(block);
-    // Top-level keys: aps + the four routing fields.
-    expect(Object.keys(payload).sort()).toEqual(["approvalId", "aps", "blockId", "event", "sessionId"]);
-    expect(payload.sessionId).toBe(block.sessionId);
-    expect(payload.blockId).toBe(block.id);
-    expect(payload.approvalId).toBe(block.approvalId);
-    expect(payload.event).toBe("approval_requested");
+    // Top-level keys: aps + body. expo-notifications drops top-level
+    // userInfo keys other than `body`, so routing fields must nest
+    // inside body to reach the JS client.
+    expect(Object.keys(payload).sort()).toEqual(["aps", "body"]);
+    const body = payload.body as Record<string, unknown>;
+    expect(body.sessionId).toBe(block.sessionId);
+    expect(body.blockId).toBe(block.id);
+    expect(body.approvalId).toBe(block.approvalId);
+    expect(body.event).toBe("approval_requested");
+    expect(body.silent).toBe(false);
   });
 });

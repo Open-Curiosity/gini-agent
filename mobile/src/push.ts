@@ -67,8 +67,13 @@ export type {
 // load means every received notification is classified at delivery.
 Notifications.setNotificationHandler({
   handleNotification: async (notification) => {
-    const aps = (notification.request.content.data as { aps?: { "content-available"?: unknown } })?.aps;
-    const isSilent = aps?.["content-available"] === 1;
+    // expo-notifications surfaces the remote `userInfo["body"]` object
+    // as `content.data` — top-level userInfo keys (including `aps`) are
+    // dropped before reaching JS. The server-side dispatcher writes a
+    // boolean `silent` discriminator inside `body` so the client can
+    // classify without depending on aps internals.
+    const data = notification.request.content.data as { silent?: unknown } | undefined;
+    const isSilent = data?.silent === true;
     if (isSilent) {
       return {
         shouldShowAlert: false,
@@ -178,6 +183,22 @@ export async function refreshBadge(): Promise<void> {
 // listener subscription would leak.
 let registrationStarted = false;
 
+// Cached APNs device token after a successful registration. The mobile
+// runtime needs this on every /read, /badge, and SSE open so the
+// gateway can scope reads + watch-state to this specific device
+// (rather than to the credential, which collapses iPhone A and
+// iPhone B onto one row). Module-scoped so the api helper can
+// import it without prop-drilling through every hook.
+let cachedDeviceToken: string | null = null;
+
+// Read-only accessor. Returns null until the device has registered
+// successfully — callers should tolerate that (mobile-only endpoints
+// like /badge can no-op when the token isn't set yet, since the
+// badge will refresh on the next mount once registration completes).
+export function getCachedDeviceToken(): string | null {
+  return cachedDeviceToken;
+}
+
 // Subscription handles — kept module-scoped so a hot reload doesn't
 // double-subscribe (the listeners would otherwise pile up and call
 // `router.push` twice for every notification tap).
@@ -244,6 +265,11 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
     const token = await Notifications.getDevicePushTokenAsync();
     if (token.type === "ios") {
       await postDevice(token.data, bundleId);
+      // Cache after the POST succeeds so callers downstream (api
+      // helper, SSE resolver) get the same token the gateway just
+      // accepted. On POST failure cachedDeviceToken stays null and
+      // those callers no-op until the next mount's retry.
+      cachedDeviceToken = token.data;
     }
 
     // Listen for token rotations. The library debounces internally,
@@ -253,7 +279,9 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
         if (event.type !== "ios") return;
         // Fire-and-forget — if the network is down the next mount's
         // initial registration will catch up.
-        void postDevice(event.data, bundleId).catch(() => { /* swallow */ });
+        void postDevice(event.data, bundleId).then(() => {
+          cachedDeviceToken = event.data;
+        }).catch(() => { /* swallow */ });
       });
     }
 
@@ -291,12 +319,17 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
     // here.
     if (!receivedSub) {
       receivedSub = Notifications.addNotificationReceivedListener((notification) => {
+        // Per the wire shape from the server-side dispatcher, all
+        // routing fields are inside `userInfo["body"]`, which expo
+        // surfaces as `content.data`. The `silent` boolean
+        // discriminator pins whether to treat this as a background
+        // wake — keying off it (rather than the now-dropped aps
+        // sub-object) avoids depending on iOS internals.
         const data = notification.request.content.data as
-          | { event?: string; sessionId?: string; aps?: { "content-available"?: unknown } }
+          | { event?: string; sessionId?: string; silent?: unknown }
           | undefined;
         if (!data) return;
-        const isSilent = data.aps?.["content-available"] === 1;
-        if (!isSilent) return;
+        if (data.silent !== true) return;
         if (data.event === "phase_completed" || data.event === "phase_failed") {
           void refreshBadge();
         }
@@ -340,6 +373,7 @@ function resolveBundleId(): string | null {
 // drive multiple registration attempts.
 export function __resetForTests(): void {
   registrationStarted = false;
+  cachedDeviceToken = null;
   if (tokenSub) { tokenSub.remove(); tokenSub = null; }
   if (responseSub) { responseSub.remove(); responseSub = null; }
   if (receivedSub) { receivedSub.remove(); receivedSub = null; }
