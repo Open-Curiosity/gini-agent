@@ -377,22 +377,42 @@ const FORMAT_BITS_M: number[] = [
 ];
 
 function placeFormat(m: Matrix, maskId: number): void {
+  // Format info is 15 bits placed in two redundant copies per ISO/IEC 18004
+  // section 8.9. setCell(m, x, y, ...) takes column then row.
+  //
+  // Copy 1 (around the top-left finder):
+  //   - bits 0..5 horizontally on row 8, columns 0..5
+  //   - bit 6 at (col 7, row 8) — skipping timing column 6
+  //   - bit 7 at (col 8, row 8)
+  //   - bit 8 at (col 8, row 7) — skipping timing row 6
+  //   - bits 9..14 vertically on col 8, rows 5..0 (going up)
+  //
+  // Copy 2 (split between top-right and bottom-left):
+  //   - bits 0..7 horizontally on row 8, columns size-1..size-8 (right→left)
+  //   - bits 8..14 vertically on col 8, rows size-7..size-1 (top→bottom)
+  //
+  // A single permanently-dark module sits at (col 8, row size-8) below the
+  // copy-2 vertical strip and is set unconditionally.
   const bits = FORMAT_BITS_M[maskId]!;
   for (let i = 0; i < 15; i += 1) {
     const bit = (bits >> i) & 1;
     if (i < 6) {
-      setCell(m, 8, i, bit, true);
+      setCell(m, i, 8, bit, true);
     } else if (i === 6) {
-      setCell(m, 8, 7, bit, true);
+      setCell(m, 7, 8, bit, true);
     } else if (i === 7) {
       setCell(m, 8, 8, bit, true);
+    } else if (i === 8) {
+      setCell(m, 8, 7, bit, true);
     } else {
-      setCell(m, 8, m.size - 15 + i, bit, true);
+      // i = 9..14 → row = 14 - i (i.e. 5, 4, 3, 2, 1, 0)
+      setCell(m, 8, 14 - i, bit, true);
     }
     if (i < 8) {
       setCell(m, m.size - 1 - i, 8, bit, true);
     } else {
-      setCell(m, 15 - i - 1 + m.size - 8, 8, bit, true);
+      // i = 8..14 → row = m.size - 15 + i (i.e. size-7..size-1)
+      setCell(m, 8, m.size - 15 + i, bit, true);
     }
   }
   setCell(m, 8, m.size - 8, 1, true);

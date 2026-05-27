@@ -1,6 +1,9 @@
 import { writeFileSync } from "node:fs";
 import { createHandler, writePid } from "./http";
 import { tunnelManager } from "./runtime/tunnel";
+import { readTunnelConfig } from "./runtime/tunnel/config-store";
+import { webPortPath } from "./paths";
+import { existsSync as fileExists, readFileSync as readFileSyncFs } from "node:fs";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
@@ -39,6 +42,36 @@ writePid(config);
 // first boot (whether or not tunnel.enabled is true) and the redaction set
 // is populated before any request lands. See PLAN.md "Persisted config".
 tunnelManager(config);
+
+// Boot-time reconciliation: if config.json persists `tunnel.enabled: true`,
+// the operator's expectation is that the tunnel comes back up after a restart
+// (with a new rotating hostname). The web port isn't known yet — the CLI
+// writes it once Next.js reports healthy — so we poll the sibling
+// `web.port` file and trigger `enable(webPort)` once it appears. Bounded
+// by the 60_000 ms PLAN.md ceiling on web-port discovery.
+{
+  const persisted = readTunnelConfig(config.instance);
+  if (persisted.enabled) {
+    const deadline = Date.now() + 60_000;
+    const poll = async () => {
+      while (Date.now() < deadline) {
+        const portFile = webPortPath(config.instance);
+        if (fileExists(portFile)) {
+          const portRaw = readFileSyncFs(portFile, "utf8").trim();
+          const port = Number(portRaw);
+          if (Number.isFinite(port) && port > 0) {
+            const result = await tunnelManager(config).enable(port);
+            appendLog(config.instance, "tunnel.boot-reconcile", { ok: result.ok });
+            return;
+          }
+        }
+        await Bun.sleep(500);
+      }
+      appendLog(config.instance, "tunnel.boot-reconcile.timeout", {});
+    };
+    void poll();
+  }
+}
 
 // Inform the browser session manager which instance to consult for the
 // optional CDP connection record. Without this the manager falls back to

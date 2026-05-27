@@ -79,6 +79,13 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
   const dir = logDir(instance);
   ensureDir(dir);
   const logPath = join(dir, fileName);
+  // For web.log only: the Next.js child logs inbound request paths verbatim,
+  // and the tunnel bootstrap path is `/<secret>/...`. Run each chunk through
+  // a tunnel-secret redactor before write so the secret doesn't persist on
+  // disk. The redactor reads the live secret from `config.json` (cheap,
+  // cached briefly) so a rotate-secret on a running gateway picks up the
+  // new value within the cache window. See PLAN.md "Log redaction".
+  const redactForLog = fileName === "web.log" ? makeWebLogRedactor(instance) : null;
   if (foreground) {
     // Foreground: open a write stream and tee child.stdout/stderr to both the
     // user's terminal and the log file. Stream is closed when the child's stdio
@@ -97,12 +104,14 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
       stdio: ["inherit", "pipe", "pipe"],
       onSpawned: (child) => {
         child.stdout?.on("data", (chunk: Buffer | string) => {
-          process.stdout.write(chunk);
-          stream.write(chunk);
+          const redacted = redactForLog ? redactForLog(chunk) : chunk;
+          process.stdout.write(redacted);
+          stream.write(redacted);
         });
         child.stderr?.on("data", (chunk: Buffer | string) => {
-          process.stderr.write(chunk);
-          stream.write(chunk);
+          const redacted = redactForLog ? redactForLog(chunk) : chunk;
+          process.stderr.write(redacted);
+          stream.write(redacted);
         });
         const close = () => { try { stream.end(); } catch { /* ignore */ } };
         // `close` (not `exit`) fires after stdio has fully drained. Using `exit`
@@ -113,13 +122,67 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
       }
     };
   }
-  // Daemon: hand the FD directly to the child so writes go straight to the
-  // file from the kernel's perspective. This survives child.unref() and the
-  // parent CLI exiting (a JS-level pipe would not — the parent owns it).
+  // Daemon: when no redaction is needed, hand the FD directly to the child so
+  // writes go straight to the file from the kernel's perspective. This
+  // survives child.unref() and the parent CLI exiting (a JS-level pipe would
+  // not — the parent owns it). For web.log we MUST intercept in JS to scrub
+  // the secret, so we fall back to a pipe + write-stream tee with a
+  // best-effort redaction; the daemon child's stdio will end if the parent
+  // CLI dies, which matches `gini start` semantics anyway.
+  if (redactForLog) {
+    const stream: WriteStream = createWriteStream(logPath, { flags: "a" });
+    return {
+      stdio: ["ignore", "pipe", "pipe"],
+      onSpawned: (child) => {
+        const sink = (chunk: Buffer | string) => stream.write(redactForLog(chunk));
+        child.stdout?.on("data", sink);
+        child.stderr?.on("data", sink);
+        const close = () => { try { stream.end(); } catch { /* ignore */ } };
+        child.once("close", close);
+        child.once("error", close);
+      }
+    };
+  }
   const fd = openSync(logPath, "a");
   return {
     stdio: ["ignore", fd, fd],
     onSpawned: () => { /* nothing to wire; FDs go to the kernel */ }
+  };
+}
+
+// Build a per-instance redactor that scrubs the live tunnel.secret from a
+// log chunk. The secret is read from config.json with a brief cache so a
+// rotate-secret picks up the new value without re-creating the redactor.
+// The previous secret is held one cycle so an in-flight log line written
+// after rotation but referencing the old secret is still scrubbed.
+function makeWebLogRedactor(instance: string): (chunk: Buffer | string) => string {
+  const PLACEHOLDER = "<redacted-secret>";
+  const CACHE_MS = 1_000;
+  let cachedSecret: string | null = null;
+  let cachedAt = 0;
+  let priorSecret: string | null = null;
+  const readSecret = (): string | null => {
+    const now = Date.now();
+    if (cachedSecret !== null && now - cachedAt < CACHE_MS) return cachedSecret;
+    try {
+      const raw = readFileSync(join(process.env.HOME ?? "", ".gini", "instances", instance, "config.json"), "utf8");
+      const parsed = JSON.parse(raw) as { tunnel?: { secret?: unknown } };
+      const next = typeof parsed.tunnel?.secret === "string" ? parsed.tunnel.secret : null;
+      if (next !== cachedSecret && cachedSecret) priorSecret = cachedSecret;
+      cachedSecret = next;
+      cachedAt = now;
+      return next;
+    } catch {
+      cachedAt = now;
+      return cachedSecret;
+    }
+  };
+  return (chunk) => {
+    const secret = readSecret();
+    let text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    if (secret) text = text.split(secret).join(PLACEHOLDER);
+    if (priorSecret) text = text.split(priorSecret).join(PLACEHOLDER);
+    return text;
   };
 }
 

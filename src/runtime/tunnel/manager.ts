@@ -4,7 +4,33 @@ import { setRedactionPublicUrl, setRedactionSecret, redact } from "./redact";
 import { launchCloudflared, type CloudflaredLaunch } from "./cloudflared";
 import { probeNotesAvailable, writeNote, clearNote } from "./apple-notes";
 import { ensureTunnelConfig, patchTunnelConfig, readTunnelConfig } from "./config-store";
+import { atomicWriteFile } from "./atomic-write";
+import { instanceRoot } from "../../paths";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 import type { AppleNotesState, TunnelSnapshot, TunnelTransitionResult, TunnelPersistedConfig } from "./types";
+
+/** Path of the sibling file the runtime writes when the tunnel is up so the
+ *  Next.js proxy (a separate process) can match the live tunnel hostname per
+ *  request instead of trusting any `*.trycloudflare.com`. The file is removed
+ *  on disable / shutdown / failed enable. */
+function publicUrlPath(instance: string): string {
+  return join(instanceRoot(instance), "tunnel.publicUrl");
+}
+
+/** Read-only view of the persisted tunnel hostname for callers in other
+ *  processes (the Next.js proxy). Returns the empty string when the file is
+ *  absent — the proxy treats that as "no live tunnel" and rejects the
+ *  request at the Host classifier. */
+export function readPersistedPublicUrl(instance: string): string {
+  const p = publicUrlPath(instance);
+  if (!existsSync(p)) return "";
+  try {
+    return readFileSync(p, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
 
 // Tunnel manager. Owns the in-memory snapshot, the cloudflared subprocess,
 // and the Apple Notes mirror. Every state transition (enable/disable/recycle/
@@ -53,10 +79,13 @@ class TunnelManager {
       }
     };
     setRedactionSecret(persisted.secret);
-    // Probe Notes availability once on construction. Failures latch into
-    // `lastError`, NOT into `notesAvailable` — that field stays null until a
-    // successful probe answers it.
-    void probeNotesAvailable().then((result) => {
+    // Probe Notes availability once on construction. Routed through the
+    // serialized apply path so the snapshot mutation can't race a concurrent
+    // setAppleNotesEnabled / refreshNotes. Failures latch into `lastError`,
+    // NOT into `notesAvailable` — that field stays null until a successful
+    // probe answers it.
+    void this.enqueue(async () => {
+      const result = await probeNotesAvailable();
       this.notesAvailable = result.available;
       this.snapshot = {
         ...this.snapshot,
@@ -66,7 +95,8 @@ class TunnelManager {
           lastError: result.available ? null : redact(result.error ?? "Notes unavailable")
         }
       };
-    });
+      return undefined;
+    }).catch(() => { /* probe failure is reflected in snapshot.appleNotes.lastError */ });
   }
 
   current(): TunnelSnapshot {
@@ -118,20 +148,38 @@ class TunnelManager {
             lastError: null
           };
           setRedactionPublicUrl(url);
+          // Publish the live URL to disk so the Next.js proxy (separate
+          // process) can equality-match Host instead of trusting any
+          // .trycloudflare.com suffix. See PLAN.md "Architecture" step 3.
+          try { atomicWriteFile(publicUrlPath(this.config.instance), `${url}\n`); } catch { /* surfaced via lastError */ }
           appendLog(this.config.instance, "tunnel.enabled", { generation: this.generation });
           // Fire Notes refresh asynchronously when enabled.
           if (this.snapshot.appleNotes.enabled) void this.refreshNotes();
         } catch (err) {
+          // Banner-parse failure or process exit — the subprocess may still be
+          // running. Calling launch.stop() here closes the orphan window
+          // before we null the reference. This is symmetric with the
+          // success-path teardown in disable().
           this.cloudflared = null;
+          try { await launch.stop(); } catch { /* already gone */ }
+          // Roll back the persisted enabled:true so the next gateway boot
+          // doesn't see a stale "enabled with no live tunnel" claim and so
+          // proxy requests stop being accepted immediately.
+          try { patchTunnelConfig(this.config.instance, { enabled: false }); } catch { /* surfaced via lastError */ }
+          try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
           const msg = err instanceof Error ? err.message : String(err);
-          this.snapshot = { ...this.snapshot, lastError: redact(msg) };
+          this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: redact(msg) };
+          setRedactionPublicUrl(null);
           appendLog(this.config.instance, "tunnel.enable.error", { error: redact(msg) });
           return { ok: false, error: redact(msg) };
         }
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
+        // Outer-catch covers config-write failure before launch — keep the
+        // persisted state consistent with the in-memory snapshot.
+        try { patchTunnelConfig(this.config.instance, { enabled: false }); } catch { /* best-effort */ }
         const msg = err instanceof Error ? err.message : String(err);
-        this.snapshot = { ...this.snapshot, lastError: redact(msg) };
+        this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: redact(msg) };
         return { ok: false, error: redact(msg) };
       }
     });
@@ -164,6 +212,7 @@ class TunnelManager {
         }
         this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: null };
         setRedactionPublicUrl(null);
+        try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
         appendLog(this.config.instance, "tunnel.disabled", { generation: this.generation });
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
@@ -223,7 +272,9 @@ class TunnelManager {
         };
         this.snapshot = { ...this.snapshot, appleNotes: notes };
         if (enabled) {
-          await this.refreshNotes();
+          // Call the un-enqueued worker — re-entering enqueue from inside an
+          // already-running task would deadlock the apply chain.
+          await this.runRefreshNotes();
         } else if (this.notesAvailable) {
           try {
             await clearNote(NOTES_FOLDER, this.notesNoteName());
@@ -245,46 +296,52 @@ class TunnelManager {
   }
 
   async refreshNotes(): Promise<TunnelTransitionResult> {
-    return this.enqueue(async () => {
-      const url = this.snapshot.publicUrl;
-      const secret = this.snapshot.secret;
-      if (!url || !secret) {
-        return { ok: false, error: "Tunnel not enabled" };
-      }
-      if (!this.snapshot.appleNotes.enabled) {
-        return { ok: false, error: "Apple Notes mirror disabled" };
-      }
-      // Re-probe availability before writing — handles TCC denial recovery.
-      const probe = await probeNotesAvailable();
-      this.notesAvailable = probe.available;
-      if (!probe.available) {
-        const msg = redact(probe.error ?? "Notes unavailable");
-        this.snapshot = {
-          ...this.snapshot,
-          appleNotes: { ...this.snapshot.appleNotes, notesAvailable: false, lastError: msg }
-        };
-        return { ok: false, error: msg };
-      }
-      try {
-        await writeNote({
-          folder: NOTES_FOLDER,
-          noteName: this.notesNoteName(),
-          body: bootstrapUrl(url, secret)
-        });
-        this.snapshot = {
-          ...this.snapshot,
-          appleNotes: { ...this.snapshot.appleNotes, notesAvailable: true, lastError: null }
-        };
-        return { ok: true, snapshot: this.snapshot };
-      } catch (err) {
-        const msg = redact(err instanceof Error ? err.message : String(err));
-        this.snapshot = {
-          ...this.snapshot,
-          appleNotes: { ...this.snapshot.appleNotes, lastError: msg }
-        };
-        return { ok: false, error: msg };
-      }
-    });
+    return this.enqueue(() => this.runRefreshNotes());
+  }
+
+  /** Notes refresh worker. Pure body — DOES NOT enqueue. Public callers go
+   *  through `refreshNotes()` which adds the enqueue wrapper; internal callers
+   *  (already inside an enqueue task) invoke this directly to avoid the
+   *  promise-chain self-deadlock. */
+  private async runRefreshNotes(): Promise<TunnelTransitionResult> {
+    const url = this.snapshot.publicUrl;
+    const secret = this.snapshot.secret;
+    if (!url || !secret) {
+      return { ok: false, error: "Tunnel not enabled" };
+    }
+    if (!this.snapshot.appleNotes.enabled) {
+      return { ok: false, error: "Apple Notes mirror disabled" };
+    }
+    // Re-probe availability before writing — handles TCC denial recovery.
+    const probe = await probeNotesAvailable();
+    this.notesAvailable = probe.available;
+    if (!probe.available) {
+      const msg = redact(probe.error ?? "Notes unavailable");
+      this.snapshot = {
+        ...this.snapshot,
+        appleNotes: { ...this.snapshot.appleNotes, notesAvailable: false, lastError: msg }
+      };
+      return { ok: false, error: msg };
+    }
+    try {
+      await writeNote({
+        folder: NOTES_FOLDER,
+        noteName: this.notesNoteName(),
+        body: bootstrapUrl(url, secret)
+      });
+      this.snapshot = {
+        ...this.snapshot,
+        appleNotes: { ...this.snapshot.appleNotes, notesAvailable: true, lastError: null }
+      };
+      return { ok: true, snapshot: this.snapshot };
+    } catch (err) {
+      const msg = redact(err instanceof Error ? err.message : String(err));
+      this.snapshot = {
+        ...this.snapshot,
+        appleNotes: { ...this.snapshot.appleNotes, lastError: msg }
+      };
+      return { ok: false, error: msg };
+    }
   }
 
   /** Stop cloudflared as part of gateway shutdown. Does not modify config. */
@@ -294,6 +351,10 @@ class TunnelManager {
       this.cloudflared = null;
       await prev.stop();
     }
+    // The hostname rotates on every restart; the persisted URL is invalid
+    // after gateway exit. Remove it so the next boot's proxy doesn't equality-
+    // match against a stale host.
+    try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
   }
 
   private notesNoteName(): string {

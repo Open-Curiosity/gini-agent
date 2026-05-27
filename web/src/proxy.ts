@@ -10,32 +10,28 @@
 // 2. Setup gate. If no provider is configured the operator is bounced to
 //    /setup so the rest of the app doesn't render in a broken state.
 //
-// The proxy reads `tunnel.secret` + `tunnel.enabled` from config.json on
-// every request (uncached) — a `rotate-secret` causes every outstanding
-// cookie to mismatch on the very next request, and a `disable` 404s the
-// next request even with a valid cookie.
+// The proxy reads `tunnel.secret`, `tunnel.enabled`, and the live tunnel
+// public-URL host from disk on every request (uncached) — a `rotate-secret`
+// causes every outstanding cookie to mismatch on the very next request, a
+// `disable` 404s the next request even with a valid cookie, and a hostname
+// rotation after restart invalidates the host-only session cookie.
 
 import { NextResponse, type NextRequest } from "next/server";
 import { runtimeToken, runtimeUrl } from "@/lib/runtime";
-import { canonicalizePath, noTrailingSlash } from "@/lib/canonicalize";
+import { canonicalizePath } from "@/lib/canonicalize";
 import {
   TUNNEL_MARKER_HEADER,
   TUNNEL_MARKER_VALUE,
-  TUNNEL_COOKIE_NAME,
-  TUNNEL_COOKIE_MAX_AGE_SECONDS,
   buildTunnelCookie,
   isTunnelDenied,
   matchSecretPrefix,
+  readLiveTunnelHost,
   readTunnelConfigFromDisk,
   readTunnelCookie,
-  tunnelSecretEquals,
-  withoutTrailingSlash
+  tunnelSecretEquals
 } from "@/lib/tunnel-policy";
 
 const PROXY_STATUS_TIMEOUT_MS = 1500;
-
-void TUNNEL_COOKIE_NAME;
-void TUNNEL_COOKIE_MAX_AGE_SECONDS;
 
 async function isProviderConfigured(): Promise<boolean | null> {
   const url = `${runtimeUrl()}/api/setup/status`;
@@ -52,6 +48,12 @@ async function isProviderConfigured(): Promise<boolean | null> {
   }
 }
 
+/** Per-request Host classifier. Loopback is the operator's own machine.
+ *  Tunnel branch matches the live trycloudflare hostname (read from the
+ *  sibling file the runtime writes on enable) OR an explicit allowlist
+ *  entry. Everything else 404s before any secret/cookie check —
+ *  defends against DNS-rebinding to an attacker-controlled hostname per
+ *  PLAN.md "Architecture" step 3. */
 function classifyHost(hostHeader: string | null): "loopback" | "tunnel-or-trusted" | "unknown" {
   if (!hostHeader) return "unknown";
   const lower = hostHeader.toLowerCase();
@@ -61,14 +63,15 @@ function classifyHost(hostHeader: string | null): "loopback" | "tunnel-or-truste
   if (hostOnly === "localhost" || hostOnly === "127.0.0.1" || hostOnly === "[::1]") {
     return "loopback";
   }
-  // PLAN.md "Host classifier": match live tunnel hostname OR a
-  // GINI_TRUSTED_ORIGINS entry. We can't currently see the live tunnel
-  // hostname from the proxy without an extra round-trip (the runtime
-  // snapshot lives in another process), so we trust the allowlist plus a
-  // structural match on the trycloudflare suffix. Operators with a stable
-  // hostname use GINI_TRUSTED_ORIGINS; rotating-tunnel hostnames fall under
-  // the structural match.
-  if (hostOnly.endsWith(".trycloudflare.com")) return "tunnel-or-trusted";
+  // Equality match against the live tunnel hostname (NOT a suffix check on
+  // .trycloudflare.com — that would accept any cloudflare-issued host the
+  // attacker could mint). The runtime writes tunnel.publicUrl to a sibling
+  // file on enable; the proxy reads it per-request so a recycle or disable
+  // is visible on the very next hit.
+  const liveHost = readLiveTunnelHost();
+  if (liveHost) {
+    if (hostMatches(lower, liveHost)) return "tunnel-or-trusted";
+  }
   const allowlist = (process.env.GINI_TRUSTED_ORIGINS ?? "")
     .split(",")
     .map((entry) => entry.trim())
@@ -77,16 +80,34 @@ function classifyHost(hostHeader: string | null): "loopback" | "tunnel-or-truste
     try {
       const url = new URL(entry);
       const entryHost = url.host.toLowerCase();
-      if (entryHost === lower) return "tunnel-or-trusted";
-      // Default-port equivalence (per PLAN.md CSRF section).
-      if (!url.port && (lower === `${entryHost}:443` || lower === `${entryHost}:80`)) {
-        return "tunnel-or-trusted";
-      }
+      if (hostMatches(lower, entryHost)) return "tunnel-or-trusted";
     } catch {
       // Skip malformed entries.
     }
   }
   return "unknown";
+}
+
+/** Compare two Host header values applying the default-port equivalence rule
+ *  PLAN.md describes in "CSRF policy": `host` and `host:443` (HTTPS) or
+ *  `host:80` (HTTP) are equivalent when one side omits the port. */
+function hostMatches(inbound: string, candidate: string): boolean {
+  if (inbound === candidate) return true;
+  const splitPort = (h: string): { name: string; port: string | null } => {
+    if (h.startsWith("[")) {
+      const close = h.lastIndexOf("]");
+      const name = h.slice(0, close + 1);
+      const rest = h.slice(close + 1);
+      return { name, port: rest.startsWith(":") ? rest.slice(1) : null };
+    }
+    const idx = h.indexOf(":");
+    return idx < 0 ? { name: h, port: null } : { name: h.slice(0, idx), port: h.slice(idx + 1) };
+  };
+  const a = splitPort(inbound);
+  const b = splitPort(candidate);
+  if (a.name !== b.name) return false;
+  const isDefault = (port: string | null) => port === null || port === "443" || port === "80";
+  return isDefault(a.port) && isDefault(b.port);
 }
 
 function notFound(): NextResponse {
@@ -149,27 +170,23 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   }
   if (!tunnel.enabled) return notFound();
 
-  // Try secret-path bootstrap: /<secret>/...
-  const segments = canon.path.split("/").filter((s) => s.length > 0);
-  if (segments.length >= 1) {
-    const candidate = segments[0]!;
-    if (tunnelSecretEquals(candidate, tunnel.secret)) {
-      // Compose the post-prefix canonical path for deny matching.
-      const rest = canon.path.slice(`/${candidate}`.length);
-      const postPrefix = rest.length === 0 ? "/" : rest;
-      if (isTunnelDenied(postPrefix, request.method)) {
-        return notFound();
-      }
-      const target = new URL(request.url);
-      target.pathname = postPrefix === "" ? "/" : postPrefix;
-      const redirect = NextResponse.redirect(target, 302);
-      redirect.headers.set("set-cookie", buildTunnelCookie(tunnel.secret));
-      // The 302 itself carries no-referrer so the brief /<secret>/ URL
-      // cannot leak via Referer on subresource fetches the destination
-      // page issues. See PLAN.md "URL cleanup after bootstrap".
-      redirect.headers.set("referrer-policy", "no-referrer");
-      return redirect;
+  // Try secret-path bootstrap: /<secret>/<rest>. Use the shared matcher so
+  // the proxy and the policy module stay byte-equivalent.
+  const prefixMatch = matchSecretPrefix(canon.path, tunnel.secret);
+  if (prefixMatch) {
+    const postPrefix = prefixMatch.suffix;
+    if (isTunnelDenied(postPrefix, request.method)) {
+      return notFound();
     }
+    const target = new URL(request.url);
+    target.pathname = postPrefix === "" ? "/" : postPrefix;
+    const redirect = NextResponse.redirect(target, 302);
+    redirect.headers.set("set-cookie", buildTunnelCookie(tunnel.secret));
+    // The 302 itself carries no-referrer so the brief /<secret>/ URL cannot
+    // leak via Referer on subresource fetches the destination page issues.
+    // See PLAN.md "URL cleanup after bootstrap".
+    redirect.headers.set("referrer-policy", "no-referrer");
+    return redirect;
   }
 
   // Cookie-bearing follow-up requests.
@@ -185,8 +202,6 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
 
   // No bootstrap, no cookie — 404 (do NOT reveal the existence of the
   // gateway via a richer error).
-  void noTrailingSlash;
-  void withoutTrailingSlash;
   return notFound();
 }
 

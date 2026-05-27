@@ -76,16 +76,20 @@ export function matchSecretPrefix(canonicalPath: string, secret: string): { matc
   return null;
 }
 
+function instanceStateDir(): string {
+  const instance = process.env.GINI_INSTANCE ?? "default";
+  const stateRoot = process.env.GINI_STATE_ROOT
+    ? resolve(process.env.GINI_STATE_ROOT)
+    : join(process.env.HOME ?? homedir(), ".gini");
+  return join(stateRoot, "instances", instance);
+}
+
 /** Read the live tunnel config from disk on every call. The PLAN.md
  *  invariant ("proxy reads tunnel.secret + tunnel.enabled on every request,
  *  uncached") means rotate-secret / disable cycles invalidate cookies on
  *  the very next hit without coordination. */
 export function readTunnelConfigFromDisk(): { enabled: boolean; secret: string } {
-  const instance = process.env.GINI_INSTANCE ?? "default";
-  const stateRoot = process.env.GINI_STATE_ROOT
-    ? resolve(process.env.GINI_STATE_ROOT)
-    : join(process.env.HOME ?? homedir(), ".gini");
-  const configFile = join(stateRoot, "instances", instance, "config.json");
+  const configFile = join(instanceStateDir(), "config.json");
   if (!existsSync(configFile)) return { enabled: false, secret: "" };
   try {
     const raw = readFileSync(configFile, "utf8");
@@ -96,6 +100,25 @@ export function readTunnelConfigFromDisk(): { enabled: boolean; secret: string }
     };
   } catch {
     return { enabled: false, secret: "" };
+  }
+}
+
+/** Read the live tunnel public URL host from the sibling file the runtime
+ *  publishes (`~/.gini/instances/<inst>/tunnel.publicUrl`). The proxy uses
+ *  this for an EQUALITY host match per PLAN.md "Architecture" step 3,
+ *  rather than a permissive `.trycloudflare.com` suffix check. Returns the
+ *  empty string when the file is missing (no live tunnel) — the proxy
+ *  treats that as "no tunnel branch matches" and rejects at the Host
+ *  classifier. */
+export function readLiveTunnelHost(): string {
+  const p = join(instanceStateDir(), "tunnel.publicUrl");
+  if (!existsSync(p)) return "";
+  try {
+    const url = readFileSync(p, "utf8").trim();
+    if (!url) return "";
+    return new URL(url).host.toLowerCase();
+  } catch {
+    return "";
   }
 }
 

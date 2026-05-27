@@ -69,9 +69,31 @@ honestly attacker-controlled because the URL bar is attacker-controlled.
   no behavioral change. Same-origin browser requests pass; cross-origin
   pages still see 403.
 - Operators exposing the BFF on a non-loopback hostname (Tailscale,
-  tunnel, public DNS) must set `GINI_TRUSTED_ORIGINS` to the list of
+  arbitrary public DNS) must set `GINI_TRUSTED_ORIGINS` to the list of
   hostnames they expect to be reached from. Without it, the guard
   refuses every privileged POST.
+- The Cloudflare quick-tunnel surface introduced by
+  [tunnel-and-mobile-access.md](tunnel-and-mobile-access.md) opens a
+  parallel trust lane that does NOT require `GINI_TRUSTED_ORIGINS`:
+  the Next.js proxy (`web/src/proxy.ts`) classifies the inbound `Host`
+  against the live `tunnel.publicUrl` (read from a sibling file the
+  runtime writes on enable), gates on a 192-bit secret-path bootstrap
+  or its host-only session cookie, and stamps the
+  `x-gini-tunnel-vetted: 1` marker on forwards. The BFF guard
+  treats the marker as proof the upstream Host classifier already ran
+  — so the loopback-Host requirement for Origin-less GETs is RELAXED
+  when the marker is present. The marker itself is un-forgeable
+  end-to-end: the proxy strips any inbound value before any branch
+  decision and only stamps it after passing the secret/cookie gate
+  (PLAN.md "Marker un-forgeability"). The BFF also re-checks a
+  tunnel-specific deny list against `/api/runtime/pairing/*` and
+  `/api/runtime/tunnel/*` (the QR endpoints, refresh-notes, and
+  PATCH on the bare tunnel root are all denied through the tunnel)
+  and rewrites bare `GET /api/runtime/tunnel` to the redacted
+  snapshot shape (`/api/tunnel/redacted`) before forwarding. The
+  legacy `GINI_TRUSTED_ORIGINS` lane remains intact for operators
+  who front the BFF with their own stable hostname instead of the
+  rotating trycloudflare URL.
 - A typo in `GINI_TRUSTED_ORIGINS` is loud (every request 403s)
   rather than silent (downgrade to rebindable fallback). The fail-closed
   posture is the defense-in-depth default for a CSRF-style control.
@@ -117,4 +139,14 @@ honestly attacker-controlled because the URL bar is attacker-controlled.
 - The same-origin loopback case (`Origin: http://localhost`,
   `Host: localhost`) passes whether the env var is set (and matches)
   or unset.
+- Tunnel-vetted GETs (marker stamped) on `/api/runtime/tunnel` return
+  the redacted snapshot shape (`secret: null`, `publicUrl: null`).
+- Tunnel-vetted requests to `/api/runtime/tunnel/qr.svg`,
+  `/api/runtime/tunnel/qr.txt`, `POST /api/runtime/tunnel/refresh-notes`,
+  `PATCH /api/runtime/tunnel`, and any method on `/api/runtime/pairing/*`
+  return 404. Loopback callers of the same routes pass (the deny list
+  only applies when the marker is stamped).
+- The marker is never forwarded to the runtime — the BFF's
+  `pickForwardHeaders` allowlist strips it before bearer injection,
+  and the runtime never observes it.
 - `bun test src/integration.test.ts` pins all of the above.
