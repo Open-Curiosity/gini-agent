@@ -261,9 +261,21 @@ interface ChatBlockBase {
   runId?: string;
 }
 
+// Inline image attached to a user message. The runtime stores the bytes on
+// disk under ~/.gini/instances/<instance>/uploads/<id>.<ext> and references
+// them by id; clients fetch them via GET /api/uploads/:id. We never embed
+// base64 in chat blocks or state.json — the upload id is the canonical
+// reference, and the provider call inlines a data URL only at dispatch time.
+export interface ImageAttachment {
+  id: string;
+  mimeType: string;
+  size: number;
+}
+
 export interface UserTextBlock extends ChatBlockBase {
   kind: "user_text";
   text: string;
+  images?: ImageAttachment[];
 }
 
 export interface AssistantTextBlock extends ChatBlockBase {
@@ -681,6 +693,11 @@ export interface ChatMessageRecord {
   createdAt: string;
   taskId?: string;
   runId?: string;
+  // User-role messages carry images attached at submit time. Stored as upload
+  // refs (id + mimeType + size) — bytes live on disk under
+  // ~/.gini/instances/<inst>/uploads/. Mirrored on the user_text ChatBlock so
+  // either persistence path can drive transcript rendering.
+  images?: ImageAttachment[];
   // Optional tag used to distinguish multiple assistant messages emitted by
   // the same task. Today only "approval_reason" is set — when an approval
   // (e.g. connector.request) is created, the runtime persists its `reason`

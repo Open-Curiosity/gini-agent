@@ -13,10 +13,13 @@ import {
   mutateState,
   readState,
   readTrace,
+  readUpload,
   removeDeviceForCredential,
+  storeUpload,
   subscribeChatBlocks,
   subscribeChatSession,
   unreadCountForDevice,
+  uploadStat,
   upsertDevice
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
@@ -190,6 +193,51 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["DELETE", /^\/api\/chat\/([^/]+)$/, async (_request, params) => { await deleteChat(config, params[0]); return json({ ok: true }); }],
     ["PATCH", /^\/api\/chat\/([^/]+)$/, async (request, params) => json(await renameChat(config, params[0], await body(request)))],
     ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
+    // Image upload. Accepts multipart/form-data with a `file` part. The bytes
+    // are stored on disk under ~/.gini/instances/<instance>/uploads/<id>.<ext>
+    // and the response carries the upload ref the client attaches to the
+    // next chat message via /messages { content, images: [{ id, ... }] }.
+    ["POST", /^\/api\/uploads$/, async (request) => {
+      const contentType = request.headers.get("content-type") ?? "";
+      if (!contentType.toLowerCase().includes("multipart/form-data")) {
+        return json({ error: "Expected multipart/form-data with a 'file' part" }, 400);
+      }
+      const form = await request.formData();
+      const file = form.get("file");
+      if (!(file instanceof Blob)) return json({ error: "Missing 'file' part" }, 400);
+      const filename = file instanceof File ? file.name : undefined;
+      const mimeType = file.type || "application/octet-stream";
+      if (!mimeType.startsWith("image/")) {
+        return json({ error: `Unsupported upload type: ${mimeType}` }, 415);
+      }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const stored = storeUpload(config.instance, bytes, mimeType, filename);
+      return json(stored, 201);
+    }],
+    ["HEAD", /^\/api\/uploads\/([^/]+)$/, (_request, params) => {
+      const meta = uploadStat(config.instance, params[0]);
+      if (!meta) return new Response(null, { status: 404 });
+      return new Response(null, {
+        status: 200,
+        headers: { "content-type": meta.mimeType, "content-length": String(meta.size) }
+      });
+    }],
+    ["GET", /^\/api\/uploads\/([^/]+)$/, (_request, params) => {
+      const upload = readUpload(config.instance, params[0]);
+      if (!upload) return json({ error: "Upload not found" }, 404);
+      const buffer = upload.bytes.buffer.slice(
+        upload.bytes.byteOffset,
+        upload.bytes.byteOffset + upload.bytes.byteLength
+      ) as ArrayBuffer;
+      return new Response(buffer, {
+        status: 200,
+        headers: {
+          "content-type": upload.mimeType,
+          "content-length": String(upload.bytes.length),
+          "cache-control": "private, max-age=31536000, immutable"
+        }
+      });
+    }],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
     // ChatBlock protocol endpoints (ADR chat-block-protocol.md). The
     // /blocks endpoint returns the full ordered list for initial render;

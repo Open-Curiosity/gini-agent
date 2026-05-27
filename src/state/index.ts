@@ -76,6 +76,13 @@ export type {
   UpdateBankInput
 } from "./memory-db";
 export {
+  storeUpload,
+  readUpload,
+  uploadDataUrl,
+  uploadExists,
+  uploadStat
+} from "./uploads";
+export {
   insertChatBlock,
   upsertAssistantTextBlock,
   updateToolCallBlock,
