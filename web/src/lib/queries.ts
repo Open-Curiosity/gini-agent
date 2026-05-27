@@ -98,15 +98,6 @@ export function useSetupRequests() {
   });
 }
 
-// Deprecated. Kept as a temporary alias so heavy consumers (the home
-// page's pending list, the permissions page) keep compiling during the
-// migration window. New code should use useAuthorizations and
-// useSetupRequests directly. TODO: remove in the next release alongside
-// the /api/approvals alias.
-export function useApprovals() {
-  return useAuthorizations();
-}
-
 // `useMemories` was removed alongside the state.memories
 // consolidation. The Memory page now surfaces Hindsight only — see
 // the per-unit/per-bank hooks below. See ADR
