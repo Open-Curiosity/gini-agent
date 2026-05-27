@@ -24,6 +24,19 @@ export interface ProviderCatalogItem {
   auth: string;
   models: string[];
   baseUrl?: string;
+  // True when credentials for this provider are available in the running
+  // gateway (env var set, codex auth.json present, or local explicitly
+  // activated). Settings hides un-configured rows; Add Provider treats the
+  // flag as informational.
+  configured?: boolean;
+}
+
+// Trim the marketing suffix used in the static catalog. Pencil mocks
+// reference providers by short name (OpenAI, OpenRouter, …) and stacking
+// "Compatible" on every label adds noise without disambiguating anything.
+export function displayProviderName(item: { displayName: string; name: string }): string {
+  if (item.name === "local") return "Local";
+  return item.displayName.replace(/\s+Compatible$/i, "");
 }
 
 // Providers selectable on the Settings page. Echo is dev-only; the four
@@ -59,7 +72,7 @@ export function ProviderCard({
   const invalidate = useInvalidate();
   const rows = SELECTABLE_PROVIDERS
     .map((name) => catalog.find((c) => c.name === name))
-    .filter((c): c is ProviderCatalogItem => Boolean(c));
+    .filter((c): c is ProviderCatalogItem => c !== undefined && c.configured === true);
 
   const setActive = useMutation({
     mutationFn: async (vars: { provider: string; model: string }): Promise<SetProviderResult> =>
@@ -95,6 +108,17 @@ export function ProviderCard({
         </Button>
       </header>
 
+      {rows.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-[#23232B] bg-[#0F0F13] p-10 text-center">
+          <p className="text-sm font-medium text-foreground">No providers connected yet</p>
+          <p className="mx-auto mt-1.5 max-w-md text-xs text-muted-foreground">
+            Add a provider to start chatting. Gini stores keys locally in
+            <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">~/.gini/secrets.env</code>
+            and never proxies them anywhere except the provider you pick.
+          </p>
+        </div>
+      ) : null}
+
       <ul className="flex flex-col gap-3">
         {rows.map((row) => {
           const isActive = activeProviderName === row.name;
@@ -122,7 +146,7 @@ export function ProviderCard({
               </span>
               <div className="flex-1 space-y-1.5">
                 <div className="flex items-center gap-2.5">
-                  <span className="text-[15px] font-semibold text-foreground">{row.displayName}</span>
+                  <span className="text-[15px] font-semibold text-foreground">{displayProviderName(row)}</span>
                   <span className="rounded-md bg-[#1C1C22] px-2 py-0.5 text-[11px] font-semibold text-[#9A9AA0]">
                     {visual.authLabel}
                   </span>
@@ -151,7 +175,7 @@ export function ProviderCard({
                     Set active
                   </Button>
                 )}
-                <Button asChild type="button" variant="outline" size="icon" aria-label={`Edit ${row.displayName}`}>
+                <Button asChild type="button" variant="outline" size="icon" aria-label={`Edit ${displayProviderName(row)}`}>
                   <Link href={`/settings/add-provider?provider=${row.name}`}>
                     <PencilIcon className="size-4 text-[#9A9AA0]" />
                   </Link>
@@ -160,7 +184,7 @@ export function ProviderCard({
                   type="button"
                   variant="outline"
                   size="icon"
-                  aria-label={`Remove ${row.displayName}`}
+                  aria-label={`Remove ${displayProviderName(row)}`}
                   disabled
                 >
                   <Trash2Icon className="size-4 text-[#9A9AA0]" />

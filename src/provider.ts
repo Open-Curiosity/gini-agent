@@ -49,6 +49,46 @@ export function providerHealth(config: RuntimeConfig) {
   };
 }
 
+// Per-provider env var that holds the bearer token. Mirrors the apiKeyEnv
+// defaults in normalizeProvider, and is the single source of truth for
+// the "is this provider configured?" gate the settings UI uses to decide
+// which rows to render.
+const PROVIDER_API_KEY_ENV: Record<string, string> = {
+  openai: "OPENAI_API_KEY",
+  openrouter: "OPENROUTER_API_KEY",
+  deepseek: "DEEPSEEK_API_KEY",
+  local: "GINI_LOCAL_API_KEY"
+};
+
+// Whether a provider has usable credentials in the current process env.
+// echo is dev-only and never reported as configured. codex consults
+// readCodexCredentials so we honor CODEX_AUTH_JSON and the default path.
+// local is a special case: most local gateways (Ollama, LM Studio)
+// accept no-auth requests so the env var is optional — we still gate
+// the row on the user having explicitly opted in by either setting the
+// env var or making local the active provider.
+export function isProviderConfigured(name: string, activeProviderName?: string): boolean {
+  if (name === "echo") return false;
+  if (name === "codex") return hasUsableCodexCredentials();
+  const envVar = PROVIDER_API_KEY_ENV[name];
+  if (envVar && process.env[envVar]) return true;
+  if (name === "local" && activeProviderName === "local") return true;
+  return false;
+}
+
+// Catalog enriched with the per-provider configured flag. Used by the
+// settings UI to hide rows the user hasn't connected; the static
+// providerCatalog() stays in place for callers that just need the list of
+// known provider shapes (e.g. setup-api default-model resolution).
+export function providerCatalogWithStatus(
+  activeProviderName?: string
+): Array<ProviderCatalogItem & { configured: boolean }> {
+  return providerCatalog().map((item) => ({
+    ...item,
+    configured: isProviderConfigured(item.name, activeProviderName)
+  }));
+}
+
 export function providerCatalog(): ProviderCatalogItem[] {
   return [
     {
