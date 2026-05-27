@@ -508,8 +508,15 @@ function cryptoSecret(): string {
   return require("./secret").generateTunnelSecret() as string;
 }
 
-/** Compose the bootstrap URL the phone scans: `<publicUrl>/<secret>/`. */
+/** Compose the bootstrap URL the phone scans: `<publicUrl>/<secret>`. The
+ *  proxy accepts both `/<secret>` and `/<secret>/` (matchSecretPrefix in
+ *  tunnel-policy.ts), but Next.js 16's trailing-slash URL normalization
+ *  intercepts the slash form with a 308 redirect BEFORE the proxy/middleware
+ *  runs, dropping the Set-Cookie header the proxy would have minted. Encoding
+ *  the no-slash form sidesteps that normalization entirely — the request
+ *  goes straight to the proxy, which mints the cookie and 302s to `/`. See
+ *  PLAN.md "Request flow — Scenario A". */
 export function bootstrapUrl(publicUrl: string, secret: string): string {
   const trimmed = publicUrl.replace(/\/+$/, "");
-  return `${trimmed}/${secret}/`;
+  return `${trimmed}/${secret}`;
 }

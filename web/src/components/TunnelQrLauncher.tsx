@@ -82,8 +82,16 @@ export function TunnelQrLauncher() {
               className="h-64 w-64 rounded border bg-white p-2"
               data-testid="tunnel-qr-image"
             />
+            {/* Show the FULL bootstrap URL that the QR encodes (publicUrl +
+                /<secret>/), not just publicUrl. The description above warns
+                that the link contains a one-time secret; the displayed URL
+                has to match the QR for that warning to make sense, and so
+                an operator manually copying the URL gets the working
+                bootstrap form instead of a 404. This launcher is loopback-
+                only (hidden in tunneled contexts), so surfacing the secret
+                here is the same trust boundary as the QR image itself. */}
             <p className="break-all rounded bg-muted px-2 py-1 font-mono text-xs text-muted-foreground">
-              {data.publicUrl}
+              {data.publicUrl && data.secret ? `${data.publicUrl.replace(/\/+$/, "")}/${data.secret}` : data.publicUrl}
             </p>
           </div>
           <DialogClose asChild>
