@@ -480,7 +480,13 @@ describe("request_connector dispatch", () => {
             sender: "@alice",
             lastAttemptAt: new Date().toISOString(),
             verificationCode: "ABCD-1234",
-            verificationCodeExpiresAt: new Date(Date.now() + 60_000).toISOString()
+            // Fixed far-future timestamp. Wall-clock "now + 60s" can be
+            // crossed by a CI worker stall (GC pause, CPU contention,
+            // debugger break) and flake the test. The test pins
+            // dispatcher behavior, not expiry; use 2099 to make the
+            // unexpired-ness load-bearing on calendar, not test
+            // execution speed.
+            verificationCodeExpiresAt: "2099-01-01T00:00:00.000Z"
           }
         ]
       };
@@ -562,7 +568,13 @@ describe("request_connector dispatch", () => {
             sender: "@alice",
             lastAttemptAt: new Date().toISOString(),
             verificationCode: "SECRET-1234",
-            verificationCodeExpiresAt: new Date(Date.now() + 60_000).toISOString()
+            // Fixed far-future timestamp. Wall-clock "now + 60s" can be
+            // crossed by a CI worker stall (GC pause, CPU contention,
+            // debugger break) and flake the test. The test pins
+            // dispatcher behavior, not expiry; use 2099 to make the
+            // unexpired-ness load-bearing on calendar, not test
+            // execution speed.
+            verificationCodeExpiresAt: "2099-01-01T00:00:00.000Z"
           }
         ]
       };
