@@ -36,9 +36,11 @@ import { id, now } from "./ids";
 // Bumped to 6 for per-device chat_read_state: switches the read-state
 // PK from (session_id, credential_id) to (session_id, device_token) so
 // two iPhones owned by the same human (sharing one "owner" credential)
-// don't share a cursor. Implemented as a recreate-and-drop migration:
-// existing v5 rows are dropped during the bump (the old keying made
-// them incorrect anyway under multi-device ownership).
+// don't share a cursor. Implemented as a copy-forward migration:
+// existing v5 rows are joined against the devices table to duplicate
+// each credential's cursor onto every device registered to that
+// credential. Sessions owned by credentials with no registered
+// devices are dropped (no devices → no badge to bias).
 export const MEMORY_SCHEMA_VERSION = 6;
 export const DEFAULT_BANK_ID = "bank_default";
 
@@ -385,10 +387,15 @@ function applyMigrations(db: Database): void {
   // cursor.
   //
   // Upgrade from v5: the previous schema used (session_id, credential_id).
-  // Under multi-device ownership those rows were already incorrect (one
-  // device's open would clobber the other's badge), so the migration
-  // simply drops the old table and starts fresh — losing one badge
-  // sync per device is a cheap correctness fix.
+  // Under multi-device ownership those rows collapsed every device's
+  // read state onto one credential cursor. The migration duplicates
+  // each v5 row onto every device currently registered under the same
+  // credential — the resulting v6 rows may over-report unread (a device
+  // that never actually opened the session inherits a "read"
+  // acknowledgement from a sibling device's cursor), but that's
+  // strictly better than the v5 collapse and far better than dropping
+  // every cursor and over-counting unread badges across the install
+  // base on first launch.
   ensureChatReadStateDeviceTokenSchema(db);
 
   db.run(
@@ -407,14 +414,27 @@ function ensureColumn(db: Database, table: string, column: string, type: string)
 
 // Migration helper for the v5 → v6 chat_read_state shape change.
 // Creates the device-keyed table from scratch if missing; if a v5
-// (credential_id-keyed) table exists, drops it and starts over. The
-// drop is intentional: under multi-device ownership the v5 rows
-// already collapsed onto one credential cursor, so they couldn't be
-// meaningfully migrated into device-specific cursors. The badge will
-// recompute as fresh-everything on first access, and the mobile
-// client POSTs /chat/:id/read on every chat-detail mount, so the
-// missing rows are repopulated within seconds of normal use.
-function ensureChatReadStateDeviceTokenSchema(db: Database): void {
+// (credential_id-keyed) table exists, copies each v5 row forward
+// into one v6 row per registered device for that credential.
+//
+// Migration semantics:
+//   - v5 schema: PRIMARY KEY (session_id, credential_id). One cursor
+//     per credential, regardless of how many physical iPhones the
+//     credential authorised. Under multi-device ownership two iPhones
+//     would clobber each other's cursor.
+//   - v6 schema: PRIMARY KEY (session_id, device_token). Each
+//     physical iPhone tracks its own cursor.
+//   - Migration: JOIN chat_read_state v5 against devices on
+//     credential_id. Every device registered under credential C
+//     inherits credential C's session cursors. The inherited cursor
+//     may over-report "read" (a device that never opened the session
+//     starts out marked-as-read up to the credential's last position),
+//     but that's strictly less wrong than the v5 collapse and far
+//     better than dropping all cursors and badge-spiking every
+//     session as unread on first launch after upgrade.
+//   - Credentials with no registered devices contribute nothing to
+//     v6: no device means no badge to bias.
+export function ensureChatReadStateDeviceTokenSchema(db: Database): void {
   const cols = db
     .query<{ name: string }, []>("PRAGMA table_info(chat_read_state)")
     .all();
@@ -442,19 +462,25 @@ function ensureChatReadStateDeviceTokenSchema(db: Database): void {
   }
 
   if (hasCredentialId) {
-    // v5 → v6: drop and recreate. The old rows aren't recoverable into
-    // the new schema (no way to attribute a credential's read to one
-    // specific device after the fact).
+    // v5 → v6: copy v5 rows forward onto every device registered for
+    // the same credential, then drop the old table. The copy uses a
+    // staging table so the drop + rename pattern keeps the final
+    // table name identical and indexed correctly.
     db.exec(`
-      DROP INDEX IF EXISTS chat_read_state_by_credential;
-      DROP TABLE chat_read_state;
-      CREATE TABLE chat_read_state (
+      CREATE TABLE chat_read_state_v6 (
         session_id TEXT NOT NULL,
         device_token TEXT NOT NULL,
         last_read_block_id TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (session_id, device_token)
       );
+      INSERT INTO chat_read_state_v6 (session_id, device_token, last_read_block_id, updated_at)
+        SELECT cr.session_id, d.token, cr.last_read_block_id, cr.updated_at
+        FROM chat_read_state cr
+        JOIN devices d ON d.credential_id = cr.credential_id;
+      DROP INDEX IF EXISTS chat_read_state_by_credential;
+      DROP TABLE chat_read_state;
+      ALTER TABLE chat_read_state_v6 RENAME TO chat_read_state;
       CREATE INDEX chat_read_state_by_device ON chat_read_state(device_token);
     `);
   }
