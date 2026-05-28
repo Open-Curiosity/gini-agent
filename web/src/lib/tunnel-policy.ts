@@ -10,8 +10,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
-const SECRET_LENGTH_DEFAULT = 32; // base64url-encoded 192-bit secret
-
 export const TUNNEL_MARKER_HEADER = "x-gini-tunnel-vetted";
 export const TUNNEL_MARKER_VALUE = "1";
 export const TUNNEL_COOKIE_NAME = "gini_tunnel_session";
@@ -210,5 +208,3 @@ export function looksLikeSecretSegment(value: string): boolean {
   if (value.length < 8 || value.length > 128) return false;
   return /^[A-Za-z0-9_-]+$/.test(value);
 }
-
-void SECRET_LENGTH_DEFAULT;

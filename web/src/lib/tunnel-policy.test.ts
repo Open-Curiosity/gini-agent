@@ -1,9 +1,14 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildTunnelCookie,
   isTunnelDenied,
   looksLikeSecretSegment,
   matchSecretPrefix,
+  readLiveTunnelHost,
+  readTunnelConfigFromDisk,
   readTunnelCookie,
   tunnelSecretEquals,
   withoutTrailingSlash
@@ -152,5 +157,118 @@ describe("withoutTrailingSlash", () => {
 
   test("leaves bare slash alone", () => {
     expect(withoutTrailingSlash("/")).toBe("/");
+  });
+});
+
+describe("readTunnelConfigFromDisk", () => {
+  let tmpRoot: string;
+  let savedStateRoot: string | undefined;
+  let savedInstance: string | undefined;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "gini-tunnel-policy-"));
+    savedStateRoot = process.env.GINI_STATE_ROOT;
+    savedInstance = process.env.GINI_INSTANCE;
+    process.env.GINI_STATE_ROOT = tmpRoot;
+    process.env.GINI_INSTANCE = "test-instance";
+    mkdirSync(join(tmpRoot, "instances", "test-instance"), { recursive: true });
+  });
+
+  afterEach(() => {
+    if (savedStateRoot === undefined) delete process.env.GINI_STATE_ROOT;
+    else process.env.GINI_STATE_ROOT = savedStateRoot;
+    if (savedInstance === undefined) delete process.env.GINI_INSTANCE;
+    else process.env.GINI_INSTANCE = savedInstance;
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  test("returns enabled/secret when the config file is present", () => {
+    const configFile = join(tmpRoot, "instances", "test-instance", "config.json");
+    writeFileSync(configFile, JSON.stringify({ tunnel: { enabled: true, secret: "ABC" } }), "utf8");
+    expect(readTunnelConfigFromDisk()).toEqual({ enabled: true, secret: "ABC" });
+  });
+
+  test("returns disabled/empty when the config file is missing", () => {
+    expect(readTunnelConfigFromDisk()).toEqual({ enabled: false, secret: "" });
+  });
+
+  test("returns disabled/empty when the config file is malformed", () => {
+    const configFile = join(tmpRoot, "instances", "test-instance", "config.json");
+    writeFileSync(configFile, "not-json", "utf8");
+    expect(readTunnelConfigFromDisk()).toEqual({ enabled: false, secret: "" });
+  });
+
+  test("coerces non-string secret to empty and non-true enabled to false", () => {
+    const configFile = join(tmpRoot, "instances", "test-instance", "config.json");
+    writeFileSync(configFile, JSON.stringify({ tunnel: { enabled: "yes", secret: 42 } }), "utf8");
+    expect(readTunnelConfigFromDisk()).toEqual({ enabled: false, secret: "" });
+  });
+
+  test("falls back to default instance when GINI_INSTANCE is unset", () => {
+    delete process.env.GINI_INSTANCE;
+    mkdirSync(join(tmpRoot, "instances", "default"), { recursive: true });
+    const configFile = join(tmpRoot, "instances", "default", "config.json");
+    writeFileSync(configFile, JSON.stringify({ tunnel: { enabled: true, secret: "D" } }), "utf8");
+    expect(readTunnelConfigFromDisk()).toEqual({ enabled: true, secret: "D" });
+  });
+
+  test("falls back to HOME-based state dir when GINI_STATE_ROOT is unset", () => {
+    delete process.env.GINI_STATE_ROOT;
+    const savedHome = process.env.HOME;
+    process.env.HOME = tmpRoot;
+    try {
+      mkdirSync(join(tmpRoot, ".gini", "instances", "test-instance"), { recursive: true });
+      const configFile = join(tmpRoot, ".gini", "instances", "test-instance", "config.json");
+      writeFileSync(configFile, JSON.stringify({ tunnel: { enabled: true, secret: "H" } }), "utf8");
+      expect(readTunnelConfigFromDisk()).toEqual({ enabled: true, secret: "H" });
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+    }
+  });
+});
+
+describe("readLiveTunnelHost", () => {
+  let tmpRoot: string;
+  let savedStateRoot: string | undefined;
+  let savedInstance: string | undefined;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "gini-tunnel-policy-host-"));
+    savedStateRoot = process.env.GINI_STATE_ROOT;
+    savedInstance = process.env.GINI_INSTANCE;
+    process.env.GINI_STATE_ROOT = tmpRoot;
+    process.env.GINI_INSTANCE = "test-instance";
+    mkdirSync(join(tmpRoot, "instances", "test-instance"), { recursive: true });
+  });
+
+  afterEach(() => {
+    if (savedStateRoot === undefined) delete process.env.GINI_STATE_ROOT;
+    else process.env.GINI_STATE_ROOT = savedStateRoot;
+    if (savedInstance === undefined) delete process.env.GINI_INSTANCE;
+    else process.env.GINI_INSTANCE = savedInstance;
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  test("returns lowercased host when the publicUrl file is present", () => {
+    const f = join(tmpRoot, "instances", "test-instance", "tunnel.publicUrl");
+    writeFileSync(f, "https://ABC.trycloudflare.com\n", "utf8");
+    expect(readLiveTunnelHost()).toBe("abc.trycloudflare.com");
+  });
+
+  test("returns empty string when the publicUrl file is missing", () => {
+    expect(readLiveTunnelHost()).toBe("");
+  });
+
+  test("returns empty string when the file is blank", () => {
+    const f = join(tmpRoot, "instances", "test-instance", "tunnel.publicUrl");
+    writeFileSync(f, "  \n", "utf8");
+    expect(readLiveTunnelHost()).toBe("");
+  });
+
+  test("returns empty string when the file contents are not a valid URL", () => {
+    const f = join(tmpRoot, "instances", "test-instance", "tunnel.publicUrl");
+    writeFileSync(f, "not a url", "utf8");
+    expect(readLiveTunnelHost()).toBe("");
   });
 });
