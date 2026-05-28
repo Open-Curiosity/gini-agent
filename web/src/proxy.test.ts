@@ -7,7 +7,7 @@ import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { NextRequest } from "next/server";
+import { NextRequest, type NextResponse } from "next/server";
 import { proxy } from "./proxy";
 
 const STATE_ROOT = mkdtempSync(join(tmpdir(), "gini-proxy-test-"));
@@ -201,5 +201,98 @@ describe("proxy Bearer-auth fallback", () => {
       })
     );
     expect(res.status).toBe(200);
+  });
+});
+
+describe("proxy /api/* rewrite to /api/runtime/* on tunnel branch", () => {
+  // Mobile clients build URLs as `${origin}/api${path}` — e.g. `/api/agents`,
+  // `/api/chat/<id>/poll` — but the BFF only exposes
+  // `/api/runtime/[...path]`. Without this internal rewrite, every mobile
+  // call 404s even after Bearer auth passes. The rewrite is scoped to the
+  // tunnel branch (loopback / trusted callers reach `/api/runtime/...`
+  // directly through the BFF the same way the local web UI does).
+  function rewriteTarget(res: NextResponse): string | null {
+    return res.headers.get("x-middleware-rewrite");
+  }
+
+  test("cookie + tunnel + /api/agents → rewrite to /api/runtime/agents", async () => {
+    writeConfig({ enabled: true, secret: SECRET });
+    writePublicUrl(TUNNEL_ORIGIN);
+    const res = await proxy(
+      makeRequest({ path: "/api/agents", cookie: `gini_tunnel_session=${SECRET}` })
+    );
+    expect(res.status).toBe(200);
+    const target = rewriteTarget(res);
+    expect(target).not.toBeNull();
+    const url = new URL(target!);
+    expect(url.pathname).toBe("/api/runtime/agents");
+  });
+
+  test("Bearer + tunnel + /api/chat/abc/poll?since=cursor123 → rewrite preserves query", async () => {
+    writeConfig({ enabled: true, secret: SECRET });
+    writePublicUrl(TUNNEL_ORIGIN);
+    const res = await proxy(
+      makeRequest({
+        path: "/api/chat/abc/poll?since=cursor123",
+        authorization: `Bearer ${SECRET}`
+      })
+    );
+    expect(res.status).toBe(200);
+    const target = rewriteTarget(res);
+    expect(target).not.toBeNull();
+    const url = new URL(target!);
+    expect(url.pathname).toBe("/api/runtime/chat/abc/poll");
+    expect(url.searchParams.get("since")).toBe("cursor123");
+  });
+
+  test("tunnel + /api/runtime/tunnel → NOT rewritten (already /runtime)", async () => {
+    // Already under /api/runtime/... — leave alone so we never
+    // double-prepend to /api/runtime/runtime/...
+    writeConfig({ enabled: true, secret: SECRET });
+    writePublicUrl(TUNNEL_ORIGIN);
+    const res = await proxy(
+      makeRequest({
+        path: "/api/runtime/tunnel",
+        authorization: `Bearer ${SECRET}`
+      })
+    );
+    expect(res.status).toBe(200);
+    expect(rewriteTarget(res)).toBeNull();
+  });
+
+  test("loopback + /api/agents → NOT rewritten (only tunnel branch rewrites)", async () => {
+    // Loopback callers reach the BFF directly the same way the local web UI
+    // does — they don't depend on the mobile path-shape rewrite.
+    writeConfig({ enabled: true, secret: SECRET });
+    writePublicUrl(TUNNEL_ORIGIN);
+    const req = new NextRequest("http://localhost/api/agents", {
+      method: "GET",
+      headers: { host: "localhost" }
+    });
+    const res = await proxy(req);
+    expect(res.status).toBe(200);
+    expect(rewriteTarget(res)).toBeNull();
+  });
+
+  test("tunnel + /connect?... → NOT rewritten (not under /api/)", async () => {
+    // /connect, /, /_next/..., /icon.png, /favicon.ico are app/static
+    // routes — not BFF endpoints — so the rewrite must not touch them.
+    writeConfig({ enabled: true, secret: SECRET });
+    writePublicUrl(TUNNEL_ORIGIN);
+    const res = await proxy(
+      makeRequest({ path: "/connect?api=foo", cookie: `gini_tunnel_session=${SECRET}` })
+    );
+    expect(res.status).toBe(200);
+    expect(rewriteTarget(res)).toBeNull();
+  });
+
+  test("tunnel + /api/agents with no auth → 404 (gate runs before rewrite)", async () => {
+    // Auth gates the rewrite; we never expose `/api/runtime/*` to a caller
+    // who hasn't passed the cookie or Bearer check.
+    writeConfig({ enabled: true, secret: SECRET });
+    writePublicUrl(TUNNEL_ORIGIN);
+    const res = await proxy(makeRequest({ path: "/api/agents" }));
+    expect(res.status).toBe(404);
+    expect(rewriteTarget(res)).toBeNull();
   });
 });

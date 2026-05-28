@@ -241,8 +241,7 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
       return notFound();
     }
     const headers = stampVettedHeaders(request.headers);
-    const next = NextResponse.next({ request: { headers } });
-    return applyResponsePolicy(next);
+    return applyResponsePolicy(forwardTunnelRequest(url, request, headers));
   }
 
   // Bearer-token follow-up requests. The installed gini-mobile app receives
@@ -258,13 +257,42 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
       return notFound();
     }
     const headers = stampVettedHeaders(request.headers);
-    const next = NextResponse.next({ request: { headers } });
-    return applyResponsePolicy(next);
+    return applyResponsePolicy(forwardTunnelRequest(url, request, headers));
   }
 
   // No bootstrap, no cookie, no Bearer — 404 (do NOT reveal the existence of
   // the gateway via a richer error).
   return notFound();
+}
+
+/** Forward a vetted tunnel request to the BFF. Mobile clients build URLs as
+ *  `${origin}/api${path}` (e.g. `/api/agents`, `/api/chat/<id>/poll`), but
+ *  the BFF only exposes `/api/runtime/[...path]` — calls to bare `/api/*`
+ *  would 404 even after the proxy's auth gate passes. When the inbound
+ *  pathname is a non-`/api/runtime/` `/api/*` request, rewrite it internally
+ *  to `/api/runtime${rest}` so the existing route handler picks it up. The
+ *  vetted-marker headers ride along on the rewrite so the BFF still sees
+ *  the proof-of-classification stamp. Anything not under `/api/` (e.g.
+ *  `/`, `/connect`, app pages, `/_next/...`, `/icon.png`, `/favicon.ico`)
+ *  falls through to `NextResponse.next()` — those paths are handled by
+ *  Next.js's own routing, not by the BFF API tree, so no rewrite is
+ *  needed (and they are excluded from the matcher anyway in the static
+ *  asset cases). Paths already under `/api/runtime/...` are passed
+ *  through untouched to avoid double-prepending. */
+function forwardTunnelRequest(
+  url: URL,
+  request: NextRequest,
+  headers: Headers
+): NextResponse {
+  const pathname = url.pathname;
+  if (pathname.startsWith("/api/") && !pathname.startsWith("/api/runtime/")) {
+    const rewritten = new URL(
+      `/api/runtime${pathname.slice(4)}${url.search}`,
+      request.url
+    );
+    return NextResponse.rewrite(rewritten, { request: { headers } });
+  }
+  return NextResponse.next({ request: { headers } });
 }
 
 /** Extract the Bearer token from an `Authorization: Bearer <value>` header.
