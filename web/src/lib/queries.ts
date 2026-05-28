@@ -331,16 +331,25 @@ export function useChatBlocks(sessionId: string | null) {
   activeSessionRef.current = sessionId;
 
   useEffect(() => {
+    // Reset on EVERY sessionId change, not just null transitions. Caller
+    // (chat/page.tsx) re-runs the hook with a new id on chat switch but
+    // does not remount the component, so the useState slot above persists
+    // the previous chat's blocks. Without this reset, the seed fetch for
+    // the new session merges its initial list with the prior session's
+    // blocks (mergeSeedWithLive de-dupes by id only, no session check),
+    // leaking blocks from chat A into chat B's transcript. Resetting here
+    // also clears the loading/error slot so the new session starts from
+    // a clean slate; the seed fetch below flips loading off on resolve.
+    setBlocks([]);
+    setError(null);
+
     if (!sessionId) {
-      setBlocks([]);
       setIsLoading(false);
-      setError(null);
       return;
     }
 
     let cancelled = false;
     setIsLoading(true);
-    setError(null);
 
     const merge = (incoming: ChatBlock) => {
       if (cancelled || activeSessionRef.current !== sessionId) return;
