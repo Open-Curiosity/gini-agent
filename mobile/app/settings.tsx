@@ -1,4 +1,5 @@
 import { Stack, router } from "expo-router";
+import * as Updates from "expo-updates";
 import {
   Alert,
   StyleSheet,
@@ -46,6 +47,27 @@ export default function SettingsScreen() {
           <Text style={styles.value} numberOfLines={1}>
             {credentials?.token ? maskToken(credentials.token) : "—"}
           </Text>
+        </View>
+
+        <View style={styles.section}>
+          <Text style={styles.label}>Build</Text>
+          <Text style={styles.value}>
+            runtime {Updates.runtimeVersion ?? "—"} · channel{" "}
+            {Updates.channel || "—"}
+          </Text>
+          <Text style={styles.value}>
+            source: {Updates.isEmbeddedLaunch ? "embedded" : "OTA"}
+          </Text>
+          {!Updates.isEmbeddedLaunch && (
+            <>
+              <Text style={styles.value}>
+                update id: {Updates.updateId?.slice(0, 8) ?? "—"}
+              </Text>
+              <Text style={styles.value}>
+                created: {Updates.createdAt?.toISOString() ?? "—"}
+              </Text>
+            </>
+          )}
         </View>
 
         <TouchableOpacity onPress={onClear} style={styles.button}>
