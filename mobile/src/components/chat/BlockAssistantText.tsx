@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { Animated, Easing, StyleSheet, View } from "react-native";
+import { Animated, Easing, StyleSheet, Text, View } from "react-native";
 import Markdown from "react-native-markdown-display";
 import { family, theme } from "@/src/theme";
 import type { AssistantTextBlock } from "@/src/types";
@@ -17,12 +17,31 @@ export function BlockAssistantText({ block }: { block: AssistantTextBlock }) {
   return (
     <View style={styles.row}>
       <View style={styles.bubble}>
-        <Markdown style={markdownStyles}>{block.text}</Markdown>
+        <Markdown style={markdownStyles} rules={selectableRules}>
+          {block.text}
+        </Markdown>
         {block.streaming ? <StreamingCursor /> : null}
       </View>
     </View>
   );
 }
+
+// react-native-markdown-display renders raw text via the `text` rule.
+// Default rule emits a plain <Text>; override it so users can long-press
+// to select and copy portions of the message.
+const selectableRules = {
+  text: (
+    node: { key: string; content: string },
+    _children: unknown,
+    _parent: unknown,
+    styles: Record<string, object>,
+    inheritedStyles: object = {}
+  ) => (
+    <Text key={node.key} style={[inheritedStyles, styles.text]} selectable>
+      {node.content}
+    </Text>
+  )
+};
 
 function StreamingCursor() {
   // Opacity-pulsing block that sits at the end of the streaming text so
