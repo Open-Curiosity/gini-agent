@@ -1067,6 +1067,15 @@ class TunnelManager {
         appendLog(this.config.instance, "tunnel.edge-unreachable.recycle-aborted", { reason: "superseded" });
         return;
       }
+      // Bump generation so any prior fire-and-forget runRefreshNotes
+      // from rotateSecret / enable bails the gen-mismatch gate before
+      // its osascript can land a stale URL into iCloud Notes. The
+      // recycle's own runRefreshNotes captures `this.generation` AFTER
+      // the bump below, so it's not invalidated by its own bump.
+      // Mirrors the same pattern used in enable(), disable(), and
+      // rotateSecret(): every state transition that ends in a
+      // snapshot change bumps generation before doing the side effect.
+      this.generation += 1;
       // Pull secret from disk — TunnelPersistedConfig.secret is `string`
       // (always present), unlike TunnelSnapshot.secret which is
       // `string | null`. Disk is the source of truth for the live
