@@ -310,6 +310,14 @@ export interface ToolCallBlock extends ChatBlockBase {
   // associate result with call, and by resume paths to flip the
   // matching running block to `ok`/`error` after the approval lands.
   callId: string;
+  // Optional message a long-running tool sets on its own tool_call block
+  // to upgrade the row from a 14px spinner to an amber waiting-card.
+  // Reserved for tools that park awaiting an external event the agent
+  // cannot drive (e.g. wait_for_messaging_pair blocking on an inbound
+  // Telegram DM). The runtime renders the hint inline in the card so the
+  // user sees the load-bearing context without scanning a separate
+  // system_note below. Cleared when the tool's status leaves "running".
+  runningHint?: string;
 }
 
 export interface ToolResultBlock extends ChatBlockBase {
