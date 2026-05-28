@@ -38,6 +38,19 @@ const POLL_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000] as const;
 let source: EventSource | null = null;
 let pollAbort: AbortController | null = null;
 let activeTransport: "sse" | "poll" | null = null;
+// In-flight connection guard. `ensureConnection()` awaits
+// `fetchTunnelTransport()` before assigning `source`/`pollAbort`, so without
+// a synchronously-claimed guard, two `subscribe()` calls in rapid
+// succession (StrictMode dev double-invocation is the canonical trigger)
+// would both pass the `source || pollAbort` check, both fetch the
+// transport, and both construct a transport — leaking one orphaned
+// EventSource or, worse, an orphaned poll loop whose AbortController is
+// no longer reachable from `closeConnection()`.
+let connecting: Promise<void> | null = null;
+// If the last subscriber unmounts WHILE a connection is mid-fetch, we
+// can't tear down anything yet (no controller exists). Latch the request
+// and honor it once the connection lands.
+let closeRequestedWhileConnecting = false;
 const listeners = new Set<Listener>();
 
 async function fetchTunnelTransport(): Promise<"sse" | "poll"> {
@@ -135,20 +148,37 @@ function openPollTransport(): void {
   void loop();
 }
 
-async function ensureConnection(): Promise<void> {
+function ensureConnection(): void {
   if (source || pollAbort) return;
-  // Use the poll fallback only when BOTH (a) the runtime publishes a
-  // quick-tunnel hostname AND (b) the page is actually being served
-  // over that tunnel. Otherwise SSE is the right transport — loopback
-  // can still hit Bun.serve directly even if the gateway exposes a
-  // quick tunnel to other clients.
-  const transport = pageIsOnTunnelHost() ? await fetchTunnelTransport() : "sse";
-  activeTransport = transport;
-  if (transport === "poll") {
-    openPollTransport();
-  } else {
-    openSseTransport();
-  }
+  if (connecting !== null) return;
+  // Synchronously claim the in-flight guard BEFORE the first await so any
+  // second `subscribe()` call lands on the `connecting !== null` short
+  // circuit above. We use an IIFE that returns the promise so the
+  // assignment to `connecting` happens before the awaited work runs.
+  connecting = (async () => {
+    try {
+      // Use the poll fallback only when BOTH (a) the runtime publishes a
+      // quick-tunnel hostname AND (b) the page is actually being served
+      // over that tunnel. Otherwise SSE is the right transport — loopback
+      // can still hit Bun.serve directly even if the gateway exposes a
+      // quick tunnel to other clients.
+      const transport = pageIsOnTunnelHost() ? await fetchTunnelTransport() : "sse";
+      // If the last subscriber unmounted while we were awaiting the
+      // transport snapshot, don't open a connection at all — the
+      // closeRequestedWhileConnecting flag is the only signal we have
+      // (source/pollAbort were null when closeConnection() ran).
+      if (closeRequestedWhileConnecting) return;
+      activeTransport = transport;
+      if (transport === "poll") {
+        openPollTransport();
+      } else {
+        openSseTransport();
+      }
+    } finally {
+      connecting = null;
+      closeRequestedWhileConnecting = false;
+    }
+  })();
 }
 
 function closeConnection(): void {
@@ -161,15 +191,24 @@ function closeConnection(): void {
     pollAbort = null;
   }
   activeTransport = null;
+  // If a connection is mid-fetch when the last subscriber unmounts, no
+  // controller exists yet to abort. Latch the intent so the in-flight
+  // ensureConnection() body bails out before opening the transport.
+  if (connecting !== null) {
+    closeRequestedWhileConnecting = true;
+  }
 }
 
 function subscribe(listener: Listener): () => void {
-  // ensureConnection is async because we need to fetch the tunnel
-  // snapshot before we know which transport to open. The listener can
-  // still be registered synchronously — the transport just hasn't
-  // started yet, so we'll queue any incoming event to whichever
-  // listeners are present when it lands.
-  void ensureConnection();
+  // ensureConnection() spawns an async IIFE that fetches the tunnel
+  // snapshot before opening either transport. It synchronously claims a
+  // module-level `connecting` promise so a second `subscribe()` call
+  // (e.g. StrictMode dev double-invocation) can't race it and open a
+  // second transport. The listener is registered synchronously — any
+  // event arriving before the transport opens has no listeners yet, but
+  // the runtime emits state-change events, not a replay, so a brief
+  // pre-open window is acceptable.
+  ensureConnection();
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
@@ -209,3 +248,39 @@ export function useRuntimeStream(onEvent: Listener): void {
 export function __activeTransportForTests(): "sse" | "poll" | null {
   return activeTransport;
 }
+
+/**
+ * Test-only: drives the race-fix unit test in useRuntimeStream.test.ts.
+ *
+ * Returns the module-level state the test pins:
+ *   - `subscribe`: the same singleton-managed subscribe path the hook uses
+ *   - `getState`: read the current source/pollAbort/connecting/activeTransport
+ *     without race-prone direct module imports across async ticks
+ *   - `reset`: tear everything down between cases so each test starts clean
+ */
+export const __raceTestHooks = {
+  subscribe,
+  getState(): {
+    source: EventSource | null;
+    pollAbort: AbortController | null;
+    activeTransport: "sse" | "poll" | null;
+    connecting: Promise<void> | null;
+    listenerCount: number;
+  } {
+    return { source, pollAbort, activeTransport, connecting, listenerCount: listeners.size };
+  },
+  reset(): void {
+    if (source) {
+      source.close();
+      source = null;
+    }
+    if (pollAbort) {
+      pollAbort.abort();
+      pollAbort = null;
+    }
+    activeTransport = null;
+    connecting = null;
+    closeRequestedWhileConnecting = false;
+    listeners.clear();
+  }
+};
