@@ -350,7 +350,13 @@ function messagesContainToolTraffic(messages: ToolCallingMessage[]): boolean {
 // own default. Future retention tiers OpenAI adds can be passed
 // through verbatim via the same field with no code change.
 function resolvePromptCacheRetention(provider: ProviderConfig): string | undefined {
-  if (provider.promptCacheRetention === undefined) return undefined;
+  // `== null` matches both `undefined` and `null`. A persisted config.json
+  // with `promptCacheRetention: null` (hand-edit, or a JSON tool that
+  // serializes undefined as null) lands here unchanged because the load
+  // path JSON.parses without type narrowing, so widening from `===
+  // undefined` to `== null` keeps the resolver from blowing up on
+  // `.length` of null and crashing every outbound request.
+  if (provider.promptCacheRetention == null) return undefined;
   return provider.promptCacheRetention.length > 0 ? provider.promptCacheRetention : undefined;
 }
 
@@ -1553,7 +1559,10 @@ function withDeepSeekThinkingDefaults(
 // provider in by setting the field directly — useful when a new OpenAI-
 // compatible backend adds support after this code ships.
 function preservePromptCacheRetention(provider: ProviderConfig): Partial<ProviderConfig> {
-  if (provider.promptCacheRetention === undefined) return {};
+  // `== null` so a persisted `promptCacheRetention: null` survives
+  // normalize as "not set" instead of being copied through to the
+  // resolver where `.length` would throw.
+  if (provider.promptCacheRetention == null) return {};
   return { promptCacheRetention: provider.promptCacheRetention };
 }
 

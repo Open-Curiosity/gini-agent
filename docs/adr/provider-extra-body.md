@@ -4,7 +4,7 @@
 
 `ProviderConfig` carries an optional `extraBody?: Record<string, unknown>` that the runtime merges into every chat-completions request body sent by the local, openai, and openrouter providers. A reserved-key denylist guards the merge so user-supplied extras can never override fields the runtime owns. Codex (`/responses`) and echo ignore `extraBody` entirely.
 
-The CLI surfaces three new flags on `gini provider set`: `--base-url`, `--api-key-env`, `--extra-body`. They write directly into the persisted instance config. No HTTP/BFF surface for `extraBody` ships in this iteration; that is deferred.
+The CLI surfaces four flags on `gini provider set`: `--base-url`, `--api-key-env`, `--extra-body`, and `--prompt-cache-retention`. They write directly into the persisted instance config. No HTTP/BFF surface for `extraBody` ships in this iteration; that is deferred.
 
 `extraBody` is non-secret transport config. It flows through `providerHealth`, `/api/status`, and trace records. Bearer tokens belong in env vars referenced by `apiKeyEnv`, never in `extraBody`.
 
@@ -25,6 +25,7 @@ The CLI flags exist because the alternative — hand-editing `~/.gini/instances/
 - `response_format` — structured calls set this; chat-completions calls must not enable JSON mode through extraBody (it would break streaming and tool calls).
 - `functions`, `function_call` — deprecated OpenAI legacy function-calling. The runtime ignores `message.function_call` in responses, so a poisoned extraBody using the legacy schema would silently drop function results.
 - `store` — controls server-side retention of the completion. The `/responses` path pins `store: false` explicitly; chat-completions paths must stay consistent.
+- `prompt_cache_retention` — OpenAI prompt-cache retention bucket. Owned by `ProviderConfig.promptCacheRetention` via `resolvePromptCacheRetention()`. The typed field is the single source of truth for the cache bucket because extended retention (`"24h"`) is documented to be NOT Zero Data Retention eligible; letting an `extraBody.prompt_cache_retention` value silently shadow the typed override would let a careless config flip an operator's ZDR posture without any explicit action.
 - `__proto__`, `constructor`, `prototype` — JSON-loaded objects can carry these as own enumerable keys; without an explicit drop the spread would forward them to the API.
 - `toJSON` — defense-in-depth against a future internal caller constructing `ProviderConfig` programmatically with a callable `toJSON` that would replace the request body wholesale at `JSON.stringify` time.
 

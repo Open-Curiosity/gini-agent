@@ -152,10 +152,21 @@ export async function setSetupProvider(
     const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
       ? payload.baseUrl.trim()
       : undefined;
+    // Preserve `promptCacheRetention` from the existing provider config
+    // when the same provider name is being re-saved — the web setup form
+    // currently has no field for it, so without this any unrelated save
+    // (model swap, baseUrl edit) would silently strip the retention
+    // bucket the operator chose by hand. That field is ZDR-relevant per
+    // the OpenAI prompt-caching docs, so the rewrite cannot drop it.
+    const carriedRetention =
+      config.provider?.name === providerName && config.provider.promptCacheRetention !== undefined
+        ? { promptCacheRetention: config.provider.promptCacheRetention }
+        : {};
     config.provider = normalizeProvider({
       name: providerName as ProviderConfig["name"],
       model,
-      ...(baseUrl ? { baseUrl } : {})
+      ...(baseUrl ? { baseUrl } : {}),
+      ...carriedRetention
     });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 
@@ -190,7 +201,17 @@ export async function setSetupProvider(
   const model = typeof payload.model === "string" && payload.model.length > 0
     ? payload.model
     : (config.provider?.name === "codex" && config.provider.model ? config.provider.model : codexCatalog?.models[0] ?? "gpt-5.5");
-  config.provider = normalizeProvider({ name: "codex", model } as ProviderConfig);
+  // Same preservation as the env-keyed branch above — a codex re-save
+  // (e.g. model swap) shouldn't drop a `promptCacheRetention` an
+  // operator set elsewhere. The codex backend currently rejects the
+  // field, but per the ProviderConfig doc-comment the runtime is a
+  // transparent forwarder so future backend support works without code
+  // changes.
+  const carriedRetention =
+    config.provider?.name === "codex" && config.provider.promptCacheRetention !== undefined
+      ? { promptCacheRetention: config.provider.promptCacheRetention }
+      : {};
+  config.provider = normalizeProvider({ name: "codex", model, ...carriedRetention } as ProviderConfig);
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   // Codex switching DOES require a plist refresh: the gateway's config.json
   // is the source of truth for which provider it boots with, and that's
