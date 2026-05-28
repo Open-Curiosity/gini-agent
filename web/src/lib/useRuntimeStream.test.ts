@@ -187,6 +187,37 @@ describe("subscribe() singleton race fix", () => {
     expect(__raceTestHooks.getState().activeTransport).toBeNull();
   });
 
+  test("resubscribe during in-flight close reopens transport for the new subscriber", async () => {
+    // Strand scenario: subscribe A, immediately unsub A (latches
+    // closeRequestedWhileConnecting because the IIFE is still awaiting
+    // the gate), subscribe B BEFORE the gate releases. Without the
+    // listeners.size check, the IIFE would observe the latch and bail
+    // — leaving B with source/pollAbort/connecting all null and no
+    // path to ever open a transport.
+    const gate = installFetchGate();
+    const unsubA = __raceTestHooks.subscribe(() => {});
+    unsubA();
+    // The latch is now set; the IIFE hasn't run its post-await body yet.
+    expect(__raceTestHooks.getState().listenerCount).toBe(0);
+    expect(__raceTestHooks.getState().connecting).not.toBeNull();
+    // New subscriber arrives BEFORE the gate releases.
+    const unsubB = __raceTestHooks.subscribe(() => {});
+    expect(__raceTestHooks.getState().listenerCount).toBe(1);
+    // Now release the gate — the IIFE's post-await body sees the latch
+    // set AND listeners.size > 0, so it MUST proceed to open the
+    // transport for the new subscriber B.
+    gate.release({ publicUrl: "https://abc.trycloudflare.com", tunnelTransport: "sse" });
+    await __raceTestHooks.getState().connecting;
+    // B has a transport — the strand is fixed.
+    expect(eventSourceConstructions).toBe(1);
+    expect(__raceTestHooks.getState().source).not.toBeNull();
+    expect(__raceTestHooks.getState().activeTransport).toBe("sse");
+    expect(__raceTestHooks.getState().connecting).toBeNull();
+    unsubB();
+    // B is gone — connection actually closes now.
+    expect(__raceTestHooks.getState().source).toBeNull();
+  });
+
   test("two rapid subscribe() calls open exactly one poll transport", async () => {
     // Same race shape, but the snapshot picks the poll branch. Asserts the
     // poll path (the costly one — orphan retry loops) is also gated.

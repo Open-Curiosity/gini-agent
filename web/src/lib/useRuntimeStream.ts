@@ -164,10 +164,15 @@ function ensureConnection(): void {
       // quick tunnel to other clients.
       const transport = pageIsOnTunnelHost() ? await fetchTunnelTransport() : "sse";
       // If the last subscriber unmounted while we were awaiting the
-      // transport snapshot, don't open a connection at all — the
-      // closeRequestedWhileConnecting flag is the only signal we have
-      // (source/pollAbort were null when closeConnection() ran).
-      if (closeRequestedWhileConnecting) return;
+      // transport snapshot AND no fresh subscriber has arrived since,
+      // don't open a connection at all — the closeRequestedWhileConnecting
+      // flag is the only signal we have (source/pollAbort were null when
+      // closeConnection() ran). But if a NEW subscriber landed during the
+      // close (i.e. unmount → remount before the IIFE settled), honor it
+      // by proceeding to open the transport — otherwise the new
+      // subscriber is stranded with no source, no pollAbort, and no
+      // in-flight `connecting` to await once this IIFE exits.
+      if (closeRequestedWhileConnecting && listeners.size === 0) return;
       activeTransport = transport;
       if (transport === "poll") {
         openPollTransport();
@@ -182,6 +187,12 @@ function ensureConnection(): void {
 }
 
 function closeConnection(): void {
+  // Defense in depth: callers gate this on `listeners.size === 0`, but a
+  // resubscribe that races the unsubscribe could leave the listener set
+  // non-empty when we arrive here. Closing in that case would strand
+  // those subscribers — bail out and let the existing transport keep
+  // serving them.
+  if (listeners.size > 0) return;
   if (source) {
     source.close();
     source = null;
