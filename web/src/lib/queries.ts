@@ -294,6 +294,23 @@ function pageIsOnQuickTunnel(): boolean {
   return window.location.hostname.toLowerCase().endsWith(".trycloudflare.com");
 }
 
+// Merge the REST seed snapshot with whatever's already in state. A live
+// SSE/poll frame can arrive BEFORE the seed promise resolves; a naive
+// setBlocks(seed) would wipe it. For id collisions, prev (live) wins
+// because the live frame is fresher than the REST snapshot — assistant
+// streaming deltas in particular keep updating the same block id, and
+// the seed's older copy would visibly clobber the running total.
+// Exported for unit testing the merge-vs-replace behavior.
+export function mergeSeedWithLive(seed: ChatBlock[], prev: ChatBlock[]): ChatBlock[] {
+  const merged = new Map<string, ChatBlock>();
+  for (const b of seed) merged.set(b.id, b);
+  for (const b of prev) merged.set(b.id, b);
+  // Sort defensively — the server returns ordinal-asc, but a future
+  // server-side change shouldn't silently re-order the UI, and the
+  // merge can interleave seed+live arbitrarily.
+  return [...merged.values()].sort((a, b) => a.ordinal - b.ordinal);
+}
+
 // The SSE stream auto-attaches Last-Event-ID on browser-driven reconnects.
 // On open we still issue a fresh GET /blocks so a tab waking from sleep or
 // a fresh navigation gets the durable list before any live frames land.
@@ -350,10 +367,10 @@ export function useChatBlocks(sessionId: string | null) {
     api<ChatBlock[]>(`/chat/${sessionId}/blocks`)
       .then((initial) => {
         if (cancelled || activeSessionRef.current !== sessionId) return;
-        // Sort defensively — the server already returns ordinal-asc, but
-        // a future server-side change shouldn't silently re-order the UI.
-        const sorted = [...initial].sort((a, b) => a.ordinal - b.ordinal);
-        setBlocks(sorted);
+        // Merge with whatever's already in state — a live SSE/poll
+        // block can arrive BEFORE the seed promise resolves, and a
+        // plain setBlocks(sorted) would silently drop it.
+        setBlocks((prev) => mergeSeedWithLive(initial, prev));
         setIsLoading(false);
       })
       .catch((err: Error) => {
