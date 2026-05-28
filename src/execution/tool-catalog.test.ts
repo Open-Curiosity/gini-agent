@@ -57,6 +57,11 @@ const ALWAYS_ON = new Set([
   "delete_job",
   "run_job",
   "mcp_call",
+  // linear_attach_image rides alongside mcp_call. The model needs it
+  // whenever Linear is connected and the user has uploaded screenshots —
+  // gating it on a toolset toggle would silently hide the screenshot
+  // attachment path on fresh instances.
+  "linear_attach_image",
   "request_connector",
   // browser_fill_secrets is the meta-tool path for asking the user
   // to type a value into a DOM field on the agent's browser tab. It

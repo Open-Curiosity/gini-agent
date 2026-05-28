@@ -1,8 +1,8 @@
 ---
 name: linear
-description: "Read and write Linear issues, comments, projects, cycles, and users via the Linear MCP server."
+description: "Read and write Linear issues, comments, projects, cycles, and users via the Linear MCP server. Attach chat-uploaded screenshots to issues."
 license: MIT
-allowed-tools: "mcp_call read_skill"
+allowed-tools: "mcp_call linear_attach_image read_skill"
 metadata:
   gini:
     version: 1.0.0
@@ -122,6 +122,22 @@ mcp_call({ server: "linear", tool: "list_issue_statuses", arguments: { team: "EN
 
 Use these to confirm a label or status exists before passing its name to `save_issue` — otherwise Linear returns a generic validation error.
 
+### Attaching screenshots / images
+
+When the user provides images in chat and asks you to file or update a Linear issue, attach the screenshots after you know the issue identifier. The runtime exposes a dedicated tool for this — it wraps Linear's `prepare_attachment_upload` → direct file upload → `create_attachment_from_upload` flow into one call, because the model can't PUT raw upload bytes to a Linear-signed URL through `mcp_call`.
+
+Each user message that carries attachments ends with a system note listing the upload ids: `Attached image upload ids (in order): <id1>, <id2>, ...`. Pass the right id through verbatim — one tool call per image.
+
+```
+linear_attach_image({
+  issue: "LIN-123",
+  uploadId: "abc-123-...",
+  title: "Login screen — error toast"
+})
+```
+
+`title` and `subtitle` are optional; Linear defaults the attachment title to the filename when omitted. For multiple images, call the tool once per image. If the tool returns `ok: false` with an `assetUrl`, the bytes uploaded but the attachment row didn't land — you can paste the `assetUrl` into the issue body as a fallback.
+
 ### Documentation search
 
 ```
@@ -140,7 +156,7 @@ Returns the relevant Linear help-center pages. Useful when the user asks "how do
 
 ## Limitations
 
-- Read-only attachments (the MCP server returns metadata, not bytes).
+- Attachment downloads return metadata only — the MCP server doesn't stream existing attachment bytes back. Outbound uploads (chat → Linear) work via `linear_attach_image`.
 - No webhook setup — the server is request/response. For live updates, point the user at Linear's native subscriptions.
 - Bulk operations (e.g. updating 50 issues at once) must loop client-side; there is no batch tool.
 
