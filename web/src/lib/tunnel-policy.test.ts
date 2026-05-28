@@ -55,6 +55,21 @@ describe("isTunnelDenied", () => {
     expect(isTunnelDenied("/api/runtime/chat", "POST")).toBe(false);
     expect(isTunnelDenied("/api/runtime/state", "GET")).toBe(false);
   });
+
+  test("denies POST /api/runtime/push/devices — APNs registration must not be tunnelable", () => {
+    expect(isTunnelDenied("/api/runtime/push/devices", "POST")).toBe(true);
+    expect(isTunnelDenied("/api/runtime/push/devices/", "POST")).toBe(true);
+    // DELETE on a sub-path would otherwise let a leaked URL holder
+    // unregister another device; deny every write verb.
+    expect(isTunnelDenied("/api/runtime/push/devices/tok_phone", "DELETE")).toBe(true);
+    expect(isTunnelDenied("/api/runtime/push/devices", "PUT")).toBe(true);
+    expect(isTunnelDenied("/api/runtime/push/devices", "PATCH")).toBe(true);
+  });
+
+  test("allows GET /api/runtime/push/devices — read-only enumeration is safe", () => {
+    expect(isTunnelDenied("/api/runtime/push/devices", "GET")).toBe(false);
+    expect(isTunnelDenied("/api/runtime/push/devices/", "GET")).toBe(false);
+  });
 });
 
 describe("matchSecretPrefix", () => {

@@ -23,6 +23,7 @@ export function withoutTrailingSlash(path: string): string {
 
 const PAIRING_PREFIX = "/api/runtime/pairing";
 const TUNNEL_PREFIX = "/api/runtime/tunnel";
+const PUSH_DEVICES_PATH = "/api/runtime/push/devices";
 
 /** True when the request must be denied through the tunnel. Operates on the
  *  BFF-visible canonical form (`/api/runtime/<rest>`) and the request method.
@@ -60,6 +61,17 @@ export function isTunnelDenied(canonicalPath: string, method: string): boolean {
   // Pairing — minting permanent device bearers — is denied on every method.
   if (trimmed === PAIRING_PREFIX) return true;
   if (canonicalPath.startsWith(`${PAIRING_PREFIX}/`)) return true;
+  // APNs device registration writes a row into devices.db that survives
+  // tunnel disable / rotate / shutdown — there's no implicit prune. A
+  // leaked tunnel URL holder could otherwise POST /api/push/devices to
+  // pin their phone as a permanent recipient of approval_requested pushes.
+  // The legitimate registration flow runs over loopback during initial
+  // setup, not through the tunnel; deny every write verb here so the
+  // tunneled lane can't add a new device row. GET is read-only and harmless
+  // to expose if a list endpoint exists.
+  if (trimmed === PUSH_DEVICES_PATH || canonicalPath.startsWith(`${PUSH_DEVICES_PATH}/`)) {
+    if (upper !== "GET" && upper !== "HEAD") return true;
+  }
   // Bare tunnel root: only the methods the live API supports (GET for
   // the snapshot, PATCH for enable / disable / rotate / Apple Notes
   // toggle). A future POST / PUT / DELETE / etc. would otherwise pass
