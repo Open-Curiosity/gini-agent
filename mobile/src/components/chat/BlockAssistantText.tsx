@@ -1,8 +1,18 @@
 import { useEffect, useRef } from "react";
-import { Animated, Easing, StyleSheet, Text, View } from "react-native";
+import { Animated, Easing, Linking, StyleSheet, Text, View } from "react-native";
 import Markdown from "react-native-markdown-display";
 import { family, theme } from "@/src/theme";
 import type { AssistantTextBlock } from "@/src/types";
+
+type MarkdownNode = { key: string; content: string; attributes?: { href?: string } };
+type MarkdownStylesMap = Record<string, object>;
+type RuleArgs = [
+  node: MarkdownNode,
+  children: React.ReactNode,
+  parent: unknown,
+  styles: MarkdownStylesMap,
+  inheritedStyles?: object
+];
 
 // Left-aligned light-gray bubble. Mirror of the user bubble's corner
 // pattern — sharp bottom-left so the bubble points toward the agent's
@@ -26,21 +36,74 @@ export function BlockAssistantText({ block }: { block: AssistantTextBlock }) {
   );
 }
 
-// react-native-markdown-display renders raw text via the `text` rule.
-// Default rule emits a plain <Text>; override it so users can long-press
-// to select and copy portions of the message.
+// react-native-markdown-display renders inline content through several
+// `<Text>` wrappers (textgroup, link, strong, em, s, inline) plus the
+// leaf `text` rule. The defaults omit `selectable`, so on iOS the
+// long-press gesture hits the wrapper and finds nothing to copy. Override
+// every text-emitting rule so the whole chain opts in to selection.
 const selectableRules = {
-  text: (
-    node: { key: string; content: string },
-    _children: unknown,
-    _parent: unknown,
-    styles: Record<string, object>,
-    inheritedStyles: object = {}
-  ) => (
-    <Text key={node.key} style={[inheritedStyles, styles.text]} selectable>
-      {node.content}
-    </Text>
-  )
+  text: (...args: RuleArgs) => {
+    const [node, , , styles, inheritedStyles = {}] = args;
+    return (
+      <Text key={node.key} style={[inheritedStyles, styles.text]} selectable>
+        {node.content}
+      </Text>
+    );
+  },
+  textgroup: (...args: RuleArgs) => {
+    const [node, children, , styles] = args;
+    return (
+      <Text key={node.key} style={styles.textgroup} selectable>
+        {children}
+      </Text>
+    );
+  },
+  strong: (...args: RuleArgs) => {
+    const [node, children, , styles] = args;
+    return (
+      <Text key={node.key} style={styles.strong} selectable>
+        {children}
+      </Text>
+    );
+  },
+  em: (...args: RuleArgs) => {
+    const [node, children, , styles] = args;
+    return (
+      <Text key={node.key} style={styles.em} selectable>
+        {children}
+      </Text>
+    );
+  },
+  s: (...args: RuleArgs) => {
+    const [node, children, , styles] = args;
+    return (
+      <Text key={node.key} style={styles.s} selectable>
+        {children}
+      </Text>
+    );
+  },
+  inline: (...args: RuleArgs) => {
+    const [node, children, , styles] = args;
+    return (
+      <Text key={node.key} style={styles.inline} selectable>
+        {children}
+      </Text>
+    );
+  },
+  link: (...args: RuleArgs) => {
+    const [node, children, , styles] = args;
+    const href = node.attributes?.href;
+    return (
+      <Text
+        key={node.key}
+        style={styles.link}
+        selectable
+        onPress={href ? () => void Linking.openURL(href) : undefined}
+      >
+        {children}
+      </Text>
+    );
+  }
 };
 
 function StreamingCursor() {
