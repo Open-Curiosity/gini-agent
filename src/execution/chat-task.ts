@@ -695,22 +695,37 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
 // servers are intentionally omitted — the v0 stdio path is a stub and
 // surfacing it would invite the model to call something that can't
 // actually serve MCP traffic.
-function buildMcpServersBlock(state: RuntimeState): string {
+//
+// We also surface each server's cached tool NAMES (from the last
+// tools/list probe). The model uses this as the authoritative inventory
+// for what's reachable via mcp_call — skills then become "wrapper shape +
+// local glue + taste", not a hand-maintained tool catalog that drifts
+// when the upstream server adds tools. Schemas are intentionally not
+// inlined here (cost) — when the model needs argument shape, it either
+// reads the skill or calls the tool and reads the validation error.
+export function buildMcpServersBlock(state: RuntimeState): string {
   const servers = state.mcpServers.filter(
     (s) => s.status === "configured" && s.transport === "http"
   );
   if (servers.length === 0) return "";
-  const lines = servers
-    .slice()
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .map((s) => {
-      const count = s.tools?.length ?? 0;
-      const suffix = count > 0 ? ` (${count} tool${count === 1 ? "" : "s"})` : "";
-      return `- ${s.name}${suffix} — call read_skill name='${s.name}' for the curated tool reference.`;
-    });
+  const lines: string[] = [];
+  for (const s of [...servers].sort((a, b) => a.name.localeCompare(b.name))) {
+    const tools = s.tools ?? [];
+    const count = tools.length;
+    const suffix = count > 0 ? ` (${count} tool${count === 1 ? "" : "s"})` : "";
+    lines.push(`- ${s.name}${suffix} — call read_skill name='${s.name}' for usage notes.`);
+    if (count > 0) {
+      const names = tools.map((t) => t.name).sort();
+      lines.push(`  tools: ${names.join(", ")}`);
+    }
+  }
   return [
     "Configured MCP servers (use the `mcp_call` tool to invoke):",
-    ...lines
+    ...lines,
+    // Explicit default-yes posture. Without this, the model treats the
+    // skill's documented tools as exhaustive and tells the user "I can't"
+    // even when a matching tool sits on the server's tools list above.
+    "If the user asks for something not covered in a server's skill but a plausible-looking tool exists in that server's `tools:` list, try `mcp_call` with it — the server returns a validation error on bad args, which is recoverable. Do not refuse based on the skill's documented subset alone."
   ].join("\n");
 }
 

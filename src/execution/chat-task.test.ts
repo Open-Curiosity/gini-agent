@@ -29,7 +29,7 @@ import {
 } from "../state";
 import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
-import { buildAgentIdentity, buildInactiveSkillsBlock } from "./chat-task";
+import { buildAgentIdentity, buildInactiveSkillsBlock, buildMcpServersBlock } from "./chat-task";
 import type { EffectiveContext } from "./effective-context";
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
@@ -1788,5 +1788,99 @@ describe("buildInactiveSkillsBlock", () => {
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).not.toContain("ONLY correct path");
     expect(block).not.toContain("browser_navigate");
+  });
+});
+
+describe("buildMcpServersBlock", () => {
+  function stateWith(servers: RuntimeState["mcpServers"]): RuntimeState {
+    return {
+      version: 1,
+      instance: "test",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
+      connectors: [], improvements: [], pairingCodes: [], devices: [],
+      promotions: [], snapshots: [], tools: [], toolsets: [], subagents: [],
+      mcpServers: servers, messagingBridges: [], importReports: [], agents: [],
+      activeAgentId: undefined, relays: [], notifications: [], events: [],
+      jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
+      runs: [], planSteps: []
+    };
+  }
+
+  function server(name: string, tools: Array<{ name: string }>): RuntimeState["mcpServers"][number] {
+    return {
+      id: `mcp_${name}`,
+      instance: "test",
+      name,
+      command: "",
+      args: [],
+      envKeys: [],
+      status: "configured",
+      exposedTools: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      transport: "http",
+      url: "https://example.test/mcp",
+      tools
+    };
+  }
+
+  test("returns empty string when no servers are configured", () => {
+    expect(buildMcpServersBlock(stateWith([]))).toBe("");
+  });
+
+  test("lists tool names per server so the model has the full inventory", () => {
+    // The inventory line is what lets the model reach for a tool the skill
+    // never documented. Skills should not have to be re-edited every time
+    // an MCP server adds a tool.
+    const state = stateWith([
+      server("linear", [
+        { name: "list_issues" },
+        { name: "save_issue" },
+        { name: "list_initiatives" },
+        { name: "extract_images" }
+      ])
+    ]);
+    const block = buildMcpServersBlock(state);
+    expect(block).toContain("- linear (4 tools)");
+    expect(block).toContain("tools: extract_images, list_initiatives, list_issues, save_issue");
+  });
+
+  test("includes the default-yes posture instruction", () => {
+    // Without this, the model treats the skill's documented tools as
+    // exhaustive and refuses tasks for tools that actually exist on the
+    // server's inventory list.
+    const state = stateWith([server("linear", [{ name: "list_issues" }])]);
+    const block = buildMcpServersBlock(state);
+    expect(block).toContain("Do not refuse");
+    expect(block).toContain("validation error on bad args");
+  });
+
+  test("omits the per-server inventory line when a server has no cached tools yet", () => {
+    // Health probe hasn't populated tools yet — show the server but skip
+    // the inventory line so we don't lie about emptiness. (The default-yes
+    // posture sentence below still mentions the word `tools:`, so we
+    // assert on the indented inventory line specifically.)
+    const state = stateWith([server("linear", [])]);
+    const block = buildMcpServersBlock(state);
+    expect(block).toContain("- linear");
+    expect(block).not.toMatch(/^ {2}tools:/m);
+  });
+
+  test("alphabetizes both servers and their tool name lists for determinism", () => {
+    // Toolset hashes and prompt-cache stability depend on stable ordering
+    // across boots even when the order tools were registered varies.
+    const state = stateWith([
+      server("zenith", [{ name: "z_one" }, { name: "a_two" }]),
+      server("acme", [{ name: "c_one" }, { name: "a_two" }])
+    ]);
+    const block = buildMcpServersBlock(state);
+    const acmeIdx = block.indexOf("- acme");
+    const zenithIdx = block.indexOf("- zenith");
+    expect(acmeIdx).toBeGreaterThanOrEqual(0);
+    expect(zenithIdx).toBeGreaterThan(acmeIdx);
+    expect(block).toContain("tools: a_two, c_one");
+    expect(block).toContain("tools: a_two, z_one");
   });
 });
