@@ -72,7 +72,6 @@ import { projectRoot, webPortPath } from "./paths";
 import { existsSync, readFileSync } from "node:fs";
 import { tunnelManager, bootstrapUrl, renderQrSvg, renderQrAnsi } from "./runtime/tunnel";
 import type { RedactedTunnelSnapshot, TunnelSnapshot } from "./runtime/tunnel/types";
-import { isSupervisedWebChild } from "./runtime/health-probe";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
@@ -108,11 +107,13 @@ function readWebPort(instance: string): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-// `isSupervisedWebChild` extracted to `./runtime/health-probe` so the
-// TunnelManager can re-run the same identity check inside its apply
-// chain — closing the port-recycle race where the supervised Next.js
-// child dies between this handler's probe and the manager's cloudflared
-// spawn and an opportunistic local process binds the freed port.
+// `isSupervisedWebChild` lives in `./runtime/health-probe` and the
+// TunnelManager runs it inside its apply chain (swapCloudflared) as
+// the sole probe per enable transition. The PATCH /api/tunnel
+// handler no longer runs a pre-probe of its own — that would land
+// outside the apply chain and let concurrent enable/disable PATCH
+// requests reorder against the queue, silently overwriting the
+// later-issued operation.
 
 export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
   const routes: Array<[string, RegExp, Handler]> = [
@@ -134,19 +135,26 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         if (payload.enabled) {
           const port = readWebPort(config.instance);
           if (!port) return json({ error: "Web port unknown; start `gini run` first." }, 409);
-          // Symmetric with the boot reconcile in src/server.ts — probe
-          // /__healthz on the candidate port and verify the response
-          // identifies the supervised Next.js child by instance name
-          // before exposing the port via cloudflared. Without this a
-          // stale web.port file (e.g., from a partially-cleaned previous
-          // run) or a port-squat from an unrelated local process would
-          // be published to the public URL.
-          const healthy = await isSupervisedWebChild(config.instance, port);
-          if (!healthy) {
-            return json({ error: "Web port not healthy. Check `gini status` and retry." }, 409);
-          }
+          // Health probe lives INSIDE the manager's apply chain
+          // (swapCloudflared). The previous version probed here before
+          // calling enable(), which created an ordering race: two
+          // PATCH requests issued in close succession (enable then
+          // disable) could land out of order because the enable's
+          // pre-probe await happens BEFORE the manager's queue slot,
+          // while disable's body parse is fast and disable enters the
+          // queue first. The later-issued disable then loses to the
+          // earlier-issued enable's probe-then-queue path, silently
+          // re-enabling a tunnel the operator just disabled. Calling
+          // mgr.enable() synchronously after body parse keeps queue
+          // arrival order = request order, so the later disable
+          // wins. The not-healthy 409 is preserved by detecting
+          // swapCloudflared's "web port ... not healthy" sentinel
+          // in the manager's error payload.
           const result = await mgr.enable(port);
-          if (!result.ok) return json({ error: result.error }, 500);
+          if (!result.ok) {
+            const notHealthy = typeof result.error === "string" && result.error.includes("not healthy");
+            return json({ error: result.error }, notHealthy ? 409 : 500);
+          }
         } else {
           const result = await mgr.disable();
           if (!result.ok) return json({ error: result.error }, 500);
