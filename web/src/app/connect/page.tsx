@@ -9,6 +9,8 @@
 // flips to true. That is the only reliable cross-version way to detect a
 // successful scheme handoff from a web page.
 
+import { headers } from "next/headers";
+import { redirect } from "next/navigation";
 import { ConnectClient } from "./ConnectClient";
 
 type SearchParams = Record<string, string | string[] | undefined>;
@@ -82,6 +84,20 @@ function clampMs(value: string | undefined, fallback: number): number {
   return Math.max(250, Math.min(10_000, Math.floor(n)));
 }
 
+// The deep-link interstitial only makes sense on platforms that can route
+// a custom URL scheme (`gini://`) to an installed app. On a desktop
+// browser the scheme handoff is guaranteed to fail and the "Opening
+// Gini…" placeholder is just noise before the timed fallback ships the
+// user to the web app. Server-render a `redirect()` to `webUrl` directly
+// when the User-Agent isn't iOS / iPadOS / Android so the operator never
+// sees the interstitial flicker — the mobile path keeps the existing
+// scheme handoff + fallback machinery.
+const MOBILE_UA_PATTERN = /\b(iPhone|iPad|iPod|Android)\b/i;
+function userAgentLooksMobile(ua: string | null | undefined): boolean {
+  if (!ua) return false;
+  return MOBILE_UA_PATTERN.test(ua);
+}
+
 export default async function ConnectPage({
   searchParams,
 }: {
@@ -93,6 +109,17 @@ export default async function ConnectPage({
   const token = validateToken(singleParam(params.token));
   const scheme = validateScheme(singleParam(params.scheme), DEFAULT_SCHEME);
   const fallbackMs = clampMs(singleParam(params.ms), DEFAULT_FALLBACK_MS);
+
+  if (webUrl) {
+    const requestHeaders = await headers();
+    const ua = requestHeaders.get("user-agent");
+    if (!userAgentLooksMobile(ua)) {
+      // Desktop / unknown UA — the deep-link can't succeed, so skip the
+      // interstitial and ship straight to the web app. `redirect()`
+      // throws past the rest of the render, so nothing else executes.
+      redirect(webUrl);
+    }
+  }
 
   if (!apiUrl || !webUrl) {
     return (
