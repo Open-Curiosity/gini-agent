@@ -13,7 +13,13 @@ const FORWARD_HEADERS = new Set([
   "accept",
   "cache-control",
   "last-event-id",
-  "x-device-token"
+  "x-device-token",
+  // Forward the proxy-stamped tunnel marker so the runtime can tag
+  // tunneled writes (e.g. push-device registration rows) and revoke
+  // them on rotate / disable. The proxy strips any inbound value
+  // before stamping its own, so the runtime only ever observes the
+  // proxy-emitted "1".
+  "x-gini-tunnel-vetted"
 ]);
 
 // Cache the file-read values across requests but invalidate on mtime change,

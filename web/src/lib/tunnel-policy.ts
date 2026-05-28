@@ -21,7 +21,6 @@ export function withoutTrailingSlash(path: string): string {
 
 const PAIRING_PREFIX = "/api/runtime/pairing";
 const TUNNEL_PREFIX = "/api/runtime/tunnel";
-const PUSH_DEVICES_PATH = "/api/runtime/push/devices";
 
 /** True when the request must be denied through the tunnel. Operates on the
  *  BFF-visible canonical form (`/api/runtime/<rest>`) and the request method.
@@ -35,6 +34,13 @@ const PUSH_DEVICES_PATH = "/api/runtime/push/devices";
  *    DENY. Minting device bearers from a tunneled session is a real
  *    privilege escalation — a leaked URL holder must not be able to
  *    walk it forward into a permanent device token.
+ *  - APNs device registration (`/api/runtime/push/devices`): ALLOW. Rows
+ *    inserted through the tunnel are tagged `origin = 'tunnel'` on the
+ *    runtime side and wiped whenever the operator rotates the secret or
+ *    disables the tunnel. The tunneled lane is the legitimate path for a
+ *    QR-onboarded iPhone to register for approval_requested pushes; the
+ *    purge on rotate/disable is what bounds a leaked URL holder's
+ *    subscription window.
  *  - Tunnel root (`/api/runtime/tunnel`, all methods): ALLOW. GET returns
  *    the privileged snapshot; PATCH lets the tunneled view enable /
  *    disable / rotate-secret / toggle Apple Notes through the confirm
@@ -59,17 +65,6 @@ export function isTunnelDenied(canonicalPath: string, method: string): boolean {
   // Pairing — minting permanent device bearers — is denied on every method.
   if (trimmed === PAIRING_PREFIX) return true;
   if (canonicalPath.startsWith(`${PAIRING_PREFIX}/`)) return true;
-  // APNs device registration writes a row into devices.db that survives
-  // tunnel disable / rotate / shutdown — there's no implicit prune. A
-  // leaked tunnel URL holder could otherwise POST /api/push/devices to
-  // pin their phone as a permanent recipient of approval_requested pushes.
-  // The legitimate registration flow runs over loopback during initial
-  // setup, not through the tunnel; deny every write verb here so the
-  // tunneled lane can't add a new device row. GET is read-only and harmless
-  // to expose if a list endpoint exists.
-  if (trimmed === PUSH_DEVICES_PATH || canonicalPath.startsWith(`${PUSH_DEVICES_PATH}/`)) {
-    if (upper !== "GET" && upper !== "HEAD") return true;
-  }
   // Bare tunnel root: only the methods the live API supports (GET for
   // the snapshot, PATCH for enable / disable / rotate / Apple Notes
   // toggle). A future POST / PUT / DELETE / etc. would otherwise pass

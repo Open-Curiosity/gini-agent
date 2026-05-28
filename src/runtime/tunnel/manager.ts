@@ -1,5 +1,5 @@
 import type { RuntimeConfig } from "../../types";
-import { appendLog } from "../../state";
+import { appendLog, purgeTunnelDevices } from "../../state";
 import { setRedactionPublicUrl, setRedactionSecret, redact } from "./redact";
 import { launchCloudflared, type CloudflaredLaunch } from "./cloudflared";
 import { probeNotesAvailable, writeNote, clearNote } from "./apple-notes";
@@ -645,7 +645,16 @@ class TunnelManager {
       };
       setRedactionPublicUrl(null);
       try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
-      appendLog(this.config.instance, "tunnel.disabled", { generation: this.generation });
+      // Wipe every push-device row tagged as tunneled. With the tunnel
+      // off, those rows refer to APNs subscriptions that can never be
+      // reached again (the public URL is gone); leaving them lets the
+      // dispatcher keep trying to deliver to dead devices and gives a
+      // leaked-bootstrap holder a permanent subscription window.
+      const purgedOnDisable = purgeTunnelDevices(this.config.instance);
+      appendLog(this.config.instance, "tunnel.disabled", {
+        generation: this.generation,
+        tunnelDevicesPurged: purgedOnDisable.deleted
+      });
       if (errorMsg) return { ok: false, error: redact(errorMsg) };
       return { ok: true, snapshot: this.snapshot };
     });
@@ -733,7 +742,17 @@ class TunnelManager {
         // If no tunnel was running, the pre-stamp above is the only
         // snapshot update we need — publicUrl stays null, secret +
         // revision reflect the rotation.
-        appendLog(this.config.instance, "tunnel.secret-rotated", { recycled: didRecycle });
+        // Wipe every tunneled push-device row. The QR-bootstrap that
+        // produced these subscriptions is no longer valid (the secret
+        // moved on disk + the cookie/header binding the device used now
+        // mismatches the live config). Forcing re-registration against
+        // the new bootstrap is the only way a leaked URL holder loses
+        // their APNs subscription window.
+        const purgedOnRotate = purgeTunnelDevices(this.config.instance);
+        appendLog(this.config.instance, "tunnel.secret-rotated", {
+          recycled: didRecycle,
+          tunnelDevicesPurged: purgedOnRotate.deleted
+        });
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

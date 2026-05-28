@@ -95,9 +95,10 @@ export {
   listAllDevices,
   getDevice,
   removeDevice,
-  removeDeviceForCredential
+  removeDeviceForCredential,
+  purgeTunnelDevices
 } from "./devices";
-export type { PushDevice, UpsertDeviceInput } from "./devices";
+export type { PushDevice, UpsertDeviceInput, DeviceOrigin } from "./devices";
 export {
   addSseSubscription,
   isDeviceWatching,

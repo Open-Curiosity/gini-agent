@@ -841,11 +841,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!token) return json({ error: "token is required" }, 400);
       if (platform !== "ios") return json({ error: "platform must be 'ios'" }, 400);
       if (!bundleId) return json({ error: "bundleId is required" }, 400);
+      // The BFF forwards the proxy-stamped `x-gini-tunnel-vetted: 1`
+      // marker on tunneled requests. We tag the resulting row with its
+      // origin so rotateSecret / disable can purge every tunneled
+      // registration without disturbing loopback rows.
+      const origin = request.headers.get("x-gini-tunnel-vetted") === "1" ? "tunnel" : "loopback";
       const device = upsertDevice(config.instance, {
         token,
         credentialId: credential,
         platform: "ios",
-        bundleId
+        bundleId,
+        origin
       });
       return json({ ok: true, device });
     }],
