@@ -377,6 +377,14 @@ class TunnelManager {
     return promise;
   }
 
+  // Manual test path for the boot-reconcile rollback guard (no unit test —
+  // the rollback branch wraps swapCloudflared which depends on cloudflared
+  // spawn + banner parse, both of which would need invasive mocks to drive
+  // synthetically): persist `tunnel.enabled:true` in config, rename the
+  // cloudflared binary out of PATH (or move the listener web port), boot
+  // the gateway, observe that the reconcile attempt fails AND that
+  // tunnel.enabled on disk is still true after the failure. Restart
+  // proves the persisted intent survives so the next reboot retries.
   async enable(webPort: number, opts: { reconcileOnly?: boolean } = {}): Promise<TunnelTransitionResult> {
     // Remember the port so rotateSecret can recycle without needing the
     // caller to thread it back through. Set OUTSIDE the queue so the
@@ -417,8 +425,18 @@ class TunnelManager {
         const result = await this.swapCloudflared(webPort, persisted.secret);
         if (!result.ok) {
           // Roll back enabled:true so the next gateway boot doesn't see a
-          // stale enable claim with no live tunnel.
-          try { this.persistTunnel({ enabled: false }); } catch { /* best-effort */ }
+          // stale enable claim with no live tunnel — but ONLY for operator-
+          // driven enables. On the boot-reconcile path the operator's
+          // persisted intent was already enabled:true; a transient
+          // cloudflared spawn failure (binary missing, banner timeout,
+          // port flaky) must NOT silently overwrite that intent. Leaving
+          // disk's enabled:true intact lets the next reboot retry the
+          // tunnel. The in-memory snapshot still reflects the failure so
+          // the UI / status can show the degraded state until the next
+          // attempt.
+          if (!opts.reconcileOnly) {
+            try { this.persistTunnel({ enabled: false }); } catch { /* best-effort */ }
+          }
           this.snapshot = { ...this.snapshot, enabled: false };
           appendLog(this.config.instance, "tunnel.enable.error", { error: result.error });
           return result;
@@ -440,8 +458,13 @@ class TunnelManager {
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
         // Outer-catch covers config-write failure before launch — keep the
-        // persisted state consistent with the in-memory snapshot.
-        try { this.persistTunnel( { enabled: false }); } catch { /* best-effort */ }
+        // persisted state consistent with the in-memory snapshot. Same
+        // boot-reconcile guard as the inner branch above: a transient
+        // failure during the reconcile path must not disarm the operator's
+        // persisted enable intent.
+        if (!opts.reconcileOnly) {
+          try { this.persistTunnel( { enabled: false }); } catch { /* best-effort */ }
+        }
         const msg = err instanceof Error ? err.message : String(err);
         this.snapshot = {
           ...this.snapshot,
