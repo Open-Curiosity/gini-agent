@@ -8,14 +8,15 @@ const PLACEHOLDER = "<redacted-secret>";
 const TRYCLOUDFLARE_HOSTNAME_SUFFIX = "trycloudflare.com";
 const ROTATION_TIME_FLOOR_MS = 30_000;
 
+// Eviction from the rotation ring is purely time-based: a prior secret stays
+// in the redaction set until ROTATION_TIME_FLOOR_MS has elapsed since its
+// rotatedAt commit. In-flight request tracking is not implemented — no caller
+// increments or decrements per-secret reference counts, so the redaction
+// window is bounded only by the time floor.
 interface PriorSecret {
   value: string;
   /** ms timestamp at which this secret was rotated out (commit). */
   rotatedAt: number;
-  /** Count of in-flight requests captured at the rotation commit. Decrement
-   *  as those requests finish; the secret only leaves the redaction set when
-   *  this hits 0 AND ROTATION_TIME_FLOOR_MS has elapsed since rotatedAt. */
-  inFlight: number;
 }
 
 // Module-level singleton state. Initialized via setRedactionSecret() on
@@ -35,7 +36,7 @@ const state: {
 export function setRedactionSecret(secret: string | null): void {
   if (state.current === secret) return;
   if (state.current) {
-    state.prior.push({ value: state.current, rotatedAt: Date.now(), inFlight: 0 });
+    state.prior.push({ value: state.current, rotatedAt: Date.now() });
   }
   state.current = secret;
 }
@@ -45,10 +46,7 @@ export function setRedactionPublicUrl(url: string | null): void {
 }
 
 function pruneRotationRing(now: number = Date.now()): void {
-  state.prior = state.prior.filter((entry) => {
-    if (entry.inFlight > 0) return true;
-    return now - entry.rotatedAt < ROTATION_TIME_FLOOR_MS;
-  });
+  state.prior = state.prior.filter((entry) => now - entry.rotatedAt < ROTATION_TIME_FLOOR_MS);
 }
 
 /** Replace every occurrence of the redaction targets in `input` with the
