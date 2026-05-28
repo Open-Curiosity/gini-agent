@@ -1,6 +1,6 @@
 import { Feather } from "@expo/vector-icons";
 import { useState } from "react";
-import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import { ActivityIndicator, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { family, theme } from "@/src/theme";
 import type { ToolCallBlock, ToolResultBlock } from "@/src/types";
 import { iconForTool } from "./tool-icons";
@@ -13,6 +13,11 @@ import { iconForTool } from "./tool-icons";
 // so no chevron / status dot — the new style relies on the icon to
 // indicate what kind of tool ran.
 //
+// While a tool is still executing (status === "running" with no result
+// yet), a small ActivityIndicator sits at the end of the row so a long
+// dispatch (e.g. wait_for_messaging_pair polling for an inbound DM)
+// reads as in-progress instead of looking finished.
+//
 // On error / denied the row gets a red error string below.
 
 export function BlockToolCall({
@@ -24,6 +29,7 @@ export function BlockToolCall({
 }) {
   const [expanded, setExpanded] = useState(false);
   const failed = block.status === "error" || block.status === "denied";
+  const running = block.status === "running" && !result;
   const canExpand = Boolean(result);
   const icon = iconForTool(block.toolName);
   return (
@@ -46,6 +52,14 @@ export function BlockToolCall({
               {block.argsPreview}
             </Text>
           </View>
+        ) : null}
+        {running ? (
+          <ActivityIndicator
+            size="small"
+            color={theme.toolIcon}
+            accessibilityLabel="Running"
+            style={styles.spinner}
+          />
         ) : null}
       </TouchableOpacity>
       {failed && block.errorMessage ? (
@@ -102,6 +116,9 @@ const styles = StyleSheet.create({
     color: theme.codeChipText,
     fontFamily: family("JetBrainsMono"),
     fontSize: 12
+  },
+  spinner: {
+    flexShrink: 0
   },
   errorMessage: {
     color: theme.danger,
