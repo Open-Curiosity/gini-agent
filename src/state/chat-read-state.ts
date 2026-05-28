@@ -223,3 +223,38 @@ export function unreadCountForDevice(
     .get(deviceToken);
   return row?.unread ?? 0;
 }
+
+// Per-session unread counts for the device — same accounting as
+// unreadCountForDevice, but grouped so the mobile chat list can render
+// a badge per row instead of the cross-session total. Sessions with
+// zero unread blocks are omitted from the map (callers can default to
+// 0). A single SQL trip mirrors the aggregate query so the list
+// endpoint's render cost stays flat regardless of session count.
+export function unreadCountsByDevice(
+  instance: Instance,
+  deviceToken: string
+): Map<string, number> {
+  const db = getMemoryDb(instance);
+  const kindList = COUNTABLE_KINDS.map((k) => `'${k}'`).join(",");
+  const rows = db
+    .query<{ session_id: string; unread: number }, [string]>(
+      `WITH cursor_ordinals AS (
+         SELECT crs.session_id, cb.ordinal AS cutoff_ordinal
+         FROM chat_read_state crs
+         LEFT JOIN chat_blocks cb ON cb.id = crs.last_read_block_id
+         WHERE crs.device_token = ?
+       )
+       SELECT b.session_id, COUNT(*) AS unread
+       FROM chat_blocks b
+       LEFT JOIN cursor_ordinals co ON co.session_id = b.session_id
+       WHERE b.kind IN (${kindList})
+         AND b.ordinal > COALESCE(co.cutoff_ordinal, -1)
+       GROUP BY b.session_id`
+    )
+    .all(deviceToken);
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    if (row.unread > 0) counts.set(row.session_id, row.unread);
+  }
+  return counts;
+}
