@@ -49,12 +49,20 @@ const NOTES_FOLDER = "gini";
 // HEAD the publicUrl on an interval; only a thrown fetch (DNS failure,
 // connection refused, timeout) counts as unreachable. ANY resolved HTTP
 // response — including 404 / 530 / 502 — means the edge is still routing
-// us, so it counts as reachable. Detection only: after the threshold of
-// consecutive failures the snapshot flips into the existing `degraded`
-// shape (enabled && publicUrl === null && lastError set), the publicUrl
-// sibling file is removed, and the probe stops. Recovery is operator-
-// driven (manual recycle) — silent auto-rotation is forbidden per the
-// "rotation never happens implicitly" contract.
+// us, so it counts as reachable. After EDGE_PROBE_FAILURE_THRESHOLD
+// consecutive failures the manager automatically recycles cloudflared:
+// the secret stays stable (only the trycloudflare hostname rotates), so
+// the "rotation never happens implicitly" contract still holds —
+// rotation means SECRET rotation, and that remains operator-driven. Once
+// the recycle stamps a fresh publicUrl, runRefreshNotes fires fire-and-
+// forget so the iCloud Notes mirror reflects the live bootstrap URL
+// without operator action. Apple Notes is the operator-facing
+// propagation channel for hostname changes — the phone re-reads the
+// note to pick up the new URL. If we have no lastWebPort to bind
+// against, or the recycle fails, the snapshot falls back to the
+// degraded shape (enabled && publicUrl === null && lastError set), the
+// publicUrl sibling file is removed, and the probe stops so an operator
+// can intervene.
 const EDGE_PROBE_INTERVAL_MS = 120_000;
 const EDGE_PROBE_TIMEOUT_MS = 8_000;
 const EDGE_PROBE_FAILURE_THRESHOLD = 3;
@@ -835,11 +843,11 @@ class TunnelManager {
     );
     this.edgeProbeFailures = failures;
     if (!dead) return;
-    // Re-validate before stamping degraded. Between the await and now a
-    // rotate-secret recycle could have swapped publicUrl, a disable
-    // could have nulled it, or SIGTERM could have started the drain.
-    // Flipping the snapshot in any of those races would clobber a
-    // fresh, healthy state with a stale failure count.
+    // Re-validate before reacting. Between the await and now a rotate-
+    // secret recycle could have swapped publicUrl, a disable could have
+    // nulled it, or SIGTERM could have started the drain. Reacting in
+    // any of those races would clobber a fresh, healthy state with a
+    // stale failure count.
     if (
       gen !== this.generation ||
       this.shuttingDown ||
@@ -848,20 +856,87 @@ class TunnelManager {
     ) {
       return;
     }
-    try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
-    setRedactionPublicUrl(null);
-    this.snapshot = {
-      ...this.snapshot,
-      publicUrl: null,
-      lastError: redact(
-        `tunnel unreachable at the Cloudflare edge after ${failures} consecutive probes — the quick-tunnel hostname likely expired; recycle to restore`
-      )
-    };
-    appendLog(this.config.instance, "tunnel.edge-unreachable", { failures });
-    // Stop polling now that we've flipped to degraded — publicUrl is
-    // null, so further probes would no-op anyway, and the operator-
-    // driven recycle is what restores the tunnel.
-    this.stopEdgeProbe();
+    // Auto-recycle path: capture the values we need before we yield the
+    // event loop, then enqueue the swap so it serializes against any
+    // concurrent enable / disable / rotateSecret. The integration path
+    // (probe → enqueue → swapCloudflared → runRefreshNotes) is covered
+    // by manual + CHECKLIST live testing rather than a unit test —
+    // testing it would require fake timers plus an invasive
+    // swapCloudflared mock in this single-class structure.
+    const deadUrl = this.snapshot.publicUrl;
+    const port = this.lastWebPort;
+    const genBeforeRecycle = this.generation;
+    const priorFailures = failures;
+    appendLog(this.config.instance, "tunnel.edge-unreachable.recycling", { deadUrl, failures });
+    if (port === null) {
+      // No port to bind against — we never observed a successful enable
+      // with a webPort, so we can't safely respawn cloudflared. Fall
+      // back to the original degraded behavior and let the operator
+      // intervene.
+      try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+      setRedactionPublicUrl(null);
+      this.snapshot = {
+        ...this.snapshot,
+        publicUrl: null,
+        lastError: redact(
+          `tunnel unreachable at the Cloudflare edge after ${failures} consecutive probes — the quick-tunnel hostname likely expired; recycle to restore`
+        )
+      };
+      appendLog(this.config.instance, "tunnel.edge-unreachable.no-port", { failures });
+      this.stopEdgeProbe();
+      return;
+    }
+    void this.enqueue(async () => {
+      // Re-validate inside the queue slot — a concurrent disable /
+      // rotateSecret / re-enable that ran ahead of us would have bumped
+      // the generation, flipped shuttingDown, or toggled enabled.
+      if (
+        this.generation !== genBeforeRecycle ||
+        this.shuttingDown ||
+        !this.snapshot.enabled
+      ) {
+        appendLog(this.config.instance, "tunnel.edge-unreachable.recycle-aborted", { reason: "superseded" });
+        return;
+      }
+      // Pull secret from disk — TunnelPersistedConfig.secret is `string`
+      // (always present), unlike TunnelSnapshot.secret which is
+      // `string | null`. Disk is the source of truth for the live
+      // secret anyway, and reading inside the queue slot means we
+      // capture the value any concurrent rotateSecret would have
+      // already committed.
+      const secret = this.readPersisted().secret;
+      const swap = await this.swapCloudflared(port, secret);
+      if (!swap.ok) {
+        const swapError = swap.error ?? "unknown swap failure";
+        try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+        setRedactionPublicUrl(null);
+        this.snapshot = {
+          ...this.snapshot,
+          publicUrl: null,
+          lastError: redact(`tunnel unreachable; auto-recycle failed: ${swapError}`)
+        };
+        appendLog(this.config.instance, "tunnel.edge-unreachable.recycle-failed", { error: redact(swapError) });
+        this.stopEdgeProbe();
+        return;
+      }
+      // swapCloudflared already called startEdgeProbe(), which zeros the
+      // failure count for the new URL — keep this assignment as a belt-
+      // and-suspenders guard so a future refactor of startEdgeProbe
+      // can't silently leave us counting against a fresh hostname.
+      this.edgeProbeFailures = 0;
+      appendLog(this.config.instance, "tunnel.edge-unreachable.recycled", {
+        newUrl: this.snapshot.publicUrl,
+        priorFailures
+      });
+      // Fire-and-forget Notes refresh so iCloud reflects the new
+      // bootstrap URL without operator action — the phone re-reads the
+      // note to find the live hostname. Same pattern as enable() /
+      // rotateSecret().
+      if (this.snapshot.appleNotes.enabled && this.notesAvailable) {
+        const scheduledGeneration = this.generation;
+        void this.runRefreshNotes(scheduledGeneration).catch(() => { /* surfaced in appleNotes.lastError */ });
+      }
+    }).catch(() => { /* surfaced in snapshot.lastError + appendLog above */ });
   }
 
   private notesNoteName(): string {
