@@ -109,7 +109,7 @@ Usage:
   bun run gini notifications list|queue|send|ack
   bun run gini promotions list|propose|approve|reject
   bun run gini snapshots list|create|restore
-  bun run gini provider show|catalog|set echo|openai|codex|openrouter|local [model]
+  bun run gini provider show|catalog|set echo|openai|codex|openrouter|local|deepseek [model]
                   [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]
                   [--prompt-cache-retention <value>]
                   --base-url and --api-key-env work for local / openai /
