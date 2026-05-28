@@ -151,7 +151,13 @@ describe("provider CLI", () => {
   // Echo bypasses HTTP entirely and ignores all three. These tests pin
   // the warning surface so the precise per-provider behavior can't drift.
 
-  test("echo provider warns for ALL three flags (none of them apply)", async () => {
+  test("echo provider warns for every ignored flag (none of them apply)", async () => {
+    // Echo bypasses HTTP entirely, so every flag that configures a
+    // wire request (--base-url, --api-key-env, --extra-body,
+    // --prompt-cache-retention) should be reported as ignored. Pin
+    // each flag explicitly so a future ignored-list entry that drops
+    // a flag (or a future flag added to ignored without being added
+    // to this assertion) gets caught here.
     const captured: string[] = [];
     const original = process.stderr.write.bind(process.stderr);
     process.stderr.write = ((chunk: unknown) => {
@@ -163,7 +169,8 @@ describe("provider CLI", () => {
         "provider", "set", "echo", "gini-echo-v0",
         "--base-url", "http://x/v1",
         "--api-key-env", "FOO",
-        "--extra-body", "{}"
+        "--extra-body", "{}",
+        "--prompt-cache-retention", "24h"
       ]);
       await provider(ctx);
     } finally {
@@ -173,6 +180,7 @@ describe("provider CLI", () => {
     expect(msg).toContain("--base-url");
     expect(msg).toContain("--api-key-env");
     expect(msg).toContain("--extra-body");
+    expect(msg).toContain("--prompt-cache-retention");
     expect(msg).toContain("echo provider");
   });
 
