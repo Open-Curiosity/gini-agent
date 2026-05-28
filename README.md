@@ -127,6 +127,18 @@ gini smoke                  # ephemeral instance under /tmp
 
 Multiple agents can run smoke tests concurrently without colliding.
 
+## Mobile tunnel
+
+Expose the running gateway over a Cloudflare quick tunnel so your phone can reach it:
+
+```bash
+gini tunnel enable          # spawn cloudflared + mint a bootstrap URL
+gini tunnel qr              # render an ASCII QR for the URL
+gini tunnel disable         # stop cloudflared + clear the URL
+```
+
+Install `cloudflared` first: `brew install cloudflared` (macOS), `sudo apt install cloudflared` (Linux), or `scoop install cloudflared` (Windows). See [tunnel-and-mobile-access.md](docs/adr/tunnel-and-mobile-access.md) for the trust boundary, secret rotation, and Bearer-auth contract.
+
 ## Local State
 
 ```text

@@ -21,9 +21,28 @@ function asSnapshot(value: unknown): TunnelSnapshot {
 // All subcommands talk to the running runtime HTTP API. The gateway must be
 // up — start it with `gini run` (or `gini start` in daemon mode) first.
 
+const HELP_TEXT = `Usage: gini tunnel <subcommand>
+
+Subcommands:
+  status                   Print the current tunnel snapshot (default).
+  qr                       Render an ASCII QR for the bootstrap URL and the URL itself.
+  enable                   Spawn cloudflared, mint a bootstrap URL, and persist intent.
+  disable                  Stop cloudflared and clear the bootstrap URL.
+  rotate-secret            Mint a fresh 192-bit secret atomically and recycle cloudflared.
+  sync-notes               Force the iCloud Notes mirror to refresh now.
+  apple-notes <on|off>     Toggle the iCloud Notes mirror.
+
+Prerequisite: cloudflared must be installed (brew install cloudflared / sudo apt install cloudflared / scoop install cloudflared).
+`;
+
 export async function tunnel(ctx: CliContext): Promise<void> {
   const { config, cliArgs } = ctx;
   const sub = cliArgs[1] ?? "status";
+
+  if (sub === "--help" || sub === "-h" || sub === "help") {
+    process.stdout.write(HELP_TEXT);
+    return;
+  }
 
   switch (sub) {
     case "status": {
