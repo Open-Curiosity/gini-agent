@@ -278,7 +278,7 @@ function isLoopbackHost(host: string): boolean {
 // that mints device tokens were previously un-guarded and DNS-rebindable.
 const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
-function guardCsrf(request: Request, _pathSegments: string[]): Response | null {
+export function guardCsrf(request: Request, _pathSegments: string[]): Response | null {
   const origin = request.headers.get("origin");
   const isUnsafe = UNSAFE_METHODS.has(request.method);
   // The proxy stamps `x-gini-tunnel-vetted: 1` only after passing its own
@@ -290,7 +290,13 @@ function guardCsrf(request: Request, _pathSegments: string[]): Response | null {
   // independently — see PLAN.md "CSRF policy".
   const vetted = request.headers.get("x-gini-tunnel-vetted") === "1";
   if (!origin) {
-    if (isUnsafe) {
+    // Mobile React Native fetch never sends Origin. When the proxy has
+    // already vetted the inbound request (Host classifier + cookie/Bearer
+    // secret compare) and stamped the marker, an unsafe-method POST without
+    // Origin is legitimate — accept it before the Origin-required gate
+    // rejects every tunneled POST. The Sec-Fetch-Site check below still
+    // fires for vetted requests that happen to carry the header.
+    if (isUnsafe && !vetted) {
       return Response.json({ error: "Forbidden" }, { status: 403 });
     }
     // Safe method (GET/HEAD) without Origin. Browsers may omit Origin on
