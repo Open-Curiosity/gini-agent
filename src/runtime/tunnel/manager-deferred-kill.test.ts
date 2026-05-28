@@ -47,20 +47,29 @@ class TestManager {
   }
 
   /** Mirrors the disable() shape after the fix: stamp synchronously,
-   *  detach the kill, return. */
+   *  detach the kill, return. Production-side detached kill is wrapped
+   *  in a setImmediate so the kill lands on a macrotask, after the IO
+   *  turn that flushes the response. This test model uses the same
+   *  shape so the macrotask-ordering test below can pin the contract. */
   disable(): Promise<{ ok: true }> {
     return this.enqueue(async () => {
       this.events.push("disable:return");
       if (this.cloudflared) {
         const prev = this.cloudflared;
         this.cloudflared = null;
-        this.pendingKill = this.pendingKill.then(async () => {
-          this.events.push("disable:kill-start");
-          try {
-            await prev.stop();
-          } catch { /* swallow */ }
-          this.events.push("disable:kill-end");
-        });
+        this.pendingKill = this.pendingKill.then(
+          () => new Promise<void>((resolve) => {
+            setImmediate(() => {
+              this.events.push("disable:kill-start");
+              prev.stop()
+                .catch(() => { /* swallow */ })
+                .finally(() => {
+                  this.events.push("disable:kill-end");
+                  resolve();
+                });
+            });
+          }),
+        );
       }
       return { ok: true };
     });
@@ -168,6 +177,63 @@ describe("TunnelManager deferred-kill ordering", () => {
     const spawnIdx = mgr.events.indexOf("enable:spawn");
     expect(killEndIdx).toBeGreaterThanOrEqual(0);
     expect(spawnIdx).toBeGreaterThan(killEndIdx);
+  });
+
+  test("kill is scheduled on the macrotask queue, after a microtask drain — IO turn ordering", async () => {
+    // Pins the macrotask scheduling invariant. A future regression to
+    // a bare `.then()` chain would run the kill on the microtask queue,
+    // which fires before the IO turn that flushes the response body.
+    // setImmediate runs after that IO turn. The contract this test
+    // pins: any microtask queued AT THE SAME TIME as the disable's
+    // kill schedule must complete BEFORE the kill starts.
+    const mgr = new TestManager();
+    const stopGate = Promise.withResolvers<void>();
+    mgr.setCloudflared({
+      stop: async () => {
+        await stopGate.promise;
+      }
+    });
+
+    const order: string[] = [];
+    await mgr.disable();
+    // Queue a microtask immediately after the disable's apply slot
+    // returns. The disable's pendingKill chain has been scheduled by
+    // now; if the kill ran on the microtask queue, this Promise.resolve
+    // callback would fire AFTER kill-start. With setImmediate, kill-start
+    // must NOT have landed before the microtask drain completes — the
+    // microtask runs first.
+    await Promise.resolve().then(() => {
+      order.push("microtask");
+    });
+    // Pin: the microtask fired but the macrotask-scheduled kill hasn't
+    // even started yet (kill-start is logged inside the setImmediate
+    // callback). The events array therefore contains 'disable:return'
+    // but NOT 'disable:kill-start' at this point.
+    expect(mgr.events).toContain("disable:return");
+    expect(mgr.events).not.toContain("disable:kill-start");
+    expect(order).toEqual(["microtask"]);
+
+    // Drain the rest. Schedule a setImmediate AFTER the disable's
+    // setImmediate is already pending — by FIFO, our setImmediate
+    // fires AFTER the disable's kill-start has been queued but its
+    // body runs after the order log. We assert kill-start landed
+    // before stopGate resolved, confirming the macrotask fired.
+    const observedOrder = await new Promise<string[]>((resolve) => {
+      setImmediate(() => {
+        order.push("macrotask-after");
+        resolve(order.slice());
+      });
+    });
+    expect(observedOrder).toContain("microtask");
+    // By the time our follow-up setImmediate fires, the disable's
+    // setImmediate must already have logged kill-start (FIFO macrotask
+    // ordering on a single instance).
+    expect(mgr.events).toContain("disable:kill-start");
+
+    // Release the gate and drain.
+    stopGate.resolve();
+    await mgr.drainKill();
+    expect(mgr.events).toContain("disable:kill-end");
   });
 
   test("drainKill() awaits any in-flight detached kill — shutdown safety", async () => {

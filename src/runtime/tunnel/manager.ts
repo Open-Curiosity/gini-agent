@@ -256,11 +256,23 @@ class TunnelManager {
       if (this.cloudflared) {
         const prev = this.cloudflared;
         this.cloudflared = null;
-        // Detached kill chained onto pendingKill — see field doc above.
-        // The next operation that needs the kill complete (enable's pre-
-        // spawn await, shutdown's await) will block on pendingKill, so
-        // chain order is preserved even though this call doesn't await.
-        this.pendingKill = this.pendingKill.then(() => prev.stop().catch(() => { /* already gone */ }));
+        // Defer the SIGTERM to a macrotask so the in-flight HTTP response
+        // has flushed past the IO turn before the tunnel process is
+        // signaled. A .then() chain alone runs on the microtask queue,
+        // which fires before the IO callbacks that write response bytes
+        // to the socket. setImmediate schedules the callback for the
+        // next IO check, after the current turn's microtask drain. The
+        // next operation that needs the kill complete (enable's
+        // pre-spawn await, shutdown's await) will block on pendingKill,
+        // so chain order is preserved even though this call doesn't
+        // await.
+        this.pendingKill = this.pendingKill.then(
+          () => new Promise<void>((resolve) => {
+            setImmediate(() => {
+              prev.stop().catch(() => { /* already gone */ }).finally(() => resolve());
+            });
+          }),
+        );
       }
       try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
       setRedactionPublicUrl(null);
@@ -277,11 +289,22 @@ class TunnelManager {
     if (this.cloudflared) {
       const prev = this.cloudflared;
       this.cloudflared = null;
-      // Detached kill chained onto pendingKill — see field doc above.
-      // The await below blocks on the chain so spawn order is preserved
+      // Defer the SIGTERM to a macrotask so the in-flight HTTP response
+      // has flushed past the IO turn before the tunnel process is
+      // signaled. A .then() chain alone runs on the microtask queue,
+      // which fires before the IO callbacks that write response bytes
+      // to the socket. setImmediate schedules the callback for the
+      // next IO check, after the current turn's microtask drain. The
+      // await below blocks on the chain so spawn order is preserved
       // (the new cloudflared can't bind until the prior one's stop
       // promise settles).
-      this.pendingKill = this.pendingKill.then(() => prev.stop().catch(() => { /* already gone */ }));
+      this.pendingKill = this.pendingKill.then(
+        () => new Promise<void>((resolve) => {
+          setImmediate(() => {
+            prev.stop().catch(() => { /* already gone */ }).finally(() => resolve());
+          });
+        }),
+      );
     }
     // Block on any prior detached kill before spawning so we don't race
     // a new cloudflared against the dying one binding the same upstream.
@@ -598,22 +621,29 @@ class TunnelManager {
       if (this.cloudflared) {
         const prev = this.cloudflared;
         this.cloudflared = null;
-        // Detached kill chained onto pendingKill so the in-flight HTTP
-        // response (the operator clicked Disable over the live tunnel)
-        // can flush through the still-alive OLD cloudflared before its
-        // TCP connection dies. Subsequent operations await pendingKill
-        // to preserve apply-chain ordering. Logging on failure is
-        // attached to the chained Promise rather than this synchronous
-        // slot — we want to RETURN now, with the new snapshot, so the
-        // HTTP layer can flush.
-        this.pendingKill = this.pendingKill.then(async () => {
-          try {
-            await prev.stop();
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            appendLog(this.config.instance, "tunnel.disable.stop-error", { error: redact(msg) });
-          }
-        });
+        // Defer the SIGTERM to a macrotask so the in-flight HTTP response
+        // has flushed past the IO turn before the tunnel process is
+        // signaled. A .then() chain alone runs on the microtask queue,
+        // which fires before the IO callbacks that write response bytes
+        // to the socket. setImmediate schedules the callback for the
+        // next IO check, after the current turn's microtask drain.
+        // Subsequent operations await pendingKill to preserve
+        // apply-chain ordering. Logging on failure stays attached to
+        // the chained Promise rather than this synchronous slot — we
+        // want to RETURN now, with the new snapshot, so the HTTP layer
+        // can flush.
+        this.pendingKill = this.pendingKill.then(
+          () => new Promise<void>((resolve) => {
+            setImmediate(() => {
+              prev.stop()
+                .catch((err) => {
+                  const msg = err instanceof Error ? err.message : String(err);
+                  appendLog(this.config.instance, "tunnel.disable.stop-error", { error: redact(msg) });
+                })
+                .finally(() => resolve());
+            });
+          }),
+        );
       }
       // Stop the edge probe in lockstep with the cloudflared teardown.
       // The probe's internal !snapshot.enabled guard would also short-
