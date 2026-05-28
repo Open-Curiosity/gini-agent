@@ -1,8 +1,19 @@
 import { useEffect, useRef } from "react";
-import { Animated, Easing, StyleSheet, Text, View } from "react-native";
+import { Animated, Easing, Linking, StyleSheet, Text, View } from "react-native";
 import Markdown, { MarkdownIt } from "react-native-markdown-display";
 import { family, theme } from "@/src/theme";
 import type { AssistantTextBlock } from "@/src/types";
+
+type MarkdownNode = { key: string; content: string; attributes?: { href?: string } };
+type MarkdownStylesMap = Record<string, object>;
+type RuleArgs = [
+  node: MarkdownNode,
+  children: React.ReactNode,
+  parent: unknown,
+  styles: MarkdownStylesMap,
+  inheritedStyles?: object
+];
+type RenderRule = (...args: RuleArgs) => React.ReactNode;
 
 // `linkify: true` autolinks bare URLs (e.g. `https://example.com`) that
 // arrive in assistant text without explicit `[label](url)` markdown, so
@@ -49,11 +60,6 @@ export function BlockAssistantText({ block }: { block: AssistantTextBlock }) {
 // actually wraps cleanly. We use the markdown body's font props so the
 // outer Text reserves the right line height before nested inline Texts
 // supply their own font styles via the lib's inherited-style cascade.
-type RenderNode = { type: string; key: string };
-type RenderRule = (
-  node: RenderNode,
-  children: React.ReactNode
-) => React.ReactNode;
 const blockTextBase = {
   color: theme.assistantBubbleText,
   fontFamily: family("HankenGrotesk", 500),
@@ -109,13 +115,23 @@ const blockTextStyles = StyleSheet.create({
     marginBottom: 4
   }
 });
+// Block-level renderers wrap inline children in a single Text so the
+// text engine can wrap runs cleanly (see comment above). `selectable`
+// is set on the wrapper so iOS' long-press gesture has something to
+// latch onto — without it, the inner inline overrides below get short-
+// circuited by a non-selectable parent.
 const renderAsText =
   (style: object): RenderRule =>
   (node, children) => (
-    <Text key={node.key} style={style}>
+    <Text key={node.key} style={style} selectable>
       {children}
     </Text>
   );
+// Inline rules (text/textgroup/link/strong/em/s/inline) need their own
+// `selectable` because react-native-markdown-display emits <Text>
+// wrappers per rule and the defaults omit the prop — without these
+// overrides a long-press in the middle of a paragraph hits an inner
+// non-selectable Text and the gesture finds nothing to copy.
 const markdownRules: Record<string, RenderRule> = {
   paragraph: renderAsText(blockTextStyles.paragraph),
   heading1: renderAsText(blockTextStyles.heading1),
@@ -123,7 +139,50 @@ const markdownRules: Record<string, RenderRule> = {
   heading3: renderAsText(blockTextStyles.heading3),
   heading4: renderAsText(blockTextStyles.heading4),
   heading5: renderAsText(blockTextStyles.heading5),
-  heading6: renderAsText(blockTextStyles.heading6)
+  heading6: renderAsText(blockTextStyles.heading6),
+  text: (node, _children, _parent, styles, inheritedStyles = {}) => (
+    <Text key={node.key} style={[inheritedStyles, styles.text]} selectable>
+      {node.content}
+    </Text>
+  ),
+  textgroup: (node, children, _parent, styles) => (
+    <Text key={node.key} style={styles.textgroup} selectable>
+      {children}
+    </Text>
+  ),
+  strong: (node, children, _parent, styles) => (
+    <Text key={node.key} style={styles.strong} selectable>
+      {children}
+    </Text>
+  ),
+  em: (node, children, _parent, styles) => (
+    <Text key={node.key} style={styles.em} selectable>
+      {children}
+    </Text>
+  ),
+  s: (node, children, _parent, styles) => (
+    <Text key={node.key} style={styles.s} selectable>
+      {children}
+    </Text>
+  ),
+  inline: (node, children, _parent, styles) => (
+    <Text key={node.key} style={styles.inline} selectable>
+      {children}
+    </Text>
+  ),
+  link: (node, children, _parent, styles) => {
+    const href = node.attributes?.href;
+    return (
+      <Text
+        key={node.key}
+        style={styles.link}
+        selectable
+        onPress={href ? () => void Linking.openURL(href) : undefined}
+      >
+        {children}
+      </Text>
+    );
+  }
 };
 
 function StreamingCursor() {
