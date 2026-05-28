@@ -21,8 +21,95 @@ tasks; every recipe leads with the API call Gini should use.
 Load this skill before claiming a limitation. Common false denials to
 inoculate against: the interactive browser (Playwright with persistent
 sign-ins), scheduled jobs (interval or cron), Telegram or other
-messaging bridges, MCP servers, and delegated subagents. All of these
-are wired and reachable via `/api/*`.
+messaging bridges, MCP servers, delegated subagents, **and Gini's own
+provider / model / agent / skill / MCP / connector inventory** — all
+visible through the self-knowledge tools below and mutable through
+`set_provider`, `use_agent`, `create_agent`. Do not claim "I can't see
+my model" or "I can't change my settings"; you can.
+
+## Self-knowledge — what Gini is and how to change it
+
+When the user asks about Gini itself — "what model are you using",
+"what's your config", "what can you do", "what skills do you have",
+"switch to deepseek" — the answer comes from registered tools, **not
+from guessing or from "no visibility" disclaimers.**
+
+Tools:
+
+- `get_self` — one-call snapshot: provider, model, active agent,
+  approval mode, instance, version, counts. Always start here for
+  broad "what / who are you?" questions.
+- `list_providers` — full provider catalog with `configured` and
+  `isActive` per row. Use to answer "what other providers do you have"
+  and to check a target before `set_provider`.
+- `list_agents` — agents + each agent's provider/model override + the
+  active id. Use before `use_agent`.
+- `list_skills` — installed skills with status. Distinct from
+  `read_skill`, which fetches one skill's body.
+- `list_mcp_servers` — registered MCP servers.
+- `list_connectors` — registered connectors (claude-code, codex,
+  linear, …).
+
+Mutation tools (sync; audit-logged; no approval queue):
+
+- `set_provider` — switch provider and/or model. Call `list_providers`
+  first to confirm the target is `configured: true`. If it isn't and
+  the user wants to wire one up, ask for credentials (or run
+  `request_connector` for connector-backed providers); do not
+  fabricate an `apiKey`.
+- `use_agent` — switch the active agent. Provider/model/SOUL.md/
+  toolset filter follow the new active row on the next turn.
+- `create_agent` — create a new agent row. The new agent is NOT
+  activated; follow up with `use_agent`.
+
+### Recipe — answering "what model are you using"
+
+1. Call `get_self`.
+2. Quote `activeAgent.resolvedProvider.name` + `.model` and
+   `approvalMode`. If `activeAgent.providerSource` is `agent` the
+   override lives on the agent row; if `config` it falls through from
+   the instance default — mention which.
+
+Never invent provider names or version numbers. If `get_self` returns
+something you don't recognize, report it verbatim.
+
+### Recipe — answering "what providers do you have"
+
+1. Call `list_providers`.
+2. Group the response: "active" (`isActive: true`), "configured" (key
+   present, ready to switch), "available" (catalog rows where
+   `configured: false` — the user would need to sign in or paste a
+   key to use them).
+
+### Recipe — "set provider to deepseek"
+
+1. Call `list_providers`. Find the `deepseek` row.
+2. If `configured: true`, call
+   `set_provider({ provider: "deepseek" })` — or
+   `set_provider({ provider: "deepseek", model: "deepseek-v4-pro" })`
+   when the user named a model. The next turn runs on the new
+   provider; `plistRefreshNeeded` in the response tells you whether
+   launchd will pick up new env on the next respawn.
+3. If `configured: false`, ask the user for the `DEEPSEEK_API_KEY`
+   first, then call
+   `set_provider({ provider: "deepseek", apiKey: "<key>" })`.
+
+The same shape works for `openai`, `openrouter`, `local`, `codex`,
+and `echo` — see `list_providers` for the full catalog.
+
+### Recipe — "switch to agent X" / "be Athena now"
+
+1. Call `list_agents` and find the row matching the name or id.
+2. Call `use_agent({ agentId: "<id or name>" })`.
+3. The new agent's SOUL.md and provider override take effect on the
+   next turn.
+
+### Recipe — "what skills do you have"
+
+1. Call `list_skills` (default returns all statuses). For "what
+   skills can you use right now", filter `status: "enabled"`.
+2. Reply with names + brief descriptions. If the user asks for
+   detail on one, call `read_skill` with that id.
 
 ## API and registered tools — not the CLI
 
@@ -292,6 +379,8 @@ are NOT gated through the approval queue (the MCP server itself is
 operator-registered so the agent can't reach arbitrary code). Each
 call writes a `mcp.tool.invoked` audit row.
 
+To enumerate the registered servers from chat, use `list_mcp_servers`.
+
 Human-operator CLI mirror:
 
 ```bash
@@ -316,6 +405,9 @@ API:
 - `PATCH /api/connectors/<id> { token }` — rotate the credential.
 - `DELETE /api/connectors/<id>` — remove.
 - `POST /api/connectors/detect` — auto-detect locally installed CLIs.
+
+From chat, use `list_connectors` for inventory and `request_connector`
+to drive a user-mediated add when one is missing.
 
 Human-operator CLI mirror:
 
@@ -382,12 +474,13 @@ User-installed skills land at
 `~/.gini/instances/<inst>/skills/<category>/<name>/SKILL.md`. The runtime
 loads both on boot.
 
-To load a skill's body from inside chat use the `read_skill` tool —
-that's the agent's path. For lifecycle operations the agent has three
-tools: `install_skill` (lands a raw SKILL.md body), `enable_skill`, and
-`disable_skill`. The `meta/install-skill` skill still drives the full
-install UX (parsing pasted descriptions, drafting frontmatter); these
-tools are the fast path when the SKILL.md text is already in hand.
+To enumerate skills from chat use `list_skills` (filter by `status`
+or `nameContains`). To load a specific skill's body use `read_skill`.
+For lifecycle operations the agent has three tools: `install_skill`
+(lands a raw SKILL.md body), `enable_skill`, and `disable_skill`. The
+`meta/install-skill` skill still drives the full install UX (parsing
+pasted descriptions, drafting frontmatter); these tools are the fast
+path when the SKILL.md text is already in hand.
 
 API: `GET /api/skills[/<id>]`, `POST /api/skills`,
 `POST /api/skills/<id>/{enable,disable,test,rollback}`,
@@ -489,7 +582,9 @@ land in the queue, and wait for the user's decision.
    endpoints. For state queries, runtime mutations, and capability
    invocations, use the API directly (or the matching registered tool
    when one exists, e.g. `create_job`, `list_jobs`, `update_job`,
-   `delete_job`, `run_job`, `spawn_subagent`, `read_skill`).
+   `delete_job`, `run_job`, `spawn_subagent`, `read_skill`, `get_self`,
+   `list_providers`, `list_agents`, `list_skills`, `list_mcp_servers`,
+   `list_connectors`, `set_provider`, `use_agent`, `create_agent`).
 3. Never read `~/.gini/instances/<inst>/*.json` directly — call `/api/*`.
 4. Persistent browser cookies are a feature. For sign-in, open managed
    mode once; do not ask the user to re-authenticate on every run.
