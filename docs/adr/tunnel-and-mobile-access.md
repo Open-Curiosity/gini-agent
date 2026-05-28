@@ -5,11 +5,14 @@
 The runtime exposes a public surface for mobile / off-LAN clients through a
 single Cloudflare quick tunnel managed by the gateway. Authorization is
 provided by a per-instance 192-bit secret embedded in the bootstrap URL and
-exchanged for a host-only `gini_tunnel_session` cookie on the first hit.
-The Next.js proxy is the chokepoint: it classifies inbound `Host`, validates
-the secret or cookie in constant time, and stamps an internal marker
-(`x-gini-tunnel-vetted: 1`) on requests that pass before the BFF guard sees
-them.
+accepted by the proxy on two peer paths after the secret-path bootstrap
+redirect: a host-only `gini_tunnel_session` cookie (Safari + the web
+fallback) and an `Authorization: Bearer <secret>` header (the installed
+gini-mobile app, which has no persistent cookie jar across launches). The
+Next.js proxy is the chokepoint: it classifies inbound `Host`, validates
+the secret, cookie, or Bearer in constant time, and stamps an internal
+marker (`x-gini-tunnel-vetted: 1`) on requests that pass before the BFF
+guard sees them.
 
 The original design contract lives in `PLAN.md` for historical context.
 The trust-radius and deny-list policy were deliberately broadened during
@@ -47,7 +50,7 @@ phone → Cloudflare edge → cloudflared subprocess → Next.js proxy
                                                      │
                                                  BFF guard
                                           [canonicalize → deny → CSRF
-                                           → rewrite-to-redacted → bearer]
+                                           → bearer]
                                                      │
                                                Runtime API
 ```
@@ -61,10 +64,30 @@ Key invariants the proxy enforces per PLAN.md:
 - **Secret-path bootstrap**: a request to `/<secret>/<rest>` mints a
   `gini_tunnel_session` cookie (HttpOnly, Secure, SameSite=Lax, no Domain,
   Max-Age=86400 — value byte-equals the live secret) and 302-redirects to
-  the clean URL with `Referrer-Policy: no-referrer`.
-- **Cookie validation**: every subsequent request is constant-time-compared
-  against the live secret read from `config.json` (uncached). A
-  `rotate-secret` causes outstanding cookies to mismatch on the next hit.
+  `/connect?api=<tunnel-origin>&web=<tunnel-origin>&token=<secret>` with
+  `Referrer-Policy: no-referrer`. The /connect interstitial attempts a
+  `gini://connect?...` scheme handoff so the installed gini-mobile app
+  can claim the bootstrap; if the scheme handler doesn't fire within a
+  visibilitychange timeout (no app installed), the page falls back to
+  the cookie-authed mobile web app on the same surface — the user
+  never re-enters the bootstrap URL after a failed scheme attempt.
+- **Dual auth on follow-up requests**: every request after the
+  bootstrap must present one of two equally-trusted credentials, each
+  constant-time-compared against the live secret read from
+  `config.json` (uncached):
+  - `Cookie: gini_tunnel_session=<secret>` — used by Safari + the web
+    fallback after the 302.
+  - `Authorization: Bearer <secret>` — used by the installed gini-mobile
+    app, which receives the secret via the `gini://connect` deep link
+    and sends it on every API call. The mobile RN runtime has no
+    cookie jar that survives across app launches the way Safari does,
+    so Bearer is the durable auth surface for the installed app.
+
+  Both branches use the same `tunnelSecretEquals` helper so neither
+  leaks the secret via timing, both stamp the same
+  `x-gini-tunnel-vetted: 1` marker on success, and both are subject
+  to the deny list below. A `rotate-secret` causes outstanding cookies
+  AND outstanding Bearer headers to mismatch on the next hit.
 - **Marker un-forgeability**: the proxy strips any inbound
   `x-gini-tunnel-vetted` value BEFORE its branch decisions and only stamps
   the marker on requests that passed the secret/cookie gate. The BFF reads
@@ -121,6 +144,7 @@ Key invariants the proxy enforces per PLAN.md:
 |---|---|---|
 | URL holder (knows `/<secret>/`) | full operator access MINUS deny list | `rotate-secret` or hostname rotation on restart |
 | Session-cookie holder | same as URL holder | same |
+| Bearer-token holder via /connect handoff (installed gini-mobile app receives the secret as a `gini://connect?...token=<secret>` deep link and sends it as `Authorization: Bearer <secret>` on every request) | same as URL holder | same — secret rotation invalidates the held Bearer on the next request, and the operator-driven `gini://connect` deep link is the only documented way the secret reaches the mobile app |
 | Tunnel-vetted browser JS | full operator access MINUS pairing subtree; receives the privileged tunnel snapshot (secret + publicUrl) so it can render the QR / URL / rotate-secret UI | same |
 | Paired-device bearer | full operator access | device revoke |
 | Loopback bearer | full operator access | config edit |
@@ -152,21 +176,34 @@ single-operator pattern. The same-UID-local-process threat is out of scope
 - **Reverse proxy on a stable hostname (`GINI_TRUSTED_ORIGINS` lane).**
   Already supported; orthogonal to the tunnel. Operators who run their own
   front can ignore the tunnel entirely.
-- **A bearer-only public surface (no cookie).** Would require the secret in
-  every URL, which leaks via Referer and browser history. The cookie-mint +
-  302-to-clean-URL design avoids both.
+- **A bearer-only public surface (no cookie).** The original draft
+  rejected bearer-only because a bare bearer-in-URL scheme would leak
+  the secret via Referer and browser history. The shipped design is
+  `cookie + Bearer` instead: the secret is delivered via a single
+  `/<secret>/<rest>` request, immediately exchanged for a host-only
+  cookie AND handed to the installed mobile app as a `gini://connect`
+  deep-link parameter so the app can send it as an `Authorization:
+  Bearer` header on every request. Neither path puts the secret in a
+  page URL, neither leaks via Referer, and the mobile app's lack of a
+  durable cookie jar is covered without re-prompting the operator
+  every cold start.
 
 ## Acceptance Checks
 
 PLAN.md "Test surface" enumerates the per-invariant observable checks. The
 short version:
 
-- Tunnel-branch requests with no secret-prefix and no cookie return 404.
-- Tunnel-branch with the secret-prefix returns 302 + Set-Cookie + a clean
-  URL; subsequent requests with the cookie pass and are stamped vetted=1.
-- Disable causes the next cookie-bearing request to 404, independent of the
-  cloudflared-termination window.
-- Rotation invalidates outstanding cookies on the next hit.
+- Tunnel-branch requests with no secret-prefix, no cookie, and no
+  Bearer return 404.
+- Tunnel-branch with the secret-prefix returns 302 + Set-Cookie + a
+  /connect URL; subsequent requests with the cookie pass and are
+  stamped vetted=1.
+- Tunnel-branch requests carrying `Authorization: Bearer <live-secret>`
+  pass and are stamped vetted=1 with no prior bootstrap.
+- Disable causes the next cookie-bearing or Bearer-bearing request to
+  404, independent of the cloudflared-termination window.
+- Rotation invalidates outstanding cookies AND outstanding Bearer
+  headers on the next hit.
 - Tunneled GET `/api/runtime/tunnel` returns the privileged snapshot
   (secret + publicUrl populated).
 - Tunneled PATCH `/api/runtime/tunnel`, GET `/qr.svg`, GET `/qr.txt`,
