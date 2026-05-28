@@ -157,13 +157,18 @@ export interface ProviderConfig {
   // at 10% of the base input price (e.g. gpt-5.5: $5.00 input vs $0.50
   // cached). Field is treated as a free-form string so future retention
   // tiers OpenAI adds can be passed through without a code change.
-  // When omitted, the runtime picks a model-aware default — codex and
-  // the gpt-5.x / gpt-5-codex / gpt-4.1 families opt in to `"24h"`;
-  // other providers and models send no field and inherit the
-  // provider's default behavior. Set to an empty string to suppress
-  // the default and fall back to whatever the provider does on its own.
-  // Ignored by providers whose surface does not honor the field
-  // (openrouter, deepseek, local, echo).
+  //
+  // No runtime default. When omitted the field is not sent and the
+  // provider's own model default applies — this matters because
+  // `"24h"` is NOT Zero Data Retention eligible per the OpenAI docs,
+  // so a silent opt-in would quietly invalidate a customer's ZDR
+  // posture. Set explicitly to opt in. An empty string sends nothing
+  // and is equivalent to omitting the field. The runtime forwards an
+  // explicit value to every HTTP-backed provider (openai, openrouter,
+  // deepseek, local, codex); whether the upstream surface honors the
+  // field is up to the provider — the chatgpt.com codex backend is
+  // currently known to reject the field with a 400, so users on the
+  // codex provider should not set this until that changes.
   promptCacheRetention?: string;
 }
 

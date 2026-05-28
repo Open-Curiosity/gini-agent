@@ -338,36 +338,20 @@ function messagesContainToolTraffic(messages: ToolCallingMessage[]): boolean {
 // and `"24h"` (extended; up to 24 h, billed at 10% of base input price
 // on the cache-read side, e.g. gpt-5.5 $5.00 input vs $0.50 cached).
 //
-// Resolution order:
-// 1. `provider.promptCacheRetention` explicit override always wins.
-//    Empty string suppresses the field entirely so a caller can
-//    deliberately fall back to the provider's own default.
-// 2. Model-aware default for the openai provider — gpt-5.x,
-//    gpt-5-codex, and gpt-4.1 model families get `"24h"`.
-// 3. Everything else (codex, openrouter, deepseek, local, echo, openai
-//    with older models) returns `undefined` and the field is not sent.
-//
-// The codex provider is intentionally NOT in the default list even
-// though it talks to a /responses-shaped endpoint: live testing showed
-// that the chatgpt.com codex backend rejects unknown body fields with
-// "Unsupported parameter: prompt_cache_retention" and a 400, breaking
-// the request entirely. The backend appears to do its own implicit
-// caching independent of the field, so omitting it costs nothing on
-// that surface. A user who needs to force the field on after a future
-// codex-backend update can still do so via `promptCacheRetention` on
-// the provider config. The runtime intentionally treats the resolved
-// value as a free-form string so future retention tiers OpenAI adds
-// can be passed through verbatim via `promptCacheRetention` without a
-// code change.
+// IMPORTANT: extended retention (`"24h"`) is NOT Zero Data Retention
+// eligible per the OpenAI docs, and `"in_memory"` is the per-model
+// default for everything except gpt-5.5 (which has no `in_memory`
+// option). A silent runtime opt-in to `"24h"` would quietly disqualify
+// every gpt-5/gpt-4.1 request from a customer's ZDR posture without
+// any operator action, so this resolver intentionally NEVER defaults
+// to a non-empty value: the field is only sent when
+// `provider.promptCacheRetention` is set explicitly on the config.
+// An empty string explicitly opts the request back to the provider's
+// own default. Future retention tiers OpenAI adds can be passed
+// through verbatim via the same field with no code change.
 function resolvePromptCacheRetention(provider: ProviderConfig): string | undefined {
-  if (provider.promptCacheRetention !== undefined) {
-    return provider.promptCacheRetention.length > 0 ? provider.promptCacheRetention : undefined;
-  }
-  if (provider.name === "openai") {
-    const model = provider.model ?? "";
-    if (/^gpt-(5|4\.1)/.test(model)) return "24h";
-  }
-  return undefined;
+  if (provider.promptCacheRetention === undefined) return undefined;
+  return provider.promptCacheRetention.length > 0 ? provider.promptCacheRetention : undefined;
 }
 
 // When falling back to the responses API for codex, collapse all `system`
@@ -1414,6 +1398,7 @@ async function callStructuredCodex<T>(
   // (retain/reflect/reinforce) doesn't lose a whole structured turn to a
   // mid-stream rotation. The JSON parsing afterward stays outside the
   // retry because a malformed payload is a model failure, not an auth one.
+  const retention = resolvePromptCacheRetention(provider);
   const streamed = await withCodexSessionRetry(async () => {
     const bearer = readCodexBearer(provider);
     const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
@@ -1440,7 +1425,8 @@ async function callStructuredCodex<T>(
               }
             ]
           }
-        ]
+        ],
+        ...(retention ? { prompt_cache_retention: retention } : {})
       })
     });
     // readCodexStream already handles non-OK and empty-output as throws.
@@ -1483,6 +1469,7 @@ async function callStructuredChatCompletions<T>(
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
+  const retention = resolvePromptCacheRetention(provider);
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
@@ -1494,7 +1481,8 @@ async function callStructuredChatCompletions<T>(
         { role: "system", content: request.system },
         { role: "user", content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema.` }
       ],
-      stream: false
+      stream: false,
+      ...(retention ? { prompt_cache_retention: retention } : {})
     })
   });
   const rawPayload = await response.text();
@@ -2256,6 +2244,12 @@ const RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
   "functions",
   "function_call",
   "store",
+  // Owned by ProviderConfig.promptCacheRetention via
+  // resolvePromptCacheRetention. Stripping it from extraBody means an
+  // operator who sets `extraBody.prompt_cache_retention` cannot silently
+  // shadow the typed override on chat-completions paths — the typed
+  // field is the single source of truth for cache retention.
+  "prompt_cache_retention",
   "__proto__",
   "constructor",
   "prototype",
@@ -2403,6 +2397,7 @@ async function callVisionCodex(
   // session-rotation failure mode is a 401 on the initial response (not
   // a mid-stream error event). Map that to CodexSessionExpiredError so
   // withCodexSessionRetry can re-read auth.json and try again.
+  const retention = resolvePromptCacheRetention(provider);
   return withCodexSessionRetry(async () => {
     const bearer = readCodexBearer(provider);
     const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
@@ -2429,7 +2424,8 @@ async function callVisionCodex(
             ]
           }
         ],
-        max_output_tokens: maxTokens
+        max_output_tokens: maxTokens,
+        ...(retention ? { prompt_cache_retention: retention } : {})
       })
     });
     const rawPayload = await response.text();
@@ -2476,6 +2472,7 @@ async function callVisionChatCompletions(
   const tokenBudgetField = provider.name === "openai"
     ? { max_completion_tokens: maxTokens }
     : { max_tokens: maxTokens };
+  const retention = resolvePromptCacheRetention(provider);
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
@@ -2492,7 +2489,8 @@ async function callVisionChatCompletions(
         }
       ],
       stream: false,
-      ...tokenBudgetField
+      ...tokenBudgetField,
+      ...(retention ? { prompt_cache_retention: retention } : {})
     })
   });
   const rawPayload = await response.text();
