@@ -1616,11 +1616,9 @@ function chatBlockPoll(config: RuntimeConfig, request: Request, sessionId: strin
   // cursor is fresh enough to be present in chat_blocks, replay only
   // missing rows; otherwise replay everything (the gateway caps
   // listChatBlocksAfter's fallback behavior).
-  const seenIds = new Set<string>();
   const backfill = listChatBlocksAfter(config.instance, sessionId, since || null);
   for (const block of backfill) {
     accumulated.push(block);
-    seenIds.add(block.id);
   }
   if (accumulated.length > 0) {
     const last = accumulated[accumulated.length - 1]!;
