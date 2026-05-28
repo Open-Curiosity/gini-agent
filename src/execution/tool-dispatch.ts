@@ -33,6 +33,11 @@ import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilitie
 import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
+import { status as runtimeStatus } from "../runtime";
+import { providerCatalogWithStatus } from "../provider";
+import { setSetupProvider } from "../runtime/setup-api";
+import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability } from "../capabilities/agents";
+import { listSkills } from "../capabilities/skills";
 import { recall } from "../memory";
 import {
   dedupeAppendLines,
@@ -221,6 +226,24 @@ export async function dispatchToolCall(
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
       return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
+    case "get_self":
+      return { kind: "sync", result: await getSelfTool(config, taskId) };
+    case "list_providers":
+      return { kind: "sync", result: await listProvidersTool(config, taskId) };
+    case "list_agents":
+      return { kind: "sync", result: await listAgentsTool(config, taskId) };
+    case "list_skills":
+      return { kind: "sync", result: await listSkillsTool(config, taskId, args) };
+    case "list_mcp_servers":
+      return { kind: "sync", result: await listMcpServersTool(config, taskId) };
+    case "list_connectors":
+      return { kind: "sync", result: await listConnectorsTool(config, taskId) };
+    case "set_provider":
+      return { kind: "sync", result: await setProviderTool(config, taskId, args) };
+    case "use_agent":
+      return { kind: "sync", result: await useAgentTool(config, taskId, args) };
+    case "create_agent":
+      return { kind: "sync", result: await createAgentTool(config, taskId, args) };
     case "browser_connect": {
       // browser.connect is a SetupRequest (user-actor): the user opens the
       // visible browser, signs in, then clicks Connect. There is no
@@ -2211,6 +2234,295 @@ async function recordLowRiskAudit(
     );
     item.updatedAt = now();
   });
+}
+
+// ---------------- Self-knowledge / self-config ----------------
+
+async function getSelfTool(config: RuntimeConfig, taskId: string): Promise<string> {
+  const snapshot = runtimeStatus(config);
+  const state = readState(config.instance);
+  const counts = {
+    agents: state.agents.length,
+    skills: state.skills.length,
+    skillsEnabled: state.skills.filter((s) => s.status === "enabled").length,
+    jobs: state.jobs.length,
+    activeJobs: snapshot.activeJobs,
+    mcpServers: state.mcpServers.length,
+    messagingBridges: state.messagingBridges.length,
+    connectors: state.connectors.length,
+    memoryUnits: snapshot.memoryUnits,
+    pendingApprovals: snapshot.pendingApprovals
+  };
+  const envelope = {
+    ok: true,
+    instance: snapshot.instance,
+    port: snapshot.port,
+    version: snapshot.version,
+    approvalMode: config.approvalMode ?? "auto",
+    provider: snapshot.provider,
+    activeAgent: snapshot.activeAgent,
+    counts
+  };
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Got self snapshot",
+    data: { instance: snapshot.instance, provider: snapshot.provider.provider.name, agent: snapshot.activeAgent?.name }
+  });
+  await recordLowRiskAudit(config, taskId, "self.get", snapshot.instance, {
+    provider: snapshot.provider.provider.name,
+    activeAgentId: snapshot.activeAgent?.id
+  });
+  return JSON.stringify(envelope);
+}
+
+async function listProvidersTool(config: RuntimeConfig, taskId: string): Promise<string> {
+  const catalog = providerCatalogWithStatus(config.provider?.name);
+  const providers = catalog.map((item) => ({
+    id: item.id,
+    name: item.name,
+    displayName: item.displayName,
+    auth: item.auth,
+    baseUrl: item.baseUrl,
+    models: item.models,
+    capabilities: item.capabilities,
+    costHint: item.costHint,
+    configured: item.configured,
+    isActive: item.name === config.provider?.name
+  }));
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Listed providers",
+    data: { count: providers.length, active: config.provider?.name }
+  });
+  await recordLowRiskAudit(config, taskId, "provider.listed", "providers", {
+    count: providers.length,
+    configured: providers.filter((p) => p.configured).length
+  });
+  return JSON.stringify({ ok: true, activeProvider: config.provider?.name, activeModel: config.provider?.model, providers });
+}
+
+async function listAgentsTool(config: RuntimeConfig, taskId: string): Promise<string> {
+  const { activeAgentId, agents } = listAgents(config);
+  const summary = agents.map((agent) => ({
+    id: agent.id,
+    name: agent.name,
+    isActive: agent.id === activeAgentId,
+    providerName: agent.providerName,
+    model: agent.model,
+    toolsets: agent.toolsets,
+    messagingTargets: agent.messagingTargets,
+    createdAt: agent.createdAt
+  }));
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Listed agents",
+    data: { count: summary.length, active: activeAgentId }
+  });
+  await recordLowRiskAudit(config, taskId, "agent.listed", "agents", {
+    count: summary.length,
+    active: activeAgentId
+  });
+  return JSON.stringify({ ok: true, activeAgentId, agents: summary });
+}
+
+async function listSkillsTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const statusFilter = typeof args.status === "string" && args.status !== "all" ? args.status : undefined;
+  const nameContains = typeof args.nameContains === "string" ? args.nameContains.toLowerCase() : undefined;
+  const all = listSkills(config);
+  const filtered = all.filter((skill) => {
+    if (statusFilter && skill.status !== statusFilter) return false;
+    if (nameContains && !skill.name.toLowerCase().includes(nameContains)) return false;
+    return true;
+  });
+  const summary = filtered.map((skill) => ({
+    id: skill.id,
+    name: skill.name,
+    category: skill.category ?? "user",
+    status: skill.status,
+    trigger: skill.trigger ?? "",
+    description: skill.description ?? "",
+    manifestPath: skill.manifestPath ?? null
+  }));
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Listed skills",
+    data: { total: all.length, returned: summary.length, statusFilter, nameContains }
+  });
+  await recordLowRiskAudit(config, taskId, "skill.listed", "skills", {
+    total: all.length,
+    returned: summary.length,
+    statusFilter,
+    nameContains
+  });
+  return JSON.stringify({ ok: true, total: all.length, skills: summary });
+}
+
+async function listMcpServersTool(config: RuntimeConfig, taskId: string): Promise<string> {
+  const state = readState(config.instance);
+  const servers = state.mcpServers.map((server) => ({
+    id: server.id,
+    name: server.name,
+    transport: server.transport ?? "stdio",
+    status: server.status,
+    exposedTools: server.exposedTools,
+    toolCount: server.tools?.length ?? 0,
+    lastHealthAt: server.lastHealthAt ?? null,
+    message: server.message ?? null,
+    url: server.url ?? null
+  }));
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Listed MCP servers",
+    data: { count: servers.length }
+  });
+  await recordLowRiskAudit(config, taskId, "mcp.listed", "mcp", { count: servers.length });
+  return JSON.stringify({ ok: true, servers });
+}
+
+async function listConnectorsTool(config: RuntimeConfig, taskId: string): Promise<string> {
+  const state = readState(config.instance);
+  const connectors = state.connectors.map((connector) => ({
+    id: connector.id,
+    name: connector.name,
+    provider: connector.provider,
+    status: connector.status,
+    health: connector.health,
+    scopes: connector.scopes,
+    source: connector.source ?? "user",
+    lastHealthAt: connector.lastHealthAt ?? null,
+    message: connector.message ?? null
+  }));
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Listed connectors",
+    data: { count: connectors.length }
+  });
+  await recordLowRiskAudit(config, taskId, "connector.listed", "connectors", { count: connectors.length });
+  return JSON.stringify({ ok: true, connectors });
+}
+
+async function setProviderTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  // When the caller omits `provider`, keep the current one and only
+  // patch model/baseUrl. setSetupProvider requires a provider name in
+  // its payload, so default to the active one to keep the API path
+  // accepting the no-switch case.
+  const targetProvider = typeof args.provider === "string" && args.provider.trim().length > 0
+    ? args.provider.trim()
+    : config.provider?.name;
+  if (!targetProvider) {
+    return JSON.stringify({ ok: false, error: "set_provider requires a 'provider' when no provider is currently active." });
+  }
+  const payload: Record<string, unknown> = { provider: targetProvider };
+  if (typeof args.model === "string" && args.model.trim().length > 0) payload.model = args.model.trim();
+  if (typeof args.baseUrl === "string" && args.baseUrl.trim().length > 0) payload.baseUrl = args.baseUrl.trim();
+  if (typeof args.apiKey === "string" && args.apiKey.trim().length > 0) payload.apiKey = args.apiKey.trim();
+  const result = await setSetupProvider(config, payload);
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: result.ok ? "Switched provider" : "Provider switch failed",
+    data: {
+      provider: targetProvider,
+      model: typeof payload.model === "string" ? payload.model : undefined,
+      ok: result.ok,
+      error: result.error
+    }
+  });
+  await recordLowRiskAudit(config, taskId, "provider.set", targetProvider, {
+    ok: result.ok,
+    model: typeof payload.model === "string" ? payload.model : undefined,
+    plistRefreshNeeded: result.plistRefreshNeeded,
+    error: result.error
+  });
+  return JSON.stringify({
+    ok: result.ok,
+    provider: result.provider,
+    plistRefreshNeeded: result.plistRefreshNeeded,
+    error: result.error
+  });
+}
+
+async function useAgentTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const idOrName = typeof args.agentId === "string" ? args.agentId.trim() : "";
+  if (!idOrName) {
+    return JSON.stringify({ ok: false, error: "use_agent requires an 'agentId' (id or name)." });
+  }
+  try {
+    const agent = await useAgentCapability(config, idOrName);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Switched active agent",
+      data: { agentId: agent.id, name: agent.name }
+    });
+    await recordLowRiskAudit(config, taskId, "agent.activated", agent.id, {
+      name: agent.name
+    });
+    return JSON.stringify({
+      ok: true,
+      activeAgentId: agent.id,
+      agent: {
+        id: agent.id,
+        name: agent.name,
+        providerName: agent.providerName,
+        model: agent.model
+      }
+    });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function createAgentTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const name = typeof args.name === "string" ? args.name.trim() : "";
+  if (!name) {
+    return JSON.stringify({ ok: false, error: "create_agent requires a 'name'." });
+  }
+  try {
+    const record = await createAgentCapability(config, {
+      name,
+      providerName: typeof args.providerName === "string" ? args.providerName : undefined,
+      model: typeof args.model === "string" ? args.model : undefined,
+      toolsets: Array.isArray(args.toolsets) ? args.toolsets : undefined
+    });
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Created agent",
+      data: { agentId: record.id, name: record.name }
+    });
+    await recordLowRiskAudit(config, taskId, "agent.created", record.id, {
+      name: record.name,
+      providerName: record.providerName,
+      model: record.model
+    });
+    return JSON.stringify({
+      ok: true,
+      agent: {
+        id: record.id,
+        name: record.name,
+        providerName: record.providerName,
+        model: record.model,
+        toolsets: record.toolsets
+      },
+      note: "Agent created but NOT activated. Call use_agent to switch."
+    });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
 }
 
 // ---------------- Approval-gated tools ----------------

@@ -90,7 +90,20 @@ const ALWAYS_ON = new Set([
   // not in defaults; always-on so a fresh instance can propose SOUL.md /
   // USER.md edits. The propose-vs-approve file split is the gate.
   "edit_soul",
-  "edit_user_profile"
+  "edit_user_profile",
+  // Self-knowledge / self-config tools live under the "self" toolset
+  // which is not in defaults; always-on so a fresh instance can answer
+  // "what model are you using" and act on the answer without an
+  // operator-only toggle.
+  "get_self",
+  "list_providers",
+  "list_agents",
+  "list_skills",
+  "list_mcp_servers",
+  "list_connectors",
+  "set_provider",
+  "use_agent",
+  "create_agent"
 ]);
 
 describe("buildToolCatalog", () => {

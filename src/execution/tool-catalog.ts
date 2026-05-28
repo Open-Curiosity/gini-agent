@@ -1121,6 +1121,168 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         required: []
       }
     }
+  },
+  {
+    // Broad self-introspection. Single call that tells Gini what
+    // provider/model it's running, which agent is active, the current
+    // approval mode, and rough counts of the resources on this instance.
+    // Call this first when the user asks "what model are you using",
+    // "what's configured", "what can you do" — then drill in with the
+    // list_* tools below if you need specifics.
+    toolset: "self",
+    displayLabel: "Get self",
+    type: "function",
+    function: {
+      name: "get_self",
+      description: "Return a compact snapshot of Gini's own runtime: instance name, port, version, active agent (id, name, resolvedProvider name + model, providerSource), approvalMode, and counts (agents, skills, jobs, mcpServers, messagingBridges, connectors, memoryUnits, pendingApprovals, activeJobs). Call this first whenever the user asks about Gini itself — 'what model are you using', 'what's your config', 'what can you do', 'who are you talking to'. For deeper detail on a specific surface, follow up with list_providers, list_agents, list_skills, list_mcp_servers, or list_connectors.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    // Provider catalog enriched with which one is active and which have
+    // credentials configured. Lets Gini answer "what providers do I have"
+    // and decide whether `set_provider` is viable for a given target
+    // ("set provider to deepseek" — check `configured: true` first).
+    toolset: "self",
+    displayLabel: "List providers",
+    type: "function",
+    function: {
+      name: "list_providers",
+      description: "List all LLM providers Gini knows about, with which is currently active and which have credentials configured. Returns an array of { id, name, displayName, models, configured, isActive, auth, baseUrl, capabilities }. Use when the user asks 'what providers do you have', 'which models can you use', or before calling set_provider to confirm the target is connected.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    // Agents listed with their per-agent provider/model overrides + the
+    // active agent id. Pair with use_agent to switch.
+    toolset: "self",
+    displayLabel: "List agents",
+    type: "function",
+    function: {
+      name: "list_agents",
+      description: "List the agents on this instance with their per-agent provider/model overrides, toolset whitelists, messaging-target filters, and which one is active. Use when the user asks 'what agents do I have', 'what other personalities are configured', or before use_agent to find the right id/name.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    // Installed skills with enable state. Distinct from read_skill (which
+    // returns one skill's body) — this is the inventory.
+    toolset: "self",
+    displayLabel: "List skills",
+    type: "function",
+    function: {
+      name: "list_skills",
+      description: "List skills installed on this instance with id, name, category, status (enabled/disabled/archived), source (built-in vs user-installed), and trigger phrase. Use when the user asks 'what skills do you have', 'what can you do', or before enable_skill / disable_skill / read_skill to find the right id. Returns a compact summary — call read_skill for a specific skill's full body.",
+      parameters: {
+        type: "object",
+        properties: {
+          status: {
+            type: "string",
+            enum: ["enabled", "disabled", "archived", "all"],
+            description: "Filter by status. Defaults to 'all'.",
+            default: "all"
+          },
+          nameContains: { type: "string", description: "Optional case-insensitive substring filter on the skill name." }
+        }
+      }
+    }
+  },
+  {
+    // MCP server inventory: id, name, transport, status, exposed tool
+    // count. Read-only — adding/removing an MCP server is operator-only
+    // for now.
+    toolset: "self",
+    displayLabel: "List MCP servers",
+    type: "function",
+    function: {
+      name: "list_mcp_servers",
+      description: "List MCP (Model Context Protocol) servers registered on this instance with id, name, transport (stdio | http), status, exposed tool count, and last health message. Use when the user asks 'what MCP servers do you have' or before mcp_call to find the server name.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    // Connector inventory: provider, name, status, health. Read-only —
+    // use request_connector to drive setup of a new one.
+    toolset: "self",
+    displayLabel: "List connectors",
+    type: "function",
+    function: {
+      name: "list_connectors",
+      description: "List connectors registered on this instance (external coding/issue services like claude-code, codex, linear) with provider, name, status, health, scopes. Use when the user asks 'what connectors do you have', 'what tools are wired up', or before request_connector to check if one already exists.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    // Switch the active provider/model. Sync — the side effect is a
+    // config rewrite, not external egress, so it does not flow through
+    // the approval queue. Fires `provider.set` audit + a runtime log
+    // entry. The provider must already be installed (env key present
+    // for env-auth providers, codex creds for codex). When the apiKey
+    // arg is supplied, this also writes the key to secrets.env and the
+    // process env so the next provider call picks it up.
+    toolset: "self",
+    displayLabel: "Set provider",
+    type: "function",
+    function: {
+      name: "set_provider",
+      description: "Switch Gini's active LLM provider and/or model. Use when the user asks 'set provider to deepseek', 'switch to gpt-5.4', 'use codex with gpt-5.5'. Call list_providers first to confirm the target is `configured: true` — if it isn't, ask the user for credentials before calling, since this tool does NOT trigger a setup card. Pass only the fields that change: `provider` to switch providers, `model` to change the model on the current or new provider, `baseUrl` to override the base URL for OpenAI-compatible endpoints. `apiKey` is only needed when wiring up a provider for the first time. Returns the resulting provider record + a `plistRefreshNeeded` flag the caller can surface.",
+      parameters: {
+        type: "object",
+        properties: {
+          provider: {
+            type: "string",
+            description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` are updated."
+          },
+          model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5'). Defaults to the provider's first catalog model when omitted." },
+          baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo." },
+          apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env." }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    // Switch the active agent. Provider/toolset/messaging filters then
+    // resolve through the new active row. Sync; no approval needed.
+    toolset: "self",
+    displayLabel: "Use agent",
+    type: "function",
+    function: {
+      name: "use_agent",
+      description: "Switch the active agent on this instance. The new active agent's provider/model override (if any) takes effect on the next turn; SOUL.md, toolset filter, and memory namespace also follow the new active row. Use when the user asks 'switch to agent X', 'use the X persona', 'be Athena now'. Call list_agents first to find the right id/name. Refuses to switch to an unknown agent.",
+      parameters: {
+        type: "object",
+        properties: {
+          agentId: { type: "string", description: "Agent id or name (e.g. 'agent_abc123' or 'athena')." }
+        },
+        required: ["agentId"]
+      }
+    }
+  },
+  {
+    // Create a new agent row. Inherits provider/toolsets/messagingTargets
+    // from the default agent unless overridden. Empty memory bank.
+    toolset: "self",
+    displayLabel: "Create agent",
+    type: "function",
+    function: {
+      name: "create_agent",
+      description: "Create a new agent on this instance. The agent inherits provider/model, toolsets, and messaging targets from the default agent unless explicitly overridden. Memory and hindsight start empty. The new agent is NOT automatically activated — call use_agent afterwards to switch. Use when the user asks 'create a new agent for X', 'spin up an agent named Y'.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Human-readable name (e.g. 'Athena')." },
+          providerName: { type: "string", description: "Optional provider override (e.g. 'deepseek'). Defaults to the default agent's provider." },
+          model: { type: "string", description: "Optional model override (e.g. 'deepseek-v4-pro'). Defaults to the default agent's model." },
+          toolsets: {
+            type: "array",
+            description: "Optional list of toolset names this agent is allowed to use. Defaults to the default agent's toolset set.",
+            items: { type: "string" }
+          }
+        },
+        required: ["name"]
+      }
+    }
   }
 ];
 
@@ -1255,6 +1417,21 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // prompt regardless of toolset state, so always-on here is safe.
     if (tool.function.name === "edit_soul") return true;
     if (tool.function.name === "edit_user_profile") return true;
+    // Self-knowledge surface. None of these tools is on a legacy default
+    // toolset; gating on enable would mean a fresh instance couldn't
+    // answer "what model are you using" or "switch to deepseek" — the
+    // exact asks the surface exists for. Read-only tools are safe
+    // always-on; set_provider / use_agent / create_agent are sync
+    // config-change tools that already write audit rows.
+    if (tool.function.name === "get_self") return true;
+    if (tool.function.name === "list_providers") return true;
+    if (tool.function.name === "list_agents") return true;
+    if (tool.function.name === "list_skills") return true;
+    if (tool.function.name === "list_mcp_servers") return true;
+    if (tool.function.name === "list_connectors") return true;
+    if (tool.function.name === "set_provider") return true;
+    if (tool.function.name === "use_agent") return true;
+    if (tool.function.name === "create_agent") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;
@@ -1420,6 +1597,22 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.content));
     case "update_memory":
       return truncatePreview(previewValue(safe.memoryId));
+    case "get_self":
+    case "list_providers":
+    case "list_agents":
+    case "list_mcp_servers":
+    case "list_connectors":
+      return "";
+    case "list_skills":
+      return truncatePreview(previewValue(safe.nameContains) || previewValue(safe.status) || "");
+    case "set_provider":
+      return truncatePreview(
+        `${previewValue(safe.provider) || "(model only)"}${safe.model ? `/${previewValue(safe.model)}` : ""}`
+      );
+    case "use_agent":
+      return truncatePreview(previewValue(safe.agentId));
+    case "create_agent":
+      return truncatePreview(previewValue(safe.name));
     default: {
       // Generic fallback: key=value, ... for the first few entries.
       // Keeps unmapped or future tools from emitting an empty preview.
