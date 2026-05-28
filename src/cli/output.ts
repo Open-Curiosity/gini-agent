@@ -113,12 +113,13 @@ Usage:
                   [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]
                   [--prompt-cache-retention <value>]
                   --base-url and --api-key-env work for local / openai /
-                  openrouter (point at OpenAI-compatible servers like oMLX,
-                  vLLM, LM Studio) AND for codex (override the backend URL
-                  or auth-file env var). --extra-body forwards server-
-                  specific request fields like \`chat_template_kwargs\` and
-                  applies to local / openai / openrouter chat-completions
-                  calls; codex (/responses) and echo ignore it.
+                  openrouter / deepseek (point at OpenAI-compatible servers
+                  like oMLX, vLLM, LM Studio) AND for codex (override the
+                  backend URL or auth-file env var). --extra-body forwards
+                  server-specific request fields like
+                  \`chat_template_kwargs\` and applies to local / openai /
+                  openrouter / deepseek chat-completions calls; codex
+                  (/responses) and echo ignore it.
                   --prompt-cache-retention sets the OpenAI prompt-cache
                   bucket sent as \`prompt_cache_retention\` on /responses
                   and /chat/completions ("in_memory" — the default;
