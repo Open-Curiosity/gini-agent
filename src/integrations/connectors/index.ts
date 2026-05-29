@@ -397,23 +397,44 @@ export async function resolveSkillEnv(
   const required = skill.requiredConnectors ?? [];
   if (required.length === 0) return {};
   const providers = required.map((r) => r.provider);
+  const requiresGeneric = providers.includes("generic");
   const bindings = envBindingsForProviders(providers);
   const state = readState(config.instance);
   const out: Record<string, string> = {};
   for (const envName of envNames) {
     const binding = bindings[envName];
-    if (!binding) continue;
-    // Same status guard as isSkillActive: a `disabled` or `error` record
-    // with a stale `health: "healthy"` from a prior probe must not leak
-    // its secret into the spawn env.
+    if (binding) {
+      // Same status guard as isSkillActive: a `disabled` or `error` record
+      // with a stale `health: "healthy"` from a prior probe must not leak
+      // its secret into the spawn env.
+      const connector = state.connectors.find(
+        (candidate) =>
+          candidate.provider === binding.provider
+          && candidate.status === "configured"
+          && candidate.health === "healthy"
+      );
+      if (!connector) continue;
+      const value = await resolveConnectorSecret(config, connector.id, binding.purpose, taskId);
+      if (value) out[envName] = value;
+      continue;
+    }
+    // The `generic` provider has no static `envBindings`, so a user-supplied
+    // key never resolves through the native path above. Treat each generic
+    // connector's secret field name as its own env binding: a declared env
+    // name resolves from a configured+healthy generic connector that stores
+    // a secret whose `purpose` matches the name verbatim (the field name the
+    // user gave the secret == the declared `prerequisites.env` name). Same
+    // status/health guard as native providers.
+    if (!requiresGeneric) continue;
     const connector = state.connectors.find(
       (candidate) =>
-        candidate.provider === binding.provider
+        candidate.provider === "generic"
         && candidate.status === "configured"
         && candidate.health === "healthy"
+        && candidate.secretRefs.some((ref) => ref.purpose === envName)
     );
     if (!connector) continue;
-    const value = await resolveConnectorSecret(config, connector.id, binding.purpose, taskId);
+    const value = await resolveConnectorSecret(config, connector.id, envName, taskId);
     if (value) out[envName] = value;
   }
   return out;

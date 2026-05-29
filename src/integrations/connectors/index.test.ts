@@ -203,4 +203,101 @@ describe("resolveSkillEnv", () => {
     const env = await resolveSkillEnv(config, skill);
     expect(env).toEqual({ LINEAR_API_KEY: "real-token" });
   });
+
+  // The `generic` provider has no static envBindings, so a user-supplied
+  // key resolves by treating each generic connector's secret field name as
+  // its own env binding (verbatim match against the declared
+  // prerequisites.env name).
+
+  test("generic connector injects a secret named like the declared env var", async () => {
+    const instance = "resolve-generic";
+    const config = {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+    const ref = writeSecret(instance, "id_generic", "MY_API_KEY", "generic-real");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_generic",
+        instance,
+        provider: "generic",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      requiredConnectors: [{ provider: "generic" }],
+      prerequisites: { env: ["MY_API_KEY"] }
+    });
+    const env = await resolveSkillEnv(config, skill);
+    expect(env).toEqual({ MY_API_KEY: "generic-real" });
+  });
+
+  test("generic secret fields NOT in prerequisites.env do not leak into the env", async () => {
+    const instance = "resolve-generic-extra";
+    const config = {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+    const wanted = writeSecret(instance, "id_generic", "MY_API_KEY", "generic-real");
+    const extra = writeSecret(instance, "id_generic", "OTHER_SECRET", "should-not-appear");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_generic",
+        instance,
+        provider: "generic",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [wanted, extra]
+      }));
+    });
+    const skill = newSkill({
+      requiredConnectors: [{ provider: "generic" }],
+      prerequisites: { env: ["MY_API_KEY"] }
+    });
+    const env = await resolveSkillEnv(config, skill);
+    expect(env).toEqual({ MY_API_KEY: "generic-real" });
+    expect(env).not.toHaveProperty("OTHER_SECRET");
+  });
+
+  test("disabled generic connector does NOT inject its secret", async () => {
+    const instance = "resolve-generic-disabled";
+    const config = {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+    const ref = writeSecret(instance, "id_generic", "MY_API_KEY", "generic-real");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_generic",
+        instance,
+        provider: "generic",
+        status: "disabled",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      requiredConnectors: [{ provider: "generic" }],
+      prerequisites: { env: ["MY_API_KEY"] }
+    });
+    const env = await resolveSkillEnv(config, skill);
+    expect(env).toEqual({});
+  });
 });
