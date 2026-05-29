@@ -709,6 +709,28 @@ class TunnelManager {
       // circuit it once the snapshot stamp below lands, but killing the
       // interval here avoids the wake-and-skip cost.
       this.stopEdgeProbe();
+      // Stamp the in-memory snapshot to enabled=false BEFORE the purge
+      // so any in-flight push-device handler whose recheck reads
+      // `tunnelManager(config).current()` during the upcoming clearNote
+      // await sees the disabled state and returns 503. Without this
+      // pre-stamp the snapshot keeps `enabled: true` for the duration
+      // of the 15s osascript window, letting the recheck pass and
+      // upsertDevice insert a fresh `origin:"tunnel"` row AFTER the
+      // purge has already wiped the table — leaving an orphan
+      // subscription window the dispatcher can never reach. The
+      // `appleNotes` block stays as-is here so the post-clear branch
+      // below can still observe `appleNotes.enabled` to decide whether
+      // to run clearNote; the eventual notesErr stamp lands below.
+      const errorMsg = configErr ?? null;
+      this.snapshot = {
+        ...this.snapshot,
+        enabled: false,
+        publicUrl: null,
+        tunnelTransport: inferTunnelTransport(null),
+        lastError: errorMsg ? redact(errorMsg) : null
+      };
+      setRedactionPublicUrl(null);
+      try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
       // Wipe every push-device row tagged as tunneled BEFORE the Notes
       // clear. With the tunnel off, those rows refer to APNs
       // subscriptions that can never be reached again (the public URL
@@ -730,20 +752,14 @@ class TunnelManager {
       }
       // The stop-error path is logged inside the detached kill chain;
       // the disable() response itself only surfaces the synchronous
-      // config-write error.
-      const errorMsg = configErr ?? null;
-      this.snapshot = {
-        ...this.snapshot,
-        enabled: false,
-        publicUrl: null,
-        tunnelTransport: inferTunnelTransport(null),
-        lastError: errorMsg ? redact(errorMsg) : null,
-        appleNotes: notesErr
-          ? { ...this.snapshot.appleNotes, lastError: redact(notesErr) }
-          : this.snapshot.appleNotes
-      };
-      setRedactionPublicUrl(null);
-      try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+      // config-write error. Fold any clearNote error into the
+      // appleNotes block now that the await has settled.
+      if (notesErr) {
+        this.snapshot = {
+          ...this.snapshot,
+          appleNotes: { ...this.snapshot.appleNotes, lastError: redact(notesErr) }
+        };
+      }
       appendLog(this.config.instance, "tunnel.disabled", {
         generation: this.generation,
         tunnelDevicesPurged: purgedOnDisable.deleted
