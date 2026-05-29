@@ -235,12 +235,15 @@ export default function ChatDetailScreen() {
   // accretion. The 50ms defer lets layout settle so the new content is
   // measured before the scroll request lands. Skipped when the user has
   // scrolled up so streaming deltas don't fight their reading position.
+  // Re-check the pin ref inside the timeout too — the user can begin
+  // scrolling up during the 50ms window, after the effect already passed
+  // its own guard.
   useEffect(() => {
     if (!pinnedToBottomRef.current) return;
-    const id = setTimeout(
-      () => scrollRef.current?.scrollToEnd({ animated: true }),
-      50
-    );
+    const id = setTimeout(() => {
+      if (!pinnedToBottomRef.current) return;
+      scrollRef.current?.scrollToEnd({ animated: true });
+    }, 50);
     return () => clearTimeout(id);
   }, [list.length, sessionId, lastAssistantUpdatedAt]);
 
