@@ -8,6 +8,7 @@ import { describe, expect, test, beforeEach, afterEach, mock } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeMemoryDb } from "../../state/memory-db";
 
 const INSTANCE = "manager-unhealthy-code-test";
 
@@ -39,6 +40,13 @@ describe("TunnelManager typed error code on health-probe failure", () => {
   afterEach(() => {
     if (prevStateRoot === undefined) delete process.env.GINI_STATE_ROOT;
     else process.env.GINI_STATE_ROOT = prevStateRoot;
+    // Evict the cached bun:sqlite handle for this instance before the
+    // on-disk file is removed. The process-wide dbCache in memory-db.ts
+    // retains Database handles across tests, and a subsequent test run
+    // would otherwise reuse a handle whose underlying file was rmSync'd
+    // — surfacing as SQLITE_IOERR_VNODE on the next memory-db touch
+    // (e.g. purgeTunnelDevices inside rotateSecret()).
+    removeMemoryDb(INSTANCE);
     rmSync(tmp, { recursive: true, force: true });
     mock.restore();
   });
