@@ -61,7 +61,10 @@ function broadcast(next: AuthCredentials | null) {
 // (e.g. 203.0.113.x) and public hosts.
 export function isLocalGatewayHost(hostname: string): boolean {
   if (!hostname) return false;
-  const host = hostname.toLowerCase();
+  // WHATWG URL exposes IPv6 hostnames in bracket form (e.g. "[::1]"), but
+  // the loopback literal in the allowlist below is bracket-less ("::1").
+  // Strip a single surrounding pair so both shapes match.
+  const host = hostname.toLowerCase().replace(/^\[(.+)\]$/, "$1");
   if (host === "localhost") return true;
   if (host === "127.0.0.1") return true;
   if (host === "::1") return true;

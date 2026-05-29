@@ -28,6 +28,12 @@ describe("isLocalGatewayHost", () => {
     expect(isLocalGatewayHost("::1")).toBe(true);
   });
 
+  test("bracketed IPv6 loopback is local (WHATWG URL hostname shape)", () => {
+    // WHATWG URL surfaces "::1" as "[::1]" via the .hostname getter,
+    // so the allowlist must strip the brackets before comparing.
+    expect(isLocalGatewayHost("[::1]")).toBe(true);
+  });
+
   test("RFC1918 ranges are local", () => {
     expect(isLocalGatewayHost("10.0.0.1")).toBe(true);
     expect(isLocalGatewayHost("172.16.0.1")).toBe(true);
@@ -102,6 +108,22 @@ describe("normalizeBaseUrl", () => {
     expect(normalizeBaseUrl("http://192.168.1.10:7421")).toBe("http://192.168.1.10:7421");
     expect(normalizeBaseUrl("http://my-pi.local:7421")).toBe("http://my-pi.local:7421");
     expect(normalizeBaseUrl("http://100.64.0.1")).toBe("http://100.64.0.1");
+  });
+
+  test("accepts http:// to bracketed IPv6 loopback", () => {
+    // The original symptom: a pasted "http://[::1]:7421" round-trips
+    // through WHATWG URL with hostname="[::1]" and was rejected by the
+    // bracket-less loopback allowlist before the strip-and-compare fix.
+    expect(normalizeBaseUrl("http://[::1]:7421")).toBe("http://[::1]:7421");
+  });
+
+  test("rejects http:// to non-loopback IPv6", () => {
+    // Non-loopback IPv6 over plaintext stays in the cleartext-warning
+    // bucket — the bracket strip must not accidentally widen the
+    // allowlist to arbitrary v6 hosts.
+    expect(() => normalizeBaseUrl("http://[2001:db8::1]:7421")).toThrow(
+      PUBLIC_HTTP_REJECTION
+    );
   });
 
   test("rejects http:// to public hosts with the cleartext warning", () => {
