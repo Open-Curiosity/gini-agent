@@ -673,6 +673,16 @@ class TunnelManager {
       // circuit it once the snapshot stamp below lands, but killing the
       // interval here avoids the wake-and-skip cost.
       this.stopEdgeProbe();
+      // Wipe every push-device row tagged as tunneled BEFORE the Notes
+      // clear. With the tunnel off, those rows refer to APNs
+      // subscriptions that can never be reached again (the public URL
+      // is gone); leaving them lets the dispatcher keep trying to
+      // deliver to dead devices and gives a leaked-bootstrap holder a
+      // permanent subscription window. The purge is a fast local
+      // SQLite DELETE, so running it ahead of the Notes osascript
+      // means a Notes hang (15s timeout) or failure can't delay the
+      // device-row teardown.
+      const purgedOnDisable = purgeTunnelDevices(this.config.instance);
       // Clear iCloud Notes copy on disable transition if Notes mirror is on.
       let notesErr: string | null = null;
       if (this.snapshot.appleNotes.enabled && this.notesAvailable) {
@@ -698,12 +708,6 @@ class TunnelManager {
       };
       setRedactionPublicUrl(null);
       try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
-      // Wipe every push-device row tagged as tunneled. With the tunnel
-      // off, those rows refer to APNs subscriptions that can never be
-      // reached again (the public URL is gone); leaving them lets the
-      // dispatcher keep trying to deliver to dead devices and gives a
-      // leaked-bootstrap holder a permanent subscription window.
-      const purgedOnDisable = purgeTunnelDevices(this.config.instance);
       appendLog(this.config.instance, "tunnel.disabled", {
         generation: this.generation,
         tunnelDevicesPurged: purgedOnDisable.deleted
@@ -809,23 +813,26 @@ class TunnelManager {
         // If no tunnel was running, the pre-stamp above is the only
         // snapshot update we need — publicUrl stays null, secret +
         // revision reflect the rotation.
-        // Wipe every tunneled push-device row. The QR-bootstrap that
-        // produced these subscriptions is no longer valid (the secret
-        // moved on disk + the cookie/header binding the device used now
-        // mismatches the live config). Forcing re-registration against
-        // the new bootstrap is the only way a leaked URL holder loses
-        // their APNs subscription window.
-        const purgedOnRotate = purgeTunnelDevices(this.config.instance);
-        appendLog(this.config.instance, "tunnel.secret-rotated", {
-          recycled: didRecycle,
-          tunnelDevicesPurged: purgedOnRotate.deleted
-        });
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.snapshot = { ...this.snapshot, lastError: redact(msg) };
         return { ok: false, error: redact(msg) };
       } finally {
+        // Wipe every tunneled push-device row regardless of how the
+        // rotate exited (success, swap early-return, or throw). The
+        // rows are bound to the OLD secret; once the new secret has
+        // hit disk (the persistTunnel call above) those subscriptions
+        // are unreachable. Keeping the purge in finally ensures a
+        // swap failure (e.g. cloudflared banner timeout) or a thrown
+        // recycle still drops the stale rows — otherwise a leaked
+        // bootstrap holder retains a permanent APNs subscription window
+        // even though their cookie no longer matches the live secret.
+        const purgedOnRotate = purgeTunnelDevices(this.config.instance);
+        appendLog(this.config.instance, "tunnel.secret-rotated", {
+          recycled: didRecycle,
+          tunnelDevicesPurged: purgedOnRotate.deleted
+        });
         // Always release the rotate window — without this a thrown
         // recycle (e.g. cloudflared banner timeout) would leave the QR
         // endpoint returning 503 forever, with no operator-visible
