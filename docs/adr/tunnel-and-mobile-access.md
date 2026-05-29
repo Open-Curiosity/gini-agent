@@ -90,8 +90,14 @@ Key invariants the proxy enforces per PLAN.md:
   AND outstanding Bearer headers to mismatch on the next hit.
 - **Marker un-forgeability**: the proxy strips any inbound
   `x-gini-tunnel-vetted` value BEFORE its branch decisions and only stamps
-  the marker on requests that passed the secret/cookie gate. The BFF reads
-  the marker only on forwarded headers, never on inbound.
+  the marker on requests that passed the secret/cookie gate. The trust
+  enforcer is the strip-then-stamp boundary on the proxy — once stamped,
+  the marker is forwarded through the BFF's `FORWARD_HEADERS` allowlist
+  (`web/src/lib/runtime.ts`) so the runtime can read it for **non-security**
+  origin tagging (e.g. marking push-device rows as tunneled so disable /
+  rotate-secret can prune them). The runtime treats the marker as a hint,
+  not a security claim — every privileged decision still gates on the
+  Bearer / loopback check the runtime performs independently.
 - **Deny list**: `/api/runtime/pairing/*` (the device-pairing surface) is
   denied for tunneled callers — minting a permanent device bearer from a
   leaked QR is the one real privilege escalation in this design, so the
@@ -137,6 +143,23 @@ Key invariants the proxy enforces per PLAN.md:
   rotation window, the live publicUrl, and the trycloudflare.com suffix.
   The Next.js child's stdout is teed through the same redactor before the
   CLI writes `web.log`.
+
+### Tunneled /api/* path rewrite
+
+The tunneled proxy in `web/src/proxy.ts` rewrites bare `/api/<rest>` to
+`/api/runtime/<rest>` so the mobile client can build URLs as
+`${origin}/api${path}` without knowing the runtime prefix. The mobile
+client at `mobile/src/api.ts` calls e.g. `api("/chat")` — that hits
+`${origin}/api/chat` on the wire, which the proxy maps to
+`/api/runtime/chat` before forwarding to the runtime. This keeps the
+mobile call-site shape identical to the web client's `api()` helper and
+preserves source-tree symmetry between `web/src/lib/api.ts` and
+`mobile/src/api.ts`.
+
+Removing or changing this rewrite is a breaking change for every
+shipped mobile build that points at a gateway over the tunnel — every
+new path would 404 until the mobile client is rebuilt with the new
+prefix.
 
 ## Trust radius
 
@@ -214,8 +237,11 @@ short version:
 - Any unknown `/api/runtime/tunnel/<sub>` path returns 404 (default-deny
   for new endpoints).
 - Loopback callers of every route pass without the marker.
-- The marker is stripped from any inbound request before branch decisions
-  and is never forwarded to the runtime.
+- The marker is stripped from any inbound request before branch decisions.
+  The BFF forwards the proxy-stamped value through to the runtime via the
+  `FORWARD_HEADERS` allowlist; the runtime uses it only for non-security
+  origin tagging (tunneled push-device rows). The strip-then-stamp
+  boundary on the proxy remains the trust enforcer.
 - Log files under `~/.gini/instances/<inst>/logs/` contain no occurrence of
   the live secret value (or the prior secret within the rotation window)
   after a request that included the secret in the path.

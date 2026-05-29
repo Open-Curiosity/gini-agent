@@ -85,7 +85,16 @@ honestly attacker-controlled because the URL bar is attacker-controlled.
   when the marker is present. The marker itself is un-forgeable
   end-to-end: the proxy strips any inbound value before any branch
   decision and only stamps it after passing the secret/cookie gate
-  (PLAN.md "Marker un-forgeability"). The BFF also re-checks a
+  ([tunnel-and-mobile-access.md](tunnel-and-mobile-access.md), "Marker
+  un-forgeability"). The strip-then-stamp boundary on the proxy is the
+  trust enforcer. The BFF then forwards the proxy-stamped value to the
+  runtime via the `FORWARD_HEADERS` allowlist in `web/src/lib/runtime.ts`
+  (which lists `x-gini-tunnel-vetted` alongside the bearer / device-token
+  headers). The runtime uses the forwarded value only for non-security
+  origin tagging — push-device rows are flagged as tunneled so
+  `tunnel disable` / `tunnel rotate-secret` can prune them — never as a
+  privilege grant. Privileged decisions on the runtime still gate on the
+  Bearer / loopback check the runtime performs independently. The BFF also re-checks a
   tunnel-specific deny list: `/api/runtime/pairing/*` is the only
   subtree denied to tunneled callers (minting a permanent device
   bearer from a leaked URL is the real privilege escalation). Every
