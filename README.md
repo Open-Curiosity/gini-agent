@@ -139,6 +139,10 @@ gini tunnel disable         # stop cloudflared + clear the URL
 
 Install `cloudflared` first: `brew install cloudflared` (macOS), `sudo apt install cloudflared` (Linux), or `scoop install cloudflared` (Windows). See [tunnel-and-mobile-access.md](docs/adr/tunnel-and-mobile-access.md) for the trust boundary, secret rotation, and Bearer-auth contract.
 
+## Messaging channels
+
+Gini can bridge to messaging channels such as Telegram and Discord. These bridges were added to exercise the gateway's messaging contract and are **not** being actively worked on. We highly recommend interacting with Gini through the native web app and iOS app. Those are the primary, actively developed surfaces. See [telegram-bridge.md](docs/adr/telegram-bridge.md) and [discord-bridge.md](docs/adr/discord-bridge.md) for the bridge contracts.
+
 ## Local State
 
 ```text
