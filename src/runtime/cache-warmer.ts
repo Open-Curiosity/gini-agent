@@ -13,10 +13,11 @@
 //   - The loop itself lives in src/server.ts next to the other gateway
 //     loops (scheduler, reprobe, telegram, discord).
 //
-// Not handled here on purpose: per-agent / per-chat prefix tracking,
-// provider-specific cache-API hooks (OpenAI's prompt_cache_retention is
-// already on the wire via promptCacheRetentionFields), or any retry
-// policy. A failed probe logs and the next interval tries again.
+// Not handled here on purpose: per-agent / per-chat prefix tracking, or
+// any retry policy. A failed probe logs and the next interval tries
+// again. The `in_memory` retention tier itself is pinned on every
+// OpenAI-compatible request body in src/provider.ts; the warmer's job
+// is just to keep the implicit prefix cache fresh by re-firing.
 
 import { writeFileSync } from "node:fs";
 import { configPath } from "../paths";

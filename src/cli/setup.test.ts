@@ -153,54 +153,6 @@ describe("gini setup", () => {
     expect(mode).toBe(0o600);
   }, 30_000);
 
-  test("--non-interactive --force preserves an existing promptCacheRetention on same-provider rebuild", async () => {
-    // An operator who set `promptCacheRetention: "24h"` via `gini
-    // provider set` and then runs `gini setup --yes --force` to
-    // rotate credentials must not silently lose the ZDR-relevant
-    // retention bucket on the rebuild. Seed an openai+24h config,
-    // force a re-run, and assert the field survives.
-    const stateRoot = scratch("retention-preserved");
-    const home = scratch("retention-preserved-home");
-    const instance = "dev";
-    const instanceDir = join(stateRoot, "instances", instance);
-    mkdirSync(instanceDir, { recursive: true });
-    const seedConfig = {
-      instance,
-      port: 7337,
-      token: "test-token",
-      provider: {
-        name: "openai",
-        model: "gpt-5.4-mini",
-        baseUrl: "https://api.openai.com/v1",
-        apiKeyEnv: "OPENAI_API_KEY",
-        promptCacheRetention: "24h"
-      },
-      workspaceRoot: join(instanceDir, "workspace"),
-      stateRoot: instanceDir,
-      logRoot: join(instanceDir, "logs")
-    };
-    writeFileSync(join(instanceDir, "config.json"), `${JSON.stringify(seedConfig, null, 2)}\n`);
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      GINI_STATE_ROOT: stateRoot,
-      GINI_INSTANCE: instance,
-      HOME: home,
-      OPENAI_API_KEY: "sk-test-preserve"
-    };
-    delete env.CODEX_AUTH_JSON;
-    delete env.GINI_PROVIDER;
-    delete env.GINI_MODEL;
-    const result = await runCli({
-      args: ["setup", "--yes", "--force", "--state-root", stateRoot, "--instance", instance],
-      env
-    });
-    expect(result.code).toBe(0);
-    const configPath = join(stateRoot, "instances", instance, "config.json");
-    const config = JSON.parse(readFileSync(configPath, "utf8")) as { provider?: { name?: string; promptCacheRetention?: string } };
-    expect(config.provider?.name).toBe("openai");
-    expect(config.provider?.promptCacheRetention).toBe("24h");
-  }, 30_000);
-
   test("--non-interactive with fresh config and NO OPENAI_API_KEY exits 1 with helpful message", async () => {
     const stateRoot = scratch("fresh-yes-nokey");
     const home = scratch("fresh-yes-nokey-home");
