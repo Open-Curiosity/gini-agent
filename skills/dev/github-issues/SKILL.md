@@ -38,8 +38,57 @@ section leads with the `gh` CLI (the preferred path) and follows with a
 
 ## Setup
 
-Resolve auth and the target repo once at the start of a session, then
-reuse `$OWNER` / `$REPO` for the curl fallback.
+`gh` is the preferred path. Make sure it's installed and authenticated
+before the first issue operation. The user here is a developer — when a
+step needs them (installing a package, completing an interactive sign-in),
+surface the exact command and let them run it rather than trying to
+automate it.
+
+### 1. Install gh if it's missing
+
+```bash
+command -v gh >/dev/null 2>&1 && echo "gh present: $(gh --version | head -1)"
+```
+
+If that prints nothing, install it for the host platform (this is a
+side-effecting command — propose it):
+
+```bash
+brew install gh                       # macOS / Linuxbrew
+sudo dnf install gh                   # Fedora / RHEL
+sudo pacman -S github-cli             # Arch
+winget install --id GitHub.cli        # Windows
+```
+
+Debian/Ubuntu needs the GitHub CLI apt repo first; if `sudo apt install
+gh` reports "Unable to locate package", follow the repo-setup steps at
+<https://github.com/cli/cli/blob/trunk/docs/install_linux.md>. If the
+host can't install `gh` at all, skip to the curl/REST fallback in step 3.
+
+### 2. Authenticate gh if it isn't signed in
+
+```bash
+gh auth status >/dev/null 2>&1 && echo "gh authenticated" || echo "gh NOT authenticated"
+```
+
+If it's not authenticated, **show the user these instructions and let
+them complete sign-in in their own terminal** — `gh auth login` is
+interactive (it opens a browser or prints a one-time device code), so the
+agent can't finish it headlessly:
+
+```bash
+# Interactive (recommended): choose GitHub.com → HTTPS → "Login with a
+# web browser", then paste the one-time code gh shows you.
+gh auth login
+
+# Non-interactive alternative, if the user has a Personal Access Token
+# (classic token needs the `repo` scope; add `read:org` for org repos):
+echo "$GITHUB_TOKEN" | gh auth login --with-token
+```
+
+Re-run `gh auth status` to confirm before continuing.
+
+### 3. Resolve the auth mode and target repo
 
 ```bash
 # Prefer the gh CLI when it's present and signed in.
@@ -47,7 +96,7 @@ if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   AUTH="gh"
 else
   AUTH="curl"
-  : "${GITHUB_TOKEN:?Set GITHUB_TOKEN or run 'gh auth login' for the gh path}"
+  : "${GITHUB_TOKEN:?gh is unavailable — set GITHUB_TOKEN, or install and auth gh (steps 1-2)}"
 fi
 
 # Derive owner/repo from the origin remote (needed for the curl path).
@@ -323,8 +372,11 @@ curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
 
 ## Rules
 
-1. Prefer `gh` when it is authenticated; only drop to curl when `gh` is
-   absent or signed out.
+1. Prefer `gh` when it is authenticated; only drop to curl when `gh`
+   cannot be installed or authenticated. If `gh` is missing or signed
+   out, surface the install command and the `gh auth login` instruction
+   to the user (Setup steps 1-2) — don't try to drive the interactive
+   sign-in headlessly.
 2. Confirm intent before any bulk close/relabel or any single destructive
    change — these are side-effecting and have no undo.
 3. Never put a token on a command line or in an issue/comment body; let
