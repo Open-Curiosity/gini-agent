@@ -122,7 +122,10 @@ Usage:
                   (/responses) and echo ignore it.
                   --prompt-cache-retention sets the OpenAI prompt-cache
                   bucket sent as \`prompt_cache_retention\` on /responses
-                  and /chat/completions. Accepted values: "in_memory"
+                  and /chat/completions. The runtime forwards any non-
+                  empty string verbatim (after trimming whitespace) so
+                  new retention tiers OpenAI adds work without a code
+                  change; currently documented values are "in_memory"
                   (most models default here; 5–10 min idle, 1 h max)
                   and "24h" (extended; up to 24 h, NOT ZDR eligible).
                   Per-model defaults vary — gpt-5.5 defaults to and only
