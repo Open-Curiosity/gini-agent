@@ -79,7 +79,16 @@ export function clampMs(value: string | undefined, fallback: number): number {
 // when the User-Agent isn't iOS / iPadOS / Android so the operator never
 // sees the interstitial flicker — the mobile path keeps the existing
 // scheme handoff + fallback machinery.
-export const MOBILE_UA_PATTERN = /\b(iPhone|iPad|iPod|Android)\b/i;
+//
+// iPadOS Safari (since iPadOS 13) sends a Mac-shaped User-Agent with no
+// `iPad`/`Mobile` token, indistinguishable from macOS Safari. We accept
+// macOS Safari too so iPad users with the native app get the scheme
+// handoff. macOS Safari users without the app see a `DEFAULT_FALLBACK_MS`
+// interstitial flicker before the client-side timed fallback ships them
+// to the web app — acceptable tradeoff. Other Mac browsers (Chrome,
+// Firefox, Edge) are excluded so they don't see the flicker.
+export const MOBILE_UA_PATTERN =
+  /\b(iPhone|iPad|iPod|Android)\b|Macintosh(?!.*Chrome).*Safari\//i;
 export function userAgentLooksMobile(ua: string | null | undefined): boolean {
   if (!ua) return false;
   return MOBILE_UA_PATTERN.test(ua);

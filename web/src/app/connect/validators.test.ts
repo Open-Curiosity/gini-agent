@@ -161,12 +161,47 @@ describe("userAgentLooksMobile", () => {
     expect(userAgentLooksMobile("MOZILLA/5.0 (ANDROID)")).toBe(true);
   });
 
-  test("rejects Mac desktop UA", () => {
+  test("rejects bare Mac desktop UA (no Safari token)", () => {
     expect(
       userAgentLooksMobile(
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
       ),
     ).toBe(false);
+  });
+
+  test("accepts iPadOS / macOS Safari UA (Mac-shaped + Safari)", () => {
+    // iPadOS Safari has sent a Mac-shaped UA since iPadOS 13 — same
+    // wire-shape as macOS Safari, no `iPad` token. Treat it as mobile
+    // so iPad users with the app get the scheme handoff.
+    expect(
+      userAgentLooksMobile(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+      ),
+    ).toBe(true);
+  });
+
+  test("rejects macOS Chrome (has Chrome token after Safari)", () => {
+    expect(
+      userAgentLooksMobile(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      ),
+    ).toBe(false);
+  });
+
+  test("rejects macOS Firefox (no Safari token at all)", () => {
+    expect(
+      userAgentLooksMobile(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0",
+      ),
+    ).toBe(false);
+  });
+
+  test("iPhone Safari still matched via the iPhone branch", () => {
+    expect(
+      userAgentLooksMobile(
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1",
+      ),
+    ).toBe(true);
   });
 
   test("returns false on null, undefined, empty", () => {
