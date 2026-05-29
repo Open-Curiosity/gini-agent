@@ -122,10 +122,14 @@ Usage:
                   (/responses) and echo ignore it.
                   --prompt-cache-retention sets the OpenAI prompt-cache
                   bucket sent as \`prompt_cache_retention\` on /responses
-                  and /chat/completions ("in_memory" — the default;
-                  "24h" — extended, not ZDR eligible). An empty string
-                  suppresses the field; codex rejects it with HTTP 400
-                  until the chatgpt.com backend adds support.
+                  and /chat/completions. Accepted values: "in_memory"
+                  (most models default here; 5–10 min idle, 1 h max)
+                  and "24h" (extended; up to 24 h, NOT ZDR eligible).
+                  Per-model defaults vary — gpt-5.5 defaults to and only
+                  accepts "24h"; older models default to "in_memory".
+                  An empty string suppresses the field; codex rejects
+                  any value with HTTP 400 until the chatgpt.com backend
+                  adds support.
   bun run gini trace <task-id>
   bun run gini events
   bun run gini audit
