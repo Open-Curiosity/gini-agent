@@ -28,6 +28,7 @@ import {
   useCreateChat,
   useDeleteChat,
   useMarkChatUnread,
+  useUnreadCounts,
   useUseAgent
 } from "@/src/queries";
 import { family, theme } from "@/src/theme";
@@ -284,6 +285,13 @@ function ChatList({
   // fall back to "New chat" for untitled sessions so empty-title rows
   // remain reachable via search.
   const [query, setQuery] = useState("");
+  // Per-session unread counts keyed by sessionId. Empty {} for clients
+  // without an APNs token (web target, pre-registration cold start) —
+  // useUnreadCounts gates the fetch on the cached device token, so the
+  // query stays disabled rather than spamming 400s. ChatRow defaults
+  // to 0 when its session is missing from the map.
+  const unreadCountsQuery = useUnreadCounts();
+  const unreadCounts = unreadCountsQuery.data ?? {};
   // User-initiated pull-to-refresh state. `isChatsFetching` from React
   // Query also flips during the 3s background poll, so binding the
   // RefreshControl to it directly makes the spinner pop at the top of
@@ -406,7 +414,13 @@ function ChatList({
               tintColor={theme.muted}
             />
           }
-          renderItem={({ item }) => <ChatRow session={item} agentId={agentId} />}
+          renderItem={({ item }) => (
+            <ChatRow
+              session={item}
+              agentId={agentId}
+              unreadCount={unreadCounts[item.id] ?? 0}
+            />
+          )}
           ListEmptyComponent={
             query.trim() ? (
               <View style={styles.searchEmpty}>
@@ -422,10 +436,12 @@ function ChatList({
 
 function ChatRow({
   session,
-  agentId
+  agentId,
+  unreadCount
 }: {
   session: ChatSession;
   agentId: string | null;
+  unreadCount: number;
 }) {
   const title = session.title?.trim() || "New chat";
   // Excerpt: the server-supplied `lastMessagePreview` is the latest
@@ -438,6 +454,11 @@ function ChatRow({
   const deleteChat = useDeleteChat(agentId);
   const markUnread = useMarkChatUnread();
   const swipeRef = useRef<SwipeableMethods | null>(null);
+  const isUnread = unreadCount > 0;
+  // Cap the badge text at "99+" so a runaway notification stream doesn't
+  // explode the pill width. The runtime aggregates the raw count without
+  // a ceiling — clamping at render time keeps that flexibility.
+  const badgeText = unreadCount > 99 ? "99+" : String(unreadCount);
 
   // iOS Mail/Messages pattern: left-swipe reveals Unread (blue) and
   // Delete (red) buttons. Delete is destructive but the swipe is itself
@@ -486,20 +507,37 @@ function ChatRow({
         onPress={() => router.push(`/chat/${session.id}`)}
         activeOpacity={0.7}
         style={[styles.chatRow, styles.chatRowSurface]}
+        accessibilityRole="button"
+        accessibilityLabel={
+          isUnread
+            ? `${title}, ${unreadCount} unread ${unreadCount === 1 ? "message" : "messages"}`
+            : title
+        }
       >
         <View style={styles.chatRowTopLine}>
           <Text style={styles.chatRowTitle} numberOfLines={1}>
             {title}
           </Text>
-          <Text style={styles.chatRowTime} numberOfLines={1}>
+          <Text
+            style={[styles.chatRowTime, isUnread && styles.chatRowTimeUnread]}
+            numberOfLines={1}
+          >
             {time}
           </Text>
         </View>
-        {subtitle ? (
-          <Text style={styles.chatRowSubtitle} numberOfLines={1}>
+        <View style={styles.chatRowBottomLine}>
+          <Text
+            style={styles.chatRowSubtitle}
+            numberOfLines={1}
+          >
             {subtitle}
           </Text>
-        ) : null}
+          {isUnread ? (
+            <View style={styles.unreadBadge} accessibilityElementsHidden>
+              <Text style={styles.unreadBadgeText}>{badgeText}</Text>
+            </View>
+          ) : null}
+        </View>
       </TouchableOpacity>
     </ReanimatedSwipeable>
   );
@@ -909,11 +947,43 @@ const styles = StyleSheet.create({
     fontFamily: family("HankenGrotesk", 600),
     fontSize: 12
   },
+  // Bottom line — subtitle (flex) and the optional unread badge sit on
+  // a row so the badge floats to the right edge regardless of subtitle
+  // length. The Pencil design pins both to a `space_between` baseline.
+  chatRowBottomLine: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
   chatRowSubtitle: {
+    flex: 1,
     color: theme.subtle,
     fontFamily: family("HankenGrotesk", 400),
     fontSize: 14,
     lineHeight: 18
+  },
+  // Unread row variations from the "Chat List" Pencil frame: time
+  // turns iOS-system-blue and bumps weight; the badge is a blue pill
+  // with the per-session unread count in white. Designed to be subtle
+  // — title text stays the same weight so a long unread thread doesn't
+  // shove the read rows around as counts change.
+  chatRowTimeUnread: {
+    color: "#2F6BFF",
+    fontFamily: family("HankenGrotesk", 700)
+  },
+  unreadBadge: {
+    minWidth: 20,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 999,
+    backgroundColor: "#2F6BFF",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  unreadBadgeText: {
+    color: "#FFFFFF",
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 12
   },
 
   // Swipe-reveal action panel — iOS Mail/Messages pattern. Two 80px

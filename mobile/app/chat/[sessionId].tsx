@@ -1,4 +1,5 @@
 import { Feather } from "@expo/vector-icons";
+import { useQueryClient } from "@tanstack/react-query";
 import * as ImagePicker from "expo-image-picker";
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -84,6 +85,7 @@ export default function ChatDetailScreen() {
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
   const stream = useChatStream(sessionId ?? null);
   const send = useSendMessage(sessionId ?? null);
+  const qc = useQueryClient();
 
   const [text, setText] = useState("");
   const [images, setImages] = useState<PendingImage[]>([]);
@@ -136,13 +138,17 @@ export default function ChatDetailScreen() {
           body: JSON.stringify({ lastReadBlockId: latestId })
         });
         await refreshBadge();
+        // Drop the per-session unread cache so the chat list's badge
+        // for this row clears on the next render instead of waiting
+        // for the 3s poll.
+        qc.invalidateQueries({ queryKey: ["unread"] });
       } catch {
         // Best-effort — read state is rebuilt on the next navigation,
         // and refreshBadge has its own swallow. A failure here only
         // delays the badge clearing until the next event.
       }
     })();
-  }, [list, sessionId]);
+  }, [list, sessionId, qc]);
 
   // Phase blocks are transient indicators — only render the latest one,
   // and only while it's still active (non-terminal). Historical phase
