@@ -277,7 +277,17 @@ class TunnelManager {
     } catch (err) {
       const code = (err as NodeJS.ErrnoException)?.code;
       if (code !== "ENOENT") {
-        appendLog(this.config.instance, "tunnel.publicurl-remove-failed", { code });
+        // appendLog can itself throw (EACCES on the log dir, ENOSPC).
+        // This helper's contract is "swallow the file-removal failure";
+        // the constructor and the cloudflared exit listener both call
+        // removePublicUrlFile() without an outer try/catch, so a thrown
+        // log error would surface as an uncaughtException. Keep the
+        // log emission strictly best-effort.
+        try {
+          appendLog(this.config.instance, "tunnel.publicurl-remove-failed", { code });
+        } catch {
+          // best-effort logging; log-dir errors must not crash the helper
+        }
       }
     }
   }
