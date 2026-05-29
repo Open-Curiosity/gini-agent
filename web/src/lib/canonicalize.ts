@@ -3,12 +3,12 @@
 // both invocation sites. See docs/adr/tunnel-and-mobile-access.md
 // "Architecture (summary)".
 //
-// IMPORTANT: this file is duplicated as src/runtime/tunnel/canonicalize.ts on
+// IMPORTANT: this file is paired with src/runtime/tunnel/canonicalize.ts on
 // the runtime side. The duplication is deliberate — Next.js refuses to bundle
-// modules from outside its project root, and the runtime can't reach into
-// web/ via tsconfig path mapping. Keep the two files byte-equal; the test
-// pinned at src/runtime/tunnel/canonicalize.test.ts covers both because the
-// algorithm is identical.
+// modules from outside its project root, so we keep a sibling copy here. The
+// two implementations are kept *behaviorally* equivalent — the parity test at
+// src/runtime/tunnel/canonicalize.parity.test.ts pins identical output on a
+// shared input corpus. Comments may drift between the two; behavior may not.
 
 export interface CanonicalizeResult {
   ok: true;

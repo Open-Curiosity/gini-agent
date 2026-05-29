@@ -1,6 +1,14 @@
 // Shared path canonicalization used by the Next.js middleware (proxy) and the
 // BFF guard. Tests pin both invocation sites. See
 // docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
+//
+// IMPORTANT: this file is paired with web/src/lib/canonicalize.ts on the BFF
+// side. The duplication is deliberate — Next.js refuses to bundle modules
+// from outside its project root, so the web project keeps a sibling copy.
+// The two implementations are kept *behaviorally* equivalent — the parity
+// test at src/runtime/tunnel/canonicalize.parity.test.ts pins identical
+// output on a shared input corpus. Comments may drift between the two;
+// behavior may not.
 
 export interface CanonicalizeResult {
   ok: true;
