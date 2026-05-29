@@ -7,9 +7,9 @@ import type { TunnelPersistedConfig } from "./types";
 
 // Reads / writes the `tunnel` subtree of config.json without disturbing the
 // rest of the file. Uses atomic-rename for writes so concurrent reads see
-// either the old or the new full document — never a partial. One retry on
-// parse error covers the brief window between unlink and rename. See PLAN.md
-// "Operational invariants".
+// either the old or the new full document — never a partial. One immediate
+// retry on parse error covers the brief window between unlink and rename.
+// See PLAN.md "Operational invariants".
 
 type ConfigShape = Record<string, unknown> & {
   tunnel?: Partial<TunnelPersistedConfig> & {
@@ -17,24 +17,29 @@ type ConfigShape = Record<string, unknown> & {
   };
 };
 
-const READ_RETRY_DELAY_MS = 10;
+// Default returned when both read attempts fail. Callers (readTunnelConfig
+// / ensureTunnelConfig / patchTunnelConfig) treat the missing `tunnel`
+// subtree as "first boot" and re-mint a fresh secret on the next write.
+const SAFE_DEFAULT: ConfigShape = {};
 
 function readConfigJson(instance: Instance): ConfigShape {
   const path = configPath(instance);
   if (!existsSync(path)) return {};
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as ConfigShape;
+  } catch {
+    // Atomic-rename collision is bounded by the writer's `rename(2)`
+    // syscall, so a single immediate retry catches the microscopic
+    // race window without burning CPU on a busy-loop. If the second
+    // read also fails (truly corrupted file), fall back to the safe
+    // default rather than propagate — losing one record means the
+    // next write re-seeds; throwing would brick the runtime.
     try {
-      const raw = readFileSync(path, "utf8");
-      return JSON.parse(raw) as ConfigShape;
-    } catch (err) {
-      lastError = err;
-      // Sleep briefly then retry once. Atomic rename windows are tiny.
-      const target = Date.now() + READ_RETRY_DELAY_MS;
-      while (Date.now() < target) { /* spin */ }
+      return JSON.parse(readFileSync(path, "utf8")) as ConfigShape;
+    } catch {
+      return { ...SAFE_DEFAULT };
     }
   }
-  throw new Error(`config.json read failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }
 
 export function readTunnelConfig(instance: Instance): TunnelPersistedConfig {
