@@ -147,7 +147,8 @@ export interface ProviderConfig {
   // referenced by `apiKeyEnv`, never in extraBody. Caller is responsible
   // for keeping values JSON-serializable.
   extraBody?: Record<string, unknown>;
-  // OpenAI prompt-cache retention bucket. Sent verbatim as the
+  // OpenAI prompt-cache retention bucket. Funneled through
+  // `normalizeRetentionValue` and forwarded as the
   // `prompt_cache_retention` field on outbound /responses and
   // /chat/completions request bodies, alongside the implicit prefix-match
   // caching OpenAI does automatically. Per
@@ -156,8 +157,11 @@ export interface ProviderConfig {
   // and `"24h"` (extended; up to 24 h). Models in the gpt-5.5 family
   // default to and only accept `"24h"`. Cached input tokens are billed
   // at 10% of the base input price (e.g. gpt-5.5: $5.00 input vs $0.50
-  // cached). Field is treated as a free-form string so future retention
-  // tiers OpenAI adds can be passed through without a code change.
+  // cached). The runtime trims surrounding whitespace as a defensive
+  // typo guard but otherwise treats the value as a free-form string
+  // so future retention tiers OpenAI adds can be passed through
+  // without a code change. A whitespace-only value collapses to
+  // undefined and the field is not sent.
   //
   // No runtime default. When omitted the field is not sent and the
   // provider's own model default applies — this matters because

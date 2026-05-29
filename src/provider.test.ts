@@ -319,7 +319,9 @@ describe("provider", () => {
       // body must omit the field. Pins the "absent everywhere when
       // unset" half of the present-or-absent contract for the codex
       // /responses surface (the chat-completions half is covered by
-      // the openai forwarding tests near line 770).
+      // the openai chat-completions forwarding test
+      // "openai tool-calling forwards promptCacheRetention as
+      // prompt_cache_retention in the body").
       expect(sent.prompt_cache_retention).toBeUndefined();
     } finally {
       globalThis.fetch = originalFetch;
