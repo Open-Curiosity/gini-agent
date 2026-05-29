@@ -49,6 +49,19 @@ Use `gws forms` to create new forms, add questions to them, change publish setti
 - Agent-internal state — use the `memory` tool.
 - Long, branching surveys with complex logic — Forms supports basic section navigation but real survey tooling (Typeform, Qualtrics) is more appropriate.
 
+## Skill context for `terminal_exec`
+
+Every `gws` invocation needs `GOOGLE_WORKSPACE_CLI_CLIENT_ID` + `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` in env. Pass `skill: "google-forms"` to `terminal_exec` so the runtime injects them:
+
+```
+terminal_exec({
+  command: "gws ...",
+  skill: "google-forms"
+})
+```
+
+Without `skill`, the spawn runs with no connector env and `gws` fails to authenticate. Omitting `skill` is the same as opting out of credentials.
+
 ## Quick Reference
 
 The Forms surface is small: `forms.create`, `forms.get`, `forms.batchUpdate`, `forms.setPublishSettings`, and the `forms.responses` subresource for reading submissions.

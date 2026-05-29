@@ -89,7 +89,7 @@ import {
   releaseApproval
 } from "./execution/approval-execution";
 import { syncSubagentFromTask } from "./capabilities/subagents";
-import { resolveActiveSkillsEnv } from "./integrations/connectors";
+import { resolveSkillEnvByName } from "./integrations/connectors";
 import { sendMessagingOutput } from "./integrations/messaging";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
 // the cycle that runs through submitTask. The finalizer flips the linked
@@ -1674,7 +1674,10 @@ async function runApprovedAction(
     if (signal.aborted) {
       return await emitTerminalAborted(config, approval, extraEvidence, { command, usePty, signal });
     }
-    const skillEnv = await resolveActiveSkillsEnv(config, approval.taskId);
+    const approvalSkill = typeof approval.payload.skill === "string" && approval.payload.skill.length > 0
+      ? approval.payload.skill
+      : undefined;
+    const skillEnv = await resolveSkillEnvByName(config, approvalSkill, approval.taskId);
     const proc = spawn(spawnArgs, {
       cwd: config.workspaceRoot,
       stdout: "pipe",
@@ -2253,7 +2256,7 @@ export async function runTerminalCommand(
   config: RuntimeConfig,
   taskId: string,
   command: string,
-  options: { timeoutMs?: number; pty?: boolean; evidenceExtra?: Record<string, unknown> } = {}
+  options: { timeoutMs?: number; pty?: boolean; skill?: string; evidenceExtra?: Record<string, unknown> } = {}
 ): Promise<{ exitCode: number; stdout: string; stderr: string; summary: string }> {
   // Spawn-config locals (usePty / timeoutMs / spawnArgs) live in
   // `runTerminalCommandClaimed`; this wrapper only owns the
@@ -2315,7 +2318,7 @@ async function runTerminalCommandClaimed(
   config: RuntimeConfig,
   taskId: string,
   command: string,
-  options: { timeoutMs?: number; pty?: boolean; evidenceExtra?: Record<string, unknown> },
+  options: { timeoutMs?: number; pty?: boolean; skill?: string; evidenceExtra?: Record<string, unknown> },
   syntheticApprovalId: string,
   controller: AbortController
 ): Promise<{ exitCode: number; stdout: string; stderr: string; summary: string }> {
@@ -2335,7 +2338,7 @@ async function runTerminalCommandClaimed(
     winner = "aborted";
     abortReason = readSignalReason(signal);
   } else {
-    const skillEnv = await resolveActiveSkillsEnv(config, taskId);
+    const skillEnv = await resolveSkillEnvByName(config, options.skill, taskId);
     const proc = spawn(spawnArgs, {
       cwd: config.workspaceRoot,
       stdout: "pipe",

@@ -380,23 +380,32 @@ export function envBindingsForProviders(providers: string[]): Record<string, { p
   return result;
 }
 
-// Aggregate env bindings across every enabled, active skill. Called at
-// terminal_exec spawn time so a skill's scripts pick up declared
-// credentials regardless of which skill the model chose to follow.
-// `taskId` is threaded so the per-secret resolution audits attribute to
-// the agent that owns the spawning task.
-export async function resolveActiveSkillsEnv(
+// NOTE: `resolveActiveSkillsEnv` (the aggregate-across-every-active-skill
+// helper) was removed as part of the ENG-1613 env-containment fix. It was
+// the leak path: every terminal_exec invocation got every active skill's
+// connector env, so an `attachments` helper script saw GitHub, Notion,
+// Linear, Google secrets just because those skills were enabled. The new
+// model: terminal_exec accepts an optional `skill` arg, and only that
+// skill's `resolveSkillEnv` is injected via `resolveSkillEnvByName` below.
+// Without a skill arg, no connector env enters the spawn. Callers that
+// previously relied on aggregation must now name the skill they're
+// operating under.
+
+// Resolve env vars for ONE named skill, or empty when no skill context is
+// supplied / the skill doesn't exist / the skill is not enabled. Unknown
+// skill names silently produce empty env rather than erroring — the
+// command itself usually still works without the connector env, and the
+// audit row captures the requested skill name either way.
+export async function resolveSkillEnvByName(
   config: RuntimeConfig,
+  skillName: string | undefined,
   taskId?: string
 ): Promise<Record<string, string>> {
+  if (!skillName) return {};
   const state = readState(config.instance);
-  const out: Record<string, string> = {};
-  for (const skill of state.skills) {
-    if (skill.status !== "enabled") continue;
-    if (!isSkillActive(state, skill)) continue;
-    Object.assign(out, await resolveSkillEnv(config, skill, taskId));
-  }
-  return out;
+  const skill = state.skills.find((s) => s.name === skillName && s.status === "enabled");
+  if (!skill) return {};
+  return resolveSkillEnv(config, skill, taskId);
 }
 
 export async function resolveSkillEnv(

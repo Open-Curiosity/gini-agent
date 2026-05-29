@@ -51,6 +51,19 @@ Use `gws gmail` to read, search, send, reply, forward, draft, label, and triage 
 - Calendar invites and meeting scheduling — use `google-calendar` (a Gmail invite is still a Calendar event).
 - Bulk outbound mail (newsletters, marketing) — personal Gmail has aggressive sending limits and Google will throttle or suspend the account. Tell the user to use a transactional provider.
 
+## Skill context for `terminal_exec`
+
+Every `gws` invocation needs `GOOGLE_WORKSPACE_CLI_CLIENT_ID` + `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` in env. Pass `skill: "google-gmail"` to `terminal_exec` so the runtime injects them:
+
+```
+terminal_exec({
+  command: "gws ...",
+  skill: "google-gmail"
+})
+```
+
+Without `skill`, the spawn runs with no connector env and `gws` fails to authenticate. Omitting `skill` is the same as opting out of credentials.
+
 ## Quick Reference
 
 The Gmail surface in `gws` is split into auto-generated API methods (`gws gmail users messages list`, `gws gmail users labels create`, …) plus a small set of curated helpers (`+send`, `+reply`, `+read`, `+triage`, …) that handle MIME encoding, threading, and base64 for you. Prefer the helpers for everyday tasks. The raw API is rooted at the `users` resource — every `--params` JSON must include `"userId": "me"` (or another delegated address).
