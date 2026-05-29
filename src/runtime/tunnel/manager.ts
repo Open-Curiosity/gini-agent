@@ -943,6 +943,20 @@ class TunnelManager {
     const result: TunnelTransitionResult = await this.enqueue(async (): Promise<TunnelTransitionResult> => {
       try {
         this.persistTunnel( { appleNotes: { enabled } });
+        // Bump the generation on every Notes-toggle transition so an
+        // in-flight `runRefreshNotes` / `runClearNotes` scheduled by a
+        // prior enable() / rotateSecret() / edge-recycle (or by the
+        // previous toggle) supersedes cleanly. Without this, a fast
+        // off→on sequence leaves `this.generation` unchanged across
+        // the persist, so the prior worker's `scheduledGeneration ===
+        // this.generation` check at its post-await re-entry passes —
+        // and writeNote fires against the now-stale URL/secret pair.
+        // Bumping here makes the gen-mismatch gate inside the worker
+        // bodies bail the older scheduled task before its side
+        // effect lands. The new `scheduledGeneration` captured below
+        // is the post-bump value, so this toggle's own follow-up
+        // worker still proceeds.
+        this.generation += 1;
         const notes: AppleNotesState = {
           enabled,
           notesAvailable: this.notesAvailable,
