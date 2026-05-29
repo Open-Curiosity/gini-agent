@@ -780,6 +780,75 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // signed_download: GET bytes from a URL and store them as a Gini
+    // upload. Inverse of signed_upload — lets the model bridge external
+    // content (Linear attachment URLs, GitHub raw files, user-pasted
+    // URLs, S3 presigned downloads) into the upload-addressable space.
+    // Once landed as an uploadId, the bytes work with signed_upload (to
+    // re-send), vision_query (to inspect), and any other tool that takes
+    // an uploadId.
+    toolset: "mcp",
+    displayLabel: "Download to upload",
+    type: "function",
+    function: {
+      name: "signed_download",
+      description: "GET bytes from a URL and store them as a Gini upload. Use this when an API returns a URL pointing to file content (e.g. Linear's get_attachment, GitHub raw, S3 presigned download) and you want to do something with the bytes — vision_query, signed_upload to a different destination, attach to a Linear issue, etc. Returns { ok, uploadId, mimeType, size, error? }. Only https URLs accepted. Body capped at 50MB.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "Source URL to GET. Must be https." },
+          headers: { type: "object", description: "Optional request headers (auth tokens, etc.).", additionalProperties: { type: "string" } },
+          filename: { type: "string", description: "Optional filename to record in the upload manifest. Defaults to the URL basename." }
+        },
+        required: ["url"]
+      }
+    }
+  },
+  {
+    // promote_file: register a workspace file as a Gini upload. Closes
+    // the agent-produced-bytes gap — anything code_exec, terminal_exec,
+    // or future browser_capture leaves on disk can be promoted into the
+    // upload system so the model can then signed_upload / vision_query
+    // / attach it.
+    toolset: "mcp",
+    displayLabel: "Promote workspace file",
+    type: "function",
+    function: {
+      name: "promote_file",
+      description: "Register a workspace file as a Gini upload and return its uploadId. Use this when code_exec / terminal_exec / a future browser tool produced a file (chart PNG, generated PDF, downloaded artifact) and you want to attach it somewhere or vision_query it. The path is workspace-relative and validated for escape (same guard file_read uses). Returns { ok, uploadId, mimeType, size, error? }. Mime defaults from the file extension.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Workspace-relative path to the file to promote." },
+          mimeType: { type: "string", description: "Optional explicit mime type. Overrides the extension-based default." }
+        },
+        required: ["path"]
+      }
+    }
+  },
+  {
+    // vision_query: ask the configured vision model a question about a
+    // Gini upload. Like browser_vision but for arbitrary uploads — pairs
+    // with signed_download / promote_file / chat-attached images so the
+    // model can "see" content it didn't start with as a data URL.
+    toolset: "mcp",
+    displayLabel: "Vision query",
+    type: "function",
+    function: {
+      name: "vision_query",
+      description: "Ask the configured vision model a question about an existing Gini upload (image/png or image/jpeg). Use this for chat-attached screenshots when you need to inspect details beyond what's already in vision context, or after signed_download / promote_file landed an image and you want the model to describe / extract from it. Returns { ok, answer, usage?, error? }. Costs a vision-model call.",
+      parameters: {
+        type: "object",
+        properties: {
+          uploadId: { type: "string", description: "Id of the image upload to query (from the chat marker, signed_download, or promote_file)." },
+          question: { type: "string", description: "What to ask about the image." },
+          maxTokens: { type: "number", description: "Optional cap on the response length. Default 512." }
+        },
+        required: ["uploadId", "question"]
+      }
+    }
+  },
+  {
     // Schedule a real cron/job. The job's output is delivered as an
     // assistant message back into the originating chat session when it
     // fires. Low-risk: no approval gate — the user can pause/delete the
@@ -1217,12 +1286,18 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // fresh instances even when a user has configured a server, so it
     // mirrors read_skill / spawn_subagent's always-on stance.
     if (tool.function.name === "mcp_call") return true;
-    // signed_upload rides alongside mcp_call: it's the generic primitive
-    // for "PUT a Gini upload to a URL" that completes signed-PUT flows
-    // (Linear attachments, GitHub uploads, S3, etc.). The model needs it
-    // on every fresh instance without toolset toggling — same always-on
-    // rationale as mcp_call.
+    // signed_upload / signed_download / promote_file / vision_query are
+    // the generic upload-space primitives. signed_upload PUTs Gini bytes
+    // out, signed_download GETs external bytes in, promote_file lifts
+    // workspace artifacts into the upload space, vision_query inspects
+    // an upload with the configured vision model. All four are always-on
+    // alongside mcp_call so a fresh instance can complete any
+    // signed-URL upload / download / vision flow without toolset
+    // toggling.
     if (tool.function.name === "signed_upload") return true;
+    if (tool.function.name === "signed_download") return true;
+    if (tool.function.name === "promote_file") return true;
+    if (tool.function.name === "vision_query") return true;
     // request_connector is the in-chat affordance that lets the agent
     // ask the user to wire up a missing connector. Same always-on
     // rationale: a fresh instance with no toolsets toggled still needs
@@ -1429,6 +1504,15 @@ export function chatBlockArgsPreviewFor(
       try { host = new URL(String(safe.url ?? "")).host; } catch { host = "?"; }
       return truncatePreview(`${previewValue(safe.uploadId)} → ${host}`);
     }
+    case "signed_download": {
+      let host = "";
+      try { host = new URL(String(safe.url ?? "")).host; } catch { host = "?"; }
+      return truncatePreview(host);
+    }
+    case "promote_file":
+      return truncatePreview(previewValue(safe.path));
+    case "vision_query":
+      return truncatePreview(`${previewValue(safe.uploadId)}: ${previewValue(safe.question)}`);
     case "request_connector":
       return truncatePreview(previewValue(safe.provider));
     case "request_messaging_bridge":

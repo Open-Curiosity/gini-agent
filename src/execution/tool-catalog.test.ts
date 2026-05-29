@@ -61,10 +61,16 @@ const ALWAYS_ON = new Set([
   "delete_job",
   "run_job",
   "mcp_call",
-  // signed_upload rides alongside mcp_call: it's the general primitive
-  // for "PUT a Gini upload to a signed URL," used by Linear attachments
-  // and any future API that returns a signed PUT URL.
+  // The upload-space primitives ride alongside mcp_call. signed_upload
+  // PUTs Gini bytes out; signed_download GETs external bytes in;
+  // promote_file lifts workspace artifacts; vision_query inspects an
+  // upload with the configured vision model. All always-on so a fresh
+  // instance can complete any signed-URL upload / download / vision
+  // flow without toolset toggling.
   "signed_upload",
+  "signed_download",
+  "promote_file",
+  "vision_query",
   "request_connector",
   // browser_fill_secrets is the meta-tool path for asking the user
   // to type a value into a DOM field on the agent's browser tab. It

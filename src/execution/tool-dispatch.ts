@@ -56,6 +56,9 @@ import { isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { invokeMcpTool } from "../integrations/mcp";
 import { invokeSignedUpload } from "../capabilities/signed-upload";
+import { invokeSignedDownload } from "../capabilities/signed-download";
+import { invokePromoteFile } from "../capabilities/promote-file";
+import { invokeVisionQuery } from "../capabilities/vision-query";
 import { checkMessagingBridge, listAllowedChats } from "../integrations/messaging";
 import { riskForAction } from "./tool-risk";
 import {
@@ -154,6 +157,12 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
     case "signed_upload":
       return { kind: "sync", result: await signedUploadTool(config, taskId, args) };
+    case "signed_download":
+      return { kind: "sync", result: await signedDownloadTool(config, taskId, args) };
+    case "promote_file":
+      return { kind: "sync", result: await promoteFileTool(config, taskId, args) };
+    case "vision_query":
+      return { kind: "sync", result: await visionQueryTool(config, taskId, args) };
     case "request_connector":
       return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
     case "browser_fill_secrets":
@@ -795,6 +804,48 @@ async function signedUploadTool(
     ? args.headers as Record<string, string>
     : {};
   const result = await invokeSignedUpload(config, { uploadId, url, headers }, { taskId });
+  return JSON.stringify(result);
+}
+
+// signed_download dispatch: fetches bytes from a URL and lands them as a
+// Gini upload. Inverse of signed_upload.
+async function signedDownloadTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const url = requireString(args, "url");
+  const headers = args.headers && typeof args.headers === "object" && !Array.isArray(args.headers)
+    ? args.headers as Record<string, string>
+    : undefined;
+  const filename = typeof args.filename === "string" ? args.filename : undefined;
+  const result = await invokeSignedDownload(config, { url, headers, filename }, { taskId });
+  return JSON.stringify(result);
+}
+
+// promote_file dispatch: registers a workspace file as an upload.
+async function promoteFileTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const path = requireString(args, "path");
+  const mimeType = typeof args.mimeType === "string" ? args.mimeType : undefined;
+  const result = await invokePromoteFile(config, { path, mimeType }, { taskId });
+  return JSON.stringify(result);
+}
+
+// vision_query dispatch: runs the configured vision model against an
+// arbitrary Gini upload.
+async function visionQueryTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const uploadId = requireString(args, "uploadId");
+  const question = requireString(args, "question");
+  const maxTokens = typeof args.maxTokens === "number" ? args.maxTokens : undefined;
+  const result = await invokeVisionQuery(config, { uploadId, question, maxTokens }, { taskId });
   return JSON.stringify(result);
 }
 
