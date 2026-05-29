@@ -2,7 +2,7 @@ import * as Linking from "expo-linking";
 import { useEffect } from "react";
 import { Alert } from "react-native";
 import { router } from "expo-router";
-import { saveCredentials } from "@/src/auth";
+import { saveCredentials, tryDeregisterCachedDevice } from "@/src/auth";
 import { resetRegistrationForCredentialSwap } from "@/src/push";
 
 // Handles `gini://connect?api=<base-url>&token=<bearer>` deep links by
@@ -141,36 +141,46 @@ export function useDeepLinkAuth(): void {
           text: "Connect",
           onPress: () => {
             if (!active) return;
-            // `saveCredentials` runs URL normalization and broadcasts to
-            // every mounted `useAuth` listener — the auth gate in
-            // `app/index.tsx` notices the new identity and the user
-            // lands on /agents on the next render tick. We still call
-            // `router.replace` explicitly so a user who tapped the deep
-            // link while sitting on /setup is moved off it immediately
-            // instead of waiting for state propagation.
-            //
-            // The deep-link payload may point at a different runtime
-            // instance than the one this process is currently signed
-            // into (different gateway, different devices table). Reset
-            // every short-circuit gate from the prior session BEFORE
-            // the credential swap commits, so the next
-            // registerForPushAsync runs the full POST + listener install
-            // against the new gateway instead of treating itself as
-            // already-registered.
-            resetRegistrationForCredentialSwap();
-            saveCredentials(creds)
-              .then(() => {
+            // Sequence is load-bearing:
+            //   1. tryDeregisterCachedDevice() — issues DELETE
+            //      /push/devices/<token> against the OLD gateway using
+            //      the still-valid OLD bearer. Must run BEFORE step 2
+            //      (which drops the in-process cached token) and BEFORE
+            //      step 3 (which overwrites the bearer with the new
+            //      one). Without this the old device row outlives the
+            //      swap on the previous gateway, and the next push
+            //      against the old credential still wakes this device.
+            //      Failures are swallowed inside the helper so the
+            //      swap still proceeds when the OLD gateway is
+            //      unreachable.
+            //   2. resetRegistrationForCredentialSwap() — clears the
+            //      in-process registration short-circuits so the next
+            //      registerForPushAsync runs the full POST + listener
+            //      install against the new gateway.
+            //   3. saveCredentials(creds) — overwrites the persisted
+            //      bearer and broadcasts to every mounted useAuth
+            //      listener; the auth gate in app/index.tsx notices
+            //      the new identity and routes to /agents on the next
+            //      render tick. We still call router.replace explicitly
+            //      so a user who tapped the deep link while sitting on
+            //      /setup is moved off it immediately instead of
+            //      waiting for state propagation.
+            void (async () => {
+              await tryDeregisterCachedDevice();
+              resetRegistrationForCredentialSwap();
+              try {
+                await saveCredentials(creds);
                 if (!active) return;
                 router.replace("/agents");
-              })
-              .catch(() => {
+              } catch {
                 // Saving can fail if the base URL fails normalization.
                 // The setup screen is the right recovery surface —
                 // bounce the user there so they can paste/correct by
                 // hand.
                 if (!active) return;
                 router.replace("/setup");
-              });
+              }
+            })();
           }
         }
       ],

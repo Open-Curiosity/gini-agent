@@ -151,7 +151,7 @@ export async function clearCredentials(): Promise<void> {
   broadcast(null);
 }
 
-async function tryDeregisterCachedDevice(): Promise<void> {
+export async function tryDeregisterCachedDevice(): Promise<void> {
   try {
     // Lazy require: keeps the import graph free of an auth → push
     // cycle (push.ts imports api.ts which depends on cached
