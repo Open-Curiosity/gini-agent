@@ -7,7 +7,7 @@
 //   - resume after approval → task completes
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -29,7 +29,7 @@ import {
 } from "../state";
 import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
-import { buildAgentIdentity, buildInactiveSkillsBlock, buildMcpServersBlock } from "./chat-task";
+import { buildAgentIdentity, buildInactiveSkillsBlock, buildMcpServersBlock, buildSkillScriptsBlock } from "./chat-task";
 import type { EffectiveContext } from "./effective-context";
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
@@ -1882,5 +1882,83 @@ describe("buildMcpServersBlock", () => {
     expect(zenithIdx).toBeGreaterThan(acmeIdx);
     expect(block).toContain("tools: a_two, c_one");
     expect(block).toContain("tools: a_two, z_one");
+  });
+});
+
+describe("buildSkillScriptsBlock", () => {
+  // listEnabledSkillScripts statSyncs the real scripts/ dir under each
+  // skill's manifestPath, so the seeded skills need real files on disk.
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "gini-skill-scripts-block-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function seedSkill(
+    state: RuntimeState,
+    name: string,
+    scripts: string[],
+    opts: { status?: SkillRecord["status"] } = {}
+  ): void {
+    const skillDir = join(dir, name);
+    const scriptsDir = join(skillDir, "scripts");
+    mkdirSync(scriptsDir, { recursive: true });
+    for (const script of scripts) {
+      writeFileSync(join(scriptsDir, script), "console.log('{}')");
+    }
+    state.skills.push({
+      id: `skill_${name}`,
+      instance: state.instance,
+      name,
+      description: "",
+      trigger: "",
+      steps: [],
+      requiredTools: [],
+      requiredPermissions: [],
+      status: opts.status ?? "enabled",
+      version: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tests: [],
+      successCount: 0,
+      failureCount: 0,
+      previousVersions: [],
+      body: "",
+      source: "bundled",
+      manifestPath: join(skillDir, "SKILL.md")
+    });
+  }
+
+  test("returns empty string when no visible skill ships scripts", () => {
+    const state = createEmptyState("test");
+    seedSkill(state, "no-scripts", []);
+    expect(buildSkillScriptsBlock(state, new Set(["no-scripts"]))).toBe("");
+  });
+
+  test("lists each visible skill's scripts, alphabetized by skill and script", () => {
+    const state = createEmptyState("test");
+    seedSkill(state, "bbb", ["alpha.sh"]);
+    seedSkill(state, "aaa", ["two.ts", "one.ts"]);
+    const block = buildSkillScriptsBlock(state, new Set(["aaa", "bbb"]));
+    expect(block).toBe(
+      [
+        "Skill scripts (invoke with skill_run, never re-implement in terminal_exec):",
+        "- aaa: one, two",
+        "- bbb: alpha"
+      ].join("\n")
+    );
+  });
+
+  test("omits skills that are enabled but not visible (inactive connector)", () => {
+    const state = createEmptyState("test");
+    seedSkill(state, "visible", ["go.ts"]);
+    seedSkill(state, "hidden", ["go.ts"]);
+    const block = buildSkillScriptsBlock(state, new Set(["visible"]));
+    expect(block).toContain("- visible: go");
+    expect(block).not.toContain("hidden");
   });
 });

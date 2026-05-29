@@ -74,6 +74,7 @@ import {
 } from "./chat-task-emit";
 import { dispatchToolCall, parseToolArgsLenient } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
+import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { isSkillActive } from "../integrations/connectors";
@@ -380,10 +381,17 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // invoking. Only "configured" status surfaces; disabled/error servers
   // stay hidden the same way disabled skills do.
   const mcpServersBlock = buildMcpServersBlock(state);
+  // Scripts shipped by the visible (active) skills, so the model reaches
+  // for skill_run rather than re-implementing the work in terminal_exec.
+  const skillScriptsBlock = buildSkillScriptsBlock(
+    state,
+    new Set(visibleSkills.map((skill) => skill.name))
+  );
   const sections = [baseSystem];
   if (skillsBlock) sections.push(skillsBlock);
   if (inactiveSkillsBlock) sections.push(inactiveSkillsBlock);
   if (mcpServersBlock) sections.push(mcpServersBlock);
+  if (skillScriptsBlock) sections.push(skillScriptsBlock);
   if (boundJobsBlock) sections.push(boundJobsBlock);
   const systemContext = sections.join("\n\n");
 
@@ -731,6 +739,20 @@ export function buildMcpServersBlock(state: RuntimeState): string {
     // skill's documented tools as exhaustive and tells the user "I can't"
     // even when a matching tool sits on the server's tools list above.
     "If the user asks for something not covered in a server's skill but a plausible-looking tool exists in that server's `tools:` list, try `mcp_call` with it — the server returns a validation error on bad args, which is recoverable. Do not refuse based on the skill's documented subset alone."
+  ].join("\n");
+}
+
+// Advertise the scripts each visible skill ships so the model reliably
+// reaches for `skill_run` instead of re-implementing the work in
+// `terminal_exec` (which never carries connector env). Filtered to
+// `visibleSkillNames` (active + visible) so we don't point the model at a
+// script whose connector isn't healthy.
+export function buildSkillScriptsBlock(state: RuntimeState, visibleSkillNames: Set<string>): string {
+  const entries = listEnabledSkillScripts(state).filter((e) => visibleSkillNames.has(e.skill));
+  if (entries.length === 0) return "";
+  return [
+    "Skill scripts (invoke with skill_run, never re-implement in terminal_exec):",
+    ...entries.map((e) => `- ${e.skill}: ${e.scripts.join(", ")}`)
   ].join("\n");
 }
 
