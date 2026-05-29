@@ -240,6 +240,13 @@ class TunnelManager {
     this.nextRotateSecretResultOverride = result;
   }
 
+  /** TEST-ONLY: expose the cached web port so a test can pin the
+   *  disable()-clears-lastWebPort invariant without depending on an
+   *  observable side effect like rotateSecret's swap behavior. */
+  __getLastWebPortForTest(): number | null {
+    return this.lastWebPort;
+  }
+
   /** Current persisted-config view. Cheap; reads memory then disk. */
   private readPersisted(): TunnelPersistedConfig {
     return readTunnelConfig(this.config.instance);
@@ -771,6 +778,16 @@ class TunnelManager {
         lastError: errorMsg ? redact(errorMsg) : null,
         lastErrorCode: null
       };
+      // Drop the cached web port now that cloudflared is stopped. The
+      // rotateSecret recycle path gates its swap on
+      // `cloudflared !== null && lastWebPort !== null`, so today the
+      // null cloudflared above already blocks a swap from running
+      // against the stale port. Clearing lastWebPort keeps the
+      // invariant local: a future change that drops the
+      // `cloudflared !== null` half of the gate would otherwise pick
+      // up the port from the prior enable() and try to recycle into
+      // a process that's no longer there.
+      this.lastWebPort = null;
       setRedactionPublicUrl(null);
       this.removePublicUrlFile();
       // Wipe every push-device row tagged as tunneled BEFORE the Notes
