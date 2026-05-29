@@ -38,32 +38,46 @@ section leads with the `gh` CLI (the preferred path) and follows with a
 
 ## Setup
 
-`gh` is the preferred path. Make sure it's installed and authenticated
-before the first issue operation. The user here is a developer — when a
-step needs them (installing a package, completing an interactive sign-in),
-surface the exact command and let them run it rather than trying to
-automate it.
+`gh` is the preferred path. It must be installed and authenticated before
+the first issue operation. **Installing is non-interactive — do it
+yourself** (it's a side-effecting command, so it runs through the approval
+seam; you propose it, you don't hand it to the user). Only the interactive
+sign-in in step 2 needs the user.
 
 ### 1. Install gh if it's missing
+
+Check for it, and if it's absent, detect the platform and run the matching
+install command yourself:
 
 ```bash
 command -v gh >/dev/null 2>&1 && echo "gh present: $(gh --version | head -1)"
 ```
 
-If that prints nothing, install it for the host platform (this is a
-side-effecting command — propose it):
+If that prints nothing, install it:
 
 ```bash
 brew install gh                       # macOS / Linuxbrew
-sudo dnf install gh                   # Fedora / RHEL
-sudo pacman -S github-cli             # Arch
+sudo dnf install -y gh                # Fedora / RHEL
+sudo pacman -S --noconfirm github-cli # Arch
 winget install --id GitHub.cli        # Windows
 ```
 
-Debian/Ubuntu needs the GitHub CLI apt repo first; if `sudo apt install
-gh` reports "Unable to locate package", follow the repo-setup steps at
-<https://github.com/cli/cli/blob/trunk/docs/install_linux.md>. If the
-host can't install `gh` at all, skip to the curl/REST fallback in step 3.
+Debian/Ubuntu need the GitHub CLI apt repo added first — run this chain
+(don't ask the user to):
+
+```bash
+(type -p wget >/dev/null || (sudo apt update && sudo apt install -y wget)) \
+  && sudo mkdir -p -m 755 /etc/apt/keyrings \
+  && wget -nv -O- https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+     | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null \
+  && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+     | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null \
+  && sudo apt update && sudo apt install -y gh
+```
+
+Only if the host genuinely can't install `gh` (no supported package
+manager, no sudo) fall back to the curl/REST path in step 3.
 
 ### 2. Authenticate gh if it isn't signed in
 
@@ -373,10 +387,10 @@ curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
 ## Rules
 
 1. Prefer `gh` when it is authenticated; only drop to curl when `gh`
-   cannot be installed or authenticated. If `gh` is missing or signed
-   out, surface the install command and the `gh auth login` instruction
-   to the user (Setup steps 1-2) — don't try to drive the interactive
-   sign-in headlessly.
+   cannot be installed or authenticated. If `gh` is missing, install it
+   yourself (Setup step 1) — don't ask the user to. Only the interactive
+   `gh auth login` (Setup step 2) goes to the user; don't try to drive
+   that sign-in headlessly.
 2. Confirm intent before any bulk close/relabel or any single destructive
    change — these are side-effecting and have no undo.
 3. Never put a token on a command line or in an issue/comment body; let
