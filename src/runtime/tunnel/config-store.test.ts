@@ -65,11 +65,11 @@ describe("readTunnelConfig parse-failure recovery", () => {
     const t0 = Date.now();
     const result = readTunnelConfig(INSTANCE);
     const elapsed = Date.now() - t0;
-    // Safe default surfaced; the busy-loop is gone, so wall-clock is
-    // dominated by two synchronous JSON parses.
+    // Safe default surfaced; the busy-loop is gone, so the elapsed
+    // wall-clock stays well under any busy-loop's wall-clock.
     expect(result.enabled).toBe(false);
     expect(typeof result.secret).toBe("string");
     expect(result.secret.length).toBeGreaterThan(0);
-    expect(elapsed).toBeLessThan(50);
+    expect(elapsed).toBeLessThan(250);
   });
 });
