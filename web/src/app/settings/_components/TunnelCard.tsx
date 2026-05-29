@@ -19,17 +19,38 @@ import { api } from "@/lib/api";
 import { shouldShowEphemeralWarning } from "@/lib/tunnel-warning";
 import { EyeOff, Info, Loader2, RefreshCw, RotateCw, ShieldAlert } from "lucide-react";
 
+// Mirrors the runtime's TunnelTransitionErrorCode union. Keep this in
+// sync with src/runtime/tunnel/types.ts — pulling it from @runtime here
+// would couple the BFF bundle to the runtime tree at runtime.
+type TunnelErrorCode = "web_port_unhealthy";
+
 interface TunnelSnapshot {
   enabled: boolean;
   secret: string | null;
   publicUrl: string | null;
   secretRevision: string | null;
   lastError: string | null;
+  lastErrorCode: TunnelErrorCode | null;
   appleNotes: {
     enabled: boolean;
     notesAvailable: boolean | null;
     lastError: string | null;
   };
+}
+
+/** Map the typed error code to operator-facing copy. Falls back to the
+ *  human-readable `lastError` prose when the snapshot doesn't carry a
+ *  code (older runtime, transient errors that don't map to the enum).
+ *  Keeping the prose lookup in one place means a future code addition
+ *  needs one new branch here rather than scattered substring matches. */
+function describeTunnelError(
+  code: TunnelErrorCode | null,
+  lastError: string | null
+): string | null {
+  if (code === "web_port_unhealthy") {
+    return "Web port unreachable — start `gini run` to bring the supervised child back, then try again.";
+  }
+  return lastError;
 }
 
 type ConfirmKind = "disable" | "rotate" | null;
@@ -142,7 +163,11 @@ export function TunnelCard() {
                 // tunnel is not actually serving. Surface this distinctly
                 // from a plain "off" so a `live` claim is never made on
                 // a tunnel that has no URL.
-                <Badge variant="destructive" data-testid="tunnel-status-pill" title={data.lastError ?? "Tunnel enabled but no public URL"}>
+                <Badge
+                  variant="destructive"
+                  data-testid="tunnel-status-pill"
+                  title={describeTunnelError(data.lastErrorCode, data.lastError) ?? "Tunnel enabled but no public URL"}
+                >
                   degraded
                 </Badge>
               ) : (

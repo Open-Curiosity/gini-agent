@@ -49,6 +49,13 @@ export interface TunnelSnapshot {
    *  go through Cloudflare. */
   tunnelTransport: "sse" | "poll";
   lastError: string | null;
+  /** Typed counterpart to `lastError`. The HTTP layer already keys its
+   *  409-vs-500 status mapping off `TunnelTransitionResult.code`;
+   *  exposing the same code through the snapshot lets mobile and the
+   *  settings card branch on the typed value instead of substring-
+   *  matching the human-readable prose. Reset to `null` whenever
+   *  `lastError` clears. */
+  lastErrorCode: TunnelTransitionErrorCode | null;
   appleNotes: AppleNotesState;
 }
 
@@ -64,6 +71,10 @@ export interface RedactedTunnelSnapshot {
    *  between SSE and long-polling. */
   tunnelTransport: "sse" | "poll";
   lastError: string | null;
+  /** Same typed error code as the privileged shape. Non-secret — it's
+   *  an enum the client uses to branch on the failure mode without
+   *  substring-matching `lastError`. */
+  lastErrorCode: TunnelTransitionErrorCode | null;
   appleNotes: {
     enabled: boolean;
     notesAvailable: boolean | null;

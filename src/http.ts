@@ -100,6 +100,10 @@ function redactedSnapshot(snapshot: TunnelSnapshot): RedactedTunnelSnapshot {
     // browser see the same value the privileged endpoint exposes.
     tunnelTransport: snapshot.tunnelTransport,
     lastError: snapshot.lastError,
+    // The typed error code is non-secret — clients use it to branch on
+    // failure mode without substring-matching the human-readable
+    // `lastError`. Mirrors the contract on the privileged endpoint.
+    lastErrorCode: snapshot.lastErrorCode,
     appleNotes: {
       enabled: snapshot.appleNotes.enabled,
       notesAvailable: snapshot.appleNotes.notesAvailable,

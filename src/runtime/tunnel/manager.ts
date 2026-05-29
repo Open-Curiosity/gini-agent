@@ -163,6 +163,7 @@ class TunnelManager {
       publicUrl: null,
       tunnelTransport: inferTunnelTransport(null),
       lastError: null,
+      lastErrorCode: null,
       appleNotes: {
         enabled: persisted.appleNotes.enabled,
         notesAvailable: null,
@@ -355,7 +356,8 @@ class TunnelManager {
         ...this.snapshot,
         publicUrl: null,
         tunnelTransport: inferTunnelTransport(null),
-        lastError: redact(message)
+        lastError: redact(message),
+        lastErrorCode: "web_port_unhealthy"
       };
       this.stopEdgeProbe();
       return { ok: false, error: redact(message), code: "web_port_unhealthy" };
@@ -416,7 +418,8 @@ class TunnelManager {
         ...this.snapshot,
         publicUrl: null,
         tunnelTransport: inferTunnelTransport(null),
-        lastError: redact(`cloudflared exited (${reason})`)
+        lastError: redact(`cloudflared exited (${reason})`),
+        lastErrorCode: null
       };
       // Process death already nulls publicUrl, so any in-flight or
       // future probe would no-op on the !url guard — but stop the
@@ -449,7 +452,8 @@ class TunnelManager {
           ...this.snapshot,
           publicUrl: null,
           tunnelTransport: inferTunnelTransport(null),
-          lastError: msg
+          lastError: msg,
+          lastErrorCode: null
         };
         return { ok: false, error: msg };
       }
@@ -463,7 +467,8 @@ class TunnelManager {
           ...this.snapshot,
           publicUrl: null,
           tunnelTransport: inferTunnelTransport(null),
-          lastError: "shutdown"
+          lastError: "shutdown",
+          lastErrorCode: null
         };
         return { ok: false, error: "shutdown" };
       }
@@ -474,7 +479,8 @@ class TunnelManager {
         secretRevision: secretRevision(secret, url),
         publicUrl: url,
         tunnelTransport: inferTunnelTransport(url),
-        lastError: null
+        lastError: null,
+        lastErrorCode: null
       };
       setRedactionPublicUrl(url);
       try {
@@ -500,7 +506,8 @@ class TunnelManager {
           ...this.snapshot,
           publicUrl: null,
           tunnelTransport: inferTunnelTransport(null),
-          lastError: redactedMsg
+          lastError: redactedMsg,
+          lastErrorCode: null
         };
         return { ok: false, error: redactedMsg };
       }
@@ -531,7 +538,8 @@ class TunnelManager {
         ...this.snapshot,
         publicUrl: null,
         tunnelTransport: inferTunnelTransport(null),
-        lastError: redact(msg)
+        lastError: redact(msg),
+        lastErrorCode: null
       };
       setRedactionPublicUrl(null);
       return { ok: false, error: redact(msg) };
@@ -675,7 +683,8 @@ class TunnelManager {
           enabled: false,
           publicUrl: null,
           tunnelTransport: inferTunnelTransport(null),
-          lastError: redact(msg)
+          lastError: redact(msg),
+          lastErrorCode: null
         };
         return { ok: false, error: redact(msg) };
       }
@@ -749,7 +758,8 @@ class TunnelManager {
         enabled: false,
         publicUrl: null,
         tunnelTransport: inferTunnelTransport(null),
-        lastError: errorMsg ? redact(errorMsg) : null
+        lastError: errorMsg ? redact(errorMsg) : null,
+        lastErrorCode: null
       };
       setRedactionPublicUrl(null);
       this.removePublicUrlFile();
@@ -848,7 +858,11 @@ class TunnelManager {
         if (this.cloudflared !== null && this.lastWebPort !== null) {
           const healthy = await isSupervisedWebChild(this.config.instance, this.lastWebPort);
           if (!healthy) {
-            this.snapshot = { ...this.snapshot, lastError: redact(`web port ${this.lastWebPort} not healthy — rotation aborted before commit`) };
+            this.snapshot = {
+              ...this.snapshot,
+              lastError: redact(`web port ${this.lastWebPort} not healthy — rotation aborted before commit`),
+              lastErrorCode: "web_port_unhealthy"
+            };
             return { ok: false, error: `web port ${this.lastWebPort} not healthy — rotation aborted before commit`, code: "web_port_unhealthy" };
           }
         }
@@ -906,7 +920,7 @@ class TunnelManager {
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        this.snapshot = { ...this.snapshot, lastError: redact(msg) };
+        this.snapshot = { ...this.snapshot, lastError: redact(msg), lastErrorCode: null };
         return { ok: false, error: redact(msg) };
       } finally {
         // Only wipe device rows when the new secret actually landed on
@@ -989,7 +1003,7 @@ class TunnelManager {
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        this.snapshot = { ...this.snapshot, lastError: redact(msg) };
+        this.snapshot = { ...this.snapshot, lastError: redact(msg), lastErrorCode: null };
         return { ok: false, error: redact(msg) };
       }
     });
@@ -1265,7 +1279,8 @@ class TunnelManager {
         tunnelTransport: inferTunnelTransport(null),
         lastError: redact(
           `tunnel unreachable at the Cloudflare edge after ${failures} consecutive probes — the quick-tunnel hostname likely expired; recycle to restore`
-        )
+        ),
+        lastErrorCode: null
       };
       appendLog(this.config.instance, "tunnel.edge-unreachable.no-port", { failures });
       this.stopEdgeProbe();
@@ -1308,7 +1323,8 @@ class TunnelManager {
           ...this.snapshot,
           publicUrl: null,
           tunnelTransport: inferTunnelTransport(null),
-          lastError: redact(`tunnel unreachable; auto-recycle failed: ${swapError}`)
+          lastError: redact(`tunnel unreachable; auto-recycle failed: ${swapError}`),
+          lastErrorCode: null
         };
         appendLog(this.config.instance, "tunnel.edge-unreachable.recycle-failed", { error: redact(swapError) });
         this.stopEdgeProbe();
