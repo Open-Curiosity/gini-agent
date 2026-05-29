@@ -50,19 +50,6 @@ Use `gws sheets` to create spreadsheets, read cell ranges, append rows, update v
 - Lightweight key-value state the agent owns internally — use the `memory` tool, not a sheet.
 - Numeric analysis Gini can do in-process (sum, average, sort, filter) — fetch the data once with `+read`, compute locally, write the result back if needed. Don't round-trip every calculation through the Sheets API.
 
-## Skill context for `terminal_exec`
-
-Every `gws` invocation needs `GOOGLE_WORKSPACE_CLI_CLIENT_ID` + `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` in env. Pass `skill: "google-sheets"` to `terminal_exec` so the runtime injects them:
-
-```
-terminal_exec({
-  command: "gws ...",
-  skill: "google-sheets"
-})
-```
-
-Without `skill`, the spawn runs with no connector env and `gws` fails to authenticate. Omitting `skill` is the same as opting out of credentials.
-
 ## Quick Reference
 
 The Sheets surface splits into two layers: helper commands for the common cases (`+read`, `+append`) and the raw API (`spreadsheets.get`, `spreadsheets.values.*`, `spreadsheets.batchUpdate`) for everything else.

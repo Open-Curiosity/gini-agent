@@ -49,19 +49,6 @@ Use `gws docs` to create blank documents, read existing document content, append
 - Agent-internal scratch state — use the `memory` tool.
 - Long-form Markdown the user maintains locally — keep it in the repo or vault. Docs is for content that needs collaborative editing or live sharing.
 
-## Skill context for `terminal_exec`
-
-Every `gws` invocation needs `GOOGLE_WORKSPACE_CLI_CLIENT_ID` + `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` in env. Pass `skill: "google-docs"` to `terminal_exec` so the runtime injects them:
-
-```
-terminal_exec({
-  command: "gws docs documents create --json '{\"title\":\"...\"}'",
-  skill: "google-docs"
-})
-```
-
-Without `skill`, the spawn runs with no connector env and `gws` fails to authenticate. Omitting `skill` is the same as opting out of credentials.
-
 ## Quick Reference
 
 The Docs surface has only three top-level methods (`documents.get`, `documents.create`, `documents.batchUpdate`) plus a `+write` helper for the common "append text" case.

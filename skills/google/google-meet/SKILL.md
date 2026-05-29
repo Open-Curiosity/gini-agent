@@ -48,19 +48,6 @@ Use `gws meet` to create Meet spaces (the persistent video rooms with a join lin
 - Personal cross-device reminders or notes — use `apple-reminders` / `apple-notes`.
 - Agent-internal ephemeral state — use the `memory` tool.
 
-## Skill context for `terminal_exec`
-
-Every `gws` invocation needs `GOOGLE_WORKSPACE_CLI_CLIENT_ID` + `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` in env. Pass `skill: "google-meet"` to `terminal_exec` so the runtime injects them:
-
-```
-terminal_exec({
-  command: "gws ...",
-  skill: "google-meet"
-})
-```
-
-Without `skill`, the spawn runs with no connector env and `gws` fails to authenticate. Omitting `skill` is the same as opting out of credentials.
-
 ## Quick Reference
 
 The Meet surface has two resources: `spaces` (the room object) and `conferenceRecords` (a finished call). Most agent workflows live in `spaces.create` and `conferenceRecords.list`.

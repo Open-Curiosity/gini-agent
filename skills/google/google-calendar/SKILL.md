@@ -50,19 +50,6 @@ Use `gws calendar` to list events, create and update events, look up free/busy w
 - Meeting *content* (agenda doc, shared notes) — use `google-docs` for the doc and attach it to the event with a Drive link.
 - Project task tracking — use the project's issue tracker; Calendar is for time-bound events, not durable to-dos.
 
-## Skill context for `terminal_exec`
-
-Every `gws` invocation needs `GOOGLE_WORKSPACE_CLI_CLIENT_ID` + `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` in env. Pass `skill: "google-calendar"` to `terminal_exec` so the runtime injects them:
-
-```
-terminal_exec({
-  command: "gws ...",
-  skill: "google-calendar"
-})
-```
-
-Without `skill`, the spawn runs with no connector env and `gws` fails to authenticate. Omitting `skill` is the same as opting out of credentials.
-
 ## Quick Reference
 
 The Calendar surface is the auto-generated v3 API (`gws calendar events list`, `gws calendar events insert`, `gws calendar freebusy query`, …) plus two curated helpers: `+agenda` for digests and `+insert` for creating events without hand-rolling the JSON body.

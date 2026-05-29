@@ -49,19 +49,6 @@ Use `gws drive` to search, list, upload, download, copy, and share files and fol
 - Large bulk downloads where the user already has `rclone` or a sync client configured — Drive's native client is more reliable for multi-GB transfers.
 - Project task tracking or structured data — Drive holds the files; the schema lives in Docs/Sheets/Forms or an issue tracker.
 
-## Skill context for `terminal_exec`
-
-Every `gws` invocation needs `GOOGLE_WORKSPACE_CLI_CLIENT_ID` + `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` in env. Pass `skill: "google-drive"` to `terminal_exec` so the runtime injects them:
-
-```
-terminal_exec({
-  command: "gws ...",
-  skill: "google-drive"
-})
-```
-
-Without `skill`, the spawn runs with no connector env and `gws` fails to authenticate. Omitting `skill` is the same as opting out of credentials.
-
 ## Quick Reference
 
 The Drive surface is the auto-generated v3 API (`gws drive files list`, `gws drive permissions create`, `gws drive drives list`, …) plus a `+upload` helper that handles multipart uploads with MIME-type detection.
