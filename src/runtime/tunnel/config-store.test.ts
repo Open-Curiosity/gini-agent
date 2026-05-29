@@ -2,7 +2,7 @@
 // Pins two invariants:
 //   1. A corrupted config.json returns the safe default (re-mints on next
 //      write) rather than throwing — the runtime must boot.
-//   2. The recovery path completes within a small wall-clock budget so
+//   2. The recovery path completes within a small CPU-time budget so
 //      a future change can't reintroduce a busy-loop CPU pin.
 
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
@@ -62,14 +62,17 @@ describe("readTunnelConfig parse-failure recovery", () => {
 
   test("falls back to safe defaults and completes promptly when config.json is corrupted", () => {
     writeBody("{ not valid json ::::");
-    const t0 = Date.now();
+    // We measure CPU time, not wall-clock — CI schedulers can stall a
+    // synchronous JS op for hundreds of ms without consuming CPU; a
+    // busy-loop on the other hand burns CPU. CPU time captures the
+    // real regression class without false positives from runner jitter.
+    const cpu0 = process.cpuUsage();
     const result = readTunnelConfig(INSTANCE);
-    const elapsed = Date.now() - t0;
-    // Safe default surfaced; the busy-loop is gone, so the elapsed
-    // wall-clock stays well under any busy-loop's wall-clock.
+    const after = process.cpuUsage(cpu0);
+    const cpuMs = (after.user + after.system) / 1000;
     expect(result.enabled).toBe(false);
     expect(typeof result.secret).toBe("string");
     expect(result.secret.length).toBeGreaterThan(0);
-    expect(elapsed).toBeLessThan(250);
+    expect(cpuMs).toBeLessThan(100); // a busy-loop would burn seconds of CPU; we burn microseconds
   });
 });
