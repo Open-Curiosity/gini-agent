@@ -54,11 +54,14 @@ This is the load-bearing invariant for the openclaw migration path (`docs/adr/op
 
 ## Test Surface
 
-Three test layers cover the change:
+Six test layers cover the change:
 
-- `src/provider.test.ts` — fetch-mock unit tests for the merge behavior, denylist, override semantics, vision token-cap protection, baseUrl normalization, and prototype-pollution defense.
+- `src/provider.test.ts` — fetch-mock unit tests for the merge behavior, denylist, override semantics, vision token-cap protection, baseUrl normalization, prototype-pollution defense, and `promptCacheRetention` wire forwarding (typed-field-wins-over-extraBody precedence, non-string-shape rejection, representative chat-completions and `/responses` paths).
 - `src/provider.integration.test.ts` — real HTTP round-trips against the bundled mock server in `src/test-utils/openai-mock-server.ts`. Each test creates its own server and env scope inside `withMockServer()`, so the file is safe under `bun test --concurrent`.
-- `src/cli/commands/provider.test.ts` — CLI flag-parsing, malformed input rejection, and the warning surface for unsupported provider+flag combinations.
+- `src/cli/commands/provider.test.ts` — CLI flag-parsing, malformed input rejection, `--prompt-cache-retention` persistence and clearing, same-provider carry-forward and cross-provider drop, and the warning surface for unsupported provider+flag combinations.
+- `src/runtime/setup-api.test.ts` — web setup save preserves the typed `promptCacheRetention` from disk on same-provider re-saves; a deliberate disk clear with a stale in-memory snapshot does NOT resurrect the cleared value.
+- `src/cli/commands/admin.test.ts` — `GINI_PROVIDER=… gini install` preserves an existing `promptCacheRetention` on same-provider re-install and drops it on a cross-provider switch.
+- `src/cli/setup.test.ts` and `src/execution/effective-context.test.ts` — `gini setup --yes --force` rebuild preserves the typed field; same-provider agent overrides inherit it while cross-provider overrides drop it.
 
 The mock server in `src/test-utils/openai-mock-server.ts` is bundled so anyone cloning the repo can run integration tests with no API keys, no model downloads, and no native bindings — `bun install` is the only prerequisite.
 

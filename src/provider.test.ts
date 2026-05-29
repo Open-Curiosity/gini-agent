@@ -315,6 +315,79 @@ describe("provider", () => {
         parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
         strict: false
       });
+      // No promptCacheRetention was set on this provider so the wire
+      // body must omit the field. Pins the "absent everywhere when
+      // unset" half of the present-or-absent contract for the codex
+      // /responses surface (the chat-completions half is covered by
+      // the openai forwarding tests near line 770).
+      expect(sent.prompt_cache_retention).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+      void authPath;
+    }
+  });
+
+  test("codex tool-calling forwards promptCacheRetention into the /responses body when explicitly set", async () => {
+    // Twin of the openai chat-completions forwarding test, but on the
+    // codex /responses surface. The chatgpt.com codex backend is
+    // documented to reject this field with HTTP 400; the runtime is
+    // still a transparent forwarder per the ProviderConfig doc
+    // ("until that changes"), so an explicit operator opt-in MUST
+    // reach the wire body on this surface too. Pin that contract here
+    // so a future "strip on codex" patch can't silently break the
+    // forward-compat path that lets the backend's eventual support
+    // work without a code change.
+    const { authPath, restore } = installCodexAuth("codex-retention-forwarding");
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          const events = [
+            // The /responses non-tool path runs through readCodexStream
+            // which requires at least one text delta to consider the
+            // response complete; emit a single short delta so the
+            // stream consumer doesn't throw before the test gets to
+            // assert on the captured request body.
+            { event: "response.output_text.delta", data: { type: "response.output_text.delta", delta: "ok" } },
+            { event: "response.completed", data: {
+              type: "response.completed",
+              response: {
+                id: "resp_codex_retention",
+                usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 }
+              }
+            } }
+          ];
+          for (const ev of events) {
+            controller.enqueue(enc.encode(`event: ${ev.event}\ndata: ${JSON.stringify(ev.data)}\n\n`));
+          }
+          controller.enqueue(enc.encode("data: [DONE]\n\n"));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "codex",
+        model: "gpt-test",
+        promptCacheRetention: "24h"
+      });
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        []
+      );
+      expect(captured?.url).toContain("/responses");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBe("24h");
     } finally {
       globalThis.fetch = originalFetch;
       restore();
