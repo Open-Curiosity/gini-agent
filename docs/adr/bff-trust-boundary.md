@@ -165,9 +165,13 @@ honestly attacker-controlled because the URL bar is attacker-controlled.
   runtime. Only `/api/runtime/pairing/*` (every method) and any
   unknown `/api/runtime/tunnel/<sub>` path return 404 under the
   marker. Loopback callers of every route pass without the marker.
-- The marker is never forwarded to the runtime — the BFF's
-  `pickForwardHeaders` allowlist strips it before bearer injection,
-  and the runtime never observes it.
+- The marker is forwarded to the runtime via the `FORWARD_HEADERS`
+  allowlist in `web/src/lib/runtime.ts`. The runtime uses it only as a
+  non-security origin tag (flagging push-device rows as tunneled so
+  `tunnel disable` / `tunnel rotate-secret` can prune them). Privileged
+  decisions on the runtime gate on the Bearer / loopback check the
+  runtime performs independently of the marker; the proxy
+  strip-then-stamp boundary remains the trust enforcer.
 - The non-tunnel `GINI_TRUSTED_ORIGINS` / loopback / Origin-match
   cases are pinned by `bun test src/integration.test.ts`. The
   tunnel-vetted marker / deny / cookie / classification flow is
