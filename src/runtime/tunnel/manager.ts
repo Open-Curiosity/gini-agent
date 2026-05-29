@@ -155,7 +155,7 @@ class TunnelManager {
     // cloudflared rotates hostnames on restart. Remove on construction so
     // the proxy can't equality-match against a host that no cloudflared
     // process is actually serving.
-    try { unlinkSync(publicUrlPath(config.instance)); } catch { /* may not exist */ }
+    this.removePublicUrlFile();
     this.snapshot = {
       enabled: persisted.enabled,
       secret: persisted.secret,
@@ -259,6 +259,28 @@ class TunnelManager {
     return next;
   }
 
+  /** Remove the publicUrl sibling file, swallowing ENOENT (the file
+   *  legitimately may not exist on the disable / failed-enable /
+   *  shutdown paths that call this). Any OTHER error is surfaced as a
+   *  log entry so an operator can see when the tear-down is silently
+   *  failing — a stuck file on disk would let the proxy keep matching
+   *  the Host header against a hostname no cloudflared process is
+   *  serving. Sync (not async) so the call is safe inside finally
+   *  blocks and the SIGTERM drain path. Extracted from ten inline
+   *  copies in this file so the ENOENT handling and the operator
+   *  visibility on real errors stay consistent across every call
+   *  site. */
+  private removePublicUrlFile(): void {
+    try {
+      unlinkSync(publicUrlPath(this.config.instance));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== "ENOENT") {
+        appendLog(this.config.instance, "tunnel.publicurl-remove-failed", { code });
+      }
+    }
+  }
+
   /** Stop any current cloudflared, launch a new one, install the exit
    *  listener BEFORE awaiting the banner, await the URL, sync-check
    *  exitCode for any same-tick exit, stamp `snapshot.publicUrl /
@@ -326,7 +348,7 @@ class TunnelManager {
           }),
         );
       }
-      try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+      this.removePublicUrlFile();
       setRedactionPublicUrl(null);
       const message = `web port ${webPort} not healthy — swap aborted, prior cloudflared stopped`;
       this.snapshot = {
@@ -381,7 +403,7 @@ class TunnelManager {
     launch.process.once("exit", (code, signal) => {
       if (this.cloudflared !== launch) return;
       this.cloudflared = null;
-      try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+      this.removePublicUrlFile();
       setRedactionPublicUrl(null);
       // `proc.on("exit", (code, signal))` reports exactly one of the two:
       // normal exits set `code` and leave `signal` null, signal-driven
@@ -417,7 +439,7 @@ class TunnelManager {
       // doesn't get treated as live.
       if (launch.process.exitCode !== null || launch.process.signalCode !== null) {
         this.cloudflared = null;
-        try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+        this.removePublicUrlFile();
         setRedactionPublicUrl(null);
         const reason = launch.process.exitCode !== null
           ? `code ${launch.process.exitCode}`
@@ -436,7 +458,7 @@ class TunnelManager {
       if (this.shuttingDown) {
         this.cloudflared = null;
         try { await launch.stop(); } catch { /* already gone */ }
-        try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+        this.removePublicUrlFile();
         this.snapshot = {
           ...this.snapshot,
           publicUrl: null,
@@ -503,7 +525,7 @@ class TunnelManager {
       if (!alreadyExited) {
         try { await launch.stop(); } catch { /* already gone */ }
       }
-      try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+      this.removePublicUrlFile();
       const msg = err instanceof Error ? err.message : String(err);
       this.snapshot = {
         ...this.snapshot,
@@ -730,7 +752,7 @@ class TunnelManager {
         lastError: errorMsg ? redact(errorMsg) : null
       };
       setRedactionPublicUrl(null);
-      try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+      this.removePublicUrlFile();
       // Wipe every push-device row tagged as tunneled BEFORE the Notes
       // clear. With the tunnel off, those rows refer to APNs
       // subscriptions that can never be reached again (the public URL
@@ -1123,7 +1145,7 @@ class TunnelManager {
     // result-handling, but unscheduling the interval first is the
     // cleaner termination order.
     this.stopEdgeProbe();
-    try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+    this.removePublicUrlFile();
     if (this.cloudflared) {
       const prev = this.cloudflared;
       this.cloudflared = null;
@@ -1235,7 +1257,7 @@ class TunnelManager {
       // with a webPort, so we can't safely respawn cloudflared. Fall
       // back to the original degraded behavior and let the operator
       // intervene.
-      try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+      this.removePublicUrlFile();
       setRedactionPublicUrl(null);
       this.snapshot = {
         ...this.snapshot,
@@ -1280,7 +1302,7 @@ class TunnelManager {
       const swap = await this.swapCloudflared(port, secret);
       if (!swap.ok) {
         const swapError = swap.error ?? "unknown swap failure";
-        try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+        this.removePublicUrlFile();
         setRedactionPublicUrl(null);
         this.snapshot = {
           ...this.snapshot,
