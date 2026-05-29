@@ -1,5 +1,30 @@
-import { readCachedCredentials, type AuthCredentials } from "./auth";
+import {
+  isLocalGatewayHost,
+  PUBLIC_HTTP_REJECTION,
+  readCachedCredentials,
+  type AuthCredentials
+} from "./auth";
 import { inferTunnelTransport } from "./transport";
+
+// Defense-in-depth runtime gate against credentials persisted by an
+// older build that didn't enforce the local-only http allowlist (or
+// a future regression). Throws so the bearer never leaves the device
+// in cleartext via a public http:// URL.
+function assertTransportAllowed(baseUrl: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new ApiError(0, "Stored base URL is invalid.");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new ApiError(0, "Stored base URL is invalid.");
+  }
+  if (parsed.protocol === "http:" && !isLocalGatewayHost(parsed.hostname)) {
+    throw new ApiError(0, PUBLIC_HTTP_REJECTION);
+  }
+  return parsed;
+}
 
 // Mirrors web/src/lib/api.ts in shape (`api<T>(path, init)`), but talks
 // to the runtime gateway directly with a bearer token instead of routing
@@ -38,6 +63,13 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   if (!creds) throw new ApiError(401, "No credentials configured");
 
   const { auth: _auth, ...rest } = init;
+
+  // Defensively re-derive the origin so a malformed value in storage
+  // (e.g. one written by an older build that didn't normalize) can't
+  // leak query strings into the request URL. Also blocks public-http
+  // base URLs before the Authorization header is attached.
+  const parsed = assertTransportAllowed(creds.baseUrl);
+
   const headers: Record<string, string> = {
     "content-type": "application/json",
     authorization: `Bearer ${creds.token}`,
@@ -50,16 +82,7 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     ...(init.headers ?? {})
   };
 
-  // Defensively re-derive the origin so a malformed value in storage
-  // (e.g. one written by an older build that didn't normalize) can't
-  // leak query strings into the request URL.
-  let origin: string;
-  try {
-    origin = new URL(creds.baseUrl).origin;
-  } catch {
-    throw new ApiError(0, "Stored base URL is invalid.");
-  }
-  const url = `${origin}/api${path}`;
+  const url = `${parsed.origin}/api${path}`;
   const response = await fetch(url, { ...rest, headers });
 
   // 204 No Content (or any empty body) — return null cast as T so callers
@@ -97,14 +120,11 @@ export function resolveStreamEndpoint(path: string): {
 } {
   const creds = readCachedCredentials();
   if (!creds) throw new ApiError(401, "No credentials configured");
-  let origin: string;
-  try {
-    origin = new URL(creds.baseUrl).origin;
-  } catch {
-    throw new ApiError(0, "Stored base URL is invalid.");
-  }
+  // Same transport guard as api(): if a stored URL is public-http,
+  // refuse to open the stream rather than leak the bearer.
+  const parsed = assertTransportAllowed(creds.baseUrl);
   return {
-    url: `${origin}/api${path}`,
+    url: `${parsed.origin}/api${path}`,
     headers: {
       authorization: `Bearer ${creds.token}`,
       // SSE endpoint resolver also injects X-Device-Token so the
