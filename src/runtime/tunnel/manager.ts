@@ -895,10 +895,20 @@ class TunnelManager {
         // value live while disk + proxy already moved to the new one.
         // The pre-stamp's publicUrl uses the prior value; swap rewrites
         // it (with the new URL) on success or nulls it on failure.
+        //
+        // Clear lastError / lastErrorCode here so a successful rotate
+        // wipes any stale failure state regardless of whether the
+        // tunnel is currently up. The no-cloudflared branch below
+        // returns directly from this pre-stamp without further
+        // snapshot updates, so a prior enable() / rotate failure that
+        // left lastError set would otherwise persist across an
+        // operator-driven rotation that has, by definition, succeeded.
         this.snapshot = {
           ...this.snapshot,
           secret: next.secret,
-          secretRevision: secretRevision(next.secret, this.snapshot.publicUrl)
+          secretRevision: secretRevision(next.secret, this.snapshot.publicUrl),
+          lastError: null,
+          lastErrorCode: null
         };
         // If a tunnel is running, recycle cloudflared INLINE so a
         // concurrent disable() can't interleave between commit and
