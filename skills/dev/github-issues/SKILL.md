@@ -85,22 +85,13 @@ manager, no sudo) fall back to the curl/REST path in step 3.
 gh auth status >/dev/null 2>&1 && echo "gh authenticated" || echo "gh NOT authenticated"
 ```
 
-If it's not authenticated, **show the user these instructions and let
-them complete sign-in in their own terminal** — `gh auth login` is
-interactive (it opens a browser or prints a one-time device code), so the
-agent can't finish it headlessly:
+If it's not authenticated, tell the user in one line and stop — sign-in is
+interactive, so they run it, not you. Say something like:
 
-```bash
-# Interactive (recommended): choose GitHub.com → HTTPS → "Login with a
-# web browser", then paste the one-time code gh shows you.
-gh auth login
+> Run `gh auth login` in your terminal to sign in, then I can file the issue.
 
-# Non-interactive alternative, if the user has a Personal Access Token
-# (classic token needs the `repo` scope; add `read:org` for org repos):
-echo "$GITHUB_TOKEN" | gh auth login --with-token
-```
-
-Re-run `gh auth status` to confirm before continuing.
+Pick up where you left off once they confirm; re-run `gh auth status` to
+verify before continuing.
 
 ### 3. Resolve the auth mode and target repo
 
