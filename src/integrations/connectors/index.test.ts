@@ -3,8 +3,7 @@ import { rmSync } from "node:fs";
 import { createEmptyState, mutateState } from "../../state";
 import { writeSecret } from "../../state/secrets";
 import type { ConnectorRecord, SkillRecord } from "../../types";
-import type { RuntimeConfig } from "../../types";
-import { isSkillActive, resolveSkillEnv, resolveSkillEnvByName } from "./index";
+import { isSkillActive, resolveSkillEnv } from "./index";
 
 const ROOT = "/tmp/gini-connectors-unit";
 
@@ -203,100 +202,5 @@ describe("resolveSkillEnv", () => {
     });
     const env = await resolveSkillEnv(config, skill);
     expect(env).toEqual({ LINEAR_API_KEY: "real-token" });
-  });
-});
-
-describe("resolveSkillEnvByName (ENG-1613 env-scoping)", () => {
-  // Pins the per-skill env scoping behavior that replaced the leaky
-  // `resolveActiveSkillsEnv` aggregation. Each test owns its own
-  // instance so the in-memory state doesn't bleed.
-  function buildConfig(instance: string): RuntimeConfig {
-    return {
-      instance,
-      port: 0,
-      token: "t",
-      provider: { name: "echo" as const, model: "echo" },
-      workspaceRoot: `${ROOT}/${instance}/workspace`,
-      stateRoot: `${ROOT}/${instance}`,
-      logRoot: `${ROOT}/${instance}/logs`
-    };
-  }
-
-  test("no skill name → empty env (default is no leakage)", async () => {
-    const instance = "skill-byname-undefined";
-    const config = buildConfig(instance);
-    // Seed a fully-resolvable linear skill so we KNOW the data is
-    // available; the test pins that it nonetheless doesn't leak without
-    // an explicit skill arg.
-    const ref = writeSecret(instance, "id_linear", "token", "linear-real");
-    await mutateState(instance, (state) => {
-      state.connectors.push(newConnector({ id: "id_linear", instance, provider: "linear", health: "healthy", secretRefs: [ref] }));
-      state.skills.push(newSkill({
-        id: "skill_linear",
-        instance,
-        name: "linear",
-        requiredConnectors: [{ provider: "linear" }],
-        prerequisites: { env: ["LINEAR_API_KEY"] }
-      }));
-    });
-    expect(await resolveSkillEnvByName(config, undefined)).toEqual({});
-  });
-
-  test("unknown skill name → empty env (silent, not an error)", async () => {
-    const instance = "skill-byname-unknown";
-    const config = buildConfig(instance);
-    expect(await resolveSkillEnvByName(config, "no-such-skill")).toEqual({});
-  });
-
-  test("matching enabled skill → only that skill's declared env", async () => {
-    // The structurally important property: enabling skill A doesn't
-    // cause skill B's invocation to receive A's secrets. We seed both
-    // and assert each invocation only sees its own.
-    const instance = "skill-byname-scoped";
-    const config = buildConfig(instance);
-    const linearRef = writeSecret(instance, "id_linear", "token", "linear-real");
-    const googleRef = writeSecret(instance, "id_google", "client_id", "google-id-real");
-    await mutateState(instance, (state) => {
-      state.connectors.push(newConnector({ id: "id_linear", instance, provider: "linear", health: "healthy", secretRefs: [linearRef] }));
-      state.connectors.push(newConnector({ id: "id_google", instance, provider: "google-oauth-desktop", health: "healthy", secretRefs: [googleRef] }));
-      state.skills.push(newSkill({
-        id: "skill_linear",
-        instance,
-        name: "linear",
-        requiredConnectors: [{ provider: "linear" }],
-        prerequisites: { env: ["LINEAR_API_KEY"] }
-      }));
-      state.skills.push(newSkill({
-        id: "skill_google",
-        instance,
-        name: "google-docs",
-        requiredConnectors: [{ provider: "google-oauth-desktop" }],
-        prerequisites: { env: ["GOOGLE_WORKSPACE_CLI_CLIENT_ID"] }
-      }));
-    });
-    const linearEnv = await resolveSkillEnvByName(config, "linear");
-    expect(linearEnv).toEqual({ LINEAR_API_KEY: "linear-real" });
-    expect(linearEnv).not.toHaveProperty("GOOGLE_WORKSPACE_CLI_CLIENT_ID");
-    const googleEnv = await resolveSkillEnvByName(config, "google-docs");
-    expect(googleEnv).toEqual({ GOOGLE_WORKSPACE_CLI_CLIENT_ID: "google-id-real" });
-    expect(googleEnv).not.toHaveProperty("LINEAR_API_KEY");
-  });
-
-  test("disabled skill name → empty env (status guard mirrors isSkillActive)", async () => {
-    const instance = "skill-byname-disabled";
-    const config = buildConfig(instance);
-    const ref = writeSecret(instance, "id_linear", "token", "linear-real");
-    await mutateState(instance, (state) => {
-      state.connectors.push(newConnector({ id: "id_linear", instance, provider: "linear", health: "healthy", secretRefs: [ref] }));
-      state.skills.push(newSkill({
-        id: "skill_linear",
-        instance,
-        name: "linear",
-        status: "disabled",
-        requiredConnectors: [{ provider: "linear" }],
-        prerequisites: { env: ["LINEAR_API_KEY"] }
-      }));
-    });
-    expect(await resolveSkillEnvByName(config, "linear")).toEqual({});
   });
 });

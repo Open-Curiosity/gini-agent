@@ -127,14 +127,13 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "terminal_exec",
-      description: "Run a shell command in the workspace. Approval-gated; user must approve. Returns stdout/stderr and exit code. Set timeoutMs explicitly for slow commands (Apple/AppleScript-backed CLIs like memo or remindctl can take 30+ seconds; brew installs can take minutes). Set pty=true for interactive CLI tools (vim, memo, claude-code, codex, python repl) — without pty they hang or exit immediately because stdin is not a TTY. Set `skill` when the command is the documented invocation pattern of an enabled skill (e.g. `gws ...` for google-* skills, `memo ...` for apple-notes); the runtime then injects ONLY that skill's declared connector env vars into the spawn. Without `skill`, no connector secrets are injected — generic shell commands run with a clean env so a Linear-token leak can't ride alongside a curl invocation.",
+      description: "Run a shell command in the workspace. Approval-gated; user must approve. Returns stdout/stderr and exit code. Set timeoutMs explicitly for slow commands (Apple/AppleScript-backed CLIs like memo or remindctl can take 30+ seconds; brew installs can take minutes). Set pty=true for interactive CLI tools (vim, memo, claude-code, codex, python repl) — without pty they hang or exit immediately because stdin is not a TTY. Commands always run with a clean env: no connector secrets are ever injected, so a Linear-token leak can't ride alongside a curl invocation. A command that genuinely needs a connector credential must ship as a skill script and be invoked via `skill_run` — that is the only path connector secrets enter a process.",
       parameters: {
         type: "object",
         properties: {
           command: { type: "string", description: "Shell command line. Runs through `zsh -lc`." },
           timeoutMs: { type: "number", description: "Maximum runtime before kill, in milliseconds. Defaults to 60000 (60s). Bump for slow ops (memo/remindctl scans, brew installs, network).", default: 60000 },
-          pty: { type: "boolean", description: "Set true for interactive CLIs that need a TTY (vim, memo, claude-code, codex, python repl). When true the command is spawned under a pseudo-terminal so it doesn't see stdin-is-not-tty errors. Default false.", default: false },
-          skill: { type: "string", description: "Optional name of an enabled skill whose CLI you're invoking. When set, the runtime injects only that skill's declared connector env vars into the spawn (scoped per skill, not aggregated across all active skills). Leave unset for generic commands — no connector secrets get injected." }
+          pty: { type: "boolean", description: "Set true for interactive CLIs that need a TTY (vim, memo, claude-code, codex, python repl). When true the command is spawned under a pseudo-terminal so it doesn't see stdin-is-not-tty errors. Default false.", default: false }
         },
         required: ["command"]
       }

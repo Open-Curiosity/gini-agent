@@ -55,11 +55,6 @@ export type PolicyAction =
 
 export interface TerminalExecPayload {
   command: string;
-  // Optional skill context the model passed in. Surfaced to the policy
-  // decision so future per-skill policies can branch (e.g. auto-approve
-  // commands inside a trusted skill's context). Not currently consulted
-  // by the dangerous-pattern check.
-  skill?: string;
 }
 
 // Used by `code.exec` policy decisions. `source` is the raw snippet

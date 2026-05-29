@@ -3755,11 +3755,6 @@ async function terminalExecDispatch(
   const command = requireString(args, "command");
   const timeoutMs = optionalNumber(args, "timeoutMs", 60_000);
   const pty = args.pty === true;
-  // Optional skill context for scoped env injection. When set, only this
-  // skill's declared connector env vars land in the spawn; otherwise no
-  // skill env is injected (the fix for cross-skill credential leakage
-  // that the old `resolveActiveSkillsEnv` aggregation caused).
-  const skill = typeof args.skill === "string" && args.skill.length > 0 ? args.skill : undefined;
 
   const matchedPattern = matchAutoApprove(config.autoApproveCommands, command);
   if (matchedPattern) {
@@ -3777,13 +3772,12 @@ async function terminalExecDispatch(
     appendTrace(config.instance, taskId, {
       type: "approval",
       message: "Auto-approved terminal command (allowlist match)",
-      data: { command, pty, matchedPattern, toolCallId, skill }
+      data: { command, pty, matchedPattern, toolCallId }
     });
     const result = await runTerminalCommand(config, taskId, command, {
       timeoutMs,
       pty,
-      skill,
-      evidenceExtra: { autoApproved: true, autoApprovedReason: matchedPattern, toolCallId, skill }
+      evidenceExtra: { autoApproved: true, autoApprovedReason: matchedPattern, toolCallId }
     });
     return { kind: "sync", result: result.summary };
   }
@@ -3791,8 +3785,8 @@ async function terminalExecDispatch(
   return pendingOrAuto(
     config,
     "terminal.exec",
-    { command, skill },
-    (reason) => requestTerminalExec(config, taskId, toolCallId, command, timeoutMs, pty, skill, reason)
+    { command },
+    (reason) => requestTerminalExec(config, taskId, toolCallId, command, timeoutMs, pty, reason)
   );
 }
 
@@ -3829,7 +3823,6 @@ async function requestTerminalExec(
   command: string,
   timeoutMs: number,
   pty: boolean,
-  skill: string | undefined,
   reasonOverride?: string
 ): Promise<string> {
   return mutateState(config.instance, (state: RuntimeState) => {
@@ -3843,14 +3836,14 @@ async function requestTerminalExec(
       target: command,
       risk: "high",
       reason: reasonOverride ?? "Terminal execution can change the system and requires explicit approval.",
-      payload: { command, timeoutMs, pty, toolCallId, skill }
+      payload: { command, timeoutMs, pty, toolCallId }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for terminal command (chat-task)",
-      data: { approvalId: approval.id, command, pty, toolCallId, skill }
+      data: { approvalId: approval.id, command, pty, toolCallId }
     });
     return approval.id;
   });
