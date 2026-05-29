@@ -67,10 +67,12 @@ jobs:
         working-directory: mobile
 
       - name: Publish update
+        env:
+          INPUT_BRANCH: ${{ github.event.inputs.branch || 'production' }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message || github.sha }}
         run: |
-          branch="${{ github.event.inputs.branch || 'production' }}"
           eas update \
-            --branch "$branch" \
-            --message "${{ github.event.head_commit.message || github.sha }}" \
+            --branch "$INPUT_BRANCH" \
+            --message "$COMMIT_MESSAGE" \
             --non-interactive
         working-directory: mobile
