@@ -448,10 +448,14 @@ export function useChatBlocks(sessionId: string | null): {
             let settle!: () => void;
             const wait = new Promise<void>((resolve) => { settle = resolve; });
             const timer = setTimeout(settle, delay);
+            // `{ once: true }` lets the runtime auto-remove the listener
+            // after firing — without it, every retry attaches a fresh
+            // listener for the lifetime of `controller.signal`, growing
+            // unbounded across consecutive errors.
             controller.signal.addEventListener("abort", () => {
               clearTimeout(timer);
               settle();
-            });
+            }, { once: true });
             await wait;
           }
         }

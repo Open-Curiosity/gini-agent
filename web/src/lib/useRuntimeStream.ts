@@ -138,10 +138,14 @@ function openPollTransport(): void {
         consecutiveErrors += 1;
         const { promise: wait, resolve: settle } = Promise.withResolvers<void>();
         const timer = setTimeout(settle, delay);
+        // `{ once: true }` lets the browser auto-remove the listener
+        // after firing — without it, every retry attaches a fresh
+        // listener for the lifetime of `controller.signal`, growing
+        // unbounded across consecutive errors.
         controller.signal.addEventListener("abort", () => {
           clearTimeout(timer);
           settle();
-        });
+        }, { once: true });
         await wait;
       }
     }
