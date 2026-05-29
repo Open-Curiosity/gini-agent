@@ -93,11 +93,12 @@ beforeEach(() => {
   originalFetch = globalThis.fetch;
   originalEventSource = (globalThis as Record<string, unknown>).EventSource;
   originalWindow = (globalThis as Record<string, unknown>).window;
-  // pageIsOnTunnelHost() reads window.location.hostname — without this
-  // shim it would early-return "sse" without awaiting the gate (the
-  // ternary branch becomes synchronous), which would mask the race.
+  // pageIsOnTunnelHost() reads window.location.origin (then derives
+  // hostname via the URL constructor) — without this shim it would
+  // early-return "sse" without awaiting the gate (the ternary branch
+  // becomes synchronous), which would mask the race.
   (globalThis as Record<string, unknown>).window = {
-    location: { hostname: "abc.trycloudflare.com" }
+    location: { origin: "https://abc.trycloudflare.com" }
   };
   (globalThis as Record<string, unknown>).EventSource = FakeEventSource;
   eventSourceConstructions = 0;
