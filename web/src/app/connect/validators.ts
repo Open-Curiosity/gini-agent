@@ -74,15 +74,21 @@ export function validateScheme(value: string | undefined, fallback: string): str
 }
 
 // The bearer token rides through to the app as a query param on the deep
-// link. We don't want to embed arbitrary attacker-controlled characters
-// into the URL we set on `window.location.href`, so restrict to the
-// printable character set that legitimate tokens use. Empty / invalid
-// inputs simply drop the param — the app will route the user to /setup
-// to paste the token by hand instead of silently saving garbage.
+// link. The gateway mints tunnel secrets as 32-character base64url
+// strings via `generateTunnelSecret` in `src/runtime/tunnel/secret.ts`
+// (24 random bytes, base64url-encoded). Constrain the validator to that
+// exact shape — base64url charset (`[A-Za-z0-9_-]`) and the fixed 32-
+// character length — so the value we eventually set on
+// `window.location.href` cannot carry an attacker-controlled byte that
+// the broader printable set (`+/=:.~`) would have permitted. A real
+// token that fails this gate is a programmer bug, not an attacker; the
+// app will route the user to /setup to paste the token by hand instead
+// of silently saving garbage.
+const TUNNEL_SECRET_LENGTH = 32;
 export function validateToken(value: string | undefined): string | undefined {
   if (!value) return undefined;
-  if (value.length > 512) return undefined;
-  if (!/^[A-Za-z0-9._~+/=:-]+$/.test(value)) return undefined;
+  if (value.length !== TUNNEL_SECRET_LENGTH) return undefined;
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return undefined;
   return value;
 }
 

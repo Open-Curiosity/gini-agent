@@ -62,16 +62,49 @@ describe("validateScheme", () => {
 });
 
 describe("validateToken", () => {
-  test("accepts the full allowed character set", () => {
-    const allowed = "ABCdefGHI012._~+/=:-";
-    expect(validateToken(allowed)).toBe(allowed);
+  test("accepts the 32-character base64url shape minted by generateTunnelSecret", () => {
+    // Example shape: the runtime mints 24 random bytes and base64url-
+    // encodes them, yielding exactly 32 characters drawn from
+    // `[A-Za-z0-9_-]`.
+    const sample = "ATFSaxaXkptHZj8C7BfeEKn8FPB6lGLO";
+    expect(sample.length).toBe(32);
+    expect(validateToken(sample)).toBe(sample);
+  });
+
+  test("accepts all characters in the base64url alphabet at 32 chars", () => {
+    // Build a 32-char string containing every legal character at least
+    // once so the regex's character class is exercised.
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef";
+    expect(alphabet.length).toBe(32);
+    expect(validateToken(alphabet)).toBe(alphabet);
+    const digits = "0123456789ghijklmnopqrstuvwxyz_-";
+    expect(digits.length).toBe(32);
+    expect(validateToken(digits)).toBe(digits);
+  });
+
+  test("rejects the broader printable charset that the prior validator permitted", () => {
+    // Each of `+`, `=`, `:`, `.`, `~`, `/` was previously legal under
+    // the old `/^[A-Za-z0-9._~+/=:-]+$/` regex. The tightened validator
+    // refuses all of them.
+    const builders: Array<{ name: string; value: string }> = [
+      { name: "plus", value: "ATFSaxaXkptHZj8C7BfeEKn8FPB6lGL+" },
+      { name: "equals", value: "ATFSaxaXkptHZj8C7BfeEKn8FPB6lGL=" },
+      { name: "colon", value: "ATFSaxaXkptHZj8C7BfeEKn8FPB6lGL:" },
+      { name: "dot", value: "ATFSaxaXkptHZj8C7BfeEKn8FPB6lGL." },
+      { name: "tilde", value: "ATFSaxaXkptHZj8C7BfeEKn8FPB6lGL~" },
+      { name: "slash", value: "ATFSaxaXkptHZj8C7BfeEKn8FPB6lGL/" }
+    ];
+    for (const c of builders) {
+      expect(c.value.length).toBe(32);
+      expect(validateToken(c.value)).toBeUndefined();
+    }
   });
 
   test("rejects spaces, < > and & characters", () => {
-    expect(validateToken("abc def")).toBeUndefined();
-    expect(validateToken("abc<def")).toBeUndefined();
-    expect(validateToken("abc>def")).toBeUndefined();
-    expect(validateToken("abc&def")).toBeUndefined();
+    expect(validateToken("abc def0123456789012345678901234")).toBeUndefined();
+    expect(validateToken("abc<def0123456789012345678901234")).toBeUndefined();
+    expect(validateToken("abc>def0123456789012345678901234")).toBeUndefined();
+    expect(validateToken("abc&def0123456789012345678901234")).toBeUndefined();
   });
 
   test("rejects empty and undefined input", () => {
@@ -79,15 +112,22 @@ describe("validateToken", () => {
     expect(validateToken("")).toBeUndefined();
   });
 
-  test("rejects oversize input (513 chars) and returns undefined", () => {
+  test("rejects a 31-char string (one under the runtime secret length)", () => {
+    const short = "ATFSaxaXkptHZj8C7BfeEKn8FPB6lGL";
+    expect(short.length).toBe(31);
+    expect(validateToken(short)).toBeUndefined();
+  });
+
+  test("rejects a 33-char string (one over the runtime secret length)", () => {
+    const long = "ATFSaxaXkptHZj8C7BfeEKn8FPB6lGLOX";
+    expect(long.length).toBe(33);
+    expect(validateToken(long)).toBeUndefined();
+  });
+
+  test("rejects oversize input (513 chars)", () => {
     const oversize = "a".repeat(513);
     expect(oversize.length).toBe(513);
     expect(validateToken(oversize)).toBeUndefined();
-  });
-
-  test("accepts a 512-char token at the boundary", () => {
-    const max = "a".repeat(512);
-    expect(validateToken(max)).toBe(max);
   });
 });
 
