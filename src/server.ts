@@ -15,6 +15,7 @@ import { loadConfig, parseInstance, runtimePortPath } from "./paths";
 import { appendLog, mutateState, readState } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
+import { installCrashHandlers } from "./runtime/crash-handlers";
 import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
 import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
@@ -38,6 +39,10 @@ const SCHEDULER_DRAIN_TIMEOUT_MS = 5000;
 
 const instance = parseInstance();
 const config = loadConfig(instance);
+// Install crash handlers before any runtime work so an uncaughtException or
+// unhandledRejection thrown during boot is still captured + filed. The
+// handler gates issue filing on launchd supervision internally.
+installCrashHandlers({ instance, source: "runtime" });
 await install(config);
 writePid(config);
 
