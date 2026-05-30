@@ -269,6 +269,33 @@ describe("syncProviderMcpServers", () => {
     expect(server?.headers?.Authorization).toBe("Bearer ${LINEAR_API_KEY}");
   });
 
+  test("registers under metadata.mcp.name when set, keying the header on the credential name", async () => {
+    // The migrated LINEAR_API_KEY credential drives the "linear" server row
+    // (so skills' `server: "linear"` keeps resolving) while the header still
+    // references ${LINEAR_API_KEY} (the credential name, == env var).
+    const config = buildConfig("mcp-sync-credential-named-row");
+    await mutateState(config.instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_cred_named",
+        instance: config.instance,
+        name: "LINEAR_API_KEY",
+        type: "api-key",
+        provider: "linear",
+        health: "healthy",
+        metadata: { mcp: { url: "https://mcp.linear.app/mcp", name: "linear", headerName: "Authorization", scheme: "Bearer" } }
+      }));
+    });
+    const created = await syncProviderMcpServers(config);
+    expect(created).toContain("linear");
+    const state = readState(config.instance);
+    // Exactly one row, named "linear" — never a separate LINEAR_API_KEY row.
+    expect(state.mcpServers.filter((s) => s.name === "linear").length).toBe(1);
+    expect(state.mcpServers.find((s) => s.name === "LINEAR_API_KEY")).toBeUndefined();
+    const server = state.mcpServers.find((s) => s.name === "linear");
+    expect(server?.url).toBe("https://mcp.linear.app/mcp");
+    expect(server?.headers?.Authorization).toBe("Bearer ${LINEAR_API_KEY}");
+  });
+
   test("credential MCP header honors headerName and scheme overrides", async () => {
     const config = buildConfig("mcp-sync-credential-override");
     await mutateState(config.instance, (state) => {

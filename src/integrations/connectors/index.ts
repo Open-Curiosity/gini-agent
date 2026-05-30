@@ -48,6 +48,11 @@ export interface CredentialTemplate {
   name: string;
   // api-key only: the HTTP MCP server URL to prefill (from module.mcpServer).
   mcpUrl?: string;
+  // api-key only: the MCP server row name to register under (from
+  // module.mcpServer.name). Lets the credential own a differently-named row —
+  // e.g. LINEAR_API_KEY drives the "linear" server skills reference. Defaults
+  // to the credential name when absent.
+  mcpName?: string;
   // oauth2 only: purpose → ENV_NAME map seeded from the module's envBindings.
   envMap?: Record<string, string>;
 }
@@ -69,7 +74,8 @@ export function credentialTemplateForProvider(module: ProviderModule): Credentia
     return {
       type: "api-key",
       name: envName,
-      ...(module.mcpServer?.url ? { mcpUrl: module.mcpServer.url } : {})
+      ...(module.mcpServer?.url ? { mcpUrl: module.mcpServer.url } : {}),
+      ...(module.mcpServer?.name ? { mcpName: module.mcpServer.name } : {})
     };
   }
   const envMap: Record<string, string> = {};

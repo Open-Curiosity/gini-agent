@@ -41,13 +41,16 @@ function connectorUsable(c: ConnectorRecord): boolean {
 }
 
 // Register an MCP server for every usable api-key credential that carries
-// `metadata.mcp`. The server row is NAMED BY THE CREDENTIAL (api-key name ==
-// env var), and its single auth header is built from the credential's mcp
-// metadata: `{[headerName ?? "Authorization"]: "<scheme ?? Bearer> ${<name>}"}`.
-// The `${<name>}` placeholder resolves at invoke-time via `resolveMcpHeaders`
-// against the same credential (name-based), so the token never lands in
-// state.json. Idempotent and keyed by name — never clobbers a user's manual
-// `gini mcp add` config or an already-registered row.
+// `metadata.mcp`. The server row is named by `mcp.name` when set, else the
+// credential name (api-key name == env var) — this lets the LINEAR_API_KEY
+// credential own the "linear" row that skills reference as `server: "linear"`.
+// Its single auth header is built from the credential's mcp metadata:
+// `{[headerName ?? "Authorization"]: "<scheme ?? Bearer> ${<credential-name>}"}`.
+// The `${<credential-name>}` placeholder always resolves at invoke-time via
+// `resolveMcpHeaders` against the credential (name-based, independent of the
+// row name), so the token never lands in state.json. Idempotent and keyed by
+// row name — never clobbers a user's manual `gini mcp add` config or an
+// already-registered row.
 async function syncCredentialMcpServers(config: RuntimeConfig, created: string[]): Promise<void> {
   const state = readState(config.instance);
   for (const credential of state.connectors) {
@@ -55,21 +58,21 @@ async function syncCredentialMcpServers(config: RuntimeConfig, created: string[]
     const mcp = credential.metadata?.mcp;
     if (!mcp?.url) continue;
     if (!connectorUsable(credential)) continue;
-    const name = credential.name;
-    if (state.mcpServers.some((s) => s.name === name)) continue;
+    const serverName = mcp.name ?? credential.name;
+    if (state.mcpServers.some((s) => s.name === serverName)) continue;
     const headerName = mcp.headerName ?? "Authorization";
     const scheme = mcp.scheme ?? "Bearer";
-    const headers = { [headerName]: `${scheme} \${${name}}` };
+    const headers = { [headerName]: `${scheme} \${${credential.name}}` };
     const inserted = await mutateState(config.instance, (mutating): { id: string; name: string } | undefined => {
       // Re-check usability and existence inside the lock to lose cleanly to a
       // concurrent disable/delete or `gini mcp add` for the same name.
       const still = mutating.connectors.find((c) => c.id === credential.id);
       if (!still || still.type !== "api-key" || !connectorUsable(still)) return undefined;
-      if (mutating.mcpServers.some((s) => s.name === name)) return undefined;
+      if (mutating.mcpServers.some((s) => s.name === serverName)) return undefined;
       const record = createMcpServerRecord(
         mutating,
         {
-          name,
+          name: serverName,
           command: "",
           args: [],
           envKeys: [],
@@ -87,7 +90,7 @@ async function syncCredentialMcpServers(config: RuntimeConfig, created: string[]
           action: "mcp.auto_register",
           target: record.id,
           risk: "low",
-          evidence: { provider: credential.provider, name, url: mcp.url }
+          evidence: { provider: credential.provider, name: serverName, url: mcp.url }
         },
         { system: true }
       );

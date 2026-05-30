@@ -117,6 +117,9 @@ export function AddConnectorDialog({
   const [apiKeyName, setApiKeyName] = useState("");
   const [apiKeySecret, setApiKeySecret] = useState("");
   const [mcpUrl, setMcpUrl] = useState("");
+  // MCP server row name to register under (from a template's mcpServer.name).
+  // Empty for plain api keys, where the row defaults to the credential name.
+  const [mcpName, setMcpName] = useState("");
   const [oauthName, setOauthName] = useState("");
   const [oauthRows, setOauthRows] = useState<OAuthRow[]>([{ envVarName: "", value: "" }]);
 
@@ -131,6 +134,7 @@ export function AddConnectorDialog({
       setApiKeyName(defaultName ?? "");
       setApiKeySecret("");
       setMcpUrl("");
+      setMcpName("");
       setOauthName(defaultName ?? "");
       setOauthRows([{ envVarName: "", value: "" }]);
     }
@@ -157,6 +161,7 @@ export function AddConnectorDialog({
     if (tmpl.type === "api-key") {
       setApiKeyName(tmpl.name);
       setMcpUrl(tmpl.mcpUrl ?? "");
+      setMcpName(tmpl.mcpName ?? "");
     } else {
       setOauthName(tmpl.name);
       const envMap = tmpl.envMap ?? {};
@@ -198,13 +203,21 @@ export function AddConnectorDialog({
         return;
       }
       const url = mcpUrl.trim();
+      const rowName = mcpName.trim();
       onSubmit({
         provider: template || "generic",
         name: envName,
         type: "api-key",
         secrets: { [envName]: apiKeySecret.trim() },
         metadata: url
-          ? { mcp: { url, headerName: "Authorization", scheme: "Bearer" } }
+          ? {
+              mcp: {
+                url,
+                ...(rowName ? { name: rowName } : {}),
+                headerName: "Authorization",
+                scheme: "Bearer"
+              }
+            }
           : {}
       });
       return;

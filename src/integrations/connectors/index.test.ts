@@ -176,6 +176,11 @@ describe("resolveSkillEnv", () => {
   });
 
   test("configured + healthy connector DOES inject its secret (regression)", async () => {
+    // Post-migration shape: the connector is typed api-key named LINEAR_API_KEY
+    // and the skill references it by name. (The state migration re-keys the
+    // secret purpose to the credential name; a stored secret under "token"
+    // resolves via bindingsForCredentials reading the single secretRef's
+    // purpose.)
     const instance = "resolve-configured";
     const config = {
       instance,
@@ -186,12 +191,14 @@ describe("resolveSkillEnv", () => {
       stateRoot: `${ROOT}/${instance}`,
       logRoot: `${ROOT}/${instance}/logs`
     };
-    const ref = writeSecret(instance, "id_ok", "token", "real-token");
+    const ref = writeSecret(instance, "id_ok", "LINEAR_API_KEY", "real-token");
     await mutateState(instance, (state) => {
       state.connectors.push(newConnector({
         id: "id_ok",
         instance,
         provider: "linear",
+        type: "api-key",
+        name: "LINEAR_API_KEY",
         status: "configured",
         health: "healthy",
         secretRefs: [ref]
@@ -199,7 +206,7 @@ describe("resolveSkillEnv", () => {
     });
     const skill = newSkill({
       source: "bundled",
-      requiredConnectors: [{ provider: "linear" }],
+      requiredCredentials: ["LINEAR_API_KEY"],
       prerequisites: { env: ["LINEAR_API_KEY"] }
     });
     const env = await resolveSkillEnv(config, skill);
@@ -396,12 +403,14 @@ describe("resolveSkillEnv", () => {
       stateRoot: `${ROOT}/${instance}`,
       logRoot: `${ROOT}/${instance}/logs`
     };
-    const ref = writeSecret(instance, "id_granted", "token", "real-token");
+    const ref = writeSecret(instance, "id_granted", "LINEAR_API_KEY", "real-token");
     await mutateState(instance, (state) => {
       state.connectors.push(newConnector({
         id: "id_granted",
         instance,
         provider: "linear",
+        type: "api-key",
+        name: "LINEAR_API_KEY",
         status: "configured",
         health: "healthy",
         secretRefs: [ref]
@@ -409,8 +418,8 @@ describe("resolveSkillEnv", () => {
     });
     const skill = newSkill({
       source: "user",
-      grantedConnectors: ["linear"],
-      requiredConnectors: [{ provider: "linear" }],
+      grantedConnectors: ["LINEAR_API_KEY"],
+      requiredCredentials: ["LINEAR_API_KEY"],
       prerequisites: { env: ["LINEAR_API_KEY"] }
     });
     const env = await resolveSkillEnv(config, skill);
@@ -428,12 +437,14 @@ describe("resolveSkillEnv", () => {
       stateRoot: `${ROOT}/${instance}`,
       logRoot: `${ROOT}/${instance}/logs`
     };
-    const ref = writeSecret(instance, "id_bundled", "token", "real-token");
+    const ref = writeSecret(instance, "id_bundled", "LINEAR_API_KEY", "real-token");
     await mutateState(instance, (state) => {
       state.connectors.push(newConnector({
         id: "id_bundled",
         instance,
         provider: "linear",
+        type: "api-key",
+        name: "LINEAR_API_KEY",
         status: "configured",
         health: "healthy",
         secretRefs: [ref]
@@ -441,7 +452,7 @@ describe("resolveSkillEnv", () => {
     });
     const skill = newSkill({
       source: "bundled",
-      requiredConnectors: [{ provider: "linear" }],
+      requiredCredentials: ["LINEAR_API_KEY"],
       prerequisites: { env: ["LINEAR_API_KEY"] }
     });
     const env = await resolveSkillEnv(config, skill);

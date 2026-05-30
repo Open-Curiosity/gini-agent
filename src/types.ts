@@ -1352,13 +1352,17 @@ export interface ConnectorRecord {
   //
   // Two typed-credential keys live here by convention:
   //   - `mcp`: present on api-key credentials that back an HTTP MCP server.
-  //     Drives MCP registration (the server row is named by the credential)
-  //     and the header `{[headerName ?? "Authorization"]: "<scheme ?? Bearer> ${<name>}"}`.
+  //     Drives MCP registration and the header
+  //     `{[headerName ?? "Authorization"]: "<scheme ?? Bearer> ${<name>}"}`.
+  //     The server row is named by `mcp.name` when set, else the credential
+  //     name. `mcp.name` lets a credential own a differently-named row — e.g.
+  //     the LINEAR_API_KEY credential drives the "linear" MCP server that
+  //     skills reference as `server: "linear"`.
   //   - `envMap`: present on oauth2 credentials, mapping each secret purpose
   //     to the ENV_NAME the runtime injects for it (e.g.
   //     `{ client_id: "GOOGLE_WORKSPACE_CLI_CLIENT_ID" }`).
   metadata?: Record<string, unknown> & {
-    mcp?: { url: string; headerName?: string; scheme?: string };
+    mcp?: { url: string; name?: string; headerName?: string; scheme?: string };
     envMap?: Record<string, string>;
   };
   // Origin marker: "auto" for connectors materialized by the startup

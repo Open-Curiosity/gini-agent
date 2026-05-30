@@ -763,12 +763,14 @@ describe("runtime api", () => {
     expect(ids).toContain("claude-code");
     expect(ids).toContain("codex");
     // Credential templates: linear (single env binding) → api-key prefill
-    // with the MCP URL; google-oauth-desktop (two bindings) → oauth2 envMap.
+    // with the MCP URL + server name; google-oauth-desktop (two bindings) →
+    // oauth2 envMap.
     const linear = providers.find((p: { id: string }) => p.id === "linear");
     expect(linear.credentialTemplate).toEqual({
       type: "api-key",
       name: "LINEAR_API_KEY",
-      mcpUrl: "https://mcp.linear.app/mcp"
+      mcpUrl: "https://mcp.linear.app/mcp",
+      mcpName: "linear"
     });
     const gws = providers.find((p: { id: string }) => p.id === "google-oauth-desktop");
     expect(gws.credentialTemplate.type).toBe("oauth2");

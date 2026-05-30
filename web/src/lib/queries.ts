@@ -191,6 +191,7 @@ export interface ProviderDescriptor {
     type: "api-key" | "oauth2";
     name: string;
     mcpUrl?: string;
+    mcpName?: string;
     envMap?: Record<string, string>;
   };
 }

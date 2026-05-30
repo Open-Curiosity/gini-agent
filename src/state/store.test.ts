@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { createEmptyState, normalizeState } from "./store";
-import type { RuntimeState } from "../types";
+import { readSecret, writeSecret } from "./secrets";
+import type { ConnectorRecord, RuntimeState, SkillRecord } from "../types";
 
 // Isolated state root so the test never touches ~/.gini.
 const ROOT = "/tmp/gini-store-test";
@@ -518,5 +519,209 @@ describe("normalizeState approval -> authorization/setup-request migration", () 
     expect(normalized.authorizations).toEqual([]);
     expect(normalized.setupRequests).toEqual([]);
     expect((normalized as unknown as { approvals?: unknown }).approvals).toBeUndefined();
+  });
+});
+
+describe("normalizeState provider-keyed → typed-named-credential migration", () => {
+  // Build a pre-migration state: provider-keyed linear + google-oauth-desktop
+  // + a generic connector, plus a user skill that requires + grants them.
+  // Secrets are written to disk so the migration's purpose re-key can be
+  // verified to preserve values.
+  function seedPreMigration(instance: string): RuntimeState {
+    const state = createEmptyState(instance);
+    const at = new Date().toISOString();
+
+    const linearRef = writeSecret(instance, "id_linear", "token", "lin_api_secret");
+    const gwsIdRef = writeSecret(instance, "id_gws", "client_id", "gws-client-id");
+    const gwsSecretRef = writeSecret(instance, "id_gws", "client_secret", "gws-client-secret");
+    const genericRef = writeSecret(instance, "id_generic", "MY_API_KEY", "generic-secret");
+
+    const connectors: ConnectorRecord[] = [
+      {
+        id: "id_linear",
+        instance,
+        name: "Linear",
+        provider: "linear",
+        status: "configured",
+        scopes: [],
+        secretRefs: [linearRef],
+        createdAt: at,
+        updatedAt: at,
+        health: "healthy",
+        source: "user"
+      },
+      {
+        id: "id_gws",
+        instance,
+        name: "Google",
+        provider: "google-oauth-desktop",
+        status: "configured",
+        scopes: [],
+        secretRefs: [gwsIdRef, gwsSecretRef],
+        createdAt: at,
+        updatedAt: at,
+        health: "healthy",
+        source: "user"
+      },
+      {
+        id: "id_generic",
+        instance,
+        name: "My Service",
+        provider: "generic",
+        status: "configured",
+        scopes: [],
+        secretRefs: [genericRef],
+        createdAt: at,
+        updatedAt: at,
+        health: "healthy",
+        source: "user"
+      }
+    ];
+    // Replace the default demo connector list with our seeded set.
+    state.connectors = connectors;
+
+    const skill: SkillRecord = {
+      id: "skill_user_1",
+      instance,
+      name: "my-linear-skill",
+      description: "User skill referencing linear + generic",
+      trigger: "",
+      steps: [],
+      requiredTools: [],
+      requiredPermissions: [],
+      status: "enabled",
+      version: 1,
+      createdAt: at,
+      updatedAt: at,
+      tests: [],
+      successCount: 0,
+      failureCount: 0,
+      previousVersions: [],
+      body: "",
+      source: "user",
+      requiredConnectors: [{ provider: "linear" }, { provider: "generic" }],
+      grantedConnectors: ["linear", "generic"]
+    };
+    state.skills = [skill];
+    return state;
+  }
+
+  test("types + names connectors, preserves secrets, converts skills, and is idempotent", () => {
+    const instance = "test-cred-migrate";
+    const state = seedPreMigration(instance);
+    const normalized = normalizeState(instance, state);
+
+    const linear = normalized.connectors.find((c) => c.id === "id_linear")!;
+    expect(linear.type).toBe("api-key");
+    expect(linear.name).toBe("LINEAR_API_KEY");
+    expect(linear.metadata?.mcp).toEqual({
+      url: "https://mcp.linear.app/mcp",
+      name: "linear",
+      headerName: "Authorization",
+      scheme: "Bearer"
+    });
+    // Secret value survives the purpose re-key (ref points at the same file).
+    const linearRef = linear.secretRefs.find((r) => r.purpose === "LINEAR_API_KEY")!;
+    expect(linearRef).toBeDefined();
+    expect(readSecret(instance, linearRef)).toBe("lin_api_secret");
+
+    const gws = normalized.connectors.find((c) => c.id === "id_gws")!;
+    expect(gws.type).toBe("oauth2");
+    expect(gws.name).toBe("google-workspace-oauth");
+    expect(gws.metadata?.envMap).toEqual({
+      client_id: "GOOGLE_WORKSPACE_CLI_CLIENT_ID",
+      client_secret: "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET"
+    });
+    // oauth2 keeps its purposes (client_id/client_secret) — values intact.
+    expect(readSecret(instance, gws.secretRefs.find((r) => r.purpose === "client_id")!)).toBe("gws-client-id");
+    expect(readSecret(instance, gws.secretRefs.find((r) => r.purpose === "client_secret")!)).toBe("gws-client-secret");
+
+    const generic = normalized.connectors.find((c) => c.id === "id_generic")!;
+    expect(generic.type).toBe("api-key");
+    expect(generic.name).toBe("MY_API_KEY");
+    expect(readSecret(instance, generic.secretRefs[0]!)).toBe("generic-secret");
+
+    const skill = normalized.skills.find((s) => s.id === "skill_user_1")!;
+    expect(skill.requiredCredentials).toEqual(["LINEAR_API_KEY", "MY_API_KEY"]);
+    expect(skill.grantedConnectors).toEqual(["LINEAR_API_KEY", "MY_API_KEY"]);
+
+    // Exactly one summary audit row.
+    const summary = normalized.audit.filter((a) => a.action === "connector.migration.typed_credentials");
+    expect(summary.length).toBe(1);
+
+    // Marker set.
+    const marker = (normalized as unknown as { migrations?: { connectorsTypedCredentials?: string } }).migrations?.connectorsTypedCredentials;
+    expect(typeof marker).toBe("string");
+
+    // Idempotent: a second pass changes nothing material and adds no new
+    // migration audit row.
+    const second = normalizeState(instance, normalized);
+    expect(second.connectors.find((c) => c.id === "id_linear")!.name).toBe("LINEAR_API_KEY");
+    expect(second.audit.filter((a) => a.action === "connector.migration.typed_credentials").length).toBe(1);
+    expect(second.skills.find((s) => s.id === "skill_user_1")!.requiredCredentials).toEqual(["LINEAR_API_KEY", "MY_API_KEY"]);
+  });
+
+  test("renames a colliding generic LINEAR_API_KEY to LINEAR_API_KEY_2 with a collision audit", () => {
+    const instance = "test-cred-collision";
+    const state = createEmptyState(instance);
+    const at = new Date().toISOString();
+
+    const linearRef = writeSecret(instance, "id_linear", "token", "lin_api_secret");
+    const dupRef = writeSecret(instance, "id_dup", "LINEAR_API_KEY", "generic-dup-secret");
+
+    state.connectors = [
+      {
+        id: "id_linear",
+        instance,
+        name: "Linear",
+        provider: "linear",
+        status: "configured",
+        scopes: [],
+        secretRefs: [linearRef],
+        createdAt: at,
+        updatedAt: at,
+        health: "healthy",
+        source: "user"
+      },
+      {
+        id: "id_dup",
+        instance,
+        name: "Dup",
+        provider: "generic",
+        status: "configured",
+        scopes: [],
+        secretRefs: [dupRef],
+        createdAt: at,
+        updatedAt: at,
+        health: "healthy",
+        source: "user"
+      }
+    ];
+
+    const normalized = normalizeState(instance, state);
+
+    // Template-typed linear keeps the canonical name.
+    expect(normalized.connectors.find((c) => c.id === "id_linear")!.name).toBe("LINEAR_API_KEY");
+    // The generic dup is renamed.
+    const dup = normalized.connectors.find((c) => c.id === "id_dup")!;
+    expect(dup.type).toBe("api-key");
+    expect(dup.name).toBe("LINEAR_API_KEY_2");
+    // Value still resolvable under the original purpose.
+    expect(readSecret(instance, dup.secretRefs[0]!)).toBe("generic-dup-secret");
+    // Collision audit emitted.
+    const collision = normalized.audit.find((a) => a.action === "connector.migration_collision");
+    expect(collision).toBeDefined();
+    expect((collision!.evidence as { from?: string; to?: string }).from).toBe("LINEAR_API_KEY");
+    expect((collision!.evidence as { from?: string; to?: string }).to).toBe("LINEAR_API_KEY_2");
+  });
+
+  test("leaves presence-only providers (demo) untyped", () => {
+    const instance = "test-cred-presence";
+    const state = createEmptyState(instance);
+    // createEmptyState seeds a demo connector — leave it as-is.
+    const normalized = normalizeState(instance, state);
+    const demo = normalized.connectors.find((c) => c.provider === "demo");
+    expect(demo).toBeDefined();
+    expect(demo!.type).toBeUndefined();
   });
 });
