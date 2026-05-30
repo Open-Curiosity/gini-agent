@@ -145,6 +145,7 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
           : {}),
         status: (payload.status as ToolCallStatus) ?? "running",
         errorMessage: typeof payload.errorMessage === "string" ? payload.errorMessage : undefined,
+        errorSeverity: payload.errorSeverity === "info" || payload.errorSeverity === "error" ? payload.errorSeverity : undefined,
         callId: String(payload.callId ?? "")
       };
     case "tool_result":
@@ -229,6 +230,7 @@ function payloadFor(block: ChatBlock): string {
         argsFull: block.argsFull,
         status: block.status,
         errorMessage: block.errorMessage,
+        errorSeverity: block.errorSeverity,
         callId: block.callId
       });
     case "tool_result":
@@ -326,6 +328,7 @@ export function insertChatBlock(
             argsFull: input.argsFull,
             status: input.status,
             errorMessage: input.errorMessage,
+            errorSeverity: input.errorSeverity,
             callId: input.callId
           };
         case "tool_result":
@@ -517,6 +520,7 @@ export function updateToolCallBlock(
   patch: {
     status: "running" | "ok" | "error" | "denied";
     errorMessage?: string;
+    errorSeverity?: "info" | "error";
   }
 ): ChatBlock | null {
   const db = getMemoryDb(instance);
@@ -539,6 +543,7 @@ export function updateToolCallBlock(
   }
   payload.status = patch.status;
   if (patch.errorMessage !== undefined) payload.errorMessage = patch.errorMessage;
+  if (patch.errorSeverity !== undefined) payload.errorSeverity = patch.errorSeverity;
   db.run(
     `UPDATE chat_blocks
        SET payload_json = ?, updated_at = ?

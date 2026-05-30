@@ -80,6 +80,23 @@ export type DispatchResult =
   | { kind: "sync"; result: string }
   | { kind: "pending"; approvalId: string };
 
+// A tool failure whose model-facing message (the thrown `message`, fed back
+// as the tool result so the model can steer itself) differs from what the
+// user should see in the chat UI. `displayMessage` is the short, calm line
+// rendered under the tool-call row; `displaySeverity` lets the client style
+// it as a neutral "info" notice (gray) instead of a red error. Plain Errors
+// continue to surface their full message to both the model and the user.
+export class ToolDisplayError extends Error {
+  readonly displayMessage: string;
+  readonly displaySeverity: "info" | "error";
+  constructor(modelMessage: string, opts: { displayMessage: string; severity?: "info" | "error" }) {
+    super(modelMessage);
+    this.name = "ToolDisplayError";
+    this.displayMessage = opts.displayMessage;
+    this.displaySeverity = opts.severity ?? "error";
+  }
+}
+
 // Top-level entry. Routes the tool call to its handler. Throws on unknown
 // tool names so the loop can surface that to the model as an error
 // (instead of silently ignoring a hallucinated tool).
@@ -549,8 +566,9 @@ async function webSearchTool(config: RuntimeConfig, taskId: string, args: Record
   }
   if (!connector || !providerId) {
     const wanted = requested ?? "brave-search or exa";
-    throw new Error(
-      `Web search is unavailable: no healthy ${wanted} connector. Your next move is to call request_connector with provider '${requested ?? "brave-search"}' so the user can paste an API key — then retry this search. Do NOT fall back to web_fetch on guessed URLs; the user asked for real web search, and guessing URLs bypasses that intent.`
+    throw new ToolDisplayError(
+      `Web search is unavailable: no healthy ${wanted} connector. Your next move is to call request_connector with provider '${requested ?? "brave-search"}' so the user can paste an API key — then retry this search. Do NOT fall back to web_fetch on guessed URLs; the user asked for real web search, and guessing URLs bypasses that intent.`,
+      { displayMessage: "No search provider connected.", severity: "info" }
     );
   }
 

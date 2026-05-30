@@ -72,7 +72,7 @@ import {
   updateAssistantTextDelta,
   type ChatEmitContext
 } from "./chat-task-emit";
-import { dispatchToolCall, parseToolArgsLenient } from "./tool-dispatch";
+import { dispatchToolCall, parseToolArgsLenient, ToolDisplayError } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { autoRenameChatAfterTurn } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
@@ -1232,8 +1232,14 @@ async function runLoop(
         }
 
         // Dispatch failed (bad args, unknown tool, validation error). Feed
-        // the error back to the model as the tool result so it can recover.
+        // the FULL error back to the model as the tool result so it can
+        // recover/steer. The chat UI may show a shorter, calmer line: a
+        // ToolDisplayError carries a separate `displayMessage`/`severity`
+        // (e.g. web_search with no provider keeps the verbose steering for
+        // the model but shows "No search provider connected." in gray).
         const message = error instanceof Error ? error.message : String(error);
+        const display = error instanceof ToolDisplayError ? error.displayMessage : message;
+        const severity = error instanceof ToolDisplayError ? error.displaySeverity : "error";
         appendTrace(config.instance, taskId, {
           type: "error",
           message: `Tool call ${call.function.name} failed: ${message}`,
@@ -1247,7 +1253,8 @@ async function runLoop(
         emitToolCallStatus(emitCtx, {
           callId: call.id,
           status: "error",
-          errorMessage: message
+          errorMessage: display,
+          errorSeverity: severity
         });
         await mutateState(config.instance, (state) => {
           updateRecentToolCall(findTask(state, taskId), call.id, "error");
