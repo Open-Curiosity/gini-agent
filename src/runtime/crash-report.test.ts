@@ -144,6 +144,14 @@ describe("redactReportText", () => {
     expect(out).toContain("leaked OPENAI value");
   });
 
+  test("passes a non-string input through untouched instead of throwing", () => {
+    // A malformed field (e.g. a numeric `message`) must not make .replace throw
+    // — return it unchanged so the whole crash report isn't dropped.
+    const num = 123 as unknown as string;
+    expect(() => redactReportText(num)).not.toThrow();
+    expect(redactReportText(num)).toBe(num);
+  });
+
   test("redacts a single-quote-escaped secrets-env value as loaded (not half-stripped)", () => {
     // The writer escapes embedded single quotes as '\'' (close, escaped
     // quote, reopen). unquoteSecretsValue inverts that, so the literal we
@@ -219,7 +227,11 @@ describe("buildCrashReport redaction", () => {
     try {
       const literalSecret = "literal-disk-secret-77";
       const tunnelSecret = "tunnel-disk-secret-88";
+      const nameSecret = "ghp_0123456789abcdefghijklmnopqrstuv";
       const err = new Error(`disk sk-abcdefghijklmnop1234 ${literalSecret}`);
+      // A secret embedded in error.name reaches the issue TITLE + body, so it
+      // crosses the same trust boundary as message/stack and must be redacted.
+      err.name = `Boom${nameSecret}`;
       err.stack = [
         "Error: disk",
         "  Authorization: Basic dXNlcjpwYXNzd29yZA==",
@@ -236,6 +248,9 @@ describe("buildCrashReport redaction", () => {
         secretsEnvBody: `export OPENAI_API_KEY='${literalSecret}'`,
         tunnelSecret
       });
+      // The redacted name no longer carries the secret token.
+      expect(report.error.name).not.toContain(nameSecret);
+      expect(report.error.name).toContain("[redacted]");
       const path = writeCrashReportFile(report);
       const onDisk = readFileSync(path, "utf8");
       expect(onDisk).not.toContain("sk-abcdefghijklmnop1234");
@@ -245,6 +260,43 @@ describe("buildCrashReport redaction", () => {
       expect(onDisk).not.toContain(tunnelSecret);
       expect(onDisk).not.toContain("raw");
       expect(onDisk).toContain("[redacted]");
+    } finally {
+      if (prevStateRoot === undefined) delete process.env.GINI_STATE_ROOT;
+      else process.env.GINI_STATE_ROOT = prevStateRoot;
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("a non-string log/error field does NOT throw and still produces a written report", () => {
+    const prevStateRoot = process.env.GINI_STATE_ROOT;
+    const stateRoot = `/tmp/gini-crash-nonstring-tests-${tag()}`;
+    rmSync(stateRoot, { recursive: true, force: true });
+    process.env.GINI_STATE_ROOT = stateRoot;
+    try {
+      // A malformed `{ "message": 123 }` tail line must not make redaction call
+      // .replace on a number and throw, which would otherwise drop the whole
+      // report. redactReportText now passes any non-string through untouched.
+      let report: ReturnType<typeof buildCrashReport> | undefined;
+      expect(() => {
+        report = buildCrashReport({
+          instance: "test-inst",
+          supervisor: "launchd",
+          source: "runtime",
+          error: new Error("boom"),
+          logTail: [
+            { at: "2026-05-29T00:00:00.000Z", message: 123 as unknown as string },
+            { at: "2026-05-29T00:00:01.000Z", message: "ok-string" }
+          ],
+          sysInfo: SYS_INFO,
+          clock: () => new Date("2026-05-29T00:00:02.000Z")
+        });
+      }).not.toThrow();
+      // The non-string message passes through untouched; the string one survives.
+      expect(report!.logTail[0]!.message).toBe(123 as unknown as string);
+      expect(report!.logTail[1]!.message).toBe("ok-string");
+      // The report still writes to the pending queue.
+      const path = writeCrashReportFile(report!);
+      expect(existsSync(path)).toBe(true);
     } finally {
       if (prevStateRoot === undefined) delete process.env.GINI_STATE_ROOT;
       else process.env.GINI_STATE_ROOT = prevStateRoot;
