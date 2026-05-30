@@ -93,9 +93,26 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
     onError: (error: Error) => toast.error(error.message)
   });
 
+  // skill.grant_connector carries no secret — the credential already lives
+  // in the connector record. The card is a pure consent gate: POST an empty
+  // body to /complete, which appends the grant, enables the skill, and
+  // resumes the chat-task loop. See docs/adr/skill-connector-consent.md.
+  const grantSubmit = useMutation({
+    mutationFn: async () =>
+      api<{ ok: boolean }>(`/setup-requests/${block.setupRequestId}/complete`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }),
+    onSuccess: () => {
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "skills"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
   const isBrowserConnect = block.action === "browser.connect";
   const isConnectorRequest = block.action === "connector.request";
   const isBrowserFillSecret = block.action === "browser.fill_secret";
+  const isSkillGrant = block.action === "skill.grant_connector";
   const isMessagingAddBridge = block.action === "messaging.add_bridge";
   const isMessagingApprovePairing = block.action === "messaging.approve_pairing";
   const isMessagingRemoveBridge = block.action === "messaging.remove_bridge";
@@ -459,7 +476,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
     <div className={cardClass}>
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-mono text-xs text-foreground">
-          {isBrowserConnect ? "Connect to agent's browser" : block.action}
+          {isBrowserConnect ? "Connect to agent's browser" : isSkillGrant ? "Grant skill access" : block.action}
         </span>
         {!isPending && setup ? <StatusPill value={setup.status} /> : null}
         <button
@@ -776,6 +793,24 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
               }}
             >
               Remove
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={cancel.isPending || !isPending}
+              onClick={() => cancel.mutate()}
+            >
+              Cancel
+            </Button>
+          </>
+        ) : isSkillGrant ? (
+          <>
+            <Button
+              size="sm"
+              disabled={grantSubmit.isPending || !isPending || !setup}
+              onClick={() => grantSubmit.mutate()}
+            >
+              Grant
             </Button>
             <Button
               size="sm"

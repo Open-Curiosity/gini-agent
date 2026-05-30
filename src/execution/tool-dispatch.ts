@@ -148,9 +148,9 @@ export async function dispatchToolCall(
     case "install_skill":
       return { kind: "sync", result: await installSkillTool(config, taskId, args) };
     case "enable_skill":
-      return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "enabled") };
+      return await setSkillStatusTool(config, taskId, toolCallId, args, "enabled");
     case "disable_skill":
-      return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "disabled") };
+      return await setSkillStatusTool(config, taskId, toolCallId, args, "disabled");
     case "mcp_call":
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
     case "skill_run":
@@ -2165,13 +2165,46 @@ async function installSkillTool(
 
 // Enable / disable a registered skill. Wraps setSkillStatus, which
 // writes the matching skill.enabled / skill.disabled audit row.
+//
+// Enabling a NON-bundled skill that requires a credentialed connector is
+// gated by a per-(skill, connector) consent grant (ADR
+// skill-connector-consent.md): the tool mints a `skill.grant_connector`
+// SetupRequest and returns `{ kind: "pending" }` instead of enabling, so the
+// user approves the grant via the chat card before the connector's env can
+// reach the skill's scripts. One SetupRequest per ungranted provider — the
+// user grants one, the loop resumes, re-enters here, and either enables (no
+// more ungranted providers) or mints the next grant. Bundled skills are
+// auto-granted in resolveSkillEnv and skip the gate entirely.
 async function setSkillStatusTool(
   config: RuntimeConfig,
   taskId: string,
+  toolCallId: string,
   args: Record<string, unknown>,
   status: "enabled" | "disabled"
-): Promise<string> {
+): Promise<DispatchResult> {
   const skillId = requireString(args, "skillId");
+
+  if (status === "enabled") {
+    const state = readState(config.instance);
+    const skill = state.skills.find((s) => s.id === skillId || s.name === skillId);
+    if (!skill) throw new Error(`Skill not found: ${skillId}`);
+    const bundled = (skill.source ?? "user") === "bundled";
+    if (!bundled) {
+      // The first required connector that carries a credential and isn't
+      // yet granted. A provider "carries a credential" when its module
+      // declares a secrets spec, or it is the generic escape-hatch provider
+      // (whose secrets are per-record). Providers without secrets need no
+      // consent (presence-only connectors leak nothing).
+      const granted = skill.grantedConnectors ?? [];
+      const ungranted = (skill.requiredConnectors ?? [])
+        .map((r) => r.provider)
+        .find((p) => (p === "generic" || Boolean(getProvider(p)?.secrets)) && !granted.includes(p));
+      if (ungranted) {
+        return await requestSkillConnectorGrant(config, taskId, toolCallId, skill.id, skill.name, ungranted);
+      }
+    }
+  }
+
   const skill = await setSkillStatus(config, skillId, status);
   appendTrace(config.instance, taskId, {
     type: "tool",
@@ -2183,7 +2216,90 @@ async function setSkillStatusTool(
     name: skill.name,
     status
   });
-  return `${status === "enabled" ? "Enabled" : "Disabled"} skill ${skill.id} ("${skill.name}").`;
+  return { kind: "sync", result: `${status === "enabled" ? "Enabled" : "Disabled"} skill ${skill.id} ("${skill.name}").` };
+}
+
+// Mint a `skill.grant_connector` SetupRequest for one (skill, provider) pair.
+// Mirrors requestConnectorTool: the chat-task loop's pending handler emits a
+// setup_requested block, the user grants via the chat card, and the
+// /complete handler (src/http.ts) appends the provider to grantedConnectors,
+// enables the skill, and resumes this task. Surface-guarded like
+// browser_fill_secrets — the amber card only renders in the web chat.
+async function requestSkillConnectorGrant(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  skillId: string,
+  skillName: string,
+  provider: string
+): Promise<DispatchResult> {
+  const providerLabel = getProvider(provider)?.label ?? provider;
+
+  // Surface guard — same rationale as browser_fill_secrets. The consent card
+  // is React UI rendered only in the web chat; a task running over a
+  // messaging bridge (Telegram/Discord) or with no chat session would park
+  // in waiting_approval with no way to grant. Fail synchronously so the
+  // agent can verbalize "open the web chat to grant" back to the user.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (!surfaceSession) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Enabling skill "${skillName}" needs a one-time grant of your ${providerLabel} credential, and that consent card only renders in a web chat session — this task isn't attached to one (subagent child, scheduled job, or other headless run). Route this through the web chat or settings page.`
+      })
+    };
+  }
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Enabling skill "${skillName}" needs a one-time grant of your ${providerLabel} credential, and the consent card only works in the web chat (this conversation is over ${surfaceKind}). Reply asking the user to open the web chat to grant access, then continue once they confirm.`
+      })
+    };
+  }
+
+  const reason = `Skill "${skillName}" requests access to your ${providerLabel} credential. Granting lets its scripts use ${providerLabel}; you can revoke by disabling the skill.`;
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createSetupRequest(mutable, {
+      taskId: item.id,
+      action: "skill.grant_connector",
+      target: providerLabel,
+      reason,
+      payload: { skillId, skillName, provider, providerLabel, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    // Persist the reason as a durable assistant bubble so it survives past
+    // approval resolution — same pattern as requestConnectorTool.
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for skill connector grant",
+      data: { approvalId: approval.id, skillId, provider, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
 }
 
 // Poll the subagent record until its child task reaches a terminal state,

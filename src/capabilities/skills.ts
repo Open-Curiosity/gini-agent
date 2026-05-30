@@ -217,6 +217,12 @@ export async function setSkillStatus(config: RuntimeConfig, idOrName: string, st
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
     skill.status = status;
     skill.updatedAt = now();
+    // On disable, drop any connector grants so re-enabling re-prompts for
+    // consent (ADR skill-connector-consent.md). Bundled skills carry no
+    // written grants, so this is a no-op for them.
+    if (status === "disabled" && (skill.grantedConnectors?.length ?? 0) > 0) {
+      skill.grantedConnectors = [];
+    }
     addAudit(
       state,
       {
@@ -227,6 +233,60 @@ export async function setSkillStatus(config: RuntimeConfig, idOrName: string, st
       },
       { system: true }
     );
+    return skill;
+  });
+}
+
+// Per-(skill, connector) consent grant. Appends `provider` to the skill's
+// grantedConnectors so `resolveSkillEnv` will inject that connector's env.
+// Bundled skills are auto-granted in resolveSkillEnv and never need a written
+// grant — this helper is for non-bundled skills the user consents to.
+// See docs/adr/skill-connector-consent.md.
+export async function grantConnectorToSkill(config: RuntimeConfig, idOrName: string, provider: string) {
+  return mutateState(config.instance, (state) => {
+    const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
+    if (!skill) throw new Error(`Skill not found: ${idOrName}`);
+    const granted = skill.grantedConnectors ?? [];
+    if (!granted.includes(provider)) {
+      skill.grantedConnectors = [...granted, provider];
+      skill.updatedAt = now();
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "skill.connector.granted",
+          target: skill.id,
+          risk: "low",
+          evidence: { provider }
+        },
+        { system: true }
+      );
+    }
+    return skill;
+  });
+}
+
+// Revoke a previously granted connector from a skill.
+export async function revokeConnectorGrant(config: RuntimeConfig, idOrName: string, provider: string) {
+  return mutateState(config.instance, (state) => {
+    const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
+    if (!skill) throw new Error(`Skill not found: ${idOrName}`);
+    const granted = skill.grantedConnectors ?? [];
+    if (granted.includes(provider)) {
+      skill.grantedConnectors = granted.filter((p) => p !== provider);
+      skill.updatedAt = now();
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "skill.connector.revoked",
+          target: skill.id,
+          risk: "low",
+          evidence: { provider }
+        },
+        { system: true }
+      );
+    }
     return skill;
   });
 }

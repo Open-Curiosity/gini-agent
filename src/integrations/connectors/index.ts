@@ -400,10 +400,21 @@ export async function resolveSkillEnv(
   const requiresGeneric = providers.includes("generic");
   const bindings = envBindingsForProviders(providers);
   const state = readState(config.instance);
+  // Per-(skill, connector) consent gate (ADR skill-connector-consent.md). A
+  // provider contributes env only when the skill is bundled (first-party,
+  // auto-granted) or the user has explicitly granted that provider to this
+  // skill. Without this, any installed+enabled skill that merely DECLARES a
+  // credentialed connector would receive its secret — the prompt-injection
+  // hole. The bundled short-circuit means bundled skills never need a written
+  // grant.
+  const bundled = (skill.source ?? "user") === "bundled";
+  const providerGranted = (provider: string): boolean =>
+    bundled || (skill.grantedConnectors?.includes(provider) ?? false);
   const out: Record<string, string> = {};
   for (const envName of envNames) {
     const binding = bindings[envName];
     if (binding) {
+      if (!providerGranted(binding.provider)) continue;
       // Same status guard as isSkillActive: a `disabled` or `error` record
       // with a stale `health: "healthy"` from a prior probe must not leak
       // its secret into the spawn env.
@@ -426,6 +437,7 @@ export async function resolveSkillEnv(
     // user gave the secret == the declared `prerequisites.env` name). Same
     // status/health guard as native providers.
     if (!requiresGeneric) continue;
+    if (!providerGranted("generic")) continue;
     const connector = state.connectors.find(
       (candidate) =>
         candidate.provider === "generic"

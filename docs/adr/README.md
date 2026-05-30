@@ -30,3 +30,4 @@ Each file in this directory captures one architecture decision: the context, the
 - [Codex Session-Rotation Retry, UA Mirroring, And auth.json Race Handling](codex-session-rotation-retry.md)
 - [Authorization vs SetupRequest](authorization-vs-setup-request.md)
 - [Skill Env Containment For terminal_exec And skill_run](skill-env-containment.md)
+- [Per-Skill Connector Consent Grant](skill-connector-consent.md)

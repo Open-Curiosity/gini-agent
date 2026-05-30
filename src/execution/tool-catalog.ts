@@ -976,7 +976,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "enable_skill",
-      description: "Enable a registered skill so it appears in the advertised-skills block and the agent can read its body. Use after the user asks to turn a skill on (or after install_skill if the manifest didn't auto-enable). Trivial; no approval gate.",
+      description: "Enable a registered skill so it appears in the advertised-skills block and the agent can read its body. Use after the user asks to turn a skill on (or after install_skill if the manifest didn't auto-enable). Bundled (first-party) skills enable immediately. Enabling a non-bundled skill that requires a credentialed connector first prompts the user for a one-time consent grant (a setup card per connector) before the skill can use that credential — expect the call to come back pending; the loop resumes once the user grants.",
       parameters: {
         type: "object",
         properties: {

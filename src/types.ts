@@ -1069,6 +1069,7 @@ export type SetupRequestAction =
   | "browser.connect"
   | "connector.request"
   | "browser.fill_secret"
+  | "skill.grant_connector"
   | "messaging.add_bridge"
   | "messaging.approve_pairing"
   | "messaging.remove_bridge";
@@ -1149,6 +1150,12 @@ export interface SkillRecord {
   // gates the skill out of the agent loop's available-skills set until every
   // entry matches a healthy ConnectorRecord. Defaults to [].
   requiredConnectors?: Array<{ provider: string; scopes?: string[] }>;
+  // Per-(skill, connector) consent: the provider ids the user has granted this
+  // skill access to. `resolveSkillEnv` injects a credentialed connector's env
+  // only when its provider is granted here (or the skill is `source:"bundled"`,
+  // which is auto-granted by short-circuit). Cleared on disable so re-enabling
+  // re-prompts. See docs/adr/skill-connector-consent.md.
+  grantedConnectors?: string[];
   // Spec-compliant top-level `allowed-tools` declaration (space-separated in
   // the source frontmatter, normalized to the original string here). Stored
   // so the UI and install-skill flow can surface it; not enforced yet.

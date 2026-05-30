@@ -6,8 +6,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { dispatchToolCall } from "./tool-dispatch";
 import { buildToolCatalog } from "./tool-catalog";
-import { createTask, mutateState, readState, upsertTask } from "../state";
-import type { RuntimeConfig, RuntimeState, ToolsetRecord } from "../types";
+import { createChatSession, createSkill, createTask, mutateState, readState, upsertTask } from "../state";
+import type { RuntimeConfig, RuntimeState, SkillRecord, ToolsetRecord } from "../types";
 
 const ROOT = "/tmp/gini-skill-dispatch-test";
 
@@ -255,5 +255,117 @@ describe("enable_skill / disable_skill dispatch", () => {
         JSON.stringify({ skillId: "skill_nope" })
       )
     ).rejects.toThrow(/Skill not found/);
+  });
+});
+
+describe("enable_skill connector-consent gate", () => {
+  async function seedTaskWithWebSession(config: RuntimeConfig): Promise<string> {
+    return mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "web session");
+      const task = createTask(state.instance, "test");
+      task.chatSessionId = session.id;
+      upsertTask(state, task);
+      session.taskIds.push(task.id);
+      return task.id;
+    });
+  }
+
+  async function seedSkill(config: RuntimeConfig, overrides: Partial<SkillRecord>) {
+    return mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "credentialed-skill",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredConnectors: [{ provider: "linear" }],
+        ...overrides
+      })
+    );
+  }
+
+  test("enabling a non-bundled credentialed skill mints a grant SetupRequest (pending)", async () => {
+    const config = makeConfig("skill-gate-pending");
+    const taskId = await seedTaskWithWebSession(config);
+    const skill = await seedSkill(config, {});
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "enable_skill",
+      "call_gate",
+      JSON.stringify({ skillId: skill.id })
+    );
+    expect(result.kind).toBe("pending");
+    const state = readState(config.instance);
+    const setup = state.setupRequests.find((s) => s.action === "skill.grant_connector");
+    expect(setup).toBeDefined();
+    expect(setup?.payload.skillId).toBe(skill.id);
+    expect(setup?.payload.provider).toBe("linear");
+    // Skill must NOT be enabled yet — consent first.
+    expect(state.skills.find((s) => s.id === skill.id)?.status).toBe("disabled");
+  });
+
+  test("enabling a bundled credentialed skill enables immediately (auto-grant)", async () => {
+    const config = makeConfig("skill-gate-bundled");
+    const taskId = await seedTaskWithWebSession(config);
+    const skill = await seedSkill(config, { name: "bundled-skill", source: "bundled" });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "enable_skill",
+      "call_bundled",
+      JSON.stringify({ skillId: skill.id })
+    );
+    expect(result.kind).toBe("sync");
+    expect(readState(config.instance).skills.find((s) => s.id === skill.id)?.status).toBe("enabled");
+  });
+
+  test("enabling an already-granted credentialed skill enables immediately", async () => {
+    const config = makeConfig("skill-gate-granted");
+    const taskId = await seedTaskWithWebSession(config);
+    const skill = await seedSkill(config, { name: "granted-skill", grantedConnectors: ["linear"] });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "enable_skill",
+      "call_granted",
+      JSON.stringify({ skillId: skill.id })
+    );
+    expect(result.kind).toBe("sync");
+    expect(readState(config.instance).skills.find((s) => s.id === skill.id)?.status).toBe("enabled");
+  });
+
+  test("enabling a credentialed skill over Telegram returns a sync error (no setup row)", async () => {
+    const config = makeConfig("skill-gate-telegram");
+    const skill = await seedSkill(config, { name: "tg-skill" });
+    const taskId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "tg session", {
+        kind: "telegram",
+        bridgeId: "bridge_t",
+        chatId: 123,
+        target: "123"
+      });
+      const task = createTask(state.instance, "test");
+      task.chatSessionId = session.id;
+      upsertTask(state, task);
+      session.taskIds.push(task.id);
+      return task.id;
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "enable_skill",
+      "call_tg",
+      JSON.stringify({ skillId: skill.id })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("web chat");
+    expect(readState(config.instance).setupRequests.some((s) => s.action === "skill.grant_connector")).toBe(false);
   });
 });

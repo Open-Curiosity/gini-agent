@@ -801,6 +801,53 @@ describe("runtime api", () => {
     expect(state.connectors.some((c) => c.provider === "demo" && c.health === "healthy")).toBe(true);
   });
 
+  test("POST /api/setup-requests/<id>/complete grants the connector and enables the skill for skill.grant_connector", async () => {
+    const config = testConfig("setup-complete-skill-grant");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-linear",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredConnectors: [{ provider: "linear" }]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "skill.grant_connector",
+        target: "Linear",
+        reason: "Skill needs-linear requests access to your Linear credential.",
+        payload: {
+          skillId: skill.id,
+          skillName: skill.name,
+          provider: "linear",
+          providerLabel: "Linear",
+          toolCallId: "call_grant_1"
+        }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(response.ok).toBe(true);
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((a) => a.id === approval.id);
+    expect(resolved?.status).toBe("completed");
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.status).toBe("enabled");
+    expect(updated?.grantedConnectors).toEqual(["linear"]);
+    expect(state.audit.some((a) => a.action === "skill.connector.granted")).toBe(true);
+  });
+
   test("POST /api/setup-requests/<id>/complete returns ok:false and leaves the request pending on probe failure", async () => {
     const config = testConfig("setup-requests-complete-probe-fail");
     const handler = createHandler(config);

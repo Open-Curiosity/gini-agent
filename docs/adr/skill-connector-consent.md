@@ -1,0 +1,169 @@
+# ADR: Per-skill connector consent grant
+
+## Decision
+
+A skill receives a credentialed connector's env only after a
+per-`(skill, connector)` **user grant**. Declaring the connector is no
+longer sufficient.
+
+- `resolveSkillEnv(config, skill, taskId?)` in
+  `src/integrations/connectors/index.ts` injects a connector's secret into a
+  skill's spawn env only when **either** the skill is first-party
+  (`source === "bundled"`, auto-granted) **or** the skill's
+  `grantedConnectors` array includes that provider id. An ungranted
+  non-bundled skill resolves to `{}` even if it declares the connector and a
+  healthy connector exists.
+
+- The grant is requested at **enable time** for the model-driven path. When
+  the `enable_skill` tool is called on a non-bundled skill whose required
+  connectors carry a credential, the dispatcher mints a
+  `skill.grant_connector` SetupRequest (one per ungranted provider) and
+  returns `{ kind: "pending" }` instead of enabling. The user grants via the
+  inline chat card; `/api/setup-requests/<id>/complete` appends the provider
+  to `grantedConnectors`, enables the skill, and resumes the chat-task loop.
+  If multiple providers need granting, the loop re-enters `enable_skill`
+  after each grant and prompts for the next one until none remain.
+
+- **Bundled skills are auto-granted** by short-circuit in `resolveSkillEnv`
+  (`(skill.source ?? "user") === "bundled"`). No grant is ever written onto
+  a bundled record, so first-party skills (linear, attachments, google-*)
+  keep a clean UX with no consent prompt.
+
+- **Revoked on disable.** `setSkillStatus` clears `grantedConnectors` on the
+  transition to `disabled`, so re-enabling re-prompts for consent.
+
+- A provider "carries a credential" — and therefore needs consent — when its
+  provider module declares a `secrets` spec, or it is the `generic`
+  escape-hatch provider (whose secrets are per-record). Providers without
+  secrets (presence-only connectors) leak nothing and need no grant.
+
+## Context
+
+Connector secrets bind to skills through SKILL.md frontmatter:
+`metadata.gini.requires.connectors` declares the providers a skill needs,
+and `metadata.gini.prerequisites.env` lists the env var names its scripts
+read. ADR skill-env-containment.md scoped credential injection to one skill
+at a time through `skill_run` / `resolveSkillEnv`, and removed the
+aggregate and per-command paths.
+
+That left one gap. The only check `resolveSkillEnv` performed was "does a
+healthy connector exist for a provider this skill declares." Any
+installed-and-enabled skill that merely **declared** `requires: linear`
+received `LINEAR_API_KEY`. The trust decision collapsed into the skill's own
+manifest — exactly the surface a model-authored or model-installed skill (or
+a prompt injection that installs one) controls. A freshly authored skill
+could silently acquire a credential the user connected for a different
+purpose.
+
+The credential model is only safe when the human, not the manifest, decides
+which skill may use which credential. This ADR adds that decision as an
+explicit per-`(skill, connector)` consent gate, checked at the single
+injection point.
+
+## Considered alternatives
+
+- **Trust the declaration (status quo).** Rejected: the manifest is
+  attacker-controllable for non-bundled skills; declaration is not consent.
+
+- **A new approval mechanism / dedicated consent store.** Rejected for
+  Simplicity First. The SetupRequest substrate (ADR
+  authorization-vs-setup-request.md) already models "user performs a setup
+  step, the side effect runs in `/complete`, the chat-task loop resumes." A
+  `skill.grant_connector` action reuses it verbatim — no new UI framework, no
+  new state collection. The grant itself lives as a `grantedConnectors`
+  string array on the existing `SkillRecord`.
+
+- **Per-grant revocation UI.** Not built here. Disable clears all grants for
+  the skill, which is the coarse-but-correct revocation primitive; finer
+  per-connector revocation can layer on later via `revokeConnectorGrant`.
+
+- **Gate every enable path, including the settings page.** The settings-page
+  / CLI `POST /api/skills/<id>/enable` is an explicit in-person user action,
+  so it carries its own consent: that path auto-grants the skill's required
+  credentialed connectors directly. The SetupRequest card is reserved for the
+  model-driven `enable_skill` tool path, which is the prompt-injection
+  surface the gate defends.
+
+## Consequences
+
+### Required
+
+- Non-bundled skills that ship `prerequisites.env` + `requires.connectors`
+  prompt for a one-time consent grant the first time they're enabled by the
+  model. The `enable_skill` tool description documents this so the model
+  expects a pending result and surfaces the card rather than retrying.
+
+- The consent card renders only in the web chat. Enabling a credentialed
+  non-bundled skill from a surface that can't render it (a messaging bridge,
+  a headless subagent / scheduled-job run) fails synchronously with an
+  "open the web chat to grant" message — mirroring the `browser_fill_secret`
+  surface guard — so the task never parks unresolvably.
+
+- Any future code that spawns a process with connector env must go through
+  `resolveSkillEnv`, which enforces the gate. Re-implementing the binding
+  resolution elsewhere would bypass consent.
+
+### Audited surfaces
+
+- `skill.connector.granted` / `skill.connector.revoked` audit rows record
+  every grant change (`evidence.provider`), so operators can answer "which
+  skill was granted which credential, and when."
+- `setup.requested` / `setup.completed` rows from the SetupRequest substrate
+  bracket the consent flow.
+
+### Trust boundary
+
+The grant is the trust boundary. A skill's manifest declares *intent* to use
+a connector; the `grantedConnectors` grant (or bundled-auto-grant) is the
+*authorization*. `resolveSkillEnv` enforces authorization, not intent, at the
+single point where a credential would enter a process.
+
+## Implementation surface
+
+- `src/types.ts`: `SkillRecord.grantedConnectors?: string[]`; new
+  `"skill.grant_connector"` member of `SetupRequestAction`.
+- `src/integrations/connectors/index.ts`: `resolveSkillEnv` gates both the
+  native-binding branch and the generic-fallback branch on
+  `bundled || grantedConnectors.includes(provider)`.
+- `src/capabilities/skills.ts`: `grantConnectorToSkill` /
+  `revokeConnectorGrant` mutate `grantedConnectors` and write the audit
+  rows; `setSkillStatus` clears grants on disable.
+- `src/execution/tool-dispatch.ts`: `setSkillStatusTool` returns a
+  `DispatchResult`; on enable of a non-bundled credentialed skill it mints a
+  `skill.grant_connector` SetupRequest (surface-guarded) and returns
+  `{ kind: "pending" }`. The dispatcher's `enable_skill` / `disable_skill`
+  cases return the dispatch result directly.
+- `src/http.ts`: the `/complete` `skill.grant_connector` branch appends the
+  grant, enables the skill, and resolves the request; the settings-page
+  `/enable` endpoint auto-grants credentialed connectors.
+- `src/execution/tool-catalog.ts`: `enable_skill` description notes the
+  one-time consent prompt.
+- `web/src/components/chat/BlockSetupRequested.tsx`: Grant / Cancel card for
+  the `skill.grant_connector` action.
+- `web/src/app/permissions/page.tsx`: "Grant skill access" label for the new
+  action in the setup-request list.
+
+## Acceptance checks
+
+- `bun test src/integrations/connectors/index.test.ts` — ungranted
+  non-bundled skill resolves to `{}`; granted non-bundled and bundled skills
+  inject.
+- `bun test src/capabilities/skills.test.ts` — grant / revoke audit rows;
+  disable clears grants.
+- `bun test src/execution/skill-dispatch.test.ts` — non-bundled credentialed
+  enable mints the SetupRequest (pending); bundled and already-granted enable
+  immediately; the messaging-bridge surface returns a sync error with no
+  setup row.
+- `bun test src/http.test.ts` — the `skill.grant_connector` `/complete`
+  branch grants the connector and enables the skill.
+
+## Related
+
+- ADR `skill-env-containment.md` — the single-surface containment this gate
+  sits on top of; `resolveSkillEnv` is the enforcement point.
+- ADR `connector-secret-storage.md` — how the connector secret is encrypted
+  at rest before `resolveSkillEnv` resolves it at spawn.
+- ADR `authorization-vs-setup-request.md` — the SetupRequest substrate the
+  `skill.grant_connector` action reuses.
+- ADR `connector-provider-spec-compliance.md` — provider modules declare the
+  `secrets` spec that marks a provider as credentialed.

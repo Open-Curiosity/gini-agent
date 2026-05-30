@@ -167,6 +167,7 @@ describe("resolveSkillEnv", () => {
       }));
     });
     const skill = newSkill({
+      source: "bundled",
       requiredConnectors: [{ provider: "linear" }],
       prerequisites: { env: ["LINEAR_API_KEY"] }
     });
@@ -197,6 +198,7 @@ describe("resolveSkillEnv", () => {
       }));
     });
     const skill = newSkill({
+      source: "bundled",
       requiredConnectors: [{ provider: "linear" }],
       prerequisites: { env: ["LINEAR_API_KEY"] }
     });
@@ -232,6 +234,7 @@ describe("resolveSkillEnv", () => {
       }));
     });
     const skill = newSkill({
+      source: "bundled",
       requiredConnectors: [{ provider: "generic" }],
       prerequisites: { env: ["MY_API_KEY"] }
     });
@@ -263,6 +266,7 @@ describe("resolveSkillEnv", () => {
       }));
     });
     const skill = newSkill({
+      source: "bundled",
       requiredConnectors: [{ provider: "generic" }],
       prerequisites: { env: ["MY_API_KEY"] }
     });
@@ -294,10 +298,109 @@ describe("resolveSkillEnv", () => {
       }));
     });
     const skill = newSkill({
+      source: "bundled",
       requiredConnectors: [{ provider: "generic" }],
       prerequisites: { env: ["MY_API_KEY"] }
     });
     const env = await resolveSkillEnv(config, skill);
     expect(env).toEqual({});
+  });
+
+  // Per-(skill, connector) consent gate (ADR skill-connector-consent.md). A
+  // non-bundled skill receives a credentialed connector's env only after the
+  // user grants that provider; bundled skills are auto-granted.
+
+  test("ungranted non-bundled skill does NOT inject even with a healthy connector", async () => {
+    const instance = "resolve-ungranted";
+    const config = {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+    const ref = writeSecret(instance, "id_ungranted", "token", "real-token");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_ungranted",
+        instance,
+        provider: "linear",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      source: "user",
+      requiredConnectors: [{ provider: "linear" }],
+      prerequisites: { env: ["LINEAR_API_KEY"] }
+    });
+    const env = await resolveSkillEnv(config, skill);
+    expect(env).toEqual({});
+  });
+
+  test("granted non-bundled skill injects the connector's secret", async () => {
+    const instance = "resolve-granted";
+    const config = {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+    const ref = writeSecret(instance, "id_granted", "token", "real-token");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_granted",
+        instance,
+        provider: "linear",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      source: "user",
+      grantedConnectors: ["linear"],
+      requiredConnectors: [{ provider: "linear" }],
+      prerequisites: { env: ["LINEAR_API_KEY"] }
+    });
+    const env = await resolveSkillEnv(config, skill);
+    expect(env).toEqual({ LINEAR_API_KEY: "real-token" });
+  });
+
+  test("bundled skill injects without any written grant (auto-grant)", async () => {
+    const instance = "resolve-bundled-autogrant";
+    const config = {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+    const ref = writeSecret(instance, "id_bundled", "token", "real-token");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_bundled",
+        instance,
+        provider: "linear",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      source: "bundled",
+      requiredConnectors: [{ provider: "linear" }],
+      prerequisites: { env: ["LINEAR_API_KEY"] }
+    });
+    const env = await resolveSkillEnv(config, skill);
+    expect(env).toEqual({ LINEAR_API_KEY: "real-token" });
   });
 });

@@ -29,7 +29,7 @@ import { runMessagingPairingConnect } from "./execution/messaging-pairing-connec
 import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
-import { listProviders } from "./integrations/connectors/registry";
+import { getProvider, listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
 import { migrateLegacyMemories, recall, reflect, retain } from "./memory";
@@ -70,7 +70,7 @@ import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrow
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
-import { createSkillFromInput, getSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
+import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
@@ -415,6 +415,29 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         return json({ ok });
       }
 
+      if (setup.action === "skill.grant_connector") {
+        // Per-(skill, connector) consent (ADR skill-connector-consent.md).
+        // No secrets are entered here — the credential already lives in the
+        // connector record; this card only records the user's consent for
+        // the skill to use it. Append the grant, enable the skill, then
+        // resolve the setup request (which auto-resumes the chat-task loop
+        // with the tool result so the enable_skill call that minted this
+        // request re-enters and either enables or prompts for the next
+        // ungranted provider).
+        const skillId = String(setup.payload.skillId ?? "");
+        const provider = String(setup.payload.provider ?? "");
+        const providerLabel = typeof setup.payload.providerLabel === "string"
+          ? setup.payload.providerLabel
+          : provider;
+        const skill = await grantConnectorToSkill(config, skillId, provider);
+        await setSkillStatus(config, skillId, "enabled");
+        await resolveSetupRequest(config, setupId, "complete", {
+          actor: "user",
+          toolResult: `Granted ${providerLabel} to skill "${skill.name}"; skill enabled.`
+        });
+        return json({ ok: true });
+      }
+
       return json({ error: `Setup request ${setupId} action not supported: ${setup.action}` }, 400);
     }],
     ["POST", /^\/api\/setup-requests\/([^/]+)\/cancel$/, async (_request, params) =>
@@ -753,7 +776,22 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/skills\/([^/]+)$/, (_request, params) => json(getSkill(config, params[0]))],
     ["PATCH", /^\/api\/skills\/([^/]+)$/, async (request, params) => json(await updateSkill(config, params[0], await body(request)))],
     ["POST", /^\/api\/skills\/([^/]+)\/test$/, async (_request, params) => json(await testSkill(config, params[0]))],
-    ["POST", /^\/api\/skills\/([^/]+)\/enable$/, async (_request, params) => json(await setSkillStatus(config, params[0], "enabled"))],
+    ["POST", /^\/api\/skills\/([^/]+)\/enable$/, async (_request, params) => {
+      // Settings-page / CLI enable is an explicit in-person user action, so
+      // it carries its own consent: auto-grant the skill's required
+      // credentialed connectors (ADR skill-connector-consent.md). The
+      // model-driven enable_skill tool path mints a SetupRequest card
+      // instead — that's the prompt-injection surface the gate defends.
+      const before = readState(config.instance).skills.find((s) => s.id === params[0] || s.name === params[0]);
+      if (before && (before.source ?? "user") !== "bundled") {
+        for (const p of (before.requiredConnectors ?? []).map((r) => r.provider)) {
+          if (p === "generic" || getProvider(p)?.secrets) {
+            await grantConnectorToSkill(config, params[0], p);
+          }
+        }
+      }
+      return json(await setSkillStatus(config, params[0], "enabled"));
+    }],
     ["POST", /^\/api\/skills\/([^/]+)\/disable$/, async (_request, params) => json(await setSkillStatus(config, params[0], "disabled"))],
     ["POST", /^\/api\/skills\/([^/]+)\/rollback$/, async (_request, params) => json(await rollbackSkill(config, params[0]))],
     ["GET", /^\/api\/jobs$/, (request) => {
