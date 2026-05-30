@@ -660,55 +660,62 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[], state?: RuntimeS
       byName.set(skill.name, skill);
     }
   }
-  // Resolve a required credential NAME to the provider that owns its setup
-  // flow: an existing connector record's provider, else the canonical provider
-  // for the name. Falls back to the name itself (e.g. a plain user key with no
-  // provider) so the line still names something the user can act on.
-  const providerForCredential = (name: string): string => {
+  // Resolve a required credential NAME to the REGISTERED provider module that
+  // owns its setup flow, or `undefined` when none does. The "generic" provider
+  // is the catch-all placeholder — it models nothing real (no fields, probe, or
+  // setup skill), so a credential on a generic row is templateless and must NOT
+  // resolve to a provider. A connector row's provider only counts when it's a
+  // real (non-generic) registered module — a disabled or unhealthy "generic"
+  // row sharing the credential name must NOT masquerade as the owning provider
+  // (that produced a bogus `{name:"generic", type:"oauth2"}` templateless line).
+  // When nothing registered owns the name, the credential is templateless and
+  // is grouped / requested by its own NAME.
+  const providerForCredential = (name: string): string | undefined => {
     const connector = state?.connectors.find((c) => c.name === name);
-    if (connector?.provider) return connector.provider;
-    return providerForCredentialName(name) ?? name;
+    if (connector?.provider && connector.provider !== "generic" && getProvider(connector.provider)) {
+      return connector.provider;
+    }
+    return providerForCredentialName(name);
   };
   // Group dedup'd skills by the provider their required credential maps to.
   // setupSkill is captured per provider — if the provider declares one, the
   // provider-level line directs the model to invoke that skill instead of
   // calling request_connector directly. `templateless` flags a group whose key
   // is a bare credential NAME with no registered provider module: those are
-  // requested with request_connector's {name, type, skillId} shape instead of
-  // a provider id. `skillId` carries one requesting skill's id so the
-  // templateless call can auto-grant on completion.
+  // requested with request_connector's {name, type:"api-key", skillId} shape
+  // instead of a provider id. `skillId` carries one requesting skill's id so
+  // the templateless call can auto-grant on completion.
   const grouped = new Map<string, { skills: string[]; setupSkill?: string; templateless: boolean; skillId?: string }>();
   for (const skill of byName.values()) {
     for (const credentialName of skill.requiredCredentials ?? []) {
       const provider = providerForCredential(credentialName);
-      const module = getProvider(provider);
-      // No registered module (and not the legacy "generic" placeholder) means
-      // `provider` is really the unmapped credential name — a templateless key
-      // the user has never connected and no module models.
-      const templateless = !module || provider === "generic";
-      const entry = grouped.get(provider) ?? { skills: [], templateless };
+      const module = provider ? getProvider(provider) : undefined;
+      // No registered module owns this name — it's a templateless credential.
+      // Group it by the credential NAME itself (never by a "generic" row), so
+      // the request_connector line names the real credential.
+      const templateless = !module;
+      const key = module ? provider! : credentialName;
+      const entry = grouped.get(key) ?? { skills: [], templateless };
       entry.skills.push(skill.name);
       if (module?.setupSkill) entry.setupSkill = module.setupSkill;
       if (templateless && !entry.skillId) entry.skillId = skill.id;
-      grouped.set(provider, entry);
+      grouped.set(key, entry);
     }
   }
   const lines = Array.from(grouped.entries())
     .sort(([a], [b]) => a.localeCompare(b))
-    .map(([provider, entry]) => {
+    .map(([key, entry]) => {
       const skillList = Array.from(new Set(entry.skills)).sort().join(", ");
       if (entry.setupSkill) {
-        return `- ${provider} (used by: ${skillList}) — run \`read_skill\` with \`${entry.setupSkill}\` first; request_connector will be rejected until you do.`;
+        return `- ${key} (used by: ${skillList}) — run \`read_skill\` with \`${entry.setupSkill}\` first; request_connector will be rejected until you do.`;
       }
       if (entry.templateless) {
-        // No registered provider: request the typed credential by name. Infer
-        // the type from the name shape — an ENV_TOKEN (UPPER_SNAKE) is an
-        // api-key (the name IS its env var); anything else (e.g. kebab-case) is
-        // an oauth2 handle. Default api-key when ambiguous.
-        const type = /^[A-Z][A-Z0-9_]*$/.test(provider) ? "api-key" : "oauth2";
-        return `- ${provider} (used by: ${skillList}) — no registered provider; call \`request_connector\` with \`{name: "${provider}", type: "${type}", skillId: "${entry.skillId ?? ""}"}\` so the user can enter it securely in chat.`;
+        // No registered provider: request the api-key credential by its actual
+        // NAME (the name IS its env var). Templateless requests are api-key
+        // only — oauth2 credentials require a provider module / setup skill.
+        return `- ${key} (used by: ${skillList}) — no registered provider; call \`request_connector\` with \`{name: "${key}", type: "api-key", skillId: "${entry.skillId ?? ""}"}\` so the user can enter it securely in chat.`;
       }
-      return `- ${provider} (used by: ${skillList}) — call \`request_connector\` with provider id \`${provider}\` to ask the user to connect.`;
+      return `- ${key} (used by: ${skillList}) — call \`request_connector\` with provider id \`${key}\` to ask the user to connect.`;
     });
   // The setup skill is the ONLY correct path for the listed providers.
   // Without this directive, the model has shortcutted to browser_navigate
@@ -718,8 +725,8 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[], state?: RuntimeS
   // the connector handshake.
   const hasSetupSkill = Array.from(grouped.values()).some((entry) => entry.setupSkill);
   const intro = hasSetupSkill
-    ? "Skills below need an external connector. The runtime gates `request_connector` for providers that declare a setup skill — call `read_skill` with the setup skill first (it owns the full prerequisite flow and will invoke request_connector itself). For a registered provider WITHOUT a setup skill, call `request_connector` with the provider id; for a credential with no registered provider, call `request_connector` with `{name, type, skillId}` as the line indicates. Each line tells you exactly how to call it."
-    : "Skills below need an external connector. For a registered provider, call `request_connector` with the provider id; for a credential with no registered provider, call `request_connector` with `{name, type, skillId}` as the line indicates. Each line tells you exactly how to call it. Never ask the user to paste a key as a chat message — request_connector captures it securely.";
+    ? "Skills below need an external connector. The runtime gates `request_connector` for providers that declare a setup skill — call `read_skill` with the setup skill first (it owns the full prerequisite flow and will invoke request_connector itself). For a registered provider WITHOUT a setup skill, call `request_connector` with the provider id; for a credential with no registered provider, call `request_connector` with `{name, type:\"api-key\", skillId}` as the line indicates. Each line tells you exactly how to call it."
+    : "Skills below need an external connector. For a registered provider, call `request_connector` with the provider id; for a credential with no registered provider, call `request_connector` with `{name, type:\"api-key\", skillId}` as the line indicates. Each line tells you exactly how to call it. Never ask the user to paste a key as a chat message — request_connector captures it securely.";
   const sections: string[] = [
     intro,
     ...lines

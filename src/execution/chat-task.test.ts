@@ -1761,17 +1761,54 @@ describe("buildInactiveSkillsBlock", () => {
     expect(block).not.toContain("will be rejected");
   });
 
-  test("infers oauth2 for a kebab-case templateless credential name", () => {
-    // A non-ENV_TOKEN handle (kebab-case) is an oauth2 credential, so the
-    // inferred type in the templateless request line is oauth2.
+  // Minimal RuntimeState carrying only the connectors the block reads.
+  function stateWithConnectors(connectors: RuntimeState["connectors"]): RuntimeState {
+    return {
+      version: 1,
+      instance: "test",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
+      connectors, improvements: [], pairingCodes: [], devices: [],
+      promotions: [], snapshots: [], tools: [], toolsets: [], subagents: [],
+      mcpServers: [], messagingBridges: [], importReports: [], agents: [],
+      activeAgentId: undefined, relays: [], notifications: [], events: [],
+      jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
+      runs: [], planSteps: []
+    };
+  }
+
+  test("a disabled generic connector sharing the credential name still yields the api-key templateless line by NAME", () => {
+    // Regression: a disabled/unhealthy "generic" connector row sharing the
+    // credential name must NOT masquerade as the owning provider. The earlier
+    // code returned the row's provider ("generic"), grouped under that key, and
+    // emitted a bogus `{name:"generic", type:"oauth2"}` line. The line must name
+    // the actual credential and be api-key (templateless is api-key only).
     const skill = makeSkill({
-      name: "needs-some-oauth",
-      requiredCredentials: ["some-oauth-service"]
+      name: "needs-some-service",
+      requiredCredentials: ["SOME_SERVICE_API_KEY"]
     });
-    const block = buildInactiveSkillsBlock([skill]);
-    expect(block).toContain("some-oauth-service");
-    expect(block).toContain('type: "oauth2"');
-    expect(block).toContain(`skillId: "${skill.id}"`);
+    const state = stateWithConnectors([
+      {
+        id: "id_generic_row",
+        instance: "test",
+        name: "SOME_SERVICE_API_KEY",
+        provider: "generic",
+        status: "disabled",
+        scopes: [],
+        secretRefs: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        health: "unknown",
+        source: "user"
+      }
+    ]);
+    const block = buildInactiveSkillsBlock([skill], state);
+    expect(block).toContain('name: "SOME_SERVICE_API_KEY"');
+    expect(block).toContain('type: "api-key"');
+    // Never the bogus generic/oauth2 line.
+    expect(block).not.toContain('name: "generic"');
+    expect(block).not.toContain('type: "oauth2"');
   });
 
   test("returns an empty string when no inactive-with-credential skills are present", () => {
@@ -1790,11 +1827,11 @@ describe("buildInactiveSkillsBlock", () => {
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toMatch(/^Skills below need an external connector\./);
     // Both request_connector routing options are advertised: a registered
-    // provider id, and the templateless {name, type, skillId} shape for a
-    // credential with no registered provider.
+    // provider id, and the templateless api-key {name, type:"api-key", skillId}
+    // shape for a credential with no registered provider.
     expect(block).toContain("request_connector");
     expect(block).toContain("provider id");
-    expect(block).toContain("{name, type, skillId}");
+    expect(block).toContain('{name, type:"api-key", skillId}');
   });
 
   test("appends a no-browser-shortcut directive when a setup-skill provider is present", () => {
