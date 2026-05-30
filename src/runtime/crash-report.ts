@@ -170,6 +170,11 @@ function secretsEnvValues(body: string): string[] {
 // Default to dropping rather than including: pattern redaction runs first so a
 // token is removed even when its literal value isn't in the provided lists.
 export function redactReportText(text: string, opts: RedactOptions = {}): string {
+  // A malformed log/error field can carry a non-string (e.g. a numeric
+  // `message`). String.replace on a number throws, which would drop the whole
+  // crash report — so pass any non-string through untouched. This guards every
+  // call site (name/message/stack/logTail).
+  if (typeof text !== "string") return text;
   if (!text) return text;
   let out = text;
   for (const pattern of REPORT_SECRET_PATTERNS) {
@@ -193,8 +198,11 @@ export function buildCrashReport(args: BuildCrashReportArgs): CrashReport {
     tunnelSecret: args.tunnelSecret
   };
   const raw = errorParts(error);
+  // `name` reaches the published issue title AND body, so it crosses the same
+  // secret trust boundary as message/stack — redact it too. The fingerprint
+  // above is computed from the RAW error, so this doesn't perturb dedup.
   const error_ = {
-    name: raw.name,
+    name: redactReportText(raw.name, redactOpts),
     message: redactReportText(raw.message, redactOpts),
     stack: redactReportText(raw.stack, redactOpts)
   };
@@ -203,7 +211,9 @@ export function buildCrashReport(args: BuildCrashReportArgs): CrashReport {
   // text that survives.
   const trimmedTail = logTail.map((line) => ({
     at: line.at,
-    message: line.message === undefined ? undefined : redactReportText(line.message, redactOpts)
+    // Only redact a string message; a malformed non-string (e.g. a numeric
+    // `message`) passes through untouched so the build never throws.
+    message: typeof line.message === "string" ? redactReportText(line.message, redactOpts) : line.message
   }));
   return {
     instance,
