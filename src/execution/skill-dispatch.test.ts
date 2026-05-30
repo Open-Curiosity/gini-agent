@@ -368,4 +368,62 @@ describe("enable_skill connector-consent gate", () => {
     expect(parsed.error).toContain("web chat");
     expect(readState(config.instance).setupRequests.some((s) => s.action === "skill.grant_connector")).toBe(false);
   });
+
+  test("enabling a credentialed skill in a job-origin session returns a sync error (no setup row)", async () => {
+    const config = makeConfig("skill-gate-job");
+    const skill = await seedSkill(config, { name: "job-skill" });
+    const taskId = await mutateState(config.instance, (state) => {
+      // Scheduled/headless dedicated job session: origin:"job", no source.
+      const session = createChatSession(state, "job session", undefined, undefined, "job");
+      const task = createTask(state.instance, "test");
+      task.chatSessionId = session.id;
+      upsertTask(state, task);
+      session.taskIds.push(task.id);
+      return task.id;
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "enable_skill",
+      "call_job",
+      JSON.stringify({ skillId: skill.id })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("web chat");
+    expect(readState(config.instance).setupRequests.some((s) => s.action === "skill.grant_connector")).toBe(false);
+  });
+
+  test("re-entering enable_skill while a grant is pending references the existing request (no duplicate)", async () => {
+    const config = makeConfig("skill-gate-dedupe");
+    const taskId = await seedTaskWithWebSession(config);
+    const skill = await seedSkill(config, {});
+    const first = await dispatchToolCall(
+      config,
+      taskId,
+      "enable_skill",
+      "call_dedupe_1",
+      JSON.stringify({ skillId: skill.id })
+    );
+    expect(first.kind).toBe("pending");
+    const existing = readState(config.instance).setupRequests.filter((s) => s.action === "skill.grant_connector");
+    expect(existing.length).toBe(1);
+
+    const second = await dispatchToolCall(
+      config,
+      taskId,
+      "enable_skill",
+      "call_dedupe_2",
+      JSON.stringify({ skillId: skill.id })
+    );
+    expect(second.kind).toBe("pending");
+    if (second.kind !== "pending") throw new Error("unreachable");
+    // Same request id, no duplicate row.
+    expect(second.approvalId).toBe(existing[0].id);
+    expect(
+      readState(config.instance).setupRequests.filter((s) => s.action === "skill.grant_connector").length
+    ).toBe(1);
+  });
 });

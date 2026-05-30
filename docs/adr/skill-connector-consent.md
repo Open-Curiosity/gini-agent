@@ -20,17 +20,24 @@ longer sufficient.
   `skill.grant_connector` SetupRequest (one per ungranted provider) and
   returns `{ kind: "pending" }` instead of enabling. The user grants via the
   inline chat card; `/api/setup-requests/<id>/complete` appends the provider
-  to `grantedConnectors`, enables the skill, and resumes the chat-task loop.
-  If multiple providers need granting, the loop re-enters `enable_skill`
-  after each grant and prompts for the next one until none remain.
+  to `grantedConnectors`. The skill is enabled **only when every credentialed
+  provider it requires is granted** — the `/complete` handler re-evaluates the
+  remaining ungranted providers server-side: if any remain it mints the next
+  `skill.grant_connector` card (attached to the same task) and keeps the task
+  pending without enabling; only when none remain does it set the skill
+  `enabled` and resume the chat-task loop. A grant is recorded only through
+  this consent flow — no other path writes `grantedConnectors`.
 
 - **Bundled skills are auto-granted** by short-circuit in `resolveSkillEnv`
   (`(skill.source ?? "user") === "bundled"`). No grant is ever written onto
   a bundled record, so first-party skills (linear, attachments, google-*)
   keep a clean UX with no consent prompt.
 
-- **Revoked on disable.** `setSkillStatus` clears `grantedConnectors` on the
-  transition to `disabled`, so re-enabling re-prompts for consent.
+- **Revoked on disable.** Both disable paths — `setSkillStatus` and the
+  status-only `updateSkill` PATCH (`PATCH /api/skills/<id>`) — clear
+  `grantedConnectors` on the transition to `disabled` and emit one
+  `skill.connector.revoked` audit row per cleared provider, so re-enabling
+  re-prompts for consent and never reuses a stale grant.
 
 - A provider "carries a credential" — and therefore needs consent — when its
   provider module declares a `secrets` spec, or it is the `generic`
@@ -77,12 +84,16 @@ injection point.
   the skill, which is the coarse-but-correct revocation primitive; finer
   per-connector revocation can layer on later via `revokeConnectorGrant`.
 
-- **Gate every enable path, including the settings page.** The settings-page
-  / CLI `POST /api/skills/<id>/enable` is an explicit in-person user action,
-  so it carries its own consent: that path auto-grants the skill's required
-  credentialed connectors directly. The SetupRequest card is reserved for the
-  model-driven `enable_skill` tool path, which is the prompt-injection
-  surface the gate defends.
+- **Auto-grant credentialed connectors on the settings-page enable.**
+  Rejected. `POST /api/skills/<id>/enable` is just an HTTP route — the model
+  can reach it (e.g. via the web BFF surface), so auto-granting there would
+  let a model-installed skill silently acquire a credential and bypass the
+  gate entirely. Enabling a skill therefore **never** grants a connector;
+  grants flow only through the `skill.grant_connector` consent flow. Enabling
+  a non-bundled credentialed skill via `/enable` is safe and stays env-denied:
+  `resolveSkillEnv` returns `{}` for any provider that is neither bundled nor
+  in `grantedConnectors`, so the skill remains inert until the user grants it
+  through the consent card.
 
 ## Consequences
 
@@ -93,11 +104,13 @@ injection point.
   model. The `enable_skill` tool description documents this so the model
   expects a pending result and surfaces the card rather than retrying.
 
-- The consent card renders only in the web chat. Enabling a credentialed
-  non-bundled skill from a surface that can't render it (a messaging bridge,
-  a headless subagent / scheduled-job run) fails synchronously with an
-  "open the web chat to grant" message — mirroring the `browser_fill_secret`
-  surface guard — so the task never parks unresolvably.
+- The consent card renders only in an interactive web chat session. Enabling
+  a credentialed non-bundled skill from a surface that can't render it — a
+  messaging bridge (Telegram/Discord), a headless subagent with no chat
+  session, or a scheduled/headless job session (`origin: "job"`) — fails
+  synchronously with an "open the web chat to grant" message, mirroring the
+  `browser_fill_secret` surface guard, so the task never parks unresolvably on
+  a card no one can see.
 
 - Any future code that spawns a process with connector env must go through
   `resolveSkillEnv`, which enforces the gate. Re-implementing the binding
@@ -124,18 +137,24 @@ single point where a credential would enter a process.
   `"skill.grant_connector"` member of `SetupRequestAction`.
 - `src/integrations/connectors/index.ts`: `resolveSkillEnv` gates both the
   native-binding branch and the generic-fallback branch on
-  `bundled || grantedConnectors.includes(provider)`.
+  `bundled || grantedConnectors.includes(provider)`. The generic-fallback
+  branch is also ambiguity-safe: if two configured+healthy generic connectors
+  store a secret under the same field name, that env var is skipped (and a
+  `connector.generic.ambiguous_env` log is written) rather than guessing.
 - `src/capabilities/skills.ts`: `grantConnectorToSkill` /
   `revokeConnectorGrant` mutate `grantedConnectors` and write the audit
-  rows; `setSkillStatus` clears grants on disable.
+  rows; a shared `clearConnectorGrantsOnDisable` helper clears grants and
+  emits the per-provider `skill.connector.revoked` rows from both the
+  `setSkillStatus` and `updateSkill` PATCH disable paths.
 - `src/execution/tool-dispatch.ts`: `setSkillStatusTool` returns a
   `DispatchResult`; on enable of a non-bundled credentialed skill it mints a
   `skill.grant_connector` SetupRequest (surface-guarded) and returns
   `{ kind: "pending" }`. The dispatcher's `enable_skill` / `disable_skill`
   cases return the dispatch result directly.
 - `src/http.ts`: the `/complete` `skill.grant_connector` branch appends the
-  grant, enables the skill, and resolves the request; the settings-page
-  `/enable` endpoint auto-grants credentialed connectors.
+  grant, then enables the skill only when no credentialed providers remain
+  ungranted — otherwise it mints the next grant card and leaves the task
+  pending. The settings-page `/enable` endpoint never grants connectors.
 - `src/execution/tool-catalog.ts`: `enable_skill` description notes the
   one-time consent prompt.
 - `web/src/components/chat/BlockSetupRequested.tsx`: Grant / Cancel card for
@@ -149,13 +168,17 @@ single point where a credential would enter a process.
   non-bundled skill resolves to `{}`; granted non-bundled and bundled skills
   inject.
 - `bun test src/capabilities/skills.test.ts` — grant / revoke audit rows;
-  disable clears grants.
+  both the `setSkillStatus` and `updateSkill` PATCH disable paths clear grants
+  and emit per-provider `skill.connector.revoked` rows.
 - `bun test src/execution/skill-dispatch.test.ts` — non-bundled credentialed
   enable mints the SetupRequest (pending); bundled and already-granted enable
-  immediately; the messaging-bridge surface returns a sync error with no
-  setup row.
+  immediately; the messaging-bridge and `origin: "job"` surfaces return a sync
+  error with no setup row; re-entering enable while a grant is pending
+  references the existing request instead of minting a duplicate.
 - `bun test src/http.test.ts` — the `skill.grant_connector` `/complete`
-  branch grants the connector and enables the skill.
+  branch grants the connector and enables a single-provider skill; for a
+  multi-provider skill it grants one provider, stays disabled, and mints the
+  next grant card.
 
 ## Related
 

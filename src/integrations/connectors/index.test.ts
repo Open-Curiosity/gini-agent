@@ -306,6 +306,50 @@ describe("resolveSkillEnv", () => {
     expect(env).toEqual({});
   });
 
+  test("two generic connectors with the same secret field name skip that env var (fail safe), leaving others unaffected", async () => {
+    const instance = "resolve-generic-ambiguous";
+    const config = {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+    // Two healthy generic connectors both store MY_API_KEY — ambiguous, must
+    // resolve to nothing. A second, unambiguous field (OTHER_KEY) still works.
+    const dupA = writeSecret(instance, "id_generic_a", "MY_API_KEY", "value-a");
+    const dupB = writeSecret(instance, "id_generic_b", "MY_API_KEY", "value-b");
+    const other = writeSecret(instance, "id_generic_b", "OTHER_KEY", "other-real");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_generic_a",
+        instance,
+        provider: "generic",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [dupA]
+      }));
+      state.connectors.push(newConnector({
+        id: "id_generic_b",
+        instance,
+        provider: "generic",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [dupB, other]
+      }));
+    });
+    const skill = newSkill({
+      source: "bundled",
+      requiredConnectors: [{ provider: "generic" }],
+      prerequisites: { env: ["MY_API_KEY", "OTHER_KEY"] }
+    });
+    const env = await resolveSkillEnv(config, skill);
+    expect(env).toEqual({ OTHER_KEY: "other-real" });
+    expect(env).not.toHaveProperty("MY_API_KEY");
+  });
+
   // Per-(skill, connector) consent gate (ADR skill-connector-consent.md). A
   // non-bundled skill receives a credentialed connector's env only after the
   // user grants that provider; bundled skills are auto-granted.

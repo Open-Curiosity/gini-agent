@@ -438,15 +438,26 @@ export async function resolveSkillEnv(
     // status/health guard as native providers.
     if (!requiresGeneric) continue;
     if (!providerGranted("generic")) continue;
-    const connector = state.connectors.find(
+    // Fail safe on ambiguity: if two configured+healthy generic connectors
+    // both store a secret field named `envName`, we cannot know which the user
+    // meant, so inject NOTHING for that var rather than guessing the wrong
+    // credential.
+    const matches = state.connectors.filter(
       (candidate) =>
         candidate.provider === "generic"
         && candidate.status === "configured"
         && candidate.health === "healthy"
         && candidate.secretRefs.some((ref) => ref.purpose === envName)
     );
-    if (!connector) continue;
-    const value = await resolveConnectorSecret(config, connector.id, envName, taskId);
+    if (matches.length === 0) continue;
+    if (matches.length > 1) {
+      appendLog(config.instance, "connector.generic.ambiguous_env", {
+        envName,
+        connectorIds: matches.map((c) => c.id)
+      });
+      continue;
+    }
+    const value = await resolveConnectorSecret(config, matches[0].id, envName, taskId);
     if (value) out[envName] = value;
   }
   return out;

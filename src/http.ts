@@ -1,16 +1,18 @@
 import { writeFileSync } from "node:fs";
 import type { ApprovalMode, ChatBlock, RuntimeConfig } from "./types";
-import { cancelTask, decideApproval, resolveSetupRequest, retryTask, submitTask } from "./agent";
+import { cancelTask, decideApproval, findTask, resolveSetupRequest, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import {
   addAudit,
   addSseSubscription,
   appendTrace,
+  createSetupRequest,
   getDevice,
   listChatBlocks,
   listChatBlocksAfter,
   markRead,
   mutateState,
+  now,
   readState,
   readTrace,
   readUpload,
@@ -419,17 +421,57 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // Per-(skill, connector) consent (ADR skill-connector-consent.md).
         // No secrets are entered here — the credential already lives in the
         // connector record; this card only records the user's consent for
-        // the skill to use it. Append the grant, enable the skill, then
-        // resolve the setup request (which auto-resumes the chat-task loop
-        // with the tool result so the enable_skill call that minted this
-        // request re-enters and either enables or prompts for the next
-        // ungranted provider).
+        // the skill to use it. Append the grant, then check whether the skill
+        // still has ungranted credentialed providers. The skill is enabled
+        // (and "enabled" reported) ONLY when ALL of them are granted — for a
+        // multi-provider skill we mint the NEXT grant card and keep the task
+        // pending rather than enabling on the first grant. This is
+        // server-driven so we never claim "enabled" while providers remain
+        // env-denied.
         const skillId = String(setup.payload.skillId ?? "");
         const provider = String(setup.payload.provider ?? "");
         const providerLabel = typeof setup.payload.providerLabel === "string"
           ? setup.payload.providerLabel
           : provider;
+        const toolCallId = typeof setup.payload.toolCallId === "string"
+          ? setup.payload.toolCallId
+          : undefined;
         const skill = await grantConnectorToSkill(config, skillId, provider);
+        // A provider "carries a credential" when its module declares a secrets
+        // spec, or it is the generic escape-hatch provider (whose secrets are
+        // per-record). Mirror the predicate in setSkillStatusTool.
+        const granted = skill.grantedConnectors ?? [];
+        const nextUngranted = (skill.requiredConnectors ?? [])
+          .map((r) => r.provider)
+          .find((p) => (p === "generic" || Boolean(getProvider(p)?.secrets)) && !granted.includes(p));
+
+        if (nextUngranted) {
+          // More credentialed providers to grant. Mint the next grant card
+          // attached to the same task + tool call, then resolve THIS setup
+          // without resuming so the task stays parked on the new approval.
+          // The web reconciles the new pending card from the setup-requests
+          // query (refreshed by the setup SSE event).
+          const nextLabel = getProvider(nextUngranted)?.label ?? nextUngranted;
+          const reason = `Skill "${skill.name}" requests access to your ${nextLabel} credential. Granting lets its scripts use ${nextLabel}; you can revoke by disabling the skill.`;
+          await mutateState(config.instance, (mutable) => {
+            const approval = createSetupRequest(mutable, {
+              taskId: setup.taskId,
+              action: "skill.grant_connector",
+              target: nextLabel,
+              reason,
+              payload: { skillId, skillName: skill.name, provider: nextUngranted, providerLabel: nextLabel, toolCallId }
+            });
+            if (setup.taskId) {
+              const item = findTask(mutable, setup.taskId);
+              item.approvalIds.push(approval.id);
+              item.updatedAt = now();
+            }
+          });
+          await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
+          return json({ ok: true });
+        }
+
+        // All credentialed providers granted — enable the skill and resume.
         await setSkillStatus(config, skillId, "enabled");
         await resolveSetupRequest(config, setupId, "complete", {
           actor: "user",
@@ -777,19 +819,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["PATCH", /^\/api\/skills\/([^/]+)$/, async (request, params) => json(await updateSkill(config, params[0], await body(request)))],
     ["POST", /^\/api\/skills\/([^/]+)\/test$/, async (_request, params) => json(await testSkill(config, params[0]))],
     ["POST", /^\/api\/skills\/([^/]+)\/enable$/, async (_request, params) => {
-      // Settings-page / CLI enable is an explicit in-person user action, so
-      // it carries its own consent: auto-grant the skill's required
-      // credentialed connectors (ADR skill-connector-consent.md). The
-      // model-driven enable_skill tool path mints a SetupRequest card
-      // instead — that's the prompt-injection surface the gate defends.
-      const before = readState(config.instance).skills.find((s) => s.id === params[0] || s.name === params[0]);
-      if (before && (before.source ?? "user") !== "bundled") {
-        for (const p of (before.requiredConnectors ?? []).map((r) => r.provider)) {
-          if (p === "generic" || getProvider(p)?.secrets) {
-            await grantConnectorToSkill(config, params[0], p);
-          }
-        }
-      }
+      // Enabling a skill never grants a connector. A non-bundled credentialed
+      // skill enabled here stays env-denied (resolveSkillEnv returns {} for any
+      // provider not bundled and not in grantedConnectors) until the user
+      // grants it through the skill.grant_connector consent flow (ADR
+      // skill-connector-consent.md). That consent path is the only way grants
+      // are recorded — enabling must never silently auto-grant, or the model
+      // could reach this route to bypass the gate.
       return json(await setSkillStatus(config, params[0], "enabled"));
     }],
     ["POST", /^\/api\/skills\/([^/]+)\/disable$/, async (_request, params) => json(await setSkillStatus(config, params[0], "disabled"))],

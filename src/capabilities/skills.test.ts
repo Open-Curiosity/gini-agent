@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { createSkill, mutateState, readState } from "../state";
 import type { RuntimeConfig, SkillRecord } from "../types";
-import { grantConnectorToSkill, revokeConnectorGrant, setSkillStatus } from "./skills";
+import { grantConnectorToSkill, revokeConnectorGrant, setSkillStatus, updateSkill } from "./skills";
 
 const ROOT = "/tmp/gini-skills-capability-unit";
 
@@ -68,12 +68,15 @@ describe("grantConnectorToSkill / revokeConnectorGrant", () => {
 });
 
 describe("setSkillStatus disable transition", () => {
-  test("disabling a skill clears its connector grants", async () => {
+  test("disabling a skill clears its connector grants and emits a revoked audit per provider", async () => {
     const instance = "skills-disable-clears";
-    const skill = await seedSkill(instance, { status: "enabled", grantedConnectors: ["linear"] });
+    const skill = await seedSkill(instance, { status: "enabled", grantedConnectors: ["linear", "generic"] });
     const disabled = await setSkillStatus(config(instance), skill.id, "disabled");
     expect(disabled.status).toBe("disabled");
     expect(disabled.grantedConnectors).toEqual([]);
+    const state = readState(instance);
+    const revoked = state.audit.filter((a) => a.action === "skill.connector.revoked" && a.target === skill.id);
+    expect(revoked.length).toBe(2);
   });
 
   test("enabling a skill leaves grants untouched", async () => {
@@ -82,5 +85,17 @@ describe("setSkillStatus disable transition", () => {
     const enabled = await setSkillStatus(config(instance), skill.id, "enabled");
     expect(enabled.status).toBe("enabled");
     expect(enabled.grantedConnectors).toEqual(["linear"]);
+  });
+});
+
+describe("updateSkill status-only PATCH disable", () => {
+  test("disabling via PATCH clears connector grants and emits a revoked audit", async () => {
+    const instance = "skills-patch-disable-clears";
+    const skill = await seedSkill(instance, { status: "enabled", grantedConnectors: ["linear"] });
+    const disabled = await updateSkill(config(instance), skill.id, { status: "disabled" });
+    expect(disabled.status).toBe("disabled");
+    expect(disabled.grantedConnectors).toEqual([]);
+    const state = readState(instance);
+    expect(state.audit.some((a) => a.action === "skill.connector.revoked" && a.target === skill.id)).toBe(true);
   });
 });

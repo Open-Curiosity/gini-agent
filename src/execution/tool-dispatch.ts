@@ -2237,16 +2237,20 @@ async function requestSkillConnectorGrant(
 
   // Surface guard — same rationale as browser_fill_secrets. The consent card
   // is React UI rendered only in the web chat; a task running over a
-  // messaging bridge (Telegram/Discord) or with no chat session would park
-  // in waiting_approval with no way to grant. Fail synchronously so the
-  // agent can verbalize "open the web chat to grant" back to the user.
+  // messaging bridge (Telegram/Discord), in a scheduled/headless job session
+  // (origin:"job"), or with no chat session at all would park in
+  // waiting_approval with no way to grant. Fail synchronously so the agent can
+  // verbalize "open the web chat to grant" back to the user.
+  // NOTE: sibling request_* guards in this file share the same shape but DON'T
+  // yet check origin:"job"; that blind spot is tracked separately — do not
+  // assume it's handled there.
   const surfaceState = readState(config.instance);
   const surfaceTask = findTask(surfaceState, taskId);
   const surfaceSession = surfaceTask.chatSessionId
     ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
     : undefined;
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
-  if (!surfaceSession) {
+  if (!surfaceSession || surfaceSession.origin === "job") {
     return {
       kind: "sync",
       result: JSON.stringify({
@@ -2263,6 +2267,21 @@ async function requestSkillConnectorGrant(
         error: `Enabling skill "${skillName}" needs a one-time grant of your ${providerLabel} credential, and the consent card only works in the web chat (this conversation is over ${surfaceKind}). Reply asking the user to open the web chat to grant access, then continue once they confirm.`
       })
     };
+  }
+
+  // Idempotent re-enter: if a pending grant SetupRequest already exists for
+  // this (skill, provider) — e.g. the model re-called enable_skill while the
+  // user hadn't yet acted on the card — reference it instead of minting a
+  // duplicate.
+  const existing = surfaceState.setupRequests.find(
+    (s) =>
+      s.status === "pending" &&
+      s.action === "skill.grant_connector" &&
+      s.payload.skillId === skillId &&
+      s.payload.provider === provider
+  );
+  if (existing) {
+    return { kind: "pending", approvalId: existing.id };
   }
 
   const reason = `Skill "${skillName}" requests access to your ${providerLabel} credential. Granting lets its scripts use ${providerLabel}; you can revoke by disabling the skill.`;
