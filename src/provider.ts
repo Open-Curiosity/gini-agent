@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { buildAgentSystemContext } from "./system-prompt";
+import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt";
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
@@ -1243,11 +1243,21 @@ export async function generateTaskSummary(
   const instructionsOverride = loadInstructions(config.instance, loadOpts) ?? undefined;
   const soulBlock = loadSoul(config.instance, activeAgentId, loadOpts) ?? undefined;
   const userProfileBlock = loadUserProfile(config.instance, loadOpts) ?? undefined;
-  const systemContext = buildAgentSystemContext(recalledContext, undefined, {
+  // The legacy single-shot path is one system + one user message with no
+  // prior transcript and no cross-turn cache prefix to preserve, so recalled
+  // memory stays appended to its system context (the stable-prefix tail only
+  // applies to the multi-turn chat-task loop). renderEphemeralContext
+  // single-sources the "Long-term memory…" header. See ADR
+  // stable-system-prefix.md.
+  const stablePrefix = buildAgentSystemContext({
     instructionsOverride,
     soul: soulBlock,
     userProfile: userProfileBlock
   });
+  const recalledBlock = renderEphemeralContext(undefined, recalledContext);
+  const systemContext = recalledBlock.length > 0
+    ? `${stablePrefix}\n\n${recalledBlock}`
+    : stablePrefix;
   if (provider.name === "openrouter" || provider.name === "local" || provider.name === "deepseek") {
     return callChatCompletions(provider, input, systemContext);
   }
