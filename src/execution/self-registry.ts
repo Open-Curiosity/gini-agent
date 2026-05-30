@@ -46,7 +46,10 @@ export interface SelfOperation {
 // Low-risk audit write, inlined here to keep the registry a leaf module (the
 // shared helper in tool-dispatch.ts depends on findTask from agent.ts, which
 // would re-enter the agent module and form an import cycle). Resolves the
-// owning task inline against state instead of via findTask.
+// owning task inline against state instead of via findTask. This is a
+// best-effort audit that runs after the handler already computed its result;
+// a task deleted mid-flight quietly skips the row rather than throwing and
+// sinking the handler's output.
 async function recordLowRiskAudit(
   config: RuntimeConfig,
   taskId: string,
@@ -56,7 +59,7 @@ async function recordLowRiskAudit(
 ): Promise<void> {
   await mutateState(config.instance, (state: RuntimeState) => {
     const item = state.tasks.find((task) => task.id === taskId);
-    if (!item) throw new Error(`Task not found: ${taskId}`);
+    if (!item) return;
     addAudit(
       state,
       {

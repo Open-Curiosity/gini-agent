@@ -2094,6 +2094,34 @@ async function runApprovedAction(
       return JSON.stringify({ ok: false, error: `Unknown self operation: ${opName}.` });
     }
     const resultStr = await op.handler(config, approval.taskId, opArgs);
+    // The handler writes its own low-risk operation trace; this row carries
+    // approvalId so the operation outcome is joinable to the approval that
+    // authorized it. Mirrors the messaging.send execute-side audit.
+    let resultOk: boolean | null = null;
+    try {
+      const parsed = JSON.parse(resultStr);
+      if (parsed && typeof parsed === "object" && typeof parsed.ok === "boolean") {
+        resultOk = parsed.ok;
+      }
+    } catch {
+      // Best-effort: a non-JSON handler result leaves ok null.
+    }
+    await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "self.config",
+          target: opName,
+          risk: "medium",
+          taskId: approval.taskId,
+          runId: state.tasks.find((t) => t.id === approval.taskId)?.runId,
+          approvalId: approval.id,
+          evidence: { ...extraEvidence, opName, ok: resultOk }
+        },
+        approvalAgentContext(approval)
+      );
+    });
     if (shouldResumeChat && chatToolCallId) {
       await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);
     }
