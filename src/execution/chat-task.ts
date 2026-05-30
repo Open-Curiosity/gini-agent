@@ -57,7 +57,15 @@ import type {
 } from "../types";
 import type { EffectiveContext } from "./effective-context";
 import { updateRunFromTask } from "./runs";
-import { buildToolCatalog, hashCatalog, toProviderTools } from "./tool-catalog";
+import {
+  applyDeferralFilter,
+  buildToolCatalog,
+  deferredToolIndex,
+  handleLoadTools,
+  hashCatalog,
+  toProviderTools,
+  type ToolCatalogTool
+} from "./tool-catalog";
 import {
   emitAuthorizationRequested,
   emitSetupRequested,
@@ -380,10 +388,23 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // invoking. Only "configured" status surfaces; disabled/error servers
   // stay hidden the same way disabled skills do.
   const mcpServersBlock = buildMcpServersBlock(state);
+  // Deferred-tools index. Build the same gated + subagent-filtered catalog
+  // runLoop builds, seed a subagent's deferred tools (those are already live,
+  // so they must NOT appear in the on-demand list), then advertise whatever
+  // deferred tools remain unloaded by name + one-line summary. The full
+  // schemas join the provider tools array only after load_tools fires.
+  const deferredCatalog = filterToolsForSubagent(
+    buildToolCatalog(state, effectiveForAgent.toolsetFilter),
+    subagent
+  );
+  const alreadyLoaded = new Set<string>(task.loadedTools ?? []);
+  if (subagent) seedSubagentDeferred(deferredCatalog, subagent, alreadyLoaded);
+  const deferredBlock = buildDeferredToolsBlock(deferredToolIndex(deferredCatalog, alreadyLoaded));
   const sections = [baseSystem];
   if (skillsBlock) sections.push(skillsBlock);
   if (inactiveSkillsBlock) sections.push(inactiveSkillsBlock);
   if (mcpServersBlock) sections.push(mcpServersBlock);
+  if (deferredBlock) sections.push(deferredBlock);
   if (boundJobsBlock) sections.push(boundJobsBlock);
   const systemContext = sections.join("\n\n");
 
@@ -546,6 +567,26 @@ function filterToolsForSubagent<T extends { toolset: string; function: { name: s
   });
 }
 
+// Seed a subagent's deferred tools into the loaded set at runLoop entry.
+// When a subagent's whitelisted toolsets own deferred tools (e.g. a subagent
+// scoped to `["browser"]`), those tools are made live immediately rather than
+// forcing the child through a load_tools round-trip — the child task is
+// short-lived and its tool world is already narrowed by the whitelist.
+// Mutates `loaded` in place. No-op when the subagent has no toolset whitelist
+// (it inherits the parent's world, where deferred tools follow the normal
+// load-on-demand flow).
+function seedSubagentDeferred(
+  catalog: ToolCatalogTool[],
+  subagent: SubagentRecord,
+  loaded: Set<string>
+): void {
+  if (!subagent.toolsetIds || subagent.toolsetIds.length === 0) return;
+  const allowed = new Set(subagent.toolsetIds);
+  for (const tool of catalog) {
+    if (tool.deferred && allowed.has(tool.toolset)) loaded.add(tool.function.name);
+  }
+}
+
 // Filter the enabled-skill list down to a subagent's whitelist. When the
 // subagent has no whitelist (toolset-or-skill-undefined / inherit), the full
 // list is returned. When the whitelist is set, only matching skill names
@@ -701,6 +742,21 @@ function buildMcpServersBlock(state: RuntimeState): string {
   ].join("\n");
 }
 
+// Build the "Tools available on demand" system-prompt block from the
+// deferred-tool index. These are real tools whose full schemas aren't shipped
+// to the provider yet (to keep the live tool count low). The model loads one
+// by calling load_tools with its exact name; from the next turn on it calls
+// the tool directly by name. Returns "" when nothing is deferred (or
+// everything deferred has already been loaded), so the section drops out of
+// the prompt entirely on the hot path.
+function buildDeferredToolsBlock(index: Array<{ name: string; summary: string }>): string {
+  if (index.length === 0) return "";
+  return [
+    "Tools available on demand (NOT yet loaded). These are real tools you can use, but their definitions aren't loaded yet. To use one, FIRST call load_tools with its exact name(s) (e.g. load_tools({\"names\":[\"browser_navigate\"]})); from the next turn on you call the tool directly by name. Don't guess a tool's arguments before loading it.",
+    ...index.map((t) => `- ${t.name} — ${t.summary}`)
+  ].join("\n");
+}
+
 // Inner loop. Calls the model, dispatches tool calls, and either completes
 // the task with the final text or pauses the task waiting for approvals.
 //
@@ -753,9 +809,29 @@ async function runLoop(
   // entry runChatTask hands us the already-resolved EffectiveContext;
   // resumeChatTask omits it so the resume picks up any agent change.
   const effective = inheritedEffective ?? resolveEffectiveContext(state0, config);
-  const tools = filterToolsForSubagent(buildToolCatalog(state0, effective.toolsetFilter), subagent0);
-  const providerTools = toProviderTools(tools);
-  const toolsHash = hashCatalog(tools);
+  // Full (gated) catalog, including deferred tools. `loadedToolNames` is the
+  // set of deferred tools the model has pulled live via load_tools; it is
+  // seeded from the task row so it survives the runLoop rebuild on every
+  // resume. `applyDeferralFilter` drops deferred tools the model hasn't
+  // loaded yet — so the provider only ever sees core ∪ loaded(deferred).
+  // `providerTools`/`toolsHash`/`tools` are recomputed by `recompute()`
+  // after a load_tools call so the next provider call sees the new schemas;
+  // the hot no-load path never calls recompute and stays byte-identical to
+  // the prior frozen-catalog behavior.
+  const fullCatalog = filterToolsForSubagent(buildToolCatalog(state0, effective.toolsetFilter), subagent0);
+  const loadedToolNames = new Set<string>(taskRow?.loadedTools ?? []);
+  // Subagent seeding: a subagent whose whitelisted toolsets own deferred
+  // tools gets those tools live at entry (no load_tools round-trip), so a
+  // narrowly-scoped browser subagent can act immediately.
+  if (subagent0) seedSubagentDeferred(fullCatalog, subagent0, loadedToolNames);
+  let tools = applyDeferralFilter(fullCatalog, loadedToolNames);
+  let providerTools = toProviderTools(tools);
+  let toolsHash = hashCatalog(tools);
+  const recompute = (): void => {
+    tools = applyDeferralFilter(fullCatalog, loadedToolNames);
+    providerTools = toProviderTools(tools);
+    toolsHash = hashCatalog(tools);
+  };
 
   const { cap, warnReason } = resolveIterationCap(config);
   if (warnReason) {
@@ -969,6 +1045,10 @@ async function runLoop(
         // the chat UI uses the synced summary instead.
         item.partialSummary = undefined;
         item.toolCallState = undefined;
+        // The loaded-deferred-tool set is per-task and only meaningful while
+        // the loop runs. Clear it on terminal completion so a finished task
+        // doesn't retain it (the next task seeds an empty set).
+        item.loadedTools = undefined;
         item.updatedAt = now();
         return item;
       });
@@ -1148,6 +1228,30 @@ async function runLoop(
         callId: call.id,
         args: parsedArgs
       });
+      // load_tools is handled INLINE (not via dispatchToolCall): it mutates
+      // the loaded set, recomputes providerTools so the NEXT iteration ships
+      // the new schemas, and persists `task.loadedTools` so an approval
+      // pause/resume keeps the loaded tools live. It is never approval-gated
+      // and produces no side effect beyond the in-loop state.
+      if (call.function.name === "load_tools") {
+        const { result, newlyLoaded } = handleLoadTools(call.function.arguments, fullCatalog, loadedToolNames);
+        for (const name of newlyLoaded) loadedToolNames.add(name);
+        recompute();
+        await mutateState(config.instance, (state) => {
+          const item = findTask(state, taskId);
+          // Belt-and-suspenders: a cancel that raced the dispatch lock could
+          // have flipped the task terminal — don't re-stamp loadedTools onto
+          // an already-finished task.
+          if (isTerminalTaskStatus(item.status)) return;
+          item.loadedTools = [...loadedToolNames];
+          updateRecentToolCall(item, call.id, "done");
+          item.updatedAt = now();
+        });
+        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content: result });
+        emitToolCallStatus(emitCtx, { callId: call.id, status: "ok" });
+        emitToolResult(emitCtx, { callId: call.id, result });
+        continue;
+      }
       try {
         const dispatch = await dispatchToolCall(
           config,
@@ -1327,6 +1431,7 @@ async function runLoop(
       item.cost = accumulatedCost;
       item.partialSummary = undefined;
       item.toolCallState = undefined;
+      item.loadedTools = undefined;
       item.updatedAt = now();
       return item;
     });
@@ -1384,6 +1489,7 @@ async function runLoop(
       // reflects all model calls leading up to the failed summary turn.
       item.cost = accumulatedCost;
       item.toolCallState = undefined;
+      item.loadedTools = undefined;
       item.updatedAt = now();
       return item;
     });

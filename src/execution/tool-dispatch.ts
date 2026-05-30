@@ -34,6 +34,7 @@ import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
 import { findSelfOperation, selfOperationIndex } from "./self-registry";
+import { isDeferredToolName } from "./tool-catalog";
 import { recall } from "../memory";
 import {
   dedupeAppendLines,
@@ -248,6 +249,20 @@ export async function dispatchToolCall(
       // `command` field on the payload is what the policy inspects.
       return codeExecDispatch(config, taskId, toolCallId, args);
     default:
+      // A deferred catalog tool whose schema the model never loaded can
+      // surface here as a hallucinated call (the dispatch case exists, but a
+      // name-typo or a not-yet-loaded reference lands in default). Return a
+      // recoverable nudge pointing at load_tools instead of the bare
+      // "Unknown tool" error so the model self-corrects on the next turn.
+      if (isDeferredToolName(toolName)) {
+        return {
+          kind: "sync",
+          result: JSON.stringify({
+            ok: false,
+            error: `Tool '${toolName}' is available but not loaded. Call load_tools({names:['${toolName}']}) first, then call it.`
+          })
+        };
+      }
       throw new Error(`Unknown tool: ${toolName}`);
   }
 }

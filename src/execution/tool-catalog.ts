@@ -21,7 +21,17 @@ import type { RuntimeState } from "../types";
 // across web / mobile / CLI bridges (see ADR chat-block-protocol.md).
 // When omitted on a TOOL_DEFS entry, `chatBlockLabelFor` falls back to a
 // humanized version of the tool name.
-const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: string }> = [
+//
+// `deferred` marks a tool whose full schema is NOT shipped to the provider
+// until the model loads it via the `load_tools` meta-tool. A deferred tool's
+// NAME + `indexSummary` still surface in the system-prompt "available on
+// demand" index so the model knows the capability exists; the schema only
+// joins the provider `tools` array once loaded. This keeps the live
+// full-schema tool count low (weak local providers degrade past ~30-50 live
+// tools) while preserving access to the whole catalog. `indexSummary` is the
+// one-line description used in that index (falls back to the description's
+// first sentence when omitted).
+const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: string; deferred?: boolean; indexSummary?: string }> = [
   {
     toolset: "file",
     displayLabel: "Read file",
@@ -204,8 +214,38 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // The deferred-tools meta-tool. CORE (always-on, never deferred): it is
+    // the only way the model can pull a deferred tool's schema into the live
+    // provider `tools` array. The system prompt lists deferred tools by name
+    // + one-line summary under an "available on demand" index; the model
+    // calls load_tools with the exact names, and from the NEXT turn on it
+    // calls those tools directly by name. Handled INLINE in the chat-task
+    // loop (not via the dispatch switch) so it can mutate the loaded set and
+    // persist it onto the task.
+    toolset: "core",
+    displayLabel: "Load tools",
+    type: "function",
+    function: {
+      name: "load_tools",
+      description: "Load the full schemas for one or more tools listed in the 'Tools available on demand' section of your system prompt so you can call them. Pass their EXACT names. After this returns, call each loaded tool directly by name on a later turn — do NOT pass its arguments to load_tools. Example: load_tools({\"names\":[\"browser_navigate\"]}).",
+      parameters: {
+        type: "object",
+        properties: {
+          names: {
+            type: "array",
+            items: { type: "string" },
+            description: "Exact names of the on-demand tools to load (e.g. ['browser_navigate', 'browser_snapshot'])."
+          }
+        },
+        required: ["names"]
+      }
+    }
+  },
+  {
     toolset: "browser",
     displayLabel: "Open page",
+    deferred: true,
+    indexSummary: "Open a URL in a headless browser and get an accessibility snapshot to click/type into. Load this first when starting any browser task.",
     type: "function",
     function: {
       name: "browser_navigate",
@@ -222,6 +262,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Snapshot page",
+    deferred: true,
+    indexSummary: "Re-snapshot the current browser page to get fresh @eN element refs.",
     type: "function",
     function: {
       name: "browser_snapshot",
@@ -237,6 +279,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Click element",
+    deferred: true,
+    indexSummary: "Click an element on the current page by its @eN ref.",
     type: "function",
     function: {
       name: "browser_click",
@@ -253,6 +297,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Type text",
+    deferred: true,
+    indexSummary: "Type text into an input element on the current page by its @eN ref.",
     type: "function",
     function: {
       name: "browser_type",
@@ -270,6 +316,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Press key",
+    deferred: true,
+    indexSummary: "Press a keyboard key on the current page (Enter, Tab, ArrowDown, …).",
     type: "function",
     function: {
       name: "browser_press",
@@ -286,6 +334,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Scroll page",
+    deferred: true,
+    indexSummary: "Scroll the current page up or down by one viewport.",
     type: "function",
     function: {
       name: "browser_scroll",
@@ -302,6 +352,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Go back",
+    deferred: true,
+    indexSummary: "Navigate back one entry in the browser history.",
     type: "function",
     function: {
       name: "browser_back",
@@ -312,6 +364,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Read console",
+    deferred: true,
+    indexSummary: "Read recent console messages, or evaluate a JavaScript expression on the page.",
     type: "function",
     function: {
       name: "browser_console",
@@ -328,6 +382,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Close browser",
+    deferred: true,
+    indexSummary: "Close the browser session for the current task.",
     type: "function",
     function: {
       name: "browser_close",
@@ -338,6 +394,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Hover element",
+    deferred: true,
+    indexSummary: "Hover over an element by its @eN ref to reveal tooltips or hover menus.",
     type: "function",
     function: {
       name: "browser_hover",
@@ -354,6 +412,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Drag element",
+    deferred: true,
+    indexSummary: "Drag from one element to another by their @eN refs.",
     type: "function",
     function: {
       name: "browser_drag",
@@ -371,6 +431,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Select option",
+    deferred: true,
+    indexSummary: "Select an option in a <select> element by its @eN ref.",
     type: "function",
     function: {
       name: "browser_select_option",
@@ -389,6 +451,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Wait for element",
+    deferred: true,
+    indexSummary: "Wait for an element (by @eN ref) to reach a state, or for text to appear on the page.",
     type: "function",
     function: {
       name: "browser_wait_for",
@@ -411,6 +475,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Manage tabs",
+    deferred: true,
+    indexSummary: "List, open, switch, or close browser tabs.",
     type: "function",
     function: {
       name: "browser_tabs",
@@ -433,6 +499,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Upload file",
+    deferred: true,
+    indexSummary: "Upload a workspace file via a file input on the current page.",
     type: "function",
     function: {
       name: "browser_upload_file",
@@ -467,6 +535,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "browser",
+    deferred: true,
+    indexSummary: "Screenshot the current page and ask a vision model about what's visible (charts, images, layout).",
     type: "function",
     function: {
       name: "browser_vision",
@@ -1171,6 +1241,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
 export type ToolCatalogTool = ToolFunctionSpec & {
   toolset: string;
   displayLabel?: string;
+  deferred?: boolean;
+  indexSummary?: string;
 };
 
 // Public read-only copy. Returned ordering is stable so the toolsHash is
@@ -1201,6 +1273,11 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
   const enabled = new Set(state.toolsets.filter((t) => t.status === "enabled").map((t) => t.name));
   return allTools().filter((tool) => {
     if (tool.function.name === "web_fetch") return true;
+    // load_tools is the deferred-tools meta-tool. Always-on and on no legacy
+    // toolset (`core`); the model needs it to pull any deferred schema into
+    // the live tools array. Deferral itself is applied later by
+    // applyDeferralFilter, not by this gate — load_tools is never deferred.
+    if (tool.function.name === "load_tools") return true;
     // Always expose read_skill so the model can load any enabled skill the
     // system prompt advertises. The "skills" toolset isn't part of the
     // legacy default toolsets; gating it on enable would mean a fresh
@@ -1323,11 +1400,151 @@ export function hashCatalog(tools: ToolCatalogTool[]): string {
   return createHash("sha1").update(summary).digest("hex").slice(0, 16);
 }
 
-// Return the OpenAI tool spec without the `toolset` / `displayLabel`
-// annotations we use for filtering and chat rendering. The provider
-// only knows the `type/function` shape.
+// Return the OpenAI tool spec without the `toolset` / `displayLabel` /
+// `deferred` / `indexSummary` annotations we use for filtering, chat
+// rendering, and the deferred-tools index. The provider only knows the
+// `type/function` shape.
 export function toProviderTools(tools: ToolCatalogTool[]): ToolFunctionSpec[] {
-  return tools.map(({ toolset: _toolset, displayLabel: _displayLabel, ...rest }) => rest);
+  return tools.map(
+    ({ toolset: _toolset, displayLabel: _displayLabel, deferred: _deferred, indexSummary: _indexSummary, ...rest }) => rest
+  );
+}
+
+// ---------------- Deferred tools ----------------
+//
+// A deferred tool's full schema is withheld from the provider until the
+// model loads it via load_tools. The functions below are the pure surface
+// the chat-task loop drives: build the system-prompt index, filter the
+// provider catalog by the loaded set, resolve names, and run a load_tools
+// call. None of them touch state — the loop owns persistence.
+
+// First sentence of a (possibly multi-paragraph) tool description, capped so
+// the on-demand index stays compact. Splits on the first sentence-ending
+// punctuation followed by whitespace; falls back to a hard char cap.
+export function firstSentence(text: string, cap = 140): string {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^.*?[.!?](?=\s|$)/);
+  const sentence = match ? match[0] : trimmed;
+  if (sentence.length <= cap) return sentence;
+  return sentence.slice(0, cap - 1).trimEnd() + "…";
+}
+
+// The system-prompt "available on demand" index: every deferred tool in the
+// (already-gated) catalog that the model has NOT yet loaded, as {name,
+// summary}. summary prefers the curated `indexSummary`, falling back to the
+// description's first sentence.
+export function deferredToolIndex(
+  catalog: ToolCatalogTool[],
+  loaded: ReadonlySet<string>
+): Array<{ name: string; summary: string }> {
+  return catalog
+    .filter((tool) => tool.deferred && !loaded.has(tool.function.name))
+    .map((tool) => ({
+      name: tool.function.name,
+      summary: tool.indexSummary ?? firstSentence(tool.function.description ?? "")
+    }));
+}
+
+// The provider-facing catalog: drop deferred tools the model hasn't loaded
+// yet. Core tools always pass; a deferred tool passes only once its name is
+// in `loaded`. The hot no-load path (loaded === ∅) returns exactly the core
+// tools, byte-identical to a catalog with no deferred entries.
+export function applyDeferralFilter(
+  catalog: ToolCatalogTool[],
+  loaded: ReadonlySet<string>
+): ToolCatalogTool[] {
+  return catalog.filter((tool) => !tool.deferred || loaded.has(tool.function.name));
+}
+
+// Partition the requested names against the (already-gated) catalog. Only a
+// deferred tool that is present in the catalog counts as loadable — a core
+// tool (already live) or a name the catalog doesn't carry lands in `unknown`
+// so the model gets a clear signal instead of silently no-op-ing.
+export function resolveLoadableTools(
+  catalog: ToolCatalogTool[],
+  names: string[]
+): { loaded: string[]; unknown: string[] } {
+  const deferredNames = new Set(
+    catalog.filter((tool) => tool.deferred).map((tool) => tool.function.name)
+  );
+  const loaded: string[] = [];
+  const unknown: string[] = [];
+  for (const name of names) {
+    if (deferredNames.has(name)) loaded.push(name);
+    else unknown.push(name);
+  }
+  return { loaded, unknown };
+}
+
+// Closest deferred-tool names for an unknown load request, so the model gets
+// a "did you mean" nudge instead of a bare miss. A candidate is "close" when
+// one name contains the other or they share a leading token.
+function suggestDeferredTools(catalog: ToolCatalogTool[], name: string): string[] {
+  const lower = name.toLowerCase();
+  const head = lower.split(/[_\s]/)[0] ?? lower;
+  return catalog
+    .filter((tool) => tool.deferred)
+    .map((tool) => tool.function.name)
+    .filter((candidate) => {
+      const c = candidate.toLowerCase();
+      return c.includes(lower) || lower.includes(c) || (head.length > 0 && c.startsWith(head));
+    })
+    .slice(0, 5);
+}
+
+// Run a load_tools call against the catalog + current loaded set. Lenient
+// parse (a malformed arg blob yields an empty names list rather than
+// throwing — the model gets a recoverable envelope). Returns the JSON
+// tool-result string plus the names that became NEWLY loaded this call, so
+// the loop can union them into the loaded set and persist.
+export function handleLoadTools(
+  rawArgs: string,
+  catalog: ToolCatalogTool[],
+  loaded: ReadonlySet<string>
+): { result: string; newlyLoaded: string[] } {
+  let names: string[] = [];
+  try {
+    const parsed = rawArgs && rawArgs.trim() ? (JSON.parse(rawArgs) as unknown) : {};
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const raw = (parsed as Record<string, unknown>).names;
+      if (Array.isArray(raw)) {
+        names = raw.filter((n): n is string => typeof n === "string" && n.trim().length > 0).map((n) => n.trim());
+      } else if (typeof raw === "string" && raw.trim().length > 0) {
+        // Tolerate a single name passed as a bare string.
+        names = [raw.trim()];
+      }
+    }
+  } catch {
+    names = [];
+  }
+  const { loaded: loadable, unknown } = resolveLoadableTools(catalog, names);
+  const newlyLoaded = loadable.filter((name) => !loaded.has(name));
+  const alreadyLoaded = loadable.filter((name) => loaded.has(name));
+  const envelope: Record<string, unknown> = {
+    ok: true,
+    loaded: newlyLoaded,
+    alreadyLoaded,
+    unknown,
+    note: "These tools are now callable directly. Call them by name on your next turn — do not pass their arguments to load_tools."
+  };
+  if (unknown.length > 0) {
+    const didYouMean: Record<string, string[]> = {};
+    for (const name of unknown) {
+      const suggestions = suggestDeferredTools(catalog, name);
+      if (suggestions.length > 0) didYouMean[name] = suggestions;
+    }
+    if (Object.keys(didYouMean).length > 0) envelope.didYouMean = didYouMean;
+  }
+  return { result: JSON.stringify(envelope), newlyLoaded };
+}
+
+// Whether a tool NAME is a deferred catalog tool. Used by the dispatcher's
+// pre-switch guard: a deferred tool the model calls before loading it isn't
+// in the dispatch switch's reachable set yet (it ships no schema), so the
+// guard returns a recoverable "load it first" nudge instead of throwing
+// "Unknown tool".
+export function isDeferredToolName(toolName: string): boolean {
+  return TOOL_DEFS.some((tool) => tool.deferred && tool.function.name === toolName);
 }
 
 // Display-label lookup for ChatBlock rendering. Returns the catalog
@@ -1397,6 +1614,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.path) || previewValue(safe.pattern));
     case "web_fetch":
       return truncatePreview(previewValue(safe.url));
+    case "load_tools":
+      return truncatePreview(Array.isArray(safe.names) ? safe.names.join(", ") : previewValue(safe.names));
     case "terminal_exec":
       return truncatePreview(previewValue(safe.command));
     case "code_exec":

@@ -1527,6 +1527,95 @@ describe("chat-task loop", () => {
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
+
+  // Deferred-tools mechanism: the on-demand index block appears in the
+  // system prompt, the model calls load_tools to pull a deferred schema
+  // live, and from the next turn on it can call the tool directly.
+  test("advertises deferred tools on demand and loads one via load_tools, feeding back a callable confirmation", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-load");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: load the browser_navigate schema via load_tools. (We stop at the
+    // load round-trip rather than driving a real browser — the load branch is
+    // what this test pins; the browser dispatch itself is exercised live.)
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_navigate"] }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: final answer (no browser call, to keep the test hermetic).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Browser tools are ready.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "get ready to browse", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Browser tools are ready.");
+    // loadedTools is cleared on terminal completion.
+    expect(finished.loadedTools).toBeUndefined();
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    // First model call: system prompt advertises the on-demand index with
+    // browser_navigate by name.
+    const firstSystem = String(calls[0]!.find((m) => m.role === "system")?.content ?? "");
+    expect(firstSystem).toContain("Tools available on demand");
+    expect(firstSystem).toContain("browser_navigate");
+
+    // After the load, the second model call's message history carries the
+    // load_tools tool result confirming the tool is now callable.
+    const secondTurn = calls[1]!;
+    const loadResult = secondTurn.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("callable directly")
+    );
+    expect(loadResult).toBeDefined();
+    const envelope = JSON.parse(String((loadResult as { content: string }).content)) as {
+      ok: boolean;
+      loaded: string[];
+    };
+    expect(envelope.ok).toBe(true);
+    expect(envelope.loaded).toContain("browser_navigate");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("the dispatcher's deferred guard nudges toward load_tools and does not over-trigger", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-nudge");
+
+    const { dispatchToolCall } = await import("./tool-dispatch");
+    const { isDeferredToolName } = await import("./tool-catalog");
+    const { createTask, upsertTask } = await import("../state");
+    const taskRow = createTask(config.instance, "nudge probe");
+    await mutateState(config.instance, (state) => upsertTask(state, taskRow));
+
+    // A genuinely unknown (non-deferred) tool still throws Unknown tool —
+    // the guard is scoped to deferred names and does not over-trigger.
+    expect(isDeferredToolName("totally_made_up_tool")).toBe(false);
+    let threw = false;
+    try {
+      await dispatchToolCall(config, taskRow.id, "totally_made_up_tool", "call_x", "{}");
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+
+    // browser_navigate is a known deferred tool. The guard helper classifies
+    // it as deferred so a not-yet-loaded reference reaching the dispatcher's
+    // default case would return the recoverable load_tools nudge rather than
+    // throwing Unknown tool.
+    expect(isDeferredToolName("browser_navigate")).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
 });
 
 describe("buildAgentIdentity", () => {
