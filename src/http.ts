@@ -108,6 +108,10 @@ async function emitConnectorRequestAudit(
         evidence: {
           provider: String(setup.payload.provider ?? ""),
           providerLabel: typeof setup.payload.providerLabel === "string" ? setup.payload.providerLabel : null,
+          // Templateless requests carry no provider id; record the credential
+          // name so the audit row is still attributable. NO secret value is
+          // ever recorded — the secret stays server-side (ADR browser-fill-secret.md).
+          credentialName: typeof setup.payload.credentialName === "string" ? setup.payload.credentialName : null,
           connectorId
         }
       },
@@ -384,18 +388,59 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
 
       if (setup.action === "connector.request") {
         const scopes = Array.isArray(payload.scopes) ? payload.scopes.map(String) : [];
+        // Two payload shapes (see SetupRequest.target doc in types.ts):
+        //   known provider → {provider, providerLabel, fields, ...}
+        //   templateless    → {credentialName, credentialType, credentialLabel, mcpUrl?}
+        // The trusted shape (name, type, metadata) comes from the SETUP
+        // PAYLOAD the dispatcher minted, NOT the browser-supplied body — the
+        // body carries only the secret. Threading `type`/`metadata` here makes
+        // a templateless request land a TYPED record; known-provider requests
+        // already get typed via the module's credentialTemplate inside
+        // createConnector, so we leave their type unset and let that path stand.
+        const credentialType = setup.payload.credentialType === "api-key" || setup.payload.credentialType === "oauth2"
+          ? setup.payload.credentialType
+          : undefined;
         const providerId = String(setup.payload.provider ?? "");
         const providerLabel = typeof setup.payload.providerLabel === "string"
           ? setup.payload.providerLabel
           : providerId;
-        const overrideName = typeof payload.name === "string" && payload.name.trim().length > 0
-          ? payload.name.trim()
-          : providerLabel;
+        const credentialName = typeof setup.payload.credentialName === "string"
+          ? setup.payload.credentialName
+          : "";
+        const credentialLabel = typeof setup.payload.credentialLabel === "string"
+          ? setup.payload.credentialLabel
+          : credentialName;
+        const isTemplateless = Boolean(credentialType) && !providerId;
+        // Templateless requests carry no provider module, so use the same
+        // "generic" provider key the type-driven Add Connector dialog uses; the
+        // explicit `type` makes createConnector stamp a typed record regardless.
+        const provider = providerId || "generic";
+        // For templateless requests, derive metadata from the trusted setup
+        // payload: an api-key with an mcpUrl gets an mcp binding; oauth2 carries
+        // an envMap. Known-provider requests pass no metadata so the module's
+        // template fills it.
+        let metadata: Record<string, unknown> | undefined;
+        if (isTemplateless) {
+          if (credentialType === "api-key" && typeof setup.payload.mcpUrl === "string" && setup.payload.mcpUrl.length > 0) {
+            metadata = { mcp: { url: setup.payload.mcpUrl, headerName: "Authorization", scheme: "Bearer" } };
+          } else if (credentialType === "oauth2" && setup.payload.envMap && typeof setup.payload.envMap === "object") {
+            metadata = { envMap: setup.payload.envMap as Record<string, string> };
+          }
+        }
+        // Connector name: the credential name for templateless, else the
+        // browser-supplied override (back-compat) falling back to the label.
+        const overrideName = isTemplateless
+          ? credentialName
+          : typeof payload.name === "string" && payload.name.trim().length > 0
+            ? payload.name.trim()
+            : providerLabel;
         const connector = await createConnector(config, {
           name: overrideName,
-          provider: providerId,
+          provider,
+          ...(isTemplateless ? { type: credentialType } : {}),
           scopes,
-          secrets
+          secrets,
+          ...(metadata ? { metadata } : {})
         });
         const probed = await checkConnector(config, connector.id);
         if (probed.health !== "healthy") {
@@ -406,9 +451,27 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           });
         }
         await emitConnectorRequestAudit(config, setup, connector.id);
+
+        // Auto-grant to the requesting skill (LOCKED decision). When the
+        // dispatcher minted this card with a `skillId`, the human entering the
+        // secret for that named skill IS the consent — so completing the card
+        // both creates the credential AND grants it to the skill, no second
+        // consent card. The model can't forge this because it never sees the
+        // secret. Enable the skill once it has no remaining ungranted
+        // credentials, reusing the same firstUngrantedCredential predicate the
+        // skill.grant_connector branch uses so the two stay in lockstep.
+        const skillId = typeof setup.payload.skillId === "string" ? setup.payload.skillId : "";
+        if (skillId) {
+          const skill = await grantConnectorToSkill(config, skillId, connector.name);
+          if (!firstUngrantedCredential(readState(config.instance), skill)) {
+            await setSkillStatus(config, skillId, "enabled");
+          }
+        }
+
+        const connectedLabel = isTemplateless ? credentialLabel : providerLabel;
         await resolveSetupRequest(config, setupId, "complete", {
           actor: "user",
-          toolResult: `Connected to ${providerLabel}. Proceed with the original request.`
+          toolResult: `Connected to ${connectedLabel}. Proceed with the original request.`
         });
         return json({ ok: true, connector: probed });
       }

@@ -889,6 +889,121 @@ describe("runtime api", () => {
     expect(state.audit.some((a) => a.action === "skill.connector.granted")).toBe(true);
   });
 
+  test("POST /api/setup-requests/<id>/complete: a templateless connector.request creates a typed api-key, grants + enables the skill, and records no secret", async () => {
+    const config = testConfig("setup-complete-templateless");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-some-service",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["SOME_SERVICE_API_KEY"]
+      })
+    );
+    // Templateless payload: no `provider`, carries credentialType/Name/Label +
+    // skillId (exactly what requestConnectorTool mints).
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "connector.request",
+        target: "SOME_SERVICE_API_KEY",
+        reason: "Enter your Some Service API key",
+        payload: {
+          credentialName: "SOME_SERVICE_API_KEY",
+          credentialType: "api-key",
+          credentialLabel: "Some Service",
+          skillId: skill.id,
+          reason: "Enter your Some Service API key",
+          toolCallId: "call_tl_complete"
+        }
+      })
+    );
+
+    const secretValue = "sk-some-service-super-secret";
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { SOME_SERVICE_API_KEY: secretValue } })
+    });
+    expect(response.ok).toBe(true);
+    expect(response.connector.health).toBe("healthy");
+
+    const state = readState(config.instance);
+    // A TYPED api-key record landed under the requested name.
+    const connector = state.connectors.find((c) => c.name === "SOME_SERVICE_API_KEY");
+    expect(connector).toBeDefined();
+    expect(connector?.type).toBe("api-key");
+    // The requesting skill was granted the credential and enabled (its only
+    // required credential is now granted).
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.grantedConnectors).toEqual(["SOME_SERVICE_API_KEY"]);
+    expect(updated?.status).toBe("enabled");
+    // The setup request resolved.
+    expect(state.setupRequests.find((a) => a.id === approval.id)?.status).toBe("completed");
+    // The audit row for connector.request carries the credential name but NO
+    // secret value — the secret stays server-side.
+    const requestAudit = state.audit.find((a) => a.action === "connector.request");
+    expect(requestAudit).toBeDefined();
+    expect((requestAudit?.evidence as Record<string, unknown>)?.credentialName).toBe("SOME_SERVICE_API_KEY");
+    expect(JSON.stringify(state.audit)).not.toContain(secretValue);
+  });
+
+  test("POST /api/setup-requests/<id>/complete: a known-provider connector.request with skillId grants + enables the skill", async () => {
+    const config = testConfig("setup-complete-known-grant");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    // demo provider has no probe (presence-only healthy) and no credential
+    // template, so its record stays untyped — to exercise the grant we point
+    // the skill's requiredCredentials at the connector name the demo create
+    // lands ("Demo") and assert the grant is recorded. firstUngrantedCredential
+    // only blocks on TYPED credentials, so an untyped demo connector enables.
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-demo",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["Demo"]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "connector.request",
+        target: "demo",
+        reason: "connect demo",
+        payload: {
+          provider: "demo",
+          providerLabel: "Demo",
+          providerDescription: "Demo provider",
+          fields: [],
+          skillId: skill.id,
+          reason: "connect demo",
+          toolCallId: "call_known_complete"
+        }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: {}, scopes: [] })
+    });
+    expect(response.ok).toBe(true);
+    expect(response.connector.provider).toBe("demo");
+
+    const state = readState(config.instance);
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.grantedConnectors).toEqual(["Demo"]);
+    expect(updated?.status).toBe("enabled");
+  });
+
   test("POST /api/setup-requests/<id>/complete on a multi-provider skill grants one provider, stays disabled, and mints the next grant card", async () => {
     const config = testConfig("setup-complete-skill-grant-multi");
     const handler = createHandler(config);
