@@ -97,7 +97,7 @@ describe("watchdog", () => {
     expect(process.exitCode).toBe(0);
   });
 
-  test("web down -> web kickstart + report-crash spawned with a written report file", async () => {
+  test("web down while runtime healthy (recorded port) -> web kickstart + report-crash spawned with a written report file", async () => {
     writePorts();
     const kicks: Array<{ instance: string; kind: PlistKind }> = [];
     const { impl: spawnImpl, calls: spawnCalls } = makeSpawn();
@@ -151,10 +151,12 @@ describe("watchdog", () => {
     expect(process.exitCode).toBe(0);
   });
 
-  test("missing port files -> both treated as down, both kicked, exit 0", async () => {
-    // No writePorts(): the port files are absent.
+  test("missing web port -> kickstart only, NO web crash report (boot race, not a crash)", async () => {
+    // No writePorts(): the port files are absent. A missing web port means the
+    // service never booted (or was stopped) — that's a boot race, not a web
+    // crash, so we kickstart but must NOT file a false-positive issue.
     const kicks: Array<{ instance: string; kind: PlistKind }> = [];
-    const { impl: spawnImpl } = makeSpawn();
+    const { impl: spawnImpl, calls: spawnCalls } = makeSpawn();
     let probedRuntime = false;
     let probedWeb = false;
     await watchdog(ctxFor(), {
@@ -178,6 +180,30 @@ describe("watchdog", () => {
     expect(probedRuntime).toBe(false);
     expect(probedWeb).toBe(false);
     expect(kicks.map((k) => k.kind)).toEqual(["gateway", "web"]);
+    // No web crash report: the missing port is a boot race, not a crash.
+    expect(spawnCalls.length).toBe(0);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("web down WHILE runtime down -> kickstart web, NO web report (symptom, not web crash)", async () => {
+    writePorts();
+    const kicks: Array<{ instance: string; kind: PlistKind }> = [];
+    const { impl: spawnImpl, calls: spawnCalls } = makeSpawn();
+    await watchdog(ctxFor(), {
+      // Runtime is down too — the web BFF failing is just a symptom of the
+      // dead gateway, not a web-specific crash worth its own issue.
+      probeRuntime: async () => false,
+      probeWeb: async () => false,
+      kickstartImpl: (instance, kind) => {
+        kicks.push({ instance, kind });
+        return okLaunchctl;
+      },
+      spawnImpl,
+      supervisorImpl: () => "launchd"
+    });
+    // Both kicked, but no web crash report filed.
+    expect(kicks.map((k) => k.kind)).toEqual(["gateway", "web"]);
+    expect(spawnCalls.length).toBe(0);
     expect(process.exitCode).toBe(0);
   });
 

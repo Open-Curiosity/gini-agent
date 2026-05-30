@@ -120,7 +120,11 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
   // stopped). We can't health-probe it, so treat it as down — kickstart will
   // (re)launch it if it's enabled, and is a graceful no-op otherwise.
   const runtimeOk = runtimePort !== null ? await probeRuntime(runtimePort) : false;
-  const webOk = webPort !== null ? await probeWeb(instance, webPort) : false;
+  // Track whether the web probe actually RAN and FAILED, separate from a
+  // missing port. A missing port is a boot race (or a stopped service), not a
+  // crash — we still kickstart, but we must not file an issue for it.
+  const webProbeFailed = webPort !== null ? !(await probeWeb(instance, webPort)) : false;
+  const webOk = webPort !== null && !webProbeFailed;
 
   const actions: string[] = [];
 
@@ -134,53 +138,64 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
     actions.push("kickstart:gateway");
   }
 
+  // A web crash report is only warranted for a GENUINE web-specific failure:
+  // the web port was recorded (so it had booted), the probe actually failed,
+  // AND the runtime is healthy. A missing port is a boot race; a failed probe
+  // while the runtime is also down is just the symptom of a runtime outage
+  // (the BFF can't reach a dead gateway). Filing in either case produces a
+  // false-positive issue. We still kickstart web below regardless.
+  const shouldReportWebCrash = webPort !== null && webProbeFailed && runtimeOk;
+
   // Web dead/hung -> build a crash report from the web log tails, write it, fire
   // a detached report-crash, then kickstart the web service. The web has no
   // in-process crash handler (decision: web crash coverage is the watchdog), so
   // this is the only place a web outage gets reported.
   if (!webOk) {
-    try {
-      const logTail = [
-        ...readWebLogTail(instance, "web-launchd.err.log"),
-        ...readWebLogTail(instance, "web.log")
-      ];
-      const report = buildCrashReport({
-        instance,
-        supervisor: supervisorImpl(),
-        // No JS Error object for a web outage — synthesize one so the report's
-        // fingerprint/dedup still works. The message is stable so recurrences
-        // collapse to a single issue.
-        error: new Error("web service health probe failed (dead or hung)"),
-        source: "web",
-        logTail,
-        sysInfo: { platform: platform(), arch: arch(), nodeVersion: process.version },
-        clock
-      });
-      const reportPath = writeCrashReportFile(report);
+    if (shouldReportWebCrash) {
+      try {
+        const logTail = [
+          ...readWebLogTail(instance, "web-launchd.err.log"),
+          ...readWebLogTail(instance, "web.log")
+        ];
+        const report = buildCrashReport({
+          instance,
+          supervisor: supervisorImpl(),
+          // No JS Error object for a web outage — synthesize one so the report's
+          // fingerprint/dedup still works. The message is stable so recurrences
+          // collapse to a single issue.
+          error: new Error("web service health probe failed (dead or hung)"),
+          source: "web",
+          logTail,
+          sysInfo: { platform: platform(), arch: arch(), nodeVersion: process.version },
+          clock
+        });
+        const reportPath = writeCrashReportFile(report);
 
-      // Only spawn the filing child when we're under launchd — report-crash
-      // itself gates on this, so spawning when not supervised would just exit
-      // 0 as a no-op. Detached + unref'd so it outlives this short tick.
-      if (supervisorImpl() === "launchd") {
-        try {
-          const child = spawnImpl(
-            process.execPath,
-            ["run", "gini", "report-crash", "--instance", instance, "--report", reportPath],
-            { detached: true, stdio: "ignore", env: { ...process.env, GINI_INSTANCE: instance } }
-          );
-          if (typeof child.unref === "function") child.unref();
-        } catch {
-          // Best-effort: a failed spawn must not block the kickstart below.
+        // Only spawn the filing child when we're under launchd — report-crash
+        // itself gates on this, so spawning when not supervised would just exit
+        // 0 as a no-op. Detached + unref'd so it outlives this short tick.
+        if (supervisorImpl() === "launchd") {
+          try {
+            const child = spawnImpl(
+              process.execPath,
+              ["run", "gini", "report-crash", "--instance", instance, "--report", reportPath],
+              { detached: true, stdio: "ignore", env: { ...process.env, GINI_INSTANCE: instance } }
+            );
+            if (typeof child.unref === "function") child.unref();
+          } catch {
+            // Best-effort: a failed spawn must not block the kickstart below.
+          }
         }
+        actions.push("report:web");
+      } catch {
+        // Building/writing the report must never stop us from reviving web.
       }
-    } catch {
-      // Building/writing the report must never stop us from reviving web.
     }
     kickstartImpl(instance, "web");
     actions.push("kickstart:web");
   }
 
-  appendLog(instance, "watchdog.tick", { webOk, runtimeOk, actions });
+  appendLog(instance, "watchdog.tick", { webOk, runtimeOk, webProbeFailed, shouldReportWebCrash, actions });
 
   // Periodic probe: always succeed so launchd's StartInterval bookkeeping
   // stays clean. Recovery actions are recorded above, not signaled via exit.
