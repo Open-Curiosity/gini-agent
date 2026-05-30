@@ -270,6 +270,29 @@ describe("enable_skill connector-consent gate", () => {
     });
   }
 
+  // The consent gate fires only when a TYPED credential the skill requires
+  // exists (a presence-only connector carries no secret to consent to). Seed a
+  // typed api-key named LINEAR_API_KEY so `firstUngrantedCredential` finds it.
+  async function seedLinearCredential(config: RuntimeConfig) {
+    const at = new Date().toISOString();
+    return mutateState(config.instance, (state) => {
+      state.connectors.push({
+        id: "id_linear_cred",
+        instance: state.instance,
+        name: "LINEAR_API_KEY",
+        provider: "linear",
+        type: "api-key",
+        status: "configured",
+        scopes: [],
+        secretRefs: [{ purpose: "LINEAR_API_KEY", path: `${ROOT}/secret.json` }],
+        createdAt: at,
+        updatedAt: at,
+        health: "healthy",
+        source: "user"
+      });
+    });
+  }
+
   async function seedSkill(config: RuntimeConfig, overrides: Partial<SkillRecord>) {
     return mutateState(config.instance, (state) =>
       createSkill(state, {
@@ -281,7 +304,7 @@ describe("enable_skill connector-consent gate", () => {
         requiredPermissions: [],
         status: "disabled",
         source: "user",
-        requiredConnectors: [{ provider: "linear" }],
+        requiredCredentials: ["LINEAR_API_KEY"],
         ...overrides
       })
     );
@@ -290,6 +313,7 @@ describe("enable_skill connector-consent gate", () => {
   test("enabling a non-bundled credentialed skill mints a grant SetupRequest (pending)", async () => {
     const config = makeConfig("skill-gate-pending");
     const taskId = await seedTaskWithWebSession(config);
+    await seedLinearCredential(config);
     const skill = await seedSkill(config, {});
     const result = await dispatchToolCall(
       config,
@@ -303,9 +327,8 @@ describe("enable_skill connector-consent gate", () => {
     const setup = state.setupRequests.find((s) => s.action === "skill.grant_connector");
     expect(setup).toBeDefined();
     expect(setup?.payload.skillId).toBe(skill.id);
-    // Payload now carries the credential name (transitional fallback returns
-    // the provider as the name when the skill still uses requiredConnectors).
-    expect(setup?.payload.credentialName).toBe("linear");
+    // Payload carries the credential NAME.
+    expect(setup?.payload.credentialName).toBe("LINEAR_API_KEY");
     // Skill must NOT be enabled yet — consent first.
     expect(state.skills.find((s) => s.id === skill.id)?.status).toBe("disabled");
   });
@@ -328,7 +351,7 @@ describe("enable_skill connector-consent gate", () => {
   test("enabling an already-granted credentialed skill enables immediately", async () => {
     const config = makeConfig("skill-gate-granted");
     const taskId = await seedTaskWithWebSession(config);
-    const skill = await seedSkill(config, { name: "granted-skill", grantedConnectors: ["linear"] });
+    const skill = await seedSkill(config, { name: "granted-skill", grantedConnectors: ["LINEAR_API_KEY"] });
     const result = await dispatchToolCall(
       config,
       taskId,
@@ -342,6 +365,7 @@ describe("enable_skill connector-consent gate", () => {
 
   test("enabling a credentialed skill over Telegram returns a sync error (no setup row)", async () => {
     const config = makeConfig("skill-gate-telegram");
+    await seedLinearCredential(config);
     const skill = await seedSkill(config, { name: "tg-skill" });
     const taskId = await mutateState(config.instance, (state) => {
       const session = createChatSession(state, "tg session", {
@@ -373,6 +397,7 @@ describe("enable_skill connector-consent gate", () => {
 
   test("enabling a credentialed skill in a job-origin session returns a sync error (no setup row)", async () => {
     const config = makeConfig("skill-gate-job");
+    await seedLinearCredential(config);
     const skill = await seedSkill(config, { name: "job-skill" });
     const taskId = await mutateState(config.instance, (state) => {
       // Scheduled/headless dedicated job session: origin:"job", no source.
@@ -401,6 +426,7 @@ describe("enable_skill connector-consent gate", () => {
   test("re-entering enable_skill while a grant is pending references the existing request (no duplicate)", async () => {
     const config = makeConfig("skill-gate-dedupe");
     const taskId = await seedTaskWithWebSession(config);
+    await seedLinearCredential(config);
     const skill = await seedSkill(config, {});
     const first = await dispatchToolCall(
       config,
@@ -433,6 +459,7 @@ describe("enable_skill connector-consent gate", () => {
     const config = makeConfig("skill-gate-cross-task");
     const taskA = await seedTaskWithWebSession(config);
     const taskB = await seedTaskWithWebSession(config);
+    await seedLinearCredential(config);
     const skill = await seedSkill(config, {});
 
     const first = await dispatchToolCall(

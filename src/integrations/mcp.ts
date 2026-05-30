@@ -2,7 +2,7 @@ import type { McpServerRecord, RuntimeConfig } from "../types";
 import { addAudit, appendEvent, createMcpServerRecord, mutateState, now, readState } from "../state";
 import { spawn } from "bun";
 import { bindingsForCredentials, envBindingsForProviders, resolveConnectorSecret } from "./connectors";
-import { getProvider, listProviders } from "./connectors/registry";
+import { listProviders } from "./connectors/registry";
 import { httpMcpCallTool, httpMcpInitialize, httpMcpListTools, resolveHeaderValue } from "./mcp-http";
 
 export async function addMcpServer(config: RuntimeConfig, input: Record<string, unknown>) {
@@ -160,28 +160,30 @@ export async function removeMcpServer(config: RuntimeConfig, idOrName: string) {
 }
 
 // Resolve each header value's `${VAR}` placeholders against the union of:
-//  - active connector secrets (via envBindingsForProviders), and
-//  - process.env (fallback ONLY for vars no provider claims as a secret
-//    envBinding).
+//  - live typed-credential secrets (resolved BY NAME), and
+//  - process.env (fallback ONLY for vars no credential or provider claims as
+//    a secret).
 // Throws when any placeholder can't resolve so the caller surfaces a
 // "missing credential" error before the request goes out.
 //
 // Two trust properties this function preserves:
 //
-//  1. Probe-based providers (e.g. `linear`) must have `health === "healthy"`
-//     to contribute their secret. A freshly-created, never-probed second
-//     connector with a bad token must not supply credentials to an MCP row
-//     that an older healthy connector originally enabled. (Mirrors the same
-//     gate in `isSkillActive` and `resolveSkillEnv`.)
+//  1. Probe-based credentials (e.g. the LINEAR_API_KEY credential) must have
+//     `health === "healthy"` to contribute their secret. A freshly-created,
+//     never-probed second connector with a bad token must not supply
+//     credentials to an MCP row that an older healthy credential originally
+//     enabled. (`bindingsForCredentials` applies the same usability guard as
+//     `isSkillActive` and `resolveSkillEnv`.)
 //
-//  2. Variables that any provider declares as a secret envBinding can ONLY
-//     be supplied by a live connector. Falling back to `process.env` for
-//     these would silently keep an MCP row authenticated after the
-//     connector is deleted/disabled (the user's shell still exports
-//     `LINEAR_API_KEY`), bypassing the `connector.secret.use` audit. We
-//     still permit `process.env` for vars no provider owns (e.g.
-//     `MCP-Protocol-Version`-style passthrough that the user wired by hand
-//     into the header map).
+//  2. Variables that any credential OR provider claims as a secret can ONLY be
+//     supplied by a live credential. Falling back to `process.env` for these
+//     would silently keep an MCP row authenticated after the credential is
+//     deleted/disabled (the user's shell still exports `LINEAR_API_KEY`),
+//     bypassing the `connector.secret.use` audit. The provider-declared set is
+//     kept in the block-list (not as a resolution source) so a deleted
+//     credential can never be quietly replaced by the operator's shell. We
+//     still permit `process.env` for vars nothing owns (e.g.
+//     `MCP-Protocol-Version`-style passthrough wired into the header by hand).
 export async function resolveMcpHeaders(
   config: RuntimeConfig,
   server: McpServerRecord,
@@ -190,44 +192,28 @@ export async function resolveMcpHeaders(
   const raw = server.headers ?? {};
   if (Object.keys(raw).length === 0) return {};
   const state = readState(config.instance);
-  // Resolve live credential secrets into `env`. Two sources, name-based first:
-  //   1. Typed credentials (api-key/oauth2) resolved by NAME via
-  //      `bindingsForCredentials` — api-key env var == credential name (so
-  //      `${LINEAR_API_KEY}` resolves against the credential named
-  //      LINEAR_API_KEY), oauth2 materializes each metadata.envMap entry.
-  //   2. Transitional provider env bindings (removed by the migration commit)
-  //      for un-migrated connectors that still lack a name/type — fills any
-  //      env var the name-based pass didn't cover so today's linear MCP row
-  //      keeps resolving before migration.
+  // Resolve live credential secrets into `env`, name-based: typed credentials
+  // (api-key/oauth2) resolved by NAME via `bindingsForCredentials` — api-key
+  // env var == credential name (so `${LINEAR_API_KEY}` resolves against the
+  // credential named LINEAR_API_KEY), oauth2 materializes each metadata.envMap
+  // entry.
   const typedNames = state.connectors.filter((c) => c.type).map((c) => c.name);
   const credentialBindings = bindingsForCredentials(state, typedNames);
-  const providerBindings = envBindingsForProviders(listProviders().map((p) => p.id));
-  // Block-list: every env var ANY provider OR typed credential CLAIMS, whether
-  // or not a connector currently resolves it. These can ONLY be supplied by a
-  // live credential, never by process.env — so deleting/disabling a connector
-  // can't leave an MCP row authenticated from the operator's shell (which
-  // would bypass the connector.secret.use audit). A claimed-but-unresolved var
-  // therefore stays unresolved and surfaces a "missing credential" error.
+  // Block-list: every env var ANY typed credential resolves OR any provider
+  // declares as a secret. These can ONLY be supplied by a live credential,
+  // never by process.env — so deleting/disabling a credential can't leave an
+  // MCP row authenticated from the operator's shell (which would bypass the
+  // connector.secret.use audit). The provider-declared set is a defense-in-
+  // depth guard, NOT a resolution source: a claimed-but-unresolved var stays
+  // unresolved and surfaces a "missing credential" error.
+  const providerClaimedVars = Object.keys(envBindingsForProviders(listProviders().map((p) => p.id)));
   const claimedVars = new Set<string>([
     ...Object.keys(credentialBindings),
-    ...Object.keys(providerBindings)
+    ...providerClaimedVars
   ]);
   const env: Record<string, string> = {};
   for (const [envName, binding] of Object.entries(credentialBindings)) {
     const value = await resolveConnectorSecret(config, binding.credentialId, binding.purpose, taskId);
-    if (value) env[envName] = value;
-  }
-  for (const [envName, binding] of Object.entries(providerBindings)) {
-    if (envName in env) continue;
-    const hasProbe = Boolean(getProvider(binding.provider)?.probe);
-    const match = state.connectors.find(
-      (c) =>
-        c.provider === binding.provider
-        && c.status === "configured"
-        && (c.health === "healthy" || (!hasProbe && c.health === "unknown"))
-    );
-    if (!match) continue;
-    const value = await resolveConnectorSecret(config, match.id, binding.purpose, taskId);
     if (value) env[envName] = value;
   }
   // Build the resolution env per header: connector-bound vars come ONLY

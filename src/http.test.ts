@@ -893,6 +893,8 @@ describe("runtime api", () => {
     const config = testConfig("setup-complete-skill-grant-multi");
     const handler = createHandler(config);
     const { createSetupRequest, createSkill } = await import("./state");
+    await seedTypedCredential(config, "LINEAR_API_KEY", "linear");
+    await seedTypedCredential(config, "GENERIC_KEY", "generic");
     const skill = await mutateState(config.instance, (state) =>
       createSkill(state, {
         name: "needs-two",
@@ -903,7 +905,7 @@ describe("runtime api", () => {
         requiredPermissions: [],
         status: "disabled",
         source: "user",
-        requiredConnectors: [{ provider: "linear" }, { provider: "generic" }]
+        requiredCredentials: ["LINEAR_API_KEY", "GENERIC_KEY"]
       })
     );
     const approval = await mutateState(config.instance, (state) =>
@@ -914,7 +916,7 @@ describe("runtime api", () => {
         payload: {
           skillId: skill.id,
           skillName: skill.name,
-          credentialName: "linear",
+          credentialName: "LINEAR_API_KEY",
           credentialLabel: "Linear",
           toolCallId: "call_grant_multi"
         }
@@ -931,13 +933,13 @@ describe("runtime api", () => {
     const resolved = state.setupRequests.find((a) => a.id === approval.id);
     expect(resolved?.status).toBe("completed");
     const updated = state.skills.find((s) => s.id === skill.id);
-    // Only the first provider is granted; the skill stays disabled until the
-    // remaining credentialed provider is granted too.
-    expect(updated?.grantedConnectors).toEqual(["linear"]);
+    // Only the first credential is granted; the skill stays disabled until the
+    // remaining credential is granted too.
+    expect(updated?.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
     expect(updated?.status).toBe("disabled");
-    // A new pending grant card was minted for the remaining provider.
+    // A new pending grant card was minted for the remaining credential.
     const next = state.setupRequests.find(
-      (s) => s.status === "pending" && s.action === "skill.grant_connector" && s.payload.credentialName === "generic"
+      (s) => s.status === "pending" && s.action === "skill.grant_connector" && s.payload.credentialName === "GENERIC_KEY"
     );
     expect(next).toBeDefined();
     expect(next?.payload.skillId).toBe(skill.id);
@@ -947,6 +949,8 @@ describe("runtime api", () => {
     const config = testConfig("setup-complete-skill-grant-double");
     const handler = createHandler(config);
     const { createSetupRequest, createSkill } = await import("./state");
+    await seedTypedCredential(config, "LINEAR_API_KEY", "linear");
+    await seedTypedCredential(config, "GENERIC_KEY", "generic");
     const skill = await mutateState(config.instance, (state) =>
       createSkill(state, {
         name: "needs-two-double",
@@ -957,7 +961,7 @@ describe("runtime api", () => {
         requiredPermissions: [],
         status: "disabled",
         source: "user",
-        requiredConnectors: [{ provider: "linear" }, { provider: "generic" }]
+        requiredCredentials: ["LINEAR_API_KEY", "GENERIC_KEY"]
       })
     );
     const approval = await mutateState(config.instance, (state) =>
@@ -968,7 +972,7 @@ describe("runtime api", () => {
         payload: {
           skillId: skill.id,
           skillName: skill.name,
-          credentialName: "linear",
+          credentialName: "LINEAR_API_KEY",
           credentialLabel: "Linear",
           toolCallId: "call_grant_double"
         }
@@ -994,10 +998,10 @@ describe("runtime api", () => {
     const state = readState(config.instance);
     const resolved = state.setupRequests.find((s) => s.id === approval.id);
     expect(resolved?.status).toBe("completed");
-    // Exactly one next card for the remaining provider — no duplicate from the
-    // losing racer.
+    // Exactly one next card for the remaining credential — no duplicate from
+    // the losing racer.
     const next = state.setupRequests.filter(
-      (s) => s.status === "pending" && s.action === "skill.grant_connector" && s.payload.credentialName === "generic"
+      (s) => s.status === "pending" && s.action === "skill.grant_connector" && s.payload.credentialName === "GENERIC_KEY"
     );
     expect(next.length).toBe(1);
     // No stray pending grant rows beyond that single next card.
@@ -3628,6 +3632,28 @@ function testConfig(instance: string): RuntimeConfig {
     // are exercised in approval-mode.test.ts.
     approvalMode: "strict"
   };
+}
+
+// Seed a typed api-key credential so the per-(skill, credential) consent gate
+// (firstUngrantedCredential) treats it as carrying a secret that needs consent.
+async function seedTypedCredential(config: RuntimeConfig, name: string, provider: string) {
+  const at = new Date().toISOString();
+  await mutateState(config.instance, (state) => {
+    state.connectors.push({
+      id: `id_${name}`,
+      instance: state.instance,
+      name,
+      provider,
+      type: "api-key",
+      status: "configured",
+      scopes: [],
+      secretRefs: [{ purpose: name, path: `/tmp/${name}.json` }],
+      createdAt: at,
+      updatedAt: at,
+      health: "healthy",
+      source: "user"
+    });
+  });
 }
 
 async function waitForTask(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, taskId: string) {

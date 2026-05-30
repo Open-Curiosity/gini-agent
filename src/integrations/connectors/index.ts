@@ -439,29 +439,17 @@ function connectorIsUsable(connector: ConnectorRecord): boolean {
 // skills out of its available-skills set; the UI still shows them so users
 // can see what's missing.
 //
-// Name-based primary path: a required credential NAME is satisfied when a
-// usable connector with that `name` exists. Transitional fallback (removed
-// by the migration commit): skills that still declare `requiredConnectors`
-// (un-migrated, no `requiredCredentials`) match by provider instead, so the
-// current suite/behavior doesn't regress mid-refactor.
+// Name-based: a required credential NAME is satisfied when a usable connector
+// with that `name` exists. A skill that declares no `requiredCredentials` has
+// no credential gate (the legacy `requires.connectors` form is mapped to
+// credential names at load time — see LEGACY_CONNECTOR_CREDENTIAL_NAMES in
+// skill-loader.ts).
 export function isSkillActive(state: RuntimeState, skill: SkillRecord): boolean {
   if (skill.validationStatus === "unsupported") return false;
   const credentials = skill.requiredCredentials ?? [];
-  if (credentials.length > 0) {
-    for (const name of credentials) {
-      const match = state.connectors.find(
-        (candidate) => candidate.name === name && connectorIsUsable(candidate)
-      );
-      if (!match) return false;
-    }
-    return true;
-  }
-  // Transitional: un-migrated skills keyed by provider.
-  const required = skill.requiredConnectors ?? [];
-  if (required.length === 0) return true;
-  for (const requirement of required) {
+  for (const name of credentials) {
     const match = state.connectors.find(
-      (candidate) => candidate.provider === requirement.provider && connectorIsUsable(candidate)
+      (candidate) => candidate.name === name && connectorIsUsable(candidate)
     );
     if (!match) return false;
   }
@@ -527,38 +515,23 @@ export function bindingsForCredentials(
 // The first required credential a non-bundled skill needs the user to grant
 // before it can be enabled — or `undefined` when every credentialed
 // requirement is already granted. A requirement needs consent only when it
-// "carries a secret": for name-based skills, the named connector has a `type`
-// (api-key/oauth2); presence-only connectors (no type, no env) leak nothing.
-// Shared by setSkillStatusTool (initial gate) and the /complete grant branch
-// (next-card mint) so both stay in lockstep.
-//
-// Transitional fallback (removed by the migration commit): skills still keyed
-// by `requiredConnectors` gate on the provider — a provider carries a
-// credential when its module declares a secrets spec, or it is the generic
-// escape-hatch provider (whose secrets are per-record).
+// "carries a secret": the named connector has a `type` (api-key/oauth2);
+// presence-only connectors (no type, no env) leak nothing. Shared by
+// setSkillStatusTool (initial gate) and the /complete grant branch (next-card
+// mint) so both stay in lockstep. Name-based only — the legacy
+// `requires.connectors` form is mapped to credential names at load time.
 export function firstUngrantedCredential(
   state: RuntimeState,
   skill: SkillRecord
 ): { name: string; label: string } | undefined {
   const granted = skill.grantedConnectors ?? [];
-  const credentials = skill.requiredCredentials ?? [];
-  if (credentials.length > 0) {
-    for (const name of credentials) {
-      if (granted.includes(name)) continue;
-      const connector = state.connectors.find((c) => c.name === name);
-      // Only typed credentials carry a secret that needs consent.
-      if (!connector?.type) continue;
-      const label = getProvider(connector.provider)?.label ?? name;
-      return { name, label };
-    }
-    return undefined;
-  }
-  for (const requirement of skill.requiredConnectors ?? []) {
-    const p = requirement.provider;
-    if (granted.includes(p)) continue;
-    if (p === "generic" || Boolean(getProvider(p)?.secrets)) {
-      return { name: p, label: getProvider(p)?.label ?? p };
-    }
+  for (const name of skill.requiredCredentials ?? []) {
+    if (granted.includes(name)) continue;
+    const connector = state.connectors.find((c) => c.name === name);
+    // Only typed credentials carry a secret that needs consent.
+    if (!connector?.type) continue;
+    const label = getProvider(connector.provider)?.label ?? name;
+    return { name, label };
   }
   return undefined;
 }
@@ -586,95 +559,34 @@ export async function resolveSkillEnv(
   // bundled short-circuit means bundled skills never need a written grant.
   const bundled = (skill.source ?? "user") === "bundled";
 
+  // Name-based resolution. Each env var resolves through
+  // `bindingsForCredentials`, which already applies the configured+healthy
+  // guard. The grant gate keys on the credential NAME: api-key credentials
+  // have env var == name; oauth2 credentials map several env vars to one name
+  // (the credential id ties an env var back to its owning credential name for
+  // the gate). A skill with no `requiredCredentials` resolves nothing — the
+  // legacy `requires.connectors` form is mapped to credential names at load
+  // time (see LEGACY_CONNECTOR_CREDENTIAL_NAMES in skill-loader.ts), so there
+  // is no provider-keyed resolution path left here.
   const credentials = skill.requiredCredentials ?? [];
-  if (credentials.length > 0) {
-    // Name-based path. Each env var resolves through `bindingsForCredentials`,
-    // which already applies the configured+healthy guard. The grant gate keys
-    // on the credential NAME: api-key credentials have env var == name; oauth2
-    // credentials map several env vars to one name (the credential id ties an
-    // env var back to its owning credential name for the gate).
-    const idToName = new Map<string, string>();
-    for (const name of credentials) {
-      const connector = state.connectors.find(
-        (candidate) => candidate.name === name && connectorIsUsable(candidate)
-      );
-      if (connector) idToName.set(connector.id, name);
-    }
-    const granted = (name: string): boolean =>
-      bundled || (skill.grantedConnectors?.includes(name) ?? false);
-    const bindings = bindingsForCredentials(state, credentials);
-    const out: Record<string, string> = {};
-    for (const envName of envNames) {
-      const binding = bindings[envName];
-      if (!binding) continue;
-      const credentialName = idToName.get(binding.credentialId);
-      if (!credentialName || !granted(credentialName)) continue;
-      const value = await resolveConnectorSecret(config, binding.credentialId, binding.purpose, taskId);
-      if (value) out[envName] = value;
-    }
-    return out;
+  if (credentials.length === 0) return {};
+  const idToName = new Map<string, string>();
+  for (const name of credentials) {
+    const connector = state.connectors.find(
+      (candidate) => candidate.name === name && connectorIsUsable(candidate)
+    );
+    if (connector) idToName.set(connector.id, name);
   }
-
-  // Transitional fallback (removed by the migration commit): un-migrated
-  // skills still declare `requiredConnectors` (providers) and connectors are
-  // still provider-keyed with no `name`/`type`. Resolve against the provider
-  // env bindings so current behavior/tests don't regress until the migration
-  // makes every record typed + named.
-  const required = skill.requiredConnectors ?? [];
-  if (required.length === 0) return {};
-  const providers = required.map((r) => r.provider);
-  const requiresGeneric = providers.includes("generic");
-  const bindings = envBindingsForProviders(providers);
-  const providerGranted = (provider: string): boolean =>
-    bundled || (skill.grantedConnectors?.includes(provider) ?? false);
+  const granted = (name: string): boolean =>
+    bundled || (skill.grantedConnectors?.includes(name) ?? false);
+  const bindings = bindingsForCredentials(state, credentials);
   const out: Record<string, string> = {};
   for (const envName of envNames) {
     const binding = bindings[envName];
-    if (binding) {
-      if (!providerGranted(binding.provider)) continue;
-      // Same status guard as isSkillActive: a `disabled` or `error` record
-      // with a stale `health: "healthy"` from a prior probe must not leak
-      // its secret into the spawn env.
-      const connector = state.connectors.find(
-        (candidate) =>
-          candidate.provider === binding.provider
-          && candidate.status === "configured"
-          && candidate.health === "healthy"
-      );
-      if (!connector) continue;
-      const value = await resolveConnectorSecret(config, connector.id, binding.purpose, taskId);
-      if (value) out[envName] = value;
-      continue;
-    }
-    // The `generic` provider has no static `envBindings`, so a user-supplied
-    // key never resolves through the native path above. Treat each generic
-    // connector's secret field name as its own env binding: a declared env
-    // name resolves from a configured+healthy generic connector that stores
-    // a secret whose `purpose` matches the name verbatim (the field name the
-    // user gave the secret == the declared `prerequisites.env` name). Same
-    // status/health guard as native providers.
-    if (!requiresGeneric) continue;
-    if (!providerGranted("generic")) continue;
-    // Fail safe on ambiguity: if two configured+healthy generic connectors
-    // both store a secret field named `envName`, we cannot know which the user
-    // meant, so inject NOTHING for that var rather than guessing the wrong
-    // credential.
-    const matches = state.connectors.filter(
-      (candidate) =>
-        candidate.provider === "generic"
-        && candidate.status === "configured"
-        && candidate.health === "healthy"
-        && candidate.secretRefs.some((ref) => ref.purpose === envName)
-    );
-    if (matches.length === 0) continue;
-    if (matches.length > 1) {
-      appendLog(config.instance, "connector.generic.ambiguous_env", {
-        envName,
-        connectorIds: matches.map((c) => c.id)
-      });
-      continue;
-    }
-    const value = await resolveConnectorSecret(config, matches[0].id, envName, taskId);
+    if (!binding) continue;
+    const credentialName = idToName.get(binding.credentialId);
+    if (!credentialName || !granted(credentialName)) continue;
+    const value = await resolveConnectorSecret(config, binding.credentialId, binding.purpose, taskId);
     if (value) out[envName] = value;
   }
   return out;

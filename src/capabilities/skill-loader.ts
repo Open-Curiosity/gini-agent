@@ -30,6 +30,20 @@ import { addAudit, appendEvent, createSkill, mutateState, now } from "../state";
 import { projectRoot, skillsDir } from "../paths";
 import { hasProvider } from "../integrations/connectors/registry";
 
+// Backward-compat table for skills that still declare the legacy
+// `requires.connectors: [{ provider }]` form instead of name-based
+// `requires.credentials`. Maps the two template providers to the credential
+// names the state migration assigns them, so an un-migrated external/user
+// SKILL.md keeps resolving for one release. Runtime resolution is purely
+// name-based; the loader derives `requiredCredentials` from this table.
+// Mirror of the literal mapping in migrateConnectorsToTypedCredentials
+// (src/state/store.ts). `generic` and unknown providers have no canonical
+// name — those skills should adopt `requires.credentials` directly.
+const LEGACY_CONNECTOR_CREDENTIAL_NAMES: Record<string, string> = {
+  linear: "LINEAR_API_KEY",
+  "google-oauth-desktop": "google-workspace-oauth"
+};
+
 export interface ParsedSkillFile {
   name: string;
   description: string;
@@ -367,6 +381,18 @@ export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFi
       }
       requiredConnectors = collected;
     }
+  }
+
+  // Backward-compat: a skill that still declares only the legacy
+  // `requires.connectors` form gets its `requiredCredentials` derived from the
+  // provider→name table so runtime resolution (purely name-based) keeps
+  // working for one release. Only template providers map; `generic`/unknown
+  // providers carry no canonical name and are dropped from the derived list.
+  if (!requiredCredentials && requiredConnectors && requiredConnectors.length > 0) {
+    const derived = requiredConnectors
+      .map((req) => LEGACY_CONNECTOR_CREDENTIAL_NAMES[req.provider])
+      .filter((name): name is string => Boolean(name));
+    if (derived.length > 0) requiredCredentials = derived;
   }
 
   // One-shot deprecation warnings for the legacy top-level Gini fields.

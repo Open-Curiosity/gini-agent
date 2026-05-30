@@ -109,6 +109,50 @@ describe("skill-loader frontmatter parsing", () => {
     // A credential-name skill carries no legacy requiredConnectors.
     expect(parsed.requiredConnectors).toBeUndefined();
   });
+
+  test("parseSkillFile derives requiredCredentials from legacy requires.connectors (template providers)", () => {
+    const text = [
+      "---",
+      "name: legacy-linear",
+      'description: "Legacy connector form."',
+      "metadata:",
+      "  gini:",
+      "    requires:",
+      "      connectors:",
+      "        - provider: linear",
+      "        - provider: google-oauth-desktop",
+      "---",
+      "",
+      "# Legacy"
+    ].join("\n");
+    const parsed = parseSkillFile(text);
+    // The legacy connectors are still parsed (kept one release)...
+    expect(parsed.requiredConnectors).toEqual([
+      { provider: "linear" },
+      { provider: "google-oauth-desktop" }
+    ]);
+    // ...and mapped to credential names so runtime resolution stays name-based.
+    expect(parsed.requiredCredentials).toEqual(["LINEAR_API_KEY", "google-workspace-oauth"]);
+  });
+
+  test("parseSkillFile drops un-mappable providers (generic) from derived requiredCredentials", () => {
+    const text = [
+      "---",
+      "name: legacy-generic",
+      'description: "Legacy generic connector."',
+      "metadata:",
+      "  gini:",
+      "    requires:",
+      "      connectors:",
+      "        - provider: generic",
+      "---",
+      "",
+      "# Legacy"
+    ].join("\n");
+    const parsed = parseSkillFile(text);
+    // generic has no canonical credential name — no derived credentials.
+    expect(parsed.requiredCredentials).toBeUndefined();
+  });
 });
 
 describe("loadSkillsFromDisk", () => {

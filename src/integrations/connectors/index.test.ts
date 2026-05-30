@@ -56,39 +56,44 @@ function newConnector(overrides: Partial<ConnectorRecord>): ConnectorRecord {
 }
 
 describe("isSkillActive", () => {
-  test("returns true when the skill has no required connectors", () => {
+  // Name-based: a skill is active iff every `requiredCredentials` name maps to
+  // a configured + healthy connector. The connector keeps its `provider` so the
+  // usability guard can consult the module's probe (linear probes; demo does
+  // not), but the gate matches on `name`.
+
+  test("returns true when the skill has no required credentials", () => {
     const state = createEmptyState("dev");
     state.connectors = [];
-    const skill = newSkill({ requiredConnectors: [] });
+    const skill = newSkill({ requiredCredentials: [] });
     expect(isSkillActive(state, skill)).toBe(true);
   });
 
-  test("returns true when every required provider has a healthy connector", () => {
+  test("returns true when every required credential has a healthy connector", () => {
     const state = createEmptyState("dev");
-    state.connectors = [newConnector({ provider: "linear", health: "healthy" })];
-    const skill = newSkill({ requiredConnectors: [{ provider: "linear" }] });
+    state.connectors = [newConnector({ name: "LINEAR_API_KEY", type: "api-key", provider: "linear", health: "healthy" })];
+    const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
     expect(isSkillActive(state, skill)).toBe(true);
   });
 
   test("returns false when the matching connector is unhealthy", () => {
     const state = createEmptyState("dev");
-    state.connectors = [newConnector({ provider: "linear", health: "unhealthy" })];
-    const skill = newSkill({ requiredConnectors: [{ provider: "linear" }] });
+    state.connectors = [newConnector({ name: "LINEAR_API_KEY", type: "api-key", provider: "linear", health: "unhealthy" })];
+    const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
     expect(isSkillActive(state, skill)).toBe(false);
   });
 
-  test("returns false when no connector of the required provider exists", () => {
+  test("returns false when no connector with the required name exists", () => {
     const state = createEmptyState("dev");
-    state.connectors = [newConnector({ provider: "github", health: "healthy" })];
-    const skill = newSkill({ requiredConnectors: [{ provider: "linear" }] });
+    state.connectors = [newConnector({ name: "OTHER_KEY", type: "api-key", provider: "linear", health: "healthy" })];
+    const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
     expect(isSkillActive(state, skill)).toBe(false);
   });
 
   test("returns false when a skill is marked unsupported", () => {
     const state = createEmptyState("dev");
-    state.connectors = [newConnector({ provider: "linear", health: "healthy" })];
+    state.connectors = [newConnector({ name: "LINEAR_API_KEY", type: "api-key", provider: "linear", health: "healthy" })];
     const skill = newSkill({
-      requiredConnectors: [{ provider: "linear" }],
+      requiredCredentials: ["LINEAR_API_KEY"],
       validationStatus: "unsupported",
       validationMessage: "Unknown provider in source"
     });
@@ -98,16 +103,16 @@ describe("isSkillActive", () => {
   test("treats unknown health as inactive when the provider has a probe", () => {
     const state = createEmptyState("dev");
     // Linear has a probe; an unprobed connector should not satisfy the gate.
-    state.connectors = [newConnector({ provider: "linear", health: "unknown" })];
-    const skill = newSkill({ requiredConnectors: [{ provider: "linear" }] });
+    state.connectors = [newConnector({ name: "LINEAR_API_KEY", type: "api-key", provider: "linear", health: "unknown" })];
+    const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
     expect(isSkillActive(state, skill)).toBe(false);
   });
 
   test("treats unknown health as active when the provider has no probe", () => {
     const state = createEmptyState("dev");
     // The "demo" provider declares no probe — presence is enough.
-    state.connectors = [newConnector({ provider: "demo", health: "unknown" })];
-    const skill = newSkill({ requiredConnectors: [{ provider: "demo" }] });
+    state.connectors = [newConnector({ name: "DEMO_KEY", type: "api-key", provider: "demo", health: "unknown" })];
+    const skill = newSkill({ requiredCredentials: ["DEMO_KEY"] });
     expect(isSkillActive(state, skill)).toBe(true);
   });
 
@@ -116,22 +121,22 @@ describe("isSkillActive", () => {
     // "healthy"` from before they disabled it (or a probe job that ran
     // anyway) must not let dependent skills activate behind their back.
     const state = createEmptyState("dev");
-    state.connectors = [newConnector({ provider: "linear", status: "disabled", health: "healthy" })];
-    const skill = newSkill({ requiredConnectors: [{ provider: "linear" }] });
+    state.connectors = [newConnector({ name: "LINEAR_API_KEY", type: "api-key", provider: "linear", status: "disabled", health: "healthy" })];
+    const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
     expect(isSkillActive(state, skill)).toBe(false);
   });
 
   test("error-status connector does NOT satisfy a skill even if a probe later returns healthy", () => {
     const state = createEmptyState("dev");
-    state.connectors = [newConnector({ provider: "linear", status: "error", health: "healthy" })];
-    const skill = newSkill({ requiredConnectors: [{ provider: "linear" }] });
+    state.connectors = [newConnector({ name: "LINEAR_API_KEY", type: "api-key", provider: "linear", status: "error", health: "healthy" })];
+    const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
     expect(isSkillActive(state, skill)).toBe(false);
   });
 
   test("disabled connector does NOT satisfy a no-probe provider either", () => {
     const state = createEmptyState("dev");
-    state.connectors = [newConnector({ provider: "demo", status: "disabled", health: "unknown" })];
-    const skill = newSkill({ requiredConnectors: [{ provider: "demo" }] });
+    state.connectors = [newConnector({ name: "DEMO_KEY", type: "api-key", provider: "demo", status: "disabled", health: "unknown" })];
+    const skill = newSkill({ requiredCredentials: ["DEMO_KEY"] });
     expect(isSkillActive(state, skill)).toBe(false);
   });
 });
@@ -155,12 +160,14 @@ describe("resolveSkillEnv", () => {
       stateRoot: `${ROOT}/${instance}`,
       logRoot: `${ROOT}/${instance}/logs`
     };
-    const ref = writeSecret(instance, "id_disabled", "token", "leaked-token");
+    const ref = writeSecret(instance, "id_disabled", "LINEAR_API_KEY", "leaked-token");
     await mutateState(instance, (state) => {
       state.connectors.push(newConnector({
         id: "id_disabled",
         instance,
         provider: "linear",
+        type: "api-key",
+        name: "LINEAR_API_KEY",
         status: "disabled",
         health: "healthy",
         secretRefs: [ref]
@@ -168,7 +175,7 @@ describe("resolveSkillEnv", () => {
     });
     const skill = newSkill({
       source: "bundled",
-      requiredConnectors: [{ provider: "linear" }],
+      requiredCredentials: ["LINEAR_API_KEY"],
       prerequisites: { env: ["LINEAR_API_KEY"] }
     });
     const env = await resolveSkillEnv(config, skill);
@@ -213,12 +220,12 @@ describe("resolveSkillEnv", () => {
     expect(env).toEqual({ LINEAR_API_KEY: "real-token" });
   });
 
-  // The `generic` provider has no static envBindings, so a user-supplied
-  // key resolves by treating each generic connector's secret field name as
-  // its own env binding (verbatim match against the declared
-  // prerequisites.env name).
+  // A generic credential migrates to an api-key named by its field purpose
+  // (single secret) or an oauth2 with an identity envMap (2+ secrets). After
+  // migration, resolution is name-based — these tests use that post-migration
+  // shape directly.
 
-  test("generic connector injects a secret named like the declared env var", async () => {
+  test("generic api-key injects the secret under its name == declared env var", async () => {
     const instance = "resolve-generic";
     const config = {
       instance,
@@ -235,6 +242,8 @@ describe("resolveSkillEnv", () => {
         id: "id_generic",
         instance,
         provider: "generic",
+        type: "api-key",
+        name: "MY_API_KEY",
         status: "configured",
         health: "healthy",
         secretRefs: [ref]
@@ -242,14 +251,14 @@ describe("resolveSkillEnv", () => {
     });
     const skill = newSkill({
       source: "bundled",
-      requiredConnectors: [{ provider: "generic" }],
+      requiredCredentials: ["MY_API_KEY"],
       prerequisites: { env: ["MY_API_KEY"] }
     });
     const env = await resolveSkillEnv(config, skill);
     expect(env).toEqual({ MY_API_KEY: "generic-real" });
   });
 
-  test("generic secret fields NOT in prerequisites.env do not leak into the env", async () => {
+  test("oauth2 env vars NOT in prerequisites.env do not leak into the env", async () => {
     const instance = "resolve-generic-extra";
     const config = {
       instance,
@@ -267,14 +276,17 @@ describe("resolveSkillEnv", () => {
         id: "id_generic",
         instance,
         provider: "generic",
+        type: "oauth2",
+        name: "my-generic-oauth",
         status: "configured",
         health: "healthy",
-        secretRefs: [wanted, extra]
+        secretRefs: [wanted, extra],
+        metadata: { envMap: { MY_API_KEY: "MY_API_KEY", OTHER_SECRET: "OTHER_SECRET" } }
       }));
     });
     const skill = newSkill({
       source: "bundled",
-      requiredConnectors: [{ provider: "generic" }],
+      requiredCredentials: ["my-generic-oauth"],
       prerequisites: { env: ["MY_API_KEY"] }
     });
     const env = await resolveSkillEnv(config, skill);
@@ -282,7 +294,7 @@ describe("resolveSkillEnv", () => {
     expect(env).not.toHaveProperty("OTHER_SECRET");
   });
 
-  test("disabled generic connector does NOT inject its secret", async () => {
+  test("disabled generic credential does NOT inject its secret", async () => {
     const instance = "resolve-generic-disabled";
     const config = {
       instance,
@@ -299,6 +311,8 @@ describe("resolveSkillEnv", () => {
         id: "id_generic",
         instance,
         provider: "generic",
+        type: "api-key",
+        name: "MY_API_KEY",
         status: "disabled",
         health: "healthy",
         secretRefs: [ref]
@@ -306,55 +320,11 @@ describe("resolveSkillEnv", () => {
     });
     const skill = newSkill({
       source: "bundled",
-      requiredConnectors: [{ provider: "generic" }],
+      requiredCredentials: ["MY_API_KEY"],
       prerequisites: { env: ["MY_API_KEY"] }
     });
     const env = await resolveSkillEnv(config, skill);
     expect(env).toEqual({});
-  });
-
-  test("two generic connectors with the same secret field name skip that env var (fail safe), leaving others unaffected", async () => {
-    const instance = "resolve-generic-ambiguous";
-    const config = {
-      instance,
-      port: 0,
-      token: "t",
-      provider: { name: "echo" as const, model: "echo" },
-      workspaceRoot: `${ROOT}/${instance}/workspace`,
-      stateRoot: `${ROOT}/${instance}`,
-      logRoot: `${ROOT}/${instance}/logs`
-    };
-    // Two healthy generic connectors both store MY_API_KEY — ambiguous, must
-    // resolve to nothing. A second, unambiguous field (OTHER_KEY) still works.
-    const dupA = writeSecret(instance, "id_generic_a", "MY_API_KEY", "value-a");
-    const dupB = writeSecret(instance, "id_generic_b", "MY_API_KEY", "value-b");
-    const other = writeSecret(instance, "id_generic_b", "OTHER_KEY", "other-real");
-    await mutateState(instance, (state) => {
-      state.connectors.push(newConnector({
-        id: "id_generic_a",
-        instance,
-        provider: "generic",
-        status: "configured",
-        health: "healthy",
-        secretRefs: [dupA]
-      }));
-      state.connectors.push(newConnector({
-        id: "id_generic_b",
-        instance,
-        provider: "generic",
-        status: "configured",
-        health: "healthy",
-        secretRefs: [dupB, other]
-      }));
-    });
-    const skill = newSkill({
-      source: "bundled",
-      requiredConnectors: [{ provider: "generic" }],
-      prerequisites: { env: ["MY_API_KEY", "OTHER_KEY"] }
-    });
-    const env = await resolveSkillEnv(config, skill);
-    expect(env).toEqual({ OTHER_KEY: "other-real" });
-    expect(env).not.toHaveProperty("MY_API_KEY");
   });
 
   // Per-(skill, connector) consent gate (ADR skill-connector-consent.md). A
@@ -372,12 +342,14 @@ describe("resolveSkillEnv", () => {
       stateRoot: `${ROOT}/${instance}`,
       logRoot: `${ROOT}/${instance}/logs`
     };
-    const ref = writeSecret(instance, "id_ungranted", "token", "real-token");
+    const ref = writeSecret(instance, "id_ungranted", "LINEAR_API_KEY", "real-token");
     await mutateState(instance, (state) => {
       state.connectors.push(newConnector({
         id: "id_ungranted",
         instance,
         provider: "linear",
+        type: "api-key",
+        name: "LINEAR_API_KEY",
         status: "configured",
         health: "healthy",
         secretRefs: [ref]
@@ -385,7 +357,7 @@ describe("resolveSkillEnv", () => {
     });
     const skill = newSkill({
       source: "user",
-      requiredConnectors: [{ provider: "linear" }],
+      requiredCredentials: ["LINEAR_API_KEY"],
       prerequisites: { env: ["LINEAR_API_KEY"] }
     });
     const env = await resolveSkillEnv(config, skill);

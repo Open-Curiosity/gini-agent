@@ -15,6 +15,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Per-Agent Memory Isolation](agent-memory-isolation.md)
 - [Connector Secret Storage](connector-secret-storage.md)
 - [Skills As Packages, Connectors As Credentials](skills-and-connectors.md)
+- [Typed, Named Credentials Referenced By Name](typed-named-credentials.md)
 - [Approval Execution Abort Protocol](approval-execution-abort.md)
 - [Runtime Update Surface And Automatic Restart](runtime-update-surface.md)
 - [Connector + Provider Vocabulary, Spec Compliance, And Meta-Skills](connector-provider-spec-compliance.md)
