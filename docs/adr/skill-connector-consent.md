@@ -2,29 +2,30 @@
 
 ## Decision
 
-A skill receives a credentialed connector's env only after a
-per-`(skill, connector)` **user grant**. Declaring the connector is no
-longer sufficient.
+A skill receives a credential's env only after a
+per-`(skill, credential)` **user grant**, keyed on the credential name.
+Declaring the credential is no longer sufficient.
 
 - `resolveSkillEnv(config, skill, taskId?)` in
-  `src/integrations/connectors/index.ts` injects a connector's secret into a
+  `src/integrations/connectors/index.ts` injects a credential's secret into a
   skill's spawn env only when **either** the skill is first-party
   (`source === "bundled"`, auto-granted) **or** the skill's
-  `grantedConnectors` array includes that provider id. An ungranted
-  non-bundled skill resolves to `{}` even if it declares the connector and a
-  healthy connector exists.
+  `grantedConnectors` array includes that credential **name**
+  (`bundled || grantedConnectors.includes(credentialName)`). An ungranted
+  non-bundled skill resolves to `{}` even if it requires the credential and a
+  healthy credential exists.
 
 - The grant is requested at **enable time** for the model-driven path. When
   the `enable_skill` tool is called on a non-bundled skill whose required
-  connectors carry a credential, the dispatcher mints a
-  `skill.grant_connector` SetupRequest (one per ungranted provider) and
+  credentials carry a secret, the dispatcher mints a
+  `skill.grant_connector` SetupRequest (one per ungranted credential) and
   returns `{ kind: "pending" }` instead of enabling. The user grants via the
-  inline chat card; `/api/setup-requests/<id>/complete` appends the provider
-  to `grantedConnectors`. The skill is enabled **only when every credentialed
-  provider it requires is granted** — the `/complete` handler re-evaluates the
-  remaining ungranted providers server-side: if any remain it mints the next
-  `skill.grant_connector` card (attached to the same task) and keeps the task
-  pending without enabling; only when none remain does it set the skill
+  inline chat card; `/api/setup-requests/<id>/complete` appends the credential
+  name to `grantedConnectors`. The skill is enabled **only when every
+  credentialed requirement is granted** — the `/complete` handler re-evaluates
+  the remaining ungranted credentials server-side: if any remain it mints the
+  next `skill.grant_connector` card (attached to the same task) and keeps the
+  task pending without enabling; only when none remain does it set the skill
   `enabled` and resume the chat-task loop. A grant is recorded only through
   this consent flow — no other path writes `grantedConnectors`.
 
@@ -36,27 +37,25 @@ longer sufficient.
 - **Revoked on disable.** Both disable paths — `setSkillStatus` and the
   status-only `updateSkill` PATCH (`PATCH /api/skills/<id>`) — clear
   `grantedConnectors` on the transition to `disabled` and emit one
-  `skill.connector.revoked` audit row per cleared provider, so re-enabling
+  `skill.connector.revoked` audit row per cleared credential, so re-enabling
   re-prompts for consent and never reuses a stale grant.
 
-- A provider "carries a credential" — and therefore needs consent — when its
-  provider module declares a `secrets` spec, or it is the `generic`
-  escape-hatch provider (whose secrets are per-record). Providers without
-  secrets (presence-only connectors) leak nothing and need no grant.
+- A credential "carries a secret" — and therefore needs consent — when its
+  connector record has a `type` (`api-key` or `oauth2`). Presence-only
+  connectors (no `type`, no env) leak nothing and need no grant.
 
 ## Context
 
-Connector secrets bind to skills through SKILL.md frontmatter:
-`metadata.gini.requires.connectors` declares the providers a skill needs,
-and `metadata.gini.prerequisites.env` lists the env var names its scripts
-read. ADR skill-env-containment.md scoped credential injection to one skill
-at a time through `skill_run` / `resolveSkillEnv`, and removed the
-aggregate and per-command paths.
+Credentials bind to skills through SKILL.md frontmatter:
+`metadata.gini.requires.credentials` declares the credential **names** a
+skill needs (ADR typed-named-credentials.md), and
+`metadata.gini.prerequisites.env` lists the env var names its scripts read.
+ADR skill-env-containment.md scopes credential injection to one skill at a
+time through `skill_run` / `resolveSkillEnv`.
 
-That left one gap. The only check `resolveSkillEnv` performed was "does a
-healthy connector exist for a provider this skill declares." Any
-installed-and-enabled skill that merely **declared** `requires: linear`
-received `LINEAR_API_KEY`. The trust decision collapsed into the skill's own
+A presence-only existence check leaves a gap: a skill that merely
+**declares** a credential and runs while a healthy credential exists would
+receive that secret. The trust decision would collapse into the skill's own
 manifest — exactly the surface a model-authored or model-installed skill (or
 a prompt injection that installs one) controls. A freshly authored skill
 could silently acquire a credential the user connected for a different
@@ -64,7 +63,7 @@ purpose.
 
 The credential model is only safe when the human, not the manifest, decides
 which skill may use which credential. This ADR adds that decision as an
-explicit per-`(skill, connector)` consent gate, checked at the single
+explicit per-`(skill, credential)` consent gate, checked at the single
 injection point.
 
 ## Considered alternatives
@@ -91,7 +90,7 @@ injection point.
   gate entirely. Enabling a skill therefore **never** grants a connector;
   grants flow only through the `skill.grant_connector` consent flow. Enabling
   a non-bundled credentialed skill via `/enable` is safe and stays env-denied:
-  `resolveSkillEnv` returns `{}` for any provider that is neither bundled nor
+  `resolveSkillEnv` returns `{}` for any credential that is neither bundled nor
   in `grantedConnectors`, so the skill remains inert until the user grants it
   through the consent card.
 
@@ -119,8 +118,8 @@ injection point.
 ### Audited surfaces
 
 - `skill.connector.granted` / `skill.connector.revoked` audit rows record
-  every grant change (`evidence.provider`), so operators can answer "which
-  skill was granted which credential, and when."
+  every grant change (`evidence.provider` holds the credential name), so
+  operators can answer "which skill was granted which credential, and when."
 - `setup.requested` / `setup.completed` rows from the SetupRequest substrate
   bracket the consent flow.
 
@@ -135,16 +134,16 @@ single point where a credential would enter a process.
 
 - `src/types.ts`: `SkillRecord.grantedConnectors?: string[]`; new
   `"skill.grant_connector"` member of `SetupRequestAction`.
-- `src/integrations/connectors/index.ts`: `resolveSkillEnv` gates both the
-  native-binding branch and the generic-fallback branch on
-  `bundled || grantedConnectors.includes(provider)`. The generic-fallback
-  branch is also ambiguity-safe: if two configured+healthy generic connectors
-  store a secret under the same field name, that env var is skipped (and a
-  `connector.generic.ambiguous_env` log is written) rather than guessing.
+- `src/integrations/connectors/index.ts`: `resolveSkillEnv` resolves env
+  through a single name-based path. It maps each required credential name to
+  its usable connector record, resolves env vars via `bindingsForCredentials`,
+  and injects a value only when `bundled || grantedConnectors.includes(credentialName)`
+  holds for the credential that owns the env var. There is no provider-keyed
+  or generic-fallback branch.
 - `src/capabilities/skills.ts`: `grantConnectorToSkill` /
   `revokeConnectorGrant` mutate `grantedConnectors` and write the audit
   rows; a shared `clearConnectorGrantsOnDisable` helper clears grants and
-  emits the per-provider `skill.connector.revoked` rows from both the
+  emits one `skill.connector.revoked` row per cleared credential from both the
   `setSkillStatus` and `updateSkill` PATCH disable paths.
 - `src/execution/tool-dispatch.ts`: `setSkillStatusTool` returns a
   `DispatchResult`; on enable of a non-bundled credentialed skill it mints a
@@ -152,7 +151,7 @@ single point where a credential would enter a process.
   `{ kind: "pending" }`. The dispatcher's `enable_skill` / `disable_skill`
   cases return the dispatch result directly.
 - `src/http.ts`: the `/complete` `skill.grant_connector` branch appends the
-  grant, then enables the skill only when no credentialed providers remain
+  grant, then enables the skill only when no credentialed requirements remain
   ungranted — otherwise it mints the next grant card and leaves the task
   pending. The settings-page `/enable` endpoint never grants connectors.
 - `src/execution/tool-catalog.ts`: `enable_skill` description notes the
@@ -169,16 +168,16 @@ single point where a credential would enter a process.
   inject.
 - `bun test src/capabilities/skills.test.ts` — grant / revoke audit rows;
   both the `setSkillStatus` and `updateSkill` PATCH disable paths clear grants
-  and emit per-provider `skill.connector.revoked` rows.
+  and emit one `skill.connector.revoked` row per cleared credential.
 - `bun test src/execution/skill-dispatch.test.ts` — non-bundled credentialed
   enable mints the SetupRequest (pending); bundled and already-granted enable
   immediately; the messaging-bridge and `origin: "job"` surfaces return a sync
   error with no setup row; re-entering enable while a grant is pending
   references the existing request instead of minting a duplicate.
 - `bun test src/http.test.ts` — the `skill.grant_connector` `/complete`
-  branch grants the connector and enables a single-provider skill; for a
-  multi-provider skill it grants one provider, stays disabled, and mints the
-  next grant card.
+  branch grants the credential and enables a single-credential skill; for a
+  multi-credential skill it grants one credential, stays disabled, and mints
+  the next grant card.
 
 ## Related
 
@@ -188,5 +187,6 @@ single point where a credential would enter a process.
   at rest before `resolveSkillEnv` resolves it at spawn.
 - ADR `authorization-vs-setup-request.md` — the SetupRequest substrate the
   `skill.grant_connector` action reuses.
-- ADR `connector-provider-spec-compliance.md` — provider modules declare the
-  `secrets` spec that marks a provider as credentialed.
+- ADR `typed-named-credentials.md` — the name-based credential binding model;
+  the consent gate keys on the credential name defined there, and a credential
+  "carries a secret" when its connector record has a `type`.

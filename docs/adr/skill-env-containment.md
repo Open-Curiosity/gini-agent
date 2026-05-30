@@ -17,43 +17,32 @@ and it is scoped to one skill at a time:
 
 `resolveSkillEnv(config, skill, taskId?)` in
 `src/integrations/connectors/index.ts` is the single resolver. It maps a
-skill's declared env names to its connectors' encrypted secrets and
-returns a `{ENV_NAME: secret-value}` map. There is no aggregate "all
-active skills" helper and no per-name terminal resolver — both
-`resolveActiveSkillsEnv` and `resolveSkillEnvByName` are gone.
+skill's declared env names to its required credentials' encrypted secrets
+via `bindingsForCredentials` (name-based) and returns a
+`{ENV_NAME: secret-value}` map. There is no aggregate "all active skills"
+helper and no per-name terminal resolver: connector env reaches a process
+only through `skill_run` calling this resolver for the named skill.
 
 ## Context
 
 Connector secrets are bound to skills through two SKILL.md frontmatter
 fields:
 
-- `metadata.gini.requires.connectors` declares which provider modules a
-  skill needs to be active.
+- `metadata.gini.requires.credentials` declares which credential **names**
+  a skill needs to be active (ADR typed-named-credentials.md).
 - `metadata.gini.prerequisites.env` lists the env var names the skill's
   CLI / scripts read at runtime (`LINEAR_API_KEY`,
   `GOOGLE_WORKSPACE_CLI_CLIENT_ID`, etc.).
 
-`resolveSkillEnv(config, skill, taskId?)` maps the declared env names
-against the connector module's `secrets.envBindings`, finds the matching
-healthy connector record, reads the per-instance encrypted secret, and
-returns a `{ENV_NAME: secret-value}` object. This per-skill resolution
-has always existed and is the right unit of env containment.
+`resolveSkillEnv(config, skill, taskId?)` maps the declared env names to
+the skill's required credentials by name via `bindingsForCredentials`: an
+`api-key` credential's env var IS its name (value from
+`secretRefs[0].purpose`); an `oauth2` credential maps several env vars to
+one name through `metadata.envMap`. It reads the per-instance encrypted
+secret and returns a `{ENV_NAME: secret-value}` object. This per-skill
+resolution is the right unit of env containment.
 
-The original spawn paths called a different helper,
-`resolveActiveSkillsEnv`, which iterated *every* enabled, active skill
-and `Object.assign`-merged each one's `resolveSkillEnv` output into a
-single env object. The spawn path then injected the merged map into
-**every** `terminal_exec` invocation regardless of which skill (if any)
-the model was acting under.
-
-The aggregation pre-dated `skill_run` and the connector-provider rewrite;
-back when skills were a smaller surface, "all enabled skills' env" was a
-useful default for letting `terminal_exec` "just work" when the model
-followed any skill's instructions. It quietly stopped being right once
-skills started layering credentials across providers (Linear, GitHub,
-Google, Notion, etc.).
-
-### Why aggregation was the wrong default
+### Why aggregating env across skills is the wrong default
 
 A SKILL.md activating to put credentials inside a process is a
 deliberate trust grant. The user accepted scope X at install/connection
@@ -66,12 +55,10 @@ whether from a model error, a prompt injection, or a third-party skill
 script following Anthropic-style "run `bun scripts/foo.ts`" guidance —
 got every other connector's secret along with it.
 
-The `skill_run` dispatch already used `resolveSkillEnv` (one skill
-only). The fact that we needed a separate dispatch path to get scoped
-env was the tell: `terminal_exec` carrying any connector env was the bug.
-A first containment step scoped `terminal_exec` to an optional `skill`
-arg; this ADR completes the move by removing that arg entirely so the
-generic command path never carries credentials at all.
+`skill_run` resolves env through `resolveSkillEnv` for one named skill,
+which is the right scope. `terminal_exec` carrying any connector env is a
+leak: an arbitrary model-written command must never pair a credential with
+an effect, so the generic command path never carries credentials at all.
 
 ### Considered alternatives
 
@@ -130,20 +117,17 @@ generic command path never carries credentials at all.
   their env into an arbitrary command.
 
 - Any future tool that spawns a process with connector env must use
-  `resolveSkillEnv` directly, not re-implement aggregation or a
-  by-name terminal resolver. `resolveActiveSkillsEnv` and
-  `resolveSkillEnvByName` are gone from the codebase and should not be
-  reintroduced.
+  `resolveSkillEnv` directly for one named skill, not re-implement an
+  aggregate "all active skills" env or a by-name terminal resolver.
 
 - **Follow-up (not done here):** a fresh `gws auth login` performed
   without a local `client_secret.json` needs
   `GOOGLE_WORKSPACE_CLI_CLIENT_ID` / `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`
-  in the spawn env. That setup step is the one remaining flow that used
-  to lean on `terminal_exec` carrying connector env. It should ship as a
-  `skill_run` script in the `google-workspace-setup` skill (declaring
-  the two env vars and the `google-oauth-desktop` connector) so it gets
-  scoped env through the trusted-bytes path. Tracked as a follow-up
-  issue; this ADR does not implement it.
+  in the spawn env. That setup step needs scoped connector env, so it
+  should ship as a `skill_run` script in the `google-workspace-setup`
+  skill (declaring the two env vars and the `google-workspace-oauth`
+  credential) so it gets scoped env through the trusted-bytes path.
+  Tracked as a follow-up issue; this ADR does not implement it.
 
 ### Audited surfaces
 
@@ -185,9 +169,11 @@ the user accepted at install time.
 ## Implementation surface
 
 - `src/integrations/connectors/index.ts`:
-  - `resolveSkillEnv(config, skill, taskId?)` is the single resolver.
-  - `resolveActiveSkillsEnv` and `resolveSkillEnvByName` removed;
-    comment block in place to prevent their reintroduction.
+  - `resolveSkillEnv(config, skill, taskId?)` is the single resolver,
+    name-based via `bindingsForCredentials`.
+  - An in-code NOTE marks the single-path invariant so neither an
+    aggregate-across-active-skills helper nor a by-name terminal resolver
+    is reintroduced.
 - `src/execution/tool-catalog.ts`: `terminal_exec` parameter schema has
   no `skill` property. Description documents the clean-env guarantee and
   routes credentialed commands to `skill_run`.
@@ -220,8 +206,8 @@ the user accepted at install time.
 - [ENG-1606](https://linear.app/lilac-labs/issue/ENG-1606) — skill-
   script capability declarations (per-script connector scoping, schema
   validation, effect-class declaration) that build on this ADR.
-- ADR `connector-provider-spec-compliance.md` — provider modules
-  declare `secrets.envBindings`, which `resolveSkillEnv` consults.
+- ADR `typed-named-credentials.md` — the name-based credential binding
+  model `resolveSkillEnv` resolves through (`bindingsForCredentials`).
 - ADR `connector-secret-storage.md` — how connector secrets are
   encrypted at rest before `resolveSkillEnv` resolves them at spawn.
 - ADR `approval-and-audit-substrate.md` — the policy seam through

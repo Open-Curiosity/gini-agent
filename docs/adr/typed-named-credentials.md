@@ -34,23 +34,20 @@ carry no env and resolve nothing.
 
 ## Context
 
-ADR skills-and-connectors.md modeled requirements as `requires.connectors:
-[{ provider }]` and resolved env per provider module (`envBindingsForProviders`).
-Two problems emerged:
+Two properties make the credential plane match how skills are authored and keep
+resolution simple:
 
-1. **A plain API key needed a provider module.** Every BYO key forced either a
-   code module or the `generic` escape hatch, whose env resolution matched a
-   secret-field name verbatim and fell back to a fail-safe on ambiguity. The
-   model carried provider-keyed branches in `resolveSkillEnv`, `isSkillActive`,
-   `firstUngrantedCredential`, `resolveMcpHeaders`, and MCP sync.
-2. **"Reference by provider" doesn't match how the agent authors skills.** Gini
-   knows the credential names (e.g. `LINEAR_API_KEY`) and should reference them
-   by name when writing a skill, the same way Hermes/OpenClaw skills reference
-   env vars — but with a managed credential plane behind the name.
+1. **A plain API key must not need a provider module.** A BYO key should resolve
+   from its own `name`/secret, with no code module or `generic` escape hatch
+   required.
+2. **Skills reference credentials by name.** Gini knows the credential names
+   (e.g. `LINEAR_API_KEY`) and references them by name when writing a skill, with
+   a managed credential plane behind the name.
 
 Naming the credential and giving it a type collapses every resolution path to a
-single name-based lookup and removes the provider-module requirement for plain
-keys, while keeping provider modules as optional templates.
+single name-based lookup (`bindingsForCredentials`) and removes the
+provider-module requirement for plain keys, while keeping provider modules as
+optional templates.
 
 ## Migration
 
@@ -58,9 +55,11 @@ keys, while keeping provider modules as optional templates.
 `normalizeState` (marker `state.migrations.connectorsTypedCredentials`,
 idempotent, one summary audit when it changes anything):
 
-- `linear` → `api-key` named `LINEAR_API_KEY` (its single secret purpose re-keyed
-  to the name; the encrypted file is untouched and resolves under the new
-  purpose), `metadata.mcp` driving the existing `linear` MCP row.
+- `linear` → `api-key` named `LINEAR_API_KEY`. The connector `name` becomes
+  `LINEAR_API_KEY`, but the secret **purpose is preserved** (stays `token`):
+  `bindingsForCredentials` reads `secretRefs[0].purpose` and the Linear probe
+  keeps resolving `token`, so neither resolution nor rotation breaks. The
+  credential's `metadata.mcp` drives the existing `linear` MCP row.
 - `google-oauth-desktop` → `oauth2` named `google-workspace-oauth` with
   `metadata.envMap` reversing the module's `envBindings` (purposes unchanged).
 - `generic` → `api-key` named by its field purpose (1 secret) or `oauth2` with an
@@ -71,7 +70,9 @@ idempotent, one summary audit when it changes anything):
 
 Collision (a generic field colliding with a template-typed canonical name): the
 template-typed credential keeps the canonical name; the generic dup is renamed
-`<name>_2` with a `connector.migration_collision` audit.
+to the first free `<name>_N` suffix (loops past `_2`, `_3`, … so two colliding
+generics can't both land on `<name>_2`) with a `connector.migration_collision`
+audit.
 
 Bundled SKILL.md frontmatter is edited on disk (re-parsed on boot), not rewritten
 by the migration.
@@ -106,9 +107,12 @@ is a block-list, not a resolution source.
 - **Renaming the skill body's `server: "linear"` to the env-var name.** Couples
   the user-facing MCP server name to an env var and churns the skill body;
   `metadata.mcp.name` keeps the row name stable instead.
-- **Re-keying nothing on the api-key migration.** `bindingsForCredentials` reads
-  the single secret purpose, so resolution would work either way, but re-keying
-  the purpose to the credential name keeps the record self-consistent.
+- **Re-keying the secret purpose to the credential name on the api-key
+  migration.** Rejected. `bindingsForCredentials` resolves from
+  `secretRefs[0].purpose` and the Linear provider probe resolves `token`;
+  re-keying the purpose to `LINEAR_API_KEY` would break both. The migration
+  renames only the connector `name` and preserves the purpose, so resolution,
+  the probe, and rotation all keep working.
 - **Dropping the provider-declared block-list with the provider-fallback.** It is
   a security boundary (no shell-supplied credentials), not the fallback.
 
