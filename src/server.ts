@@ -16,6 +16,7 @@ import { appendLog, mutateState, readState } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { installCrashHandlers } from "./runtime/crash-handlers";
+import { maybeAskAboutCrashes } from "./runtime/crash-recovery";
 import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
 import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
@@ -255,6 +256,12 @@ writeFileSync(runtimePortPath(config.instance), String(server.port));
 
 appendLog(config.instance, "runtime.started", { port: server.port, pid: process.pid });
 console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=${config.instance}`);
+
+// If crashes were captured while we were down, offer (default + launchd only)
+// to file them — best-effort, never blocks or crashes boot.
+maybeAskAboutCrashes(config).catch((err) =>
+  appendLog(config.instance, "crash.recovery.error", { error: String(err) })
+);
 
 // Self-rescheduling scheduler loop. We await runDueJobs(config) before
 // scheduling the next tick so a slow tick (e.g. spawning N script jobs
