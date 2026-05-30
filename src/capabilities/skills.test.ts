@@ -45,22 +45,27 @@ async function seedSkill(instance: string, overrides: Partial<SkillRecord>) {
 }
 
 describe("grantConnectorToSkill / revokeConnectorGrant", () => {
-  test("grant appends the provider and writes an audit row; idempotent", async () => {
+  // Grants are keyed by credential NAME (the /complete handler passes the
+  // credential name, and the state migration canonicalizes any legacy
+  // provider-string grants to their credential name on read).
+  test("grant appends the credential name and writes an audit row; idempotent", async () => {
     const instance = "skills-grant";
     const skill = await seedSkill(instance, {});
-    const granted = await grantConnectorToSkill(config(instance), skill.id, "linear");
-    expect(granted.grantedConnectors).toEqual(["linear"]);
-    // Re-granting the same provider is a no-op (no duplicate entry).
-    const again = await grantConnectorToSkill(config(instance), skill.id, "linear");
-    expect(again.grantedConnectors).toEqual(["linear"]);
+    const granted = await grantConnectorToSkill(config(instance), skill.id, "LINEAR_API_KEY");
+    expect(granted.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
+    // Re-granting the same credential is a no-op (no duplicate entry).
+    const again = await grantConnectorToSkill(config(instance), skill.id, "LINEAR_API_KEY");
+    expect(again.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
     const state = readState(instance);
     expect(state.audit.filter((a) => a.action === "skill.connector.granted").length).toBe(1);
   });
 
-  test("revoke removes the provider and writes an audit row", async () => {
+  test("revoke removes the credential name and writes an audit row", async () => {
     const instance = "skills-revoke";
+    // A legacy provider-string grant is canonicalized to LINEAR_API_KEY by the
+    // migration on read, so revoke targets the credential name.
     const skill = await seedSkill(instance, { grantedConnectors: ["linear"] });
-    const revoked = await revokeConnectorGrant(config(instance), skill.id, "linear");
+    const revoked = await revokeConnectorGrant(config(instance), skill.id, "LINEAR_API_KEY");
     expect(revoked.grantedConnectors).toEqual([]);
     const state = readState(instance);
     expect(state.audit.some((a) => a.action === "skill.connector.revoked")).toBe(true);
@@ -81,10 +86,12 @@ describe("setSkillStatus disable transition", () => {
 
   test("enabling a skill leaves grants untouched", async () => {
     const instance = "skills-enable-keeps";
+    // The seeded legacy "linear" grant is canonicalized to LINEAR_API_KEY by
+    // the migration on read; enabling must leave it as-is.
     const skill = await seedSkill(instance, { status: "disabled", grantedConnectors: ["linear"] });
     const enabled = await setSkillStatus(config(instance), skill.id, "enabled");
     expect(enabled.status).toBe("enabled");
-    expect(enabled.grantedConnectors).toEqual(["linear"]);
+    expect(enabled.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
   });
 });
 
