@@ -966,6 +966,161 @@ describe("runtime api", () => {
     expect(pendingGrants.length).toBe(1);
   });
 
+  test("POST /api/setup-requests/<id>/complete: a double-complete of the FINAL grant request enables once and writes exactly one skill.enabled audit and one grant", async () => {
+    const config = testConfig("setup-complete-skill-grant-final-double");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill, createTask, upsertTask } = await import("./state");
+    // A single-provider skill so completing the one grant card is the FINAL
+    // step (no next card): the winner records the grant, enables the skill,
+    // and resumes the task. A losing racer must produce ZERO side effects —
+    // no duplicate grant, no duplicate skill.enabled audit, no second resume.
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-linear-final-double",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredConnectors: [{ provider: "linear" }]
+      })
+    );
+    // Seed a terminal task so the resume branch is exercised but bails fast
+    // (resumeChatTask no-ops on a completed task) instead of polling for a
+    // waiting_approval flip that never comes.
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "grant final double");
+      task.status = "completed";
+      upsertTask(state, task);
+      return task.id;
+    });
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        taskId,
+        action: "skill.grant_connector",
+        target: "Linear",
+        reason: "Skill needs-linear-final-double requests access to your Linear credential.",
+        payload: {
+          skillId: skill.id,
+          skillName: skill.name,
+          provider: "linear",
+          providerLabel: "Linear",
+          toolCallId: "call_grant_final_double"
+        }
+      })
+    );
+
+    const [a, b] = await Promise.all([
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }, config.token),
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }, config.token)
+    ]);
+    expect([a.ok, b.ok].filter(Boolean).length).toBe(1);
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((s) => s.id === approval.id);
+    expect(resolved?.status).toBe("completed");
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.status).toBe("enabled");
+    // Exactly one grant — the loser double-granted nothing.
+    expect(updated?.grantedConnectors).toEqual(["linear"]);
+    // Exactly ONE skill.enabled audit row (the loser produced no second one).
+    expect(state.audit.filter((a) => a.action === "skill.enabled").length).toBe(1);
+    // Exactly ONE grant audit row.
+    expect(state.audit.filter((a) => a.action === "skill.connector.granted").length).toBe(1);
+    // No extra pending grant rows from the losing racer.
+    expect(
+      state.setupRequests.filter((s) => s.status === "pending" && s.action === "skill.grant_connector").length
+    ).toBe(0);
+  });
+
+  test("POST /api/setup-requests/<id>/complete vs cancel on the same grant card: Cancel prevents the grant+enable", async () => {
+    const config = testConfig("setup-complete-skill-grant-cancel-race");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill, createTask, upsertTask } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-linear-cancel-race",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredConnectors: [{ provider: "linear" }]
+      })
+    );
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "grant cancel race");
+      task.status = "completed";
+      upsertTask(state, task);
+      return task.id;
+    });
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        taskId,
+        action: "skill.grant_connector",
+        target: "Linear",
+        reason: "Skill needs-linear-cancel-race requests access to your Linear credential.",
+        payload: {
+          skillId: skill.id,
+          skillName: skill.name,
+          provider: "linear",
+          providerLabel: "Linear",
+          toolCallId: "call_grant_cancel_race"
+        }
+      })
+    );
+
+    // Race a complete against a cancel on the SAME card. The per-instance
+    // mutateState lock serializes the two pending→terminal transitions, so
+    // exactly one wins. The consent gate must be honored: whichever side wins,
+    // a grant+enable happens ONLY if complete won — a winning cancel leaves the
+    // skill disabled and ungranted.
+    const [completeRes, cancelRes] = await Promise.all([
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }, config.token),
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/cancel`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }, config.token)
+    ]);
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((s) => s.id === approval.id);
+    const updated = state.skills.find((s) => s.id === skill.id);
+    const granted = state.audit.some((a) => a.action === "skill.connector.granted");
+    const enabled = state.audit.some((a) => a.action === "skill.enabled");
+
+    if (resolved?.status === "cancelled") {
+      // Cancel won — the consent gate is honored: NO grant, NO enable.
+      expect(completeRes.ok).toBe(false);
+      expect(updated?.status).toBe("disabled");
+      expect(updated?.grantedConnectors ?? []).toEqual([]);
+      expect(granted).toBe(false);
+      expect(enabled).toBe(false);
+    } else {
+      // Complete won — cancel is a no-op against the now-completed row, and
+      // the skill is granted+enabled.
+      expect(resolved?.status).toBe("completed");
+      expect(cancelRes.ok).toBe(false);
+      expect(updated?.status).toBe("enabled");
+      expect(updated?.grantedConnectors).toEqual(["linear"]);
+      expect(granted).toBe(true);
+      expect(enabled).toBe(true);
+    }
+  });
+
   test("POST /api/setup-requests/<id>/complete returns ok:false and leaves the request pending on probe failure", async () => {
     const config = testConfig("setup-requests-complete-probe-fail");
     const handler = createHandler(config);

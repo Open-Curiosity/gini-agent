@@ -74,6 +74,8 @@ import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueN
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
+import { resumeChatTask } from "./execution/chat-task";
+import { approvalToolCallId } from "./execution/tool-dispatch";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
@@ -436,28 +438,40 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         const toolCallId = typeof setup.payload.toolCallId === "string"
           ? setup.payload.toolCallId
           : undefined;
+
+        // Atomically claim THIS setup request BEFORE any observable side
+        // effect (grant write, skill enable, audit row, next-card mint,
+        // resume). resolveSetupRequest transitions pending→completed inside
+        // the per-instance mutateState lock and throws ApprovalRaceLostError
+        // ("already <status>") if the row is no longer pending — which the
+        // route's catch surfaces as an error response. The loser of a
+        // double-complete, and any complete that races a cancel (the row is
+        // already non-pending), throws here and performs ZERO side effects.
+        // We claim with resumeChatTask:false / no toolResult so the resume is
+        // staged LATER, as the final step, exactly once on the winning claim.
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
+
+        // Only the winner reaches here. Record the grant for the approved
+        // provider, then check whether the skill still has ungranted
+        // credentialed providers. A provider "carries a credential" when its
+        // module declares a secrets spec, or it is the generic escape-hatch
+        // provider (whose secrets are per-record). Mirror the predicate in
+        // setSkillStatusTool. The skill is enabled ONLY when ALL of them are
+        // granted — for a multi-provider skill we mint the NEXT grant card and
+        // keep the task pending rather than enabling on the first grant.
         const skill = await grantConnectorToSkill(config, skillId, provider);
-        // A provider "carries a credential" when its module declares a secrets
-        // spec, or it is the generic escape-hatch provider (whose secrets are
-        // per-record). Mirror the predicate in setSkillStatusTool.
         const granted = skill.grantedConnectors ?? [];
         const nextUngranted = (skill.requiredConnectors ?? [])
           .map((r) => r.provider)
           .find((p) => (p === "generic" || Boolean(getProvider(p)?.secrets)) && !granted.includes(p));
 
         if (nextUngranted) {
-          // More credentialed providers to grant. Atomically claim THIS setup
-          // request FIRST — resolveSetupRequest throws ApprovalRaceLostError
-          // ("already <status>") if the row is no longer pending, which the
-          // route's catch surfaces as an error response. Only the winner of a
-          // double-complete reaches the mint below, so two rapid completes can
-          // never both create the next provider's grant row (TOCTOU). We
-          // resolve without resuming so the task stays parked on the new card.
-          await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
-          // Mint the next grant card attached to the same task + tool call.
-          // The web reconciles the new pending card from the setup-requests
-          // query (refreshed by the setup SSE event). Dedupe to the same task
-          // as a second safety layer — a retried mint must not double up.
+          // More credentialed providers to grant — mint the next grant card
+          // attached to the same task + tool call, leaving the task pending
+          // (not enabled). The web reconciles the new pending card from the
+          // setup-requests query (refreshed by the setup SSE event). Dedupe to
+          // the same task as a second safety layer — a retried mint must not
+          // double up.
           const nextLabel = getProvider(nextUngranted)?.label ?? nextUngranted;
           const reason = `Skill "${skill.name}" requests access to your ${nextLabel} credential. Granting lets its scripts use ${nextLabel}; you can revoke by disabling the skill.`;
           await mutateState(config.instance, (mutable) => {
@@ -486,16 +500,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           return json({ ok: true });
         }
 
-        // All credentialed providers granted. Atomically claim THIS setup
-        // request FIRST (same race guard as above), then enable the skill and
-        // resume only on the winning completion. resolveSetupRequest's built-in
-        // resume runs after the claim, so a losing double-complete throws
-        // before any resume or extra side effect.
+        // All credentialed providers granted: enable the skill, then resume
+        // the chat task LAST and exactly once with the success toolResult.
+        // The request was already claimed above, so we reuse resolveSetupRequest's
+        // internal resume wiring (approvalToolCallId + resumeChatTask) directly
+        // rather than calling resolveSetupRequest again (which would throw on
+        // the now-completed row). A losing racer never reaches this enable/resume.
         await setSkillStatus(config, skillId, "enabled");
-        await resolveSetupRequest(config, setupId, "complete", {
-          actor: "user",
-          toolResult: `Granted ${providerLabel} to skill "${skill.name}"; skill enabled.`
-        });
+        if (setup.taskId) {
+          const resumeToolCallId = approvalToolCallId(setup.payload);
+          if (resumeToolCallId) {
+            await resumeChatTask(
+              config,
+              setup.taskId,
+              resumeToolCallId,
+              `Granted ${providerLabel} to skill "${skill.name}"; skill enabled.`
+            );
+          }
+        }
         return json({ ok: true });
       }
 
