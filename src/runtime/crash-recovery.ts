@@ -33,17 +33,29 @@ const ASK_WINDOW_MS = 24 * 60 * 60 * 1000;
 // The prompt the seeded one-shot job runs. It instructs the agent to post a
 // single chat message asking for consent — and explicitly NOT to file or act
 // this turn. When the user replies, the gini-bug-report skill does the work.
-export function ASK_PROMPT(count: number): string {
+//
+// The SPECIFIC fingerprints being asked about are named so the consent is bound
+// to exactly this batch: a crash that lands between the ask and the user's
+// "yes" must not get filed under this consent. The skill files only the
+// fingerprints listed here.
+export function ASK_PROMPT(fingerprints: string[]): string {
+  const count = fingerprints.length;
   const noun = count === 1 ? "crash" : "crashes";
+  // Short, human-glanceable identifiers; the full fingerprints live in the
+  // queued reports the skill reads.
+  const shortList = fingerprints.map((fp) => fp.slice(0, 8)).join(", ");
   return [
     `Gini detected ${count} ${noun} since it last ran (captured locally and already redacted — no secrets or message content).`,
+    "",
+    `The specific crash fingerprint(s) this consent covers: ${shortList}.`,
     "",
     "In ONE short, friendly chat message: tell the user you noticed the " +
       `${count} ${noun}, and ASK whether they'd like you to file ${count === 1 ? "it" : "them"} as ` +
       "GitHub issue(s) to help improve Gini.",
     "",
     "Do NOT file anything and do NOT take any other action this turn — just ask the question and wait for the user's answer.",
-    "When the user replies, use the gini-bug-report skill to act on their answer."
+    "When the user replies, use the gini-bug-report skill to act on their answer — and file ONLY the " +
+      `fingerprint(s) named above (${shortList}), not any other crash that may have landed since.`
   ].join("\n");
 }
 
@@ -101,7 +113,7 @@ export async function maybeAskAboutCrashes(
 
     await createJobImpl(config, {
       name: "crash-report-consent",
-      prompt: ASK_PROMPT(freshFingerprints.length),
+      prompt: ASK_PROMPT(freshFingerprints),
       intervalSeconds: 2,
       oneShot: true,
       timeoutSeconds: 120,
