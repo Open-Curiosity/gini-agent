@@ -418,4 +418,38 @@ describe("web_search dispatch", () => {
     expect(err.displayMessage).toBe("No search provider connected.");
     expect(err.displaySeverity).toBe("info");
   });
+
+  test("explicit provider that isn't connected names that provider, even when another is connected", async () => {
+    const instance = `web-search-wrong-provider-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    // Brave is connected and healthy; the model explicitly asks for Exa.
+    // "No search provider connected." would be false here — the user has
+    // Brave — so the display line must name the missing provider instead.
+    await mutateState(instance, (state) => {
+      state.connectors.unshift({
+        id: "id_brave",
+        instance,
+        name: "Brave Search",
+        provider: "brave-search",
+        status: "configured",
+        scopes: [],
+        secretRefs: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        health: "healthy",
+        source: "user"
+      });
+    });
+    let thrown: unknown;
+    try {
+      await dispatchToolCall(config, taskId, "web_search", "call_2", JSON.stringify({ query: "q", provider: "exa" }));
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ToolDisplayError);
+    const err = thrown as ToolDisplayError;
+    expect(err.displayMessage).toBe("Exa is not connected.");
+    expect(err.displaySeverity).toBe("info");
+  });
 });

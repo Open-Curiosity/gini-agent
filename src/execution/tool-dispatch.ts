@@ -566,9 +566,17 @@ async function webSearchTool(config: RuntimeConfig, taskId: string, args: Record
   }
   if (!connector || !providerId) {
     const wanted = requested ?? "brave-search or exa";
+    // When the model named a specific provider, the user may already have a
+    // DIFFERENT search provider connected — so "No search provider connected."
+    // would be false. Name the missing one instead. The no-`provider` case
+    // keeps the generic line (nothing is connected at all).
+    const requestedLabel = requested ? (getProvider(requested)?.label ?? requested) : undefined;
     throw new ToolDisplayError(
       `Web search is unavailable: no healthy ${wanted} connector. Your next move is to call request_connector with provider '${requested ?? "brave-search"}' so the user can paste an API key — then retry this search. Do NOT fall back to web_fetch on guessed URLs; the user asked for real web search, and guessing URLs bypasses that intent.`,
-      { displayMessage: "No search provider connected.", severity: "info" }
+      {
+        displayMessage: requestedLabel ? `${requestedLabel} is not connected.` : "No search provider connected.",
+        severity: "info"
+      }
     );
   }
 
