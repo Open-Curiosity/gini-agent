@@ -1527,6 +1527,226 @@ describe("chat-task loop", () => {
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
+
+  // Tool-calling transcript persistence + replay (ADR
+  // agent-loop-tool-calling.md). A prior turn's assistant tool_calls and its
+  // paired role:"tool" results are persisted durably (kind:"tool_transcript")
+  // and replayed next turn so the model sees the structured results of its
+  // own earlier actions instead of re-deriving them.
+  test("a structured tool result from a prior turn is replayed on the next turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-id");
+    const provider = normalizeProvider(config.provider);
+    const fixturePath = join(workspaceRoot, "issue.json");
+    // The "create issue" stand-in: a tool the loop dispatches synchronously
+    // whose result carries an id the agent must remember next turn.
+    const issueResult = JSON.stringify({ ok: true, issueId: "ISSUE-4242" });
+    writeFileSync(fixturePath, issueResult);
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Issue thread" });
+
+    // Turn 1: read the file (returns the issue id), then a final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_issue", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "issue.json" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Created issue ISSUE-4242.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "create an issue" });
+    await waitForTerminal(config, first.taskId);
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: the model just answers — we only care about the transcript it
+    // was handed.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Editing ISSUE-4242 as requested.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "now edit that issue" });
+    await waitForTerminal(config, second.taskId);
+
+    // Locate turn 2's provider call: the one whose user message is the
+    // second prompt.
+    const calls = getEchoToolCallingCalls();
+    const turn2 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "now edit that issue")
+    );
+    expect(turn2).toBeDefined();
+
+    // The replayed transcript carries the assistant tool_calls message AND
+    // the paired role:"tool" result with the issue id.
+    const assistantToolCalls = turn2!.find(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0
+    );
+    expect(assistantToolCalls).toBeDefined();
+    expect(assistantToolCalls!.tool_calls![0]!.id).toBe("call_issue");
+
+    const toolResult = turn2!.find((m) => m.role === "tool" && m.tool_call_id === "call_issue");
+    expect(toolResult).toBeDefined();
+    expect(String(toolResult!.content)).toContain("ISSUE-4242");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("a read_skill body from a prior turn persists into the next turn's transcript", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-skill");
+    const provider = normalizeProvider(config.provider);
+
+    const skill = await createSkillFromInput(config, {
+      name: "apple-notes",
+      description: "Apple Notes via memo CLI."
+    });
+    const skillBody = "# Apple Notes\n\nUse `memo notes -a` to add a note.";
+    await mutateState(config.instance, (state) => {
+      const item = state.skills.find((s) => s.id === skill.id)!;
+      item.body = skillBody;
+    });
+    await setSkillStatus(config, skill.id, "enabled");
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Skill thread" });
+
+    // Turn 1: read the skill, then answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_skill", type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: "apple-notes" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "I now know how to use Apple Notes.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "how do I add an apple note?" });
+    await waitForTerminal(config, first.taskId);
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: a follow-up. The skill body must be in the replayed transcript
+    // so the model need not re-read it (Claude Code skill behavior).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Adding your note now.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "add a note that says hi" });
+    await waitForTerminal(config, second.taskId);
+
+    const calls = getEchoToolCallingCalls();
+    const turn2 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "add a note that says hi")
+    );
+    expect(turn2).toBeDefined();
+    const skillToolResult = turn2!.find((m) => m.role === "tool" && m.tool_call_id === "call_skill");
+    expect(skillToolResult).toBeDefined();
+    expect(String(skillToolResult!.content)).toContain("memo notes -a");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("the gated approval path persists and replays its tool result, keeping pairing valid", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-gated");
+    const provider = normalizeProvider(config.provider);
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Gated thread" });
+
+    // Turn 1: request a file write (approval-gated), then answer after resume.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_gated", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "out.txt", content: "from-agent" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Wrote the file as requested.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "create out.txt" });
+    const paused = await waitForTerminal(config, first.taskId);
+    expect(paused.status).toBe("waiting_approval");
+    const approvalId = paused.approvalIds[0]!;
+    await decideApproval(config, approvalId, "approve");
+    const finished = await waitForTerminal(config, first.taskId);
+    expect(finished.status).toBe("completed");
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: a follow-up. The gated tool's result must be replayed, and the
+    // assistant tool_calls row must be immediately followed by its paired
+    // role:"tool" result (provider ordering invariant).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "thanks" });
+    await waitForTerminal(config, second.taskId);
+
+    const calls = getEchoToolCallingCalls();
+    const turn2 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "thanks")
+    );
+    expect(turn2).toBeDefined();
+
+    const assistantIdx = turn2!.findIndex(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls!.some((c) => c.id === "call_gated")
+    );
+    expect(assistantIdx).toBeGreaterThan(-1);
+    // The matching tool result must immediately follow its assistant message.
+    const nextMsg = turn2![assistantIdx + 1];
+    expect(nextMsg?.role).toBe("tool");
+    expect(nextMsg?.tool_call_id).toBe("call_gated");
+
+    // No orphan tool results: every role:"tool" message in the replay points
+    // at an assistant tool_call id that appears earlier in the same array.
+    const emittedCallIds = new Set<string>();
+    for (const m of turn2!) {
+      if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+        for (const c of m.tool_calls) emittedCallIds.add(c.id);
+      }
+      if (m.role === "tool") {
+        expect(typeof m.tool_call_id).toBe("string");
+        expect(emittedCallIds.has(m.tool_call_id!)).toBe(true);
+      }
+    }
+
+    // The durable transcript rows exist in state.chatMessages but are
+    // excluded from the human-facing JSON view.
+    const { getChatSession } = await import("./chat");
+    const stored = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === session.id && m.kind === "tool_transcript"
+    );
+    expect(stored.length).toBeGreaterThan(0);
+    const view = getChatSession(config, session.id);
+    expect(view.messages.some((m) => m.kind === "tool_transcript")).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
 });
 
 describe("buildAgentIdentity", () => {
