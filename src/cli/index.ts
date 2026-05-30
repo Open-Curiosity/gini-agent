@@ -43,6 +43,7 @@ import { setup } from "./commands/setup";
 import { autostart } from "./commands/autostart";
 import { identity } from "./commands/identity";
 import { tunnel } from "./commands/tunnel";
+import { reportCrash } from "./commands/report-crash";
 
 export async function run(): Promise<void> {
   const args = Bun.argv.slice(2);
@@ -159,6 +160,7 @@ export async function run(): Promise<void> {
     case "smoke": await smoke(ctx); break;
     case "identity": await identity(ctx); break;
     case "tunnel": await tunnel(ctx); break;
+    case "report-crash": await reportCrash(ctx); break;
     default: help();
   }
 }
