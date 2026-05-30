@@ -25,6 +25,20 @@ import { disableForUninstall } from "./autostart";
 import { installedRuntimeDir, updateRuntime } from "../../runtime/update";
 import { api } from "../api";
 
+// How long the foreground parent waits for a runtime child to exit on its own
+// after forwarding SIGTERM, before escalating to SIGKILL. This MUST exceed the
+// child's own shutdown budget: src/server.ts drains in-flight work bounded by
+// SCHEDULER_DRAIN_TIMEOUT_MS (5000ms) and writes its "shutting down (SIGTERM)"
+// marker to runtime-stdout.log only AFTER that drain completes. A grace equal
+// to the child's 5000ms drain leaves no room for the marker write+flush, so
+// under parallel-CI CPU starvation the parent can SIGKILL the child mid-drain
+// and drop the marker entirely. The 2500ms of headroom here lets a cleanly
+// draining child reach its own exit first. Kept below the 8000ms teardown
+// budget the run command honors on terminal close / Ctrl-C (7500ms grace plus
+// the 50ms post-SIGKILL reap wait = 7550ms, under 8000ms), so the SIGKILL
+// stays a failsafe rather than a routine wait.
+const RUNTIME_CHILD_SIGKILL_GRACE_MS = 7500;
+
 export async function install_(ctx: CliContext): Promise<void> {
   // Provider configuration is optional at install time. The piped-curl
   // install path (`curl … | bash`) has no GINI_PROVIDER env, and the
@@ -522,8 +536,10 @@ export async function runForeground(ctx: CliContext): Promise<void> {
     for (const child of children) {
       try { child.kill("SIGTERM"); } catch { /* already gone */ }
     }
-    // Escalate to SIGKILL after 5s so we don't hang on a stuck child.
-    const deadline = Date.now() + 5000;
+    // Escalate to SIGKILL only after the child's own bounded drain has had room
+    // to finish (see RUNTIME_CHILD_SIGKILL_GRACE_MS), so a cleanly draining
+    // runtime can write its shutdown marker before we force-kill it.
+    const deadline = Date.now() + RUNTIME_CHILD_SIGKILL_GRACE_MS;
     while (aliveChildren().length > 0 && Date.now() < deadline) {
       await Bun.sleep(100);
     }
