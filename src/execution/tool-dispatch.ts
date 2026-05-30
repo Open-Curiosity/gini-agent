@@ -2692,11 +2692,28 @@ async function requestConnectorTool(
   const provider = providerId ? getProvider(providerId) : undefined;
 
   // The contract: the caller supplies EITHER a registered `provider`
-  // (template path) OR `{name, type}` (templateless typed credential for a
-  // service with no provider module). Templateless is the path when the
+  // (template path) OR `{name, type:"api-key"}` (templateless typed credential
+  // for a service with no provider module). Templateless is the path when the
   // model passed `type` and there's no registered provider for `provider`.
+  // Templateless supports api-key ONLY — an oauth2 credential needs a provider
+  // module / setup skill to model its env vars and OAuth flow, so the model
+  // can't request one without a registered provider (see
+  // docs/adr/chat-credential-provisioning.md).
   const credentialType = optionalString(args, "type", "");
-  const templateless = !provider && (credentialType === "api-key" || credentialType === "oauth2");
+  const templateless = !provider && credentialType === "api-key";
+
+  if (!provider && credentialType === "oauth2") {
+    // Recoverable: an oauth2 credential can't be requested templatelessly.
+    // The model must go through a provider module / setup skill that knows the
+    // service's env vars and OAuth flow.
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Templateless request_connector supports type "api-key" only. An oauth2 credential requires a registered provider module (pass its \`provider\` id) or a setup skill that owns the OAuth flow — request_connector cannot mint one for a service with no provider module.`
+      })
+    };
+  }
 
   if (!provider && !templateless) {
     // Synchronous error so the model can recover. It either picked a bogus
@@ -2707,16 +2724,16 @@ async function requestConnectorTool(
       result: JSON.stringify({
         ok: false,
         error: providerId
-          ? `Unknown provider: ${providerId}. For a service with no registered provider, pass {name, type:"api-key"|"oauth2"} instead so the user can connect it.`
-          : `request_connector needs either a registered \`provider\` id, or \`type\` ("api-key" | "oauth2") plus \`name\` for a templateless credential.`
+          ? `Unknown provider: ${providerId}. For a service with no registered provider, pass {name, type:"api-key"} instead so the user can connect it.`
+          : `request_connector needs either a registered \`provider\` id, or \`type:"api-key"\` plus \`name\` for a templateless credential.`
       })
     };
   }
 
-  // Templateless field capture. `name` is the credential name; for api-key it
-  // IS the env var, so validate it synchronously here (createConnector
-  // re-validates server-side) — a recoverable error lets the model fix the
-  // name before any card is minted.
+  // Templateless field capture. `name` is the credential name; it IS the env
+  // var (templateless is api-key only), so validate it synchronously here
+  // (createConnector re-validates server-side) — a recoverable error lets the
+  // model fix the name before any card is minted.
   const credentialName = templateless ? optionalString(args, "name", "") : "";
   const credentialLabel = optionalString(args, "label", "");
   const mcpUrl = optionalString(args, "mcpUrl", "");
@@ -2727,11 +2744,11 @@ async function requestConnectorTool(
         kind: "sync",
         result: JSON.stringify({
           ok: false,
-          error: `A templateless request needs a \`name\`. For type 'api-key' it must be an uppercase env-var token (e.g. SOME_SERVICE_API_KEY).`
+          error: `A templateless request needs a \`name\`. It is used as the environment variable, so it must be an uppercase env-var token (e.g. SOME_SERVICE_API_KEY).`
         })
       };
     }
-    if (credentialType === "api-key" && !/^[A-Z][A-Z0-9_]*$/.test(credentialName)) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(credentialName)) {
       return {
         kind: "sync",
         result: JSON.stringify({

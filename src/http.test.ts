@@ -1004,6 +1004,187 @@ describe("runtime api", () => {
     expect(updated?.status).toBe("enabled");
   });
 
+  test("POST /api/setup-requests/<id>/complete: a known-provider (linear) connector.request creates a TYPED LINEAR_API_KEY, grants + enables the requesting skill", async () => {
+    // Real template-path regression: a connector.request for {provider:"linear",
+    // skillId} must land a TYPED LINEAR_API_KEY record (stamped from the
+    // module's credentialTemplate), and because the requesting skill declares
+    // LINEAR_API_KEY, completing the card grants it and enables the skill — no
+    // second consent card. The demo provider can't prove this (it's untyped /
+    // presence-only); linear has both a credentialTemplate and a live probe, so
+    // we stub a healthy viewer query.
+    const config = testConfig("setup-complete-linear-typed-grant");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-linear-typed",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["LINEAR_API_KEY"]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "connector.request",
+        target: "linear",
+        reason: "connect linear",
+        payload: {
+          provider: "linear",
+          providerLabel: "Linear",
+          providerDescription: "Linear",
+          fields: [],
+          skillId: skill.id,
+          reason: "connect linear",
+          toolCallId: "call_linear_typed"
+        }
+      })
+    );
+
+    // Stub the Linear GraphQL probe with a healthy viewer so checkConnector
+    // flips the typed record to healthy without a live network call.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ data: { viewer: { id: "u1", name: "Tester", email: "t@e.co" } } }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      })) as unknown as typeof fetch;
+    let response: { ok: boolean; connector?: { provider?: string } };
+    try {
+      response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({ secrets: { token: "lin_api_realish" } })
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(response.ok).toBe(true);
+
+    const state = readState(config.instance);
+    // The Linear template stamps a TYPED api-key record named LINEAR_API_KEY.
+    const connector = state.connectors.find((c) => c.provider === "linear");
+    expect(connector?.type).toBe("api-key");
+    expect(connector?.name).toBe("LINEAR_API_KEY");
+    expect(connector?.health).toBe("healthy");
+    // The requesting skill (declares LINEAR_API_KEY) was granted + enabled.
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
+    expect(updated?.status).toBe("enabled");
+    // No secret value leaked into the audit log.
+    expect(JSON.stringify(state.audit)).not.toContain("lin_api_realish");
+  });
+
+  test("POST /api/setup-requests/<id>/complete: skillId for a skill that does NOT declare the credential creates the connector but does NOT grant or enable", async () => {
+    // Auto-grant trust guard: the model supplies skillId, so /complete must
+    // verify the named skill actually declares connector.name before granting.
+    // A skill that does not declare the credential gets the connector created
+    // (so the credential exists) but is neither granted the credential nor
+    // enabled — "a skill only gets credentials it declared + the user granted".
+    const config = testConfig("setup-complete-undeclared-no-grant");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "wants-other-cred",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        // Declares a DIFFERENT credential than the one being requested.
+        requiredCredentials: ["OTHER_API_KEY"]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "connector.request",
+        target: "SOME_SERVICE_API_KEY",
+        reason: "Enter your Some Service API key",
+        payload: {
+          credentialName: "SOME_SERVICE_API_KEY",
+          credentialType: "api-key",
+          credentialLabel: "Some Service",
+          skillId: skill.id,
+          reason: "Enter your Some Service API key",
+          toolCallId: "call_undeclared"
+        }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { SOME_SERVICE_API_KEY: "sk-secret" } })
+    });
+    expect(response.ok).toBe(true);
+
+    const state = readState(config.instance);
+    // The connector was created (the credential now exists).
+    expect(state.connectors.some((c) => c.name === "SOME_SERVICE_API_KEY")).toBe(true);
+    // But the skill — which never declared SOME_SERVICE_API_KEY — was NOT
+    // granted it and stays disabled.
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.grantedConnectors ?? []).not.toContain("SOME_SERVICE_API_KEY");
+    expect(updated?.status).toBe("disabled");
+  });
+
+  test("POST /api/setup-requests/<id>/complete: a multi-credential skill grants the requested credential but stays DISABLED while another required credential has no connector", async () => {
+    // Enable-when-fully-satisfied: a skill that requires two credentials and
+    // only just got the first must NOT be enabled while the second has no
+    // connector row at all. firstUngrantedCredential alone misses this (it
+    // skips required creds with no connector); isSkillActive catches it.
+    const config = testConfig("setup-complete-partial-multi-disabled");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-two-creds",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        // SECOND_API_KEY has no connector yet — it'll be requested separately.
+        requiredCredentials: ["FIRST_API_KEY", "SECOND_API_KEY"]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "connector.request",
+        target: "FIRST_API_KEY",
+        reason: "Enter your first API key",
+        payload: {
+          credentialName: "FIRST_API_KEY",
+          credentialType: "api-key",
+          credentialLabel: "First",
+          skillId: skill.id,
+          reason: "Enter your first API key",
+          toolCallId: "call_first"
+        }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { FIRST_API_KEY: "sk-first" } })
+    });
+    expect(response.ok).toBe(true);
+
+    const state = readState(config.instance);
+    const updated = state.skills.find((s) => s.id === skill.id);
+    // The requested credential was granted (the human entered it for this skill).
+    expect(updated?.grantedConnectors).toEqual(["FIRST_API_KEY"]);
+    // But the skill stays disabled — SECOND_API_KEY still has no connector.
+    expect(updated?.status).toBe("disabled");
+  });
+
   test("POST /api/setup-requests/<id>/complete on a multi-provider skill grants one provider, stays disabled, and mints the next grant card", async () => {
     const config = testConfig("setup-complete-skill-grant-multi");
     const handler = createHandler(config);
@@ -1281,7 +1462,7 @@ describe("runtime api", () => {
     }
   });
 
-  test("POST /api/setup-requests/<id>/complete returns ok:false and leaves the request pending on probe failure", async () => {
+  test("POST /api/setup-requests/<id>/complete returns ok:false, claims the request, and cleans up the connector on probe failure", async () => {
     const config = testConfig("setup-requests-complete-probe-fail");
     const handler = createHandler(config);
     const { createSetupRequest } = await import("./state");
@@ -1316,9 +1497,15 @@ describe("runtime api", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+    // The row was claimed BEFORE the create (claim-first race safety), so a
+    // probe failure cannot bounce it back to pending — it stays completed
+    // with a persisted failure outcome, and the orphaned unhealthy connector
+    // is cleaned up so it never lingers as a half-configured record.
     const state = readState(config.instance);
     const after = state.setupRequests.find((a) => a.id === approval.id);
-    expect(after?.status).toBe("pending");
+    expect(after?.status).toBe("completed");
+    expect(after?.connectOutcome?.ok).toBe(false);
+    expect(state.connectors.some((c) => c.provider === "linear")).toBe(false);
   });
 
   test("POST /api/setup-requests/<id>/complete 404s for an authorization id", async () => {

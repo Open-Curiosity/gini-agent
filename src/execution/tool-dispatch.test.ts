@@ -417,6 +417,31 @@ describe("request_connector dispatch", () => {
     }
   });
 
+  test("templateless: type:'oauth2' with no registered provider is rejected (api-key only)", async () => {
+    // Templateless request_connector supports api-key ONLY — an oauth2
+    // credential needs a provider module / setup skill to model its env vars
+    // and OAuth flow, so a no-provider oauth2 request bounces with a
+    // recoverable error and mints no card.
+    const instance = `req-connector-tl-oauth2-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_tl_oauth2",
+      JSON.stringify({ name: "some-service-oauth", type: "oauth2", reason: "connect" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("api-key");
+    }
+    const state = readState(instance);
+    expect(state.setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
+  });
+
   test("templateless: a bad api-key name is rejected with a recoverable error before any card is minted", async () => {
     const instance = `req-connector-badname-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance);
