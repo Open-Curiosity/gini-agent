@@ -33,11 +33,7 @@ import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilitie
 import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
-import { status as runtimeStatus } from "../runtime";
-import { providerCatalogWithStatus } from "../provider";
-import { setSetupProvider } from "../runtime/setup-api";
-import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability } from "../capabilities/agents";
-import { listSkills } from "../capabilities/skills";
+import { findSelfOperation, selfOperationIndex } from "./self-registry";
 import { recall } from "../memory";
 import {
   dedupeAppendLines,
@@ -226,24 +222,10 @@ export async function dispatchToolCall(
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
       return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
-    case "get_self":
-      return { kind: "sync", result: await getSelfTool(config, taskId) };
-    case "list_providers":
-      return { kind: "sync", result: await listProvidersTool(config, taskId) };
-    case "list_agents":
-      return { kind: "sync", result: await listAgentsTool(config, taskId) };
-    case "list_skills":
-      return { kind: "sync", result: await listSkillsTool(config, taskId, args) };
-    case "list_mcp_servers":
-      return { kind: "sync", result: await listMcpServersTool(config, taskId) };
-    case "list_connectors":
-      return { kind: "sync", result: await listConnectorsTool(config, taskId) };
-    case "set_provider":
-      return { kind: "sync", result: await setProviderTool(config, taskId, args) };
-    case "use_agent":
-      return { kind: "sync", result: await useAgentTool(config, taskId, args) };
-    case "create_agent":
-      return { kind: "sync", result: await createAgentTool(config, taskId, args) };
+    case "self_discover":
+      return { kind: "sync", result: await selfDiscoverTool(config, taskId, args) };
+    case "self_invoke":
+      return await selfInvokeTool(config, taskId, toolCallId, args);
     case "browser_connect": {
       // browser.connect is a SetupRequest (user-actor): the user opens the
       // visible browser, signs in, then clicks Connect. There is no
@@ -2237,292 +2219,95 @@ async function recordLowRiskAudit(
 }
 
 // ---------------- Self-knowledge / self-config ----------------
+//
+// The operation handlers live in self-registry.ts (the single source of
+// truth). These two dispatch handlers are the thin meta-tool wrappers:
+// self_discover surfaces the index / a single op's schema; self_invoke
+// validates args and routes by tag (query => sync; mutate => approval seam).
 
-async function getSelfTool(config: RuntimeConfig, taskId: string): Promise<string> {
-  const snapshot = runtimeStatus(config);
-  const state = readState(config.instance);
-  const counts = {
-    agents: state.agents.length,
-    skills: state.skills.length,
-    skillsEnabled: state.skills.filter((s) => s.status === "enabled").length,
-    jobs: state.jobs.length,
-    activeJobs: snapshot.activeJobs,
-    mcpServers: state.mcpServers.length,
-    messagingBridges: state.messagingBridges.length,
-    connectors: state.connectors.length,
-    memoryUnits: snapshot.memoryUnits,
-    pendingApprovals: snapshot.pendingApprovals
-  };
-  const envelope = {
-    ok: true,
-    instance: snapshot.instance,
-    port: snapshot.port,
-    version: snapshot.version,
-    approvalMode: config.approvalMode ?? "auto",
-    provider: snapshot.provider,
-    activeAgent: snapshot.activeAgent,
-    counts
-  };
-  appendTrace(config.instance, taskId, {
-    type: "tool",
-    message: "Got self snapshot",
-    data: { instance: snapshot.instance, provider: snapshot.provider.provider.name, agent: snapshot.activeAgent?.name }
-  });
-  await recordLowRiskAudit(config, taskId, "self.get", snapshot.instance, {
-    provider: snapshot.provider.provider.name,
-    activeAgentId: snapshot.activeAgent?.id
-  });
-  return JSON.stringify(envelope);
+// Find a small set of close operation-name matches for an unknown name so
+// the model gets a "did you mean" nudge instead of a bare error. A name is
+// "close" when one string contains the other or they share a leading token
+// (e.g. "list_provider" → "list_providers"; "provider" → both provider ops).
+function suggestSelfOperations(name: string): string[] {
+  const lower = name.toLowerCase();
+  const head = lower.split(/[_\s]/)[0] ?? lower;
+  return selfOperationIndex()
+    .map((op) => op.name)
+    .filter((candidate) => {
+      const c = candidate.toLowerCase();
+      return c.includes(lower) || lower.includes(c) || (head.length > 0 && c.startsWith(head));
+    })
+    .slice(0, 5);
 }
 
-async function listProvidersTool(config: RuntimeConfig, taskId: string): Promise<string> {
-  const catalog = providerCatalogWithStatus(config.provider?.name);
-  const providers = catalog.map((item) => ({
-    id: item.id,
-    name: item.name,
-    displayName: item.displayName,
-    auth: item.auth,
-    baseUrl: item.baseUrl,
-    models: item.models,
-    capabilities: item.capabilities,
-    costHint: item.costHint,
-    configured: item.configured,
-    isActive: item.name === config.provider?.name
-  }));
-  appendTrace(config.instance, taskId, {
-    type: "tool",
-    message: "Listed providers",
-    data: { count: providers.length, active: config.provider?.name }
-  });
-  await recordLowRiskAudit(config, taskId, "provider.listed", "providers", {
-    count: providers.length,
-    configured: providers.filter((p) => p.configured).length
-  });
-  return JSON.stringify({ ok: true, activeProvider: config.provider?.name, activeModel: config.provider?.model, providers });
-}
-
-async function listAgentsTool(config: RuntimeConfig, taskId: string): Promise<string> {
-  const { activeAgentId, agents } = listAgents(config);
-  const summary = agents.map((agent) => ({
-    id: agent.id,
-    name: agent.name,
-    isActive: agent.id === activeAgentId,
-    providerName: agent.providerName,
-    model: agent.model,
-    toolsets: agent.toolsets,
-    messagingTargets: agent.messagingTargets,
-    createdAt: agent.createdAt
-  }));
-  appendTrace(config.instance, taskId, {
-    type: "tool",
-    message: "Listed agents",
-    data: { count: summary.length, active: activeAgentId }
-  });
-  await recordLowRiskAudit(config, taskId, "agent.listed", "agents", {
-    count: summary.length,
-    active: activeAgentId
-  });
-  return JSON.stringify({ ok: true, activeAgentId, agents: summary });
-}
-
-async function listSkillsTool(
+async function selfDiscoverTool(
   config: RuntimeConfig,
   taskId: string,
   args: Record<string, unknown>
 ): Promise<string> {
-  const statusFilter = typeof args.status === "string" && args.status !== "all" ? args.status : undefined;
-  const nameContains = typeof args.nameContains === "string" ? args.nameContains.toLowerCase() : undefined;
-  const all = listSkills(config);
-  const filtered = all.filter((skill) => {
-    if (statusFilter && skill.status !== statusFilter) return false;
-    if (nameContains && !skill.name.toLowerCase().includes(nameContains)) return false;
-    return true;
-  });
-  const summary = filtered.map((skill) => ({
-    id: skill.id,
-    name: skill.name,
-    category: skill.category ?? "user",
-    status: skill.status,
-    trigger: skill.trigger ?? "",
-    description: skill.description ?? "",
-    manifestPath: skill.manifestPath ?? null
-  }));
+  const name = typeof args.name === "string" && args.name.trim().length > 0 ? args.name.trim() : undefined;
+  const tag = typeof args.tag === "string" && args.tag.trim().length > 0 ? args.tag.trim() : undefined;
+  await recordLowRiskAudit(config, taskId, "self.discover", name ?? tag ?? "index", { name: name ?? null, tag: tag ?? null });
   appendTrace(config.instance, taskId, {
     type: "tool",
-    message: "Listed skills",
-    data: { total: all.length, returned: summary.length, statusFilter, nameContains }
+    message: "Discovered self operations",
+    data: { name: name ?? null, tag: tag ?? null }
   });
-  await recordLowRiskAudit(config, taskId, "skill.listed", "skills", {
-    total: all.length,
-    returned: summary.length,
-    statusFilter,
-    nameContains
-  });
-  return JSON.stringify({ ok: true, total: all.length, skills: summary });
-}
-
-async function listMcpServersTool(config: RuntimeConfig, taskId: string): Promise<string> {
-  const state = readState(config.instance);
-  const servers = state.mcpServers.map((server) => ({
-    id: server.id,
-    name: server.name,
-    transport: server.transport ?? "stdio",
-    status: server.status,
-    exposedTools: server.exposedTools,
-    toolCount: server.tools?.length ?? 0,
-    lastHealthAt: server.lastHealthAt ?? null,
-    message: server.message ?? null,
-    url: server.url ?? null
-  }));
-  appendTrace(config.instance, taskId, {
-    type: "tool",
-    message: "Listed MCP servers",
-    data: { count: servers.length }
-  });
-  await recordLowRiskAudit(config, taskId, "mcp.listed", "mcp", { count: servers.length });
-  return JSON.stringify({ ok: true, servers });
-}
-
-async function listConnectorsTool(config: RuntimeConfig, taskId: string): Promise<string> {
-  const state = readState(config.instance);
-  const connectors = state.connectors.map((connector) => ({
-    id: connector.id,
-    name: connector.name,
-    provider: connector.provider,
-    status: connector.status,
-    health: connector.health,
-    scopes: connector.scopes,
-    source: connector.source ?? "user",
-    lastHealthAt: connector.lastHealthAt ?? null,
-    message: connector.message ?? null
-  }));
-  appendTrace(config.instance, taskId, {
-    type: "tool",
-    message: "Listed connectors",
-    data: { count: connectors.length }
-  });
-  await recordLowRiskAudit(config, taskId, "connector.listed", "connectors", { count: connectors.length });
-  return JSON.stringify({ ok: true, connectors });
-}
-
-async function setProviderTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  // When the caller omits `provider`, keep the current one and only
-  // patch model/baseUrl. setSetupProvider requires a provider name in
-  // its payload, so default to the active one to keep the API path
-  // accepting the no-switch case.
-  const targetProvider = typeof args.provider === "string" && args.provider.trim().length > 0
-    ? args.provider.trim()
-    : config.provider?.name;
-  if (!targetProvider) {
-    return JSON.stringify({ ok: false, error: "set_provider requires a 'provider' when no provider is currently active." });
-  }
-  const payload: Record<string, unknown> = { provider: targetProvider };
-  if (typeof args.model === "string" && args.model.trim().length > 0) payload.model = args.model.trim();
-  if (typeof args.baseUrl === "string" && args.baseUrl.trim().length > 0) payload.baseUrl = args.baseUrl.trim();
-  if (typeof args.apiKey === "string" && args.apiKey.trim().length > 0) payload.apiKey = args.apiKey.trim();
-  const result = await setSetupProvider(config, payload);
-  appendTrace(config.instance, taskId, {
-    type: "tool",
-    message: result.ok ? "Switched provider" : "Provider switch failed",
-    data: {
-      provider: targetProvider,
-      model: typeof payload.model === "string" ? payload.model : undefined,
-      ok: result.ok,
-      error: result.error
+  if (name) {
+    const op = findSelfOperation(name);
+    if (!op) {
+      return JSON.stringify({ ok: false, error: `Unknown self operation: ${name}.`, didYouMean: suggestSelfOperations(name) });
     }
-  });
-  await recordLowRiskAudit(config, taskId, "provider.set", targetProvider, {
-    ok: result.ok,
-    model: typeof payload.model === "string" ? payload.model : undefined,
-    plistRefreshNeeded: result.plistRefreshNeeded,
-    error: result.error
-  });
-  return JSON.stringify({
-    ok: result.ok,
-    provider: result.provider,
-    plistRefreshNeeded: result.plistRefreshNeeded,
-    error: result.error
-  });
+    return JSON.stringify({ name: op.name, summary: op.summary, tag: op.tag, schema: op.schema });
+  }
+  return JSON.stringify(selfOperationIndex(tag ? { tag } : undefined));
 }
 
-async function useAgentTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  const idOrName = typeof args.agentId === "string" ? args.agentId.trim() : "";
-  if (!idOrName) {
-    return JSON.stringify({ ok: false, error: "use_agent requires an 'agentId' (id or name)." });
+// Shallow required-key check against an op's schema. We deliberately do NOT
+// pull in a JSON-schema validator: the goal is to catch the obvious "missing
+// a required arg" mistake and hand the model the full schema back so it can
+// self-correct, not to enforce the schema exhaustively (the handlers already
+// validate the specific fields they consume). Returns the first missing
+// required key, or undefined when all required keys are present.
+function firstMissingRequiredKey(schema: Record<string, unknown>, args: Record<string, unknown>): string | undefined {
+  const required = Array.isArray(schema.required) ? (schema.required as unknown[]) : [];
+  for (const key of required) {
+    if (typeof key !== "string") continue;
+    const value = args[key];
+    if (value === undefined || value === null) return key;
   }
-  try {
-    const agent = await useAgentCapability(config, idOrName);
-    appendTrace(config.instance, taskId, {
-      type: "tool",
-      message: "Switched active agent",
-      data: { agentId: agent.id, name: agent.name }
-    });
-    await recordLowRiskAudit(config, taskId, "agent.activated", agent.id, {
-      name: agent.name
-    });
-    return JSON.stringify({
-      ok: true,
-      activeAgentId: agent.id,
-      agent: {
-        id: agent.id,
-        name: agent.name,
-        providerName: agent.providerName,
-        model: agent.model
-      }
-    });
-  } catch (error) {
-    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
-  }
+  return undefined;
 }
 
-async function createAgentTool(
+async function selfInvokeTool(
   config: RuntimeConfig,
   taskId: string,
+  toolCallId: string,
   args: Record<string, unknown>
-): Promise<string> {
+): Promise<DispatchResult> {
   const name = typeof args.name === "string" ? args.name.trim() : "";
   if (!name) {
-    return JSON.stringify({ ok: false, error: "create_agent requires a 'name'." });
+    return { kind: "sync", result: JSON.stringify({ ok: false, error: "self_invoke requires a 'name'.", didYouMean: selfOperationIndex().map((op) => op.name) }) };
   }
-  try {
-    const record = await createAgentCapability(config, {
-      name,
-      providerName: typeof args.providerName === "string" ? args.providerName : undefined,
-      model: typeof args.model === "string" ? args.model : undefined,
-      toolsets: Array.isArray(args.toolsets) ? args.toolsets : undefined
-    });
-    appendTrace(config.instance, taskId, {
-      type: "tool",
-      message: "Created agent",
-      data: { agentId: record.id, name: record.name }
-    });
-    await recordLowRiskAudit(config, taskId, "agent.created", record.id, {
-      name: record.name,
-      providerName: record.providerName,
-      model: record.model
-    });
-    return JSON.stringify({
-      ok: true,
-      agent: {
-        id: record.id,
-        name: record.name,
-        providerName: record.providerName,
-        model: record.model,
-        toolsets: record.toolsets
-      },
-      note: "Agent created but NOT activated. Call use_agent to switch."
-    });
-  } catch (error) {
-    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  const op = findSelfOperation(name);
+  if (!op) {
+    return { kind: "sync", result: JSON.stringify({ ok: false, error: `Unknown self operation: ${name}.`, didYouMean: suggestSelfOperations(name) }) };
   }
+  const opArgs = (args.args && typeof args.args === "object" && !Array.isArray(args.args))
+    ? args.args as Record<string, unknown>
+    : {};
+  const missing = firstMissingRequiredKey(op.schema, opArgs);
+  if (missing) {
+    return { kind: "sync", result: JSON.stringify({ ok: false, error: `Missing required argument: ${missing}.`, schema: op.schema }) };
+  }
+  if (op.tag === "query") {
+    return { kind: "sync", result: await op.handler(config, taskId, opArgs) };
+  }
+  // mutate => route through the approval seam. The actual handler run
+  // happens in agent.executeApprovedAction (the "self.config" branch) on
+  // approval, re-reading {opName, args} from the approval payload.
+  return pendingOrAuto(config, "self.config", undefined, (reason) => requestSelfInvoke(config, taskId, toolCallId, op.name, opArgs, reason));
 }
 
 // ---------------- Approval-gated tools ----------------
@@ -2790,6 +2575,48 @@ async function requestSendMessage(
       type: "approval",
       message: "Approval requested for messaging send (chat-task)",
       data: { approvalId: approval.id, bridgeId: bridge.id, target, textBytes: text.length, toolCallId }
+    });
+    return approval.id;
+  });
+}
+
+// Create the approval row for a mutate self-config operation. Mirrors
+// requestSendMessage: the side effect (running the registry handler) does
+// NOT happen here — it runs in agent.executeApprovedAction's "self.config"
+// branch once the approval resolves, re-reading {opName, args} from the
+// payload. In `auto` mode pendingOrAuto auto-resolves this immediately; in
+// `strict` mode the row waits for the operator.
+async function requestSelfInvoke(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  opName: string,
+  opArgs: Record<string, unknown>,
+  reasonOverride?: string
+): Promise<string> {
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createAuthorization(state, {
+      taskId: item.id,
+      action: "self.config",
+      target: opName,
+      risk: "medium",
+      reason: reasonOverride ?? "Changing Gini's own configuration requires approval.",
+      payload: {
+        opName,
+        args: opArgs,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for self-config change (chat-task)",
+      data: { approvalId: approval.id, opName, toolCallId }
     });
     return approval.id;
   });

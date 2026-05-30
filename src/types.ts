@@ -1047,7 +1047,8 @@ export type AuthorizationAction =
   | "skill.enable"
   | "connector.enable"
   | "browser.upload_file"
-  | "messaging.send";
+  | "messaging.send"
+  | "self.config";
 
 export interface Authorization {
   id: string;

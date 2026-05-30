@@ -24,7 +24,11 @@ export const ACTION_RISK: ReadonlyMap<string, RiskLevel> = new Map<string, RiskL
   // Routes user-typed secrets directly into a DOM field on the
   // agent's page. High risk because the approval card is the user's
   // last chance to refuse before a credential leaves their keyboard.
-  ["browser.fill_secret", "high"]
+  ["browser.fill_secret", "high"],
+  // Mutate self-config ops (set_provider / use_agent / create_agent)
+  // route through the approval seam as this action. Medium: a config
+  // rewrite, not external egress.
+  ["self.config", "medium"]
   // anything not listed defaults to "low" via the helper below
 ]);
 
@@ -46,7 +50,15 @@ export const TOOL_RISK: ReadonlyMap<string, RiskLevel> = new Map<string, RiskLev
   // Mirrors the high classification ACTION_RISK gives to
   // browser.fill_secret. The catalog tool name is the
   // underscore-separated form.
-  ["browser_fill_secrets", "high"]
+  ["browser_fill_secrets", "high"],
+  // The self-config meta-tools. Per-op gating happens inside dispatch via
+  // pendingOrAuto (mutate ops route through "self.config"); the tool names
+  // themselves are low. Without these explicit entries the substring
+  // heuristic below would seed self_invoke as "high" (it matches
+  // includes("invoke")), which would mis-gate the always-on discover/invoke
+  // surface at the tool-name level.
+  ["self_discover", "low"],
+  ["self_invoke", "low"]
   // Everything else falls out of the substring heuristic in defaults.ts.
 ]);
 
