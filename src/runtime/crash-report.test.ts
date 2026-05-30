@@ -106,6 +106,23 @@ describe("redactReportText", () => {
     expect(out).toContain("[redacted]");
   });
 
+  test("redacts the FULL Authorization header value (Basic, bare token, not just Bearer)", () => {
+    // The header value can be `Basic <base64>`, a bare token with no scheme,
+    // or carry multiple space-separated tokens. Redacting only the first
+    // whitespace-delimited token leaves the rest of the credential exposed.
+    const text = [
+      "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+      "Authorization: ghp_0123456789abcdefghijklmnopqrstuv",
+      "Authorization: some-opaque-api-key-value here-too"
+    ].join("\n");
+    const out = redactReportText(text);
+    expect(out).not.toContain("dXNlcjpwYXNzd29yZA==");
+    expect(out).not.toContain("ghp_0123456789abcdefghijklmnopqrstuv");
+    expect(out).not.toContain("some-opaque-api-key-value");
+    expect(out).not.toContain("here-too");
+    expect(out).toContain("[redacted]");
+  });
+
   test("redacts literal secrets-env values and the tunnel secret", () => {
     const text = "leaked OPENAI value hunter2-literal and tunnel ts-secret-zzz here";
     const out = redactReportText(text, {
@@ -118,6 +135,20 @@ describe("redactReportText", () => {
     // A non-secret value still present (FOO=bar is a value too, but "bar"
     // appears nowhere in the text, so the surrounding prose is intact).
     expect(out).toContain("leaked OPENAI value");
+  });
+
+  test("redacts a single-quote-escaped secrets-env value as loaded (not half-stripped)", () => {
+    // The writer escapes embedded single quotes as '\'' (close, escaped
+    // quote, reopen). unquoteSecretsValue inverts that, so the literal we
+    // redact is exactly `ab'cd` — an ad-hoc slice(1,-1) would have left the
+    // `\''` debris and failed to match the loaded value.
+    const secret = "ab'cd-secret-99";
+    const escaped = "'ab'\\''cd-secret-99'"; // shellSingleQuote(secret)
+    const out = redactReportText(`the key is ${secret} appears here`, {
+      secretsEnvBody: `export WEIRD_KEY=${escaped}`
+    });
+    expect(out).not.toContain(secret);
+    expect(out).toContain("[redacted]");
   });
 });
 
