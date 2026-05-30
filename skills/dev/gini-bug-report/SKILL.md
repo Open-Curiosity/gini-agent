@@ -3,7 +3,7 @@ name: gini-bug-report
 description: "File a locally-captured, already-redacted Gini crash report as a GitHub issue, with the user's consent. Reads the pending crash queue and delegates the actual filing to the github-issues skill."
 license: MIT
 compatibility: "Runs on the default, launchd-supervised Gini instance. Needs `gh` (via the github-issues skill) to actually file. Reads the local crash queue under ${GINI_STATE_ROOT:-$HOME/.gini}/crash-reports."
-allowed-tools: "terminal_exec"
+allowed-tools: "read_skill terminal_exec"
 metadata:
   gini:
     version: 1.0.0
@@ -107,7 +107,7 @@ Multiple pending files can share one `fingerprint` (the same crash
 recurring). Group by `fingerprint` — you file **one** issue per distinct
 fingerprint (see step 3), not one per file.
 
-## 2. Confirm intent
+## 2. Confirm intent — and scope to the asked fingerprints
 
 The restart consent flow already asked the user the "want me to file this?"
 question, so on this turn you are acting on their reply:
@@ -115,6 +115,20 @@ question, so on this turn you are acting on their reply:
 - **The user said yes** (or "report it", "go ahead") → proceed to step 3.
 - **The user said no** (or "don't", "skip it") → file nothing; mark the
   report(s) dismissed (step 5).
+
+**File ONLY the fingerprints the consent named.** The consent message in
+this conversation listed the specific crash fingerprint(s) it covers (e.g.
+`The specific crash fingerprint(s) this consent covers: ab12cd34, ...`). A
+new crash can land in `$QUEUE/pending` between the ask and the user's "yes";
+filing it would be unconsented. So when you list the queue in step 1, **match
+each pending file against the fingerprint(s) named in the consent message**
+(the listed values are the first 8 hex chars of each fingerprint — match by
+prefix) and act on those files only. Leave any pending file whose fingerprint
+was not named where it is; a later consent flow will offer it.
+
+The one exception: if the user **explicitly** asks to file *all* pending
+crashes ("file all of them", "report everything in the queue"), then act on
+every pending file.
 
 If you were invoked **manually** (the user asked directly, without the
 consent message having been posted), ask first: summarize the pending
@@ -131,7 +145,9 @@ follow its `gh` path — it handles installing `gh`, the interactive
 read_skill name='github-issues'
 ```
 
-Then, **once per distinct fingerprint**:
+Then, **once per distinct fingerprint that the consent named** (skip any
+pending file whose fingerprint was not in the consent message, unless the
+user explicitly asked to file all):
 
 1. **Dedup first.** Search for an existing open crash issue with the same
    fingerprint (per `github-issues` Listing and Searching). The fingerprint
@@ -250,6 +266,10 @@ declined → `dismissed/`, and gh-not-authed / user-defers → leave it in
 4. **One issue per distinct fingerprint.** Search the existing open
    `gini-crash` issues for the fingerprint first; comment on a match rather
    than opening a duplicate.
+7. **File only the fingerprints the consent named.** The consent message
+   lists the exact crash fingerprint(s) it covers; act on those pending files
+   only. A crash that landed after the ask is unconsented — leave it pending.
+   The sole exception is an explicit "file all" from the user.
 5. **Confirm before filing.** Act on the user's consent-flow reply, or — if
    invoked manually — ask first and wait.
 6. Quote issue numbers verbatim (`#N`) in replies so GitHub deeplinks
