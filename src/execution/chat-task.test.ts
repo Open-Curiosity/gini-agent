@@ -18,15 +18,20 @@ import {
 } from "../provider";
 import { submitTask, decideApproval, resolveSetupRequest } from "../agent";
 import {
+  bankIdForAgent,
   createChatSession,
   createEmptyState,
   createRun,
   createSubagentRecord,
   deleteChatSession,
+  ensureAgentBank,
+  ensureDefaultBank,
+  insertMemoryUnit,
   mutateState,
   now,
   readState
 } from "../state";
+import { echoEmbed } from "../embeddings";
 import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
 import { buildAgentIdentity, buildInactiveSkillsBlock } from "./chat-task";
@@ -1046,12 +1051,22 @@ describe("chat-task loop", () => {
 
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBeGreaterThan(0);
-    const system = calls[0]!.find((m) => m.role === "system");
-    const content = String(system?.content ?? "");
-    expect(content).toContain("Your runtime identity:");
-    expect(content).toContain(`- instance: ${config.instance}`);
-    expect(content).toContain(`- runtime port: ${config.port}`);
-    expect(content).toContain("- provider: echo/");
+    // The emitted identity now rides in the ephemeral role:"user" tail
+    // placed immediately before the real user message — NOT in the
+    // byte-stable system prefix. See ADR stable-system-prefix.md.
+    const turn = calls[0]!;
+    const system = turn.find((m) => m.role === "system");
+    const systemContent = String(system?.content ?? "");
+    expect(systemContent).not.toContain("Your runtime identity:");
+    const userIdx = turn.findIndex((m) => m.role === "user" && m.content === "what's your setup?");
+    expect(userIdx).toBeGreaterThan(0);
+    const tail = turn[userIdx - 1]!;
+    expect(tail.role).toBe("user");
+    const tailContent = String(tail.content ?? "");
+    expect(tailContent).toContain("Your runtime identity:");
+    expect(tailContent).toContain(`- instance: ${config.instance}`);
+    expect(tailContent).toContain(`- runtime port: ${config.port}`);
+    expect(tailContent).toContain("- provider: echo/");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1092,11 +1107,20 @@ describe("chat-task loop", () => {
 
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBeGreaterThan(0);
-    const system = calls[0]!.find((m) => m.role === "system");
+    const turn = calls[0]!;
+    const system = turn.find((m) => m.role === "system");
     const content = String(system?.content ?? "");
     expect(content.startsWith(SUBAGENT_PROMPT)).toBe(true);
     expect(content).not.toContain("Your runtime identity:");
     expect(content).not.toContain("Runtime identity changes since last turn:");
+    // Subagents keep their single override prompt + the real user message:
+    // no ephemeral identity/memory tail is injected on the subagent path.
+    expect(turn.filter((m) => m.role === "user").length).toBe(1);
+    for (const m of turn) {
+      const text = String(m.content ?? "");
+      expect(text).not.toContain("Your runtime identity:");
+      expect(text).not.toContain("Runtime identity changes since last turn:");
+    }
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1156,11 +1180,18 @@ describe("chat-task loop", () => {
 
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBe(2);
-    const firstSystem = String(calls[0]!.find((m) => m.role === "system")?.content ?? "");
-    const secondSystem = String(calls[1]!.find((m) => m.role === "system")?.content ?? "");
-    expect(firstSystem).toContain("Your runtime identity:");
-    expect(secondSystem).not.toContain("Your runtime identity:");
-    expect(secondSystem).not.toContain("Runtime identity changes since last turn:");
+    // Identity now rides in the ephemeral role:"user" tail, so check every
+    // message of each turn — not just the (now identity-free) system prefix.
+    const firstTurnText = calls[0]!.map((m) => String(m.content ?? "")).join("\n");
+    const secondTurnText = calls[1]!.map((m) => String(m.content ?? "")).join("\n");
+    // First turn emits the full identity (in the tail); the system prefix
+    // itself never carries it anymore.
+    expect(firstTurnText).toContain("Your runtime identity:");
+    expect(String(calls[0]!.find((m) => m.role === "system")?.content ?? "")).not.toContain("Your runtime identity:");
+    // Quiet follow-up turn: no identity anywhere — neither system nor tail
+    // (and with nothing recalled, no tail message is injected at all).
+    expect(secondTurnText).not.toContain("Your runtime identity:");
+    expect(secondTurnText).not.toContain("Runtime identity changes since last turn:");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1208,6 +1239,215 @@ describe("chat-task loop", () => {
     await waitForTerminal(config, task.id);
 
     expect(readState(config.instance).identitySnapshots?.[sessionId]).toBeUndefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("message 0 is a byte-stable prefix across two turns in the same session", async () => {
+    // Headline cache contract: with no identity/skill/job/connector change
+    // between turns and recall isolated (no active agent → recall skipped, so
+    // recalledContext is empty on both turns), the system message (message 0)
+    // must be byte-identical turn-to-turn so automatic provider prefix
+    // caching stays warm. The per-turn-varying content (emitted identity,
+    // recalled memory) now lives in the ephemeral role:"user" tail, not the
+    // prefix. See ADR stable-system-prefix.md.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-stable-prefix");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Stable prefix");
+      return session.id;
+    });
+
+    const firstRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 1",
+        input: "first",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+    setEchoToolCallingResponse({ provider, text: "One.", toolCalls: [], finishReason: "stop" });
+    const firstTask = await submitTask(config, "first question", { mode: "chat", runId: firstRunId });
+    await waitForTerminal(config, firstTask.id);
+
+    const secondRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 2",
+        input: "second",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+    setEchoToolCallingResponse({ provider, text: "Two.", toolCalls: [], finishReason: "stop" });
+    const secondTask = await submitTask(config, "second question", { mode: "chat", runId: secondRunId });
+    await waitForTerminal(config, secondTask.id);
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    expect(calls[0]![0]!.role).toBe("system");
+    expect(calls[1]![0]!.role).toBe("system");
+    // Byte equality of message 0 across the two turns is the whole point.
+    expect(calls[0]![0]!.content).toBe(calls[1]![0]!.content);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("delivers emitted identity then recalled memory in a role:user tail before the user message", async () => {
+    // Both per-turn blocks must still reach the model: the emitted identity
+    // (turn 1 of a session) and the recalled-memory block, in that order,
+    // inside a single role:"user" message placed immediately before the real
+    // user message. Recall is driven through the real pipeline with the echo
+    // embedder and the reranker pinned to `none` so it returns the seeded
+    // unit deterministically and offline.
+    const prevEmbed = process.env.GINI_EMBEDDING_PROVIDER;
+    const prevReranker = process.env.GINI_RERANKER_PROVIDER;
+    process.env.GINI_EMBEDDING_PROVIDER = "echo";
+    process.env.GINI_RERANKER_PROVIDER = "none";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-tail-delivery");
+    const provider = normalizeProvider(config.provider);
+    const MEMORY_TEXT = "the user keeps bees on a rooftop in Lisbon";
+
+    try {
+      // Active agent so resolveEffectiveContext yields a memory namespace and
+      // recall runs; seed one matching unit into that agent's bank.
+      const agentId = "agent_tail";
+      const sessionId = await mutateState(config.instance, (state) => {
+        state.agents.push({
+          id: agentId,
+          instance: state.instance,
+          name: "tail",
+          providerName: "echo",
+          model: "gini-echo-v0",
+          toolsets: [],
+          messagingTargets: [],
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z"
+        });
+        state.activeAgentId = agentId;
+        const session = createChatSession(state, "Tail delivery");
+        return session.id;
+      });
+      ensureDefaultBank(config.instance);
+      ensureAgentBank(config.instance, agentId);
+      insertMemoryUnit(config.instance, {
+        bankId: bankIdForAgent(agentId),
+        agentId,
+        text: MEMORY_TEXT,
+        embedding: echoEmbed(MEMORY_TEXT),
+        embeddingModel: "echo-embed-v0",
+        network: "world"
+      });
+
+      const runId = await mutateState(config.instance, (state) => {
+        const run = createRun(state, {
+          kind: "conversation_turn",
+          title: "Tail turn",
+          input: "intro",
+          conversationId: sessionId
+        });
+        return run.id;
+      });
+
+      setEchoToolCallingResponse({ provider, text: "Noted.", toolCalls: [], finishReason: "stop" });
+      const task = await submitTask(config, MEMORY_TEXT, { mode: "chat", runId });
+      const finished = await waitForTerminal(config, task.id);
+      expect(finished.status).toBe("completed");
+
+      const calls = getEchoToolCallingCalls();
+      expect(calls.length).toBeGreaterThan(0);
+      const turn = calls[0]!;
+      // The stable system prefix carries neither block anymore.
+      const systemContent = String(turn.find((m) => m.role === "system")?.content ?? "");
+      expect(systemContent).not.toContain("Your runtime identity:");
+      expect(systemContent).not.toContain("Long-term memory of prior conversations");
+      // The tail is the role:"user" message immediately before the real input.
+      const userIdx = turn.findIndex((m) => m.role === "user" && m.content === MEMORY_TEXT);
+      expect(userIdx).toBeGreaterThan(0);
+      const tail = turn[userIdx - 1]!;
+      expect(tail.role).toBe("user");
+      const tailContent = String(tail.content ?? "");
+      const identityIdx = tailContent.indexOf("Your runtime identity:");
+      const memoryIdx = tailContent.indexOf("Long-term memory of prior conversations");
+      expect(identityIdx).toBeGreaterThanOrEqual(0);
+      expect(memoryIdx).toBeGreaterThanOrEqual(0);
+      expect(tailContent).toContain(MEMORY_TEXT);
+      // Identity before memory, mirroring the old system-prompt order.
+      expect(identityIdx).toBeLessThan(memoryIdx);
+    } finally {
+      if (prevEmbed === undefined) delete process.env.GINI_EMBEDDING_PROVIDER;
+      else process.env.GINI_EMBEDDING_PROVIDER = prevEmbed;
+      if (prevReranker === undefined) delete process.env.GINI_RERANKER_PROVIDER;
+      else process.env.GINI_RERANKER_PROVIDER = prevReranker;
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("does not replay a prior turn's ephemeral tail on the next turn", async () => {
+    // The tail is built live and never persisted, so the next turn's prior
+    // transcript (priorChatMessages reads only durable chatMessages) must not
+    // contain the previous tail's identity/memory text. Turn 1 emits identity
+    // into its tail; turn 2's outgoing messages must carry none of it as
+    // replayed history. Recall is isolated (no active agent), so the only
+    // tail content under test is the turn-1 identity block.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-no-double-inject");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "No double inject");
+      return session.id;
+    });
+
+    const firstRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 1",
+        input: "first",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+    setEchoToolCallingResponse({ provider, text: "One.", toolCalls: [], finishReason: "stop" });
+    const firstTask = await submitTask(config, "first question", { mode: "chat", runId: firstRunId });
+    await waitForTerminal(config, firstTask.id);
+
+    const secondRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 2",
+        input: "second",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+    setEchoToolCallingResponse({ provider, text: "Two.", toolCalls: [], finishReason: "stop" });
+    const secondTask = await submitTask(config, "second question", { mode: "chat", runId: secondRunId });
+    await waitForTerminal(config, secondTask.id);
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    // Turn 1 emitted identity into its tail.
+    const firstTurnText = calls[0]!.map((m) => String(m.content ?? "")).join("\n");
+    expect(firstTurnText).toContain("Your runtime identity:");
+    // Turn 2's messages, EXCLUDING its own freshly-built tail, must not carry
+    // the prior turn's identity as replayed history. (The quiet second turn
+    // emits no identity of its own, so any occurrence would be a stale replay.)
+    const secondTurn = calls[1]!;
+    const userIdx = secondTurn.findIndex((m) => m.role === "user" && m.content === "second question");
+    const historyAndPrefix = secondTurn.filter((_, i) => i !== userIdx - 1);
+    const historyText = historyAndPrefix.map((m) => String(m.content ?? "")).join("\n");
+    expect(historyText).not.toContain("Your runtime identity:");
+    // Durable transcript rows likewise never include the tail.
+    const stored = readState(config.instance).chatMessages.filter((m) => m.sessionId === sessionId);
+    for (const m of stored) {
+      expect(String(m.content ?? "")).not.toContain("Your runtime identity:");
+    }
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

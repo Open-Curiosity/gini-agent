@@ -39,6 +39,7 @@ import {
   buildBoundJobsBlock,
   decideIdentityEmission,
   identityBudgetState,
+  renderEphemeralContext,
   renderFullIdentity
 } from "../system-prompt";
 import { loadInstructions, loadSoul, loadUserProfile } from "../runtime/identity-files";
@@ -353,7 +354,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   }
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt
-    : buildAgentSystemContext(recalledContext, identityBlock, {
+    : buildAgentSystemContext({
         instructionsOverride,
         soul: soulBlock,
         userProfile: userProfileBlock
@@ -391,9 +392,21 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // Conversation history: include prior turns from the same chat session so
   // the model has multi-turn context (the legacy single-shot path didn't).
   const prior = priorChatMessages(config, task);
+  // Ephemeral per-turn context: the emitted identity block and recalled
+  // memory ride in a role:"user" message placed after the full prior
+  // transcript and immediately before the real user message — so the
+  // byte-stable system prefix stays cacheable across turns. It's built live
+  // and never persisted (priorChatMessages reads only durable chatMessages),
+  // so the next turn rebuilds it fresh rather than replaying a stale tail.
+  // Only the non-subagent path injects it; subagents keep their single
+  // override prompt. role:"user" (not system) because codex hoists every
+  // system message into its top-level instructions, which would re-merge
+  // this content back into the cached prefix. See ADR stable-system-prefix.md.
+  const ephemeralContext = subagent ? "" : renderEphemeralContext(identityBlock, recalledContext);
   const messages: ToolCallingMessage[] = [
     { role: "system", content: systemContext },
     ...prior,
+    ...(ephemeralContext.length > 0 ? [{ role: "user" as const, content: ephemeralContext }] : []),
     buildUserMessage(config, task)
   ];
 

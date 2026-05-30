@@ -1,5 +1,7 @@
 # ADR: Cache warmer and the in_memory prompt cache default
 
+- **See also:** [Stable System Prefix For Chat Prompt Caching](./stable-system-prefix.md)
+
 ## Decision
 
 Two complementary mechanisms keep OpenAI's prompt cache useful for chat
@@ -71,6 +73,14 @@ on a setting whose safe default is "no change."
 The cache warmer sidesteps both problems. It keeps the default tier
 (`in_memory`) and adds an explicit operator-configured probe cadence
 that prevents idle eviction within the tier the docs already cover.
+
+The warmer and the pinned `in_memory` tier only pay off when the chat
+turn's prompt prefix is byte-stable across turns — automatic prefix
+caching hashes the leading bytes, so a per-turn-varying message 0 would
+go cold before the warmer's cadence ever mattered. Byte-stability of the
+system message (message 0) is established in ADR stable-system-prefix.md;
+that is what makes the pinned `in_memory` tier effective for chat turns
+rather than just for the warmer's own one-character probe.
 
 ## Consequences
 
