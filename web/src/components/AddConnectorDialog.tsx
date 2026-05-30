@@ -91,13 +91,15 @@ export interface AddConnectorDialogProps {
   // the user can correct the token without the dialog closing.
   externalError?: string | null;
   // Templateless request fields (mode="request" only). When the
-  // connector.request approval carries a credentialType and no registered
-  // provider, the card renders the type-driven minimal inputs instead of a
-  // provider's fields: the credential name is pinned from the trusted setup
-  // payload (read-only), and the user enters only the secret(s). See
-  // BlockSetupRequested and docs/adr/chat-credential-provisioning.md.
+  // connector.request approval carries an api-key credentialType and no
+  // registered provider, the card renders the type-driven minimal inputs
+  // instead of a provider's fields: the credential name is pinned from the
+  // trusted setup payload (read-only), and the user enters only the secret.
+  // Templateless requests are api-key ONLY (oauth2 needs a provider module /
+  // setup skill — see docs/adr/chat-credential-provisioning.md). See
+  // BlockSetupRequested.
   requestCredentialName?: string;
-  requestCredentialType?: "api-key" | "oauth2";
+  requestCredentialType?: "api-key";
   requestMcpUrl?: string;
 }
 
@@ -116,10 +118,25 @@ export function AddConnectorDialog({
   requestCredentialType,
   requestMcpUrl
 }: AddConnectorDialogProps) {
+  // A templateless request carries an api-key credentialType and NO registered
+  // provider (the connector.request approval had no `provider`). Detect it
+  // FIRST, straight from the trusted props — independent of the provider list.
+  // The earlier bug let `initialProvider` fall back to the first registered
+  // provider (demo) whenever `defaultProvider` was empty, which made
+  // `selectedProvider` truthy and the templateless branch unreachable, so the
+  // api-key secret input never rendered. Detection now mirrors the server
+  // (http.ts): credentialType present && no provider.
+  const hasDefaultProvider = Boolean(defaultProvider && providers.some((p) => p.id === defaultProvider));
+  const templatelessRequest = mode === "request" && requestCredentialType === "api-key" && !hasDefaultProvider;
+
   const initialProvider = useMemo(() => {
-    if (defaultProvider && providers.some((p) => p.id === defaultProvider)) return defaultProvider;
+    if (hasDefaultProvider) return defaultProvider as string;
+    // No default provider: a templateless request has no provider at all (leave
+    // it empty so the templateless branch stays active). Other modes keep the
+    // legacy first-provider fallback for the type-driven create / generic flows.
+    if (templatelessRequest) return "";
     return providers[0]?.id ?? "demo";
-  }, [defaultProvider, providers]);
+  }, [defaultProvider, hasDefaultProvider, providers, templatelessRequest]);
 
   const [provider, setProvider] = useState(initialProvider);
   const [name, setName] = useState(defaultName ?? "");
@@ -162,13 +179,6 @@ export function AddConnectorDialog({
   }, [open, initialProvider, defaultName, requestCredentialName, requestCredentialType, requestMcpUrl]);
 
   const selectedProvider = providers.find((p) => p.id === provider);
-
-  // A templateless request: the connector.request approval carries a
-  // credentialType but no registered provider, so there are no provider
-  // `fields` to render — the card shows the type-driven minimal inputs
-  // (name pinned from the payload + secret) instead. Mirrors the server-side
-  // detection in http.ts (credentialType present && no provider).
-  const templatelessRequest = mode === "request" && Boolean(requestCredentialType) && !selectedProvider;
 
   // Pick a provider module as a template: stamp the credential type, name, and
   // (api-key) MCP URL / (oauth2) env-var rows from its declared bindings, and
@@ -296,57 +306,23 @@ export function AddConnectorDialog({
     });
   };
 
-  // Templateless request submit (mode="request", no registered provider). The
-  // credential name is pinned by the trusted setup payload, so the user only
-  // supplies the secret(s); /complete derives name/type/metadata from that
-  // payload. api-key → one secret keyed by the credential name. oauth2 → one
-  // secret per env-var row keyed by its purpose, plus the non-secret envMap
-  // (purpose → ENV) the /complete branch reads from the body.
+  // Templateless request submit (mode="request", no registered provider).
+  // api-key ONLY (oauth2 needs a provider module / setup skill). The credential
+  // name is pinned by the trusted setup payload, so the user supplies only the
+  // secret; /complete derives name/type/metadata from that payload. The api-key
+  // name IS its env var, so there is no envMap to send.
   const submitTemplatelessRequest = () => {
     setError(null);
     const credName = (requestCredentialName ?? "").trim();
-    if (requestCredentialType === "api-key") {
-      if (!apiKeySecret.trim()) {
-        setError("Secret value is required.");
-        return;
-      }
-      onSubmit({
-        provider: "generic",
-        name: credName,
-        type: "api-key",
-        secrets: { [credName]: apiKeySecret.trim() }
-      });
+    if (!apiKeySecret.trim()) {
+      setError("Secret value is required.");
       return;
-    }
-
-    // oauth2
-    const rows = oauthRows.filter((r) => r.envVarName.trim().length > 0);
-    if (rows.length === 0) {
-      setError("OAuth2 credentials need at least one field.");
-      return;
-    }
-    const secrets: Record<string, string> = {};
-    const envMap: Record<string, string> = {};
-    for (const row of rows) {
-      const envName = row.envVarName.trim();
-      if (!ENV_TOKEN.test(envName)) {
-        setError(`Invalid env var name "${envName}": uppercase letters, digits, underscores (e.g. SOME_SERVICE_CLIENT_ID).`);
-        return;
-      }
-      if (!row.value.trim()) {
-        setError(`Value for ${envName} is required.`);
-        return;
-      }
-      const purpose = row.purpose?.trim() || envName;
-      secrets[purpose] = row.value.trim();
-      envMap[purpose] = envName;
     }
     onSubmit({
       provider: "generic",
       name: credName,
-      type: "oauth2",
-      secrets,
-      metadata: { envMap }
+      type: "api-key",
+      secrets: { [credName]: apiKeySecret.trim() }
     });
   };
 
@@ -517,53 +493,42 @@ export function AddConnectorDialog({
               )}
             </>
           ) : templatelessRequest ? (
-            // Templateless request: the credential name is pinned by the trusted
-            // setup payload (read-only) — the user enters only the secret(s). The
-            // type-driven inputs mirror create mode, minus the name field.
-            requestCredentialType === "api-key" ? (
-              <>
+            // Templateless request (api-key only): the credential name is pinned
+            // by the trusted setup payload (read-only) — the user enters only the
+            // secret. Mirrors create mode's api-key inputs, minus the name field.
+            <>
+              <div className="space-y-1">
+                <Label htmlFor="request-apikey-name">Credential name (used as the env var)</Label>
+                <Input id="request-apikey-name" value={apiKeyName} readOnly disabled autoComplete="off" />
+                <p className="text-[11px] text-muted-foreground">Skills reference this credential by this name.</p>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="request-apikey-secret">Secret value</Label>
+                <Input
+                  id="request-apikey-secret"
+                  type="password"
+                  value={apiKeySecret}
+                  onChange={(e) => { setApiKeySecret(e.target.value); setError(null); }}
+                  placeholder="paste the key"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  data-1p-ignore="true"
+                  data-lpignore="true"
+                  data-form-type="other"
+                />
+              </div>
+              {requestMcpUrl ? (
                 <div className="space-y-1">
-                  <Label htmlFor="request-apikey-name">Credential name (used as the env var)</Label>
-                  <Input id="request-apikey-name" value={apiKeyName} readOnly disabled autoComplete="off" />
-                  <p className="text-[11px] text-muted-foreground">Skills reference this credential by this name.</p>
+                  <Label htmlFor="request-apikey-mcp">MCP server URL</Label>
+                  <Input id="request-apikey-mcp" value={mcpUrl} readOnly disabled autoComplete="off" />
+                  <p className="text-[11px] text-muted-foreground">
+                    Registers an MCP server with header Authorization: Bearer ${"{"}{apiKeyName.trim() || "ENV"}{"}"}.
+                  </p>
                 </div>
-                <div className="space-y-1">
-                  <Label htmlFor="request-apikey-secret">Secret value</Label>
-                  <Input
-                    id="request-apikey-secret"
-                    type="password"
-                    value={apiKeySecret}
-                    onChange={(e) => { setApiKeySecret(e.target.value); setError(null); }}
-                    placeholder="paste the key"
-                    autoComplete="off"
-                    autoCorrect="off"
-                    autoCapitalize="off"
-                    spellCheck={false}
-                    data-1p-ignore="true"
-                    data-lpignore="true"
-                    data-form-type="other"
-                  />
-                </div>
-                {requestMcpUrl ? (
-                  <div className="space-y-1">
-                    <Label htmlFor="request-apikey-mcp">MCP server URL</Label>
-                    <Input id="request-apikey-mcp" value={mcpUrl} readOnly disabled autoComplete="off" />
-                    <p className="text-[11px] text-muted-foreground">
-                      Registers an MCP server with header Authorization: Bearer ${"{"}{apiKeyName.trim() || "ENV"}{"}"}.
-                    </p>
-                  </div>
-                ) : null}
-              </>
-            ) : (
-              <>
-                <div className="space-y-1">
-                  <Label htmlFor="request-oauth-name">Credential name</Label>
-                  <Input id="request-oauth-name" value={oauthName} readOnly disabled autoComplete="off" />
-                  <p className="text-[11px] text-muted-foreground">A handle skills reference by name.</p>
-                </div>
-                <OAuthFieldEditor rows={oauthRows} onChange={(next) => { setOauthRows(next); setError(null); }} />
-              </>
-            )
+              ) : null}
+            </>
           ) : (
             selectedProvider?.fields.map((field) => (
               <div key={field.name} className="space-y-1">

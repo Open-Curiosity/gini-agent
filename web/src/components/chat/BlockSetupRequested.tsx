@@ -53,12 +53,10 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
 
   const connect = useMutation({
     mutationFn: async (body: CreateConnectorBody) => {
-      // The body carries ONLY the secret(s) plus non-secret structure: for a
-      // templateless oauth2 request the envMap (purpose → ENV) rides in
-      // `metadata` so /complete can stamp the typed record (the dispatcher
-      // never mints an envMap — the model doesn't know the service's env vars).
-      // name/type/credential metadata are otherwise derived from the trusted
-      // setup payload server-side; the secret value reaches the gateway only
+      // The body carries ONLY the secret. For a templateless request (api-key
+      // only) the name/type/metadata are all derived from the TRUSTED setup
+      // payload server-side — the api-key name IS its env var, so there is no
+      // client-supplied envMap. The secret value reaches the gateway only
       // through this POST and never through the model.
       return api<{ ok: boolean; message?: string; connector?: unknown }>(
         `/setup-requests/${block.setupRequestId}/complete`,
@@ -130,14 +128,16 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
       ? (setup.payload.providerLabel as string)
       : providerId
     : "";
-  // Templateless connector.request: the payload carries a credentialType and
-  // credentialName with no registered provider. Thread these into the dialog
-  // so it renders the type-driven secure input instead of provider fields.
-  // (Detection mirrors http.ts: credentialType present && no provider.)
+  // Templateless connector.request: the payload carries an api-key
+  // credentialType and credentialName with no registered provider. Thread
+  // these into the dialog so it renders the type-driven secure input instead
+  // of provider fields. (Detection mirrors http.ts: credentialType present &&
+  // no provider.) Templateless is api-key ONLY — oauth2 requires a provider
+  // module / setup skill (docs/adr/chat-credential-provisioning.md).
   const credentialType = isConnectorRequest && setup
-    && (setup.payload?.credentialType === "api-key" || setup.payload?.credentialType === "oauth2")
+    && setup.payload?.credentialType === "api-key"
     && !providerId
-    ? (setup.payload.credentialType as "api-key" | "oauth2")
+    ? ("api-key" as const)
     : undefined;
   const credentialName = isConnectorRequest && setup && typeof setup.payload?.credentialName === "string"
     ? (setup.payload.credentialName as string)
