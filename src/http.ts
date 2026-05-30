@@ -446,14 +446,30 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           .find((p) => (p === "generic" || Boolean(getProvider(p)?.secrets)) && !granted.includes(p));
 
         if (nextUngranted) {
-          // More credentialed providers to grant. Mint the next grant card
-          // attached to the same task + tool call, then resolve THIS setup
-          // without resuming so the task stays parked on the new approval.
+          // More credentialed providers to grant. Atomically claim THIS setup
+          // request FIRST — resolveSetupRequest throws ApprovalRaceLostError
+          // ("already <status>") if the row is no longer pending, which the
+          // route's catch surfaces as an error response. Only the winner of a
+          // double-complete reaches the mint below, so two rapid completes can
+          // never both create the next provider's grant row (TOCTOU). We
+          // resolve without resuming so the task stays parked on the new card.
+          await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
+          // Mint the next grant card attached to the same task + tool call.
           // The web reconciles the new pending card from the setup-requests
-          // query (refreshed by the setup SSE event).
+          // query (refreshed by the setup SSE event). Dedupe to the same task
+          // as a second safety layer — a retried mint must not double up.
           const nextLabel = getProvider(nextUngranted)?.label ?? nextUngranted;
           const reason = `Skill "${skill.name}" requests access to your ${nextLabel} credential. Granting lets its scripts use ${nextLabel}; you can revoke by disabling the skill.`;
           await mutateState(config.instance, (mutable) => {
+            const dup = mutable.setupRequests.find(
+              (s) =>
+                s.status === "pending" &&
+                s.action === "skill.grant_connector" &&
+                s.taskId === setup.taskId &&
+                s.payload.skillId === skillId &&
+                s.payload.provider === nextUngranted
+            );
+            if (dup) return;
             const approval = createSetupRequest(mutable, {
               taskId: setup.taskId,
               action: "skill.grant_connector",
@@ -467,11 +483,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
               item.updatedAt = now();
             }
           });
-          await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
           return json({ ok: true });
         }
 
-        // All credentialed providers granted — enable the skill and resume.
+        // All credentialed providers granted. Atomically claim THIS setup
+        // request FIRST (same race guard as above), then enable the skill and
+        // resume only on the winning completion. resolveSetupRequest's built-in
+        // resume runs after the claim, so a losing double-complete throws
+        // before any resume or extra side effect.
         await setSkillStatus(config, skillId, "enabled");
         await resolveSetupRequest(config, setupId, "complete", {
           actor: "user",

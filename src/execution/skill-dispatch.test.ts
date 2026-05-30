@@ -426,4 +426,42 @@ describe("enable_skill connector-consent gate", () => {
       readState(config.instance).setupRequests.filter((s) => s.action === "skill.grant_connector").length
     ).toBe(1);
   });
+
+  test("two different tasks enabling the same skill each get their own grant request", async () => {
+    const config = makeConfig("skill-gate-cross-task");
+    const taskA = await seedTaskWithWebSession(config);
+    const taskB = await seedTaskWithWebSession(config);
+    const skill = await seedSkill(config, {});
+
+    const first = await dispatchToolCall(
+      config,
+      taskA,
+      "enable_skill",
+      "call_taskA",
+      JSON.stringify({ skillId: skill.id })
+    );
+    expect(first.kind).toBe("pending");
+    if (first.kind !== "pending") throw new Error("unreachable");
+
+    const second = await dispatchToolCall(
+      config,
+      taskB,
+      "enable_skill",
+      "call_taskB",
+      JSON.stringify({ skillId: skill.id })
+    );
+    expect(second.kind).toBe("pending");
+    if (second.kind !== "pending") throw new Error("unreachable");
+
+    // Each task gets its OWN resumable approval — the dedupe is per-task, so a
+    // second task does not park on the first task's card (which would resume
+    // only the first task on completion, stranding the second).
+    expect(second.approvalId).not.toBe(first.approvalId);
+    const rows = readState(config.instance).setupRequests.filter((s) => s.action === "skill.grant_connector");
+    expect(rows.length).toBe(2);
+    const reqA = rows.find((s) => s.id === first.approvalId);
+    const reqB = rows.find((s) => s.id === second.approvalId);
+    expect(reqA?.taskId).toBe(taskA);
+    expect(reqB?.taskId).toBe(taskB);
+  });
 });

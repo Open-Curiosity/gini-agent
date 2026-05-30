@@ -2270,13 +2270,18 @@ async function requestSkillConnectorGrant(
   }
 
   // Idempotent re-enter: if a pending grant SetupRequest already exists for
-  // this (skill, provider) — e.g. the model re-called enable_skill while the
-  // user hadn't yet acted on the card — reference it instead of minting a
-  // duplicate.
+  // this (skill, provider) ON THIS TASK — e.g. the model re-called
+  // enable_skill while the user hadn't yet acted on the card — reference it
+  // instead of minting a duplicate. The dedupe is scoped to the SAME task:
+  // each task that enables the skill needs its own resumable approval, since
+  // completing the card resumes only its owning `setup.taskId`. Reusing
+  // another task's pending request would park this task on a request that
+  // resumes someone else, stranding it forever.
   const existing = surfaceState.setupRequests.find(
     (s) =>
       s.status === "pending" &&
       s.action === "skill.grant_connector" &&
+      s.taskId === taskId &&
       s.payload.skillId === skillId &&
       s.payload.provider === provider
   );

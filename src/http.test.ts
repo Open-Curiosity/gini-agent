@@ -902,6 +902,70 @@ describe("runtime api", () => {
     expect(next?.payload.skillId).toBe(skill.id);
   });
 
+  test("POST /api/setup-requests/<id>/complete: a double-complete of one grant request resolves once and mints exactly one next card", async () => {
+    const config = testConfig("setup-complete-skill-grant-double");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-two-double",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredConnectors: [{ provider: "linear" }, { provider: "generic" }]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "skill.grant_connector",
+        target: "Linear",
+        reason: "Skill needs-two-double requests access to your Linear credential.",
+        payload: {
+          skillId: skill.id,
+          skillName: skill.name,
+          provider: "linear",
+          providerLabel: "Linear",
+          toolCallId: "call_grant_double"
+        }
+      })
+    );
+
+    // Fire two completes of the SAME request. The mutateState lock serializes
+    // the atomic claim, so exactly one wins; the loser hits the already-
+    // resolved guard and mints nothing. No extra pending grant row.
+    const [a, b] = await Promise.all([
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }, config.token),
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }, config.token)
+    ]);
+    const oks = [a.ok, b.ok];
+    expect(oks.filter(Boolean).length).toBe(1);
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((s) => s.id === approval.id);
+    expect(resolved?.status).toBe("completed");
+    // Exactly one next card for the remaining provider — no duplicate from the
+    // losing racer.
+    const next = state.setupRequests.filter(
+      (s) => s.status === "pending" && s.action === "skill.grant_connector" && s.payload.provider === "generic"
+    );
+    expect(next.length).toBe(1);
+    // No stray pending grant rows beyond that single next card.
+    const pendingGrants = state.setupRequests.filter(
+      (s) => s.status === "pending" && s.action === "skill.grant_connector"
+    );
+    expect(pendingGrants.length).toBe(1);
+  });
+
   test("POST /api/setup-requests/<id>/complete returns ok:false and leaves the request pending on probe failure", async () => {
     const config = testConfig("setup-requests-complete-probe-fail");
     const handler = createHandler(config);
