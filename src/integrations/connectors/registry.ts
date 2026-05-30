@@ -61,3 +61,15 @@ export function canonicalCredentialName(providerId: string): string | undefined 
   if (envVars.length === 1) return envVars[0];
   return undefined;
 }
+
+// Reverse of `canonicalCredentialName`: the provider id whose canonical typed
+// credential is named `credentialName`, or undefined when no registered
+// provider owns that name. Used by the inactive-skills / "needs setup" UI to
+// route a required credential name back to a provider's setup skill /
+// request_connector flow even when no connector record exists yet.
+export function providerForCredentialName(credentialName: string): string | undefined {
+  for (const module of REGISTRY.values()) {
+    if (canonicalCredentialName(module.id) === credentialName) return module.id;
+  }
+  return undefined;
+}

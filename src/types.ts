@@ -1334,8 +1334,8 @@ export interface ConnectorRecord {
   //     whose fields materialize as env vars via `metadata.envMap`
   //     (purpose → ENV_NAME).
   // Optional: presence-only providers (demo/claude-code/codex) carry no env
-  // and stay untyped. Un-migrated records also lack it until the migration
-  // stamps a type; resolution falls back to provider env bindings then.
+  // and stay untyped. The state migration stamps a type on every legacy
+  // provider-keyed record at boot, so all credentialed records are typed.
   type?: "api-key" | "oauth2";
   status: "configured" | "disabled" | "error";
   scopes: string[];

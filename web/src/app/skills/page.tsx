@@ -173,12 +173,16 @@ export default function SkillsPage() {
     [filtered]
   );
   const detail = filtered.find((s) => s.id === selected) ?? sorted[0];
-  const connectorsByProv = useMemo(
-    () => connectorsByProvider(connectors.data ?? []),
+  const byName = useMemo(
+    () => connectorsByName(connectors.data ?? []),
     [connectors.data]
   );
   const providersById = useMemo(
     () => providersByIdMap(providers.data ?? []),
+    [providers.data]
+  );
+  const providerByCredentialName = useMemo(
+    () => providerByCredentialNameMap(providers.data ?? []),
     [providers.data]
   );
 
@@ -225,7 +229,7 @@ export default function SkillsPage() {
                     <div className="flex items-center justify-between gap-2">
                       <span className="line-clamp-1 text-sm font-medium">{skill.name}</span>
                       <ActivationPill
-                        activation={deriveActivation(skill, connectorsByProv, providersById)}
+                        activation={deriveActivation(skill, byName, providersById)}
                       />
                     </div>
                     {skill.description ? (
@@ -257,7 +261,7 @@ export default function SkillsPage() {
                     ) : null}
                   </div>
                   <ActivationPill
-                    activation={deriveActivation(detail, connectorsByProv, providersById)}
+                    activation={deriveActivation(detail, byName, providersById)}
                   />
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-1.5">
@@ -287,7 +291,7 @@ export default function SkillsPage() {
                 ) : null}
                 <ActivationRow
                   skill={detail}
-                  connectorsByProv={connectorsByProv}
+                  byName={byName}
                   providersById={providersById}
                 />
                 <div className="flex flex-wrap gap-2">
@@ -306,14 +310,20 @@ export default function SkillsPage() {
                     <p className="font-mono text-[11px] text-muted-foreground">{detail.allowedTools}</p>
                   </Section>
                 ) : null}
-                {(detail.requiredConnectors ?? []).length > 0 ? (
-                  <Section title="Required connectors">
+                {(detail.requiredCredentials ?? []).length > 0 ? (
+                  <Section title="Required credentials">
                     <ul className="space-y-1">
-                      {(detail.requiredConnectors ?? []).map((req) => {
+                      {(detail.requiredCredentials ?? []).map((credentialName) => {
+                        // Connectors carrying this credential NAME. The provider
+                        // for setup guidance comes from a matching record, else
+                        // the canonical provider for the name (so a credential
+                        // with no connector yet still routes to its setup flow).
                         const matches = (connectors.data ?? []).filter(
-                          (c) => c.provider === req.provider && c.status === "configured"
+                          (c) => c.name === credentialName && c.status === "configured"
                         );
-                        const provider = providersById.get(req.provider);
+                        const provider =
+                          providersById.get(matches[0]?.provider ?? "") ??
+                          providerByCredentialName.get(credentialName);
                         const hasProbe = Boolean(provider?.hasProbe);
                         // Mirror the runtime gate: a connector counts as
                         // satisfying the requirement when it is healthy, OR
@@ -323,12 +333,11 @@ export default function SkillsPage() {
                         const satisfying = matches.find(
                           (c) => c.health === "healthy" || (!hasProbe && c.health === "unknown" && c.status === "configured")
                         );
-                        const dependentCount = countDependentSkills(filtered, req.provider);
+                        const dependentCount = countDependentSkills(filtered, credentialName);
                         return (
-                          <li key={req.provider} className="flex items-center justify-between gap-2 text-xs">
+                          <li key={credentialName} className="flex items-center justify-between gap-2 text-xs">
                             <span className="font-mono">
-                              {req.provider}
-                              {req.scopes?.length ? ` (${req.scopes.join(", ")})` : ""}
+                              {credentialName}
                             </span>
                             {satisfying ? (
                               <div className="flex items-center gap-1.5">
@@ -379,7 +388,7 @@ export default function SkillsPage() {
                                         onClick={() =>
                                           setDialog({
                                             open: true,
-                                            provider: req.provider,
+                                            provider: broken.provider,
                                             suggestedName: broken.name,
                                             mode: "rotate",
                                             connectorId: broken.id
@@ -435,7 +444,7 @@ export default function SkillsPage() {
                                 onClick={() =>
                                   setDialog({
                                     open: true,
-                                    provider: req.provider,
+                                    provider: provider.id,
                                     suggestedName: provider.label,
                                     mode: "create"
                                   })
@@ -610,30 +619,30 @@ type Activation = {
 // is the source of truth for "is this skill in the agent's set"; we replay
 // the same dependency check here so users see the badge that matches what
 // the agent loop sees. Mirrors src/integrations/connectors/index.ts
-// isSkillActive: a connector satisfies a requirement when healthy OR when
-// its provider has no probe and the record is configured (unknown health
-// is acceptable when there's no remote signal to refute it). Without the
-// provider info we'd diverge from the runtime gate for demo / generic
-// providers, which always sit at health: "unknown" at rest.
+// isSkillActive: a skill is active when every required credential NAME maps to
+// a connector that is healthy OR (when its provider has no probe) configured
+// with unknown health. Without the provider info we'd diverge from the runtime
+// gate for demo / generic providers, which sit at health: "unknown" at rest.
 function deriveActivation(
   skill: SkillRecord,
-  connectorsByProv: Map<string, ConnectorRecord[]>,
+  byName: Map<string, ConnectorRecord[]>,
   providersById: Map<string, ProviderDescriptor>
 ): Activation {
   if (skill.validationStatus === "unsupported") return { label: "unsupported", tone: "danger" };
   if (skill.status === "disabled" || skill.status === "archived") return { label: "disabled", tone: "neutral" };
-  const required = skill.requiredConnectors ?? [];
+  const required = skill.requiredCredentials ?? [];
   if (required.length === 0) return { label: "active", tone: "ok" };
-  for (const req of required) {
-    const matches = connectorsByProv.get(req.provider) ?? [];
-    const hasProbe = Boolean(providersById.get(req.provider)?.hasProbe);
+  for (const credentialName of required) {
+    const matches = byName.get(credentialName) ?? [];
     const satisfied = matches.some((c) => {
       // Mirror the runtime gate exactly: only configured records ever
       // satisfy. Disabled (tombstoned) and error-status records are
       // excluded even if they carry a stale `health: "healthy"` from
-      // a prior probe.
+      // a prior probe. A typed credential whose provider has no probe is
+      // presence-healthy at unknown (no remote signal to refute it).
       if (c.status !== "configured") return false;
       if (c.health === "healthy") return true;
+      const hasProbe = Boolean(providersById.get(c.provider)?.hasProbe);
       if (!hasProbe && c.health === "unknown") return true;
       return false;
     });
@@ -657,14 +666,14 @@ function ActivationPill({ activation }: { activation: Activation }) {
 
 function ActivationRow({
   skill,
-  connectorsByProv,
+  byName,
   providersById
 }: {
   skill: SkillRecord;
-  connectorsByProv: Map<string, ConnectorRecord[]>;
+  byName: Map<string, ConnectorRecord[]>;
   providersById: Map<string, ProviderDescriptor>;
 }) {
-  const activation = deriveActivation(skill, connectorsByProv, providersById);
+  const activation = deriveActivation(skill, byName, providersById);
   return (
     <div className="flex items-center gap-2 text-xs">
       <ActivationPill activation={activation} />
@@ -675,20 +684,26 @@ function ActivationRow({
   );
 }
 
-// Provider setup is "chat-grade" when it requires non-secret config the
-// user can't just paste from a settings page — typically OAuth Client ID
-// alongside Client Secret. The credential dialog only handles "paste one
-// secret", so anything multi-field gets routed to the agent instead.
+// Provider setup is "chat-grade" when it owns a setup skill (the gws/gcloud
+// walkthrough), or it requires non-secret config the user can't just paste
+// from a settings page. The credential dialog only handles "paste one
+// secret", so anything beyond that gets routed to the agent instead. The
+// setup-skill check matters now that google-oauth-desktop's fields are all
+// secret (so the field-shape heuristic alone would miss it).
 function needsChatSetup(provider: ProviderDescriptor): boolean {
-  return provider.fields.some((f) => !f.secret);
+  return Boolean(provider.hasSetupSkill) || provider.fields.some((f) => !f.secret);
 }
 
-function connectorsByProvider(connectors: ConnectorRecord[]): Map<string, ConnectorRecord[]> {
+// Index connectors by their credential NAME (skills reference credentials by
+// name). Multiple records can share a name only transiently (e.g. a tombstoned
+// + a fresh one); the list preserves them so the activation check can pick the
+// usable one.
+function connectorsByName(connectors: ConnectorRecord[]): Map<string, ConnectorRecord[]> {
   const map = new Map<string, ConnectorRecord[]>();
   for (const c of connectors) {
-    const list = map.get(c.provider) ?? [];
+    const list = map.get(c.name) ?? [];
     list.push(c);
-    map.set(c.provider, list);
+    map.set(c.name, list);
   }
   return map;
 }
@@ -699,11 +714,25 @@ function providersByIdMap(providers: ProviderDescriptor[]): Map<string, Provider
   return map;
 }
 
-function countDependentSkills(skills: SkillRecord[], providerId: string): number {
+// Reverse of the provider credential template: credential NAME → the provider
+// whose template owns it (linear → LINEAR_API_KEY, google-oauth-desktop →
+// google-workspace-oauth). Lets the page route a required credential name to
+// its provider's setup flow even before any connector record exists. Mirrors
+// providerForCredentialName in connectors/registry.ts.
+function providerByCredentialNameMap(providers: ProviderDescriptor[]): Map<string, ProviderDescriptor> {
+  const map = new Map<string, ProviderDescriptor>();
+  for (const p of providers) {
+    const name = p.credentialTemplate?.name;
+    if (name && !map.has(name)) map.set(name, p);
+  }
+  return map;
+}
+
+function countDependentSkills(skills: SkillRecord[], credentialName: string): number {
   let count = 0;
   for (const skill of skills) {
-    const required = skill.requiredConnectors ?? [];
-    if (required.some((r) => r.provider === providerId)) count += 1;
+    const required = skill.requiredCredentials ?? [];
+    if (required.includes(credentialName)) count += 1;
   }
   return count;
 }

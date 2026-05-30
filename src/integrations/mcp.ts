@@ -192,27 +192,55 @@ export async function resolveMcpHeaders(
   const raw = server.headers ?? {};
   if (Object.keys(raw).length === 0) return {};
   const state = readState(config.instance);
-  // Resolve live credential secrets into `env`, name-based: typed credentials
-  // (api-key/oauth2) resolved by NAME via `bindingsForCredentials` — api-key
-  // env var == credential name (so `${LINEAR_API_KEY}` resolves against the
-  // credential named LINEAR_API_KEY), oauth2 materializes each metadata.envMap
-  // entry.
-  const typedNames = state.connectors.filter((c) => c.type).map((c) => c.name);
-  const credentialBindings = bindingsForCredentials(state, typedNames);
-  // Block-list: every env var ANY typed credential resolves OR any provider
-  // declares as a secret. These can ONLY be supplied by a live credential,
-  // never by process.env — so deleting/disabling a credential can't leave an
+  // The `${VAR}` placeholders this server's headers actually reference. We only
+  // resolve secrets for THESE — resolving every typed credential's secret would
+  // emit spurious `connector.secret.use` audits for unrelated credentials, and
+  // a single unrelated credential failing to resolve would break the call.
+  const referencedVars = new Set<string>();
+  for (const value of Object.values(raw)) {
+    for (const m of value.matchAll(/\$\{([A-Z0-9_]+)\}/g)) referencedVars.add(m[1] as string);
+  }
+
+  // Block-list: every env var ANY typed credential owns — INCLUDING
+  // disabled/error/tombstoned records — plus any provider-declared secret var.
+  // These can ONLY be supplied by a live (configured + healthy) credential,
+  // never by process.env, so deleting/disabling a credential can't leave an
   // MCP row authenticated from the operator's shell (which would bypass the
-  // connector.secret.use audit). The provider-declared set is a defense-in-
-  // depth guard, NOT a resolution source: a claimed-but-unresolved var stays
-  // unresolved and surfaces a "missing credential" error.
-  const providerClaimedVars = Object.keys(envBindingsForProviders(listProviders().map((p) => p.id)));
-  const claimedVars = new Set<string>([
-    ...Object.keys(credentialBindings),
-    ...providerClaimedVars
-  ]);
+  // connector.secret.use audit). A credential whose status excludes it from
+  // resolution therefore yields a "missing credential" error rather than
+  // silently falling back. The provider-declared set is a defense-in-depth
+  // guard, NOT a resolution source.
+  const claimedVars = new Set<string>(Object.keys(envBindingsForProviders(listProviders().map((p) => p.id))));
+  // Map each typed credential's owned env vars → its name, for ALL typed
+  // records regardless of status. The same loop seeds the block-list.
+  const envVarToCredentialName = new Map<string, string>();
+  for (const connector of state.connectors) {
+    if (!connector.type) continue;
+    const ownedVars = connector.type === "oauth2"
+      ? Object.values(connector.metadata?.envMap ?? {})
+      : [connector.name];
+    for (const envVar of ownedVars) {
+      claimedVars.add(envVar);
+      // Only the first owner of an env var maps (names are unique
+      // instance-wide once migrated; this just keeps the map deterministic).
+      if (!envVarToCredentialName.has(envVar)) envVarToCredentialName.set(envVar, connector.name);
+    }
+  }
+
+  // Resolve ONLY the referenced placeholders, name-based. Collect the typed
+  // credential names that own a referenced var, then resolve through
+  // `bindingsForCredentials` (which applies the configured + healthy guard so
+  // a disabled/never-probed credential contributes nothing). api-key env var ==
+  // credential name; oauth2 materializes each metadata.envMap entry.
+  const referencedNames = new Set<string>();
+  for (const envVar of referencedVars) {
+    const name = envVarToCredentialName.get(envVar);
+    if (name) referencedNames.add(name);
+  }
+  const credentialBindings = bindingsForCredentials(state, Array.from(referencedNames));
   const env: Record<string, string> = {};
   for (const [envName, binding] of Object.entries(credentialBindings)) {
+    if (!referencedVars.has(envName)) continue;
     const value = await resolveConnectorSecret(config, binding.credentialId, binding.purpose, taskId);
     if (value) env[envName] = value;
   }
@@ -224,9 +252,9 @@ export async function resolveMcpHeaders(
   // any claimed var.
   const resolved: Record<string, string> = {};
   for (const [key, value] of Object.entries(raw)) {
-    const referencedVars = Array.from(value.matchAll(/\$\{([A-Z0-9_]+)\}/g)).map((m) => m[1] as string);
+    const headerVars = Array.from(value.matchAll(/\$\{([A-Z0-9_]+)\}/g)).map((m) => m[1] as string);
     let usedEnv: Record<string, string> = env;
-    const fallbackCandidates = referencedVars.filter((name) => !claimedVars.has(name));
+    const fallbackCandidates = headerVars.filter((name) => !claimedVars.has(name));
     if (fallbackCandidates.length > 0) {
       const fallback: Record<string, string> = {};
       for (const name of fallbackCandidates) {

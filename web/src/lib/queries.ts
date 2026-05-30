@@ -182,6 +182,9 @@ export interface ProviderDescriptor {
   secrets?: { purposes: string[]; envBindings: Record<string, string> };
   hasProbe: boolean;
   hasDetect: boolean;
+  // Whether the provider declares a chat-driven setup skill (e.g.
+  // google-workspace-setup). Skills page routes these to "Set up via chat".
+  hasSetupSkill?: boolean;
   probeIntervalMs?: number;
   // Defaults the Add Connector dialog prefills when this provider is picked
   // as a credential template. Present only for providers whose module

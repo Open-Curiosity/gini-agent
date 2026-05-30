@@ -78,7 +78,7 @@ import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { isSkillActive } from "../integrations/connectors";
-import { getProvider } from "../integrations/connectors/registry";
+import { getProvider, providerForCredentialName } from "../integrations/connectors/registry";
 import { resolveEffectiveContext } from "./effective-context";
 
 // Default safety cap on chat-task loop iterations. Each iteration is one
@@ -368,7 +368,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const inactiveSkills = filteredSkills.filter(
     (skill) => skill.status === "enabled" && !isSkillActive(state, skill)
   );
-  const inactiveSkillsBlock = buildInactiveSkillsBlock(inactiveSkills);
+  const inactiveSkillsBlock = buildInactiveSkillsBlock(inactiveSkills, state);
   // Bound-jobs block: if this chat session has one or more JobRecords whose
   // chatSessionId matches, surface them in the system prompt so the model
   // can act on "this job" / "the reminder" without first calling list_jobs.
@@ -622,24 +622,27 @@ function buildEnabledSkillsBlock(skills: SkillRecord[]): string {
 }
 
 // Inactive-but-enabled skills block. Distinct from buildEnabledSkillsBlock:
-// these skills are turned on but unusable because a required connector is
+// these skills are turned on but unusable because a required credential is
 // missing. We tell the model exactly which provider needs connecting so it
 // can either invoke the provider's setup skill (when the provider declares
 // one) or call `request_connector` directly to ask the user to connect.
 //
-// Skills with `requiredConnectors` undefined / empty are skipped: those are
+// Skills with `requiredCredentials` undefined / empty are skipped: those are
 // inactive for some other reason (validation status, etc.) and there's no
 // connector affordance to offer.
 //
-// We group by provider — multiple product skills often share the same
-// connector (e.g. all Google Workspace skills share google-oauth-desktop),
-// and emitting one line per provider keeps the block compact and points
-// the model at a single setup path per connector.
+// Skills declare credentials BY NAME; we map each required credential name to
+// the provider that owns its setup flow — an existing connector record with
+// that name, else the canonical provider for the name (so a never-connected
+// credential still routes to its setup skill / request_connector). We group by
+// that provider so multiple product skills sharing one connector (e.g. all
+// Google Workspace skills → google-workspace-oauth → google-oauth-desktop)
+// collapse to a single line.
 //
 // Exported for unit testing; production callers use it via runChatTask.
-export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
+export function buildInactiveSkillsBlock(skills: SkillRecord[], state?: RuntimeState): string {
   const candidates = skills.filter(
-    (skill) => skill.status === "enabled" && (skill.requiredConnectors?.length ?? 0) > 0
+    (skill) => skill.status === "enabled" && (skill.requiredCredentials?.length ?? 0) > 0
   );
   if (candidates.length === 0) return "";
   // Same dedupe rule as buildEnabledSkillsBlock so the same skill name
@@ -657,18 +660,28 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
       byName.set(skill.name, skill);
     }
   }
-  // Group dedup'd skills by provider id. setupSkill is captured per
-  // provider — if any skill's required provider declares one, the
-  // provider-level line directs the model to invoke that skill instead
-  // of calling request_connector directly.
+  // Resolve a required credential NAME to the provider that owns its setup
+  // flow: an existing connector record's provider, else the canonical provider
+  // for the name. Falls back to the name itself (e.g. a plain user key with no
+  // provider) so the line still names something the user can act on.
+  const providerForCredential = (name: string): string => {
+    const connector = state?.connectors.find((c) => c.name === name);
+    if (connector?.provider) return connector.provider;
+    return providerForCredentialName(name) ?? name;
+  };
+  // Group dedup'd skills by the provider their required credential maps to.
+  // setupSkill is captured per provider — if the provider declares one, the
+  // provider-level line directs the model to invoke that skill instead of
+  // calling request_connector directly.
   const grouped = new Map<string, { skills: string[]; setupSkill?: string }>();
   for (const skill of byName.values()) {
-    for (const req of skill.requiredConnectors ?? []) {
-      const entry = grouped.get(req.provider) ?? { skills: [] };
+    for (const credentialName of skill.requiredCredentials ?? []) {
+      const provider = providerForCredential(credentialName);
+      const entry = grouped.get(provider) ?? { skills: [] };
       entry.skills.push(skill.name);
-      const module = getProvider(req.provider);
+      const module = getProvider(provider);
       if (module?.setupSkill) entry.setupSkill = module.setupSkill;
-      grouped.set(req.provider, entry);
+      grouped.set(provider, entry);
     }
   }
   const lines = Array.from(grouped.entries())

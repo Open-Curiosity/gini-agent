@@ -899,6 +899,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       secrets: p.secrets,
       hasProbe: Boolean(p.probe),
       hasDetect: Boolean(p.detect),
+      // Whether the provider owns a chat-driven setup skill. Drives the Skills
+      // page "Set up via chat" routing for providers whose setup is more than
+      // pasting a secret (e.g. google-oauth-desktop's gws/gcloud walkthrough),
+      // which can't be inferred from field shape now that all its fields are
+      // secret.
+      hasSetupSkill: Boolean(p.setupSkill),
       probeIntervalMs: p.probeIntervalMs,
       // Optional credential-template the Add Connector dialog prefills when a
       // provider is picked as a template. Derived from the module's secret

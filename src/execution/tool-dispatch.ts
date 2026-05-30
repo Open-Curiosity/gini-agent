@@ -2193,11 +2193,8 @@ async function setSkillStatusTool(
       // The first required credential that carries a secret and isn't yet
       // granted. A credential "carries a secret" when its connector has a
       // `type` (api-key/oauth2). Presence-only connectors (no type, no env)
-      // leak nothing and need no consent. Transitional fallback (removed by
-      // the migration commit): skills still keyed by `requiredConnectors`
-      // gate on the provider — a provider carries a credential when its
-      // module declares a secrets spec, or it is the generic escape-hatch
-      // provider (whose secrets are per-record).
+      // leak nothing and need no consent. Name-based: skills declare
+      // `requiredCredentials`, resolved against the named connector record.
       const ungranted = firstUngrantedCredential(state, skill);
       if (ungranted) {
         return await requestSkillConnectorGrant(config, taskId, toolCallId, skill.id, skill.name, ungranted.name, ungranted.label);
