@@ -107,7 +107,7 @@ export type RuntimeEventKind =
 
 export type JobRunStatus = "running" | "completed" | "failed";
 
-export type ChatMessageRole = "user" | "assistant" | "system";
+export type ChatMessageRole = "user" | "assistant" | "system" | "tool";
 
 export type RunStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
 
@@ -758,6 +758,21 @@ export interface ChatMessageRecord {
   // from landing. Untagged assistant messages (the default) are the
   // task's terminal summary.
   kind?: string;
+  // Tool-calling transcript fields, set only on rows tagged
+  // kind:"tool_transcript". The assistant row that emits tool calls carries
+  // `toolCalls`; each paired result row uses role:"tool" with `toolCallId`
+  // pointing back at the originating call. Stored in a provider-agnostic
+  // inline shape (not the provider's ToolCall type) so the durable store has
+  // no provider dependency; chat-task maps these back to the provider message
+  // shape when replaying across turns. These rows are excluded from the
+  // human-facing JSON views in chat.ts.
+  toolCalls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
+  toolCallId?: string;
+  // Monotonic per-store sequence stamped at create time. Gives a stable
+  // tiebreaker when several transcript rows share a createdAt timestamp, so
+  // replay can reconstruct exact assistant→tool ordering. Older rows lack it
+  // and fall back to 0.
+  seq?: number;
 }
 
 export interface TraceRecord {

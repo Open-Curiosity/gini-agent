@@ -16,6 +16,7 @@ import {
   appendLog,
   appendTaskPartial,
   appendTrace,
+  createChatMessage,
   isTerminalTaskStatus,
   mutateState,
   now,
@@ -465,31 +466,126 @@ function findBoundJobsForTask(state: RuntimeState, task: Task): JobRecord[] {
   return state.jobs.filter((job) => job.chatSessionId === sessionId);
 }
 
-// Pull prior chat messages for multi-turn context. We synthesize an
-// assistant message for any prior task that completed in the same chat
-// session; we skip the in-flight task itself. Tool calls / tool results
-// from prior turns are dropped — only finalized text feeds back in. This
-// keeps the conversation clean without a tool-result transcript ballooning.
-function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessage[] {
-  if (!task.runId) return [];
-  const state = readState(config.instance);
+// Resolve the chat session id behind a task via its run's conversationId.
+// Returns undefined for tasks with no chat session (subagent children,
+// imperative CLI runs) — those paths skip transcript persistence.
+function resolveChatSessionId(state: RuntimeState, task: Task): string | undefined {
+  if (!task.runId) return undefined;
   const run = state.runs.find((r) => r.id === task.runId);
-  if (!run?.conversationId) return [];
-  const sessionId = run.conversationId;
+  return run?.conversationId ?? undefined;
+}
+
+// Persist one tool-calling transcript row so the model can replay its own
+// prior tool calls + results on the next turn (see ADR
+// agent-loop-tool-calling.md). Rows are tagged kind:"tool_transcript" and
+// stay out of the human-facing JSON views (chat.ts). No-op when the task
+// has no chat session (sessionId undefined) or has already reached a
+// terminal status — a transcript row written after cancel/fail would
+// outlive the turn it belongs to.
+function persistTranscriptRow(
+  config: RuntimeConfig,
+  taskId: string,
+  sessionId: string | undefined,
+  row: {
+    role: "assistant" | "tool";
+    content: string;
+    toolCalls?: ToolCall[];
+    toolCallId?: string;
+  }
+): void {
+  if (!sessionId) return;
+  void mutateState(config.instance, (state) => {
+    const item = state.tasks.find((t) => t.id === taskId);
+    if (item && isTerminalTaskStatus(item.status)) return;
+    createChatMessage(state, {
+      sessionId,
+      role: row.role,
+      content: row.content,
+      taskId,
+      runId: item?.runId,
+      kind: "tool_transcript",
+      ...(row.toolCalls ? { toolCalls: row.toolCalls } : {}),
+      ...(row.toolCallId ? { toolCallId: row.toolCallId } : {})
+    });
+  });
+}
+
+// Pull prior chat messages for multi-turn context. We replay the full
+// ordered transcript of every prior turn in the same chat session —
+// user/assistant text plus the assistant tool_calls and role:"tool" results
+// persisted as kind:"tool_transcript" rows — so the model sees the structured
+// results of its own earlier actions (a created issue's id, a read_skill
+// body) instead of re-deriving them. The in-flight task is excluded (its own
+// turn is built live in workingMessages).
+function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessage[] {
+  const state = readState(config.instance);
+  const sessionId = resolveChatSessionId(state, task);
+  if (!sessionId) return [];
   const stored = state.chatMessages
     .filter((m) => m.sessionId === sessionId && m.taskId !== task.id)
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  return stored
-    .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => {
-      if (m.role === "user" && m.images && m.images.length > 0) {
-        return {
-          role: "user" as const,
-          content: buildVisionContent(config, m.content, m.images)
-        };
-      }
-      return { role: m.role as "user" | "assistant", content: m.content };
+    .sort((a, b) => {
+      const byTime = a.createdAt.localeCompare(b.createdAt);
+      if (byTime !== 0) return byTime;
+      return (a.seq ?? 0) - (b.seq ?? 0);
     });
+
+  // Map durable rows to provider messages. Assistant rows carrying toolCalls
+  // and role:"tool" result rows become tool-calling messages; plain
+  // user/assistant text rows keep their legacy shape (vision content for
+  // user images).
+  const mapped: (ToolCallingMessage & { __toolCallIds?: string[] })[] = [];
+  for (const m of stored) {
+    if (m.role === "tool" && m.kind === "tool_transcript") {
+      mapped.push({ role: "tool", content: m.content, tool_call_id: m.toolCallId });
+      continue;
+    }
+    if (m.role === "assistant" && m.kind === "tool_transcript") {
+      const toolCalls = m.toolCalls ?? [];
+      mapped.push({
+        role: "assistant",
+        content: m.content.length > 0 ? m.content : null,
+        tool_calls: toolCalls as ToolCall[],
+        __toolCallIds: toolCalls.map((c) => c.id)
+      });
+      continue;
+    }
+    if (m.role === "user" || m.role === "assistant") {
+      if (m.role === "user" && m.images && m.images.length > 0) {
+        mapped.push({ role: "user", content: buildVisionContent(config, m.content, m.images) });
+      } else {
+        mapped.push({ role: m.role, content: m.content });
+      }
+    }
+  }
+
+  // Defensive pairing pass. Providers reject an assistant tool_calls message
+  // whose ids aren't each answered by a following role:"tool" message, and
+  // reject orphan tool messages. A partially-persisted turn (process died
+  // mid-loop) can leave either. Group each tool row under the assistant that
+  // emitted its id; drop orphan tool rows, and drop any assistant tool_calls
+  // row missing one of its paired results — so replay can never produce a
+  // provider 400.
+  const resultsByCallId = new Map<string, ToolCallingMessage>();
+  for (const msg of mapped) {
+    if (msg.role === "tool" && typeof msg.tool_call_id === "string") {
+      resultsByCallId.set(msg.tool_call_id, msg);
+    }
+  }
+  const paired: ToolCallingMessage[] = [];
+  for (const msg of mapped) {
+    if (msg.role === "tool") continue; // emitted alongside its assistant below
+    if (msg.role === "assistant" && msg.__toolCallIds) {
+      const ids = msg.__toolCallIds;
+      const results = ids.map((id) => resultsByCallId.get(id));
+      if (ids.length === 0 || results.some((r) => r === undefined)) continue; // drop unpaired turn
+      const { __toolCallIds, ...assistant } = msg;
+      paired.push(assistant);
+      for (const result of results) paired.push(result as ToolCallingMessage);
+      continue;
+    }
+    paired.push(msg);
+  }
+  return paired;
 }
 
 // Build the latest user-turn message. When the task carries image refs the
@@ -746,6 +842,10 @@ async function runLoop(
   const state0 = readState(config.instance);
   const taskRow = state0.tasks.find((t) => t.id === taskId);
   const subagent0 = taskRow ? getSubagentForTask(state0, taskRow) : undefined;
+  // Resolve the chat session id once per loop entry so each persist point
+  // below can stamp a tool_transcript row. Undefined for subagent/imperative
+  // tasks (no chat session), in which case persistTranscriptRow is a no-op.
+  const transcriptSessionId = taskRow ? resolveChatSessionId(state0, taskRow) : undefined;
   // Resolve the active-agent overrides (provider, toolset filter, etc.).
   // Provider override flows into generateToolCallingResponse below; the
   // toolset filter narrows buildToolCatalog before the subagent filter
@@ -1050,6 +1150,14 @@ async function runLoop(
       tool_calls: result.toolCalls
     };
     workingMessages.push(assistantMessage);
+    // Persist the assistant tool_calls row so next turn replays it. Its
+    // paired tool results are persisted per call below (sync / skip /
+    // dispatch-error) or in resumeChatTask (gated path).
+    persistTranscriptRow(config, taskId, transcriptSessionId, {
+      role: "assistant",
+      content: result.text ?? "",
+      toolCalls: result.toolCalls
+    });
 
     const pendingApprovals: PendingToolCall[] = [];
     const toolResultMessages: ToolCallingMessage[] = [];
@@ -1084,10 +1192,16 @@ async function runLoop(
     for (const call of result.toolCalls) {
       if (pausedThisTurn) {
         const skipMessage = "Skipped: a prior tool call in this turn requires approval. Will re-evaluate after that approval resolves.";
+        const skipContent = JSON.stringify({ ok: false, skipped: true, reason: skipMessage });
         toolResultMessages.push({
           role: "tool",
           tool_call_id: call.id,
-          content: JSON.stringify({ ok: false, skipped: true, reason: skipMessage })
+          content: skipContent
+        });
+        persistTranscriptRow(config, taskId, transcriptSessionId, {
+          role: "tool",
+          toolCallId: call.id,
+          content: skipContent
         });
         emitToolCallStatus(emitCtx, { callId: call.id, status: "error", errorMessage: skipMessage });
         emitToolResult(emitCtx, { callId: call.id, result: skipMessage });
@@ -1161,6 +1275,11 @@ async function runLoop(
           toolResultMessages.push({
             role: "tool",
             tool_call_id: call.id,
+            content: dispatch.result
+          });
+          persistTranscriptRow(config, taskId, transcriptSessionId, {
+            role: "tool",
+            toolCallId: call.id,
             content: dispatch.result
           });
           // Flip the tool_call row to `ok` and append a tool_result
@@ -1242,6 +1361,11 @@ async function runLoop(
         toolResultMessages.push({
           role: "tool",
           tool_call_id: call.id,
+          content: `Error: ${message}`
+        });
+        persistTranscriptRow(config, taskId, transcriptSessionId, {
+          role: "tool",
+          toolCallId: call.id,
           content: `Error: ${message}`
         });
         emitToolCallStatus(emitCtx, {
@@ -1533,11 +1657,21 @@ export async function resumeChatTask(
   // without a chat session (subagent children) skip emission, matching
   // the loop-entry behavior in runLoop.
   const resumeEmitCtx = resolveEmitContext(config, taskId);
+  // Resolve the chat session once so each gated tool result lands as a
+  // tool_transcript row paired with the assistant tool_calls row that
+  // runLoop persisted before the pause.
+  const resumeSessionId = resolveChatSessionId(readState(config.instance), stage.task);
   for (const entry of snapshot.pending) {
+    const resumeResult = entry.result ?? "(no result)";
     messages.push({
       role: "tool",
       tool_call_id: entry.toolCallId,
-      content: entry.result ?? "(no result)"
+      content: resumeResult
+    });
+    persistTranscriptRow(config, taskId, resumeSessionId, {
+      role: "tool",
+      toolCallId: entry.toolCallId,
+      content: resumeResult
     });
     // Pair the resumed tool_result message with a chat-block update so
     // clients see the previously-running tool_call flip to `ok` and a
