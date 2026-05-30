@@ -16,6 +16,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { baseStateRoot } from "../paths";
 import { SECRET_PATTERNS, redactSecretValuesFromString } from "../tools/browser";
+import { unquoteSecretsValue } from "../state/secrets-env";
 
 export type CrashSource = "runtime" | "web";
 
@@ -123,7 +124,11 @@ const REPORT_SECRET_PATTERNS: RegExp[] = [
   ...SECRET_PATTERNS.map((p) => new RegExp(p.source, p.flags.includes("g") ? p.flags : p.flags + "g")),
   /gh[opsur]_[A-Za-z0-9]{20,}/g,
   /Bearer\s+\S+/gi,
-  /Authorization:\s*\S+/gi
+  // Match the WHOLE header value to end-of-line, not just the first
+  // whitespace-delimited token. `Authorization: Basic <b64>` and a bare
+  // `Authorization: <token>` (no scheme) both have a single-space-then-value
+  // shape where \S+ would leave the trailing token(s) behind.
+  /Authorization:\s*[^\r\n]+/gi
 ];
 
 export interface RedactOptions {
@@ -138,17 +143,17 @@ export interface RedactOptions {
 // Parse literal secret values out of a secrets.env body. Reuses the same
 // `export KEY=value` / bare `KEY=value` shape the writer emits; values may be
 // single- or double-quoted. We only need the raw VALUES (not key names) to
-// feed redactSecretValuesFromString.
+// feed redactSecretValuesFromString. Unquoting goes through the repo's
+// `unquoteSecretsValue` so the value we redact is exactly the value the
+// runtime loaded — escaped/quoted forms are inverted identically rather than
+// half-stripped, which would otherwise leak the escaped portion.
 function secretsEnvValues(body: string): string[] {
   const values: string[] = [];
   for (const line of body.split("\n")) {
     const match = /^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=(.*)$/.exec(line);
     if (!match) continue;
-    let raw = (match[1] ?? "").trim();
-    if (raw.length >= 2 && ((raw.startsWith("'") && raw.endsWith("'")) || (raw.startsWith('"') && raw.endsWith('"')))) {
-      raw = raw.slice(1, -1);
-    }
-    if (raw.length > 0) values.push(raw);
+    const value = unquoteSecretsValue(match[1] ?? "");
+    if (value.length > 0) values.push(value);
   }
   return values;
 }
@@ -207,6 +212,11 @@ export interface RateLimitState {
   lastFiledAt: string | null;
   lastCommentAt: string | null;
   commentCount: number;
+  // The open crash issue this fingerprint was last filed to. Once known, a
+  // recurrence comments directly instead of searching — defeating GitHub's
+  // search-indexing latency, which could otherwise let a crash loop file a
+  // duplicate issue before the first one is indexed.
+  issueNumber?: number;
 }
 
 function rateLimitStatePath(fingerprint: string): string {
@@ -223,7 +233,8 @@ export function readRateLimitState(fingerprint: string): RateLimitState {
     return {
       lastFiledAt: typeof parsed.lastFiledAt === "string" ? parsed.lastFiledAt : null,
       lastCommentAt: typeof parsed.lastCommentAt === "string" ? parsed.lastCommentAt : null,
-      commentCount: typeof parsed.commentCount === "number" ? parsed.commentCount : 0
+      commentCount: typeof parsed.commentCount === "number" ? parsed.commentCount : 0,
+      ...(typeof parsed.issueNumber === "number" ? { issueNumber: parsed.issueNumber } : {})
     };
   } catch {
     return { lastFiledAt: null, lastCommentAt: null, commentCount: 0 };
