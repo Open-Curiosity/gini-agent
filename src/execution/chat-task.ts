@@ -672,15 +672,24 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[], state?: RuntimeS
   // Group dedup'd skills by the provider their required credential maps to.
   // setupSkill is captured per provider — if the provider declares one, the
   // provider-level line directs the model to invoke that skill instead of
-  // calling request_connector directly.
-  const grouped = new Map<string, { skills: string[]; setupSkill?: string }>();
+  // calling request_connector directly. `templateless` flags a group whose key
+  // is a bare credential NAME with no registered provider module: those are
+  // requested with request_connector's {name, type, skillId} shape instead of
+  // a provider id. `skillId` carries one requesting skill's id so the
+  // templateless call can auto-grant on completion.
+  const grouped = new Map<string, { skills: string[]; setupSkill?: string; templateless: boolean; skillId?: string }>();
   for (const skill of byName.values()) {
     for (const credentialName of skill.requiredCredentials ?? []) {
       const provider = providerForCredential(credentialName);
-      const entry = grouped.get(provider) ?? { skills: [] };
-      entry.skills.push(skill.name);
       const module = getProvider(provider);
+      // No registered module (and not the legacy "generic" placeholder) means
+      // `provider` is really the unmapped credential name — a templateless key
+      // the user has never connected and no module models.
+      const templateless = !module || provider === "generic";
+      const entry = grouped.get(provider) ?? { skills: [], templateless };
+      entry.skills.push(skill.name);
       if (module?.setupSkill) entry.setupSkill = module.setupSkill;
+      if (templateless && !entry.skillId) entry.skillId = skill.id;
       grouped.set(provider, entry);
     }
   }
@@ -690,6 +699,14 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[], state?: RuntimeS
       const skillList = Array.from(new Set(entry.skills)).sort().join(", ");
       if (entry.setupSkill) {
         return `- ${provider} (used by: ${skillList}) — run \`read_skill\` with \`${entry.setupSkill}\` first; request_connector will be rejected until you do.`;
+      }
+      if (entry.templateless) {
+        // No registered provider: request the typed credential by name. Infer
+        // the type from the name shape — an ENV_TOKEN (UPPER_SNAKE) is an
+        // api-key (the name IS its env var); anything else (e.g. kebab-case) is
+        // an oauth2 handle. Default api-key when ambiguous.
+        const type = /^[A-Z][A-Z0-9_]*$/.test(provider) ? "api-key" : "oauth2";
+        return `- ${provider} (used by: ${skillList}) — no registered provider; call \`request_connector\` with \`{name: "${provider}", type: "${type}", skillId: "${entry.skillId ?? ""}"}\` so the user can enter it securely in chat.`;
       }
       return `- ${provider} (used by: ${skillList}) — call \`request_connector\` with provider id \`${provider}\` to ask the user to connect.`;
     });
@@ -701,8 +718,8 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[], state?: RuntimeS
   // the connector handshake.
   const hasSetupSkill = Array.from(grouped.values()).some((entry) => entry.setupSkill);
   const intro = hasSetupSkill
-    ? "Skills below need an external connector. The runtime gates `request_connector` for providers that declare a setup skill — call `read_skill` with the setup skill first (it owns the full prerequisite flow and will invoke request_connector itself). For providers WITHOUT a setup skill, call `request_connector` with the provider id directly."
-    : "Skills below need an external connector. For providers with a setup skill listed, invoke that skill first (it walks through any install / OAuth / project provisioning, then captures credentials). Otherwise, call `request_connector` with the provider id directly.";
+    ? "Skills below need an external connector. The runtime gates `request_connector` for providers that declare a setup skill — call `read_skill` with the setup skill first (it owns the full prerequisite flow and will invoke request_connector itself). For a registered provider WITHOUT a setup skill, call `request_connector` with the provider id; for a credential with no registered provider, call `request_connector` with `{name, type, skillId}` as the line indicates. Each line tells you exactly how to call it."
+    : "Skills below need an external connector. For a registered provider, call `request_connector` with the provider id; for a credential with no registered provider, call `request_connector` with `{name, type, skillId}` as the line indicates. Each line tells you exactly how to call it. Never ask the user to paste a key as a chat message — request_connector captures it securely.";
   const sections: string[] = [
     intro,
     ...lines

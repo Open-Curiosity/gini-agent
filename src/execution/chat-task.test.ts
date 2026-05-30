@@ -1737,6 +1737,43 @@ describe("buildInactiveSkillsBlock", () => {
     expect(block).not.toMatch(/read_skill/);
   });
 
+  test("instructs a templateless request_connector for a credential with no registered provider", () => {
+    // SOME_SERVICE_API_KEY maps to no provider module, so providerForCredential
+    // falls back to the name itself. The block must NOT emit the bare
+    // provider-id shortcut (there is no provider to connect) — it must tell the
+    // model to call request_connector with the {name, type, skillId} shape so
+    // the user can enter the secret in chat. The name is UPPER_SNAKE so the
+    // inferred type is api-key.
+    const skill = makeSkill({
+      name: "needs-some-service",
+      description: "Test skill that needs an unmapped credential.",
+      requiredCredentials: ["SOME_SERVICE_API_KEY"]
+    });
+    const block = buildInactiveSkillsBlock([skill]);
+    expect(block).toContain("SOME_SERVICE_API_KEY");
+    expect(block).toContain('name: "SOME_SERVICE_API_KEY"');
+    expect(block).toContain('type: "api-key"');
+    expect(block).toContain(`skillId: "${skill.id}"`);
+    // No provider-id shortcut and no read_skill dead-end for a name with no
+    // registered provider.
+    expect(block).not.toContain("call `request_connector` with provider id `SOME_SERVICE_API_KEY`");
+    expect(block).not.toMatch(/read_skill/);
+    expect(block).not.toContain("will be rejected");
+  });
+
+  test("infers oauth2 for a kebab-case templateless credential name", () => {
+    // A non-ENV_TOKEN handle (kebab-case) is an oauth2 credential, so the
+    // inferred type in the templateless request line is oauth2.
+    const skill = makeSkill({
+      name: "needs-some-oauth",
+      requiredCredentials: ["some-oauth-service"]
+    });
+    const block = buildInactiveSkillsBlock([skill]);
+    expect(block).toContain("some-oauth-service");
+    expect(block).toContain('type: "oauth2"');
+    expect(block).toContain(`skillId: "${skill.id}"`);
+  });
+
   test("returns an empty string when no inactive-with-credential skills are present", () => {
     expect(buildInactiveSkillsBlock([])).toBe("");
     // Skills with no requiredCredentials are filtered out before the
@@ -1752,8 +1789,12 @@ describe("buildInactiveSkillsBlock", () => {
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toMatch(/^Skills below need an external connector\./);
-    expect(block).toContain("setup skill");
+    // Both request_connector routing options are advertised: a registered
+    // provider id, and the templateless {name, type, skillId} shape for a
+    // credential with no registered provider.
     expect(block).toContain("request_connector");
+    expect(block).toContain("provider id");
+    expect(block).toContain("{name, type, skillId}");
   });
 
   test("appends a no-browser-shortcut directive when a setup-skill provider is present", () => {
