@@ -4,15 +4,16 @@ import { deleteConnectorSecrets, readSecret, writeSecret } from "../../state/sec
 import { syncProviderMcpServers } from "../mcp-sync";
 import { redactSecretsInText } from "../mcp-http";
 import { getProvider, listProviders } from "./registry";
+import type { ProviderModule } from "./types";
 
 export interface CreateConnectorInput {
   name: string;
   provider: string;
   // Credential type. When supplied, the record is stamped with it so skills
-  // and MCP rows can resolve the credential by name. Optional — presence-only
-  // and un-typed legacy records omit it. The hard "provider must be a
-  // registered module" requirement is relaxed for typed credentials in a
-  // later commit; commit 1 only threads the field through.
+  // and MCP rows can resolve the credential by name, and the hard "provider
+  // must be a registered module" requirement is relaxed (the module becomes
+  // optional template enrichment). Optional — presence-only and un-typed
+  // legacy records omit it and still validate against a registered provider.
   type?: ConnectorRecord["type"];
   scopes?: string[];
   secrets?: Record<string, string>;
@@ -36,13 +37,88 @@ export interface UpdateConnectorInput {
   metadata?: Record<string, unknown>;
 }
 
+// Default values the Add Connector dialog prefills when a provider is picked
+// as a credential template. Derived from the provider module's secret spec,
+// so a plain API key still needs no module while first-party providers
+// (linear, google-oauth-desktop) seed the right name + shape automatically.
+export interface CredentialTemplate {
+  type: "api-key" | "oauth2";
+  // api-key: the env var the secret binds to (== credential name).
+  // oauth2: a handle (the provider id) the user can rename.
+  name: string;
+  // api-key only: the HTTP MCP server URL to prefill (from module.mcpServer).
+  mcpUrl?: string;
+  // oauth2 only: purpose → ENV_NAME map seeded from the module's envBindings.
+  envMap?: Record<string, string>;
+}
+
+// Derive the credential template for a provider from its declared secret
+// bindings: exactly one env binding → api-key (the binding's env var is the
+// credential name; the module's `mcpServer.url`, if any, prefills the MCP
+// field); two or more → oauth2 (envMap = purpose → ENV_NAME, reversed from
+// the module's `envBindings`). Providers with no secret spec (presence-only,
+// generic) have no template — those still go through the by-type dialog
+// inputs the user fills in manually.
+export function credentialTemplateForProvider(module: ProviderModule): CredentialTemplate | undefined {
+  const envBindings = module.secrets?.envBindings;
+  if (!envBindings) return undefined;
+  const entries = Object.entries(envBindings);
+  if (entries.length === 0) return undefined;
+  if (entries.length === 1) {
+    const [envName] = entries[0]!;
+    return {
+      type: "api-key",
+      name: envName,
+      ...(module.mcpServer?.url ? { mcpUrl: module.mcpServer.url } : {})
+    };
+  }
+  const envMap: Record<string, string> = {};
+  for (const [envName, purpose] of entries) {
+    envMap[purpose] = envName;
+  }
+  return { type: "oauth2", name: module.id, envMap };
+}
+
+// An env-var token: uppercase ASCII, digits, and underscores, leading with a
+// letter. An api-key credential's `name` IS its env var, and every oauth2
+// `metadata.envMap` target must be one of these.
+const ENV_TOKEN = /^[A-Z][A-Z0-9_]*$/;
+
 export async function createConnector(config: RuntimeConfig, input: CreateConnectorInput): Promise<ConnectorRecord> {
   const provider = String(input.provider || "").trim();
   const name = String(input.name || "").trim();
+  const type = input.type;
   if (!provider) throw new Error("Invalid input: provider is required.");
   if (!name) throw new Error("Invalid input: name is required.");
   const module = getProvider(provider);
-  if (!module) throw new Error(`Unknown provider: ${provider}. Use one of ${listProviders().map((p) => p.id).join(", ")} or "generic".`);
+  // The provider module is REQUIRED only for un-typed creates (presence-only
+  // and legacy provider-keyed connectors still resolve through their module).
+  // When a credential `type` is supplied the module is OPTIONAL template
+  // enrichment — a plain api-key needs no registered provider, so an unknown
+  // provider is allowed and the record resolves from its own fields/envMap.
+  if (!module && !type) {
+    throw new Error(`Unknown provider: ${provider}. Use one of ${listProviders().map((p) => p.id).join(", ")} or "generic".`);
+  }
+  // Typed-credential name rules (LOCKED decision 3). api-key name IS the env
+  // var; oauth2 name is a handle but each envMap target must be a valid env
+  // token. Names are unique instance-wide.
+  if (type === "api-key" && !ENV_TOKEN.test(name)) {
+    throw new Error(`Invalid api-key credential name: "${name}". The name is used as the environment variable, so it must match ${ENV_TOKEN.source} (e.g. LINEAR_API_KEY).`);
+  }
+  if (type === "oauth2") {
+    const envMap = (input.metadata?.envMap ?? {}) as Record<string, string>;
+    for (const envName of Object.values(envMap)) {
+      if (!ENV_TOKEN.test(String(envName))) {
+        throw new Error(`Invalid env var name in envMap: "${envName}". Each target must match ${ENV_TOKEN.source} (e.g. GOOGLE_WORKSPACE_CLI_CLIENT_ID).`);
+      }
+    }
+  }
+  if (type) {
+    const existing = readState(config.instance).connectors.find((c) => c.name === name && c.status !== "disabled");
+    if (existing) {
+      throw new Error(`A credential named "${name}" already exists. Credential names must be unique.`);
+    }
+  }
   const connectorId = id("id");
   const secretRefs: ConnectorSecretRef[] = [];
   for (const [purpose, value] of Object.entries(input.secrets ?? {})) {
@@ -67,14 +143,15 @@ export async function createConnector(config: RuntimeConfig, input: CreateConnec
       source: "user"
     };
     state.connectors.unshift(connector);
-    // For providers without a probe (demo, generic, claude-code, codex)
-    // there is no remote check that could refute the configured-status
-    // assumption, so the synchronous health-set is honest. For probe-based
-    // providers (linear), seeding `healthy` from `status === "configured"`
-    // would lie until the next reprobe — leave them at `health: "unknown"`
-    // so the activation gate (which treats unknown-with-probe as inactive)
-    // waits for the first real probe before surfacing dependent skills.
-    if (!module.probe) {
+    // For connectors without a probe (demo, generic, claude-code, codex, and
+    // typed credentials whose provider has no registered module) there is no
+    // remote check that could refute the configured-status assumption, so the
+    // synchronous health-set is honest. For probe-based providers (linear),
+    // seeding `healthy` from `status === "configured"` would lie until the
+    // next reprobe — leave them at `health: "unknown"` so the activation gate
+    // (which treats unknown-with-probe as inactive) waits for the first real
+    // probe before surfacing dependent skills.
+    if (!module?.probe) {
       updateConnectorHealth(connector);
     }
     // Connectors live at the instance level — they're shared across

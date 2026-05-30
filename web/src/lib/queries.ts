@@ -183,6 +183,16 @@ export interface ProviderDescriptor {
   hasProbe: boolean;
   hasDetect: boolean;
   probeIntervalMs?: number;
+  // Defaults the Add Connector dialog prefills when this provider is picked
+  // as a credential template. Present only for providers whose module
+  // declares secret bindings (linear → api-key LINEAR_API_KEY + MCP URL,
+  // google-oauth-desktop → oauth2 + envMap). Plain api keys carry none.
+  credentialTemplate?: {
+    type: "api-key" | "oauth2";
+    name: string;
+    mcpUrl?: string;
+    envMap?: Record<string, string>;
+  };
 }
 
 export function useProviders() {

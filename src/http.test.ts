@@ -762,6 +762,45 @@ describe("runtime api", () => {
     expect(ids).toContain("generic");
     expect(ids).toContain("claude-code");
     expect(ids).toContain("codex");
+    // Credential templates: linear (single env binding) → api-key prefill
+    // with the MCP URL; google-oauth-desktop (two bindings) → oauth2 envMap.
+    const linear = providers.find((p: { id: string }) => p.id === "linear");
+    expect(linear.credentialTemplate).toEqual({
+      type: "api-key",
+      name: "LINEAR_API_KEY",
+      mcpUrl: "https://mcp.linear.app/mcp"
+    });
+    const gws = providers.find((p: { id: string }) => p.id === "google-oauth-desktop");
+    expect(gws.credentialTemplate.type).toBe("oauth2");
+    expect(gws.credentialTemplate.envMap).toEqual({
+      client_id: "GOOGLE_WORKSPACE_CLI_CLIENT_ID",
+      client_secret: "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET"
+    });
+    // Presence-only providers (no secret spec) carry no template.
+    const demo = providers.find((p: { id: string }) => p.id === "demo");
+    expect(demo.credentialTemplate).toBeUndefined();
+  });
+
+  test("POST /api/connectors threads a typed api-key credential through createConnector", async () => {
+    const config = testConfig("connector-typed-create");
+    const handler = createHandler(config);
+    const created = await call(handler, config, "/api/connectors", {
+      method: "POST",
+      body: JSON.stringify({
+        provider: "generic",
+        name: "MY_SERVICE_KEY",
+        type: "api-key",
+        secrets: { MY_SERVICE_KEY: "lin_secret_typed" },
+        metadata: { mcp: { url: "https://mcp.example.com/mcp", headerName: "Authorization", scheme: "Bearer" } }
+      })
+    });
+    expect(created.type).toBe("api-key");
+    expect(created.name).toBe("MY_SERVICE_KEY");
+    expect(created.metadata.mcp.url).toBe("https://mcp.example.com/mcp");
+    expect(created.secretRefs).toHaveLength(1);
+    expect(created.secretRefs[0].purpose).toBe("MY_SERVICE_KEY");
+    const raw = readFileSync(`${config.stateRoot}/state.json`, "utf8");
+    expect(raw).not.toContain("lin_secret_typed");
   });
 
   test("POST /api/setup-requests/<id>/complete creates a connector and resolves the setup request on probe success", async () => {

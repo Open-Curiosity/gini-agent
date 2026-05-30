@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { createEmptyState, mutateState } from "../../state";
+import { createEmptyState, mutateState, readState } from "../../state";
 import { writeSecret } from "../../state/secrets";
-import type { ConnectorRecord, SkillRecord } from "../../types";
-import { bindingsForCredentials, isSkillActive, resolveSkillEnv } from "./index";
+import type { ConnectorRecord, RuntimeConfig, SkillRecord } from "../../types";
+import { bindingsForCredentials, createConnector, isSkillActive, resolveSkillEnv } from "./index";
 
 const ROOT = "/tmp/gini-connectors-unit";
 
@@ -701,5 +701,134 @@ describe("resolveSkillEnv by credential name", () => {
     });
     const env = await resolveSkillEnv(configFor(instance), skill);
     expect(env).toEqual({});
+  });
+});
+
+// Type-driven create (commit 4). When `type` is supplied, createConnector
+// drops the "provider must be a registered module" requirement — a plain
+// api key needs no provider code — and enforces the LOCKED name rules:
+// api-key name IS the env var (uppercase env-token), names are unique
+// instance-wide, oauth2 envMap targets are valid env tokens.
+
+describe("createConnector typed credentials", () => {
+  function configFor(instance: string): RuntimeConfig {
+    return {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+  }
+
+  test("api-key: name IS the env var; secret keyed by name; MCP metadata persisted", async () => {
+    const config = configFor("create-apikey");
+    const created = await createConnector(config, {
+      provider: "generic",
+      name: "MY_SERVICE_KEY",
+      type: "api-key",
+      secrets: { MY_SERVICE_KEY: "secret-value" },
+      metadata: { mcp: { url: "https://mcp.example.com/mcp", headerName: "Authorization", scheme: "Bearer" } }
+    });
+    expect(created.type).toBe("api-key");
+    expect(created.name).toBe("MY_SERVICE_KEY");
+    expect(created.secretRefs).toHaveLength(1);
+    expect(created.secretRefs[0]!.purpose).toBe("MY_SERVICE_KEY");
+    expect(created.metadata?.mcp).toEqual({ url: "https://mcp.example.com/mcp", headerName: "Authorization", scheme: "Bearer" });
+  });
+
+  test("api-key: an unknown provider is allowed once a type is supplied", async () => {
+    const config = configFor("create-apikey-unknown-provider");
+    const created = await createConnector(config, {
+      provider: "not-a-registered-module",
+      name: "PLAIN_KEY",
+      type: "api-key",
+      secrets: { PLAIN_KEY: "value" }
+    });
+    expect(created.type).toBe("api-key");
+    expect(created.provider).toBe("not-a-registered-module");
+  });
+
+  test("api-key: a non-env-token name is rejected", async () => {
+    const config = configFor("create-apikey-badname");
+    await expect(
+      createConnector(config, {
+        provider: "generic",
+        name: "my-service-key",
+        type: "api-key",
+        secrets: { "my-service-key": "value" }
+      })
+    ).rejects.toThrow(/Invalid api-key credential name/);
+  });
+
+  test("a duplicate name is rejected instance-wide", async () => {
+    const config = configFor("create-dupe");
+    await createConnector(config, {
+      provider: "generic",
+      name: "DUPE_KEY",
+      type: "api-key",
+      secrets: { DUPE_KEY: "value" }
+    });
+    await expect(
+      createConnector(config, {
+        provider: "generic",
+        name: "DUPE_KEY",
+        type: "api-key",
+        secrets: { DUPE_KEY: "value2" }
+      })
+    ).rejects.toThrow(/already exists/);
+  });
+
+  test("oauth2: envMap persisted and every secret keyed by its env var", async () => {
+    const config = configFor("create-oauth2");
+    const created = await createConnector(config, {
+      provider: "generic",
+      name: "my-oauth",
+      type: "oauth2",
+      secrets: { CLIENT_ID: "cid", CLIENT_SECRET: "csec" },
+      metadata: { envMap: { CLIENT_ID: "CLIENT_ID", CLIENT_SECRET: "CLIENT_SECRET" } }
+    });
+    expect(created.type).toBe("oauth2");
+    expect(created.name).toBe("my-oauth");
+    expect(created.metadata?.envMap).toEqual({ CLIENT_ID: "CLIENT_ID", CLIENT_SECRET: "CLIENT_SECRET" });
+    expect(created.secretRefs.map((r) => r.purpose).sort()).toEqual(["CLIENT_ID", "CLIENT_SECRET"]);
+  });
+
+  test("oauth2: an invalid env var name in envMap is rejected", async () => {
+    const config = configFor("create-oauth2-badenv");
+    await expect(
+      createConnector(config, {
+        provider: "generic",
+        name: "my-oauth-bad",
+        type: "oauth2",
+        secrets: { "client-id": "cid" },
+        metadata: { envMap: { "client-id": "client-id" } }
+      })
+    ).rejects.toThrow(/Invalid env var name in envMap/);
+  });
+
+  test("untyped create still requires a registered provider (unchanged)", async () => {
+    const config = configFor("create-untyped-unknown");
+    await expect(
+      createConnector(config, {
+        provider: "not-a-registered-module",
+        name: "whatever"
+      })
+    ).rejects.toThrow(/Unknown provider/);
+  });
+
+  test("a typed create persists the record and resolves by name", async () => {
+    const config = configFor("create-roundtrip");
+    const created = await createConnector(config, {
+      provider: "generic",
+      name: "ROUNDTRIP_KEY",
+      type: "api-key",
+      secrets: { ROUNDTRIP_KEY: "value" }
+    });
+    const stored = readState(config.instance).connectors.find((c) => c.id === created.id);
+    expect(stored?.name).toBe("ROUNDTRIP_KEY");
+    expect(stored?.type).toBe("api-key");
   });
 });

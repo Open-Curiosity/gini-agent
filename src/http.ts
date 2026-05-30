@@ -30,7 +30,7 @@ import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect"
 import { runMessagingPairingConnect } from "./execution/messaging-pairing-connect";
 import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
 import { mobileBootstrap, publicState } from "./runtime/views";
-import { checkConnector, createConnector, deleteConnector, firstUngrantedCredential, updateConnector } from "./integrations/connectors";
+import { checkConnector, createConnector, credentialTemplateForProvider, deleteConnector, firstUngrantedCredential, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
@@ -899,7 +899,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       secrets: p.secrets,
       hasProbe: Boolean(p.probe),
       hasDetect: Boolean(p.detect),
-      probeIntervalMs: p.probeIntervalMs
+      probeIntervalMs: p.probeIntervalMs,
+      // Optional credential-template the Add Connector dialog prefills when a
+      // provider is picked as a template. Derived from the module's secret
+      // bindings: one env binding → api-key (name == that env var, MCP URL
+      // from the module's mcpServer); two+ → oauth2 (envMap = purpose→ENV).
+      // Modules with no secret spec (presence-only, generic) carry none.
+      credentialTemplate: credentialTemplateForProvider(p)
     })))],
     ["POST", /^\/api\/connectors$/, async (request) => {
       const payload = await body(request);
@@ -909,9 +915,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const metadata = payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
         ? payload.metadata as Record<string, unknown>
         : undefined;
+      const type = payload.type === "api-key" || payload.type === "oauth2" ? payload.type : undefined;
       return json(await createConnector(config, {
         name: String(payload.name ?? ""),
         provider: String(payload.provider ?? ""),
+        type,
         scopes: Array.isArray(payload.scopes) ? payload.scopes.map(String) : undefined,
         secrets,
         metadata

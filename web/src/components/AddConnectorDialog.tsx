@@ -24,6 +24,11 @@ import type { ProviderDescriptor } from "@/lib/queries";
 export interface CreateConnectorBody {
   provider: string;
   name: string;
+  // Credential type. Threaded through to createConnector so the record is
+  // stamped by type and resolves by name. Omitted by rotate/request (those
+  // operate on existing/provider-pinned records) and by the legacy
+  // provider-template create path.
+  type?: "api-key" | "oauth2";
   // Optional so rotate mode can omit it. The runtime's updateConnector
   // treats any provided scopes array as a full replacement, so sending
   // `scopes: []` from a rotate (where the dialog hides the input) would
@@ -34,10 +39,20 @@ export interface CreateConnectorBody {
   metadata?: Record<string, unknown>;
 }
 
-interface GenericField {
-  name: string;
+// An env-var token: uppercase ASCII, digits, and underscores, leading with a
+// letter. Mirrors the server-side rule in createConnector. An api-key
+// credential `name` IS its env var; each oauth2 row's env var name must match.
+const ENV_TOKEN = /^[A-Z][A-Z0-9_]*$/;
+
+type CredType = "api-key" | "oauth2";
+
+// One oauth2 field: an env var the runtime materializes and the value to
+// store for it. Every value is persisted encrypted (oauth2 credentials
+// resolve entirely through the secret store via metadata.envMap), so there
+// is no non-secret variant here.
+interface OAuthRow {
+  envVarName: string;
   value: string;
-  secret: boolean;
 }
 
 export interface AddConnectorDialogProps {
@@ -91,48 +106,154 @@ export function AddConnectorDialog({
 
   const [provider, setProvider] = useState(initialProvider);
   const [name, setName] = useState(defaultName ?? "");
-  const [scopes, setScopes] = useState("");
   const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
-  const [genericFields, setGenericFields] = useState<GenericField[]>([{ name: "", value: "", secret: false }]);
   const [error, setError] = useState<string | null>(null);
+
+  // Type-driven create state. The credential `type` decides which inputs
+  // render; the (optional) template picker above prefills them from a
+  // provider module. `template === ""` means a plain, module-less credential.
+  const [credType, setCredType] = useState<CredType>("api-key");
+  const [template, setTemplate] = useState("");
+  const [apiKeyName, setApiKeyName] = useState("");
+  const [apiKeySecret, setApiKeySecret] = useState("");
+  const [mcpUrl, setMcpUrl] = useState("");
+  const [oauthName, setOauthName] = useState("");
+  const [oauthRows, setOauthRows] = useState<OAuthRow[]>([{ envVarName: "", value: "" }]);
 
   useEffect(() => {
     if (open) {
       setProvider(initialProvider);
       setName(defaultName ?? "");
-      setScopes("");
       setFieldValues({});
-      setGenericFields([{ name: "", value: "", secret: false }]);
       setError(null);
+      setCredType("api-key");
+      setTemplate("");
+      setApiKeyName(defaultName ?? "");
+      setApiKeySecret("");
+      setMcpUrl("");
+      setOauthName(defaultName ?? "");
+      setOauthRows([{ envVarName: "", value: "" }]);
     }
   }, [open, initialProvider, defaultName]);
 
   const selectedProvider = providers.find((p) => p.id === provider);
 
-  // Secret-only providers (linear, claude-code, codex, demo) need just
-  // an API token from the user — Name is decorative since we only support
-  // one connection per provider in practice, Provider is locked when
-  // launched from a skill row, and Scopes are encoded inside the secret
-  // itself. The `generic` provider is the one exception: it always renders
-  // the full form because the user has to declare custom fields.
-  // "request" mode (in-chat Connect button) is always minimal: it never
-  // surfaces name/provider/scopes regardless of provider shape, because
-  // the approval payload already pins the provider and there is no use
-  // case for connecting `generic` via this path.
-  const minimal =
-    mode === "request"
-    || (mode === "create"
-      && provider !== "generic"
-      && !!selectedProvider
-      && selectedProvider.fields.length > 0
-      && selectedProvider.fields.every((f) => f.secret));
-
-  const submit = () => {
+  // Pick a provider module as a template: stamp the credential type, name, and
+  // (api-key) MCP URL / (oauth2) env-var rows from its declared bindings, and
+  // carry the provider id forward so the record keeps its probe + MCP module.
+  // "" clears back to a plain, module-less credential (provider "generic").
+  function applyTemplate(templateId: string) {
+    setTemplate(templateId);
     setError(null);
-    if (mode === "create" && !minimal && !name.trim()) {
-      setError("Name is required.");
+    if (!templateId) {
+      setProvider("generic");
       return;
     }
+    const picked = providers.find((p) => p.id === templateId);
+    const tmpl = picked?.credentialTemplate;
+    setProvider(templateId);
+    if (!tmpl) return;
+    setCredType(tmpl.type);
+    if (tmpl.type === "api-key") {
+      setApiKeyName(tmpl.name);
+      setMcpUrl(tmpl.mcpUrl ?? "");
+    } else {
+      setOauthName(tmpl.name);
+      const envMap = tmpl.envMap ?? {};
+      const rows = Object.values(envMap).map((envVarName) => ({ envVarName, value: "" }));
+      setOauthRows(rows.length > 0 ? rows : [{ envVarName: "", value: "" }]);
+    }
+  }
+
+  // Providers worth offering as templates: those whose module declares a
+  // credential template (linear, google-oauth-desktop). Presence-only and
+  // generic providers carry none, so they'd add noise to the picker.
+  const templateProviders = providers.filter((p) => p.credentialTemplate);
+
+  // "request" mode (in-chat Connect button) is always minimal: it surfaces
+  // just the provider's secret fields, because the approval payload already
+  // pins the provider and there is no use case for connecting `generic` via
+  // this path. "rotate" reuses the same provider-fields UI (replace secrets
+  // only). "create" no longer uses this — it renders the type-driven UI.
+  const minimal = mode === "request";
+
+  // Type-driven create submit (api-key / oauth2). Builds the create input
+  // createConnector expects: api-key → name == env var, one secret under
+  // that key, optional `metadata.mcp`; oauth2 → handle name, one secret per
+  // row keyed by its env var, `metadata.envMap` (identity purpose → ENV).
+  const submitCreate = () => {
+    setError(null);
+    if (credType === "api-key") {
+      const envName = apiKeyName.trim();
+      if (!envName) {
+        setError("Credential name is required.");
+        return;
+      }
+      if (!ENV_TOKEN.test(envName)) {
+        setError("Credential name must be an env var: uppercase letters, digits, underscores (e.g. LINEAR_API_KEY).");
+        return;
+      }
+      if (!apiKeySecret.trim()) {
+        setError("Secret value is required.");
+        return;
+      }
+      const url = mcpUrl.trim();
+      onSubmit({
+        provider: template || "generic",
+        name: envName,
+        type: "api-key",
+        secrets: { [envName]: apiKeySecret.trim() },
+        metadata: url
+          ? { mcp: { url, headerName: "Authorization", scheme: "Bearer" } }
+          : {}
+      });
+      return;
+    }
+
+    // oauth2
+    const handle = oauthName.trim();
+    if (!handle) {
+      setError("Credential name is required.");
+      return;
+    }
+    const rows = oauthRows.filter((r) => r.envVarName.trim().length > 0);
+    if (rows.length === 0) {
+      setError("OAuth2 credentials need at least one field.");
+      return;
+    }
+    const secrets: Record<string, string> = {};
+    const envMap: Record<string, string> = {};
+    for (const row of rows) {
+      const envName = row.envVarName.trim();
+      if (!ENV_TOKEN.test(envName)) {
+        setError(`Invalid env var name "${envName}": uppercase letters, digits, underscores (e.g. GOOGLE_WORKSPACE_CLI_CLIENT_ID).`);
+        return;
+      }
+      if (!row.value.trim()) {
+        setError(`Value for ${envName} is required.`);
+        return;
+      }
+      secrets[envName] = row.value.trim();
+      // Identity purpose → ENV map (generic oauth2). Template-seeded rows
+      // carry the provider's env names directly, so the purpose IS the env
+      // name; bindingsForCredentials reads each purpose's secret by name.
+      envMap[envName] = envName;
+    }
+    onSubmit({
+      provider: template || "generic",
+      name: handle,
+      type: "oauth2",
+      secrets,
+      metadata: { envMap }
+    });
+  };
+
+  const submit = () => {
+    if (mode === "create") {
+      submitCreate();
+      return;
+    }
+    setError(null);
     if (!selectedProvider) {
       setError(`Provider ${provider} is not registered.`);
       return;
@@ -140,34 +261,19 @@ export function AddConnectorDialog({
     const secrets: Record<string, string> = {};
     const metadataFields: Record<string, string> = {};
 
-    if (provider === "generic") {
-      const cleaned = genericFields.filter((f) => f.name.trim().length > 0);
-      if (cleaned.length === 0) {
-        setError("Generic connectors need at least one field.");
+    for (const field of selectedProvider.fields) {
+      const raw = fieldValues[field.name] ?? "";
+      // In rotate mode the user is replacing secrets only; non-secret
+      // metadata fields keep their stored values, so don't block the
+      // submission on them being empty.
+      const requiredHere = field.required && (mode !== "rotate" || field.secret);
+      if (requiredHere && !raw.trim()) {
+        setError(`${field.label} is required.`);
         return;
       }
-      for (const field of cleaned) {
-        const key = field.name.trim();
-        const value = field.value.trim();
-        if (!value) continue;
-        if (field.secret) secrets[key] = value;
-        else metadataFields[key] = value;
-      }
-    } else {
-      for (const field of selectedProvider.fields) {
-        const raw = fieldValues[field.name] ?? "";
-        // In rotate mode the user is replacing secrets only; non-secret
-        // metadata fields keep their stored values, so don't block the
-        // submission on them being empty.
-        const requiredHere = field.required && (mode !== "rotate" || field.secret);
-        if (requiredHere && !raw.trim()) {
-          setError(`${field.label} is required.`);
-          return;
-        }
-        if (!raw.trim()) continue;
-        if (field.secret) secrets[field.name] = raw.trim();
-        else metadataFields[field.name] = raw.trim();
-      }
+      if (!raw.trim()) continue;
+      if (field.secret) secrets[field.name] = raw.trim();
+      else metadataFields[field.name] = raw.trim();
     }
 
     if (mode === "rotate" && Object.keys(secrets).length === 0) {
@@ -179,20 +285,15 @@ export function AddConnectorDialog({
     // promises name and scopes stay the same. Sending an empty `scopes`
     // array would have updateConnector treat it as a full replacement and
     // wipe the stored scopes. Omit the field entirely on rotate so only
-    // the new secrets land. In minimal create mode, default name to the
+    // the new secrets land. In minimal request mode, default name to the
     // provider label and skip scopes entirely (secret encodes scope).
     const resolvedName =
       mode === "rotate"
         ? (defaultName ?? name).trim()
-        : minimal
-          ? (name.trim() || selectedProvider.label)
-          : name.trim();
+        : (name.trim() || selectedProvider.label);
     onSubmit({
       provider,
       name: resolvedName,
-      ...(mode === "create" && !minimal
-        ? { scopes: scopes.split(",").map((s) => s.trim()).filter(Boolean) }
-        : {}),
       secrets,
       metadata: Object.keys(metadataFields).length > 0 ? { fields: metadataFields } : undefined
     });
@@ -216,32 +317,97 @@ export function AddConnectorDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
-          {mode === "create" && !minimal ? (
+          {mode === "create" ? (
             <>
               <div className="space-y-1">
-                <Label htmlFor="connector-name">Name</Label>
-                <Input id="connector-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="primary linear" />
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="connector-provider">Provider</Label>
-                <Select value={provider} onValueChange={setProvider} disabled={lockProvider}>
-                  <SelectTrigger id="connector-provider"><SelectValue /></SelectTrigger>
+                <Label htmlFor="credential-type">Credential type</Label>
+                <Select value={credType} onValueChange={(v) => { setCredType(v as CredType); setError(null); }}>
+                  <SelectTrigger id="credential-type"><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    {providers.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>{p.label} ({p.id})</SelectItem>
-                    ))}
+                    <SelectItem value="api-key">API key</SelectItem>
+                    <SelectItem value="oauth2">OAuth2</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
-              <div className="space-y-1">
-                <Label htmlFor="connector-scopes">Scopes (comma-separated)</Label>
-                <Input id="connector-scopes" value={scopes} onChange={(e) => setScopes(e.target.value)} placeholder="read, write" />
-              </div>
-            </>
-          ) : null}
+              {templateProviders.length > 0 ? (
+                <div className="space-y-1">
+                  <Label htmlFor="credential-template">Template (optional)</Label>
+                  <Select value={template || "__none"} onValueChange={(v) => applyTemplate(v === "__none" ? "" : v)} disabled={lockProvider}>
+                    <SelectTrigger id="credential-template"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none">None / custom</SelectItem>
+                      {templateProviders.map((p) => (
+                        <SelectItem key={p.id} value={p.id}>{p.label} ({p.id})</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-[11px] text-muted-foreground">
+                    Prefill the name and shape from a known provider, or leave on custom for a plain key.
+                  </p>
+                </div>
+              ) : null}
 
-          {provider === "generic" ? (
-            <GenericFieldEditor fields={genericFields} onChange={setGenericFields} />
+              {credType === "api-key" ? (
+                <>
+                  <div className="space-y-1">
+                    <Label htmlFor="apikey-name">Credential name (used as the env var)</Label>
+                    <Input
+                      id="apikey-name"
+                      value={apiKeyName}
+                      onChange={(e) => { setApiKeyName(e.target.value); setError(null); }}
+                      placeholder="LINEAR_API_KEY"
+                      autoComplete="off"
+                    />
+                    {apiKeyName.trim() && !ENV_TOKEN.test(apiKeyName.trim()) ? (
+                      <p className="text-[11px] text-destructive">
+                        Must be an env var: uppercase letters, digits, underscores (e.g. LINEAR_API_KEY).
+                      </p>
+                    ) : (
+                      <p className="text-[11px] text-muted-foreground">Skills reference this credential by this name.</p>
+                    )}
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="apikey-secret">Secret value</Label>
+                    <Input
+                      id="apikey-secret"
+                      type="password"
+                      value={apiKeySecret}
+                      onChange={(e) => setApiKeySecret(e.target.value)}
+                      placeholder="lin_api_…"
+                      autoComplete="off"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="apikey-mcp">MCP server URL (optional)</Label>
+                    <Input
+                      id="apikey-mcp"
+                      value={mcpUrl}
+                      onChange={(e) => setMcpUrl(e.target.value)}
+                      placeholder="https://mcp.example.com/mcp"
+                      autoComplete="off"
+                    />
+                    <p className="text-[11px] text-muted-foreground">
+                      Registers an MCP server with header Authorization: Bearer ${"{"}{apiKeyName.trim() || "ENV"}{"}"}.
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="space-y-1">
+                    <Label htmlFor="oauth-name">Credential name</Label>
+                    <Input
+                      id="oauth-name"
+                      value={oauthName}
+                      onChange={(e) => { setOauthName(e.target.value); setError(null); }}
+                      placeholder="google-workspace-oauth"
+                      autoComplete="off"
+                    />
+                    <p className="text-[11px] text-muted-foreground">A handle skills reference by name (kebab-case is fine).</p>
+                  </div>
+                  <OAuthFieldEditor rows={oauthRows} onChange={(next) => { setOauthRows(next); setError(null); }} />
+                </>
+              )}
+            </>
           ) : (
             selectedProvider?.fields.map((field) => (
               <div key={field.name} className="space-y-1">
@@ -282,21 +448,25 @@ export function AddConnectorDialog({
   );
 }
 
-function GenericFieldEditor({
-  fields,
+// Dynamic env-var rows for an oauth2 credential. Each row maps an env var
+// name (the runtime materializes it via metadata.envMap) to its value; the
+// value is always stored encrypted. Mirrors the field-list pattern the
+// generic editor used, with an env-var-name column.
+function OAuthFieldEditor({
+  rows,
   onChange
 }: {
-  fields: GenericField[];
-  onChange: (next: GenericField[]) => void;
+  rows: OAuthRow[];
+  onChange: (next: OAuthRow[]) => void;
 }) {
-  function update(index: number, patch: Partial<GenericField>) {
-    onChange(fields.map((f, i) => (i === index ? { ...f, ...patch } : f)));
+  function update(index: number, patch: Partial<OAuthRow>) {
+    onChange(rows.map((r, i) => (i === index ? { ...r, ...patch } : r)));
   }
   function add() {
-    onChange([...fields, { name: "", value: "", secret: false }]);
+    onChange([...rows, { envVarName: "", value: "" }]);
   }
   function remove(index: number) {
-    onChange(fields.filter((_, i) => i !== index));
+    onChange(rows.filter((_, i) => i !== index));
   }
   return (
     <div className="space-y-2">
@@ -305,30 +475,23 @@ function GenericFieldEditor({
         <Button type="button" size="sm" variant="outline" onClick={add}>Add field</Button>
       </div>
       <p className="text-[11px] text-muted-foreground">
-        Define the credentials and config the dependent skill expects. Secret fields are stored encrypted.
+        Each row is an env var the skill expects. Values are stored encrypted.
       </p>
-      {fields.map((field, index) => (
-        <div key={index} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto] items-center gap-2 rounded-md border border-border p-2">
+      {rows.map((row, index) => (
+        <div key={index} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] items-center gap-2 rounded-md border border-border p-2">
           <Input
-            placeholder="field name (e.g. base_url)"
-            value={field.name}
-            onChange={(e) => update(index, { name: e.target.value })}
+            placeholder="ENV_VAR_NAME"
+            value={row.envVarName}
+            onChange={(e) => update(index, { envVarName: e.target.value })}
+            autoComplete="off"
           />
           <Input
-            placeholder={field.secret ? "secret value" : "value"}
-            type={field.secret ? "password" : "text"}
-            value={field.value}
+            placeholder="value"
+            type="password"
+            value={row.value}
             onChange={(e) => update(index, { value: e.target.value })}
+            autoComplete="off"
           />
-          <label className="flex items-center gap-1 text-[11px]">
-            <input
-              type="checkbox"
-              checked={field.secret}
-              onChange={(e) => update(index, { secret: e.target.checked })}
-              className="h-4 w-4 rounded border-border"
-            />
-            secret
-          </label>
           <Button type="button" size="sm" variant="ghost" className="text-destructive" onClick={() => remove(index)}>
             ×
           </Button>
