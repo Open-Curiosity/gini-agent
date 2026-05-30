@@ -1616,6 +1616,121 @@ describe("chat-task loop", () => {
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
+
+  // The riskiest invariant: a deferred tool the model loaded must stay live
+  // across an approval pause/resume. We load a deferred mutate self tool
+  // (set_provider), call it (strict → gates), assert the paused task carries
+  // loadedTools, then approve and confirm the loop resumes and completes —
+  // proving runLoop re-seeds loadedToolNames from task.loadedTools on resume.
+  test("loaded deferred tool set persists across an approval pause/resume", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    // strict so set_provider gates instead of auto-resolving.
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-resume");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: load set_provider.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["set_provider"] }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: call set_provider directly (top-level args). Strict → pauses.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_sp", type: "function", function: { name: "set_provider", arguments: JSON.stringify({ provider: "echo" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 3 (after approval resumes): final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Provider set.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "switch to echo", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id, 10000);
+    expect(paused.status).toBe("waiting_approval");
+    // The loaded set survived onto the task across the pause snapshot.
+    expect(paused.loadedTools).toContain("set_provider");
+    expect(paused.toolCallState).toBeDefined();
+    expect(paused.toolCallState?.pending[0]?.toolName).toBe("set_provider");
+    expect(paused.approvalIds.length).toBe(1);
+
+    // Approve → resume. runLoop re-seeds loadedToolNames from task.loadedTools
+    // so set_provider is live again on the resumed iteration.
+    await decideApproval(config, paused.approvalIds[0]!, "approve");
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Provider set.");
+    // Cleared on terminal completion.
+    expect(finished.loadedTools).toBeUndefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // create_agent approve/resume regression: the direct self tool routes
+  // through the unchanged self.config approval branch. Approving the gate
+  // must run the create_agent handler (agent row lands) and resume the loop.
+  test("create_agent direct tool gates, then approval lands the agent and resumes", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-create-agent-resume");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: load create_agent.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["create_agent"] }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: call create_agent directly. Strict → gates.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_ca", type: "function", function: { name: "create_agent", arguments: JSON.stringify({ name: "E2E2" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 3: final answer after approval.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Agent created.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "create an agent called E2E2", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id, 10000);
+    expect(paused.status).toBe("waiting_approval");
+
+    const stateBefore = readState(config.instance);
+    const approval = stateBefore.authorizations.find((a) => a.id === paused.approvalIds[0]!)!;
+    expect(approval.action).toBe("self.config");
+    expect(approval.payload.opName).toBe("create_agent");
+    // No agent yet — the side effect is deferred to approval time.
+    expect(stateBefore.agents.some((a) => a.name === "E2E2")).toBe(false);
+
+    await decideApproval(config, approval.id, "approve");
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Agent created.");
+
+    // The handler ran on approval — the agent row now exists.
+    const stateAfter = readState(config.instance);
+    expect(stateAfter.agents.some((a) => a.name === "E2E2")).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
 });
 
 describe("buildAgentIdentity", () => {

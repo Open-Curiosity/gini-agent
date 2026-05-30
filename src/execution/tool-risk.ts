@@ -50,15 +50,12 @@ export const TOOL_RISK: ReadonlyMap<string, RiskLevel> = new Map<string, RiskLev
   // Mirrors the high classification ACTION_RISK gives to
   // browser.fill_secret. The catalog tool name is the
   // underscore-separated form.
-  ["browser_fill_secrets", "high"],
-  // The self-config meta-tools. Per-op gating happens inside dispatch via
-  // pendingOrAuto (mutate ops route through "self.config"); the tool names
-  // themselves are low. Without these explicit entries the substring
-  // heuristic below would seed self_invoke as "high" (it matches
-  // includes("invoke")), which would mis-gate the always-on discover/invoke
-  // surface at the tool-name level.
-  ["self_discover", "low"],
-  ["self_invoke", "low"]
+  ["browser_fill_secrets", "high"]
+  // The self-config direct tools (get_self, list_*, set_provider, use_agent,
+  // create_agent) are not listed here: none of their names trip the
+  // substring heuristic below, so they correctly seed as "low" at the
+  // tool-name level. The mutate ops still gate at dispatch via the
+  // "self.config" ACTION_RISK entry above.
   // Everything else falls out of the substring heuristic in defaults.ts.
 ]);
 

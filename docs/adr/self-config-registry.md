@@ -1,30 +1,35 @@
-# ADR: Self-Config Registry Behind Discover/Invoke Meta-Tools
+# ADR: Self-Config Registry as Deferred Direct Tools
 
 ## Decision
 
 Gini introspects and reconfigures its own runtime — provider/model, active
-agent, skills, MCP servers, connectors — through **two always-on meta-tools**
-rather than one catalog entry per capability:
+agent, skills, MCP servers, connectors — through **direct, deferred tools**
+(one per capability), surfaced via the general deferred-tools mechanism
+(catalog `deferred` flag + the `load_tools` meta-tool; see
+agent-loop-tool-calling.md). Each capability is its own catalog tool whose
+name is the operation name (`get_self`, `list_providers`, `set_provider`,
+`use_agent`, …). The tool names + one-line summaries appear in the system
+prompt's "Tools available on demand" index; the model `load_tools` the ones
+it needs, then calls them directly by name.
 
-- `self_discover(name?, tag?)` — returns the index of self operations (each
-  `{ name, summary, tag }`); pass `name` for one operation's full argument
-  schema, `tag` (`query` | `mutate`) to filter.
-- `self_invoke(name, args)` — runs a named operation. Args are validated
-  against the operation's JSON Schema; a validation miss returns the schema so
-  the model self-corrects.
+This **supersedes the original two-meta-tool facade** (`self_discover` /
+`self_invoke`). The general deferred-tools mechanism now solves the
+keep-the-live-tool-count-low problem for the whole catalog, so a domain
+-specific discover/invoke indirection is no longer warranted — the self ops
+ride the same load-on-demand path as every other deferred tool.
 
-Both front a registry of `SelfOperation` records in
-`src/execution/self-registry.ts`. Each record is the single source of truth
-for one capability: its `summary` (the discovery index entry), its `tag`
-(`query` => synchronous read; `mutate` => routed through the approval seam),
-its arg `schema`, and its `handler`. Adding a capability = registering one
-operation — no separate catalog/dispatch/skill edit.
+The tools still front a registry of `SelfOperation` records in
+`src/execution/self-registry.ts`, which remains the single source of truth for
+each capability's BEHAVIOR: its `tag` (`query` => synchronous read; `mutate`
+=> routed through the approval seam), its `handler`, and its arg `schema` (the
+catalog entry mirrors this schema in its `function.parameters`). Adding a
+capability = registering one operation here plus a matching catalog entry.
 
-The **operation names are the load-bearing discovery index**; full arg schemas
-are fetched on demand via `self_discover`. This keeps the live full-schema
-tool count constant (two entries) regardless of how many self operations
-exist, which matters for weaker local providers whose tool-selection accuracy
-degrades as the live tool count grows.
+Because the tools are deferred, their full schemas are withheld from the live
+provider `tools` array until loaded. This keeps the live full-schema tool
+count low even as the number of self operations grows, which matters for
+weaker local providers whose tool-selection accuracy degrades as the live tool
+count grows.
 
 ## Context
 
@@ -49,12 +54,13 @@ Two priors informed the shape:
   entirely — `/model` is a human slash command parsed by the CLI/gateway, not
   a tool the model calls.
 
-We take OpenClaw's discover-then-act shape but keep **named operations**
-(`set_provider`, not a raw path), because the names are what the model selects
-against and good names drive selection accuracy. The chat-task loop builds its
-`tools` array once per loop entry and freezes it for the turn (see
-agent-loop-tool-calling.md), so the dynamism lives entirely inside the two
-meta-tools' handlers — no per-turn schema injection, no `toolsHash` churn.
+We keep **named operations** (`set_provider`, not a raw path), because the
+names are what the model selects against and good names drive selection
+accuracy. The original facade froze a two-entry surface and did the discovery
+inside the meta-tools' handlers; the deferred-tools mechanism instead withholds
+each op's schema until `load_tools` pulls it live and the chat-task loop
+recomputes its `tools` array (see agent-loop-tool-calling.md). The loaded set
+persists on the task so it survives an approval pause/resume.
 
 ## Required Now
 
@@ -65,15 +71,17 @@ meta-tools' handlers — no per-turn schema injection, no `toolsHash` churn.
   helper transitively re-enters `agent.ts` and forms a cycle. The inlined
   audit is best-effort: a task deleted mid-flight skips the row rather than
   throwing and discarding the handler's already-computed result.
-- `self_discover` and `self_invoke` are always-on (toolset `self`, not in the
-  default toolsets) so a fresh instance can answer "what model are you using"
-  and act on the answer without an operator-only toggle.
-- `self_invoke` resolves the operation by name (unknown name returns a
-  recoverable `{ ok: false, didYouMean }` — never throws), shallow-validates
-  required args (returning the schema on a miss), then routes by tag:
-  - `query` runs the handler synchronously and returns its string.
-  - `mutate` routes through the approval seam (`pendingOrAuto`) as PolicyAction
-    `self.config`.
+- The self tools are on toolset `self` (not in the default toolsets) and
+  bypass the toolset gate (`tool.toolset === "self"` in `buildToolCatalog`) so
+  a fresh instance can answer "what model are you using" and act on the answer
+  without an operator-only toggle. They are `deferred: true`, so deferral —
+  not gating — is what keeps them out of the live tools array until the model
+  `load_tools` them.
+- The dispatcher routes the nine tool cases through one helper
+  (`dispatchSelfOp`): a `query` tool runs its handler synchronously; a
+  `mutate` tool (`set_provider`, `use_agent`, `create_agent`) routes through
+  the approval seam (`pendingOrAuto`) as PolicyAction `self.config`. The tool
+  name IS the op name and args are passed at top level.
 - `self.config` policy (ADR approval-mode.md): auto-approves under `auto` (the
   default — frictionless when the user says "set provider to deepseek"), gates
   under `strict`, auto-resolves under `yolo`. The approval row carries
@@ -82,11 +90,13 @@ meta-tools' handlers — no per-turn schema injection, no `toolsHash` churn.
   `{ opName, args }`, runs the registry handler, and writes an approval-linked
   audit row (`approvalId`, `risk: medium`, the operation outcome) mirroring the
   `messaging.send` branch so the operation is joinable to the approval that
-  authorized it (ADR approval-and-audit-substrate.md).
-- `self_invoke` carries an explicit `TOOL_RISK` entry of `low` so the
-  substring heuristic (`includes("invoke")`) does not seed it high-risk;
-  per-operation gating happens inside dispatch via `self.config`, not via the
-  tool-name heuristic.
+  authorized it (ADR approval-and-audit-substrate.md). Because the direct tool
+  name equals the op name and its args are top-level, this payload shape is
+  identical to the retired facade's — `executeApprovedAction` is unchanged.
+- The nine self tool names do not trip the `riskForTool` substring heuristic
+  (none contain `write`/`exec`/`invoke`/`send`), so they correctly seed as
+  `low` at the tool-name level; per-operation gating happens inside dispatch
+  via `self.config`, not via the tool-name heuristic.
 
 Seed operations: `get_self`, `list_providers`, `list_agents`,
 `list_skills`, `list_mcp_servers`, `list_connectors` (`query`); `set_provider`,
@@ -109,20 +119,21 @@ operating on its **own runtime state**, not for arbitrary side effects.
 ## Forward-Looking
 
 The registry is intended to extend beyond the initial self-config domain to a
-broader set of runtime operations the agent can perform on itself, without
-re-introducing one catalog tool per operation. The invariant to preserve:
-discovery (`self_discover`) lists names + summaries; invocation
-(`self_invoke`) validates and routes by tag; the registry is the single
-source of truth; the live full-schema tool count stays at two. Generalizing
-to cover more of the `/api/*` surface is an extension of this ADR, not a new
-mechanism — register more operations and tag their risk; do not wrap
-endpoints as individual tools.
+broader set of runtime operations the agent can perform on itself. The
+invariant to preserve: the registry is the single source of truth for each
+op's behavior; each op is a deferred direct tool that loads on demand and
+routes by tag (query sync; mutate via `self.config`); the live full-schema
+tool count stays low because unloaded ops ship no schema. Generalizing to
+cover more of the `/api/*` surface is an extension of this ADR — register more
+operations, add their catalog entries (deferred), and tag their risk.
 
 ## Consequences For Coding Agents
 
 - To add a self-config / self-introspection capability, register a
-  `SelfOperation` in `src/execution/self-registry.ts`. Do NOT add a new
-  catalog tool for it. The two meta-tools and the gini self-skill breadcrumb
+  `SelfOperation` in `src/execution/self-registry.ts` AND add a matching
+  deferred catalog entry (toolset `self`, `deferred: true`, `function.
+  parameters` mirroring the op's schema) plus a dispatch case routed through
+  `dispatchSelfOp`. The on-demand index and the gini self-skill breadcrumb
   surface it automatically.
 - Keep `self-registry.ts` a leaf. A handler that needs a helper which
   transitively imports `agent.ts` must inline it or import from a neutral
@@ -132,22 +143,20 @@ endpoints as individual tools.
   chat-task loop, so return a JSON envelope the model can act on (include
   `ok`).
 - The gini self-skill (`skills/agents/gini/SKILL.md`) carries the breadcrumb
-  that names the common operations so the hot path is a single `self_invoke`
-  with no `self_discover` round-trip. Keep it in sync when seed operations
-  change.
+  that names the common operations and the `load_tools`-then-call flow. Keep
+  it in sync when seed operations change.
 
 ## Acceptance Checks
 
-- `self_discover()` returns every operation with `name`, `summary`, `tag`;
-  `self_discover({ tag })` filters; `self_discover({ name })` returns one
-  operation's schema; an unknown name returns `{ ok: false }` without throwing.
-- `self_invoke` of a `query` op returns a sync result; an unknown op or a
-  missing required arg returns a recoverable `{ ok: false, ... }` (schema on a
-  validation miss).
-- `self_invoke` of a `mutate` op returns a pending approval under `strict` and
-  auto-resolves (running the handler) under `auto`; the resulting
-  `self.config` audit row carries the `approvalId` and the operation outcome.
+- `buildToolCatalog` carries the nine self tools (toolset `self`,
+  `deferred: true`); `applyDeferralFilter(catalog, ∅)` excludes them until
+  loaded; `self_discover` / `self_invoke` are gone.
+- A `query` tool (`get_self`) dispatched directly returns a sync result; a
+  `mutate` tool returns a pending approval under `strict` and auto-resolves
+  (running the handler) under `auto`; the resulting `self.config` audit row
+  carries the `approvalId` and the operation outcome.
+- The loaded set persists across an approval pause/resume (`task.loadedTools`).
 - A real chat turn confirms model selection: "what model are you using" drives
-  `self_invoke(get_self)`; "set provider to deepseek" drives
-  `list_providers` then `self_invoke(set_provider)`.
+  `load_tools(get_self)` then `get_self`; "set provider to deepseek" drives
+  `load_tools(list_providers, set_provider)` then those tools.
 - `bun run typecheck` and `bun test` are green.

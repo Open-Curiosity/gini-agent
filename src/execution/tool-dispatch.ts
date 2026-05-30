@@ -33,7 +33,7 @@ import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilitie
 import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
-import { findSelfOperation, selfOperationIndex } from "./self-registry";
+import { findSelfOperation } from "./self-registry";
 import { isDeferredToolName } from "./tool-catalog";
 import { recall } from "../memory";
 import {
@@ -223,10 +223,21 @@ export async function dispatchToolCall(
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
       return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
-    case "self_discover":
-      return { kind: "sync", result: await selfDiscoverTool(config, taskId, args) };
-    case "self_invoke":
-      return await selfInvokeTool(config, taskId, toolCallId, args);
+    // Self-config / self-introspection direct tools. Each maps to a
+    // SelfOperation; query tools resolve sync, mutate tools route through the
+    // generic self.config approval branch. The tool name IS the op name and
+    // args are top-level, so the approval payload shape is identical to the
+    // legacy facade — executeApprovedAction needs no change.
+    case "get_self":
+    case "list_providers":
+    case "list_agents":
+    case "list_skills":
+    case "list_mcp_servers":
+    case "list_connectors":
+    case "set_provider":
+    case "use_agent":
+    case "create_agent":
+      return await dispatchSelfOp(config, taskId, toolCallId, toolName, args);
     case "browser_connect": {
       // browser.connect is a SetupRequest (user-actor): the user opens the
       // visible browser, signs in, then clicks Connect. There is no
@@ -2236,93 +2247,32 @@ async function recordLowRiskAudit(
 // ---------------- Self-knowledge / self-config ----------------
 //
 // The operation handlers live in self-registry.ts (the single source of
-// truth). These two dispatch handlers are the thin meta-tool wrappers:
-// self_discover surfaces the index / a single op's schema; self_invoke
-// validates args and routes by tag (query => sync; mutate => approval seam).
+// truth). Each self-config capability is now a DIRECT deferred tool whose
+// name IS the op name; this dispatcher routes the 9 tool cases through one
+// helper. Query ops resolve synchronously; mutate ops route through the
+// generic self.config approval branch (auto-approved in `auto`, gated in
+// `strict`), with the actual handler re-run in agent.executeApprovedAction
+// on approval.
 
-// Find a small set of close operation-name matches for an unknown name so
-// the model gets a "did you mean" nudge instead of a bare error. A name is
-// "close" when one string contains the other or they share a leading token
-// (e.g. "list_provider" → "list_providers"; "provider" → both provider ops).
-function suggestSelfOperations(name: string): string[] {
-  const lower = name.toLowerCase();
-  const head = lower.split(/[_\s]/)[0] ?? lower;
-  return selfOperationIndex()
-    .map((op) => op.name)
-    .filter((candidate) => {
-      const c = candidate.toLowerCase();
-      return c.includes(lower) || lower.includes(c) || (head.length > 0 && c.startsWith(head));
-    })
-    .slice(0, 5);
-}
-
-async function selfDiscoverTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  const name = typeof args.name === "string" && args.name.trim().length > 0 ? args.name.trim() : undefined;
-  const tag = typeof args.tag === "string" && args.tag.trim().length > 0 ? args.tag.trim() : undefined;
-  await recordLowRiskAudit(config, taskId, "self.discover", name ?? tag ?? "index", { name: name ?? null, tag: tag ?? null });
-  appendTrace(config.instance, taskId, {
-    type: "tool",
-    message: "Discovered self operations",
-    data: { name: name ?? null, tag: tag ?? null }
-  });
-  if (name) {
-    const op = findSelfOperation(name);
-    if (!op) {
-      return JSON.stringify({ ok: false, error: `Unknown self operation: ${name}.`, didYouMean: suggestSelfOperations(name) });
-    }
-    return JSON.stringify({ name: op.name, summary: op.summary, tag: op.tag, schema: op.schema });
-  }
-  return JSON.stringify(selfOperationIndex(tag ? { tag } : undefined));
-}
-
-// Shallow required-key check against an op's schema. We deliberately do NOT
-// pull in a JSON-schema validator: the goal is to catch the obvious "missing
-// a required arg" mistake and hand the model the full schema back so it can
-// self-correct, not to enforce the schema exhaustively (the handlers already
-// validate the specific fields they consume). Returns the first missing
-// required key, or undefined when all required keys are present.
-function firstMissingRequiredKey(schema: Record<string, unknown>, args: Record<string, unknown>): string | undefined {
-  const required = Array.isArray(schema.required) ? (schema.required as unknown[]) : [];
-  for (const key of required) {
-    if (typeof key !== "string") continue;
-    const value = args[key];
-    if (value === undefined || value === null) return key;
-  }
-  return undefined;
-}
-
-async function selfInvokeTool(
+async function dispatchSelfOp(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
+  opName: string,
   args: Record<string, unknown>
 ): Promise<DispatchResult> {
-  const name = typeof args.name === "string" ? args.name.trim() : "";
-  if (!name) {
-    return { kind: "sync", result: JSON.stringify({ ok: false, error: "self_invoke requires a 'name'.", didYouMean: selfOperationIndex().map((op) => op.name) }) };
-  }
-  const op = findSelfOperation(name);
-  if (!op) {
-    return { kind: "sync", result: JSON.stringify({ ok: false, error: `Unknown self operation: ${name}.`, didYouMean: suggestSelfOperations(name) }) };
-  }
-  const opArgs = (args.args && typeof args.args === "object" && !Array.isArray(args.args))
-    ? args.args as Record<string, unknown>
-    : {};
-  const missing = firstMissingRequiredKey(op.schema, opArgs);
-  if (missing) {
-    return { kind: "sync", result: JSON.stringify({ ok: false, error: `Missing required argument: ${missing}.`, schema: op.schema }) };
-  }
+  // The 9 tool cases are the only callers, and each name is a registered op,
+  // so findSelfOperation always resolves here.
+  const op = findSelfOperation(opName)!;
   if (op.tag === "query") {
-    return { kind: "sync", result: await op.handler(config, taskId, opArgs) };
+    return { kind: "sync", result: await op.handler(config, taskId, args) };
   }
-  // mutate => route through the approval seam. The actual handler run
-  // happens in agent.executeApprovedAction (the "self.config" branch) on
-  // approval, re-reading {opName, args} from the approval payload.
-  return pendingOrAuto(config, "self.config", undefined, (reason) => requestSelfInvoke(config, taskId, toolCallId, op.name, opArgs, reason));
+  // mutate => route through the approval seam. The actual handler run happens
+  // in agent.executeApprovedAction (the "self.config" branch) on approval,
+  // re-reading {opName, args} from the approval payload. The direct tool
+  // passes args at TOP LEVEL, so the payload shape is identical to the legacy
+  // facade and the executeApprovedAction branch needs no change.
+  return pendingOrAuto(config, "self.config", undefined, (reason) => requestSelfInvoke(config, taskId, toolCallId, op.name, args, reason));
 }
 
 // ---------------- Approval-gated tools ----------------

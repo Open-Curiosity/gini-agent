@@ -1,19 +1,19 @@
 // Self-config / self-introspection operation registry.
 //
-// The chat-task agent loop exposes two always-on meta-tools — self_discover
-// and self_invoke (see tool-catalog.ts / tool-dispatch.ts) — instead of one
-// catalog entry per self-config endpoint. The names of the operations are
-// the load-bearing index the model selects against; the full arg schemas are
-// fetched on demand via self_discover. This keeps the live full-schema tool
-// count low (which weak local providers need) while still letting Gini
-// inspect and reconfigure itself from chat.
+// Each self-config capability is exposed to the chat-task agent loop as a
+// DIRECT deferred tool (see tool-catalog.ts): its name + one-line summary
+// surface in the system-prompt on-demand index, and the model loads the
+// schema via load_tools before calling the tool by name. This registry stays
+// the single source of truth for the OPERATION BEHAVIOR — the catalog entry
+// carries the schema/description the model sees, while the handler + tag +
+// audit live here. Keeping the live full-schema tool count low (which weak
+// local providers need) is now the deferral mechanism's job, not a facade's.
 //
 // Each SelfOperation is the single source of truth for one capability: its
-// summary (shown in the discover index), its tag (query => sync read;
-// mutate => routed through the approval seam), its JSON Schema (validated by
-// self_invoke and returned to the model on a discover-by-name or a
-// validation miss), and its handler. Adding a capability = registering an op
-// here — no separate catalog/dispatch/skill edit.
+// summary, its tag (query => sync read; mutate => routed through the approval
+// seam), its handler, and its JSON Schema (the catalog mirrors this schema in
+// the tool's function.parameters). Adding a capability = registering an op
+// here plus a matching catalog entry.
 //
 // Layering: this module is a leaf. It must NOT import from agent.ts or
 // tool-dispatch.ts (tool-dispatch imports this registry; agent.ts imports
@@ -37,8 +37,8 @@ export interface SelfOperation {
   // gate provider/agent changes.
   tag: "query" | "mutate";
   // JSON Schema for the op's args — same shape a tool's function.parameters
-  // carries. Returned by self_discover(name) and on a self_invoke validation
-  // miss so the model can self-correct.
+  // carries. The catalog entry for this op mirrors this schema in its
+  // function.parameters; this field is the canonical source it is copied from.
   schema: Record<string, unknown>;
   handler: (config: RuntimeConfig, taskId: string, args: Record<string, unknown>) => Promise<string>;
 }
@@ -478,14 +478,4 @@ export const SELF_OPERATIONS: SelfOperation[] = [
 
 export function findSelfOperation(name: string): SelfOperation | undefined {
   return SELF_OPERATIONS.find((op) => op.name === name);
-}
-
-// Compact index for self_discover: just name + summary + tag per op. The
-// optional `tag` filter narrows to query-only or mutate-only ops.
-export function selfOperationIndex(filter?: { tag?: string }): Array<{ name: string; summary: string; tag: string }> {
-  return SELF_OPERATIONS.filter((op) => !filter?.tag || op.tag === filter.tag).map((op) => ({
-    name: op.name,
-    summary: op.summary,
-    tag: op.tag
-  }));
 }

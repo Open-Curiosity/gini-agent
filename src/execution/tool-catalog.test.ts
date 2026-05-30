@@ -122,27 +122,49 @@ const ALWAYS_ON = new Set([
   // not in defaults; always-on so a fresh instance can propose SOUL.md /
   // USER.md edits. The propose-vs-approve file split is the gate.
   "edit_soul",
-  "edit_user_profile",
-  // Self-knowledge / self-config meta-tools live under the "self" toolset
-  // which is not in defaults; always-on so a fresh instance can answer
-  // "what model are you using" and act on the answer without an
-  // operator-only toggle. They back a registry of self-config operations
-  // (set_provider, get_self, …) discovered/run through these two entries.
-  "self_discover",
-  "self_invoke"
+  "edit_user_profile"
+  // The 9 self-config tools (get_self, list_*, set_provider, …) live under
+  // the "self" toolset (not in defaults) and pass gating, but they are
+  // DEFERRED — they only join the live tools array once the model loads
+  // them. They are asserted separately (see "deferred tools" below), not
+  // in ALWAYS_ON, because ALWAYS_ON is the set that surfaces in the live
+  // (post-deferral) catalog with no toolsets enabled.
 ]);
 
+// The 9 self-config / introspection tools, now direct deferred tools.
+const SELF_TOOLS = [
+  "get_self",
+  "list_providers",
+  "list_agents",
+  "list_skills",
+  "list_mcp_servers",
+  "list_connectors",
+  "set_provider",
+  "use_agent",
+  "create_agent"
+];
+
 describe("buildToolCatalog", () => {
-  test("includes only always-on tools when no toolsets are enabled", () => {
+  test("includes only always-on (and ungated self) tools when no toolsets are enabled", () => {
     const state = stateWithToolsets([]);
     const catalog = buildToolCatalog(state);
+    // buildToolCatalog returns the gated catalog INCLUDING deferred tools;
+    // the self tools bypass toolset gating (deferral, applied later, is what
+    // hides them from the live array). So every tool here is either always-on
+    // or one of the 9 self tools.
     for (const tool of catalog) {
-      expect(ALWAYS_ON.has(tool.function.name)).toBe(true);
+      expect(ALWAYS_ON.has(tool.function.name) || tool.toolset === "self").toBe(true);
     }
     // Sanity: every always-on tool surfaces.
     const names = new Set(catalog.map((t) => t.function.name));
     for (const expected of ALWAYS_ON) {
       expect(names.has(expected)).toBe(true);
+    }
+    // The 9 self tools surface (ungated) and are marked deferred.
+    for (const name of SELF_TOOLS) {
+      const tool = catalog.find((t) => t.function.name === name);
+      expect(tool).toBeDefined();
+      expect(tool?.deferred).toBe(true);
     }
   });
 
@@ -207,7 +229,9 @@ describe("buildToolCatalog", () => {
     const catalog = buildToolCatalog(state, new Set(["file"]));
     for (const tool of catalog) {
       if (ALWAYS_ON.has(tool.function.name)) continue;
-      // Only file.* tools should survive.
+      // The self tools bypass the agent toolset filter (ungated). Everything
+      // else surviving must be a file.* tool.
+      if (tool.toolset === "self") continue;
       expect(tool.toolset).toBe("file");
     }
     // file_read should be present, terminal_exec should not.
@@ -233,7 +257,9 @@ describe("buildToolCatalog", () => {
     const state = stateWithToolsets([ts("file", "disabled")]);
     const catalog = buildToolCatalog(state, new Set(["file"]));
     for (const tool of catalog) {
-      expect(ALWAYS_ON.has(tool.function.name)).toBe(true);
+      // Only always-on tools and the ungated self tools survive when the one
+      // requested toolset is globally disabled.
+      expect(ALWAYS_ON.has(tool.function.name) || tool.toolset === "self").toBe(true);
     }
   });
 
@@ -328,6 +354,24 @@ describe("deferred tools", () => {
     }
     // No deferred tool leaks into the empty-loaded provider array.
     expect(filtered.every((t) => !t.deferred)).toBe(true);
+  });
+
+  test("the 9 self-config tools are deferred and absent from applyDeferralFilter(catalog, ∅)", () => {
+    const catalog = buildToolCatalog(fullState);
+    for (const name of SELF_TOOLS) {
+      const tool = catalog.find((t) => t.function.name === name);
+      expect(tool).toBeDefined();
+      expect(tool?.toolset).toBe("self");
+      expect(tool?.deferred).toBe(true);
+    }
+    const live = new Set(applyDeferralFilter(catalog, new Set()).map((t) => t.function.name));
+    for (const name of SELF_TOOLS) {
+      expect(live.has(name)).toBe(false);
+    }
+    // self_discover / self_invoke are gone.
+    const allNames = new Set(catalog.map((t) => t.function.name));
+    expect(allNames.has("self_discover")).toBe(false);
+    expect(allNames.has("self_invoke")).toBe(false);
   });
 
   test("applyDeferralFilter includes a deferred tool once it is loaded", () => {

@@ -1,12 +1,14 @@
-// Coverage for the self-config / introspection registry and its
-// discover/invoke dispatch surface.
+// Coverage for the self-config / introspection registry and its direct-tool
+// dispatch surface.
 //
 // The registry (self-registry.ts) is the single source of truth for the
-// self-config operations; dispatch (tool-dispatch.ts) exposes them through
-// two always-on meta-tools. The index/find helpers are pure; the
-// dispatch-level tests exercise the validate-and-route logic (unknown name,
-// query sync, mutate gated-vs-auto) against a seeded RuntimeConfig + state,
-// reusing the same fixture shape as tool-dispatch.test.ts.
+// self-config operation BEHAVIOR (handler + tag + audit). Each capability is
+// exposed to the agent loop as a direct deferred tool whose NAME is the op
+// name; dispatch routes the 9 tool cases through dispatchSelfOp. The
+// dispatch-level tests exercise the route-by-tag logic (query sync, mutate
+// gated-vs-auto) against a seeded RuntimeConfig + state, reusing the same
+// fixture shape as tool-dispatch.test.ts. Args are passed at TOP LEVEL (no
+// {name, args} envelope) — that is the contract this file pins.
 
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
@@ -15,7 +17,7 @@ import { join } from "node:path";
 import { createChatSession, createTask, mutateState, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 import { dispatchToolCall } from "./tool-dispatch";
-import { findSelfOperation, selfOperationIndex, SELF_OPERATIONS } from "./self-registry";
+import { findSelfOperation, SELF_OPERATIONS } from "./self-registry";
 
 const ROOT = mkdtempSync(join(tmpdir(), "gini-self-registry-"));
 process.env.GINI_STATE_ROOT = ROOT;
@@ -45,39 +47,34 @@ async function newTask(config: RuntimeConfig): Promise<string> {
 }
 
 describe("self operation registry", () => {
-  test("selfOperationIndex returns all ops with name, summary, tag", () => {
-    const index = selfOperationIndex();
-    expect(index.length).toBe(SELF_OPERATIONS.length);
-    expect(index.length).toBe(9);
-    for (const entry of index) {
-      expect(typeof entry.name).toBe("string");
-      expect(entry.name.length).toBeGreaterThan(0);
-      expect(typeof entry.summary).toBe("string");
-      expect(entry.summary.length).toBeGreaterThan(0);
-      expect(["query", "mutate"]).toContain(entry.tag);
+  test("SELF_OPERATIONS carries the 9 expected ops with name, summary, tag, handler", () => {
+    expect(SELF_OPERATIONS.length).toBe(9);
+    for (const op of SELF_OPERATIONS) {
+      expect(typeof op.name).toBe("string");
+      expect(op.name.length).toBeGreaterThan(0);
+      expect(typeof op.summary).toBe("string");
+      expect(op.summary.length).toBeGreaterThan(0);
+      expect(["query", "mutate"]).toContain(op.tag);
+      expect(typeof op.handler).toBe("function");
     }
-    const names = index.map((e) => e.name).sort();
-    expect(names).toEqual(
-      [
-        "create_agent",
-        "get_self",
-        "list_agents",
-        "list_connectors",
-        "list_mcp_servers",
-        "list_providers",
-        "list_skills",
-        "set_provider",
-        "use_agent"
-      ]
-    );
+    const names = SELF_OPERATIONS.map((op) => op.name).sort();
+    expect(names).toEqual([
+      "create_agent",
+      "get_self",
+      "list_agents",
+      "list_connectors",
+      "list_mcp_servers",
+      "list_providers",
+      "list_skills",
+      "set_provider",
+      "use_agent"
+    ]);
   });
 
-  test("selfOperationIndex filters by tag", () => {
-    const queries = selfOperationIndex({ tag: "query" });
-    const mutates = selfOperationIndex({ tag: "mutate" });
-    expect(queries.every((op) => op.tag === "query")).toBe(true);
-    expect(mutates.every((op) => op.tag === "mutate")).toBe(true);
-    expect(queries.map((op) => op.name).sort()).toEqual([
+  test("the query/mutate split matches the gating contract", () => {
+    const queries = SELF_OPERATIONS.filter((op) => op.tag === "query").map((op) => op.name).sort();
+    const mutates = SELF_OPERATIONS.filter((op) => op.tag === "mutate").map((op) => op.name).sort();
+    expect(queries).toEqual([
       "get_self",
       "list_agents",
       "list_connectors",
@@ -85,88 +82,22 @@ describe("self operation registry", () => {
       "list_providers",
       "list_skills"
     ]);
-    expect(mutates.map((op) => op.name).sort()).toEqual(["create_agent", "set_provider", "use_agent"]);
+    expect(mutates).toEqual(["create_agent", "set_provider", "use_agent"]);
   });
 
-  test("findSelfOperation returns undefined for an unknown name", () => {
+  test("findSelfOperation resolves known names and rejects unknown ones", () => {
     expect(findSelfOperation("nope")).toBeUndefined();
     expect(findSelfOperation("get_self")).toBeDefined();
+    expect(findSelfOperation("set_provider")?.tag).toBe("mutate");
   });
 });
 
-describe("self_discover dispatch", () => {
-  test("no args returns the index", async () => {
-    const instance = `self-disc-${Math.random().toString(36).slice(2, 8)}`;
+describe("direct self tools — query", () => {
+  test("get_self resolves synchronously with the instance snapshot", async () => {
+    const instance = `self-get-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance);
     const taskId = await newTask(config);
-    const result = await dispatchToolCall(config, taskId, "self_discover", "call_1", "{}");
-    expect(result.kind).toBe("sync");
-    if (result.kind === "sync") {
-      const parsed = JSON.parse(result.result) as Array<{ name: string; tag: string }>;
-      expect(parsed.length).toBe(9);
-    }
-  });
-
-  test("name arg returns one op's full schema", async () => {
-    const instance = `self-disc-name-${Math.random().toString(36).slice(2, 8)}`;
-    const config = buildConfig(instance);
-    const taskId = await newTask(config);
-    const result = await dispatchToolCall(config, taskId, "self_discover", "call_1", JSON.stringify({ name: "set_provider" }));
-    expect(result.kind).toBe("sync");
-    if (result.kind === "sync") {
-      const parsed = JSON.parse(result.result) as { name: string; tag: string; schema: Record<string, unknown> };
-      expect(parsed.name).toBe("set_provider");
-      expect(parsed.tag).toBe("mutate");
-      expect(parsed.schema.type).toBe("object");
-    }
-  });
-
-  test("unknown name returns an error envelope with suggestions", async () => {
-    const instance = `self-disc-unk-${Math.random().toString(36).slice(2, 8)}`;
-    const config = buildConfig(instance);
-    const taskId = await newTask(config);
-    const result = await dispatchToolCall(config, taskId, "self_discover", "call_1", JSON.stringify({ name: "list_provider" }));
-    expect(result.kind).toBe("sync");
-    if (result.kind === "sync") {
-      const parsed = JSON.parse(result.result) as { ok: boolean; didYouMean: string[] };
-      expect(parsed.ok).toBe(false);
-      expect(parsed.didYouMean).toContain("list_providers");
-    }
-  });
-});
-
-describe("self_invoke dispatch", () => {
-  test("unknown op returns ok:false and does not throw", async () => {
-    const instance = `self-inv-unk-${Math.random().toString(36).slice(2, 8)}`;
-    const config = buildConfig(instance);
-    const taskId = await newTask(config);
-    const result = await dispatchToolCall(config, taskId, "self_invoke", "call_1", JSON.stringify({ name: "frobnicate" }));
-    expect(result.kind).toBe("sync");
-    if (result.kind === "sync") {
-      const parsed = JSON.parse(result.result) as { ok: boolean; didYouMean: string[] };
-      expect(parsed.ok).toBe(false);
-    }
-  });
-
-  test("missing required arg returns the schema so the model can self-correct", async () => {
-    const instance = `self-inv-missing-${Math.random().toString(36).slice(2, 8)}`;
-    const config = buildConfig(instance);
-    const taskId = await newTask(config);
-    // use_agent requires agentId; omit it.
-    const result = await dispatchToolCall(config, taskId, "self_invoke", "call_1", JSON.stringify({ name: "use_agent", args: {} }));
-    expect(result.kind).toBe("sync");
-    if (result.kind === "sync") {
-      const parsed = JSON.parse(result.result) as { ok: boolean; schema?: Record<string, unknown> };
-      expect(parsed.ok).toBe(false);
-      expect(parsed.schema).toBeDefined();
-    }
-  });
-
-  test("query op (get_self) returns a sync result", async () => {
-    const instance = `self-inv-get-${Math.random().toString(36).slice(2, 8)}`;
-    const config = buildConfig(instance);
-    const taskId = await newTask(config);
-    const result = await dispatchToolCall(config, taskId, "self_invoke", "call_1", JSON.stringify({ name: "get_self" }));
+    const result = await dispatchToolCall(config, taskId, "get_self", "call_1", "{}");
     expect(result.kind).toBe("sync");
     if (result.kind === "sync") {
       const parsed = JSON.parse(result.result) as { ok: boolean; instance: string };
@@ -175,11 +106,40 @@ describe("self_invoke dispatch", () => {
     }
   });
 
-  test("mutate op gates as pending in strict mode", async () => {
-    const instance = `self-inv-strict-${Math.random().toString(36).slice(2, 8)}`;
+  test("list_skills takes its filter args at top level (no {name,args} envelope)", async () => {
+    const instance = `self-skills-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    // Top-level args, NOT nested under `args`.
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "list_skills",
+      "call_1",
+      JSON.stringify({ status: "enabled" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as { ok: boolean; skills: unknown[] };
+      expect(parsed.ok).toBe(true);
+      expect(Array.isArray(parsed.skills)).toBe(true);
+    }
+  });
+});
+
+describe("direct self tools — mutate", () => {
+  test("create_agent gates as pending in strict mode with payload.opName set", async () => {
+    const instance = `self-create-strict-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance, "strict");
     const taskId = await newTask(config);
-    const result = await dispatchToolCall(config, taskId, "self_invoke", "call_1", JSON.stringify({ name: "create_agent", args: { name: "Athena" } }));
+    // Args at top level — the direct tool's name IS the op name.
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "create_agent",
+      "call_1",
+      JSON.stringify({ name: "Athena" })
+    );
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
@@ -187,23 +147,54 @@ describe("self_invoke dispatch", () => {
       expect(approval).toBeDefined();
       expect(approval?.action).toBe("self.config");
       expect(approval?.status).toBe("pending");
+      // The approval payload carries the op name + top-level args, so the
+      // executeApprovedAction self.config branch re-runs the right handler.
       expect(approval?.payload.opName).toBe("create_agent");
+      const payloadArgs = approval?.payload.args as Record<string, unknown> | undefined;
+      expect(payloadArgs?.name).toBe("Athena");
     }
   });
 
-  test("mutate op auto-resolves in auto mode and runs the handler", async () => {
-    const instance = `self-inv-auto-${Math.random().toString(36).slice(2, 8)}`;
+  test("create_agent auto-resolves in auto mode and lands the side effect", async () => {
+    const instance = `self-create-auto-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance, "auto");
     const taskId = await newTask(config);
-    const result = await dispatchToolCall(config, taskId, "self_invoke", "call_1", JSON.stringify({ name: "create_agent", args: { name: "Athena" } }));
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "create_agent",
+      "call_1",
+      JSON.stringify({ name: "Athena" })
+    );
     expect(result.kind).toBe("sync");
     if (result.kind === "sync") {
       const parsed = JSON.parse(result.result) as { ok: boolean; agent?: { name: string } };
       expect(parsed.ok).toBe(true);
       expect(parsed.agent?.name).toBe("Athena");
     }
-    // The side effect actually landed: a new agent row exists.
     const state = readState(instance);
     expect(state.agents.some((a) => a.name === "Athena")).toBe(true);
+  });
+
+  test("set_provider gates as pending in strict mode and carries top-level args in the payload", async () => {
+    const instance = `self-setprov-strict-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "strict");
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "set_provider",
+      "call_1",
+      JSON.stringify({ provider: "echo" })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.authorizations.find((a) => a.id === result.approvalId);
+      expect(approval?.action).toBe("self.config");
+      expect(approval?.payload.opName).toBe("set_provider");
+      const payloadArgs = approval?.payload.args as Record<string, unknown> | undefined;
+      expect(payloadArgs?.provider).toBe("echo");
+    }
   });
 });

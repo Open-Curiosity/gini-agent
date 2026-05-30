@@ -1192,45 +1192,159 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
       }
     }
   },
+  // Self-config / self-introspection direct tools. Each maps 1:1 to a
+  // SelfOperation in self-registry.ts (the handler home). All are DEFERRED:
+  // their names + one-line summaries surface in the on-demand index, and the
+  // model loads the ones it needs via load_tools. Query tools resolve
+  // synchronously; the three mutate tools (set_provider, use_agent,
+  // create_agent) route through the generic self.config approval branch in
+  // the dispatcher (auto-approved in `auto`, gated in `strict`). Args are
+  // passed at TOP LEVEL — no `{name, args}` envelope.
   {
-    // Self-config / self-introspection discovery. Returns the index of
-    // operations Gini can run against its own runtime (provider, agents,
-    // skills, MCP, connectors). The names are the load-bearing part — the
-    // model selects an op by name, then runs it via self_invoke. Full arg
-    // schemas are fetched on demand so the live tool count stays small.
     toolset: "self",
-    displayLabel: "Discover self",
+    displayLabel: "Get self",
+    deferred: true,
+    indexSummary: "Compact snapshot of Gini's runtime: instance, port, version, active provider/model, active agent, approval mode, resource counts. Load this to answer 'what model are you using' / 'what's your setup'.",
     type: "function",
     function: {
-      name: "self_discover",
-      description: "Discover what Gini can inspect or change about itself. Call with no args for the index of self-config / introspection operations (each as { name, summary, tag }). Pass `name` to fetch one op's full argument schema before calling self_invoke. Pass `tag` (\"query\" for read-only introspection, \"mutate\" for config changes) to filter the index. Use this when the user asks about Gini's own configuration (model, providers, agents, skills, MCP, connectors) and you're unsure which op or what args to use — then run the op with self_invoke.",
+      name: "get_self",
+      description: "Compact snapshot of Gini's own runtime — instance, port, version, active provider/model, active agent, approval mode, and resource counts. Use this to answer questions about Gini's current configuration ('what model are you using?', 'what's your setup?'). Read-only.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "List providers",
+    deferred: true,
+    indexSummary: "LLM provider catalog with which is active and which have credentials configured.",
+    type: "function",
+    function: {
+      name: "list_providers",
+      description: "List the LLM provider catalog — which provider is active and which have credentials configured. Read-only. Call this before set_provider to confirm the target is configured.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "List agents",
+    deferred: true,
+    indexSummary: "Agents on this instance with per-agent provider/model overrides, toolset whitelists, and which is active.",
+    type: "function",
+    function: {
+      name: "list_agents",
+      description: "List the agents on this instance with their per-agent provider/model overrides, toolset whitelists, and which one is active. Read-only. Call before use_agent to get the right agent id.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "List skills",
+    deferred: true,
+    indexSummary: "Installed skills with id, name, category, status, and trigger phrase. Filter by status or nameContains.",
+    type: "function",
+    function: {
+      name: "list_skills",
+      description: "List installed skills with id, name, category, status, and trigger phrase. Read-only. Filter by `status` or `nameContains`.",
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "Operation name (e.g. 'get_self', 'set_provider'). When set, returns that op's full arg schema instead of the index." },
-          tag: { type: "string", enum: ["query", "mutate"], description: "Filter the index to read-only ops (query) or config-change ops (mutate)." }
+          status: {
+            type: "string",
+            enum: ["enabled", "disabled", "archived", "all"],
+            description: "Filter by status. Defaults to 'all'.",
+            default: "all"
+          },
+          nameContains: { type: "string", description: "Optional case-insensitive substring filter on the skill name." }
         }
       }
     }
   },
   {
-    // Self-config / self-introspection invocation. Runs a named operation
-    // from the registry. Query ops resolve synchronously; mutate ops route
-    // through the approval seam (auto-approved in `auto` mode, gated in
-    // `strict`). The common op names are inlined in the description so the
-    // hot path ("what model are you using") needs no self_discover
-    // round-trip.
     toolset: "self",
-    displayLabel: "Configure self",
+    displayLabel: "List MCP servers",
+    deferred: true,
+    indexSummary: "Registered MCP servers with transport, status, and exposed tool count.",
     type: "function",
     function: {
-      name: "self_invoke",
-      description: "Run a self-config / introspection operation by name (discover them via self_discover). Args are validated against the op's schema; on a miss the schema is returned so you can self-correct. Read-only ops resolve immediately; config-change ops may require user approval. Common ops: get_self, list_providers, list_agents, list_skills, list_mcp_servers, list_connectors, set_provider, use_agent, create_agent. Examples: self_invoke({ name: \"get_self\" }) to answer 'what model are you using'; self_invoke({ name: \"set_provider\", args: { provider: \"deepseek\" } }) to switch providers.",
+      name: "list_mcp_servers",
+      description: "List the registered MCP servers with transport, status, and exposed tool count. Read-only.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "List connectors",
+    deferred: true,
+    indexSummary: "Registered connectors (claude-code, codex, linear, …) with provider, status, and health.",
+    type: "function",
+    function: {
+      name: "list_connectors",
+      description: "List the registered connectors (claude-code, codex, linear, …) with provider, status, and health. Read-only.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Set provider",
+    deferred: true,
+    indexSummary: "Switch the active LLM provider and/or model. Confirm the target is configured via list_providers first.",
+    type: "function",
+    function: {
+      name: "set_provider",
+      description: "Switch the active LLM provider and/or model (e.g. 'switch to deepseek'). Confirm the target is configured via list_providers first. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "Operation name to run (e.g. 'get_self', 'set_provider'). Call self_discover first if unsure." },
-          args: { type: "object", description: "Arguments for the operation, matching the op's schema (see self_discover with that name). Omit for ops that take no args.", additionalProperties: true }
+          provider: {
+            type: "string",
+            description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` are updated."
+          },
+          model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5'). Defaults to the provider's first catalog model when omitted." },
+          baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo." },
+          apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env." }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Use agent",
+    deferred: true,
+    indexSummary: "Switch the active agent. Its provider/model override, SOUL.md, toolset filter, and memory namespace take effect next turn.",
+    type: "function",
+    function: {
+      name: "use_agent",
+      description: "Switch the active agent. Its provider/model override, SOUL.md, toolset filter, and memory namespace take effect next turn. Call list_agents first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          agentId: { type: "string", description: "Agent id or name (e.g. 'agent_abc123' or 'athena')." }
+        },
+        required: ["agentId"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Create agent",
+    deferred: true,
+    indexSummary: "Create a new agent row (NOT activated — follow up with use_agent). Inherits provider/toolsets from the default agent unless overridden.",
+    type: "function",
+    function: {
+      name: "create_agent",
+      description: "Create a new agent row. It is NOT activated — follow up with use_agent to switch. Inherits provider/toolsets from the default agent unless overridden. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Human-readable name (e.g. 'Athena')." },
+          providerName: { type: "string", description: "Optional provider override (e.g. 'deepseek'). Defaults to the default agent's provider." },
+          model: { type: "string", description: "Optional model override (e.g. 'deepseek-v4-pro'). Defaults to the default agent's model." },
+          toolsets: {
+            type: "array",
+            description: "Optional list of toolset names this agent is allowed to use. Defaults to the default agent's toolset set.",
+            items: { type: "string" }
+          }
         },
         required: ["name"]
       }
@@ -1376,15 +1490,16 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // prompt regardless of toolset state, so always-on here is safe.
     if (tool.function.name === "edit_soul") return true;
     if (tool.function.name === "edit_user_profile") return true;
-    // Self-knowledge surface. The two meta-tools back a registry of
-    // self-config / introspection operations (provider, agents, skills,
-    // MCP, connectors). Neither is on a legacy default toolset; gating on
-    // enable would mean a fresh instance couldn't answer "what model are
-    // you using" or "switch to deepseek" — the exact asks the surface
-    // exists for. self_discover is read-only; self_invoke gates its
-    // individual mutate ops via the approval seam inside dispatch.
-    if (tool.function.name === "self_discover") return true;
-    if (tool.function.name === "self_invoke") return true;
+    // Self-knowledge surface. The 9 self-config / introspection tools
+    // (get_self, list_*, set_provider, use_agent, create_agent) are direct
+    // deferred tools on the "self" toolset, which is not a legacy default;
+    // gating on enable would mean a fresh instance couldn't answer "what
+    // model are you using" or "switch to deepseek" — the exact asks the
+    // surface exists for. They pass gating here; deferral (applied later by
+    // applyDeferralFilter) is what keeps them out of the live tools array
+    // until the model loads them. Query tools are read-only; the three
+    // mutate tools gate via the self.config approval branch in dispatch.
+    if (tool.toolset === "self") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;
@@ -1692,9 +1807,19 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.content));
     case "update_memory":
       return truncatePreview(previewValue(safe.memoryId));
-    case "self_discover":
-      return truncatePreview(previewValue(safe.name) || previewValue(safe.tag) || "");
-    case "self_invoke":
+    case "get_self":
+    case "list_providers":
+    case "list_agents":
+    case "list_mcp_servers":
+    case "list_connectors":
+      return "";
+    case "list_skills":
+      return truncatePreview(previewValue(safe.nameContains) || previewValue(safe.status) || "");
+    case "set_provider":
+      return truncatePreview(previewValue(safe.provider) || previewValue(safe.model) || "");
+    case "use_agent":
+      return truncatePreview(previewValue(safe.agentId));
+    case "create_agent":
       return truncatePreview(previewValue(safe.name));
     default: {
       // Generic fallback: key=value, ... for the first few entries.
