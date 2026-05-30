@@ -216,7 +216,7 @@ function normalizeSkillStatusInput(status: string): SkillRecord["status"] {
 }
 
 // Clear all connector grants on a skill and emit one
-// `skill.connector.revoked` audit row per cleared provider, mirroring
+// `skill.connector.revoked` audit row per cleared credential, mirroring
 // grantConnectorToSkill's granted row. Synchronous so it composes inside any
 // mutateState body — both disable paths (setSkillStatus and the updateSkill
 // status-only PATCH) call it so a re-enable always re-prompts for consent
@@ -226,7 +226,7 @@ function clearConnectorGrantsOnDisable(state: RuntimeState, skill: SkillRecord):
   const granted = skill.grantedConnectors ?? [];
   if (granted.length === 0) return;
   skill.grantedConnectors = [];
-  for (const provider of granted) {
+  for (const credentialName of granted) {
     addAudit(
       state,
       {
@@ -234,7 +234,7 @@ function clearConnectorGrantsOnDisable(state: RuntimeState, skill: SkillRecord):
         action: "skill.connector.revoked",
         target: skill.id,
         risk: "low",
-        evidence: { provider }
+        evidence: { provider: credentialName }
       },
       { system: true }
     );
@@ -262,18 +262,18 @@ export async function setSkillStatus(config: RuntimeConfig, idOrName: string, st
   });
 }
 
-// Per-(skill, connector) consent grant. Appends `provider` to the skill's
-// grantedConnectors so `resolveSkillEnv` will inject that connector's env.
-// Bundled skills are auto-granted in resolveSkillEnv and never need a written
-// grant — this helper is for non-bundled skills the user consents to.
+// Per-(skill, credential) consent grant. Appends the credential NAME to the
+// skill's grantedConnectors so `resolveSkillEnv` will inject that credential's
+// env. Bundled skills are auto-granted in resolveSkillEnv and never need a
+// written grant — this helper is for non-bundled skills the user consents to.
 // See docs/adr/skill-connector-consent.md.
-export async function grantConnectorToSkill(config: RuntimeConfig, idOrName: string, provider: string) {
+export async function grantConnectorToSkill(config: RuntimeConfig, idOrName: string, credentialName: string) {
   return mutateState(config.instance, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
     const granted = skill.grantedConnectors ?? [];
-    if (!granted.includes(provider)) {
-      skill.grantedConnectors = [...granted, provider];
+    if (!granted.includes(credentialName)) {
+      skill.grantedConnectors = [...granted, credentialName];
       skill.updatedAt = now();
       addAudit(
         state,
@@ -282,7 +282,7 @@ export async function grantConnectorToSkill(config: RuntimeConfig, idOrName: str
           action: "skill.connector.granted",
           target: skill.id,
           risk: "low",
-          evidence: { provider }
+          evidence: { provider: credentialName }
         },
         { system: true }
       );
@@ -291,14 +291,14 @@ export async function grantConnectorToSkill(config: RuntimeConfig, idOrName: str
   });
 }
 
-// Revoke a previously granted connector from a skill.
-export async function revokeConnectorGrant(config: RuntimeConfig, idOrName: string, provider: string) {
+// Revoke a previously granted credential from a skill.
+export async function revokeConnectorGrant(config: RuntimeConfig, idOrName: string, credentialName: string) {
   return mutateState(config.instance, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
     const granted = skill.grantedConnectors ?? [];
-    if (granted.includes(provider)) {
-      skill.grantedConnectors = granted.filter((p) => p !== provider);
+    if (granted.includes(credentialName)) {
+      skill.grantedConnectors = granted.filter((p) => p !== credentialName);
       skill.updatedAt = now();
       addAudit(
         state,
@@ -307,7 +307,7 @@ export async function revokeConnectorGrant(config: RuntimeConfig, idOrName: stri
           action: "skill.connector.revoked",
           target: skill.id,
           risk: "low",
-          evidence: { provider }
+          evidence: { provider: credentialName }
         },
         { system: true }
       );

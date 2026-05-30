@@ -3,7 +3,7 @@ import { rmSync } from "node:fs";
 import { createEmptyState, mutateState } from "../../state";
 import { writeSecret } from "../../state/secrets";
 import type { ConnectorRecord, SkillRecord } from "../../types";
-import { isSkillActive, resolveSkillEnv } from "./index";
+import { bindingsForCredentials, isSkillActive, resolveSkillEnv } from "./index";
 
 const ROOT = "/tmp/gini-connectors-unit";
 
@@ -446,5 +446,260 @@ describe("resolveSkillEnv", () => {
     });
     const env = await resolveSkillEnv(config, skill);
     expect(env).toEqual({ LINEAR_API_KEY: "real-token" });
+  });
+});
+
+// Name-based resolution (the model post-credential-refactor). Skills declare
+// `requiredCredentials` (names); connectors carry a `type` and (for api-key)
+// the env var IS the credential name. The transitional fallback above keeps
+// `requiredConnectors`-keyed skills working until the migration lands.
+
+describe("isSkillActive by credential name", () => {
+  test("satisfied when a usable connector with the required name exists", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({ name: "LINEAR_API_KEY", type: "api-key", provider: "linear", health: "healthy" })];
+    const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
+    expect(isSkillActive(state, skill)).toBe(true);
+  });
+
+  test("unsatisfied when no connector has the required name", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({ name: "OTHER_KEY", type: "api-key", provider: "linear", health: "healthy" })];
+    const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
+
+  test("unsatisfied when the named connector is disabled (stale healthy probe)", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({ name: "LINEAR_API_KEY", type: "api-key", provider: "linear", status: "disabled", health: "healthy" })];
+    const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
+});
+
+describe("bindingsForCredentials", () => {
+  test("api-key credential: env var IS the credential name", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({
+      id: "id_linear",
+      name: "LINEAR_API_KEY",
+      type: "api-key",
+      provider: "linear",
+      health: "healthy",
+      secretRefs: [{ purpose: "token", path: "secrets/id_linear/token.json" }]
+    })];
+    const bindings = bindingsForCredentials(state, ["LINEAR_API_KEY"]);
+    expect(bindings).toEqual({ LINEAR_API_KEY: { credentialId: "id_linear", purpose: "token" } });
+  });
+
+  test("oauth2 credential: one binding per envMap entry", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({
+      id: "id_gws",
+      name: "google-workspace-oauth",
+      type: "oauth2",
+      provider: "google-oauth-desktop",
+      health: "healthy",
+      secretRefs: [
+        { purpose: "client_id", path: "secrets/id_gws/client_id.json" },
+        { purpose: "client_secret", path: "secrets/id_gws/client_secret.json" }
+      ],
+      metadata: {
+        envMap: {
+          client_id: "GOOGLE_WORKSPACE_CLI_CLIENT_ID",
+          client_secret: "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET"
+        }
+      }
+    })];
+    const bindings = bindingsForCredentials(state, ["google-workspace-oauth"]);
+    expect(bindings).toEqual({
+      GOOGLE_WORKSPACE_CLI_CLIENT_ID: { credentialId: "id_gws", purpose: "client_id" },
+      GOOGLE_WORKSPACE_CLI_CLIENT_SECRET: { credentialId: "id_gws", purpose: "client_secret" }
+    });
+  });
+
+  test("disabled credential contributes no bindings", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({
+      id: "id_linear",
+      name: "LINEAR_API_KEY",
+      type: "api-key",
+      provider: "linear",
+      status: "disabled",
+      health: "healthy",
+      secretRefs: [{ purpose: "token", path: "secrets/id_linear/token.json" }]
+    })];
+    expect(bindingsForCredentials(state, ["LINEAR_API_KEY"])).toEqual({});
+  });
+});
+
+describe("resolveSkillEnv by credential name", () => {
+  function configFor(instance: string) {
+    return {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+  }
+
+  test("api-key: granted non-bundled skill injects the secret under name==env var", async () => {
+    const instance = "name-apikey-granted";
+    const ref = writeSecret(instance, "id_linear", "token", "real-token");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_linear",
+        instance,
+        name: "LINEAR_API_KEY",
+        type: "api-key",
+        provider: "linear",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      source: "user",
+      grantedConnectors: ["LINEAR_API_KEY"],
+      requiredCredentials: ["LINEAR_API_KEY"],
+      prerequisites: { env: ["LINEAR_API_KEY"] }
+    });
+    const env = await resolveSkillEnv(configFor(instance), skill);
+    expect(env).toEqual({ LINEAR_API_KEY: "real-token" });
+  });
+
+  test("api-key: ungranted non-bundled skill injects nothing", async () => {
+    const instance = "name-apikey-ungranted";
+    const ref = writeSecret(instance, "id_linear", "token", "real-token");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_linear",
+        instance,
+        name: "LINEAR_API_KEY",
+        type: "api-key",
+        provider: "linear",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      source: "user",
+      requiredCredentials: ["LINEAR_API_KEY"],
+      prerequisites: { env: ["LINEAR_API_KEY"] }
+    });
+    const env = await resolveSkillEnv(configFor(instance), skill);
+    expect(env).toEqual({});
+  });
+
+  test("api-key: bundled skill auto-grants (no written grant needed)", async () => {
+    const instance = "name-apikey-bundled";
+    const ref = writeSecret(instance, "id_linear", "token", "real-token");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_linear",
+        instance,
+        name: "LINEAR_API_KEY",
+        type: "api-key",
+        provider: "linear",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      source: "bundled",
+      requiredCredentials: ["LINEAR_API_KEY"],
+      prerequisites: { env: ["LINEAR_API_KEY"] }
+    });
+    const env = await resolveSkillEnv(configFor(instance), skill);
+    expect(env).toEqual({ LINEAR_API_KEY: "real-token" });
+  });
+
+  test("oauth2: granted skill materializes every envMap var by name", async () => {
+    const instance = "name-oauth-granted";
+    const cid = writeSecret(instance, "id_gws", "client_id", "client-id-value");
+    const csec = writeSecret(instance, "id_gws", "client_secret", "client-secret-value");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_gws",
+        instance,
+        name: "google-workspace-oauth",
+        type: "oauth2",
+        provider: "google-oauth-desktop",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [cid, csec],
+        metadata: {
+          envMap: {
+            client_id: "GOOGLE_WORKSPACE_CLI_CLIENT_ID",
+            client_secret: "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET"
+          }
+        }
+      }));
+    });
+    const skill = newSkill({
+      source: "user",
+      grantedConnectors: ["google-workspace-oauth"],
+      requiredCredentials: ["google-workspace-oauth"],
+      prerequisites: { env: ["GOOGLE_WORKSPACE_CLI_CLIENT_ID", "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET"] }
+    });
+    const env = await resolveSkillEnv(configFor(instance), skill);
+    expect(env).toEqual({
+      GOOGLE_WORKSPACE_CLI_CLIENT_ID: "client-id-value",
+      GOOGLE_WORKSPACE_CLI_CLIENT_SECRET: "client-secret-value"
+    });
+  });
+
+  test("oauth2: ungranted skill injects nothing", async () => {
+    const instance = "name-oauth-ungranted";
+    const cid = writeSecret(instance, "id_gws", "client_id", "client-id-value");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_gws",
+        instance,
+        name: "google-workspace-oauth",
+        type: "oauth2",
+        provider: "google-oauth-desktop",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [cid],
+        metadata: { envMap: { client_id: "GOOGLE_WORKSPACE_CLI_CLIENT_ID" } }
+      }));
+    });
+    const skill = newSkill({
+      source: "user",
+      requiredCredentials: ["google-workspace-oauth"],
+      prerequisites: { env: ["GOOGLE_WORKSPACE_CLI_CLIENT_ID"] }
+    });
+    const env = await resolveSkillEnv(configFor(instance), skill);
+    expect(env).toEqual({});
+  });
+
+  test("disabled named connector does NOT inject its secret", async () => {
+    const instance = "name-apikey-disabled";
+    const ref = writeSecret(instance, "id_linear", "token", "leaked-token");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_linear",
+        instance,
+        name: "LINEAR_API_KEY",
+        type: "api-key",
+        provider: "linear",
+        status: "disabled",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      source: "bundled",
+      requiredCredentials: ["LINEAR_API_KEY"],
+      prerequisites: { env: ["LINEAR_API_KEY"] }
+    });
+    const env = await resolveSkillEnv(configFor(instance), skill);
+    expect(env).toEqual({});
   });
 });

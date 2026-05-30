@@ -52,7 +52,7 @@ import { resolveEffectiveContext } from "./effective-context";
 import { emitSystemNote, resolveEmitContext } from "./chat-task-emit";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
-import { isSkillActive } from "../integrations/connectors";
+import { firstUngrantedCredential, isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { invokeMcpTool } from "../integrations/mcp";
 import { findSkillScript, invokeSkillScript } from "../capabilities/skill-scripts";
@@ -2190,17 +2190,17 @@ async function setSkillStatusTool(
     if (!skill) throw new Error(`Skill not found: ${skillId}`);
     const bundled = (skill.source ?? "user") === "bundled";
     if (!bundled) {
-      // The first required connector that carries a credential and isn't
-      // yet granted. A provider "carries a credential" when its module
-      // declares a secrets spec, or it is the generic escape-hatch provider
-      // (whose secrets are per-record). Providers without secrets need no
-      // consent (presence-only connectors leak nothing).
-      const granted = skill.grantedConnectors ?? [];
-      const ungranted = (skill.requiredConnectors ?? [])
-        .map((r) => r.provider)
-        .find((p) => (p === "generic" || Boolean(getProvider(p)?.secrets)) && !granted.includes(p));
+      // The first required credential that carries a secret and isn't yet
+      // granted. A credential "carries a secret" when its connector has a
+      // `type` (api-key/oauth2). Presence-only connectors (no type, no env)
+      // leak nothing and need no consent. Transitional fallback (removed by
+      // the migration commit): skills still keyed by `requiredConnectors`
+      // gate on the provider — a provider carries a credential when its
+      // module declares a secrets spec, or it is the generic escape-hatch
+      // provider (whose secrets are per-record).
+      const ungranted = firstUngrantedCredential(state, skill);
       if (ungranted) {
-        return await requestSkillConnectorGrant(config, taskId, toolCallId, skill.id, skill.name, ungranted);
+        return await requestSkillConnectorGrant(config, taskId, toolCallId, skill.id, skill.name, ungranted.name, ungranted.label);
       }
     }
   }
@@ -2219,21 +2219,22 @@ async function setSkillStatusTool(
   return { kind: "sync", result: `${status === "enabled" ? "Enabled" : "Disabled"} skill ${skill.id} ("${skill.name}").` };
 }
 
-// Mint a `skill.grant_connector` SetupRequest for one (skill, provider) pair.
+// Mint a `skill.grant_connector` SetupRequest for one (skill, credential) pair.
 // Mirrors requestConnectorTool: the chat-task loop's pending handler emits a
 // setup_requested block, the user grants via the chat card, and the
-// /complete handler (src/http.ts) appends the provider to grantedConnectors,
-// enables the skill, and resumes this task. Surface-guarded like
-// browser_fill_secrets — the amber card only renders in the web chat.
+// /complete handler (src/http.ts) appends the credential name to
+// grantedConnectors, enables the skill, and resumes this task. Surface-guarded
+// like browser_fill_secrets — the amber card only renders in the web chat.
 async function requestSkillConnectorGrant(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
   skillId: string,
   skillName: string,
-  provider: string
+  credentialName: string,
+  credentialLabel: string
 ): Promise<DispatchResult> {
-  const providerLabel = getProvider(provider)?.label ?? provider;
+  const providerLabel = credentialLabel;
 
   // Surface guard — same rationale as browser_fill_secrets. The consent card
   // is React UI rendered only in the web chat; a task running over a
@@ -2283,7 +2284,7 @@ async function requestSkillConnectorGrant(
       s.action === "skill.grant_connector" &&
       s.taskId === taskId &&
       s.payload.skillId === skillId &&
-      s.payload.provider === provider
+      s.payload.credentialName === credentialName
   );
   if (existing) {
     return { kind: "pending", approvalId: existing.id };
@@ -2300,7 +2301,7 @@ async function requestSkillConnectorGrant(
       action: "skill.grant_connector",
       target: providerLabel,
       reason,
-      payload: { skillId, skillName, provider, providerLabel, toolCallId }
+      payload: { skillId, skillName, credentialName, credentialLabel, toolCallId }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
@@ -2319,7 +2320,7 @@ async function requestSkillConnectorGrant(
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for skill connector grant",
-      data: { approvalId: approval.id, skillId, provider, toolCallId }
+      data: { approvalId: approval.id, skillId, credentialName, toolCallId }
     });
     return approval.id;
   });

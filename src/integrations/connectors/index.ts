@@ -337,34 +337,49 @@ export async function checkConnector(config: RuntimeConfig, connectorId: string)
   return result;
 }
 
-// A skill is active iff every required connector is satisfied by a
-// configured + healthy ConnectorRecord of the matching provider. The agent
-// loop filters inactive skills out of its available-skills set; the UI
-// still shows them so users can see what's missing.
+// Does this configured connector pass the same health guard the activation
+// gate and env resolution share? A `disabled` connector is one the user
+// explicitly turned off — even if a stale probe still says "healthy", it
+// must not satisfy a skill. An `error` status means setup failed.
+// `health: "unknown"` counts only when the matching provider has no probe
+// (no failing signal); a probe-based provider that hasn't run yet stays
+// inactive so we don't surface skills before their first probe.
+function connectorIsUsable(connector: ConnectorRecord): boolean {
+  if (connector.status !== "configured") return false;
+  if (connector.health === "healthy") return true;
+  const hasProbe = Boolean(getProvider(connector.provider)?.probe);
+  return !hasProbe && connector.health === "unknown";
+}
+
+// A skill is active iff every required credential is satisfied by a
+// configured + healthy ConnectorRecord. The agent loop filters inactive
+// skills out of its available-skills set; the UI still shows them so users
+// can see what's missing.
 //
-// Both branches require `status === "configured"`. A `disabled` connector
-// is one the user explicitly turned off — even if a stale health probe
-// still says "healthy", we should not let it satisfy a skill. An `error`
-// status means setup failed and the connector isn't usable.
-//
-// `health: "unknown"` is treated as active when the matching provider has
-// no probe (we have no failing signal). It's treated as inactive when the
-// provider declares a probe but hasn't run yet — to avoid surfacing skills
-// before their first probe.
+// Name-based primary path: a required credential NAME is satisfied when a
+// usable connector with that `name` exists. Transitional fallback (removed
+// by the migration commit): skills that still declare `requiredConnectors`
+// (un-migrated, no `requiredCredentials`) match by provider instead, so the
+// current suite/behavior doesn't regress mid-refactor.
 export function isSkillActive(state: RuntimeState, skill: SkillRecord): boolean {
   if (skill.validationStatus === "unsupported") return false;
+  const credentials = skill.requiredCredentials ?? [];
+  if (credentials.length > 0) {
+    for (const name of credentials) {
+      const match = state.connectors.find(
+        (candidate) => candidate.name === name && connectorIsUsable(candidate)
+      );
+      if (!match) return false;
+    }
+    return true;
+  }
+  // Transitional: un-migrated skills keyed by provider.
   const required = skill.requiredConnectors ?? [];
   if (required.length === 0) return true;
   for (const requirement of required) {
-    const module = getProvider(requirement.provider);
-    const hasProbe = Boolean(module?.probe);
-    const match = state.connectors.find((candidate) => {
-      if (candidate.provider !== requirement.provider) return false;
-      if (candidate.status !== "configured") return false;
-      if (candidate.health === "healthy") return true;
-      if (!hasProbe && candidate.health === "unknown") return true;
-      return false;
-    });
+    const match = state.connectors.find(
+      (candidate) => candidate.provider === requirement.provider && connectorIsUsable(candidate)
+    );
     if (!match) return false;
   }
   return true;
@@ -387,6 +402,84 @@ export function envBindingsForProviders(providers: string[]): Record<string, { p
   return result;
 }
 
+// Derive env var → (credentialId, purpose) mappings from named credentials.
+// This is the name-based successor to `envBindingsForProviders` for skill-env
+// resolution. For each requested credential NAME:
+//   - api-key: one binding whose env var IS the credential name (uppercase
+//     env-token), reading the credential's single secret purpose.
+//   - oauth2: one binding per `metadata.envMap` entry (purpose → ENV_NAME).
+// Only configured + healthy credentials contribute (same guard as
+// `isSkillActive`). A name that matches no usable credential yields nothing.
+// On a duplicate env var across two requested credentials, the first
+// requested credential wins (deterministic; names are unique instance-wide
+// once migrated).
+export function bindingsForCredentials(
+  state: RuntimeState,
+  names: string[]
+): Record<string, { credentialId: string; purpose: string }> {
+  const result: Record<string, { credentialId: string; purpose: string }> = {};
+  for (const name of names) {
+    const connector = state.connectors.find(
+      (candidate) => candidate.name === name && connectorIsUsable(candidate)
+    );
+    if (!connector) continue;
+    if (connector.type === "oauth2") {
+      const envMap = connector.metadata?.envMap ?? {};
+      for (const [purpose, envName] of Object.entries(envMap)) {
+        if (envName in result) continue;
+        result[envName] = { credentialId: connector.id, purpose };
+      }
+      continue;
+    }
+    // api-key (and any other single-secret typed credential): the env var IS
+    // the credential name. Resolve from its single secret purpose.
+    const purpose = connector.secretRefs[0]?.purpose;
+    if (!purpose) continue;
+    if (name in result) continue;
+    result[name] = { credentialId: connector.id, purpose };
+  }
+  return result;
+}
+
+// The first required credential a non-bundled skill needs the user to grant
+// before it can be enabled — or `undefined` when every credentialed
+// requirement is already granted. A requirement needs consent only when it
+// "carries a secret": for name-based skills, the named connector has a `type`
+// (api-key/oauth2); presence-only connectors (no type, no env) leak nothing.
+// Shared by setSkillStatusTool (initial gate) and the /complete grant branch
+// (next-card mint) so both stay in lockstep.
+//
+// Transitional fallback (removed by the migration commit): skills still keyed
+// by `requiredConnectors` gate on the provider — a provider carries a
+// credential when its module declares a secrets spec, or it is the generic
+// escape-hatch provider (whose secrets are per-record).
+export function firstUngrantedCredential(
+  state: RuntimeState,
+  skill: SkillRecord
+): { name: string; label: string } | undefined {
+  const granted = skill.grantedConnectors ?? [];
+  const credentials = skill.requiredCredentials ?? [];
+  if (credentials.length > 0) {
+    for (const name of credentials) {
+      if (granted.includes(name)) continue;
+      const connector = state.connectors.find((c) => c.name === name);
+      // Only typed credentials carry a secret that needs consent.
+      if (!connector?.type) continue;
+      const label = getProvider(connector.provider)?.label ?? name;
+      return { name, label };
+    }
+    return undefined;
+  }
+  for (const requirement of skill.requiredConnectors ?? []) {
+    const p = requirement.provider;
+    if (granted.includes(p)) continue;
+    if (p === "generic" || Boolean(getProvider(p)?.secrets)) {
+      return { name: p, label: getProvider(p)?.label ?? p };
+    }
+  }
+  return undefined;
+}
+
 // NOTE: connector env enters a process through exactly one path —
 // `skill_run`, which calls `resolveSkillEnv` for the named skill. The old
 // aggregate-across-every-active-skill helper (`resolveActiveSkillsEnv`) and
@@ -401,20 +494,54 @@ export async function resolveSkillEnv(
 ): Promise<Record<string, string>> {
   const envNames = skill.prerequisites?.env ?? [];
   if (envNames.length === 0) return {};
+  const state = readState(config.instance);
+  // Per-(skill, credential) consent gate (ADR skill-connector-consent.md). A
+  // credential contributes env only when the skill is bundled (first-party,
+  // auto-granted) or the user has explicitly granted that credential NAME to
+  // this skill. Without this, any installed+enabled skill that merely DECLARES
+  // a credential would receive its secret — the prompt-injection hole. The
+  // bundled short-circuit means bundled skills never need a written grant.
+  const bundled = (skill.source ?? "user") === "bundled";
+
+  const credentials = skill.requiredCredentials ?? [];
+  if (credentials.length > 0) {
+    // Name-based path. Each env var resolves through `bindingsForCredentials`,
+    // which already applies the configured+healthy guard. The grant gate keys
+    // on the credential NAME: api-key credentials have env var == name; oauth2
+    // credentials map several env vars to one name (the credential id ties an
+    // env var back to its owning credential name for the gate).
+    const idToName = new Map<string, string>();
+    for (const name of credentials) {
+      const connector = state.connectors.find(
+        (candidate) => candidate.name === name && connectorIsUsable(candidate)
+      );
+      if (connector) idToName.set(connector.id, name);
+    }
+    const granted = (name: string): boolean =>
+      bundled || (skill.grantedConnectors?.includes(name) ?? false);
+    const bindings = bindingsForCredentials(state, credentials);
+    const out: Record<string, string> = {};
+    for (const envName of envNames) {
+      const binding = bindings[envName];
+      if (!binding) continue;
+      const credentialName = idToName.get(binding.credentialId);
+      if (!credentialName || !granted(credentialName)) continue;
+      const value = await resolveConnectorSecret(config, binding.credentialId, binding.purpose, taskId);
+      if (value) out[envName] = value;
+    }
+    return out;
+  }
+
+  // Transitional fallback (removed by the migration commit): un-migrated
+  // skills still declare `requiredConnectors` (providers) and connectors are
+  // still provider-keyed with no `name`/`type`. Resolve against the provider
+  // env bindings so current behavior/tests don't regress until the migration
+  // makes every record typed + named.
   const required = skill.requiredConnectors ?? [];
   if (required.length === 0) return {};
   const providers = required.map((r) => r.provider);
   const requiresGeneric = providers.includes("generic");
   const bindings = envBindingsForProviders(providers);
-  const state = readState(config.instance);
-  // Per-(skill, connector) consent gate (ADR skill-connector-consent.md). A
-  // provider contributes env only when the skill is bundled (first-party,
-  // auto-granted) or the user has explicitly granted that provider to this
-  // skill. Without this, any installed+enabled skill that merely DECLARES a
-  // credentialed connector would receive its secret — the prompt-injection
-  // hole. The bundled short-circuit means bundled skills never need a written
-  // grant.
-  const bundled = (skill.source ?? "user") === "bundled";
   const providerGranted = (provider: string): boolean =>
     bundled || (skill.grantedConnectors?.includes(provider) ?? false);
   const out: Record<string, string> = {};

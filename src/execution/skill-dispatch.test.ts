@@ -303,7 +303,9 @@ describe("enable_skill connector-consent gate", () => {
     const setup = state.setupRequests.find((s) => s.action === "skill.grant_connector");
     expect(setup).toBeDefined();
     expect(setup?.payload.skillId).toBe(skill.id);
-    expect(setup?.payload.provider).toBe("linear");
+    // Payload now carries the credential name (transitional fallback returns
+    // the provider as the name when the skill still uses requiredConnectors).
+    expect(setup?.payload.credentialName).toBe("linear");
     // Skill must NOT be enabled yet — consent first.
     expect(state.skills.find((s) => s.id === skill.id)?.status).toBe("disabled");
   });

@@ -826,8 +826,8 @@ describe("runtime api", () => {
         payload: {
           skillId: skill.id,
           skillName: skill.name,
-          provider: "linear",
-          providerLabel: "Linear",
+          credentialName: "linear",
+          credentialLabel: "Linear",
           toolCallId: "call_grant_1"
         }
       })
@@ -873,8 +873,8 @@ describe("runtime api", () => {
         payload: {
           skillId: skill.id,
           skillName: skill.name,
-          provider: "linear",
-          providerLabel: "Linear",
+          credentialName: "linear",
+          credentialLabel: "Linear",
           toolCallId: "call_grant_multi"
         }
       })
@@ -896,7 +896,7 @@ describe("runtime api", () => {
     expect(updated?.status).toBe("disabled");
     // A new pending grant card was minted for the remaining provider.
     const next = state.setupRequests.find(
-      (s) => s.status === "pending" && s.action === "skill.grant_connector" && s.payload.provider === "generic"
+      (s) => s.status === "pending" && s.action === "skill.grant_connector" && s.payload.credentialName === "generic"
     );
     expect(next).toBeDefined();
     expect(next?.payload.skillId).toBe(skill.id);
@@ -927,8 +927,8 @@ describe("runtime api", () => {
         payload: {
           skillId: skill.id,
           skillName: skill.name,
-          provider: "linear",
-          providerLabel: "Linear",
+          credentialName: "linear",
+          credentialLabel: "Linear",
           toolCallId: "call_grant_double"
         }
       })
@@ -956,7 +956,7 @@ describe("runtime api", () => {
     // Exactly one next card for the remaining provider — no duplicate from the
     // losing racer.
     const next = state.setupRequests.filter(
-      (s) => s.status === "pending" && s.action === "skill.grant_connector" && s.payload.provider === "generic"
+      (s) => s.status === "pending" && s.action === "skill.grant_connector" && s.payload.credentialName === "generic"
     );
     expect(next.length).toBe(1);
     // No stray pending grant rows beyond that single next card.
@@ -1005,8 +1005,8 @@ describe("runtime api", () => {
         payload: {
           skillId: skill.id,
           skillName: skill.name,
-          provider: "linear",
-          providerLabel: "Linear",
+          credentialName: "linear",
+          credentialLabel: "Linear",
           toolCallId: "call_grant_final_double"
         }
       })
@@ -1073,8 +1073,8 @@ describe("runtime api", () => {
         payload: {
           skillId: skill.id,
           skillName: skill.name,
-          provider: "linear",
-          providerLabel: "Linear",
+          credentialName: "linear",
+          credentialLabel: "Linear",
           toolCallId: "call_grant_cancel_race"
         }
       })

@@ -30,8 +30,8 @@ import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect"
 import { runMessagingPairingConnect } from "./execution/messaging-pairing-connect";
 import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
 import { mobileBootstrap, publicState } from "./runtime/views";
-import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
-import { getProvider, listProviders } from "./integrations/connectors/registry";
+import { checkConnector, createConnector, deleteConnector, firstUngrantedCredential, updateConnector } from "./integrations/connectors";
+import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
 import { migrateLegacyMemories, recall, reflect, retain } from "./memory";
@@ -420,21 +420,20 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
 
       if (setup.action === "skill.grant_connector") {
-        // Per-(skill, connector) consent (ADR skill-connector-consent.md).
+        // Per-(skill, credential) consent (ADR skill-connector-consent.md).
         // No secrets are entered here — the credential already lives in the
         // connector record; this card only records the user's consent for
         // the skill to use it. Append the grant, then check whether the skill
-        // still has ungranted credentialed providers. The skill is enabled
-        // (and "enabled" reported) ONLY when ALL of them are granted — for a
-        // multi-provider skill we mint the NEXT grant card and keep the task
-        // pending rather than enabling on the first grant. This is
-        // server-driven so we never claim "enabled" while providers remain
-        // env-denied.
+        // still has ungranted credentials. The skill is enabled (and "enabled"
+        // reported) ONLY when ALL of them are granted — for a multi-credential
+        // skill we mint the NEXT grant card and keep the task pending rather
+        // than enabling on the first grant. This is server-driven so we never
+        // claim "enabled" while credentials remain env-denied.
         const skillId = String(setup.payload.skillId ?? "");
-        const provider = String(setup.payload.provider ?? "");
-        const providerLabel = typeof setup.payload.providerLabel === "string"
-          ? setup.payload.providerLabel
-          : provider;
+        const credentialName = String(setup.payload.credentialName ?? "");
+        const credentialLabel = typeof setup.payload.credentialLabel === "string"
+          ? setup.payload.credentialLabel
+          : credentialName;
         const toolCallId = typeof setup.payload.toolCallId === "string"
           ? setup.payload.toolCallId
           : undefined;
@@ -452,27 +451,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
 
         // Only the winner reaches here. Record the grant for the approved
-        // provider, then check whether the skill still has ungranted
-        // credentialed providers. A provider "carries a credential" when its
-        // module declares a secrets spec, or it is the generic escape-hatch
-        // provider (whose secrets are per-record). Mirror the predicate in
-        // setSkillStatusTool. The skill is enabled ONLY when ALL of them are
-        // granted — for a multi-provider skill we mint the NEXT grant card and
-        // keep the task pending rather than enabling on the first grant.
-        const skill = await grantConnectorToSkill(config, skillId, provider);
-        const granted = skill.grantedConnectors ?? [];
-        const nextUngranted = (skill.requiredConnectors ?? [])
-          .map((r) => r.provider)
-          .find((p) => (p === "generic" || Boolean(getProvider(p)?.secrets)) && !granted.includes(p));
+        // credential by NAME, then check whether the skill still has ungranted
+        // credentials. `firstUngrantedCredential` is the same predicate
+        // setSkillStatusTool uses (a credential needs consent when it carries a
+        // secret), so the two stay in lockstep. The skill is enabled ONLY when
+        // ALL of them are granted — for a multi-credential skill we mint the
+        // NEXT grant card and keep the task pending rather than enabling on the
+        // first grant.
+        const skill = await grantConnectorToSkill(config, skillId, credentialName);
+        const nextUngranted = firstUngrantedCredential(readState(config.instance), skill);
 
         if (nextUngranted) {
-          // More credentialed providers to grant — mint the next grant card
-          // attached to the same task + tool call, leaving the task pending
-          // (not enabled). The web reconciles the new pending card from the
-          // setup-requests query (refreshed by the setup SSE event). Dedupe to
-          // the same task as a second safety layer — a retried mint must not
-          // double up.
-          const nextLabel = getProvider(nextUngranted)?.label ?? nextUngranted;
+          // More credentials to grant — mint the next grant card attached to
+          // the same task + tool call, leaving the task pending (not enabled).
+          // The web reconciles the new pending card from the setup-requests
+          // query (refreshed by the setup SSE event). Dedupe to the same task
+          // as a second safety layer — a retried mint must not double up.
+          const nextLabel = nextUngranted.label;
           const reason = `Skill "${skill.name}" requests access to your ${nextLabel} credential. Granting lets its scripts use ${nextLabel}; you can revoke by disabling the skill.`;
           await mutateState(config.instance, (mutable) => {
             const dup = mutable.setupRequests.find(
@@ -481,7 +476,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
                 s.action === "skill.grant_connector" &&
                 s.taskId === setup.taskId &&
                 s.payload.skillId === skillId &&
-                s.payload.provider === nextUngranted
+                s.payload.credentialName === nextUngranted.name
             );
             if (dup) return;
             const approval = createSetupRequest(mutable, {
@@ -489,7 +484,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
               action: "skill.grant_connector",
               target: nextLabel,
               reason,
-              payload: { skillId, skillName: skill.name, provider: nextUngranted, providerLabel: nextLabel, toolCallId }
+              payload: { skillId, skillName: skill.name, credentialName: nextUngranted.name, credentialLabel: nextLabel, toolCallId }
             });
             if (setup.taskId) {
               const item = findTask(mutable, setup.taskId);
@@ -500,12 +495,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           return json({ ok: true });
         }
 
-        // All credentialed providers granted: enable the skill, then resume
-        // the chat task LAST and exactly once with the success toolResult.
-        // The request was already claimed above, so we reuse resolveSetupRequest's
-        // internal resume wiring (approvalToolCallId + resumeChatTask) directly
-        // rather than calling resolveSetupRequest again (which would throw on
-        // the now-completed row). A losing racer never reaches this enable/resume.
+        // All credentials granted: enable the skill, then resume the chat task
+        // LAST and exactly once with the success toolResult. The request was
+        // already claimed above, so we reuse resolveSetupRequest's internal
+        // resume wiring (approvalToolCallId + resumeChatTask) directly rather
+        // than calling resolveSetupRequest again (which would throw on the
+        // now-completed row). A losing racer never reaches this enable/resume.
         await setSkillStatus(config, skillId, "enabled");
         if (setup.taskId) {
           const resumeToolCallId = approvalToolCallId(setup.payload);
@@ -514,7 +509,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
               config,
               setup.taskId,
               resumeToolCallId,
-              `Granted ${providerLabel} to skill "${skill.name}"; skill enabled.`
+              `Granted ${credentialLabel} to skill "${skill.name}"; skill enabled.`
             );
           }
         }
