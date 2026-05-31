@@ -595,8 +595,11 @@ export function bindingsForCredentials(
       }
       continue;
     }
-    // api-key (and any other single-secret typed credential): the env var IS
-    // the credential name. Resolve from its single secret purpose.
+    // api-key: the env var IS the credential name. Resolve from its single
+    // secret purpose. Untyped/presence-only records (type=null, e.g.
+    // claude-code/codex) carry no env and must contribute no binding even
+    // though they may hold a secretRef.
+    if (connector.type !== "api-key") continue;
     const purpose = connector.secretRefs[0]?.purpose;
     if (!purpose) continue;
     if (name in result) continue;

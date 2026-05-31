@@ -515,6 +515,44 @@ describe("bindingsForCredentials", () => {
     })];
     expect(bindingsForCredentials(state, ["LINEAR_API_KEY"])).toEqual({});
   });
+
+  test("untyped presence-only credential contributes no bindings even with a secretRef", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({
+      id: "id_claude",
+      name: "claude-code",
+      // No `type`: a presence-only record (claude-code/codex). It may carry a
+      // secretRef but exposes no env var, so a skill that names it gets {}.
+      provider: "claude-code",
+      health: "healthy",
+      secretRefs: [{ purpose: "token", path: "secrets/id_claude/token.json" }]
+    })];
+    expect(bindingsForCredentials(state, ["claude-code"])).toEqual({});
+  });
+
+  test("untyped record alongside a real api-key: only the api-key injects", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [
+      newConnector({
+        id: "id_claude",
+        name: "claude-code",
+        provider: "claude-code",
+        health: "healthy",
+        secretRefs: [{ purpose: "token", path: "secrets/id_claude/token.json" }]
+      }),
+      newConnector({
+        id: "id_linear",
+        name: "LINEAR_API_KEY",
+        type: "api-key",
+        provider: "linear",
+        health: "healthy",
+        secretRefs: [{ purpose: "token", path: "secrets/id_linear/token.json" }]
+      })
+    ];
+    expect(bindingsForCredentials(state, ["claude-code", "LINEAR_API_KEY"])).toEqual({
+      LINEAR_API_KEY: { credentialId: "id_linear", purpose: "token" }
+    });
+  });
 });
 
 describe("resolveSkillEnv by credential name", () => {
