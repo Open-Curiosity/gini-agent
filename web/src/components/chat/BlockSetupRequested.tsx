@@ -74,16 +74,29 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
       } else {
         // The backend now claims the setup row BEFORE createConnector, so a
         // failed connect leaves the row `completed` (with a persisted
-        // ok:false connectOutcome) — retrying the same setup id 410s. Refresh
-        // setup-requests/tasks/chat (like the other resolved cards do) so the
-        // card flips out of the retryable dialog into the resolved-failure
-        // summary instead of stranding the user on a dialog whose resubmit is
-        // Gone. The agent will re-issue request_connector for a fresh card.
+        // ok:false connectOutcome) — retrying the same setup id 410s. Close
+        // the submit dialog and refresh setup-requests/tasks/chat (like the
+        // other resolved cards do) so the card flips out of the retryable
+        // dialog into the resolved-failure summary instead of stranding the
+        // user on a dialog whose resubmit is Gone. The inline connectError
+        // remains visible in that resolved-failure summary. The agent will
+        // re-issue request_connector for a fresh card.
+        setConnectOpen(false);
         setConnectError(result.message ?? "Could not connect. Please verify the credentials and try again.");
         invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "connectors"]);
       }
     },
-    onError: (error: Error) => setConnectError(error.message)
+    onError: (error: Error) => {
+      // A thrown non-2xx (the backend already claimed the row before throwing)
+      // is just as terminal as the ok:false path: the setup id is now Gone, so
+      // the submit dialog must close and the same query set must be
+      // invalidated so the card transitions to its resolved-failure summary
+      // rather than a retryable dialog. The inline connectError stays visible
+      // in that summary.
+      setConnectOpen(false);
+      setConnectError(error.message);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "connectors"]);
+    }
   });
 
   const browserConnect = useMutation({
