@@ -392,7 +392,6 @@ describe("request_connector dispatch", () => {
         type: "api-key",
         label: "Some Service",
         mcpUrl: "https://some.test/mcp",
-        skillId: "skill_demo",
         reason: "Enter your Some Service API key"
       })
     );
@@ -411,17 +410,64 @@ describe("request_connector dispatch", () => {
       expect(approval!.payload.credentialType).toBe("api-key");
       expect(approval!.payload.credentialLabel).toBe("Some Service");
       expect(approval!.payload.mcpUrl).toBe("https://some.test/mcp");
-      expect(approval!.payload.skillId).toBe("skill_demo");
       expect(approval!.payload.toolCallId).toBe("call_tl");
       expect(approval!.reason).toBe("Enter your Some Service API key");
     }
   });
 
-  test("templateless: payload carries the server-resolved credentialSkillName when skillId matches a skill", async () => {
-    // Fix 5-backend: the card displays "Grant <credential> to skill <name>"
-    // from a server-resolved identity. The model supplies only the id, so the
+  test("a skillId for a skill that does not declare the credential is dropped (no false grant promise)", async () => {
+    // The model supplies skillId. When the named skill does NOT declare the
+    // requested credential, the card must not promise "Grant X to skill Y" for
+    // a grant /complete would refuse. The credential is still created on
+    // completion — just not auto-granted — so skillId + credentialSkillName are
+    // stripped from the payload.
+    const instance = `req-connector-undeclared-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const { createSkill } = await import("../state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "unrelated-skill",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["OTHER_API_KEY"]
+      })
+    );
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_undeclared",
+      JSON.stringify({
+        name: "SOME_SERVICE_API_KEY",
+        type: "api-key",
+        skillId: skill.id,
+        reason: "Enter your Some Service API key"
+      })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      // skillId dropped because the skill does not declare SOME_SERVICE_API_KEY.
+      expect(approval!.payload.skillId).toBeUndefined();
+      expect(approval!.payload.credentialSkillName).toBeUndefined();
+      // The credential itself is still requested.
+      expect(approval!.payload.credentialName).toBe("SOME_SERVICE_API_KEY");
+    }
+  });
+
+  test("templateless: payload carries the server-resolved credentialSkillName when the skill declares the credential", async () => {
+    // The card displays "Grant <credential> to skill <name>" from a
+    // server-resolved identity. The model supplies only the id, so the
     // dispatcher resolves the skill NAME from state and threads it into the
-    // payload.
+    // payload — and only when the skill declares the requested credential.
     const instance = `req-connector-skillname-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance);
     const taskId = await newTask(config);
@@ -506,22 +552,39 @@ describe("request_connector dispatch", () => {
     expect(state.setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
   });
 
-  test("templateless: skillId is carried into the payload for a known provider too", async () => {
+  test("skillId is carried into the payload for a known provider when the skill declares the credential", async () => {
     const instance = `req-connector-skillid-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance);
     const taskId = await newTask(config);
+    const { createSkill } = await import("../state");
+    // The known-provider request will mint a LINEAR_API_KEY credential, so the
+    // skill must declare that name for the skillId to survive the guard.
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "linear-skill",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["LINEAR_API_KEY"]
+      })
+    );
     const result = await dispatchToolCall(
       config,
       taskId,
       "request_connector",
       "call_known_skill",
-      JSON.stringify({ provider: "linear", skillId: "skill_linear", reason: "connect linear" })
+      JSON.stringify({ provider: "linear", skillId: skill.id, reason: "connect linear" })
     );
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
       const approval = state.setupRequests.find((a) => a.id === result.approvalId);
-      expect(approval!.payload.skillId).toBe("skill_linear");
+      expect(approval!.payload.skillId).toBe(skill.id);
+      expect(approval!.payload.credentialSkillName).toBe("linear-skill");
       expect(approval!.payload.provider).toBe("linear");
     }
   });

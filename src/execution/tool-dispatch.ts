@@ -52,7 +52,7 @@ import { resolveEffectiveContext } from "./effective-context";
 import { emitSystemNote, resolveEmitContext } from "./chat-task-emit";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
-import { firstUngrantedCredential, isSkillActive } from "../integrations/connectors";
+import { credentialTemplateForProvider, firstUngrantedCredential, isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { invokeMcpTool } from "../integrations/mcp";
 import { findSkillScript, invokeSkillScript } from "../capabilities/skill-scripts";
@@ -2880,10 +2880,23 @@ async function requestConnectorTool(
   // When a skill requested this credential, resolve its NAME from state (the
   // model supplies only the id) so the card can render "Grant <credential> to
   // skill <name>" from a server-resolved identity rather than the
-  // model-authored reason/title.
-  const credentialSkillName = skillId
-    ? state.skills.find((s) => s.id === skillId)?.name
-    : undefined;
+  // model-authored reason/title. GUARD: only carry the skillId through when the
+  // named skill actually DECLARES the credential this request will mint. The
+  // model supplies skillId, so without this check the card could promise "Grant
+  // X to skill Y" for a grant /complete will then refuse (Y doesn't declare X) —
+  // the consent copy must never advertise a grant that won't happen. When the
+  // skill doesn't declare it, drop skillId + credentialSkillName: the credential
+  // is still created on completion, just not auto-granted. The /complete
+  // declares-credential check remains the authoritative backstop.
+  const requestedName = templateless
+    ? credentialName
+    : (provider ? credentialTemplateForProvider(provider)?.name : undefined);
+  const grantSkill = skillId ? state.skills.find((s) => s.id === skillId) : undefined;
+  const skillDeclaresCredential = Boolean(
+    grantSkill && requestedName && (grantSkill.requiredCredentials ?? []).includes(requestedName)
+  );
+  const effectiveSkillId = skillDeclaresCredential ? skillId : "";
+  const credentialSkillName = skillDeclaresCredential ? grantSkill?.name : undefined;
   const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
     const item = findTask(mutable, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -2907,8 +2920,10 @@ async function requestConnectorTool(
         credentialType: templateless ? credentialType : undefined,
         credentialLabel: templateless ? payloadLabel : undefined,
         mcpUrl: templateless && mcpUrl ? mcpUrl : undefined,
-        // Skill to auto-grant on completion (either path).
-        skillId: skillId || undefined,
+        // Skill to auto-grant on completion (either path). Only stamped when
+        // the named skill declares this credential (see guard above), so a
+        // promised grant always matches what /complete will perform.
+        skillId: effectiveSkillId || undefined,
         // Server-resolved name of that skill, for the card to display.
         credentialSkillName,
         reason,
