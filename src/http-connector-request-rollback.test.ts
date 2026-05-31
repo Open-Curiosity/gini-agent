@@ -5,12 +5,15 @@
 // hits the existing-healthy fast path, and skips the missing skill grant —
 // leaving the skill env-denied.
 //
-// Lives in its own file because it relies on `mock.module` to force a throw
-// out of `./capabilities/skills` (the enable step), and that mock would leak
-// into the broader http.test.ts suite.
+// Lives in its own file because it spies on `setSkillStatus` (the enable step)
+// to force a throw, and the spy is torn down in afterEach so it never leaks
+// into the broader suite.
 
-import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { rmSync } from "node:fs";
+import * as skillsModule from "./capabilities/skills";
+import { createHandler } from "./http";
+import { createSetupRequest, createSkill, createTask, mutateState, readState, upsertTask } from "./state";
 import type { RuntimeConfig } from "./types";
 
 const ROOT = "/tmp/gini-http-rollback-tests";
@@ -18,6 +21,14 @@ const ROOT = "/tmp/gini-http-rollback-tests";
 beforeAll(() => {
   process.env.GINI_STATE_ROOT = ROOT;
   process.env.GINI_LOG_ROOT = `${ROOT}-logs`;
+});
+
+afterEach(() => {
+  // Restore the genuine setSkillStatus so the forced throw never leaks into a
+  // test file that runs later in the same process. spyOn + restore reverts the
+  // live module binding in place (unlike mock.module, which is not reliably
+  // undone).
+  (skillsModule.setSkillStatus as ReturnType<typeof spyOn>).mockRestore?.();
 });
 
 afterAll(() => {
@@ -30,23 +41,14 @@ describe("connector.request /complete rolls back a connector created this attemp
     const instance = "connreq-rollback";
     rmSync(`${ROOT}/instances/${instance}`, { recursive: true, force: true });
 
-    // Mock the enable step to throw AFTER the connector is created + granted.
-    // Preserve every other export of the skills module so the rest of the
-    // handler keeps working. setSkillStatus is the last post-create step in the
-    // connector.request branch, so a throw here means: connector created +
-    // healthy, grant recorded, enable explodes.
-    const realSkills = await import("./capabilities/skills");
-    mock.module("./capabilities/skills", () => ({
-      ...realSkills,
-      setSkillStatus: async () => {
-        throw new Error("simulated enable failure");
-      }
-    }));
-
-    // Late imports AFTER the mock is installed so the handler picks it up.
-    const { createHandler } = await import("./http");
-    const { mutateState, readState } = await import("./state");
-    const { createSetupRequest, createSkill, createTask, upsertTask } = await import("./state");
+    // Force the enable step to throw AFTER the connector is created + granted.
+    // setSkillStatus is the last post-create step in the connector.request
+    // branch, so a throw here means: connector created + healthy, grant
+    // recorded, enable explodes. http.ts reads setSkillStatus through the live
+    // module binding, so spying on it here redirects the handler's call.
+    spyOn(skillsModule, "setSkillStatus").mockImplementation(async () => {
+      throw new Error("simulated enable failure");
+    });
 
     const config: RuntimeConfig = {
       instance,
@@ -61,7 +63,7 @@ describe("connector.request /complete rolls back a connector created this attemp
     const handler = createHandler(config);
 
     // A skill that declares the credential so the grant guard passes and the
-    // handler proceeds to the (mocked, throwing) enable step.
+    // handler proceeds to the (spied, throwing) enable step.
     const skill = await mutateState(config.instance, (state) =>
       createSkill(state, {
         name: "needs-rollback-service",
