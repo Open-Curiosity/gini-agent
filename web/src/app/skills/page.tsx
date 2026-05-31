@@ -167,6 +167,33 @@ export default function SkillsPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
+  // "Set up via chat" for a credential with NO registered provider module.
+  // There is no Add Connector dialog to open at such a credential (no fields,
+  // no probe), so the canonical path is agent-driven: the seed message names
+  // the specific credential + skill so the agent inspects requires.credentials
+  // and issues request_connector for it (which mints the secure in-chat card).
+  // Steers the user to that flow instead of the dead-end "not supported" note.
+  const setupCredentialViaChat = useMutation({
+    mutationFn: async (args: { skill: SkillRecord; credentialName: string }) => {
+      const session = await api<ChatSession>("/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: `Set up ${args.credentialName}` })
+      });
+      await api(`/chat/${session.id}/messages`, {
+        method: "POST",
+        body: JSON.stringify({
+          content: `The ${args.skill.name} skill needs the ${args.credentialName} credential, which has no provider module. Please request it from me so I can enter it securely.`
+        })
+      });
+      return session;
+    },
+    onSuccess: (session) => {
+      invalidate(["chat", "tasks"]);
+      router.push(`/chat?session=${session.id}`);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
   const filtered = skills.data ?? [];
   const sorted = useMemo(
     () => filtered.slice().sort((a, b) => a.name.localeCompare(b.name)),
@@ -358,11 +385,21 @@ export default function SkillsPage() {
                                 </Button>
                               </div>
                             ) : !provider ? (
-                              // Provider isn't in the registry, so we can't
-                              // open the Add Connector dialog at it.
-                              <span className="text-[10px] text-muted-foreground">
-                                Not supported — use the <span className="font-mono">generic</span> provider or request native support.
-                              </span>
+                              // No registered provider module for this
+                              // credential name, so there's no Add Connector
+                              // dialog to open at it. The canonical path is
+                              // agent-driven request_connector, so hand off to
+                              // chat with a seed that names this credential
+                              // rather than dead-ending.
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 px-2 text-[10px]"
+                                disabled={setupCredentialViaChat.isPending}
+                                onClick={() => setupCredentialViaChat.mutate({ skill: detail, credentialName })}
+                              >
+                                {setupCredentialViaChat.isPending ? "Opening chat…" : "Set up via chat"}
+                              </Button>
                             ) : matches.length > 0 ? (
                               // Matching connector(s) exist but none satisfy
                               // (typically: unhealthy creds). Render the
