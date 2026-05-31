@@ -1094,7 +1094,8 @@ export interface SetupRequest {
   // For connector.request the payload is one of two shapes. Known-provider:
   // {provider, providerLabel, providerDescription, fields, reason, toolCallId}.
   // Templateless typed credential (no registered provider): {credentialName,
-  // credentialType ("api-key" | "oauth2"), credentialLabel, mcpUrl?, reason,
+  // credentialType ("api-key" only — templateless oauth2 is rejected because it
+  // needs a provider module / setup skill), credentialLabel, mcpUrl?, reason,
   // toolCallId}. Either shape may also carry {skillId} — when set, completing
   // the request both stores the credential AND grants it to that skill — plus
   // {credentialSkillName}, the server-resolved name of that skill for the card
@@ -1104,9 +1105,13 @@ export interface SetupRequest {
   reason: string;
   payload: Record<string, unknown>;
   // Set by the messaging.* /complete handlers (add_bridge, approve_pairing,
-  // remove_bridge) after the post-completion side effect runs. `ok: true`
-  // means the side effect succeeded (bridge created, pairing approved,
-  // etc.); `ok: false` plus `message` carries the sanitized failure reason.
+  // remove_bridge) after the post-completion side effect runs, AND by the
+  // connector.request /complete handler on a terminal failure (probe failure
+  // or a post-claim throw). `ok: true` means the side effect succeeded (bridge
+  // created, pairing approved, etc.); `ok: false` plus `message` carries the
+  // sanitized failure reason. connector.request persists this ONLY on failure
+  // — a successful create + grant leaves the completed row with no outcome, so
+  // a completed connector.request row with no outcome IS the success case.
   // The chat card reads this as the source of truth for the past-tense
   // summary after reload — React-component-local sticky state is cleared on
   // reload, so without a persisted outcome a failed side effect on a
