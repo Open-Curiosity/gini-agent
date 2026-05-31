@@ -451,7 +451,18 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // branch below.
         await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
 
-        // Only the winner reaches here. Create the typed record, then probe.
+        // Only the winner reaches here. Every post-claim path — successful
+        // create + grant + enable + resume, probe failure, or an UNEXPECTED
+        // throw (duplicate credential name, malformed secret, grant/enable
+        // error) — must persist an outcome and resume the task exactly once.
+        // Without this wrapper, a throw after the claim returns the route's
+        // catch-all 500 while the row sits `completed` and the task stays
+        // `waiting_approval` — stranded with no live executor. The catch below
+        // mirrors the probe-failure handling: persist a failure outcome and
+        // safeResume the task with a failure message so the agent can re-issue
+        // request_connector.
+        try {
+        // Create the typed record, then probe.
         const connector = await createConnector(config, {
           name: overrideName,
           provider,
@@ -533,16 +544,40 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // Resume the chat-task LAST, exactly once, on the winning claim. The
         // request was already claimed above, so reuse the resume wiring
         // directly (calling resolveSetupRequest again would throw on the
-        // now-completed row). A losing racer never reaches here.
+        // now-completed row). A losing racer never reaches here. Route it
+        // through safeResume so a throw from the chat-task loop AFTER the
+        // mutations landed flips the task out of the orphan-running state
+        // instead of being left dangling.
         if (setup.taskId && toolCallId) {
-          await resumeChatTask(
+          await safeResume(
             config,
             setup.taskId,
             toolCallId,
-            `Connected to ${connectedLabel}. Proceed with the original request.`
+            `Connected to ${connectedLabel}. Proceed with the original request.`,
+            { context: "connector.request", approvalId: setupId }
           );
         }
         return json({ ok: true, connector: probed });
+        } catch (error) {
+          // An unexpected throw after the claim (createConnector duplicate
+          // name, malformed secret, grant/enable error). The probe-failure
+          // path above already handled its own resume + return, so we only
+          // reach here for errors OTHER than a clean probe failure. Persist a
+          // failure outcome and resume the task so it never strands at
+          // waiting_approval. Mirrors the probe-failure cleanup.
+          const message = error instanceof Error ? error.message : String(error);
+          await persistConnectOutcome(config, setupId, { ok: false, message });
+          if (setup.taskId && toolCallId) {
+            await safeResume(
+              config,
+              setup.taskId,
+              toolCallId,
+              `Could not connect ${isTemplateless ? credentialLabel : providerLabel}: ${message}. Tell the user setup failed; you can call request_connector again so they can re-enter it.`,
+              { context: "connector.request", approvalId: setupId }
+            );
+          }
+          return json({ ok: false, message }, statusFromErrorMessage(message));
+        }
       }
 
       if (setup.action === "browser.connect") {

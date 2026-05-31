@@ -1508,6 +1508,148 @@ describe("runtime api", () => {
     expect(state.connectors.some((c) => c.provider === "linear")).toBe(false);
   });
 
+  test("POST /api/setup-requests/<id>/complete: an UNEXPECTED post-claim throw resumes the task instead of stranding it", async () => {
+    // Strand-the-task regression: after the winning claim, createConnector /
+    // grant / enable / resume can still throw (here: a duplicate credential
+    // name). The route's catch-all would return 500 while the setup row sits
+    // `completed` and the task stays `waiting_approval` — orphaned. The fix
+    // wraps the whole post-claim block: any throw persists a failure outcome
+    // and resumes the task. We seed a genuine waiting_approval task with a
+    // resumable toolCallState (one pending request_connector call) so the
+    // resume re-enters the echo loop and the task settles terminally.
+    const config = testConfig("setup-complete-postclaim-throw");
+    const handler = createHandler(config);
+    const { createSetupRequest, createTask, upsertTask } = await import("./state");
+
+    // Pre-seed a connector under the requested name so createConnector throws
+    // on instance-wide name uniqueness AFTER the claim.
+    await seedTypedCredential(config, "DUP_API_KEY", "generic");
+
+    const toolCallId = "call_postclaim_throw";
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "needs dup key");
+      task.status = "waiting_approval";
+      task.toolCallState = {
+        messages: [
+          { role: "system", content: "you are gini" },
+          { role: "user", content: "connect dup" },
+          { role: "assistant", content: "", tool_calls: [{ id: toolCallId, type: "function", function: { name: "request_connector", arguments: "{}" } }] }
+        ],
+        toolsHash: "test",
+        pending: [{ toolCallId, toolName: "request_connector", approvalId: "" }],
+        iterations: 1
+      };
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const approval = await mutateState(config.instance, (state) => {
+      const a = createSetupRequest(state, {
+        taskId,
+        action: "connector.request",
+        target: "DUP_API_KEY",
+        reason: "Enter your Dup API key",
+        payload: {
+          credentialName: "DUP_API_KEY",
+          credentialType: "api-key",
+          credentialLabel: "Dup",
+          reason: "Enter your Dup API key",
+          toolCallId
+        }
+      });
+      // Bind the approval to the task so the pending entry resolves on resume.
+      const item = state.tasks.find((t) => t.id === taskId)!;
+      item.toolCallState!.pending[0]!.approvalId = a.id;
+      item.approvalIds.push(a.id);
+      return a;
+    });
+
+    const raw = await rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { DUP_API_KEY: "dup-secret" } })
+    }, config.token);
+    const response = await raw.json();
+    // The route returned a structured failure body (the outcome + resume ran;
+    // it is NOT the bare catch-all 500 that bypasses both).
+    expect(response.ok).toBe(false);
+    expect(response.message).toBeString();
+
+    const settled = await waitForTask(handler, config, taskId);
+    // The task RESUMED — it is no longer stranded at waiting_approval.
+    expect(settled.task.status).not.toBe("waiting_approval");
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((a) => a.id === approval.id);
+    // The setup row is claimed (resolved) with a persisted failure outcome.
+    expect(resolved?.status).toBe("completed");
+    expect(resolved?.connectOutcome?.ok).toBe(false);
+    // No duplicate connector was created — only the pre-seeded one remains.
+    expect(state.connectors.filter((c) => c.name === "DUP_API_KEY").length).toBe(1);
+  });
+
+  test("POST /api/setup-requests/<id>/complete: a double-submit of a connector.request resolves once with no extra mutations", async () => {
+    // Claim-first race safety for connector.request: two concurrent completes
+    // of the same card — the mutateState lock serializes the atomic claim, so
+    // exactly one wins and creates exactly one connector; the loser produces
+    // zero side effects.
+    const config = testConfig("setup-complete-connector-double");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-race-key",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["RACE_API_KEY"]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "connector.request",
+        target: "RACE_API_KEY",
+        reason: "Enter your Race API key",
+        payload: {
+          credentialName: "RACE_API_KEY",
+          credentialType: "api-key",
+          credentialLabel: "Race",
+          skillId: skill.id,
+          reason: "Enter your Race API key",
+          toolCallId: "call_race"
+        }
+      })
+    );
+
+    const [a, b] = await Promise.all([
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({ secrets: { RACE_API_KEY: "race-secret" } })
+      }, config.token),
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({ secrets: { RACE_API_KEY: "race-secret" } })
+      }, config.token)
+    ]);
+    // Exactly one winner.
+    expect([a.ok, b.ok].filter(Boolean).length).toBe(1);
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((s) => s.id === approval.id);
+    expect(resolved?.status).toBe("completed");
+    // Exactly one connector created — the loser created nothing.
+    expect(state.connectors.filter((c) => c.name === "RACE_API_KEY").length).toBe(1);
+    // The skill was granted the credential exactly once and enabled.
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.grantedConnectors).toEqual(["RACE_API_KEY"]);
+    expect(updated?.status).toBe("enabled");
+    // Exactly one grant audit row from the single winner.
+    expect(state.audit.filter((au) => au.action === "skill.connector.granted").length).toBe(1);
+  });
+
   test("POST /api/setup-requests/<id>/complete 404s for an authorization id", async () => {
     const config = testConfig("setup-requests-complete-wrong-collection");
     const handler = createHandler(config);
