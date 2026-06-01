@@ -1229,7 +1229,8 @@ export async function generateTaskSummary(
   // user-curated INSTRUCTIONS.md / USER.md and the active agent's
   // SOUL.md. Active-agent lookup is best-effort — when no agent is
   // active the SOUL.md block is elided. See ADR runtime-identity-files.md.
-  const activeAgentId = resolveActiveAgentId(config);
+  const activeAgent = resolveActiveAgent(config);
+  const activeAgentId = activeAgent?.agentId;
   const onBlocked = taskId
     ? (filename: string, findings: string[]): void => {
         appendTrace(config.instance, taskId, {
@@ -1250,6 +1251,7 @@ export async function generateTaskSummary(
   // single-sources the "Long-term memory…" header. See ADR
   // stable-system-prefix.md.
   const stablePrefix = buildAgentSystemContext({
+    agentName: activeAgent?.name,
     instructionsOverride,
     soul: soulBlock,
     userProfile: userProfileBlock
@@ -1265,12 +1267,18 @@ export async function generateTaskSummary(
 }
 
 // Best-effort active-agent resolution for the legacy single-shot path.
-// Reads state once; failures (missing state file in tests, etc.) leave
-// the SOUL.md block elided. The modern chat-task path threads the
-// agent through resolveEffectiveContext and never falls back to this.
-function resolveActiveAgentId(config: RuntimeConfig): string | undefined {
+// Reads state once and returns both the id (for the SOUL.md lookup) and
+// the name (which sources the "You are X, a personal agent." identity
+// line). Failures (missing state file in tests, etc.) leave the SOUL.md
+// block elided and the identity line at the file default. The modern
+// chat-task path threads the agent through resolveEffectiveContext and
+// never falls back to this.
+function resolveActiveAgent(config: RuntimeConfig): { agentId: string | undefined; name: string | undefined } | undefined {
   try {
-    return readState(config.instance).activeAgentId;
+    const state = readState(config.instance);
+    const agentId = state.activeAgentId;
+    const name = agentId ? state.agents.find((a) => a.id === agentId)?.name : undefined;
+    return { agentId, name };
   } catch {
     return undefined;
   }

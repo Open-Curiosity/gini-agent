@@ -362,9 +362,17 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
       }
     }
   }
+  // Resolve the active agent so its name sources the "You are X, a
+  // personal agent." identity line. Mirrors the lookup buildAgentIdentity
+  // does below; an undefined agentId or missing record leaves agentName
+  // undefined, in which case the instructions emit verbatim.
+  const activeAgent = effectiveForAgent.agentId
+    ? state.agents.find((a) => a.id === effectiveForAgent.agentId)
+    : undefined;
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt
     : buildAgentSystemContext({
+        agentName: activeAgent?.name,
         instructionsOverride,
         soul: soulBlock,
         userProfile: userProfileBlock
