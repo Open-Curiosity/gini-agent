@@ -93,6 +93,13 @@ const ALWAYS_ON = new Set([
   "delete_job",
   "run_job",
   "mcp_call",
+  // skill_run is the generic dispatch surface for skill-bundled
+  // procedures (signed-URL uploads/downloads, format conversions,
+  // multi-step orchestrations). vision_query is the base primitive that
+  // exposes the model's multimodal capability on arbitrary uploads.
+  // Both always-on alongside mcp_call.
+  "skill_run",
+  "vision_query",
   "request_connector",
   // browser_fill_secrets is the meta-tool path for asking the user
   // to type a value into a DOM field on the agent's browser tab. It
@@ -251,6 +258,29 @@ describe("buildToolCatalog", () => {
     expect(tool).toBeDefined();
     expect(tool?.toolset).toBe("jobs");
     expect(tool?.function.parameters.required).toEqual(["jobId"]);
+  });
+
+  test("skill_run is always-on with the expected required args", () => {
+    // skill_run is the generic dispatch surface for skill-bundled
+    // procedures (signed-URL upload flows, format conversions, multi-
+    // step orchestrations) — always-on alongside mcp_call so a fresh
+    // instance can invoke any enabled skill's scripts.
+    const state = stateWithToolsets([]);
+    const catalog = buildToolCatalog(state);
+    const tool = catalog.find((t) => t.function.name === "skill_run");
+    expect(tool).toBeDefined();
+    expect(tool?.function.parameters.required).toEqual(["skill", "script"]);
+  });
+
+  test("vision_query is always-on (stays a base primitive in core)", () => {
+    // vision_query exposes the model's internal multimodal capability —
+    // same shape as browser_vision / web_fetch. Stays in core; not a
+    // skill script.
+    const state = stateWithToolsets([]);
+    const catalog = buildToolCatalog(state);
+    const tool = catalog.find((t) => t.function.name === "vision_query");
+    expect(tool).toBeDefined();
+    expect(tool?.function.parameters.required).toEqual(["uploadId", "question"]);
   });
 
   test("agent filter for a globally-disabled toolset still produces an empty (non-always-on) catalog", () => {

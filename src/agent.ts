@@ -90,7 +90,6 @@ import {
   releaseApproval
 } from "./execution/approval-execution";
 import { syncSubagentFromTask } from "./capabilities/subagents";
-import { resolveActiveSkillsEnv } from "./integrations/connectors";
 import { sendMessagingOutput } from "./integrations/messaging";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
 // the cycle that runs through submitTask. The finalizer flips the linked
@@ -1687,12 +1686,11 @@ async function runApprovedAction(
     if (signal.aborted) {
       return await emitTerminalAborted(config, approval, extraEvidence, { command, usePty, signal });
     }
-    const skillEnv = await resolveActiveSkillsEnv(config, approval.taskId);
     const proc = spawn(spawnArgs, {
       cwd: config.workspaceRoot,
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, ...skillEnv }
+      env: { ...process.env }
     });
     const timeoutMs = Number(approval.payload.timeoutMs ?? 10_000);
     const timeout = setTimeout(() => proc.kill(), timeoutMs);
@@ -2408,12 +2406,11 @@ async function runTerminalCommandClaimed(
     winner = "aborted";
     abortReason = readSignalReason(signal);
   } else {
-    const skillEnv = await resolveActiveSkillsEnv(config, taskId);
     const proc = spawn(spawnArgs, {
       cwd: config.workspaceRoot,
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, ...skillEnv }
+      env: { ...process.env }
     });
     const timeout = setTimeout(() => proc.kill(), timeoutMs);
     const procExitedSentinel = proc.exited.then(() => "exited" as const);

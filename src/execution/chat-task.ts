@@ -85,10 +85,11 @@ import {
 } from "./chat-task-emit";
 import { dispatchToolCall, parseToolArgsLenient } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
+import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { isSkillActive } from "../integrations/connectors";
-import { getProvider } from "../integrations/connectors/registry";
+import { getProvider, providerForCredentialName } from "../integrations/connectors/registry";
 import { resolveEffectiveContext } from "./effective-context";
 
 // Default safety cap on chat-task loop iterations. Each iteration is one
@@ -378,7 +379,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const inactiveSkills = filteredSkills.filter(
     (skill) => skill.status === "enabled" && !isSkillActive(state, skill)
   );
-  const inactiveSkillsBlock = buildInactiveSkillsBlock(inactiveSkills);
+  const inactiveSkillsBlock = buildInactiveSkillsBlock(inactiveSkills, state);
   // Bound-jobs block: if this chat session has one or more JobRecords whose
   // chatSessionId matches, surface them in the system prompt so the model
   // can act on "this job" / "the reminder" without first calling list_jobs.
@@ -391,6 +392,12 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // invoking. Only "configured" status surfaces; disabled/error servers
   // stay hidden the same way disabled skills do.
   const mcpServersBlock = buildMcpServersBlock(state);
+  // Scripts shipped by the visible (active) skills, so the model reaches
+  // for skill_run rather than re-implementing the work in terminal_exec.
+  const skillScriptsBlock = buildSkillScriptsBlock(
+    state,
+    new Set(visibleSkills.map((skill) => skill.name))
+  );
   // Deferred-tools index. Build the same gated + subagent-filtered catalog
   // runLoop builds, seed a subagent's deferred tools (those are already live,
   // so they must NOT appear in the on-demand list), then advertise whatever
@@ -407,6 +414,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   if (skillsBlock) sections.push(skillsBlock);
   if (inactiveSkillsBlock) sections.push(inactiveSkillsBlock);
   if (mcpServersBlock) sections.push(mcpServersBlock);
+  if (skillScriptsBlock) sections.push(skillScriptsBlock);
   if (deferredBlock) sections.push(deferredBlock);
   if (boundJobsBlock) sections.push(boundJobsBlock);
   const systemContext = sections.join("\n\n");
@@ -660,10 +668,11 @@ function buildUserMessage(config: RuntimeConfig, task: Task): ToolCallingMessage
 function buildVisionContent(
   config: RuntimeConfig,
   text: string,
-  images: ReadonlyArray<{ id: string; mimeType: string }>
+  images: ReadonlyArray<{ id: string; mimeType: string; size: number }>
 ): MessageContentPart[] {
   const parts: MessageContentPart[] = [];
   if (text.length > 0) parts.push({ type: "text", text });
+  const loaded: Array<{ id: string; mimeType: string; size: number }> = [];
   for (const image of images) {
     const dataUrl = uploadDataUrl(config.instance, image.id);
     if (!dataUrl) {
@@ -671,6 +680,23 @@ function buildVisionContent(
       continue;
     }
     parts.push({ type: "image_url", image_url: { url: dataUrl } });
+    loaded.push({ id: image.id, mimeType: image.mimeType, size: image.size });
+  }
+  // Surface upload metadata to the model so non-vision tools (e.g.
+  // signed_upload, MCP attachment uploads) can plug the right values into
+  // their args. Each line carries id + mimeType + size — the model needs
+  // size for `prepare_attachment_upload`-style calls, mimeType for
+  // content-type headers, and the id for any tool that takes an uploadId.
+  // The data URL itself carries none of this; the marker is the canonical
+  // place to read it from.
+  if (loaded.length > 0) {
+    const lines = loaded.map(
+      (u) => `- ${u.id} (${u.mimeType}, ${u.size} bytes)`
+    );
+    parts.push({
+      type: "text",
+      text: `Attached image uploads (in order):\n${lines.join("\n")}`
+    });
   }
   // Provider requires non-empty content. If every image failed to load and
   // there was no text, fall through to an empty text part so we never send
@@ -767,24 +793,27 @@ function buildEnabledSkillsBlock(skills: SkillRecord[]): string {
 }
 
 // Inactive-but-enabled skills block. Distinct from buildEnabledSkillsBlock:
-// these skills are turned on but unusable because a required connector is
+// these skills are turned on but unusable because a required credential is
 // missing. We tell the model exactly which provider needs connecting so it
 // can either invoke the provider's setup skill (when the provider declares
 // one) or call `request_connector` directly to ask the user to connect.
 //
-// Skills with `requiredConnectors` undefined / empty are skipped: those are
+// Skills with `requiredCredentials` undefined / empty are skipped: those are
 // inactive for some other reason (validation status, etc.) and there's no
 // connector affordance to offer.
 //
-// We group by provider — multiple product skills often share the same
-// connector (e.g. all Google Workspace skills share google-oauth-desktop),
-// and emitting one line per provider keeps the block compact and points
-// the model at a single setup path per connector.
+// Skills declare credentials BY NAME; we map each required credential name to
+// the provider that owns its setup flow — an existing connector record with
+// that name, else the canonical provider for the name (so a never-connected
+// credential still routes to its setup skill / request_connector). We group by
+// that provider so multiple product skills sharing one connector (e.g. all
+// Google Workspace skills → google-workspace-oauth → google-oauth-desktop)
+// collapse to a single line.
 //
 // Exported for unit testing; production callers use it via runChatTask.
-export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
+export function buildInactiveSkillsBlock(skills: SkillRecord[], state?: RuntimeState): string {
   const candidates = skills.filter(
-    (skill) => skill.status === "enabled" && (skill.requiredConnectors?.length ?? 0) > 0
+    (skill) => skill.status === "enabled" && (skill.requiredCredentials?.length ?? 0) > 0
   );
   if (candidates.length === 0) return "";
   // Same dedupe rule as buildEnabledSkillsBlock so the same skill name
@@ -802,28 +831,62 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
       byName.set(skill.name, skill);
     }
   }
-  // Group dedup'd skills by provider id. setupSkill is captured per
-  // provider — if any skill's required provider declares one, the
-  // provider-level line directs the model to invoke that skill instead
-  // of calling request_connector directly.
-  const grouped = new Map<string, { skills: string[]; setupSkill?: string }>();
+  // Resolve a required credential NAME to the REGISTERED provider module that
+  // owns its setup flow, or `undefined` when none does. The "generic" provider
+  // is the catch-all placeholder — it models nothing real (no fields, probe, or
+  // setup skill), so a credential on a generic row is templateless and must NOT
+  // resolve to a provider. A connector row's provider only counts when it's a
+  // real (non-generic) registered module — a disabled or unhealthy "generic"
+  // row sharing the credential name must NOT masquerade as the owning provider
+  // (that produced a bogus `{name:"generic", type:"oauth2"}` templateless line).
+  // When nothing registered owns the name, the credential is templateless and
+  // is grouped / requested by its own NAME.
+  const providerForCredential = (name: string): string | undefined => {
+    const connector = state?.connectors.find((c) => c.name === name);
+    if (connector?.provider && connector.provider !== "generic" && getProvider(connector.provider)) {
+      return connector.provider;
+    }
+    return providerForCredentialName(name);
+  };
+  // Group dedup'd skills by the provider their required credential maps to.
+  // setupSkill is captured per provider — if the provider declares one, the
+  // provider-level line directs the model to invoke that skill instead of
+  // calling request_connector directly. `templateless` flags a group whose key
+  // is a bare credential NAME with no registered provider module: those are
+  // requested with request_connector's {name, type:"api-key", skillId} shape
+  // instead of a provider id. `skillId` carries one requesting skill's id so
+  // the templateless call can auto-grant on completion.
+  const grouped = new Map<string, { skills: string[]; setupSkill?: string; templateless: boolean; skillId?: string }>();
   for (const skill of byName.values()) {
-    for (const req of skill.requiredConnectors ?? []) {
-      const entry = grouped.get(req.provider) ?? { skills: [] };
+    for (const credentialName of skill.requiredCredentials ?? []) {
+      const provider = providerForCredential(credentialName);
+      const module = provider ? getProvider(provider) : undefined;
+      // No registered module owns this name — it's a templateless credential.
+      // Group it by the credential NAME itself (never by a "generic" row), so
+      // the request_connector line names the real credential.
+      const templateless = !module;
+      const key = module ? provider! : credentialName;
+      const entry = grouped.get(key) ?? { skills: [], templateless };
       entry.skills.push(skill.name);
-      const module = getProvider(req.provider);
       if (module?.setupSkill) entry.setupSkill = module.setupSkill;
-      grouped.set(req.provider, entry);
+      if (templateless && !entry.skillId) entry.skillId = skill.id;
+      grouped.set(key, entry);
     }
   }
   const lines = Array.from(grouped.entries())
     .sort(([a], [b]) => a.localeCompare(b))
-    .map(([provider, entry]) => {
+    .map(([key, entry]) => {
       const skillList = Array.from(new Set(entry.skills)).sort().join(", ");
       if (entry.setupSkill) {
-        return `- ${provider} (used by: ${skillList}) — run \`read_skill\` with \`${entry.setupSkill}\` first; request_connector will be rejected until you do.`;
+        return `- ${key} (used by: ${skillList}) — run \`read_skill\` with \`${entry.setupSkill}\` first; request_connector will be rejected until you do.`;
       }
-      return `- ${provider} (used by: ${skillList}) — call \`request_connector\` with provider id \`${provider}\` to ask the user to connect.`;
+      if (entry.templateless) {
+        // No registered provider: request the api-key credential by its actual
+        // NAME (the name IS its env var). Templateless requests are api-key
+        // only — oauth2 credentials require a provider module / setup skill.
+        return `- ${key} (used by: ${skillList}) — no registered provider; call \`request_connector\` with \`{name: "${key}", type: "api-key", skillId: "${entry.skillId ?? ""}"}\` so the user can enter it securely in chat.`;
+      }
+      return `- ${key} (used by: ${skillList}) — call \`request_connector\` with provider id \`${key}\` to ask the user to connect.`;
     });
   // The setup skill is the ONLY correct path for the listed providers.
   // Without this directive, the model has shortcutted to browser_navigate
@@ -833,8 +896,8 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
   // the connector handshake.
   const hasSetupSkill = Array.from(grouped.values()).some((entry) => entry.setupSkill);
   const intro = hasSetupSkill
-    ? "Skills below need an external connector. The runtime gates `request_connector` for providers that declare a setup skill — call `read_skill` with the setup skill first (it owns the full prerequisite flow and will invoke request_connector itself). For providers WITHOUT a setup skill, call `request_connector` with the provider id directly."
-    : "Skills below need an external connector. For providers with a setup skill listed, invoke that skill first (it walks through any install / OAuth / project provisioning, then captures credentials). Otherwise, call `request_connector` with the provider id directly.";
+    ? "Skills below need an external connector. The runtime gates `request_connector` for providers that declare a setup skill — call `read_skill` with the setup skill first (it owns the full prerequisite flow and will invoke request_connector itself). For a registered provider WITHOUT a setup skill, call `request_connector` with the provider id; for a credential with no registered provider, call `request_connector` with `{name, type:\"api-key\", skillId}` as the line indicates. Each line tells you exactly how to call it."
+    : "Skills below need an external connector. For a registered provider, call `request_connector` with the provider id; for a credential with no registered provider, call `request_connector` with `{name, type:\"api-key\", skillId}` as the line indicates. Each line tells you exactly how to call it. Never ask the user to paste a key as a chat message — request_connector captures it securely.";
   const sections: string[] = [
     intro,
     ...lines
@@ -853,22 +916,51 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
 // servers are intentionally omitted — the v0 stdio path is a stub and
 // surfacing it would invite the model to call something that can't
 // actually serve MCP traffic.
-function buildMcpServersBlock(state: RuntimeState): string {
+//
+// We also surface each server's cached tool NAMES (from the last
+// tools/list probe). The model uses this as the authoritative inventory
+// for what's reachable via mcp_call — skills then become "wrapper shape +
+// local glue + taste", not a hand-maintained tool catalog that drifts
+// when the upstream server adds tools. Schemas are intentionally not
+// inlined here (cost) — when the model needs argument shape, it either
+// reads the skill or calls the tool and reads the validation error.
+export function buildMcpServersBlock(state: RuntimeState): string {
   const servers = state.mcpServers.filter(
     (s) => s.status === "configured" && s.transport === "http"
   );
   if (servers.length === 0) return "";
-  const lines = servers
-    .slice()
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .map((s) => {
-      const count = s.tools?.length ?? 0;
-      const suffix = count > 0 ? ` (${count} tool${count === 1 ? "" : "s"})` : "";
-      return `- ${s.name}${suffix} — call read_skill name='${s.name}' for the curated tool reference.`;
-    });
+  const lines: string[] = [];
+  for (const s of [...servers].sort((a, b) => a.name.localeCompare(b.name))) {
+    const tools = s.tools ?? [];
+    const count = tools.length;
+    const suffix = count > 0 ? ` (${count} tool${count === 1 ? "" : "s"})` : "";
+    lines.push(`- ${s.name}${suffix} — call read_skill name='${s.name}' for usage notes.`);
+    if (count > 0) {
+      const names = tools.map((t) => t.name).sort();
+      lines.push(`  tools: ${names.join(", ")}`);
+    }
+  }
   return [
     "Configured MCP servers (use the `mcp_call` tool to invoke):",
-    ...lines
+    ...lines,
+    // Explicit default-yes posture. Without this, the model treats the
+    // skill's documented tools as exhaustive and tells the user "I can't"
+    // even when a matching tool sits on the server's tools list above.
+    "If the user asks for something not covered in a server's skill but a plausible-looking tool exists in that server's `tools:` list, try `mcp_call` with it — the server returns a validation error on bad args, which is recoverable. Do not refuse based on the skill's documented subset alone."
+  ].join("\n");
+}
+
+// Advertise the scripts each visible skill ships so the model reliably
+// reaches for `skill_run` instead of re-implementing the work in
+// `terminal_exec` (which never carries connector env). Filtered to
+// `visibleSkillNames` (active + visible) so we don't point the model at a
+// script whose connector isn't healthy.
+export function buildSkillScriptsBlock(state: RuntimeState, visibleSkillNames: Set<string>): string {
+  const entries = listEnabledSkillScripts(state).filter((e) => visibleSkillNames.has(e.skill));
+  if (entries.length === 0) return "";
+  return [
+    "Skill scripts (invoke with skill_run, never re-implement in terminal_exec):",
+    ...entries.map((e) => `- ${e.skill}: ${e.scripts.join(", ")}`)
   ].join("\n");
 }
 

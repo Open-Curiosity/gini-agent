@@ -1,17 +1,19 @@
 import { writeFileSync } from "node:fs";
-import type { ApprovalMode, ChatBlock, RuntimeConfig } from "./types";
-import { cancelTask, decideApproval, resolveSetupRequest, retryTask, submitTask } from "./agent";
+import type { ApprovalMode, ChatBlock, RuntimeConfig, SkillRecord } from "./types";
+import { cancelTask, decideApproval, findTask, resolveSetupRequest, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import {
   addAudit,
   addSseSubscription,
   appendTrace,
+  createSetupRequest,
   getDevice,
   listChatBlocks,
   listChatBlocksAfter,
   markRead,
   markUnread,
   mutateState,
+  now,
   readState,
   unreadCountsByDevice,
   readTrace,
@@ -30,7 +32,7 @@ import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect"
 import { runMessagingPairingConnect } from "./execution/messaging-pairing-connect";
 import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
 import { mobileBootstrap, publicState } from "./runtime/views";
-import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
+import { checkConnector, createConnector, credentialTemplateForProvider, deleteConnector, firstUngrantedCredential, isSkillActive, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
@@ -73,8 +75,11 @@ import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
-import { createSkillFromInput, getSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
+import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
+import { resumeChatTask } from "./execution/chat-task";
+import { persistConnectOutcome, safeResume } from "./execution/safe-resume";
+import { approvalToolCallId } from "./execution/tool-dispatch";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
@@ -158,6 +163,10 @@ async function emitConnectorRequestAudit(
         evidence: {
           provider: String(setup.payload.provider ?? ""),
           providerLabel: typeof setup.payload.providerLabel === "string" ? setup.payload.providerLabel : null,
+          // Templateless requests carry no provider id; record the credential
+          // name so the audit row is still attributable. NO secret value is
+          // ever recorded — the secret stays server-side (ADR browser-fill-secret.md).
+          credentialName: typeof setup.payload.credentialName === "string" ? setup.payload.credentialName : null,
           connectorId
         }
       },
@@ -554,39 +563,322 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
 
       if (setup.action === "connector.request") {
         const scopes = Array.isArray(payload.scopes) ? payload.scopes.map(String) : [];
+        // Two payload shapes (see SetupRequest.target doc in types.ts):
+        //   known provider → {provider, providerLabel, fields, ...}
+        //   templateless    → {credentialName, credentialType:"api-key", credentialLabel, mcpUrl?}
+        // The trusted shape (name, type, metadata) comes from the SETUP
+        // PAYLOAD the dispatcher minted, NOT the browser-supplied body — the
+        // body carries only the secret. Threading `type`/`metadata` here makes
+        // a templateless request land a TYPED record; known-provider requests
+        // already get typed via the module's credentialTemplate inside
+        // createConnector, so we leave their type unset and let that path stand.
+        // Templateless requests are api-key ONLY (oauth2 needs a provider
+        // module / setup skill — see docs/adr/chat-credential-provisioning.md).
+        const credentialType = setup.payload.credentialType === "api-key"
+          ? setup.payload.credentialType
+          : undefined;
         const providerId = String(setup.payload.provider ?? "");
         const providerLabel = typeof setup.payload.providerLabel === "string"
           ? setup.payload.providerLabel
           : providerId;
-        const overrideName = typeof payload.name === "string" && payload.name.trim().length > 0
-          ? payload.name.trim()
-          : providerLabel;
+        const credentialName = typeof setup.payload.credentialName === "string"
+          ? setup.payload.credentialName
+          : "";
+        const credentialLabel = typeof setup.payload.credentialLabel === "string"
+          ? setup.payload.credentialLabel
+          : credentialName;
+        const isTemplateless = Boolean(credentialType) && !providerId;
+        // Templateless requests carry no provider module, so use the same
+        // "generic" provider key the type-driven Add Connector dialog uses; the
+        // explicit `type` makes createConnector stamp a typed record regardless.
+        const provider = providerId || "generic";
+        // For a templateless api-key, derive metadata from the TRUSTED setup
+        // payload only: an mcpUrl gets an mcp binding. The api-key name IS its
+        // env var, so there is no envMap to mint and nothing is read from the
+        // browser body. Known-provider requests pass no metadata so the
+        // module's template fills it.
+        const metadata: Record<string, unknown> | undefined =
+          isTemplateless && typeof setup.payload.mcpUrl === "string" && setup.payload.mcpUrl.length > 0
+            ? { mcp: { url: setup.payload.mcpUrl, headerName: "Authorization", scheme: "Bearer" } }
+            : undefined;
+        // Connector name: the credential name for templateless, else the
+        // browser-supplied override (back-compat) falling back to the label.
+        const overrideName = isTemplateless
+          ? credentialName
+          : typeof payload.name === "string" && payload.name.trim().length > 0
+            ? payload.name.trim()
+            : providerLabel;
+
+        const skillId = typeof setup.payload.skillId === "string" ? setup.payload.skillId : "";
+        const toolCallId = typeof setup.payload.toolCallId === "string" ? setup.payload.toolCallId : undefined;
+
+        // Atomically claim THIS setup request BEFORE any observable side effect
+        // (createConnector + secret write, grant, enable, audit, resume). The
+        // claim transitions pending→completed inside the per-instance
+        // mutateState lock and throws ApprovalRaceLostError ("already <status>")
+        // when the row is no longer pending — the route's catch surfaces that
+        // as an error response. A double-submit's loser, and any complete that
+        // races a cancel, throws here and performs ZERO side effects: a cancel
+        // that wins prevents the create AND the grant entirely. We claim with
+        // resumeChatTask:false / no toolResult so the resume is staged LATER,
+        // exactly once, on the winning claim. Mirrors the skill.grant_connector
+        // branch below.
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
+
+        // Only the winner reaches here. Every post-claim path — successful
+        // create + grant + enable + resume, probe failure, or an UNEXPECTED
+        // throw (duplicate credential name, malformed secret, grant/enable
+        // error) — must persist an outcome and resume the task exactly once.
+        // Without this wrapper, a throw after the claim returns the route's
+        // catch-all 500 while the row sits `completed` and the task stays
+        // `waiting_approval` — stranded with no live executor. The catch below
+        // mirrors the probe-failure handling: persist a failure outcome and
+        // safeResume the task with a failure message so the agent can re-issue
+        // request_connector.
+        // Track a connector created during THIS attempt so the post-claim
+        // catch can roll it back. Without this, a throw AFTER a successful
+        // create + healthy probe (e.g. an audit/grant/enable failure) would
+        // leave a healthy connector behind; the agent then re-requests, hits
+        // the existing-healthy fast path, and skips the missing skill grant —
+        // the skill stays env-denied. Only set for connectors this attempt
+        // created, so the rollback never touches a pre-existing record.
+        let createdConnectorId: string | undefined;
+        try {
+        // Create the typed record, then probe.
         const connector = await createConnector(config, {
           name: overrideName,
-          provider: providerId,
+          provider,
+          ...(isTemplateless ? { type: credentialType } : {}),
           scopes,
-          secrets
+          secrets,
+          ...(metadata ? { metadata } : {})
         });
+        createdConnectorId = connector.id;
         const probed = await checkConnector(config, connector.id);
         if (probed.health !== "healthy") {
-          return json({
-            ok: false,
-            connector: probed,
-            message: probed.message ?? "Connector probe failed; please verify the credentials and retry."
-          });
+          // The secret was wrong/unreachable. The row is already claimed
+          // (the race window is closed), so it cannot bounce back to pending
+          // for an in-place retype — instead drop the orphaned unhealthy
+          // record, persist the failure outcome so a reloaded card reads
+          // truthfully, and resume the chat-task with the failure so the agent
+          // can re-issue request_connector for a fresh card. Mirrors the
+          // messaging.add_bridge side-effect-failure path.
+          const message = probed.message ?? "Connector probe failed; please verify the credentials and retry.";
+          try {
+            await deleteConnector(config, connector.id);
+          } catch {
+            // Best-effort cleanup — a leftover unhealthy record is inert
+            // (inactive skills never resolve env from it) and far less
+            // harmful than failing the response over a delete throw.
+          }
+          await persistConnectOutcome(config, setupId, { ok: false, message });
+          if (setup.taskId && toolCallId) {
+            await safeResume(
+              config,
+              setup.taskId,
+              toolCallId,
+              `Could not connect ${isTemplateless ? credentialLabel : providerLabel}: ${message}. Tell the user the credential was rejected; you can call request_connector again so they can re-enter it.`,
+              { context: "connector.request", approvalId: setupId }
+            );
+          }
+          return json({ ok: false, connector: probed, message });
         }
         await emitConnectorRequestAudit(config, setup, connector.id);
-        await resolveSetupRequest(config, setupId, "complete", {
-          actor: "user",
-          toolResult: `Connected to ${providerLabel}. Proceed with the original request.`
-        });
+
+        // Auto-grant to the requesting skill (LOCKED decision). When the
+        // dispatcher minted this card with a `skillId`, the human entering the
+        // secret for that named skill IS the consent — so completing the card
+        // both creates the credential AND grants it to the skill, no second
+        // consent card. The model can't forge this because it never sees the
+        // secret. GUARD: only auto-grant when the named skill actually DECLARES
+        // this credential in its requiredCredentials. The model supplies
+        // skillId, so without this check it could grant a credential a skill
+        // never declared (or target a different skill); the credential model's
+        // "a skill only gets credentials it declared + the user granted" must
+        // hold. When the skill does not declare the credential, the connector
+        // is still created — it just isn't granted or enabled.
+        if (skillId) {
+          let skill: SkillRecord | undefined;
+          try {
+            skill = getSkill(config, skillId);
+          } catch {
+            // Unknown skillId — create the connector but grant nothing.
+            skill = undefined;
+          }
+          if (skill && (skill.requiredCredentials ?? []).includes(connector.name)) {
+            await grantConnectorToSkill(config, skillId, connector.name);
+            // Enable ONLY when the skill is now fully satisfiable: every
+            // required credential resolves to a configured + healthy connector
+            // AND is granted. isSkillActive covers the resolution half (a
+            // required credential with no connector row at all keeps it
+            // inactive — firstUngrantedCredential alone would miss that); the
+            // firstUngrantedCredential check covers the consent half. A
+            // multi-credential skill stays disabled until the next missing
+            // credential is requested separately.
+            const granted = getSkill(config, skillId);
+            const afterState = readState(config.instance);
+            if (isSkillActive(afterState, granted) && !firstUngrantedCredential(afterState, granted)) {
+              await setSkillStatus(config, skillId, "enabled");
+            }
+          }
+        }
+
+        const connectedLabel = isTemplateless ? credentialLabel : providerLabel;
+        // Resume the chat-task LAST, exactly once, on the winning claim. The
+        // request was already claimed above, so reuse the resume wiring
+        // directly (calling resolveSetupRequest again would throw on the
+        // now-completed row). A losing racer never reaches here. Route it
+        // through safeResume so a throw from the chat-task loop AFTER the
+        // mutations landed flips the task out of the orphan-running state
+        // instead of being left dangling.
+        if (setup.taskId && toolCallId) {
+          await safeResume(
+            config,
+            setup.taskId,
+            toolCallId,
+            `Connected to ${connectedLabel}. Proceed with the original request.`,
+            { context: "connector.request", approvalId: setupId }
+          );
+        }
         return json({ ok: true, connector: probed });
+        } catch (error) {
+          // An unexpected throw after the claim (createConnector duplicate
+          // name, malformed secret, grant/enable error). The probe-failure
+          // path above already handled its own resume + return, so we only
+          // reach here for errors OTHER than a clean probe failure. Persist a
+          // failure outcome and resume the task so it never strands at
+          // waiting_approval. Mirrors the probe-failure cleanup.
+          const message = error instanceof Error ? error.message : String(error);
+          // Roll back a connector created during THIS attempt. The create +
+          // probe may have succeeded and a LATER step (audit, grant, enable)
+          // thrown, leaving a healthy record behind. Drop it so a re-request
+          // starts fresh and creates + grants cleanly instead of short-circuiting
+          // on the existing-healthy fast path (which would skip the skill grant).
+          // Mirrors the probe-fail orphan cleanup; best-effort so a delete throw
+          // never masks the original failure.
+          if (createdConnectorId) {
+            try {
+              await deleteConnector(config, createdConnectorId);
+            } catch {
+              // A leftover record is inert; failing the response over a delete
+              // throw would be worse than leaving it.
+            }
+          }
+          await persistConnectOutcome(config, setupId, { ok: false, message });
+          if (setup.taskId && toolCallId) {
+            await safeResume(
+              config,
+              setup.taskId,
+              toolCallId,
+              `Could not connect ${isTemplateless ? credentialLabel : providerLabel}: ${message}. Tell the user setup failed; you can call request_connector again so they can re-enter it.`,
+              { context: "connector.request", approvalId: setupId }
+            );
+          }
+          return json({ ok: false, message }, statusFromErrorMessage(message));
+        }
       }
 
       if (setup.action === "browser.connect") {
         const { ok, result } = await completeBrowserConnectSetup(config, setup);
         await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result });
         return json({ ok });
+      }
+
+      if (setup.action === "skill.grant_connector") {
+        // Per-(skill, credential) consent (ADR skill-connector-consent.md).
+        // No secrets are entered here — the credential already lives in the
+        // connector record; this card only records the user's consent for
+        // the skill to use it. Append the grant, then check whether the skill
+        // still has ungranted credentials. The skill is enabled (and "enabled"
+        // reported) ONLY when ALL of them are granted — for a multi-credential
+        // skill we mint the NEXT grant card and keep the task pending rather
+        // than enabling on the first grant. This is server-driven so we never
+        // claim "enabled" while credentials remain env-denied.
+        const skillId = String(setup.payload.skillId ?? "");
+        const credentialName = String(setup.payload.credentialName ?? "");
+        const credentialLabel = typeof setup.payload.credentialLabel === "string"
+          ? setup.payload.credentialLabel
+          : credentialName;
+        const toolCallId = typeof setup.payload.toolCallId === "string"
+          ? setup.payload.toolCallId
+          : undefined;
+
+        // Atomically claim THIS setup request BEFORE any observable side
+        // effect (grant write, skill enable, audit row, next-card mint,
+        // resume). resolveSetupRequest transitions pending→completed inside
+        // the per-instance mutateState lock and throws ApprovalRaceLostError
+        // ("already <status>") if the row is no longer pending — which the
+        // route's catch surfaces as an error response. The loser of a
+        // double-complete, and any complete that races a cancel (the row is
+        // already non-pending), throws here and performs ZERO side effects.
+        // We claim with resumeChatTask:false / no toolResult so the resume is
+        // staged LATER, as the final step, exactly once on the winning claim.
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
+
+        // Only the winner reaches here. Record the grant for the approved
+        // credential by NAME, then check whether the skill still has ungranted
+        // credentials. `firstUngrantedCredential` is the same predicate
+        // setSkillStatusTool uses (a credential needs consent when it carries a
+        // secret), so the two stay in lockstep. The skill is enabled ONLY when
+        // ALL of them are granted — for a multi-credential skill we mint the
+        // NEXT grant card and keep the task pending rather than enabling on the
+        // first grant.
+        const skill = await grantConnectorToSkill(config, skillId, credentialName);
+        const nextUngranted = firstUngrantedCredential(readState(config.instance), skill);
+
+        if (nextUngranted) {
+          // More credentials to grant — mint the next grant card attached to
+          // the same task + tool call, leaving the task pending (not enabled).
+          // The web reconciles the new pending card from the setup-requests
+          // query (refreshed by the setup SSE event). Dedupe to the same task
+          // as a second safety layer — a retried mint must not double up.
+          const nextLabel = nextUngranted.label;
+          const reason = `Skill "${skill.name}" requests access to your ${nextLabel} credential. Granting lets its scripts use ${nextLabel}; you can revoke by disabling the skill.`;
+          await mutateState(config.instance, (mutable) => {
+            const dup = mutable.setupRequests.find(
+              (s) =>
+                s.status === "pending" &&
+                s.action === "skill.grant_connector" &&
+                s.taskId === setup.taskId &&
+                s.payload.skillId === skillId &&
+                s.payload.credentialName === nextUngranted.name
+            );
+            if (dup) return;
+            const approval = createSetupRequest(mutable, {
+              taskId: setup.taskId,
+              action: "skill.grant_connector",
+              target: nextLabel,
+              reason,
+              payload: { skillId, skillName: skill.name, credentialName: nextUngranted.name, credentialLabel: nextLabel, toolCallId }
+            });
+            if (setup.taskId) {
+              const item = findTask(mutable, setup.taskId);
+              item.approvalIds.push(approval.id);
+              item.updatedAt = now();
+            }
+          });
+          return json({ ok: true });
+        }
+
+        // All credentials granted: enable the skill, then resume the chat task
+        // LAST and exactly once with the success toolResult. The request was
+        // already claimed above, so we reuse resolveSetupRequest's internal
+        // resume wiring (approvalToolCallId + resumeChatTask) directly rather
+        // than calling resolveSetupRequest again (which would throw on the
+        // now-completed row). A losing racer never reaches this enable/resume.
+        await setSkillStatus(config, skillId, "enabled");
+        if (setup.taskId) {
+          const resumeToolCallId = approvalToolCallId(setup.payload);
+          if (resumeToolCallId) {
+            await resumeChatTask(
+              config,
+              setup.taskId,
+              resumeToolCallId,
+              `Granted ${credentialLabel} to skill "${skill.name}"; skill enabled.`
+            );
+          }
+        }
+        return json({ ok: true });
       }
 
       return json({ error: `Setup request ${setupId} action not supported: ${setup.action}` }, 400);
@@ -931,7 +1223,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/skills\/([^/]+)$/, (_request, params) => json(getSkill(config, params[0]))],
     ["PATCH", /^\/api\/skills\/([^/]+)$/, async (request, params) => json(await updateSkill(config, params[0], await body(request)))],
     ["POST", /^\/api\/skills\/([^/]+)\/test$/, async (_request, params) => json(await testSkill(config, params[0]))],
-    ["POST", /^\/api\/skills\/([^/]+)\/enable$/, async (_request, params) => json(await setSkillStatus(config, params[0], "enabled"))],
+    ["POST", /^\/api\/skills\/([^/]+)\/enable$/, async (_request, params) => {
+      // Enabling a skill never grants a connector. A non-bundled credentialed
+      // skill enabled here stays env-denied (resolveSkillEnv returns {} for any
+      // provider not bundled and not in grantedConnectors) until the user
+      // grants it through the skill.grant_connector consent flow (ADR
+      // skill-connector-consent.md). That consent path is the only way grants
+      // are recorded — enabling must never silently auto-grant, or the model
+      // could reach this route to bypass the gate.
+      return json(await setSkillStatus(config, params[0], "enabled"));
+    }],
     ["POST", /^\/api\/skills\/([^/]+)\/disable$/, async (_request, params) => json(await setSkillStatus(config, params[0], "disabled"))],
     ["POST", /^\/api\/skills\/([^/]+)\/rollback$/, async (_request, params) => json(await rollbackSkill(config, params[0]))],
     ["GET", /^\/api\/jobs$/, (request) => {
@@ -967,7 +1268,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       secrets: p.secrets,
       hasProbe: Boolean(p.probe),
       hasDetect: Boolean(p.detect),
-      probeIntervalMs: p.probeIntervalMs
+      // Whether the provider owns a chat-driven setup skill. Drives the Skills
+      // page "Set up via chat" routing for providers whose setup is more than
+      // pasting a secret (e.g. google-oauth-desktop's gws/gcloud walkthrough),
+      // which can't be inferred from field shape now that all its fields are
+      // secret.
+      hasSetupSkill: Boolean(p.setupSkill),
+      probeIntervalMs: p.probeIntervalMs,
+      // Optional credential-template the Add Connector dialog prefills when a
+      // provider is picked as a template. Derived from the module's secret
+      // bindings: one env binding → api-key (name == that env var, MCP URL
+      // from the module's mcpServer); two+ → oauth2 (envMap = purpose→ENV).
+      // Modules with no secret spec (presence-only, generic) carry none.
+      credentialTemplate: credentialTemplateForProvider(p)
     })))],
     ["POST", /^\/api\/connectors$/, async (request) => {
       const payload = await body(request);
@@ -977,9 +1290,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const metadata = payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
         ? payload.metadata as Record<string, unknown>
         : undefined;
+      const type = payload.type === "api-key" || payload.type === "oauth2" ? payload.type : undefined;
       return json(await createConnector(config, {
         name: String(payload.name ?? ""),
         provider: String(payload.provider ?? ""),
+        type,
         scopes: Array.isArray(payload.scopes) ? payload.scopes.map(String) : undefined,
         secrets,
         metadata

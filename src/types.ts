@@ -1119,6 +1119,7 @@ export type SetupRequestAction =
   | "browser.connect"
   | "connector.request"
   | "browser.fill_secret"
+  | "skill.grant_connector"
   | "messaging.add_bridge"
   | "messaging.approve_pairing"
   | "messaging.remove_bridge";
@@ -1136,16 +1137,31 @@ export interface SetupRequest {
   action: SetupRequestAction;
   // Trust anchor shown to the user before they complete the request: the
   // destination URL for browser.connect / browser.fill_secret, the provider
-  // id for connector.request, or the bridge kind / id for the messaging.*
-  // actions.
+  // id for connector.request (or the credential `name` for a templateless
+  // typed-credential request, which carries no registered provider), or the
+  // bridge kind / id for the messaging.* actions.
+  //
+  // For connector.request the payload is one of two shapes. Known-provider:
+  // {provider, providerLabel, providerDescription, fields, reason, toolCallId}.
+  // Templateless typed credential (no registered provider): {credentialName,
+  // credentialType ("api-key" only — templateless oauth2 is rejected because it
+  // needs a provider module / setup skill), credentialLabel, mcpUrl?, reason,
+  // toolCallId}. Either shape may also carry {skillId} — when set, completing
+  // the request both stores the credential AND grants it to that skill — plus
+  // {credentialSkillName}, the server-resolved name of that skill for the card
+  // to display.
   target: string;
   // Human-language ask shown to the user in the chat card.
   reason: string;
   payload: Record<string, unknown>;
   // Set by the messaging.* /complete handlers (add_bridge, approve_pairing,
-  // remove_bridge) after the post-completion side effect runs. `ok: true`
-  // means the side effect succeeded (bridge created, pairing approved,
-  // etc.); `ok: false` plus `message` carries the sanitized failure reason.
+  // remove_bridge) after the post-completion side effect runs, AND by the
+  // connector.request /complete handler on a terminal failure (probe failure
+  // or a post-claim throw). `ok: true` means the side effect succeeded (bridge
+  // created, pairing approved, etc.); `ok: false` plus `message` carries the
+  // sanitized failure reason. connector.request persists this ONLY on failure
+  // — a successful create + grant leaves the completed row with no outcome, so
+  // a completed connector.request row with no outcome IS the success case.
   // The chat card reads this as the source of truth for the past-tense
   // summary after reload — React-component-local sticky state is cleared on
   // reload, so without a persisted outcome a failed side effect on a
@@ -1198,7 +1214,22 @@ export interface SkillRecord {
   // ids (and optionally scopes) the skill needs to function. The runtime
   // gates the skill out of the agent loop's available-skills set until every
   // entry matches a healthy ConnectorRecord. Defaults to [].
+  // Migration source for `requiredCredentials`; kept one release.
   requiredConnectors?: Array<{ provider: string; scopes?: string[] }>;
+  // Frontmatter `metadata.gini.requires.credentials` — credential NAMES the
+  // skill needs to function (e.g. ["LINEAR_API_KEY"] or
+  // ["google-workspace-oauth"]). The runtime gates the skill out of the agent
+  // loop's available-skills set until every name matches a configured+healthy
+  // ConnectorRecord with that `name`, and resolveSkillEnv resolves the skill's
+  // prerequisites.env from those named credentials. Defaults to [].
+  requiredCredentials?: string[];
+  // Per-(skill, connector) consent: the credential NAMES the user has granted
+  // this skill access to (the field name is kept for back-compat; the contents
+  // are now names, not provider strings). `resolveSkillEnv` injects a named
+  // credential's env only when that name is granted here (or the skill is
+  // `source:"bundled"`, which is auto-granted by short-circuit). Cleared on
+  // disable so re-enabling re-prompts. See docs/adr/skill-connector-consent.md.
+  grantedConnectors?: string[];
   // Spec-compliant top-level `allowed-tools` declaration (space-separated in
   // the source frontmatter, normalized to the original string here). Stored
   // so the UI and install-skill flow can surface it; not enforced yet.
@@ -1358,6 +1389,19 @@ export interface ConnectorRecord {
   // ("demo", "linear", "claude-code", "codex", "generic", or any module id
   // in the registry). Renamed from `kind` in ADR connector-provider-spec-compliance.md.
   provider: string;
+  // Credential type. Skills and MCP rows reference credentials BY NAME, and
+  // `type` says how the name resolves to env vars:
+  //   - "api-key": a single secret whose env var IS the credential `name`
+  //     (uppercase env-token, e.g. LINEAR_API_KEY). Optional
+  //     `metadata.mcp` powers MCP registration with
+  //     `Authorization: Bearer ${<name>}`.
+  //   - "oauth2": a named handle (may be kebab, e.g. google-workspace-oauth)
+  //     whose fields materialize as env vars via `metadata.envMap`
+  //     (purpose → ENV_NAME).
+  // Optional: presence-only providers (demo/claude-code/codex) carry no env
+  // and stay untyped. The state migration stamps a type on every legacy
+  // provider-keyed record at boot, so all credentialed records are typed.
+  type?: "api-key" | "oauth2";
   status: "configured" | "disabled" | "error";
   scopes: string[];
   secretRefs: ConnectorSecretRef[];
@@ -1370,7 +1414,22 @@ export interface ConnectorRecord {
   // persist non-secret dynamic fields (base URLs, account ids, …) that the
   // user supplies in the Add Connector dialog. Provider-specific keys live
   // under a nested namespace (e.g. `metadata.fields`) by convention.
-  metadata?: Record<string, unknown>;
+  //
+  // Two typed-credential keys live here by convention:
+  //   - `mcp`: present on api-key credentials that back an HTTP MCP server.
+  //     Drives MCP registration and the header
+  //     `{[headerName ?? "Authorization"]: "<scheme ?? Bearer> ${<name>}"}`.
+  //     The server row is named by `mcp.name` when set, else the credential
+  //     name. `mcp.name` lets a credential own a differently-named row — e.g.
+  //     the LINEAR_API_KEY credential drives the "linear" MCP server that
+  //     skills reference as `server: "linear"`.
+  //   - `envMap`: present on oauth2 credentials, mapping each secret purpose
+  //     to the ENV_NAME the runtime injects for it (e.g.
+  //     `{ client_id: "GOOGLE_WORKSPACE_CLI_CLIENT_ID" }`).
+  metadata?: Record<string, unknown> & {
+    mcp?: { url: string; name?: string; headerName?: string; scheme?: string };
+    envMap?: Record<string, string>;
+  };
   // Origin marker: "auto" for connectors materialized by the startup
   // detection job (claude-code, codex on PATH); "user" for connectors
   // created via the Add Connector dialog or `gini connector add`. Drives

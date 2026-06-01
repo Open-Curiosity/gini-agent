@@ -7,7 +7,7 @@
 //   - resume after approval → task completes
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -34,7 +34,7 @@ import {
 import { echoEmbed } from "../embeddings";
 import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
-import { buildAgentIdentity, buildInactiveSkillsBlock } from "./chat-task";
+import { buildAgentIdentity, buildInactiveSkillsBlock, buildMcpServersBlock, buildSkillScriptsBlock } from "./chat-task";
 import type { EffectiveContext } from "./effective-context";
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
@@ -2638,12 +2638,14 @@ describe("buildAgentIdentity", () => {
 
 describe("buildInactiveSkillsBlock", () => {
   // Minimal SkillRecord factory. Only the fields the block builder
-  // reads (name, description, status, requiredConnectors, source) carry
-  // meaningful values; the rest are stubbed so the type checks.
+  // reads (name, description, status, requiredCredentials, source) carry
+  // meaningful values; the rest are stubbed so the type checks. Skills now
+  // declare credentials BY NAME; the block maps each name to its provider
+  // (LINEAR_API_KEY → linear, google-workspace-oauth → google-oauth-desktop).
   function makeSkill(opts: {
     name: string;
     description?: string;
-    requiredConnectors?: Array<{ provider: string; scopes?: string[] }>;
+    requiredCredentials?: string[];
     status?: SkillRecord["status"];
     source?: SkillRecord["source"];
   }): SkillRecord {
@@ -2666,18 +2668,19 @@ describe("buildInactiveSkillsBlock", () => {
       failureCount: 0,
       previousVersions: [],
       body: "",
-      requiredConnectors: opts.requiredConnectors,
+      requiredCredentials: opts.requiredCredentials,
       source: opts.source
     };
   }
 
   test("routes setup-skill providers to the setup skill instead of request_connector", () => {
-    // google-oauth-desktop declares setupSkill: "google-workspace-setup".
-    // The block must point the model at that skill, NOT at request_connector.
+    // google-workspace-oauth maps to google-oauth-desktop, which declares
+    // setupSkill: "google-workspace-setup". The block must point the model at
+    // that skill, NOT at request_connector.
     const skill = makeSkill({
       name: "google-calendar",
       description: "Google Calendar",
-      requiredConnectors: [{ provider: "google-oauth-desktop" }]
+      requiredCredentials: ["google-workspace-oauth"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toContain("google-oauth-desktop");
@@ -2687,13 +2690,13 @@ describe("buildInactiveSkillsBlock", () => {
     expect(block).not.toContain("call `request_connector` with provider id `google-oauth-desktop`");
   });
 
-  test("collapses multiple skills sharing one setup-skill provider into a single line", () => {
-    // All six Google Workspace product skills share one connector — the
-    // block should emit ONE provider line, not six per-skill lines.
+  test("collapses multiple skills sharing one credential into a single line", () => {
+    // All Google Workspace product skills share one credential — the block
+    // should emit ONE provider line, not one per skill.
     const skills = [
-      makeSkill({ name: "google-calendar", requiredConnectors: [{ provider: "google-oauth-desktop" }] }),
-      makeSkill({ name: "google-gmail", requiredConnectors: [{ provider: "google-oauth-desktop" }] }),
-      makeSkill({ name: "google-drive", requiredConnectors: [{ provider: "google-oauth-desktop" }] })
+      makeSkill({ name: "google-calendar", requiredCredentials: ["google-workspace-oauth"] }),
+      makeSkill({ name: "google-gmail", requiredCredentials: ["google-workspace-oauth"] }),
+      makeSkill({ name: "google-drive", requiredCredentials: ["google-workspace-oauth"] })
     ];
     const block = buildInactiveSkillsBlock(skills);
     const providerLines = block.split("\n").filter((line) => line.includes("google-oauth-desktop"));
@@ -2705,12 +2708,12 @@ describe("buildInactiveSkillsBlock", () => {
   });
 
   test("falls back to request_connector guidance for providers without a setup skill", () => {
-    // The linear provider does not declare setupSkill, so the block must
-    // emit the default request_connector instruction.
+    // LINEAR_API_KEY → linear, which does not declare setupSkill, so the
+    // block must emit the default request_connector instruction.
     const skill = makeSkill({
       name: "needs-linear",
       description: "Test skill that needs Linear.",
-      requiredConnectors: [{ provider: "linear" }]
+      requiredCredentials: ["LINEAR_API_KEY"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toContain("linear");
@@ -2719,23 +2722,101 @@ describe("buildInactiveSkillsBlock", () => {
     expect(block).not.toMatch(/read_skill/);
   });
 
-  test("returns an empty string when no inactive-with-connector skills are present", () => {
+  test("instructs a templateless request_connector for a credential with no registered provider", () => {
+    // SOME_SERVICE_API_KEY maps to no provider module, so providerForCredential
+    // falls back to the name itself. The block must NOT emit the bare
+    // provider-id shortcut (there is no provider to connect) — it must tell the
+    // model to call request_connector with the {name, type, skillId} shape so
+    // the user can enter the secret in chat. The name is UPPER_SNAKE so the
+    // inferred type is api-key.
+    const skill = makeSkill({
+      name: "needs-some-service",
+      description: "Test skill that needs an unmapped credential.",
+      requiredCredentials: ["SOME_SERVICE_API_KEY"]
+    });
+    const block = buildInactiveSkillsBlock([skill]);
+    expect(block).toContain("SOME_SERVICE_API_KEY");
+    expect(block).toContain('name: "SOME_SERVICE_API_KEY"');
+    expect(block).toContain('type: "api-key"');
+    expect(block).toContain(`skillId: "${skill.id}"`);
+    // No provider-id shortcut and no read_skill dead-end for a name with no
+    // registered provider.
+    expect(block).not.toContain("call `request_connector` with provider id `SOME_SERVICE_API_KEY`");
+    expect(block).not.toMatch(/read_skill/);
+    expect(block).not.toContain("will be rejected");
+  });
+
+  // Minimal RuntimeState carrying only the connectors the block reads.
+  function stateWithConnectors(connectors: RuntimeState["connectors"]): RuntimeState {
+    return {
+      version: 1,
+      instance: "test",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
+      connectors, improvements: [], pairingCodes: [], devices: [],
+      promotions: [], snapshots: [], tools: [], toolsets: [], subagents: [],
+      mcpServers: [], messagingBridges: [], importReports: [], agents: [],
+      activeAgentId: undefined, relays: [], notifications: [], events: [],
+      jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
+      runs: [], planSteps: []
+    };
+  }
+
+  test("a disabled generic connector sharing the credential name still yields the api-key templateless line by NAME", () => {
+    // Regression: a disabled/unhealthy "generic" connector row sharing the
+    // credential name must NOT masquerade as the owning provider. The earlier
+    // code returned the row's provider ("generic"), grouped under that key, and
+    // emitted a bogus `{name:"generic", type:"oauth2"}` line. The line must name
+    // the actual credential and be api-key (templateless is api-key only).
+    const skill = makeSkill({
+      name: "needs-some-service",
+      requiredCredentials: ["SOME_SERVICE_API_KEY"]
+    });
+    const state = stateWithConnectors([
+      {
+        id: "id_generic_row",
+        instance: "test",
+        name: "SOME_SERVICE_API_KEY",
+        provider: "generic",
+        status: "disabled",
+        scopes: [],
+        secretRefs: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        health: "unknown",
+        source: "user"
+      }
+    ]);
+    const block = buildInactiveSkillsBlock([skill], state);
+    expect(block).toContain('name: "SOME_SERVICE_API_KEY"');
+    expect(block).toContain('type: "api-key"');
+    // Never the bogus generic/oauth2 line.
+    expect(block).not.toContain('name: "generic"');
+    expect(block).not.toContain('type: "oauth2"');
+  });
+
+  test("returns an empty string when no inactive-with-credential skills are present", () => {
     expect(buildInactiveSkillsBlock([])).toBe("");
-    // Skills with no requiredConnectors are filtered out before the
+    // Skills with no requiredCredentials are filtered out before the
     // grouping step.
-    const skill = makeSkill({ name: "no-conn", requiredConnectors: [] });
+    const skill = makeSkill({ name: "no-cred", requiredCredentials: [] });
     expect(buildInactiveSkillsBlock([skill])).toBe("");
   });
 
   test("opens with the dual-path intro so the model knows both routing options", () => {
     const skill = makeSkill({
       name: "needs-linear",
-      requiredConnectors: [{ provider: "linear" }]
+      requiredCredentials: ["LINEAR_API_KEY"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toMatch(/^Skills below need an external connector\./);
-    expect(block).toContain("setup skill");
+    // Both request_connector routing options are advertised: a registered
+    // provider id, and the templateless api-key {name, type:"api-key", skillId}
+    // shape for a credential with no registered provider.
     expect(block).toContain("request_connector");
+    expect(block).toContain("provider id");
+    expect(block).toContain('{name, type:"api-key", skillId}');
   });
 
   test("appends a no-browser-shortcut directive when a setup-skill provider is present", () => {
@@ -2746,7 +2827,7 @@ describe("buildInactiveSkillsBlock", () => {
     // only sanctioned route.
     const skill = makeSkill({
       name: "google-calendar",
-      requiredConnectors: [{ provider: "google-oauth-desktop" }]
+      requiredCredentials: ["google-workspace-oauth"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toContain("ONLY correct path");
@@ -2768,10 +2849,182 @@ describe("buildInactiveSkillsBlock", () => {
     // declared, so the browser-shortcut directive is unnecessary noise.
     const skill = makeSkill({
       name: "needs-linear",
-      requiredConnectors: [{ provider: "linear" }]
+      requiredCredentials: ["LINEAR_API_KEY"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).not.toContain("ONLY correct path");
     expect(block).not.toContain("browser_navigate");
+  });
+});
+
+describe("buildMcpServersBlock", () => {
+  function stateWith(servers: RuntimeState["mcpServers"]): RuntimeState {
+    return {
+      version: 1,
+      instance: "test",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
+      connectors: [], improvements: [], pairingCodes: [], devices: [],
+      promotions: [], snapshots: [], tools: [], toolsets: [], subagents: [],
+      mcpServers: servers, messagingBridges: [], importReports: [], agents: [],
+      activeAgentId: undefined, relays: [], notifications: [], events: [],
+      jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
+      runs: [], planSteps: []
+    };
+  }
+
+  function server(name: string, tools: Array<{ name: string }>): RuntimeState["mcpServers"][number] {
+    return {
+      id: `mcp_${name}`,
+      instance: "test",
+      name,
+      command: "",
+      args: [],
+      envKeys: [],
+      status: "configured",
+      exposedTools: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      transport: "http",
+      url: "https://example.test/mcp",
+      tools
+    };
+  }
+
+  test("returns empty string when no servers are configured", () => {
+    expect(buildMcpServersBlock(stateWith([]))).toBe("");
+  });
+
+  test("lists tool names per server so the model has the full inventory", () => {
+    // The inventory line is what lets the model reach for a tool the skill
+    // never documented. Skills should not have to be re-edited every time
+    // an MCP server adds a tool.
+    const state = stateWith([
+      server("linear", [
+        { name: "list_issues" },
+        { name: "save_issue" },
+        { name: "list_initiatives" },
+        { name: "extract_images" }
+      ])
+    ]);
+    const block = buildMcpServersBlock(state);
+    expect(block).toContain("- linear (4 tools)");
+    expect(block).toContain("tools: extract_images, list_initiatives, list_issues, save_issue");
+  });
+
+  test("includes the default-yes posture instruction", () => {
+    // Without this, the model treats the skill's documented tools as
+    // exhaustive and refuses tasks for tools that actually exist on the
+    // server's inventory list.
+    const state = stateWith([server("linear", [{ name: "list_issues" }])]);
+    const block = buildMcpServersBlock(state);
+    expect(block).toContain("Do not refuse");
+    expect(block).toContain("validation error on bad args");
+  });
+
+  test("omits the per-server inventory line when a server has no cached tools yet", () => {
+    // Health probe hasn't populated tools yet — show the server but skip
+    // the inventory line so we don't lie about emptiness. (The default-yes
+    // posture sentence below still mentions the word `tools:`, so we
+    // assert on the indented inventory line specifically.)
+    const state = stateWith([server("linear", [])]);
+    const block = buildMcpServersBlock(state);
+    expect(block).toContain("- linear");
+    expect(block).not.toMatch(/^ {2}tools:/m);
+  });
+
+  test("alphabetizes both servers and their tool name lists for determinism", () => {
+    // Toolset hashes and prompt-cache stability depend on stable ordering
+    // across boots even when the order tools were registered varies.
+    const state = stateWith([
+      server("zenith", [{ name: "z_one" }, { name: "a_two" }]),
+      server("acme", [{ name: "c_one" }, { name: "a_two" }])
+    ]);
+    const block = buildMcpServersBlock(state);
+    const acmeIdx = block.indexOf("- acme");
+    const zenithIdx = block.indexOf("- zenith");
+    expect(acmeIdx).toBeGreaterThanOrEqual(0);
+    expect(zenithIdx).toBeGreaterThan(acmeIdx);
+    expect(block).toContain("tools: a_two, c_one");
+    expect(block).toContain("tools: a_two, z_one");
+  });
+});
+
+describe("buildSkillScriptsBlock", () => {
+  // listEnabledSkillScripts statSyncs the real scripts/ dir under each
+  // skill's manifestPath, so the seeded skills need real files on disk.
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "gini-skill-scripts-block-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function seedSkill(
+    state: RuntimeState,
+    name: string,
+    scripts: string[],
+    opts: { status?: SkillRecord["status"] } = {}
+  ): void {
+    const skillDir = join(dir, name);
+    const scriptsDir = join(skillDir, "scripts");
+    mkdirSync(scriptsDir, { recursive: true });
+    for (const script of scripts) {
+      writeFileSync(join(scriptsDir, script), "console.log('{}')");
+    }
+    state.skills.push({
+      id: `skill_${name}`,
+      instance: state.instance,
+      name,
+      description: "",
+      trigger: "",
+      steps: [],
+      requiredTools: [],
+      requiredPermissions: [],
+      status: opts.status ?? "enabled",
+      version: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tests: [],
+      successCount: 0,
+      failureCount: 0,
+      previousVersions: [],
+      body: "",
+      source: "bundled",
+      manifestPath: join(skillDir, "SKILL.md")
+    });
+  }
+
+  test("returns empty string when no visible skill ships scripts", () => {
+    const state = createEmptyState("test");
+    seedSkill(state, "no-scripts", []);
+    expect(buildSkillScriptsBlock(state, new Set(["no-scripts"]))).toBe("");
+  });
+
+  test("lists each visible skill's scripts, alphabetized by skill and script", () => {
+    const state = createEmptyState("test");
+    seedSkill(state, "bbb", ["alpha.sh"]);
+    seedSkill(state, "aaa", ["two.ts", "one.ts"]);
+    const block = buildSkillScriptsBlock(state, new Set(["aaa", "bbb"]));
+    expect(block).toBe(
+      [
+        "Skill scripts (invoke with skill_run, never re-implement in terminal_exec):",
+        "- aaa: one, two",
+        "- bbb: alpha"
+      ].join("\n")
+    );
+  });
+
+  test("omits skills that are enabled but not visible (inactive connector)", () => {
+    const state = createEmptyState("test");
+    seedSkill(state, "visible", ["go.ts"]);
+    seedSkill(state, "hidden", ["go.ts"]);
+    const block = buildSkillScriptsBlock(state, new Set(["visible"]));
+    expect(block).toContain("- visible: go");
+    expect(block).not.toContain("hidden");
   });
 });

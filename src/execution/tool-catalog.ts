@@ -137,7 +137,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "terminal_exec",
-      description: "Run a shell command in the workspace. Approval-gated; user must approve. Returns stdout/stderr and exit code. Set timeoutMs explicitly for slow commands (Apple/AppleScript-backed CLIs like memo or remindctl can take 30+ seconds; brew installs can take minutes). Set pty=true for interactive CLI tools (vim, memo, claude-code, codex, python repl) — without pty they hang or exit immediately because stdin is not a TTY. To drive vim non-interactively, pre-feed keystrokes via stdin like: `printf 'i<title>\\n<body>\\x1b:wq\\n' | <command>`.",
+      description: "Run a shell command in the workspace. Approval-gated; user must approve. Returns stdout/stderr and exit code. Set timeoutMs explicitly for slow commands (Apple/AppleScript-backed CLIs like memo or remindctl can take 30+ seconds; brew installs can take minutes). Set pty=true for interactive CLI tools (vim, memo, claude-code, codex, python repl) — without pty they hang or exit immediately because stdin is not a TTY. Commands always run with a clean env: no connector secrets are ever injected, so a Linear-token leak can't ride alongside a curl invocation. A command that genuinely needs a connector credential must ship as a skill script and be invoked via `skill_run` — that is the only path connector secrets enter a process.",
       parameters: {
         type: "object",
         properties: {
@@ -564,14 +564,19 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "request_connector",
-      description: "Ask the user to connect an external provider (e.g. linear, github). Use this when a skill is available but inactive because the required connector is not configured. The user sees a Connect button in the chat; the task pauses until they finish the setup, then resumes automatically.",
+      description: "Ask the user to connect a credential the task needs. This is the ONLY way to obtain a credential: it renders a SECURE inline input in the web chat so the value is captured server-side — NEVER ask the user to paste an API key, token, or secret as a normal chat message (the value would land in your context and the transcript). Two ways to call it: (1) pass a registered `provider` id (e.g. 'linear', 'github') for a known service; or (2) for a brand-new service that has no provider module, pass `name` + `type:\"api-key\"` (and optionally `label`, `mcpUrl`, `skillId`) to request an arbitrary api-key credential. Templateless requests support api-key ONLY — an oauth2 credential requires a registered provider or setup skill. The user sees a Connect button in the chat; the task pauses until they finish the setup, then resumes automatically.",
       parameters: {
         type: "object",
         properties: {
-          provider: { type: "string", description: "Provider id (e.g. 'linear'). Must match a registered provider module." },
+          provider: { type: "string", description: "Registered provider id (e.g. 'linear'). Use this for a known service whose setup is already modeled. Omit it (and pass `name` + `type:\"api-key\"` instead) for a brand-new service with no provider module." },
+          name: { type: "string", description: "Credential name for a templateless request (no registered provider). It IS the environment variable, so it must be an uppercase token like SOME_SERVICE_API_KEY (matches /^[A-Z][A-Z0-9_]*$/). Required when `provider` is omitted." },
+          type: { type: "string", enum: ["api-key"], description: "Credential type for a templateless request. Only 'api-key' (a single secret token stored in the env var named by `name`) is supported templatelessly; an oauth2 credential needs a registered provider or setup skill. Required when `provider` is omitted." },
+          label: { type: "string", description: "Optional human-readable label shown to the user for a templateless request (e.g. 'Some Service'). Defaults to `name`." },
+          mcpUrl: { type: "string", description: "Optional MCP server URL to associate with an api-key credential (templateless requests only)." },
+          skillId: { type: "string", description: "Optional id of the skill that needs this credential. When set, completing the card both stores the credential AND grants it to this skill — no separate consent card." },
           reason: { type: "string", description: "The full user-visible message shown above the inline Connect form. You are responsible for producing the complete text — including any URLs, project IDs, click instructions, or step-by-step guidance the user needs. Substitute any real values (project ids, etc.) directly into the string; do not leave `${...}` placeholders. The skill body (when one applies) shows the exact format to follow; copy it line-for-line, fill in the real values, and pass the result here verbatim." }
         },
-        required: ["provider", "reason"]
+        required: ["reason"]
       }
     }
   },
@@ -820,6 +825,61 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // skill_run: invoke a script that ships with an enabled skill. The
+    // skill's SKILL.md documents what scripts it offers and what args
+    // each takes; the runtime spawns the script with stdin = JSON args,
+    // env = connector secrets + GINI_* context, and returns stdout
+    // parsed as JSON. This is the dispatch surface for recipe-shaped
+    // procedures that live in skills (signed-URL upload flows, multi-
+    // step orchestrations, format conversions) — distinct from `mcp_call`
+    // (which hits external MCP servers) and from the primitive tools in
+    // the catalog (which expose raw runtime capabilities).
+    //
+    // Read the skill's body via read_skill first to know which scripts
+    // exist and what args they take.
+    toolset: "mcp",
+    displayLabel: "Run skill script",
+    type: "function",
+    function: {
+      name: "skill_run",
+      description: "Invoke a script that ships with an enabled skill. Use this for skill-bundled procedures (e.g. `skill_run({skill:'attachments', script:'signed-upload', args:{uploadId, url, headers}})` for signed-PUT upload flows). The skill's SKILL.md is the reference for which scripts it offers and what args each takes — read_skill it first. Returns the script's JSON result verbatim, or `{ok:false, error}` on script failure / non-JSON output.",
+      parameters: {
+        type: "object",
+        properties: {
+          skill: { type: "string", description: "Name of the enabled skill that owns the script (e.g. 'attachments')." },
+          script: { type: "string", description: "Script basename (no extension) inside the skill's scripts/ folder (e.g. 'signed-upload')." },
+          args: { type: "object", description: "Args object passed to the script as JSON on stdin. Shape is per-script; the skill's SKILL.md documents it.", additionalProperties: true }
+        },
+        required: ["skill", "script"]
+      }
+    }
+  },
+  {
+    // vision_query: ask the configured vision model a question about a
+    // Gini upload. Like browser_vision but for arbitrary uploads — pairs
+    // with skill-managed downloads/uploads and chat-attached images so
+    // the model can "see" content it didn't start with as a data URL.
+    // Stays in core (not a skill script) because it's a thin wrapper
+    // over the model's internal multimodal capability — same shape as
+    // browser_vision and web_fetch.
+    toolset: "mcp",
+    displayLabel: "Vision query",
+    type: "function",
+    function: {
+      name: "vision_query",
+      description: "Ask the configured vision model a question about an existing Gini upload (image/png or image/jpeg). Use this for chat-attached screenshots when you need to inspect details beyond what's already in vision context, or after skill scripts (e.g. attachments/signed-download) landed an image and you want the model to describe / extract from it. Returns { ok, answer, usage?, error? }. Costs a vision-model call.",
+      parameters: {
+        type: "object",
+        properties: {
+          uploadId: { type: "string", description: "Id of the image upload to query (from the chat marker, or from a skill script that landed an upload)." },
+          question: { type: "string", description: "What to ask about the image." },
+          maxTokens: { type: "number", description: "Optional cap on the response length. Default 512." }
+        },
+        required: ["uploadId", "question"]
+      }
+    }
+  },
+  {
     // Schedule a real cron/job. The job's output is delivered as an
     // assistant message back into the originating chat session when it
     // fires. Low-risk: no approval gate — the user can pause/delete the
@@ -990,7 +1050,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "enable_skill",
-      description: "Enable a registered skill so it appears in the advertised-skills block and the agent can read its body. Use after the user asks to turn a skill on (or after install_skill if the manifest didn't auto-enable). Trivial; no approval gate.",
+      description: "Enable a registered skill so it appears in the advertised-skills block and the agent can read its body. Use after the user asks to turn a skill on (or after install_skill if the manifest didn't auto-enable). Bundled (first-party) skills enable immediately. Enabling a non-bundled skill that requires a credentialed connector first prompts the user for a one-time consent grant (a setup card per connector) before the skill can use that credential — expect the call to come back pending; the loop resumes once the user grants.",
       parameters: {
         type: "object",
         properties: {
@@ -1364,6 +1424,7 @@ export function allTools(): ToolCatalogTool[] {
   return TOOL_DEFS.map((t) => ({ ...t, function: { ...t.function, parameters: { ...t.function.parameters } } }));
 }
 
+
 // Filter tools by enabled toolsets in state. The web_fetch tool is grouped
 // under "messaging" only because the legacy defaults didn't include a "web"
 // toolset; if state has no `web` toolset the tool stays available unless an
@@ -1420,6 +1481,17 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // fresh instances even when a user has configured a server, so it
     // mirrors read_skill / spawn_subagent's always-on stance.
     if (tool.function.name === "mcp_call") return true;
+    // skill_run is the generic dispatch surface for skill-bundled
+    // procedures (recipe-shaped operations that live in skills, not in
+    // core). Always-on alongside mcp_call so a fresh instance can invoke
+    // any skill script without toolset toggling — the skill's `enabled`
+    // status is the gate.
+    if (tool.function.name === "skill_run") return true;
+    // vision_query is the base primitive that exposes the model's
+    // multimodal capability against arbitrary uploads — like
+    // browser_vision but not tied to the browser session. Always-on
+    // alongside mcp_call for the same reasons.
+    if (tool.function.name === "vision_query") return true;
     // request_connector is the in-chat affordance that lets the agent
     // ask the user to wire up a missing connector. Same always-on
     // rationale: a fresh instance with no toolsets toggled still needs
@@ -1773,6 +1845,10 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(
         `${previewValue(safe.server)}.${previewValue(safe.tool)}`
       );
+    case "skill_run":
+      return truncatePreview(`${previewValue(safe.skill)}/${previewValue(safe.script)}`);
+    case "vision_query":
+      return truncatePreview(`${previewValue(safe.uploadId)}: ${previewValue(safe.question)}`);
     case "request_connector":
       return truncatePreview(previewValue(safe.provider));
     case "request_messaging_bridge":

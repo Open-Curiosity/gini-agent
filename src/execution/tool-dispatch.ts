@@ -54,9 +54,11 @@ import { resolveEffectiveContext } from "./effective-context";
 import { resolveEmitContext, setToolCallRunningHint } from "./chat-task-emit";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
-import { isSkillActive } from "../integrations/connectors";
+import { credentialTemplateForProvider, firstUngrantedCredential, isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { invokeMcpTool } from "../integrations/mcp";
+import { findSkillScript, invokeSkillScript } from "../capabilities/skill-scripts";
+import { invokeVisionQuery } from "../capabilities/vision-query";
 import { checkMessagingBridge, listAllowedChats } from "../integrations/messaging";
 import { riskForAction } from "./tool-risk";
 import {
@@ -148,11 +150,15 @@ export async function dispatchToolCall(
     case "install_skill":
       return { kind: "sync", result: await installSkillTool(config, taskId, args) };
     case "enable_skill":
-      return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "enabled") };
+      return await setSkillStatusTool(config, taskId, toolCallId, args, "enabled");
     case "disable_skill":
-      return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "disabled") };
+      return await setSkillStatusTool(config, taskId, toolCallId, args, "disabled");
     case "mcp_call":
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
+    case "skill_run":
+      return { kind: "sync", result: await skillRunTool(config, taskId, args) };
+    case "vision_query":
+      return { kind: "sync", result: await visionQueryTool(config, taskId, args) };
     case "request_connector":
       return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
     case "browser_fill_secrets":
@@ -739,7 +745,7 @@ async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record
   }
   if (!isSkillActive(state, skill)) {
     const missing = (skill.requiredConnectors ?? []).map((entry) => entry.provider).join(", ");
-    throw new Error(`Skill ${name} is inactive: required connectors not healthy (${missing || "unknown"}). Ask the user to set up the missing connector — they can click [Set up <Provider>] next to the affected skill on the /skills page, or paste the credential and you'll wire it up.`);
+    throw new Error(`Skill ${name} is inactive: required connectors not healthy (${missing || "unknown"}). Ask the user to set up the missing connector — they can click [Set up <Provider>] next to the affected skill on the /skills page, or call request_connector so they can enter it securely.`);
   }
   appendTrace(config.instance, taskId, {
     type: "tool",
@@ -810,6 +816,49 @@ async function mcpCallTool(
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
   return `${text.slice(0, max)}\n... (truncated)`;
+}
+
+// skill_run dispatch: looks up the requested skill+script and spawns the
+// script with stdin = JSON args. Returns the script's JSON stdout
+// verbatim, or a clear { ok: false, error } envelope on script failure
+// / missing script / malformed output. See src/capabilities/skill-
+// scripts.ts for the spawn + env-injection details.
+async function skillRunTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const skillName = requireString(args, "skill");
+  const scriptName = requireString(args, "script");
+  const scriptArgs = args.args && typeof args.args === "object" && !Array.isArray(args.args)
+    ? args.args as Record<string, unknown>
+    : {};
+  const handle = findSkillScript(readState(config.instance), skillName, scriptName);
+  if (!handle) {
+    return JSON.stringify({
+      ok: false,
+      error: `Skill script not found: ${skillName}/${scriptName}. The skill must be enabled and ship a top-level file named ${scriptName}.<ext> under scripts/.`
+    });
+  }
+  const result = await invokeSkillScript(config, handle, scriptArgs, { taskId });
+  if (result.parsed !== null && result.parsed !== undefined) {
+    return typeof result.parsed === "string" ? result.parsed : JSON.stringify(result.parsed);
+  }
+  return JSON.stringify({ ok: result.ok, error: result.error ?? "Skill script returned no output." });
+}
+
+// vision_query dispatch: runs the configured vision model against an
+// arbitrary Gini upload.
+async function visionQueryTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const uploadId = requireString(args, "uploadId");
+  const question = requireString(args, "question");
+  const maxTokens = typeof args.maxTokens === "number" ? args.maxTokens : undefined;
+  const result = await invokeVisionQuery(config, { uploadId, question, maxTokens }, { taskId });
+  return JSON.stringify(result);
 }
 
 // Spawn a constrained subagent and wait for its terminal state. The model
@@ -2123,7 +2172,8 @@ async function installSkillTool(
           skillId: installed.skill.id,
           name: installed.skill.name,
           manifestPath: installed.manifestPath,
-          validationIssues: installed.validation.issues
+          validationIssues: installed.validation.issues,
+          frontmatterWarnings: installed.validation.warnings
         }
       },
       { taskId: item.id }
@@ -2138,18 +2188,54 @@ async function installSkillTool(
   const issuesSuffix = installed.validation.issues.length > 0
     ? ` Warnings: ${installed.validation.issues.join("; ")}.`
     : "";
-  return `Installed skill ${installed.skill.id} ("${installed.skill.name}") at ${installed.manifestPath}.${issuesSuffix}`;
+  // Surface advisory frontmatter near-misses prominently so the authoring
+  // model fixes them and re-installs — these flag a silently-dropped
+  // credential/connector declaration the skill is currently missing.
+  const warningsSuffix = installed.validation.warnings.length > 0
+    ? ` ⚠ Frontmatter warnings — fix and re-install: ${installed.validation.warnings.join("; ")}.`
+    : "";
+  return `Installed skill ${installed.skill.id} ("${installed.skill.name}") at ${installed.manifestPath}.${issuesSuffix}${warningsSuffix}`;
 }
 
 // Enable / disable a registered skill. Wraps setSkillStatus, which
 // writes the matching skill.enabled / skill.disabled audit row.
+//
+// Enabling a NON-bundled skill that requires a credentialed connector is
+// gated by a per-(skill, connector) consent grant (ADR
+// skill-connector-consent.md): the tool mints a `skill.grant_connector`
+// SetupRequest and returns `{ kind: "pending" }` instead of enabling, so the
+// user approves the grant via the chat card before the connector's env can
+// reach the skill's scripts. One SetupRequest per ungranted provider — the
+// user grants one, the loop resumes, re-enters here, and either enables (no
+// more ungranted providers) or mints the next grant. Bundled skills are
+// auto-granted in resolveSkillEnv and skip the gate entirely.
 async function setSkillStatusTool(
   config: RuntimeConfig,
   taskId: string,
+  toolCallId: string,
   args: Record<string, unknown>,
   status: "enabled" | "disabled"
-): Promise<string> {
+): Promise<DispatchResult> {
   const skillId = requireString(args, "skillId");
+
+  if (status === "enabled") {
+    const state = readState(config.instance);
+    const skill = state.skills.find((s) => s.id === skillId || s.name === skillId);
+    if (!skill) throw new Error(`Skill not found: ${skillId}`);
+    const bundled = (skill.source ?? "user") === "bundled";
+    if (!bundled) {
+      // The first required credential that carries a secret and isn't yet
+      // granted. A credential "carries a secret" when its connector has a
+      // `type` (api-key/oauth2). Presence-only connectors (no type, no env)
+      // leak nothing and need no consent. Name-based: skills declare
+      // `requiredCredentials`, resolved against the named connector record.
+      const ungranted = firstUngrantedCredential(state, skill);
+      if (ungranted) {
+        return await requestSkillConnectorGrant(config, taskId, toolCallId, skill.id, skill.name, ungranted.name, ungranted.label);
+      }
+    }
+  }
+
   const skill = await setSkillStatus(config, skillId, status);
   appendTrace(config.instance, taskId, {
     type: "tool",
@@ -2161,7 +2247,115 @@ async function setSkillStatusTool(
     name: skill.name,
     status
   });
-  return `${status === "enabled" ? "Enabled" : "Disabled"} skill ${skill.id} ("${skill.name}").`;
+  return { kind: "sync", result: `${status === "enabled" ? "Enabled" : "Disabled"} skill ${skill.id} ("${skill.name}").` };
+}
+
+// Mint a `skill.grant_connector` SetupRequest for one (skill, credential) pair.
+// Mirrors requestConnectorTool: the chat-task loop's pending handler emits a
+// setup_requested block, the user grants via the chat card, and the
+// /complete handler (src/http.ts) appends the credential name to
+// grantedConnectors, enables the skill, and resumes this task. Surface-guarded
+// like browser_fill_secrets — the amber card only renders in the web chat.
+async function requestSkillConnectorGrant(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  skillId: string,
+  skillName: string,
+  credentialName: string,
+  credentialLabel: string
+): Promise<DispatchResult> {
+  const providerLabel = credentialLabel;
+
+  // Surface guard — same rationale as browser_fill_secrets. The consent card
+  // is React UI rendered only in the web chat; a task running over a
+  // messaging bridge (Telegram/Discord), in a scheduled/headless job session
+  // (origin:"job"), or with no chat session at all would park in
+  // waiting_approval with no way to grant. Fail synchronously so the agent can
+  // verbalize "open the web chat to grant" back to the user.
+  // NOTE: sibling request_* guards in this file share the same shape but DON'T
+  // yet check origin:"job"; that blind spot is tracked separately — do not
+  // assume it's handled there.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (!surfaceSession || surfaceSession.origin === "job") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Enabling skill "${skillName}" needs a one-time grant of your ${providerLabel} credential, and that consent card only renders in a web chat session — this task isn't attached to one (subagent child, scheduled job, or other headless run). Route this through the web chat or settings page.`
+      })
+    };
+  }
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Enabling skill "${skillName}" needs a one-time grant of your ${providerLabel} credential, and the consent card only works in the web chat (this conversation is over ${surfaceKind}). Reply asking the user to open the web chat to grant access, then continue once they confirm.`
+      })
+    };
+  }
+
+  // Idempotent re-enter: if a pending grant SetupRequest already exists for
+  // this (skill, provider) ON THIS TASK — e.g. the model re-called
+  // enable_skill while the user hadn't yet acted on the card — reference it
+  // instead of minting a duplicate. The dedupe is scoped to the SAME task:
+  // each task that enables the skill needs its own resumable approval, since
+  // completing the card resumes only its owning `setup.taskId`. Reusing
+  // another task's pending request would park this task on a request that
+  // resumes someone else, stranding it forever.
+  const existing = surfaceState.setupRequests.find(
+    (s) =>
+      s.status === "pending" &&
+      s.action === "skill.grant_connector" &&
+      s.taskId === taskId &&
+      s.payload.skillId === skillId &&
+      s.payload.credentialName === credentialName
+  );
+  if (existing) {
+    return { kind: "pending", approvalId: existing.id };
+  }
+
+  const reason = `Skill "${skillName}" requests access to your ${providerLabel} credential. Granting lets its scripts use ${providerLabel}; you can revoke by disabling the skill.`;
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createSetupRequest(mutable, {
+      taskId: item.id,
+      action: "skill.grant_connector",
+      target: providerLabel,
+      reason,
+      payload: { skillId, skillName, credentialName, credentialLabel, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    // Persist the reason as a durable assistant bubble so it survives past
+    // approval resolution — same pattern as requestConnectorTool.
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for skill connector grant",
+      data: { approvalId: approval.id, skillId, credentialName, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
 }
 
 // Poll the subagent record until its child task reaches a terminal state,
@@ -2600,17 +2794,105 @@ async function requestConnectorTool(
   args: Record<string, unknown>,
   messageHistory?: readonly unknown[]
 ): Promise<DispatchResult> {
-  const providerId = requireString(args, "provider");
   const reason = requireString(args, "reason");
-  const provider = getProvider(providerId);
-  if (!provider) {
-    // Synchronous error so the model can recover (it picked a bogus
-    // provider id). Matches how mcp_call surfaces unknown servers.
+  const providerId = optionalString(args, "provider", "");
+  const provider = providerId ? getProvider(providerId) : undefined;
+
+  // The contract: the caller supplies EITHER a registered `provider`
+  // (template path) OR `{name, type:"api-key"}` (templateless typed credential
+  // for a service with no provider module). Templateless is the path when the
+  // model passed `type` and there's no registered provider for `provider`.
+  // Templateless supports api-key ONLY — an oauth2 credential needs a provider
+  // module / setup skill to model its env vars and OAuth flow, so the model
+  // can't request one without a registered provider (see
+  // docs/adr/chat-credential-provisioning.md).
+  const credentialType = optionalString(args, "type", "");
+  const templateless = !provider && credentialType === "api-key";
+
+  if (!provider && credentialType === "oauth2") {
+    // Recoverable: an oauth2 credential can't be requested templatelessly.
+    // The model must go through a provider module / setup skill that knows the
+    // service's env vars and OAuth flow.
     return {
       kind: "sync",
       result: JSON.stringify({
         ok: false,
-        error: `Unknown provider: ${providerId}. The user has no path to connect this.`
+        error: `Templateless request_connector supports type "api-key" only. An oauth2 credential requires a registered provider module (pass its \`provider\` id) or a setup skill that owns the OAuth flow — request_connector cannot mint one for a service with no provider module.`
+      })
+    };
+  }
+
+  if (!provider && !templateless) {
+    // Synchronous error so the model can recover. It either picked a bogus
+    // provider id, or asked for a templateless credential without a valid
+    // `type`. Matches how mcp_call surfaces unknown servers.
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: providerId
+          ? `Unknown provider: ${providerId}. For a service with no registered provider, pass {name, type:"api-key"} instead so the user can connect it.`
+          : `request_connector needs either a registered \`provider\` id, or \`type:"api-key"\` plus \`name\` for a templateless credential.`
+      })
+    };
+  }
+
+  // Templateless field capture. `name` is the credential name; it IS the env
+  // var (templateless is api-key only), so validate it synchronously here
+  // (createConnector re-validates server-side) — a recoverable error lets the
+  // model fix the name before any card is minted.
+  const credentialName = templateless ? optionalString(args, "name", "") : "";
+  const credentialLabel = optionalString(args, "label", "");
+  const mcpUrl = optionalString(args, "mcpUrl", "");
+  const skillId = optionalString(args, "skillId", "");
+  if (templateless) {
+    if (!credentialName) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: `A templateless request needs a \`name\`. It is used as the environment variable, so it must be an uppercase env-var token (e.g. SOME_SERVICE_API_KEY).`
+        })
+      };
+    }
+    if (!/^[A-Z][A-Z0-9_]*$/.test(credentialName)) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: `Invalid api-key credential name: "${credentialName}". The name is used as the environment variable, so it must match ^[A-Z][A-Z0-9_]*$ (e.g. SOME_SERVICE_API_KEY).`
+        })
+      };
+    }
+  }
+
+  // Surface guard — same rationale as requestSkillConnectorGrant /
+  // browser_fill_secrets. The Connect card is React UI rendered only in the
+  // web chat; a task running over a messaging bridge (Telegram/Discord), in a
+  // scheduled/headless job session (origin:"job"), or with no chat session at
+  // all would park in waiting_approval with no way to enter the secret. Fail
+  // synchronously so the agent can verbalize "open the web chat to enter it".
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (!surfaceSession || surfaceSession.origin === "job") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Connecting a credential needs the secure Connect card, and that card only renders in a web chat session — this task isn't attached to one (subagent child, scheduled job, or other headless run). Route this through the web chat or settings page.`
+      })
+    };
+  }
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Connecting a credential needs the secure Connect card, which only works in the web chat (this conversation is over ${surfaceKind}). Reply asking the user to open the web chat to enter it, then continue once they confirm.`
       })
     };
   }
@@ -2620,17 +2902,23 @@ async function requestConnectorTool(
   // values like project IDs, and passes the finished text here. No runtime
   // templating: `reason` becomes the approval's `reason` verbatim.
 
-  // Fast path: if a healthy + configured connector already exists for
-  // this provider, the model is calling defensively. Tell it to proceed
-  // and skip the round-trip through the approval UI.
-  const state = readState(config.instance);
-  const existing = state.connectors.find(
-    (c) => c.provider === providerId && c.status === "configured" && c.health === "healthy"
-  );
+  // Fast path: if a healthy + configured connector already exists, the model
+  // is calling defensively. Tell it to proceed and skip the round-trip through
+  // the approval UI. Key on the credential `name` for templateless requests,
+  // else on the provider id.
+  const state = surfaceState;
+  const existing = templateless
+    ? state.connectors.find(
+        (c) => c.name === credentialName && c.status === "configured" && c.health === "healthy"
+      )
+    : state.connectors.find(
+        (c) => c.provider === providerId && c.status === "configured" && c.health === "healthy"
+      );
   if (existing) {
+    const label = provider?.label ?? (credentialLabel || credentialName);
     return {
       kind: "sync",
-      result: `${provider.label} is already connected. Proceed with the original request.`
+      result: `${label} is already connected. Proceed with the original request.`
     };
   }
 
@@ -2652,7 +2940,7 @@ async function requestConnectorTool(
   // snapshot is only written when a task pauses for approval, so the
   // first time the model calls request_connector inside the same turn
   // it just called read_skill, only messageHistory has the evidence.
-  if (provider.setupSkill) {
+  if (provider?.setupSkill) {
     const task = state.tasks.find((t) => t.id === taskId);
     const persisted = task?.toolCallState?.messages ?? [];
     const inFlight = messageHistory ?? [];
@@ -2689,6 +2977,33 @@ async function requestConnectorTool(
     }
   }
 
+  // Resolve the user-facing target/label. For the known-provider path these
+  // come from the module; for a templateless request they come from the
+  // model's `name`/`label`. The card detects the templateless case by
+  // `credentialType` being present with no registered provider (see
+  // BlockSetupRequested / AddConnectorDialog).
+  const target = provider?.id ?? credentialName;
+  const payloadLabel = provider?.label ?? (credentialLabel || credentialName);
+  // When a skill requested this credential, resolve its NAME from state (the
+  // model supplies only the id) so the card can render "Grant <credential> to
+  // skill <name>" from a server-resolved identity rather than the
+  // model-authored reason/title. GUARD: only carry the skillId through when the
+  // named skill actually DECLARES the credential this request will mint. The
+  // model supplies skillId, so without this check the card could promise "Grant
+  // X to skill Y" for a grant /complete will then refuse (Y doesn't declare X) —
+  // the consent copy must never advertise a grant that won't happen. When the
+  // skill doesn't declare it, drop skillId + credentialSkillName: the credential
+  // is still created on completion, just not auto-granted. The /complete
+  // declares-credential check remains the authoritative backstop.
+  const requestedName = templateless
+    ? credentialName
+    : (provider ? credentialTemplateForProvider(provider)?.name : undefined);
+  const grantSkill = skillId ? state.skills.find((s) => s.id === skillId) : undefined;
+  const skillDeclaresCredential = Boolean(
+    grantSkill && requestedName && (grantSkill.requiredCredentials ?? []).includes(requestedName)
+  );
+  const effectiveSkillId = skillDeclaresCredential ? skillId : "";
+  const credentialSkillName = skillDeclaresCredential ? grantSkill?.name : undefined;
   const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
     const item = findTask(mutable, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -2697,14 +3012,28 @@ async function requestConnectorTool(
     const approval = createSetupRequest(mutable, {
       taskId: item.id,
       action: "connector.request",
-      target: provider.id,
+      target,
       reason,
       payload: {
-        provider: provider.id,
-        providerLabel: provider.label,
-        providerDescription: provider.description,
+        // Known-provider fields (undefined for templateless requests).
+        provider: provider?.id,
+        providerLabel: provider?.label,
+        providerDescription: provider?.description,
+        fields: provider?.fields,
+        // Templateless typed-credential fields (undefined for the
+        // known-provider path). credentialType present + no registered
+        // provider is how the card detects templateless.
+        credentialName: templateless ? credentialName : undefined,
+        credentialType: templateless ? credentialType : undefined,
+        credentialLabel: templateless ? payloadLabel : undefined,
+        mcpUrl: templateless && mcpUrl ? mcpUrl : undefined,
+        // Skill to auto-grant on completion (either path). Only stamped when
+        // the named skill declares this credential (see guard above), so a
+        // promised grant always matches what /complete will perform.
+        skillId: effectiveSkillId || undefined,
+        // Server-resolved name of that skill, for the card to display.
+        credentialSkillName,
         reason,
-        fields: provider.fields,
         toolCallId
       }
     });
@@ -2731,7 +3060,7 @@ async function requestConnectorTool(
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for connector connect (chat-task)",
-      data: { approvalId: approval.id, provider: provider.id, toolCallId }
+      data: { approvalId: approval.id, provider: target, toolCallId }
     });
     return approval.id;
   });
@@ -3967,7 +4296,7 @@ export function approvalToolCallId(payload: Record<string, unknown>): string | u
 async function pendingOrAuto(
   config: RuntimeConfig,
   action: PolicyAction,
-  payload: { command: string; source?: string; language?: string } | undefined,
+  payload: { command: string; source?: string; language?: string; skill?: string } | undefined,
   request: (reasonOverride?: string) => Promise<string>
 ): Promise<DispatchResult> {
   // Compute the policy decision BEFORE creating the approval so the

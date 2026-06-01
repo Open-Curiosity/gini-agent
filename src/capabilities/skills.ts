@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, normalize, sep } from "node:path";
-import type { RuntimeConfig, SkillRecord } from "../types";
+import type { RuntimeConfig, RuntimeState, SkillRecord } from "../types";
 import { addAudit, appendEvent, createSkill, mutateState, now, readState } from "../state";
 import { skillsDir } from "../paths";
 import { loadSkillsFromDisk, parseSkillFile, validateParsedSkill, type SkillLoadResult } from "./skill-loader";
@@ -21,7 +21,10 @@ export interface InstallSkillInput {
 export interface InstallSkillResult {
   skill: SkillRecord;
   manifestPath: string;
-  validation: { ok: boolean; issues: string[] };
+  // `warnings` are advisory frontmatter near-misses (see
+  // detectGiniFrontmatterWarnings); they don't block install but flag a
+  // silently-dropped declaration so the caller can re-install corrected.
+  validation: { ok: boolean; issues: string[]; warnings: string[] };
 }
 
 // Persist a SKILL.md (and optional sidecar files) under the instance
@@ -82,7 +85,7 @@ export async function installSkillFromBody(
   return {
     skill,
     manifestPath,
-    validation: { ok: issues.length === 0, issues }
+    validation: { ok: issues.length === 0, issues, warnings: parsed.warnings ?? [] }
   };
 }
 
@@ -150,6 +153,10 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
       const prev = skill.status;
       skill.status = next;
       skill.updatedAt = now();
+      // Disabling via PATCH must drop connector grants too (same as
+      // setSkillStatus) so a re-enable re-prompts for consent rather than
+      // reusing a stale grant (ADR skill-connector-consent.md).
+      if (next === "disabled") clearConnectorGrantsOnDisable(state, skill);
       // Skills are instance-level capabilities.
       addAudit(
         state,
@@ -202,12 +209,39 @@ function normalizeSkillStatusInput(status: string): SkillRecord["status"] {
   throw new Error(`Invalid skill status: ${status}`);
 }
 
+// Clear all connector grants on a skill and emit one
+// `skill.connector.revoked` audit row per cleared credential, mirroring
+// grantConnectorToSkill's granted row. Synchronous so it composes inside any
+// mutateState body — both disable paths (setSkillStatus and the updateSkill
+// status-only PATCH) call it so a re-enable always re-prompts for consent
+// (ADR skill-connector-consent.md). Bundled skills carry no written grants, so
+// this is a no-op for them.
+function clearConnectorGrantsOnDisable(state: RuntimeState, skill: SkillRecord): void {
+  const granted = skill.grantedConnectors ?? [];
+  if (granted.length === 0) return;
+  skill.grantedConnectors = [];
+  for (const credentialName of granted) {
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "skill.connector.revoked",
+        target: skill.id,
+        risk: "low",
+        evidence: { provider: credentialName }
+      },
+      { system: true }
+    );
+  }
+}
+
 export async function setSkillStatus(config: RuntimeConfig, idOrName: string, status: "enabled" | "disabled" | "archived") {
   return mutateState(config.instance, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
     skill.status = status;
     skill.updatedAt = now();
+    if (status === "disabled") clearConnectorGrantsOnDisable(state, skill);
     addAudit(
       state,
       {
@@ -218,6 +252,60 @@ export async function setSkillStatus(config: RuntimeConfig, idOrName: string, st
       },
       { system: true }
     );
+    return skill;
+  });
+}
+
+// Per-(skill, credential) consent grant. Appends the credential NAME to the
+// skill's grantedConnectors so `resolveSkillEnv` will inject that credential's
+// env. Bundled skills are auto-granted in resolveSkillEnv and never need a
+// written grant — this helper is for non-bundled skills the user consents to.
+// See docs/adr/skill-connector-consent.md.
+export async function grantConnectorToSkill(config: RuntimeConfig, idOrName: string, credentialName: string) {
+  return mutateState(config.instance, (state) => {
+    const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
+    if (!skill) throw new Error(`Skill not found: ${idOrName}`);
+    const granted = skill.grantedConnectors ?? [];
+    if (!granted.includes(credentialName)) {
+      skill.grantedConnectors = [...granted, credentialName];
+      skill.updatedAt = now();
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "skill.connector.granted",
+          target: skill.id,
+          risk: "low",
+          evidence: { provider: credentialName }
+        },
+        { system: true }
+      );
+    }
+    return skill;
+  });
+}
+
+// Revoke a previously granted credential from a skill.
+export async function revokeConnectorGrant(config: RuntimeConfig, idOrName: string, credentialName: string) {
+  return mutateState(config.instance, (state) => {
+    const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
+    if (!skill) throw new Error(`Skill not found: ${idOrName}`);
+    const granted = skill.grantedConnectors ?? [];
+    if (granted.includes(credentialName)) {
+      skill.grantedConnectors = granted.filter((p) => p !== credentialName);
+      skill.updatedAt = now();
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "skill.connector.revoked",
+          target: skill.id,
+          risk: "low",
+          evidence: { provider: credentialName }
+        },
+        { system: true }
+      );
+    }
     return skill;
   });
 }
