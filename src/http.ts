@@ -380,7 +380,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!(file instanceof Blob)) return json({ error: "Missing 'file' part" }, 400);
       const filename = file instanceof File ? file.name : undefined;
       const mimeType = file.type || "application/octet-stream";
-      if (!mimeType.startsWith("image/")) {
+      if (!mimeType.startsWith("image/") && !mimeType.startsWith("audio/")) {
         return json({ error: `Unsupported upload type: ${mimeType}` }, 415);
       }
       const bytes = new Uint8Array(await file.arrayBuffer());
