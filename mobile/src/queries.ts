@@ -719,15 +719,20 @@ export function useMarkChatUnread() {
 export interface SendMessageInput {
   content: string;
   images?: UploadRef[];
+  // Voice-message attachment. When set with empty content the gateway
+  // transcribes the audio and uses the transcript as the message text;
+  // the ref is also persisted so the thread renders a playable bubble.
+  audio?: { id: string; mimeType: string; size: number; durationMs?: number };
 }
 
 export function useSendMessage(sessionId: string | null) {
   const qc = useQueryClient();
   return useMutation<{ taskId: string }, Error, SendMessageInput>({
-    mutationFn: ({ content, images }: SendMessageInput) => {
+    mutationFn: ({ content, images, audio }: SendMessageInput) => {
       if (!sessionId) throw new Error("No session selected");
       const body: Record<string, unknown> = { content };
       if (images && images.length > 0) body.images = images;
+      if (audio) body.audio = audio;
       return api<{ taskId: string }>(`/chat/${sessionId}/messages`, {
         method: "POST",
         body: JSON.stringify(body)
