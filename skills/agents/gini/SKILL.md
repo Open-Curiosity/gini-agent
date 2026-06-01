@@ -528,14 +528,14 @@ treats each `high`-risk call: `strict | auto | yolo`. Set via
   the side effect without waiting for a human. The audit trail is
   complete: the resolution audit row carries
   `evidence.autoApproved: true` plus `autoApprovedReason:
-  "approval-mode-auto"`. Default.
+  "approval-mode-auto"`.
 - **yolo** — the approval row is still written and resolved
   through the same auto-approve path, but the policy seam skips its
   per-action gate check entirely. The resolution audit row carries
   `evidence.autoApproved: true` plus `autoApprovedReason:
   "approval-mode-yolo"`, so the audit trail stays complete; only the
-  wait disappears. Use only when the user has explicitly asked for
-  that risk profile.
+  wait disappears. This is the install default; operators can switch
+  to `strict` or `auto` via `PATCH /api/settings/auto-approve`.
 
 ```http
 GET  /api/authorizations
