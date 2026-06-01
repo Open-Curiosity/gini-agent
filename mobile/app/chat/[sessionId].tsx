@@ -22,6 +22,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError, uploadImage, type UploadRef } from "@/src/api";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
+import { VoiceRecorder, type VoiceRef } from "@/src/components/chat/VoiceRecorder";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
@@ -281,6 +282,16 @@ export default function ChatDetailScreen() {
     );
   };
 
+  // Voice messages post with empty content and the uploaded audio ref;
+  // the gateway transcribes the WAV and uses the transcript as the
+  // message text. Re-pin to the bottom so the user sees the reply, the
+  // same as a typed send.
+  const sendVoice = (audio: VoiceRef): void => {
+    if (!sessionId) return;
+    pinnedToBottomRef.current = true;
+    send.mutate({ content: "", audio });
+  };
+
   // Each picker asset gets a local id so the tray entry can be replaced
   // in place when its upload finishes (or fails), and removed by the
   // user before send. The preview uri the picker returns is a stable
@@ -516,22 +527,32 @@ export default function ChatDetailScreen() {
               style={styles.inputText}
               accessibilityLabel="Message input"
             />
-            <Pressable
-              onPress={submit}
-              disabled={sendDisabled}
-              style={[
-                styles.sendButton,
-                sendDisabled && styles.sendButtonDisabled
-              ]}
-              accessibilityRole="button"
-              accessibilityLabel="Send"
-            >
-              {send.isPending ? (
-                <ActivityIndicator color={theme.buttonText} />
-              ) : (
-                <Feather name="arrow-up" size={22} color={theme.buttonText} />
-              )}
-            </Pressable>
+            {/* Trailing control mirrors Telegram/iMessage: the send arrow
+                appears once there's text or a ready image; an empty
+                composer shows the press-and-hold mic instead. */}
+            {trimmed || readyImages.length > 0 ? (
+              <Pressable
+                onPress={submit}
+                disabled={sendDisabled}
+                style={[
+                  styles.sendButton,
+                  sendDisabled && styles.sendButtonDisabled
+                ]}
+                accessibilityRole="button"
+                accessibilityLabel="Send"
+              >
+                {send.isPending ? (
+                  <ActivityIndicator color={theme.buttonText} />
+                ) : (
+                  <Feather name="arrow-up" size={22} color={theme.buttonText} />
+                )}
+              </Pressable>
+            ) : (
+              <VoiceRecorder
+                disabled={!sessionId || showSendBusy || anyUploading}
+                onSend={sendVoice}
+              />
+            )}
           </View>
         </View>
       </KeyboardAvoidingView>
