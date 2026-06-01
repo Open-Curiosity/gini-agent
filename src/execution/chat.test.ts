@@ -27,7 +27,8 @@ import {
   normalizeProvider
 } from "../provider";
 import { decideApproval } from "../agent";
-import { createChatMessage, insertChatBlock, mutateState, readState } from "../state";
+import { createChatMessage, insertChatBlock, listChatBlocks, mutateState, readState } from "../state";
+import { storeUpload } from "../state/uploads";
 import { createScheduledJob } from "../jobs";
 import {
   getChatSession,
@@ -402,6 +403,41 @@ describe("chat session waiting-approval placeholder", () => {
     expect(message).not.toBeNull();
     expect(message?.role).toBe("assistant");
     expect(message?.content).toContain("Approval denied");
+  });
+
+  test("transcribes an audio-only message and persists the voice attachment", async () => {
+    const config = buildConfig(workspaceRoot, "chat-voice-message");
+    const provider = normalizeProvider(config.provider);
+    setEchoToolCallingResponse({ provider, text: "Heard you.", toolCalls: [], finishReason: "stop" });
+
+    // Echo STT keeps the test fast + offline — no whisper download.
+    process.env.GINI_STT_PROVIDER = "echo";
+    try {
+      const ref = storeUpload(config.instance, new Uint8Array([1, 2, 3, 4]), "audio/wav", "voice.wav");
+      const session = await createChat(config, { title: "voice" });
+      const submission = await submitChatMessage(config, session.id, {
+        content: "",
+        audio: { id: ref.id, mimeType: ref.mimeType, size: ref.size, durationMs: 1200 }
+      });
+      await waitForStatus(config, submission.taskId, (t) => t.status === "completed");
+
+      const blocks = listChatBlocks(config.instance, session.id);
+      const userBlock = blocks.find((b) => b.kind === "user_text");
+      expect(userBlock?.kind).toBe("user_text");
+      if (userBlock?.kind === "user_text") {
+        expect(userBlock.text).toBe("[voice message]");
+        expect(userBlock.audio?.id).toBe(ref.id);
+        expect(userBlock.audio?.mimeType).toBe("audio/wav");
+        expect(userBlock.audio?.durationMs).toBe(1200);
+      }
+
+      const stateNow = readState(config.instance);
+      const userMsg = stateNow.chatMessages.find((m) => m.role === "user" && m.taskId === submission.taskId);
+      expect(userMsg?.content).toBe("[voice message]");
+      expect(userMsg?.audio?.id).toBe(ref.id);
+    } finally {
+      delete process.env.GINI_STT_PROVIDER;
+    }
   });
 
   test("auto-renames a default chat with a provider-generated title after two synced turns", async () => {

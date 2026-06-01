@@ -14,8 +14,9 @@ import {
   readState,
   renameChatSession
 } from "../state";
-import type { AssistantTextBlock, ChatBlock, ChatMessageRecord, ImageAttachment, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
-import { uploadExists } from "../state/uploads";
+import type { AssistantTextBlock, AudioAttachment, ChatBlock, ChatMessageRecord, ImageAttachment, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
+import { readUpload, uploadExists } from "../state/uploads";
+import { getSttProvider } from "../stt";
 import { generateStructured } from "../provider";
 import { providerOverrideForRuntime, resolveEffectiveContext } from "./effective-context";
 import { createConversationRun, linkRunToTask } from "./runs";
@@ -235,10 +236,50 @@ function parseImageAttachments(instance: string, raw: unknown): ImageAttachment[
   return out;
 }
 
+// Parse the optional voice attachment on a submit. Mirrors the image-upload
+// validation: reject a missing/foreign upload id so a client can't pin an
+// audio bubble with no backing bytes. Audio must be an audio/* upload —
+// guard the mime so a stray image id can't masquerade as a recording.
+function parseAudioAttachment(instance: string, raw: unknown): AudioAttachment | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const item = raw as Record<string, unknown>;
+  const id = typeof item.id === "string" ? item.id : "";
+  const mimeType = typeof item.mimeType === "string" ? item.mimeType : "";
+  if (!id || !mimeType) throw new Error("Invalid input: audio attachment requires id and mimeType.");
+  if (!mimeType.startsWith("audio/")) {
+    throw new Error(`Invalid input: audio attachment must be an audio/* upload: ${mimeType}`);
+  }
+  if (!uploadExists(instance, id)) {
+    throw new Error(`Invalid input: audio upload not found: ${id}`);
+  }
+  const size = typeof item.size === "number" ? item.size : Number(item.size ?? 0);
+  const durationMs = typeof item.durationMs === "number" ? item.durationMs : undefined;
+  return { id, mimeType, size, ...(durationMs !== undefined ? { durationMs } : {}) };
+}
+
 export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
-  const content = String(input.content ?? "").trim();
+  let content = String(input.content ?? "").trim();
   const images = parseImageAttachments(config.instance, input.images);
-  if (!content && images.length === 0) {
+  const audio = parseAudioAttachment(config.instance, input.audio);
+  // A voice message arrives with empty content — transcribe the recording so
+  // the transcript becomes the message content. The audio itself never
+  // reaches the provider; only this transcript does. A transcription failure
+  // leaves content empty so the message still posts with its audio bubble.
+  if (audio && !content) {
+    const upload = readUpload(config.instance, audio.id);
+    if (upload) {
+      try {
+        content = (await getSttProvider().transcribe(upload.bytes)).trim();
+      } catch (error) {
+        appendLog(config.instance, "chat.stt.failed", {
+          sessionId,
+          uploadId: audio.id,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  }
+  if (!content && images.length === 0 && !audio) {
     throw new Error("Chat message content is required.");
   }
   const state = readState(config.instance);
@@ -264,7 +305,8 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
       content,
       taskId: task.id,
       runId: run.id,
-      ...(images.length > 0 ? { images } : {})
+      ...(images.length > 0 ? { images } : {}),
+      ...(audio ? { audio } : {})
     });
     const runRecord = current.runs.find((item) => item.id === run.id);
     if (runRecord) {
@@ -287,7 +329,8 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
       taskId: task.id,
       runId: run.id,
       agentId: session.agentId ?? null,
-      ...(images.length > 0 ? { images } : {})
+      ...(images.length > 0 ? { images } : {}),
+      ...(audio ? { audio } : {})
     });
   } catch (error) {
     appendLog(config.instance, "chat.user_block.insert_failed", {
