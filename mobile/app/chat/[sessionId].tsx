@@ -402,7 +402,13 @@ export default function ChatDetailScreen() {
 
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : undefined}
-        keyboardVerticalOffset={Platform.OS === "ios" ? 80 : 0}
+        // No vertical offset: the SafeAreaView is this screen's root view
+        // (the native stack header is hidden), so KeyboardAvoidingView's
+        // own onLayout frame is already in screen coordinates and accounts
+        // for the custom header + top inset. Any non-zero offset here is
+        // pure over-padding and leaves a gap between the composer and the
+        // keyboard.
+        keyboardVerticalOffset={0}
         style={styles.flex}
       >
         {stream.isPending && !stream.blocks ? (
