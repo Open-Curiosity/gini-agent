@@ -219,6 +219,39 @@ describe("buildAgentSystemContext", () => {
     });
     expect(out).toBe("RULES");
   });
+
+  test("agentName sources the identity line from the agent's name", () => {
+    // A non-default agent must self-identify by its own name, not by the
+    // bundled default's "Gini". The leading identity sentence in the
+    // default instructions is replaced; the rest of the operating rules
+    // (e.g. "Reply directly") survive.
+    const out = buildAgentSystemContext({ agentName: "Mansour" });
+    expect(out.startsWith("You are Mansour, a personal agent.")).toBe(true);
+    expect(out).toContain("Reply directly");
+    expect(out).not.toContain("You are Gini");
+  });
+
+  test("agentName 'Gini' against the default file is byte-identical to omitting it", () => {
+    // Backward-compat pin: the default agent named "Gini" against the
+    // unmodified default file must produce exactly today's output, so the
+    // change is a no-op for existing default-agent instances.
+    expect(buildAgentSystemContext({ agentName: "Gini" })).toBe(buildAgentSystemContext());
+  });
+
+  test("agentName prepends the identity line to an override lacking one", () => {
+    // A custom override with no leading identity sentence keeps all its
+    // content; the agent-derived line is prepended, joined with a single
+    // newline.
+    const out = buildAgentSystemContext({
+      agentName: "Mansour",
+      instructionsOverride: "Custom rules only."
+    });
+    expect(out).toBe("You are Mansour, a personal agent.\nCustom rules only.");
+  });
+
+  test("absent agentName leaves the instructions unchanged", () => {
+    expect(buildAgentSystemContext()).toBe(expectedDefaultInstructions);
+  });
 });
 
 describe("renderEphemeralContext", () => {
