@@ -16,7 +16,7 @@ import {
 } from "../state";
 import type { AssistantTextBlock, ChatBlock, ChatMessageRecord, ImageAttachment, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
 import { uploadExists } from "../state/uploads";
-import { generateStructured, providerAuthFailureText, providerDisplayLabel } from "../provider";
+import { generateStructured, providerAuthFailureText, providerDisplayLabel, providerReauth } from "../provider";
 import { providerOverrideForRuntime, resolveEffectiveContext } from "./effective-context";
 import { createConversationRun, linkRunToTask } from "./runs";
 
@@ -367,7 +367,10 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
     const content = task.status === "completed"
       ? task.summary ?? "Task completed."
       : task.authErrorProvider
-        ? providerAuthFailureText(providerDisplayLabel(task.authErrorProvider))
+        ? providerAuthFailureText(
+            providerDisplayLabel(task.authErrorProvider),
+            providerReauth(task.authErrorProvider)
+          )
         : task.error ?? task.currentStep ?? `Task is ${task.status}.`;
     const message = createChatMessage(state, { sessionId, role: "assistant", content, taskId, runId: task.runId });
     if (task.runId) {

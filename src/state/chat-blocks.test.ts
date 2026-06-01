@@ -599,11 +599,13 @@ describe("chat-blocks persistence", () => {
     insertChatBlock(instance, {
       kind: "system_note",
       sessionId: "chat_auth",
-      text: "Codex authentication expired. Re-authenticate Codex to continue.",
+      text: "Codex authentication failed. Re-authenticate Codex to continue.",
       authError: {
         provider: "codex",
         providerLabel: "Codex",
-        detail: "Provided authentication token is expired. Please try signing in again."
+        detail: "Provided authentication token is expired. Please try signing in again.",
+        reauthKind: "docs",
+        reauthUrl: "https://gini.lilaclabs.ai/docs/providers/codex#reauth"
       }
     });
     insertChatBlock(instance, {
@@ -619,7 +621,9 @@ describe("chat-blocks persistence", () => {
     expect(authNote.authError).toEqual({
       provider: "codex",
       providerLabel: "Codex",
-      detail: "Provided authentication token is expired. Please try signing in again."
+      detail: "Provided authentication token is expired. Please try signing in again.",
+      reauthKind: "docs",
+      reauthUrl: "https://gini.lilaclabs.ai/docs/providers/codex#reauth"
     });
     expect(plainNote.authError).toBeUndefined();
   });

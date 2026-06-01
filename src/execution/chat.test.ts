@@ -447,17 +447,21 @@ describe("chat session waiting-approval placeholder", () => {
     expect(note.authError).toEqual({
       provider: "codex",
       providerLabel: "Codex",
-      detail: "Provided authentication token is expired. Please try signing in again."
+      detail: "Provided authentication token is expired. Please try signing in again.",
+      reauthKind: "docs",
+      reauthUrl: "https://gini.lilaclabs.ai/docs/providers/codex#reauth"
     });
     expect(note.text).toBe("Codex authentication failed. Re-authenticate Codex to continue.");
 
     // The failed provider is recorded on the task so text-only clients
-    // (messaging/CLI) get the same actionable line via syncChatTaskResult,
-    // not the raw "token expired" message.
+    // (messaging/CLI) get the same actionable line via syncChatTaskResult —
+    // for codex, the docs link inline since there's no CTA button.
     const failedTask = readState(config.instance).tasks.find((t) => t.id === taskId);
     expect(failedTask?.authErrorProvider).toBe("codex");
     const synced = await syncChatTaskResult(config, session.id, taskId);
-    expect(synced?.content).toBe("Codex authentication failed. Re-authenticate Codex to continue.");
+    expect(synced?.content).toBe(
+      "Codex authentication failed. Re-authenticate Codex to continue: https://gini.lilaclabs.ai/docs/providers/codex#reauth"
+    );
 
     // A non-auth failure must NOT carry authError — the raw message passes
     // through as before.
@@ -529,7 +533,16 @@ describe("chat session waiting-approval placeholder", () => {
     const note = listChatBlocks(config.instance, session.id).find((b) => b.kind === "system_note");
     if (note?.kind !== "system_note") throw new Error("expected a system_note block");
     expect(note.authError?.provider).toBe("openai");
+    // openai is API-key, so the CTA routes to the in-app Settings form, not docs.
+    expect(note.authError?.reauthKind).toBe("settings");
+    expect(note.authError?.reauthUrl).toBe("/settings");
     expect(note.text).toBe("OpenAI authentication failed. Re-authenticate OpenAI to continue.");
+
+    // Text-only clients get the Settings-form line for an API-key provider.
+    const synced = await syncChatTaskResult(config, session.id, taskId);
+    expect(synced?.content).toBe(
+      "OpenAI authentication failed. Update your OpenAI API key in Settings → Providers."
+    );
   });
 
   test("auto-renames a default chat with a provider-generated title after two synced turns", async () => {
