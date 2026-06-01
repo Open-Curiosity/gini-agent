@@ -45,28 +45,14 @@ through the same loop. So the loop comes first.
   for tests.
 - `src/execution/tool-catalog.ts` produces OpenAI-shape specs filtered
   by enabled toolsets. The catalog is hashed; the loop captures the hash
-  on pause so a reader can see which catalog the resume runs against.
-- **Deferred tools.** A catalog tool may be marked `deferred: true`. Its
-  NAME + a one-line `indexSummary` surface in a system-prompt "Tools
-  available on demand" index, but its full schema is withheld from the
-  live provider `tools` array until the model loads it via the core
-  always-on `load_tools({ names })` meta-tool. `load_tools` is handled
-  INLINE in the chat-task loop (not via the dispatch switch): it unions
-  the names into a per-task loaded set, recomputes the provider `tools`
-  array so the next iteration ships the new schemas, and persists the set
-  on `Task.loadedTools` so it survives an approval pause/resume (runLoop
-  re-seeds the loaded set from the task row on every entry). The
-  `tools`/`providerTools`/`toolsHash` are now per-iteration `let`s
-  recomputed only after a load — the hot no-load path is unchanged. This
-  keeps the live full-schema tool count low (weak local providers degrade
-  past ~30-50 live tools) while preserving access to the whole catalog.
-  The browser cluster (16 of 18 tools; `browser_fill_secrets` /
-  `browser_connect` stay core) and the nine self-config tools (see ADR
-  self-config-registry.md) are deferred; the rest stay core. A subagent
-  whose whitelisted toolsets own deferred tools gets those seeded live at
-  runLoop entry (no `load_tools` round-trip). A deferred tool reaching the
-  dispatcher's default case unloaded returns a recoverable "load it first"
-  nudge instead of throwing `Unknown tool`.
+  on pause so a reader can see which catalog the resume runs against (the
+  hash is telemetry, not enforced on resume).
+- Catalog tools may be marked `deferred`: their schemas are withheld from
+  the live provider `tools` array until the model loads them by name via
+  the core `load_tools` meta-tool, which the loop handles inline and
+  persists on `Task.loadedTools`. This keeps the live full-schema tool
+  count low. See ADR deferred-tools.md for the mechanism, the
+  persistence / resume contract, and which clusters are deferred.
 - `src/execution/tool-dispatch.ts` is the per-tool handler: low-risk
   tools (`file_read`, `file_list`, `file_search`, `web_fetch`) execute
   synchronously and return a string; high-risk tools (`file_write`,

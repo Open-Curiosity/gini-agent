@@ -3,47 +3,33 @@
 ## Decision
 
 Gini introspects and reconfigures its own runtime — provider/model, active
-agent, skills, MCP servers, connectors — through **direct, deferred tools**
-(one per capability), surfaced via the general deferred-tools mechanism
-(catalog `deferred` flag + the `load_tools` meta-tool; see
-agent-loop-tool-calling.md). Each capability is its own catalog tool whose
-name is the operation name (`get_self`, `list_providers`, `set_provider`,
-`use_agent`, …). The tool names + one-line summaries appear in the system
-prompt's "Tools available on demand" index; the model `load_tools` the ones
-it needs, then calls them directly by name.
+agent, skills, MCP servers, connectors — through **direct tools**, one per
+capability, whose name is the operation name (`get_self`, `list_providers`,
+`set_provider`, `use_agent`, …). The model calls each tool directly by name.
 
-This **supersedes the original two-meta-tool facade** (`self_discover` /
-`self_invoke`). The general deferred-tools mechanism now solves the
-keep-the-live-tool-count-low problem for the whole catalog, so a domain
--specific discover/invoke indirection is no longer warranted — the self ops
-ride the same load-on-demand path as every other deferred tool.
+These tools are **deferred** (ADR deferred-tools.md): their schemas are
+withheld from the live provider `tools` array until the model loads them by
+name via `load_tools`, so the count of full-schema tools the model sees each
+turn stays low even as the number of self operations grows — which matters for
+weaker local providers whose tool-selection accuracy degrades with that count.
 
-The tools still front a registry of `SelfOperation` records in
-`src/execution/self-registry.ts`, which remains the single source of truth for
-each capability's BEHAVIOR: its `tag` (`query` => synchronous read; `mutate`
-=> routed through the approval seam), its `handler`, and its arg `schema` (the
+The tools front a registry of `SelfOperation` records in
+`src/execution/self-registry.ts`, the single source of truth for each
+capability's BEHAVIOR: its `tag` (`query` => synchronous read; `mutate` =>
+routed through the approval seam), its `handler`, and its arg `schema` (the
 catalog entry mirrors this schema in its `function.parameters`). Adding a
 capability = registering one operation here plus a matching catalog entry.
 
-Because the tools are deferred, their full schemas are withheld from the live
-provider `tools` array until loaded. This keeps the live full-schema tool
-count low even as the number of self operations grows, which matters for
-weaker local providers whose tool-selection accuracy degrades as the live tool
-count grows.
-
 ## Context
-
-The catalog described in ADR agent-loop-tool-calling.md is a static list — one
-OpenAI-shape spec per tool, all sent to the model every turn. Its own Deferred
-section flags this ("the catalog is currently a static list"). Exposing every
-self-config capability as its own catalog entry does not scale: each wrapped
-capability costs prompt tokens on every turn, and a large flat tool surface
-degrades model tool-selection — earlier and more steeply for the weaker
-providers Gini must support (local OpenAI-compatible servers, smaller models).
 
 The motivating failure was concrete: asked "what model are you using," Gini
 answered "I don't have visibility into the exact underlying model name" — it
-had no tool to introspect itself and fell back to a disclaimer.
+had no tool to introspect itself and fell back to a disclaimer. Gini needs to
+inspect and change its own runtime from chat, but giving each self capability
+an always-on catalog entry costs prompt tokens every turn and enlarges the flat
+tool surface that degrades model tool-selection. The deferred-tools mechanism
+(ADR deferred-tools.md) removes that cost — self tools surface by name and load
+on demand — so the remaining decision is the SHAPE of the self surface.
 
 Two priors informed the shape:
 
@@ -56,11 +42,9 @@ Two priors informed the shape:
 
 We keep **named operations** (`set_provider`, not a raw path), because the
 names are what the model selects against and good names drive selection
-accuracy. The original facade froze a two-entry surface and did the discovery
-inside the meta-tools' handlers; the deferred-tools mechanism instead withholds
-each op's schema until `load_tools` pulls it live and the chat-task loop
-recomputes its `tools` array (see agent-loop-tool-calling.md). The loaded set
-persists on the task so it survives an approval pause/resume.
+accuracy. Each op's schema is withheld until `load_tools` pulls it live (ADR
+deferred-tools.md), so the discovery cost is paid only when a self capability
+is actually used.
 
 ## Required Now
 
@@ -90,9 +74,10 @@ persists on the task so it survives an approval pause/resume.
   `{ opName, args }`, runs the registry handler, and writes an approval-linked
   audit row (`approvalId`, `risk: medium`, the operation outcome) mirroring the
   `messaging.send` branch so the operation is joinable to the approval that
-  authorized it (ADR approval-and-audit-substrate.md). Because the direct tool
-  name equals the op name and its args are top-level, this payload shape is
-  identical to the retired facade's — `executeApprovedAction` is unchanged.
+  authorized it (ADR approval-and-audit-substrate.md). The direct tool name is
+  the op name and its args are top-level, so `dispatchSelfOp` carries them onto
+  the approval payload and `executeApprovedAction` re-runs the handler from
+  there.
 - The nine self tool names do not trip the `riskForTool` substring heuristic
   (none contain `write`/`exec`/`invoke`/`send`), so they correctly seed as
   `low` at the tool-name level; per-operation gating happens inside dispatch
@@ -150,7 +135,7 @@ operations, add their catalog entries (deferred), and tag their risk.
 
 - `buildToolCatalog` carries the nine self tools (toolset `self`,
   `deferred: true`); `applyDeferralFilter(catalog, ∅)` excludes them until
-  loaded; `self_discover` / `self_invoke` are gone.
+  loaded.
 - A `query` tool (`get_self`) dispatched directly returns a sync result; a
   `mutate` tool returns a pending approval under `strict` and auto-resolves
   (running the handler) under `auto`; the resulting `self.config` audit row
