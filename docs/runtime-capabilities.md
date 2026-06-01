@@ -36,7 +36,7 @@ bun run gini evidence
 | Search | `gini search <query>`, `/api/search` with task, trace, skill, and audit citations (pinned-memory citations were dropped with the state.memories consolidation; Hindsight recall is its own surface via `recall_memory`) |
 | Jobs | `gini jobs list/add/run/pause/resume/remove/runs/replay`, prompt jobs, and script jobs |
 | File tools | task inputs: `read`, `list`, `find`, `write`, `patch` |
-| Terminal/code tools | task inputs: `shell`, `code js|python :: ...`, approval gated under `approvalMode: "strict"`; under the default `"auto"` mode safe commands auto-run and dangerous shapes still gate (see ADR approval-mode.md) |
+| Terminal/code tools | task inputs: `shell`, `code js|python :: ...`, approval gated under `approvalMode: "strict"`; under the default `"yolo"` mode every gate is bypassed, and the safe-middle `"auto"` mode (which operators can switch to) auto-runs safe commands while dangerous shapes still gate (see ADR approval-mode.md) |
 | Approval settings | `GET/PATCH /api/settings/auto-approve` for `approvalMode` (`strict`/`auto`/`yolo`), `autoApproveCommands` (shell-glob allowlist for `terminal_exec`), and `dangerousTerminalPatterns` (operator extension to the built-in blocklist) |
 | Toolsets | `gini toolsets list/enable/disable`, `/api/toolsets` |
 | Providers | `gini provider show/catalog/set`, Codex OAuth, OpenAI, OpenRouter-compatible records, echo |

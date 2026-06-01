@@ -916,7 +916,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           approvalMode: {
             type: "string",
             enum: ["strict", "auto", "yolo"],
-            description: "Approval policy for this job's spawned tasks only. \"strict\" gates every approval-eligible action. \"auto\" (instance default) auto-approves file writes / safe shell commands, gates dangerous shell patterns. \"yolo\" bypasses everything (full audit trail still written). When omitted, the spawned task inherits the operator's instance default."
+            description: "Approval policy for this job's spawned tasks only. \"strict\" gates every approval-eligible action. \"auto\" auto-approves file writes / safe shell commands, gates dangerous shell patterns. \"yolo\" bypasses everything (full audit trail still written). When omitted, the spawned task inherits the operator's instance default."
           },
           dangerousTerminalPatterns: {
             type: "array",

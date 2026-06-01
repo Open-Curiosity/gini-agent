@@ -157,8 +157,9 @@ export interface ProviderConfig {
 // - "strict" — every approval-eligible action creates a pending approval
 //   row and pauses the task for a human decision. Matches the legacy
 //   pre-flip default.
-// - "auto" — the new default. Auto-approve `file.write`, `file.patch`,
-//   and `browser.upload_file` unconditionally. For `terminal.exec` and
+// - "auto" — a safe-middle mode (no longer the default; operators can
+//   switch to it). Auto-approve `file.write`, `file.patch`, and
+//   `browser.upload_file` unconditionally. For `terminal.exec` and
 //   `code_exec`, auto-approve unless the command (or, for `code_exec`,
 //   either the shell wrapper OR the raw source — see
 //   `matchDangerousSource`) matches a dangerous-pattern entry (see
@@ -203,10 +204,12 @@ export interface RuntimeConfig {
   // blocklist below — explicit operator opt-in wins over the heuristic.
   autoApproveCommands?: string[];
   // Approval-policy mode. Drives `resolveApprovalPolicy`. Fresh instances
-  // default to "auto" via `defaultConfig`. Legacy config files that carry
-  // `dangerouslyAutoApprove: true` without an `approvalMode` set are
-  // migrated to "yolo" at load time and emit a one-time `config.migrated`
-  // audit row. See ADR approval-mode.md.
+  // default to "yolo" via `defaultConfig`; existing configs that predate
+  // an explicit `approvalMode` backfill "auto" in `loadConfig` so the
+  // default flip never silently escalates an already-created instance.
+  // Legacy config files that carry `dangerouslyAutoApprove: true` without
+  // an `approvalMode` set are migrated to "yolo" at load time and emit a
+  // one-time `config.migrated` audit row. See ADR approval-mode.md.
   approvalMode?: ApprovalMode;
   // Optional operator-supplied list of substring patterns that should
   // GATE a `terminal.exec` call even under `approvalMode: "auto"`. Each
