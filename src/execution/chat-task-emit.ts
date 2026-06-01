@@ -42,6 +42,7 @@ import type {
   RiskLevel,
   RuntimeConfig,
   SetupRequestAction,
+  SystemNoteAuthError,
   Task,
   ToolCallStatus
 } from "../types";
@@ -118,15 +119,18 @@ export function emitPhase(
 // Emit a system_note block. Used for terminal-bail-out markers
 // (cancellation, iteration-cap exhaustion, dispatch error before any
 // tool ran) — anything that's runtime-level rather than user- or
-// assistant-authored.
+// assistant-authored. Pass `authError` for a provider-credential failure
+// so the client can name the provider and offer a re-auth CTA (issue #205).
 export function emitSystemNote(
   ctx: ChatEmitContext | undefined,
-  text: string
+  text: string,
+  authError?: SystemNoteAuthError
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
   return insertChatBlock(ctx.instance, {
     kind: "system_note",
     text,
+    ...(authError ? { authError } : {}),
     ...bookkeepingFor(ctx)
   });
 }
