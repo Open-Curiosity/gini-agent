@@ -86,6 +86,11 @@ export function VoiceRecorder({
   const [cancelling, setCancelling] = useState(false);
   const [uploading, setUploading] = useState(false);
   const startedAtRef = useRef<number>(0);
+  // Synchronous mirror of "a take is in progress". The gesture's end /
+  // finalize callbacks both route here via runOnJS, and a permission
+  // denial leaves the take unstarted — gating on this ref keeps us from
+  // calling recorder.stop() when nothing is recording.
+  const activeRef = useRef(false);
 
   // Drives the slide-to-cancel hint translation and the pulsing dot. Both
   // live on the UI thread so the drag and pulse stay smooth regardless of
@@ -124,12 +129,18 @@ export function VoiceRecorder({
     await recorder.prepareToRecordAsync();
     recorder.record();
     startedAtRef.current = Date.now();
+    activeRef.current = true;
     setCancelling(false);
     setRecording(true);
   }, [recorder]);
 
   const stop = useCallback(
     async (cancel: boolean) => {
+      // A lifted-too-fast tap (gesture never activated) or a denied
+      // permission prompt reaches here with no take running — nothing to
+      // stop, and recorder.stop() would reject.
+      if (!activeRef.current) return;
+      activeRef.current = false;
       const durationMs = Date.now() - startedAtRef.current;
       await recorder.stop();
       const uri = recorder.uri;
