@@ -42,6 +42,8 @@ Byte-stable system-prefix assembly order in `buildAgentSystemContext`:
 2. `SOUL.md` content (per active agent, when present)
 3. `USER.md` content (when present)
 
+The leading "You are X, a personal agent." identity sentence is sourced from the active agent's `AgentRecord.name` (threaded in via `buildAgentSystemContext`'s `agentName` option) and replaces any leading identity sentence carried in `INSTRUCTIONS.md`; the remaining `INSTRUCTIONS.md` operating rules follow it unchanged. The default agent is named "Gini", so the default case is byte-identical to before; a non-default agent self-identifies by its own name. When `agentName` is absent, the `INSTRUCTIONS.md` content (including whatever identity sentence it carries) is emitted verbatim.
+
 The runtime identity block and long-term recalled memory are no longer part of the system prefix — they vary per turn, so they ride in the ephemeral `role:"user"` tail rendered by `renderEphemeralContext` (identity then memory), placed after the full prior transcript and immediately before the real user message. This keeps message 0 byte-stable for prompt caching. See ADR stable-system-prefix.md.
 
 All three files are passed through a prompt-injection scanner before they reach the prompt. Files that match a threat pattern are replaced inline with a `[BLOCKED: ... ]` notice and a warning is recorded in the runtime trace; the gateway does not crash on a malicious file.
@@ -65,8 +67,8 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 
 ## Required Now
 
-- `src/runtime/defaults/INSTRUCTIONS.md` is the single source of truth for the default operating rules. Every byte of this file is spliced verbatim into the system prompt when no per-instance `INSTRUCTIONS.md` exists, and the scaffolder copies the same bytes into freshly-installed instances. There is no in-code constant; the prior `DEFAULT_GINI_INSTRUCTIONS` string has been replaced.
-- `src/system-prompt.ts` exports `getDefaultGiniInstructions()` (memoized per-process, reads and trims the bundled file) and `DEFAULT_INSTRUCTIONS_PATH` (the resolved path other modules import). A missing bundle file is unrecoverable — both the runtime fallback and the scaffolder throw with `"default INSTRUCTIONS.md missing from bundle"` rather than silently falling back to an empty string. `buildAgentSystemContext` takes an options object with `instructionsOverride`, `soul`, and `userProfile`; the call assembles them into the byte-stable prefix in the order above. (Per-turn identity + recalled memory render through `renderEphemeralContext` into the role:"user" tail — see ADR stable-system-prefix.md.)
+- `src/runtime/defaults/INSTRUCTIONS.md` is the single source of truth for the default operating rules. The operating rules of this file are spliced verbatim into the system prompt when no per-instance `INSTRUCTIONS.md` exists, and the scaffolder copies the same bytes into freshly-installed instances. The one exception is the leading "You are X, a personal agent." identity sentence: when `agentName` is provided, the per-agent name owns that sentence and the file's leading identity sentence is replaced. There is no in-code constant; the prior `DEFAULT_GINI_INSTRUCTIONS` string has been replaced.
+- `src/system-prompt.ts` exports `getDefaultGiniInstructions()` (memoized per-process, reads and trims the bundled file) and `DEFAULT_INSTRUCTIONS_PATH` (the resolved path other modules import). A missing bundle file is unrecoverable — both the runtime fallback and the scaffolder throw with `"default INSTRUCTIONS.md missing from bundle"` rather than silently falling back to an empty string. `buildAgentSystemContext` takes an options object with `instructionsOverride`, `soul`, `userProfile`, and `agentName`; the call assembles them into the byte-stable prefix in the order above. (Per-turn identity + recalled memory render through `renderEphemeralContext` into the role:"user" tail — see ADR stable-system-prefix.md.)
 - `src/runtime/identity-files.ts` owns file I/O and the injection scan:
   - `loadInstructions(instance)`, `loadSoul(instance, agentId)`, `loadUserProfile(instance)` return either the scanned content, a `[BLOCKED: ...]` notice, or `null` when the file is absent.
   - `writeSoul(instance, agentId, content, status)` and `writeUserProfile(instance, content, status)` write `<file>` for approved content and `<file>.proposed` for proposed content. The gateway only reads the approved file into the prompt; proposals require approval via the API.
@@ -126,7 +128,7 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 ## Critical Files
 
 - `src/runtime/defaults/INSTRUCTIONS.md` — the canonical default operating rules. Single source of truth: the runtime fallback reads it (trimmed, memoized) and the scaffolder copies it bytes-as-is into freshly-installed instances.
-- `src/system-prompt.ts` — `getDefaultGiniInstructions()` + `DEFAULT_INSTRUCTIONS_PATH`; `buildAgentSystemContext` accepts `instructionsOverride`, `soul`, `userProfile`.
+- `src/system-prompt.ts` — `getDefaultGiniInstructions()` + `DEFAULT_INSTRUCTIONS_PATH`; `buildAgentSystemContext` accepts `instructionsOverride`, `soul`, `userProfile`, `agentName`.
 - `src/runtime/identity-files.ts` — load/write/scan helpers; `scaffoldInstanceIdentityFiles` reads the bundled defaults file once per call.
 - `src/execution/chat-task.ts`, `src/provider.ts` — call sites that load and forward the three files.
 - `src/execution/tool-catalog.ts`, `src/execution/tool-dispatch.ts` — `edit_soul` and `edit_user_profile`.

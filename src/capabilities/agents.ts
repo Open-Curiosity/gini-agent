@@ -18,7 +18,11 @@ export function listAgents(config: RuntimeConfig) {
 }
 
 export async function createAgent(config: RuntimeConfig, input: Record<string, unknown>) {
-  const name = String(input.name ?? "");
+  // The name flows into the system prompt as the "You are X, a personal
+  // agent." identity line, so collapse every whitespace run (incl.
+  // embedded \n/\r/\t) to a single space and trim — this keeps the stored
+  // name a clean single-line label and rejects whitespace-only input.
+  const name = String(input.name ?? "").replace(/\s+/g, " ").trim();
   if (!name) throw new Error("Agent name is required.");
   const record = await mutateState(config.instance, (state) => {
     // Config (provider, toolsets, memory scopes, messaging targets) is

@@ -369,10 +369,15 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const activeAgent = effectiveForAgent.agentId
     ? state.agents.find((a) => a.id === effectiveForAgent.agentId)
     : undefined;
+  // agentName applies only to the non-subagent path. This same
+  // buildAgentSystemContext call is also the fallback for a subagent whose
+  // systemPrompt is empty; feeding the parent agent's name there would
+  // change the subagent fallback preamble, so it stays undefined for
+  // subagents (their persona is the parent's responsibility).
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt
     : buildAgentSystemContext({
-        agentName: activeAgent?.name,
+        agentName: subagent ? undefined : activeAgent?.name,
         instructionsOverride,
         soul: soulBlock,
         userProfile: userProfileBlock

@@ -194,7 +194,13 @@ export function buildAgentSystemContext(options?: AgentSystemContextOptions): st
   // file's line-1/line-2 separator, so the default agent named "Gini"
   // against the unmodified default file is byte-identical to omitting
   // agentName. Absent/blank name leaves the instructions untouched.
-  const agentName = options?.agentName?.trim();
+  //
+  // The name becomes verbatim system-prompt text, so collapse every
+  // whitespace run (incl. embedded \n/\r/\t) to a single space before
+  // trimming — a name carrying a newline would otherwise inject a second
+  // system-prompt line. "Gini" has no whitespace, so it is byte-identical
+  // after this and the backward-compat pin still holds.
+  const agentName = options?.agentName?.replace(/\s+/g, " ").trim();
   if (agentName) {
     const rules = instructions.replace(LEADING_IDENTITY_SENTENCE, "").replace(/^\n+/, "");
     const identityLine = `You are ${agentName}, a personal agent.`;
