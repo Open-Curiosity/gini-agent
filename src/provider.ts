@@ -222,12 +222,39 @@ export class ProviderAuthError extends Error {
   }
 }
 
+export type ProviderReauth = { kind: "docs" | "settings"; url: string };
+
+// Hosted documentation root. Re-auth step-throughs for OAuth/CLI providers live
+// here so the instructions have a single source and never drift from code.
+const DOCS_BASE_URL = "https://gini.lilaclabs.ai/docs";
+
+// Where to send the user to re-establish a failed provider credential. OAuth/
+// CLI providers (codex) have no in-app form and a non-obvious terminal flow, so
+// they link to the hosted step-through docs. API-key providers link straight to
+// the Settings → Providers key form — the specific cause is already in the
+// provider's own 401/403 message (surfaced as the note's detail), so no doc is
+// needed. The OAuth-vs-API-key split is read from the catalog's `auth` field,
+// not re-encoded here. See ADR provider-reauth-guidance.md.
+export function providerReauth(name: ProviderName): ProviderReauth {
+  const entry = providerCatalog().find((item) => item.name === name);
+  if (entry?.auth === "codex-oauth") {
+    return { kind: "docs", url: `${DOCS_BASE_URL}/providers/${name}#reauth` };
+  }
+  return { kind: "settings", url: "/settings" };
+}
+
 // Actionable copy for a failed provider credential, shared by the chat system
 // note and the legacy assistant message so every client surface says the same
 // thing. Neutral on the failure mode (the classifier matches expired, invalid,
-// revoked, 401, …), so it reads correctly for all of them.
-export function providerAuthFailureText(providerLabel: string): string {
-  return `${providerLabel} authentication failed. Re-authenticate ${providerLabel} to continue.`;
+// revoked, 401, …). Pass `reauth` for text-only clients (CLI/messaging) that
+// can't render a CTA button — the actionable target is appended inline; omit it
+// for the web note, which renders the CTA separately.
+export function providerAuthFailureText(providerLabel: string, reauth?: ProviderReauth): string {
+  const base = `${providerLabel} authentication failed.`;
+  if (!reauth) return `${base} Re-authenticate ${providerLabel} to continue.`;
+  return reauth.kind === "docs"
+    ? `${base} Re-authenticate ${providerLabel} to continue: ${reauth.url}`
+    : `${base} Update your ${providerLabel} API key in Settings → Providers.`;
 }
 
 // OpenAI tool-calling shapes. We mirror the chat-completions API surface

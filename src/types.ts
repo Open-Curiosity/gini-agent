@@ -415,8 +415,16 @@ export interface SystemNoteAuthError {
   provider: ProviderName;
   // Short human label for the provider (e.g. "Codex").
   providerLabel: string;
-  // The raw provider error message, preserved as secondary detail.
+  // The raw provider error message, preserved as secondary detail. For
+  // API-key providers this carries the specific cause (the provider's own
+  // 401/403 text — "incorrect key", "quota exceeded", "key disabled").
   detail: string;
+  // Where the CTA sends the user to re-establish the credential. "docs" → the
+  // hosted step-through (OAuth/CLI providers like codex, whose re-auth is a
+  // non-obvious terminal flow); "settings" → the in-app Settings → Providers
+  // key form (API-key providers). See ADR provider-reauth-guidance.md.
+  reauthKind: "docs" | "settings";
+  reauthUrl: string;
 }
 
 export interface SystemNoteBlock extends ChatBlockBase {

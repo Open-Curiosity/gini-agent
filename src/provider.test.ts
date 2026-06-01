@@ -14,6 +14,7 @@ import {
   providerAuthFailureText,
   providerDisplayLabel,
   providerHealth,
+  providerReauth,
   setEchoToolCallingResponse,
   setEchoVisionResponse,
   type ToolFunctionSpec
@@ -3004,9 +3005,29 @@ describe("auth-error classification", () => {
     expect(providerDisplayLabel("echo")).toBe("Gini Echo");
   });
 
-  test("providerAuthFailureText names the provider and the action", () => {
+  test("providerReauth routes OAuth/CLI providers to docs and API-key providers to settings", () => {
+    expect(providerReauth("codex")).toEqual({
+      kind: "docs",
+      url: "https://gini.lilaclabs.ai/docs/providers/codex#reauth"
+    });
+    expect(providerReauth("openai")).toEqual({ kind: "settings", url: "/settings" });
+    expect(providerReauth("deepseek")).toEqual({ kind: "settings", url: "/settings" });
+    expect(providerReauth("openrouter")).toEqual({ kind: "settings", url: "/settings" });
+    expect(providerReauth("local")).toEqual({ kind: "settings", url: "/settings" });
+  });
+
+  test("providerAuthFailureText: base for the web note, target appended for text-only", () => {
+    // Web note (no reauth arg) — the CTA button carries the destination.
     expect(providerAuthFailureText("Codex")).toBe(
       "Codex authentication failed. Re-authenticate Codex to continue."
+    );
+    // Text-only docs target — the URL is inline since there's no button.
+    expect(providerAuthFailureText("Codex", providerReauth("codex"))).toBe(
+      "Codex authentication failed. Re-authenticate Codex to continue: https://gini.lilaclabs.ai/docs/providers/codex#reauth"
+    );
+    // Text-only settings target — point at the in-app key form.
+    expect(providerAuthFailureText("OpenAI", providerReauth("openai"))).toBe(
+      "OpenAI authentication failed. Update your OpenAI API key in Settings → Providers."
     );
   });
 });

@@ -75,7 +75,8 @@ import {
   generateTaskSummary,
   isAuthExpiredError,
   providerAuthFailureText,
-  providerDisplayLabel
+  providerDisplayLabel,
+  providerReauth
 } from "./provider";
 import { listFiles, readFile, requestFilePatch, requestFileWrite, searchFiles } from "./tools/file";
 import { fetchWeb } from "./tools/web";
@@ -888,10 +889,13 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
         // #205). Every other failure passes the raw message through unchanged.
         if (authProvider) {
           const providerLabel = providerDisplayLabel(authProvider);
+          const reauth = providerReauth(authProvider);
           emitSystemNote(emitCtx, providerAuthFailureText(providerLabel), {
             provider: authProvider,
             providerLabel,
-            detail: message
+            detail: message,
+            reauthKind: reauth.kind,
+            reauthUrl: reauth.url
           });
         } else {
           emitSystemNote(emitCtx, message);

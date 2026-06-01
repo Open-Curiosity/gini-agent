@@ -8,12 +8,16 @@ import type { SystemNoteBlock } from "@runtime/types";
 // from the assistant's reply.
 //
 // Provider-credential failures (block.authError) are the exception: they
-// render as an alert card that names the provider and links to Settings →
-// Providers, so the user can re-authenticate instead of being told to "sign
-// in again" with no provider and no entry point (issue #205).
+// render as an alert card naming the provider, with a CTA whose destination
+// depends on how the provider authenticates (issue #205). OAuth/CLI providers
+// (codex) link to the hosted re-auth step-through; API-key providers link to
+// the Settings → Providers key form, with the provider's own error shown as
+// the specific cause.
 export function BlockSystemNote({ block }: { block: SystemNoteBlock }) {
   if (block.authError) {
-    const { providerLabel, detail } = block.authError;
+    const { providerLabel, detail, reauthKind, reauthUrl } = block.authError;
+    const ctaLabel =
+      reauthKind === "docs" ? `Re-authenticate ${providerLabel}` : `Update ${providerLabel} key`;
     return (
       <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
         <div className="flex items-center gap-2">
@@ -24,7 +28,13 @@ export function BlockSystemNote({ block }: { block: SystemNoteBlock }) {
           <p className="mt-1 text-[11px] italic text-muted-foreground">{detail}</p>
         ) : null}
         <Button asChild size="sm" variant="outline" className="mt-2">
-          <Link href="/settings">Re-authenticate {providerLabel}</Link>
+          {reauthKind === "docs" ? (
+            <a href={reauthUrl} target="_blank" rel="noreferrer">
+              {ctaLabel}
+            </a>
+          ) : (
+            <Link href={reauthUrl}>{ctaLabel}</Link>
+          )}
         </Button>
       </div>
     );
