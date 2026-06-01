@@ -5,7 +5,7 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
+import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -151,6 +151,44 @@ export function providerCatalog(): ProviderCatalogItem[] {
       costHint: "unknown"
     }
   ];
+}
+
+// Short brand label for a provider, used in user-facing copy (e.g. the
+// re-authenticate note surfaced when a credential expires). Mirrors the web
+// settings labels: drops the catalog's "Compatible"/"OAuth" suffixes so the
+// brand reads cleanly on its own.
+export function providerDisplayLabel(name: ProviderName): string {
+  switch (name) {
+    case "codex":
+      return "Codex";
+    case "openai":
+      return "OpenAI";
+    case "openrouter":
+      return "OpenRouter";
+    case "deepseek":
+      return "DeepSeek";
+    case "local":
+      return "Local";
+    case "echo":
+      return "Gini Echo";
+  }
+}
+
+// Detects provider errors that mean the user's credential must be
+// re-established — an expired/invalid/revoked token, a bare 401/unauthorized,
+// or an explicit "sign in again" / "re-authenticate" instruction.
+// Deliberately broader than CODEX_SESSION_EXPIRED_RE (which gates retries and
+// must avoid retrying generic failures): here a false positive only adds a
+// re-auth hint to a note we were already going to show, so the matcher favors
+// recall. The proximity windows ([^.]{0,40}) keep "expired"/"invalid" tied to
+// an auth noun within the same sentence so unrelated failures ("the cached
+// file is invalid") don't trip it.
+const AUTH_EXPIRED_RE =
+  /\b401\b|\bunauthorized\b|sign(?:ing)?[\s-]*in[\s-]*again|re-?authenticate|\b(?:auth(?:enticat\w*)?|session|token|credential|api[\s_-]*key|access[\s_-]*token)\b[^.]{0,40}\b(?:expired|invalid|revoked|rejected|missing|failed)\b|\b(?:expired|invalid|revoked|missing)\b[^.]{0,40}\b(?:auth(?:enticat\w*)?|session|token|credential|api[\s_-]*key|access[\s_-]*token)\b/i;
+
+export function isAuthExpiredError(message: string | undefined): boolean {
+  if (!message) return false;
+  return AUTH_EXPIRED_RE.test(message);
 }
 
 // OpenAI tool-calling shapes. We mirror the chat-completions API surface

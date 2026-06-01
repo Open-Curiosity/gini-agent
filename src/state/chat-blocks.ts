@@ -25,6 +25,7 @@ import type {
   Instance,
   RiskLevel,
   SetupRequestAction,
+  SystemNoteAuthError,
   ToolCallBlock,
   ToolCallStatus
 } from "../types";
@@ -198,8 +199,18 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
         action: String(payload.action ?? "") as SetupRequestAction,
         summary: String(payload.summary ?? "")
       };
-    case "system_note":
-      return { ...base, kind: "system_note", text: String(payload.text ?? "") };
+    case "system_note": {
+      const authError =
+        payload.authError && typeof payload.authError === "object"
+          ? (payload.authError as SystemNoteAuthError)
+          : undefined;
+      return {
+        ...base,
+        kind: "system_note",
+        text: String(payload.text ?? ""),
+        ...(authError ? { authError } : {})
+      };
+    }
     default: {
       // Exhaustiveness guard. CHECK constraint on the kind column makes
       // this unreachable for rows we wrote, but a hand-edited DB might
@@ -255,7 +266,10 @@ function payloadFor(block: ChatBlock): string {
         summary: block.summary
       });
     case "system_note":
-      return JSON.stringify({ text: block.text });
+      return JSON.stringify({
+        text: block.text,
+        ...(block.authError ? { authError: block.authError } : {})
+      });
   }
 }
 
@@ -359,7 +373,12 @@ export function insertChatBlock(
             summary: input.summary
           };
         case "system_note":
-          return { ...base, kind: "system_note", text: input.text };
+          return {
+            ...base,
+            kind: "system_note",
+            text: input.text,
+            ...(input.authError ? { authError: input.authError } : {})
+          };
       }
     })();
 

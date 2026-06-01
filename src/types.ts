@@ -405,9 +405,27 @@ export interface SetupRequestedBlock extends ChatBlockBase {
   summary: string;
 }
 
+// Provider-credential failure metadata attached to a terminal-failure
+// system note when a chat turn dies because the provider's auth token
+// expired / was rejected. Lets clients name which provider failed and
+// render a "Re-authenticate <provider>" CTA instead of passing the raw
+// provider line through verbatim. See issue #205.
+export interface SystemNoteAuthError {
+  // Provider whose credential failed (e.g. "codex").
+  provider: ProviderName;
+  // Short human label for the provider (e.g. "Codex").
+  providerLabel: string;
+  // The raw provider error message, preserved as secondary detail.
+  detail: string;
+}
+
 export interface SystemNoteBlock extends ChatBlockBase {
   kind: "system_note";
   text: string;
+  // Present only when this note marks a provider authentication failure
+  // (see SystemNoteAuthError). Absent for ordinary notes (cancellation,
+  // iteration-cap, approval-denied).
+  authError?: SystemNoteAuthError;
 }
 
 export type ChatBlock =
