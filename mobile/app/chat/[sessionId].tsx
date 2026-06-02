@@ -26,6 +26,7 @@ import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
   isTaskInFlight,
+  useCancelTask,
   useChatStream,
   useSendMessage
 } from "@/src/queries";
@@ -75,6 +76,24 @@ function describeAsset(asset: ImagePicker.ImagePickerAsset): {
 // stable, conversation-derived label is more useful than "New chat" in
 // the gap between the user's first send and the auto-rename completing.
 const DEFAULT_TITLE_FALLBACKS = new Set<string>(["Untitled chat", "New chat"]);
+const TERMINAL_PHASE_LABELS = new Set<string>(["Completed", "Cancelled", "Failed"]);
+
+function findInFlightTaskId(blocks: ChatBlock[]): string | null {
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const b = blocks[i]!;
+    if (b.kind === "phase") {
+      if (TERMINAL_PHASE_LABELS.has(b.label)) return null;
+      return b.taskId ?? null;
+    }
+    if (b.kind === "setup_requested" || b.kind === "authorization_requested") {
+      return b.taskId ?? null;
+    }
+    if (b.kind === "tool_call" && b.status === "running") {
+      return b.taskId ?? null;
+    }
+  }
+  return null;
+}
 
 // Three sections: a header with back arrow + centered title, the
 // scrolling conversation, and the input bar (pill + circular send
@@ -85,6 +104,7 @@ export default function ChatDetailScreen() {
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
   const stream = useChatStream(sessionId ?? null);
   const send = useSendMessage(sessionId ?? null);
+  const cancel = useCancelTask();
   const qc = useQueryClient();
 
   const [text, setText] = useState("");
@@ -218,6 +238,7 @@ export default function ChatDetailScreen() {
   }, [list, stream.session]);
 
   const inFlight = useMemo(() => isTaskInFlight(list), [list]);
+  const inFlightTaskId = useMemo(() => findInFlightTaskId(list), [list]);
 
   // The most recent assistant_text block's updatedAt advances on every
   // streaming delta. Including it in the scroll dep array means the
@@ -261,6 +282,7 @@ export default function ChatDetailScreen() {
   const showSendBusy = send.isPending || inFlight;
   const sendDisabled =
     (!trimmed && readyImages.length === 0) || showSendBusy || anyUploading || !sessionId;
+  const canStop = Boolean(inFlightTaskId) && !cancel.isPending;
 
   const submit = () => {
     // Hardware-keyboard onSubmitEditing can fire mid-task; `showSendBusy`
@@ -279,6 +301,15 @@ export default function ChatDetailScreen() {
         }
       }
     );
+  };
+
+  const stopTask = () => {
+    if (!inFlightTaskId || cancel.isPending) return;
+    cancel.mutate(inFlightTaskId, {
+      onError: (err) => {
+        Alert.alert("Stop failed", err.message);
+      }
+    });
   };
 
   // Each picker asset gets a local id so the tray entry can be replaced
@@ -530,17 +561,21 @@ export default function ChatDetailScreen() {
               accessibilityLabel="Message input"
             />
             <Pressable
-              onPress={submit}
-              disabled={sendDisabled}
+              onPress={canStop ? stopTask : submit}
+              disabled={canStop ? false : sendDisabled}
               style={[
                 styles.sendButton,
-                sendDisabled && styles.sendButtonDisabled
+                canStop && styles.stopButton,
+                !canStop && sendDisabled && styles.sendButtonDisabled,
+                cancel.isPending && styles.sendButtonDisabled
               ]}
               accessibilityRole="button"
-              accessibilityLabel="Send"
+              accessibilityLabel={canStop ? "Stop response" : "Send"}
             >
-              {send.isPending ? (
+              {cancel.isPending || send.isPending ? (
                 <ActivityIndicator color={theme.buttonText} />
+              ) : canStop ? (
+                <Feather name="square" size={16} color={theme.buttonText} />
               ) : (
                 <Feather name="arrow-up" size={22} color={theme.buttonText} />
               )}
@@ -697,5 +732,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
+  stopButton: { backgroundColor: theme.danger },
   sendButtonDisabled: { backgroundColor: theme.buttonDisabled }
 });
