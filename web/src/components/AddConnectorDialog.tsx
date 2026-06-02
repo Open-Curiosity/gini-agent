@@ -259,6 +259,17 @@ export function AddConnectorDialog({
             ))
           )}
 
+          {selectedProvider?.docsUrl ? (
+            <a
+              href={selectedProvider.docsUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-block text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+            >
+              Learn more
+            </a>
+          ) : null}
+
           {error ? <p className="text-xs text-destructive">{error}</p> : null}
           {externalError ? <p className="text-xs text-destructive">{externalError}</p> : null}
         </div>

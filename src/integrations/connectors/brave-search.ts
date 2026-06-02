@@ -51,11 +51,12 @@ export const braveSearchProvider: ProviderModule = {
   id: "brave-search",
   label: "Brave Search",
   description: "Web search via Brave's Data-for-Search API. Free tier: 2k queries/month at https://brave.com/search/api/.",
+  docsUrl: "https://github.com/Lilac-Labs/gini-agent/blob/main/docs/search/brave.md",
   fields: [
     {
       name: "token",
       label: "API key",
-      description: "Get one at https://brave.com/search/api/ — the free tier covers 2k queries/month.",
+      description: "Your Brave Search API key.",
       secret: true,
       required: true,
       placeholder: "BSA…"

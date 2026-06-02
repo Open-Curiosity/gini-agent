@@ -718,6 +718,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       id: p.id,
       label: p.label,
       description: p.description,
+      docsUrl: p.docsUrl,
       fields: p.fields,
       secrets: p.secrets,
       hasProbe: Boolean(p.probe),
