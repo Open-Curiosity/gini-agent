@@ -547,11 +547,11 @@ async function launchManaged(
   // the headless context is already signed in. Falls back to visible
   // (`headless: false`) for any other value.
   const wantHeadless = opts.headless === true;
-  // launchPersistentChrome picks the launch identity: GINI_CHROME_PATH
-  // override, branded Chrome via the "chrome" channel, or the bundled-first
-  // fallback. It returns the binary that actually backed the context so the
-  // UI shows a meaningful path. Either way, the lifecycle is owned by
-  // Playwright — no separate spawn() / CDP probe / PID tracking.
+  // launchPersistentChrome picks the launch binary: GINI_CHROME_PATH
+  // override, the detected branded Chrome, or the bundled-first fallback. It
+  // returns the binary that actually backed the context so the UI shows a
+  // meaningful path. Either way, the lifecycle is owned by Playwright — no
+  // separate spawn() / CDP probe / PID tracking.
   const dataDir = profileDirFor(config);
   mkdirSync(dataDir, { recursive: true });
 
