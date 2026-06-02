@@ -8,7 +8,7 @@ import { resolveEffectiveContext } from "../execution/effective-context";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
 import { migratePinnedMemoriesToUserProfile } from "../memory/migrate-pinned-to-user-md";
 import { providerHealth } from "../provider";
-import { seedAgentSoulFile, scaffoldInstanceIdentityFiles } from "./identity-files";
+import { migrateInstructionsIdentityLine, seedAgentSoulFile, scaffoldInstanceIdentityFiles } from "./identity-files";
 import { currentVersionInfo } from "./update";
 
 export function status(config: RuntimeConfig) {
@@ -98,6 +98,12 @@ export async function install(config: RuntimeConfig): Promise<void> {
   // the filesystem for the user to discover. Best-effort: scaffolding never
   // throws on a filesystem error.
   scaffoldInstanceIdentityFiles(config.instance);
+  // Existing instances seeded INSTRUCTIONS.md before the preamble went
+  // name-free; that on-disk file overrides the bundled default, so rewrite
+  // a stale leading "You are Gini, a personal agent." (or the interim
+  // framework wording) to the current generic line. The agent's name now
+  // lives in its SOUL.md. Idempotent + best-effort.
+  migrateInstructionsIdentityLine(config.instance);
   // Approval-mode migration: legacy configs that carry
   // `dangerouslyAutoApprove: true` without an explicit `approvalMode`
   // get aliased to `approvalMode: "yolo"`. Patch the in-memory config

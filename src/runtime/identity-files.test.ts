@@ -17,6 +17,7 @@ import {
   loadInstructions,
   loadSoul,
   loadUserProfile,
+  migrateInstructionsIdentityLine,
   removeSoulSection,
   removeUserProfileSection,
   restoreSoulFromHistory,
@@ -513,6 +514,46 @@ describe("identity-files", () => {
       seedAgentSoulFile(INSTANCE, AGENT, "Gini");
       expect(loadUserProfile(INSTANCE)).toBeNull();
       expect(loadSoul(INSTANCE, AGENT)).toBe("Your name is Gini.");
+    });
+  });
+
+  describe("migrateInstructionsIdentityLine", () => {
+    test("rewrites a legacy 'You are Gini, a personal agent.' first line, preserving the rest", () => {
+      const path = instructionsPath(INSTANCE);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "You are Gini, a personal agent.\nReply directly and concisely.\nMore rules.");
+      expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(true);
+      expect(readFileSync(path, "utf8")).toBe("You are a personal agent.\nReply directly and concisely.\nMore rules.");
+    });
+
+    test("rewrites the interim framework wording too", () => {
+      const path = instructionsPath(INSTANCE);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "You are a personal assistant running on the gini-agent framework.\nReply directly.");
+      expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(true);
+      expect(readFileSync(path, "utf8")).toBe("You are a personal agent.\nReply directly.");
+    });
+
+    test("is idempotent — a second pass does not rewrite", () => {
+      const path = instructionsPath(INSTANCE);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "You are Gini, a personal agent.\nReply directly.");
+      expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(true);
+      expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(false);
+      expect(readFileSync(path, "utf8")).toBe("You are a personal agent.\nReply directly.");
+    });
+
+    test("leaves a user-customized first line untouched", () => {
+      const path = instructionsPath(INSTANCE);
+      mkdirSync(dirname(path), { recursive: true });
+      const custom = "You are Jarvis, a sardonic butler.\nReply directly.";
+      writeFileSync(path, custom);
+      expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(false);
+      expect(readFileSync(path, "utf8")).toBe(custom);
+    });
+
+    test("no-op when INSTRUCTIONS.md is absent", () => {
+      expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(false);
     });
   });
 

@@ -223,6 +223,56 @@ export function scaffoldInstanceIdentityFiles(instance: Instance): ScaffoldInsta
   return { created };
 }
 
+// First-line identity sentences shipped by earlier bundled defaults.
+// Existing instances seeded INSTRUCTIONS.md first-write-wins, so they keep
+// one of these on disk even after the bundled default changed — and that
+// on-disk file overrides the bundled default at load time. The agent's
+// name now lives in its SOUL.md, so the shared operating-rules file must
+// not carry a name (a stale "You are Gini, a personal agent." otherwise
+// bleeds into a non-default agent's self-description as "your Gini ...").
+const LEGACY_INSTRUCTIONS_IDENTITY_LINES = new Set<string>([
+  "You are Gini, a personal agent.",
+  "You are a personal assistant running on the gini-agent framework."
+]);
+const CURRENT_INSTRUCTIONS_IDENTITY_LINE = "You are a personal agent.";
+
+// One-time, per-boot migration: when the on-disk INSTRUCTIONS.md leads with
+// a known legacy identity sentence, rewrite ONLY that first line to the
+// current generic preamble and leave the rest of the file (any user edits)
+// intact. Idempotent — the current line isn't in the legacy set — and
+// best-effort. A user who replaced the first line with their own wording
+// is left untouched. Returns true when it rewrote the file.
+export function migrateInstructionsIdentityLine(instance: Instance): boolean {
+  const path = instructionsPath(instance);
+  if (!existsSync(path)) return false;
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return false;
+  }
+  const newlineIdx = raw.indexOf("\n");
+  // trimEnd drops a trailing \r so a CRLF file still matches.
+  const firstLine = (newlineIdx === -1 ? raw : raw.slice(0, newlineIdx)).trimEnd();
+  if (!LEGACY_INSTRUCTIONS_IDENTITY_LINES.has(firstLine)) return false;
+  const rest = newlineIdx === -1 ? "" : raw.slice(newlineIdx);
+  try {
+    writeFileSafe(path, `${CURRENT_INSTRUCTIONS_IDENTITY_LINE}${rest}`);
+    return true;
+  } catch (error) {
+    try {
+      appendLog(instance, "identity.migrate.error", {
+        file: "INSTRUCTIONS.md",
+        path,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } catch {
+      // Best-effort — see scaffoldInstanceIdentityFiles.
+    }
+    return false;
+  }
+}
+
 export interface ScaffoldAgentResult {
   created: string | null;
 }
