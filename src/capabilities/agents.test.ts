@@ -8,7 +8,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAgent, deleteAgent, useAgent } from "./agents";
+import { createAgent, deleteAgent, renameAgent, useAgent } from "./agents";
 import { soulPath } from "../runtime/identity-files";
 import { install } from "../runtime";
 import {
@@ -161,6 +161,71 @@ describe("createAgent", () => {
     await install(config);
     expect(readFileSync(defaultSoul, "utf8")).toBe("Your name is Gini.");
     expect(readFileSync(mansourSoul, "utf8")).toBe("Your name is Mansour.");
+  });
+
+  test("renameAgent updates AgentRecord.name and audits agent.renamed", async () => {
+    const config = buildConfig(workspaceRoot, "rename-agent-basic", root);
+    await install(config);
+    const created = await createAgent(config, { name: "Mansour" });
+    const renamed = await renameAgent(config, created.id, "Bob");
+    expect(renamed.id).toBe(created.id);
+    expect(renamed.name).toBe("Bob");
+    const after = readState(config.instance);
+    expect(after.agents.find((agent) => agent.id === created.id)?.name).toBe("Bob");
+    const audit = after.audit.find((event) => event.action === "agent.renamed" && event.target === created.id);
+    expect(audit).toBeDefined();
+    expect(audit?.evidence).toMatchObject({ from: "Mansour", to: "Bob", agentId: created.id });
+  });
+
+  test("renameAgent resolves the target by name", async () => {
+    const config = buildConfig(workspaceRoot, "rename-agent-by-name", root);
+    await install(config);
+    const created = await createAgent(config, { name: "Mansour" });
+    const renamed = await renameAgent(config, "Mansour", "Bob");
+    expect(renamed.id).toBe(created.id);
+    expect(renamed.name).toBe("Bob");
+  });
+
+  test("renameAgent throws when the agent does not exist", async () => {
+    const config = buildConfig(workspaceRoot, "rename-agent-missing", root);
+    await install(config);
+    await expect(renameAgent(config, "agent_nope", "Bob")).rejects.toThrow(
+      "Agent not found: agent_nope"
+    );
+  });
+
+  test("renameAgent rejects an empty / whitespace-only new name", async () => {
+    const config = buildConfig(workspaceRoot, "rename-agent-empty", root);
+    await install(config);
+    const created = await createAgent(config, { name: "Mansour" });
+    await expect(renameAgent(config, created.id, "   \n\t ")).rejects.toThrow(
+      "New agent name is required."
+    );
+  });
+
+  test("renameAgent syncs the seeded SOUL.md name line", async () => {
+    // The new agent's SOUL is exactly the untouched seed, so the rename
+    // rewrites it to match the new name.
+    const config = buildConfig(workspaceRoot, "rename-agent-soul-sync", root);
+    await install(config);
+    const created = await createAgent(config, { name: "Mansour" });
+    expect(readFileSync(soulPath(config.instance, created.id), "utf8")).toBe("Your name is Mansour.");
+    await renameAgent(config, created.id, "Bob");
+    expect(readFileSync(soulPath(config.instance, created.id), "utf8")).toBe("Your name is Bob.");
+  });
+
+  test("renameAgent leaves a customized SOUL.md untouched", async () => {
+    // A SOUL the user/agent has rewritten is sacred — the rename updates
+    // only AgentRecord.name and leaves the persona body alone.
+    const config = buildConfig(workspaceRoot, "rename-agent-soul-custom", root);
+    await install(config);
+    const created = await createAgent(config, { name: "Mansour" });
+    const path = soulPath(config.instance, created.id);
+    writeFileSync(path, "Your name is Mansour.\n\n## Voice\nSardonic and direct.");
+    await renameAgent(config, created.id, "Bob");
+    expect(readFileSync(path, "utf8")).toBe("Your name is Mansour.\n\n## Voice\nSardonic and direct.");
+    const after = readState(config.instance);
+    expect(after.agents.find((agent) => agent.id === created.id)?.name).toBe("Bob");
   });
 
   test("deleteAgent removes the agent, its memories, and its hindsight bank", async () => {

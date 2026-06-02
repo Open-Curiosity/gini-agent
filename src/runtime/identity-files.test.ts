@@ -20,6 +20,7 @@ import {
   migrateInstructionsIdentityLine,
   removeSoulSection,
   removeUserProfileSection,
+  renameSeededSoulName,
   restoreSoulFromHistory,
   restoreUserProfileFromHistory,
   seedAgentSoulFile,
@@ -514,6 +515,33 @@ describe("identity-files", () => {
       seedAgentSoulFile(INSTANCE, AGENT, "Gini");
       expect(loadUserProfile(INSTANCE)).toBeNull();
       expect(loadSoul(INSTANCE, AGENT)).toBe("Your name is Gini.");
+    });
+  });
+
+  describe("renameSeededSoulName", () => {
+    test("rewrites the SOUL.md seed line when it is exactly the untouched seed", () => {
+      seedAgentSoulFile(INSTANCE, AGENT, "Mansour");
+      expect(renameSeededSoulName(INSTANCE, AGENT, "Mansour", "Bob")).toBe(true);
+      expect(readFileSync(soulPath(INSTANCE, AGENT), "utf8")).toBe("Your name is Bob.");
+    });
+
+    test("leaves a customized SOUL.md untouched", () => {
+      const path = soulPath(INSTANCE, AGENT);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "Your name is Mansour.\n\n## Voice\nSardonic.");
+      expect(renameSeededSoulName(INSTANCE, AGENT, "Mansour", "Bob")).toBe(false);
+      expect(readFileSync(path, "utf8")).toBe("Your name is Mansour.\n\n## Voice\nSardonic.");
+    });
+
+    test("returns false when the SOUL.md is absent", () => {
+      expect(renameSeededSoulName(INSTANCE, AGENT, "Mansour", "Bob")).toBe(false);
+      expect(existsSync(soulPath(INSTANCE, AGENT))).toBe(false);
+    });
+
+    test("is a no-op when the new name sanitizes to empty", () => {
+      seedAgentSoulFile(INSTANCE, AGENT, "Mansour");
+      expect(renameSeededSoulName(INSTANCE, AGENT, "Mansour", "  \n\t ")).toBe(false);
+      expect(readFileSync(soulPath(INSTANCE, AGENT), "utf8")).toBe("Your name is Mansour.");
     });
   });
 

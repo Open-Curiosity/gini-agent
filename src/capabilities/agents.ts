@@ -9,7 +9,8 @@ import {
   readState
 } from "../state";
 import { addAudit } from "../state/audit";
-import { seedAgentSoulFile } from "../runtime/identity-files";
+import { now } from "../state/ids";
+import { renameSeededSoulName, seedAgentSoulFile } from "../runtime/identity-files";
 import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
 
 export function listAgents(config: RuntimeConfig) {
@@ -93,6 +94,48 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
 
 export async function useAgent(config: RuntimeConfig, idOrName: string) {
   return mutateState(config.instance, (state) => activateAgent(state, idOrName));
+}
+
+// Rename an agent. `AgentRecord.name` is the authoritative label (drives
+// the switcher, list, `use_agent <name>`, and the `- agent:` identity
+// block). The folder + Hindsight bank are keyed by the stable opaque id,
+// so a rename never moves them. After the state write we best-effort sync
+// the agent's seeded SOUL.md name line — but only when the SOUL is exactly
+// the untouched seed (`renameSeededSoulName`); a customized persona is left
+// to the model/user.
+export async function renameAgent(
+  config: RuntimeConfig,
+  idOrName: string,
+  rawName: string
+) {
+  // Collapse every whitespace run to a single space and trim — same
+  // hygiene as `createAgent`, so the stored name stays a clean single-line
+  // label and a whitespace-only rename is rejected.
+  const newName = String(rawName ?? "").replace(/\s+/g, " ").trim();
+  if (!newName) throw new Error("New agent name is required.");
+  const result = await mutateState(config.instance, (state) => {
+    const agent = state.agents.find((item) => item.id === idOrName || item.name === idOrName);
+    if (!agent) throw new Error(`Agent not found: ${idOrName}`);
+    const oldName = agent.name;
+    agent.name = newName;
+    agent.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "agent.renamed",
+        target: agent.id,
+        risk: "low",
+        evidence: { from: oldName, to: newName, agentId: agent.id }
+      },
+      { agentId: agent.id }
+    );
+    return { record: agent, oldName };
+  });
+  // Keep the seeded SOUL.md name line in sync outside the state write.
+  // Best-effort: never clobbers a customized SOUL (see renameSeededSoulName).
+  renameSeededSoulName(config.instance, result.record.id, result.oldName, newName);
+  return result.record;
 }
 
 // Hard-deletes an agent and cascades cleanup across its memory pools.

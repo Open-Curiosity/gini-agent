@@ -47,8 +47,8 @@ async function newTask(config: RuntimeConfig): Promise<string> {
 }
 
 describe("self operation registry", () => {
-  test("SELF_OPERATIONS carries the 9 expected ops with name, summary, tag, handler", () => {
-    expect(SELF_OPERATIONS.length).toBe(9);
+  test("SELF_OPERATIONS carries the 10 expected ops with name, summary, tag, handler", () => {
+    expect(SELF_OPERATIONS.length).toBe(10);
     for (const op of SELF_OPERATIONS) {
       expect(typeof op.name).toBe("string");
       expect(op.name.length).toBeGreaterThan(0);
@@ -66,6 +66,7 @@ describe("self operation registry", () => {
       "list_mcp_servers",
       "list_providers",
       "list_skills",
+      "rename_agent",
       "set_provider",
       "use_agent"
     ]);
@@ -82,7 +83,7 @@ describe("self operation registry", () => {
       "list_providers",
       "list_skills"
     ]);
-    expect(mutates).toEqual(["create_agent", "set_provider", "use_agent"]);
+    expect(mutates).toEqual(["create_agent", "rename_agent", "set_provider", "use_agent"]);
   });
 
   test("findSelfOperation resolves known names and rejects unknown ones", () => {

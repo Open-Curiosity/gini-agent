@@ -243,6 +243,7 @@ export async function dispatchToolCall(
     case "set_provider":
     case "use_agent":
     case "create_agent":
+    case "rename_agent":
       return await dispatchSelfOp(config, taskId, toolCallId, toolName, args);
     case "browser_connect": {
       // browser.connect is a SetupRequest (user-actor): the user opens the

@@ -354,6 +354,53 @@ export function seedAgentSoulFile(instance: Instance, agentId: string, name: str
   }
 }
 
+// Keep the seeded SOUL.md name line in sync when an agent is renamed. The
+// name lives both in `AgentRecord.name` (the authoritative label) and in
+// the per-agent SOUL.md seed line `Your name is <name>.`. A rename rewrites
+// the SOUL line ONLY when the file is EXACTLY the untouched seed for the
+// old name — the same never-clobber rule `seedAgentSoulFile` enforces. A
+// SOUL the user/agent has customized (any other content) is left alone; the
+// model/operator owns updating the name reference inside a real persona.
+//
+// Best-effort: an absent file, an empty new name, or a customized body all
+// return false (nothing rewritten); a filesystem error is swallowed and
+// logged via `appendLog`. Returns true only when it rewrote the seed line.
+export function renameSeededSoulName(
+  instance: Instance,
+  agentId: string,
+  oldName: string | undefined,
+  newName: string | undefined
+): boolean {
+  const path = soulPath(instance, agentId);
+  if (!existsSync(path)) return false;
+  const cleanOld = sanitizeAgentName(oldName);
+  const cleanNew = sanitizeAgentName(newName);
+  if (!cleanNew) return false;
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return false;
+  }
+  if (raw.trim() !== `Your name is ${cleanOld}.`) return false;
+  try {
+    writeFileSafe(path, `Your name is ${cleanNew}.`);
+    return true;
+  } catch (error) {
+    try {
+      appendLog(instance, "identity.rename.error", {
+        file: "SOUL.md",
+        agentId,
+        path,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } catch {
+      // Best-effort — see seedAgentSoulFile.
+    }
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Injection scan. Ported from Hermes' agent/prompt_builder.py.
 // ---------------------------------------------------------------------------

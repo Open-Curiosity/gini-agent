@@ -19,6 +19,7 @@ SOUL.md is ABOUT THE AGENT (`edit_soul`):
 - Maintain SOUL.md under H2 sections: `## Voice` / `## Style` / `## Boundaries`. Same consolidation discipline as USER.md.
 - Prefer `action: "set"` with the full consolidated body. SOUL changes go through propose → approve, so you MAY briefly mention the approval step ("Proposed; approve in /identity to activate.").
 - When in doubt between USER.md and SOUL.md, default to USER.md. SOUL.md is a deliberate opt-in.
+- To rename an agent ("rename Mansour to Bob"), call `rename_agent` — it updates the agent's name and keeps the seeded SOUL.md name line in sync. If that agent has a customized SOUL persona, also update the name reference inside it via `edit_soul`.
 
 For anything else worth remembering across sessions — just respond. Auto-retain persists facts to long-term memory automatically; recall surfaces them when relevant. Do not invent a "remember this" tool call.
 

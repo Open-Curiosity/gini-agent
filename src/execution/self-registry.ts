@@ -26,7 +26,7 @@ import { addAudit, appendTrace, mutateState, now, readState } from "../state";
 import { status as runtimeStatus } from "../runtime";
 import { providerCatalogWithStatus } from "../provider";
 import { setSetupProvider } from "../runtime/setup-api";
-import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability } from "../capabilities/agents";
+import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability, renameAgent as renameAgentCapability } from "../capabilities/agents";
 import { listSkills } from "../capabilities/skills";
 
 export interface SelfOperation {
@@ -366,6 +366,43 @@ async function createAgent(
   }
 }
 
+async function renameAgent(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const idOrName = typeof args.agentId === "string" ? args.agentId.trim() : "";
+  const name = typeof args.name === "string" ? args.name.trim() : "";
+  if (!idOrName) {
+    return JSON.stringify({ ok: false, error: "rename_agent requires an 'agentId' (id or name)." });
+  }
+  if (!name) {
+    return JSON.stringify({ ok: false, error: "rename_agent requires a 'name'." });
+  }
+  try {
+    const record = await renameAgentCapability(config, idOrName, name);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Renamed agent",
+      data: { agentId: record.id, name: record.name }
+    });
+    await recordLowRiskAudit(config, taskId, "agent.renamed", record.id, {
+      name: record.name
+    });
+    return JSON.stringify({
+      ok: true,
+      agent: {
+        id: record.id,
+        name: record.name,
+        providerName: record.providerName,
+        model: record.model
+      }
+    });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
 // ---------------- Registry ----------------
 
 export const SELF_OPERATIONS: SelfOperation[] = [
@@ -473,6 +510,20 @@ export const SELF_OPERATIONS: SelfOperation[] = [
       required: ["name"]
     },
     handler: (config, taskId, args) => createAgent(config, taskId, args)
+  },
+  {
+    name: "rename_agent",
+    summary: "Rename an agent. Updates the agent's name and keeps its seeded SOUL.md name line in sync. The folder/memory bank are id-keyed and never move.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        agentId: { type: "string", description: "Agent id or name to rename (e.g. 'agent_abc123' or 'Mansour')." },
+        name: { type: "string", description: "New human-readable name (e.g. 'Bob')." }
+      },
+      required: ["agentId", "name"]
+    },
+    handler: (config, taskId, args) => renameAgent(config, taskId, args)
   }
 ];
 

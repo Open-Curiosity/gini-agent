@@ -51,7 +51,7 @@ import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./
 import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableMessagingBridge, listAllowedChats, listMessagingMessages, receiveMessagingInput, rejectPendingChat, removeMessagingBridge, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalogWithStatus } from "./provider";
-import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
+import { createAgent, deleteAgent, listAgents, renameAgent, useAgent } from "./capabilities/agents";
 import {
   approveSoul,
   approveUserProfile,
@@ -1566,6 +1566,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],
     ["POST", /^\/api\/agents$/, async (request) => json(await createAgent(config, await body(request)), 201)],
     ["POST", /^\/api\/agents\/([^/]+)\/use$/, async (_request, params) => json(await useAgent(config, params[0]))],
+    ["PATCH", /^\/api\/agents\/([^/]+)$/, async (request, params) => json(await renameAgent(config, params[0], String((await body(request)).name ?? "")))],
     ["DELETE", /^\/api\/agents\/([^/]+)$/, async (_request, params) => json(await deleteAgent(config, params[0]))],
     ["GET", /^\/api\/parity\/hermes$/, () => json(hermesParityChecks(config))],
     ["GET", /^\/api\/readiness\/v1$/, () => json(v1Readiness(config))],

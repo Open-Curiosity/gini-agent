@@ -281,6 +281,38 @@ describe("runtime api", () => {
     expect(body.error).toContain("Cannot delete the active agent");
   });
 
+  test("PATCH /api/agents/:id renames the agent", async () => {
+    const config = testConfig("agents-rename");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Mansour" })
+    });
+    const renamed = await call(handler, config, `/api/agents/${created.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name: "Bob" })
+    });
+    expect(renamed.id).toBe(created.id);
+    expect(renamed.name).toBe("Bob");
+
+    const after = await call(handler, config, "/api/agents");
+    expect(after.agents.find((agent: { id: string }) => agent.id === created.id)?.name).toBe("Bob");
+  });
+
+  test("PATCH /api/agents/:id returns 404 for an unknown agent", async () => {
+    const config = testConfig("agents-rename-missing");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/agents/agent_does_not_exist",
+      { method: "PATCH", body: JSON.stringify({ name: "Bob" }) },
+      config.token
+    );
+    expect(response.status).toBe(404);
+  });
+
   test("supports relay degraded health and notification delivery records", async () => {
     const config = testConfig("relay-notifications");
     const handler = createHandler(config);

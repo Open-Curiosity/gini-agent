@@ -1408,6 +1408,25 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         required: ["name"]
       }
     }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Rename agent",
+    deferred: true,
+    indexSummary: "Rename an agent. Updates the agent's name and keeps its seeded SOUL.md name line in sync. The folder/memory bank are id-keyed and never move.",
+    type: "function",
+    function: {
+      name: "rename_agent",
+      description: "Rename an agent. Updates the agent's name and keeps its seeded SOUL.md name line in sync (the folder/memory bank are id-keyed and never move). If the agent has a customized SOUL persona, also update the name reference there via edit_soul. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          agentId: { type: "string", description: "Agent id or name to rename (e.g. 'agent_abc123' or 'Mansour')." },
+          name: { type: "string", description: "New human-readable name (e.g. 'Bob')." }
+        },
+        required: ["agentId", "name"]
+      }
+    }
   }
 ];
 
@@ -1561,9 +1580,9 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // prompt regardless of toolset state, so always-on here is safe.
     if (tool.function.name === "edit_soul") return true;
     if (tool.function.name === "edit_user_profile") return true;
-    // Self-knowledge surface. The 9 self-config / introspection tools
-    // (get_self, list_*, set_provider, use_agent, create_agent) are direct
-    // deferred tools on the "self" toolset, which is not a legacy default;
+    // Self-knowledge surface. The 10 self-config / introspection tools
+    // (get_self, list_*, set_provider, use_agent, create_agent, rename_agent)
+    // are direct deferred tools on the "self" toolset, which is not a legacy default;
     // gating on enable would mean a fresh instance couldn't answer "what
     // model are you using" or "switch to deepseek" — the exact asks the
     // surface exists for. They pass gating here; deferral (applied later by
@@ -1895,6 +1914,8 @@ export function chatBlockArgsPreviewFor(
     case "use_agent":
       return truncatePreview(previewValue(safe.agentId));
     case "create_agent":
+      return truncatePreview(previewValue(safe.name));
+    case "rename_agent":
       return truncatePreview(previewValue(safe.name));
     default: {
       // Generic fallback: key=value, ... for the first few entries.
