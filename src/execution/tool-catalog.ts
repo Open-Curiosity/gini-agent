@@ -1554,6 +1554,134 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         required: ["patterns"]
       }
     }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Add MCP server",
+    deferred: true,
+    indexSummary: "Register a new MCP server (stdio command or http url) so its tools become available.",
+    type: "function",
+    function: {
+      name: "add_mcp_server",
+      description: "Register a new MCP server so its tools become available. http transport needs a url; stdio needs a command. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Server name (e.g. 'linear')." },
+          transport: { type: "string", enum: ["stdio", "http"], description: "Transport. Defaults to 'stdio', or 'http' when a url is given." },
+          command: { type: "string", description: "Executable for a stdio server (e.g. 'npx'). Required for stdio." },
+          args: { type: "array", description: "Argument list for the stdio command.", items: { type: "string" } },
+          url: { type: "string", description: "Streamable-HTTP endpoint for an http server (e.g. 'https://mcp.linear.app/mcp'). Required for http." },
+          headers: { type: "object", description: "Static or ${ENV}-placeholder header map for an http server." },
+          exposedTools: { type: "array", description: "Optional whitelist of tool names to expose from this server.", items: { type: "string" } }
+        },
+        required: ["name"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Remove MCP server",
+    deferred: true,
+    indexSummary: "Disable a registered MCP server so its tools stop being offered.",
+    type: "function",
+    function: {
+      name: "remove_mcp_server",
+      description: "Disable a registered MCP server so its tools stop being offered. Call list_mcp_servers first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server id or name." }
+        },
+        required: ["server"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Remove connector",
+    deferred: true,
+    indexSummary: "Disconnect a connector: wipe its secrets (user) or tombstone it (auto-detected).",
+    type: "function",
+    function: {
+      name: "remove_connector",
+      description: "Disconnect a connector: wipe its encrypted secrets (user connectors) or tombstone it (auto-detected ones). Call list_connectors first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          connector: { type: "string", description: "Connector id to remove." }
+        },
+        required: ["connector"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Rotate connector",
+    deferred: true,
+    indexSummary: "Rotate a connector's credential — write a new token into one of its secret slots.",
+    type: "function",
+    function: {
+      name: "rotate_connector",
+      description: "Rotate a connector's credential — write a new token into one of its secret slots. Pass 'purpose' when the connector has more than one slot. Call list_connectors first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          connector: { type: "string", description: "Connector id to rotate." },
+          token: { type: "string", description: "The new secret value to store." },
+          purpose: { type: "string", description: "Which secret slot to write (e.g. 'token'). Optional when the connector has exactly one slot; required when it has several." }
+        },
+        required: ["connector", "token"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Update runtime",
+    deferred: true,
+    indexSummary: "Update the runtime to the latest commit and RESTART the gateway to run the new code.",
+    type: "function",
+    function: {
+      name: "update_self",
+      description: "Update the runtime to the latest commit (git fetch + reset + bun install) and RESTART the gateway so the new code takes effect. Only works from the installer-managed runtime. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Roll back skill",
+    deferred: true,
+    indexSummary: "Roll a skill back to its previous saved version. Fails if it has no rollback history.",
+    type: "function",
+    function: {
+      name: "rollback_skill",
+      description: "Roll a skill back to its previous saved version. Fails if the skill has no rollback history. Call list_skills first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: { type: "string", description: "Skill id or name to roll back." }
+        },
+        required: ["skillId"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Test skill",
+    deferred: true,
+    indexSummary: "Validate a skill's record (required fields, steps, spec compliance) and report pass/fail.",
+    type: "function",
+    function: {
+      name: "test_skill",
+      description: "Validate a skill's record (required fields, steps, spec compliance) and report pass/fail. Read-only diagnostic. Call list_skills first for the id.",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: { type: "string", description: "Skill id or name to test." }
+        },
+        required: ["skillId"]
+      }
+    }
   }
 ];
 
@@ -2035,6 +2163,7 @@ export function chatBlockArgsPreviewFor(
     case "list_mcp_servers":
     case "list_connectors":
     case "list_toolsets":
+    case "update_self":
       return "";
     case "list_skills":
       return truncatePreview(previewValue(safe.nameContains) || previewValue(safe.status) || "");
@@ -2056,6 +2185,16 @@ export function chatBlockArgsPreviewFor(
     case "set_auto_approve_commands":
     case "set_dangerous_patterns":
       return truncatePreview(Array.isArray(safe.patterns) ? `${safe.patterns.length} patterns` : "");
+    case "add_mcp_server":
+      return truncatePreview(previewValue(safe.name));
+    case "remove_mcp_server":
+      return truncatePreview(previewValue(safe.server));
+    case "remove_connector":
+    case "rotate_connector":
+      return truncatePreview(previewValue(safe.connector));
+    case "rollback_skill":
+    case "test_skill":
+      return truncatePreview(previewValue(safe.skillId));
     default: {
       // Generic fallback: key=value, ... for the first few entries.
       // Keeps unmapped or future tools from emitting an empty preview.

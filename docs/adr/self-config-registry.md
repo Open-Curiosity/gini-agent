@@ -86,10 +86,12 @@ is actually used.
 Seed operations:
 
 - `query` — `get_self`, `list_providers`, `list_agents`, `list_skills`,
-  `list_mcp_servers`, `list_connectors`, `list_toolsets`.
+  `list_mcp_servers`, `list_connectors`, `list_toolsets`, `test_skill`.
 - `mutate` — `set_provider`, `use_agent`, `create_agent`,
   `set_approval_mode`, `enable_toolset`, `disable_toolset`, `delete_agent`,
-  `remove_provider`, `set_auto_approve_commands`, `set_dangerous_patterns`.
+  `remove_provider`, `set_auto_approve_commands`, `set_dangerous_patterns`,
+  `add_mcp_server`, `remove_mcp_server`, `remove_connector`,
+  `rotate_connector`, `update_self`, `rollback_skill`.
 
 ## Config vs Action
 

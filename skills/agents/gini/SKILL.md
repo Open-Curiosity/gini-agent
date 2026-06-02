@@ -104,16 +104,33 @@ Approvals
 MCP
 
 - `list_mcp_servers` (query) — registered MCP servers.
+- `add_mcp_server` (mutate) — register a stdio (`command`) or http
+  (`url`) MCP server.
+- `remove_mcp_server` (mutate) — disable a registered MCP server.
 
 Connectors
 
 - `list_connectors` (query) — registered connectors (claude-code,
   codex, linear, …).
+- `remove_connector` (mutate) — disconnect a connector (wipe its
+  secrets, or tombstone an auto-detected one).
+- `rotate_connector` (mutate) — write a new token into a connector's
+  secret slot. Pass `purpose` when it has more than one slot.
+
+Runtime
+
+- `update_self` (mutate) — pull the latest commit and RESTART the
+  gateway to run the new code. Only works from the installer-managed
+  runtime. Warn the user the runtime will restart.
 
 Skills
 
 - `list_skills` (query) — installed skills with status. Distinct from
   `read_skill`, which fetches one skill's body.
+- `test_skill` (query) — validate one skill's record and report
+  pass/fail. Diagnostic, no approval.
+- `rollback_skill` (mutate) — roll a skill back to its previous saved
+  version.
 
 Query tools resolve immediately; mutate tools may require user approval.
 

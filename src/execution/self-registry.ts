@@ -27,8 +27,12 @@ import { status as runtimeStatus, updateAutoApproveSettings } from "../runtime";
 import { providerCatalogWithStatus } from "../provider";
 import { setSetupProvider, removeSetupProvider } from "../runtime/setup-api";
 import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability, deleteAgent } from "../capabilities/agents";
-import { listSkills } from "../capabilities/skills";
+import { listSkills, rollbackSkill, testSkill } from "../capabilities/skills";
 import { listToolsets, setToolsetStatus } from "../capabilities/toolsets";
+import { addMcpServer, removeMcpServer } from "../integrations/mcp";
+import { deleteConnector, updateConnector } from "../integrations/connectors";
+import { assertCurrentRuntimeUpdateSupported, scheduleRuntimeRestart, updateRuntime } from "../runtime/update";
+import { projectRoot } from "../paths";
 
 export interface SelfOperation {
   name: string;
@@ -553,6 +557,212 @@ async function setDangerousPatterns(
   return JSON.stringify({ ok: true, dangerousTerminalPatterns: result.dangerousTerminalPatterns });
 }
 
+async function addMcpServerOp(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const name = typeof args.name === "string" ? args.name.trim() : "";
+  if (!name) {
+    return JSON.stringify({ ok: false, error: "add_mcp_server requires a 'name'." });
+  }
+  try {
+    const server = await addMcpServer(config, args);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Added MCP server",
+      data: { serverId: server.id, name: server.name, transport: server.transport }
+    });
+    await recordLowRiskAudit(config, taskId, "mcp.added", server.id, {
+      name: server.name,
+      transport: server.transport
+    });
+    return JSON.stringify({
+      ok: true,
+      server: { id: server.id, name: server.name, transport: server.transport, status: server.status }
+    });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function removeMcpServerOp(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const idOrName = typeof args.server === "string" ? args.server.trim() : "";
+  if (!idOrName) {
+    return JSON.stringify({ ok: false, error: "remove_mcp_server requires a 'server' (id or name)." });
+  }
+  try {
+    const server = await removeMcpServer(config, idOrName);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Removed MCP server",
+      data: { serverId: server.id, name: server.name }
+    });
+    await recordLowRiskAudit(config, taskId, "mcp.removed", server.id, { name: server.name });
+    return JSON.stringify({ ok: true, serverId: server.id, status: server.status });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function removeConnectorOp(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const connectorId = typeof args.connector === "string" ? args.connector.trim() : "";
+  if (!connectorId) {
+    return JSON.stringify({ ok: false, error: "remove_connector requires a 'connector' id." });
+  }
+  try {
+    const result = await deleteConnector(config, connectorId);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Removed connector",
+      data: { connectorId: result.id, tombstoned: result.tombstoned }
+    });
+    await recordLowRiskAudit(config, taskId, "connector.removed", result.id, {
+      tombstoned: result.tombstoned ?? false
+    });
+    return JSON.stringify({ ok: true, connectorId: result.id, tombstoned: result.tombstoned ?? false });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function rotateConnector(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const connectorId = typeof args.connector === "string" ? args.connector.trim() : "";
+  const token = typeof args.token === "string" ? args.token : "";
+  if (!connectorId) {
+    return JSON.stringify({ ok: false, error: "rotate_connector requires a 'connector' id." });
+  }
+  if (!token) {
+    return JSON.stringify({ ok: false, error: "rotate_connector requires a non-empty 'token'." });
+  }
+  const connector = readState(config.instance).connectors.find((c) => c.id === connectorId);
+  if (!connector) {
+    return JSON.stringify({ ok: false, error: `Connector not found: ${connectorId}` });
+  }
+  // Resolve which secret slot the token rotates. Writing an arbitrary
+  // `purpose` would create an unused credential slot the connector never
+  // reads, so when the caller omits `purpose` we only auto-pick when the
+  // record has exactly one existing slot; ambiguity surfaces the choices.
+  let purpose = typeof args.purpose === "string" ? args.purpose.trim() : "";
+  if (!purpose) {
+    const purposes = connector.secretRefs.map((ref) => ref.purpose);
+    if (purposes.length === 1) {
+      purpose = purposes[0]!;
+    } else if (purposes.length === 0) {
+      return JSON.stringify({ ok: false, error: `Connector '${connectorId}' has no secret slot to rotate; pass a 'purpose'.` });
+    } else {
+      return JSON.stringify({
+        ok: false,
+        error: `Connector '${connectorId}' has multiple secret slots; pass 'purpose' (one of: ${purposes.join(", ")}).`
+      });
+    }
+  }
+  try {
+    const updated = await updateConnector(config, connectorId, { secrets: { [purpose]: token } });
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Rotated connector credential",
+      data: { connectorId: updated.id, purpose }
+    });
+    await recordLowRiskAudit(config, taskId, "connector.rotated", updated.id, { purpose });
+    return JSON.stringify({ ok: true, connectorId: updated.id, purpose });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function updateSelf(config: RuntimeConfig, taskId: string): Promise<string> {
+  try {
+    assertCurrentRuntimeUpdateSupported();
+    const result = updateRuntime(projectRoot());
+    const restart = result.upToDate ? false : scheduleRuntimeRestart(config.instance);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: result.upToDate ? "Runtime already up to date" : "Updated runtime",
+      data: { beforeSha: result.beforeSha, afterSha: result.afterSha, restart }
+    });
+    await recordLowRiskAudit(config, taskId, "runtime.updated", result.afterSha, {
+      beforeSha: result.beforeSha,
+      commitCount: result.commitCount,
+      restart
+    });
+    return JSON.stringify({
+      ok: true,
+      beforeSha: result.beforeSha,
+      afterSha: result.afterSha,
+      commitCount: result.commitCount,
+      upToDate: result.upToDate,
+      restart
+    });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function rollbackSkillOp(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const idOrName = typeof args.skillId === "string" ? args.skillId.trim() : "";
+  if (!idOrName) {
+    return JSON.stringify({ ok: false, error: "rollback_skill requires a 'skillId' (id or name)." });
+  }
+  try {
+    const skill = await rollbackSkill(config, idOrName);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Rolled back skill",
+      data: { skillId: skill.id, name: skill.name, version: skill.version }
+    });
+    await recordLowRiskAudit(config, taskId, "skill.rolledBack", skill.id, {
+      name: skill.name,
+      version: skill.version
+    });
+    return JSON.stringify({ ok: true, skillId: skill.id, name: skill.name, version: skill.version });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function testSkillOp(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const idOrName = typeof args.skillId === "string" ? args.skillId.trim() : "";
+  if (!idOrName) {
+    return JSON.stringify({ ok: false, error: "test_skill requires a 'skillId' (id or name)." });
+  }
+  try {
+    const result = await testSkill(config, idOrName);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Tested skill",
+      data: { skillId: result.skill.id, ok: result.ok, failures: result.failures.length }
+    });
+    await recordLowRiskAudit(config, taskId, "skill.tested", result.skill.id, {
+      ok: result.ok,
+      failures: result.failures
+    });
+    return JSON.stringify({ ok: result.ok, skillId: result.skill.id, name: result.skill.name, failures: result.failures });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
 // ---------------- Registry ----------------
 
 export const SELF_OPERATIONS: SelfOperation[] = [
@@ -766,6 +976,99 @@ export const SELF_OPERATIONS: SelfOperation[] = [
       required: ["patterns"]
     },
     handler: (config, taskId, args) => setDangerousPatterns(config, taskId, args)
+  },
+  {
+    name: "add_mcp_server",
+    summary: "Register a new MCP server (stdio command or http url) so its tools become available. http transport needs a url; stdio needs a command.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Server name (e.g. 'linear')." },
+        transport: { type: "string", enum: ["stdio", "http"], description: "Transport. Defaults to 'stdio', or 'http' when a url is given." },
+        command: { type: "string", description: "Executable for a stdio server (e.g. 'npx'). Required for stdio." },
+        args: { type: "array", description: "Argument list for the stdio command.", items: { type: "string" } },
+        url: { type: "string", description: "Streamable-HTTP endpoint for an http server (e.g. 'https://mcp.linear.app/mcp'). Required for http." },
+        headers: { type: "object", description: "Static or ${ENV}-placeholder header map for an http server." },
+        exposedTools: { type: "array", description: "Optional whitelist of tool names to expose from this server.", items: { type: "string" } }
+      },
+      required: ["name"]
+    },
+    handler: (config, taskId, args) => addMcpServerOp(config, taskId, args)
+  },
+  {
+    name: "remove_mcp_server",
+    summary: "Disable a registered MCP server so its tools stop being offered. Call list_mcp_servers first for the id.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        server: { type: "string", description: "MCP server id or name." }
+      },
+      required: ["server"]
+    },
+    handler: (config, taskId, args) => removeMcpServerOp(config, taskId, args)
+  },
+  {
+    name: "remove_connector",
+    summary: "Disconnect a connector: wipe its encrypted secrets (user connectors) or tombstone it (auto-detected ones). Call list_connectors first for the id.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        connector: { type: "string", description: "Connector id to remove." }
+      },
+      required: ["connector"]
+    },
+    handler: (config, taskId, args) => removeConnectorOp(config, taskId, args)
+  },
+  {
+    name: "rotate_connector",
+    summary: "Rotate a connector's credential — write a new token into one of its secret slots. Pass 'purpose' when the connector has more than one slot.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        connector: { type: "string", description: "Connector id to rotate." },
+        token: { type: "string", description: "The new secret value to store." },
+        purpose: { type: "string", description: "Which secret slot to write (e.g. 'token'). Optional when the connector has exactly one slot; required when it has several." }
+      },
+      required: ["connector", "token"]
+    },
+    handler: (config, taskId, args) => rotateConnector(config, taskId, args)
+  },
+  {
+    name: "update_self",
+    summary: "Update the runtime to the latest commit (git fetch + reset + bun install) and RESTART the gateway to run the new code. Only works from the installer-managed runtime.",
+    tag: "mutate",
+    schema: { type: "object", properties: {} },
+    handler: (config, taskId) => updateSelf(config, taskId)
+  },
+  {
+    name: "rollback_skill",
+    summary: "Roll a skill back to its previous saved version. Fails if the skill has no rollback history. Call list_skills first for the id.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        skillId: { type: "string", description: "Skill id or name to roll back." }
+      },
+      required: ["skillId"]
+    },
+    handler: (config, taskId, args) => rollbackSkillOp(config, taskId, args)
+  },
+  {
+    name: "test_skill",
+    summary: "Validate a skill's record (required fields, steps, spec compliance) and report pass/fail. Diagnostic — no approval needed.",
+    tag: "query",
+    schema: {
+      type: "object",
+      properties: {
+        skillId: { type: "string", description: "Skill id or name to test." }
+      },
+      required: ["skillId"]
+    },
+    handler: (config, taskId, args) => testSkillOp(config, taskId, args)
   }
 ];
 
