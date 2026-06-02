@@ -4,10 +4,10 @@ import * as ImagePicker from "expo-image-picker";
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  ActionSheetIOS,
   ActivityIndicator,
   Alert,
   Image,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -20,6 +20,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError, uploadImage, type UploadRef } from "@/src/api";
+import { AttachmentSheet } from "@/src/components/AttachmentSheet";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
 import { VoiceRecorder, type VoiceRef } from "@/src/components/chat/VoiceRecorder";
@@ -112,6 +113,7 @@ export default function ChatDetailScreen() {
 
   const [text, setText] = useState("");
   const [images, setImages] = useState<PendingImage[]>([]);
+  const [attachMenuVisible, setAttachMenuVisible] = useState(false);
   // True from the moment a voice message is posted until the gateway
   // finishes transcribing it. Drives the inline pending bubble below the
   // thread; on the very first voice message the local whisper model still
@@ -420,24 +422,8 @@ export default function ChatDetailScreen() {
   };
 
   const openAttachmentMenu = (): void => {
-    if (Platform.OS === "ios") {
-      ActionSheetIOS.showActionSheetWithOptions(
-        {
-          options: ["Cancel", "Take Photo", "Choose From Library"],
-          cancelButtonIndex: 0
-        },
-        (index) => {
-          if (index === 1) void takePhoto();
-          else if (index === 2) void pickFromLibrary();
-        }
-      );
-    } else {
-      Alert.alert("Attach photo", undefined, [
-        { text: "Take Photo", onPress: () => void takePhoto() },
-        { text: "Choose From Library", onPress: () => void pickFromLibrary() },
-        { text: "Cancel", style: "cancel" }
-      ]);
-    }
+    Keyboard.dismiss();
+    setAttachMenuVisible(true);
   };
 
   const removeImage = (localId: string): void => {
@@ -667,6 +653,14 @@ export default function ChatDetailScreen() {
           </View>
         </View>
       </KeyboardAvoidingView>
+      <AttachmentSheet
+        visible={attachMenuVisible}
+        sources={[
+          { key: "camera", label: "Camera", icon: "camera", onPress: () => void takePhoto() },
+          { key: "photos", label: "Photos", icon: "image", onPress: () => void pickFromLibrary() }
+        ]}
+        onClose={() => setAttachMenuVisible(false)}
+      />
     </SafeAreaView>
   );
 }
