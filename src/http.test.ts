@@ -313,6 +313,25 @@ describe("runtime api", () => {
     expect(response.status).toBe(404);
   });
 
+  test("PATCH /api/agents/:id returns 400 for an empty name", async () => {
+    // A missing / blank name is user input, not a server fault — it must
+    // map to 400, never the catch-all 500.
+    const config = testConfig("agents-rename-empty");
+    const handler = createHandler(config);
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Mansour" })
+    });
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/agents/${created.id}`,
+      { method: "PATCH", body: JSON.stringify({}) },
+      config.token
+    );
+    expect(response.status).toBe(400);
+  });
+
   test("supports relay degraded health and notification delivery records", async () => {
     const config = testConfig("relay-notifications");
     const handler = createHandler(config);

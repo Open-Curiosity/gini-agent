@@ -1255,10 +1255,10 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   // SelfOperation in self-registry.ts (the handler home). All are DEFERRED:
   // their names + one-line summaries surface in the on-demand index, and the
   // model loads the ones it needs via load_tools. Query tools resolve
-  // synchronously; the three mutate tools (set_provider, use_agent,
-  // create_agent) route through the generic self.config approval branch in
-  // the dispatcher (auto-approved in `auto`, gated in `strict`). Args are
-  // passed at TOP LEVEL — no `{name, args}` envelope.
+  // synchronously; the four mutate tools (set_provider, use_agent,
+  // create_agent, rename_agent) route through the generic self.config approval
+  // branch in the dispatcher (auto-approved in `auto`, gated in `strict`). Args
+  // are passed at TOP LEVEL — no `{name, args}` envelope.
   {
     toolset: "self",
     displayLabel: "Get self",
@@ -1587,7 +1587,7 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // model are you using" or "switch to deepseek" — the exact asks the
     // surface exists for. They pass gating here; deferral (applied later by
     // applyDeferralFilter) is what keeps them out of the live tools array
-    // until the model loads them. Query tools are read-only; the three
+    // until the model loads them. Query tools are read-only; the four
     // mutate tools gate via the self.config approval branch in dispatch.
     if (tool.toolset === "self") return true;
     if (!enabled.has(tool.toolset)) return false;

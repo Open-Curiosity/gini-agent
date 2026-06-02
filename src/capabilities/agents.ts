@@ -113,8 +113,22 @@ export async function renameAgent(
   // label and a whitespace-only rename is rejected.
   const newName = String(rawName ?? "").replace(/\s+/g, " ").trim();
   if (!newName) throw new Error("New agent name is required.");
+  // "default" is the sentinel the `renameDefaultAgentToGini` migration keys
+  // on: it flips an `agent_default` row named "default" back to "Gini" on the
+  // next state read, which would drift the AgentRecord name away from a SOUL
+  // that says "default". Reject it outright rather than let the rename silently
+  // un-stick.
+  if (newName === "default") throw new Error('"default" is a reserved name.');
+  // Resolve id-first, then fall back to name, so an agent whose NAME happens
+  // to equal another agent's id can't shadow the intended target.
+  const found = readState(config.instance).agents;
+  const target = found.find((a) => a.id === idOrName) ?? found.find((a) => a.name === idOrName);
+  if (!target) throw new Error(`Agent not found: ${idOrName}`);
+  // No-op a rename to the current name: skip the state write, audit, and SOUL
+  // sync so an identity rename doesn't bump updatedAt or log a from===to event.
+  if (target.name === newName) return target;
   const result = await mutateState(config.instance, (state) => {
-    const agent = state.agents.find((item) => item.id === idOrName || item.name === idOrName);
+    const agent = state.agents.find((a) => a.id === target.id);
     if (!agent) throw new Error(`Agent not found: ${idOrName}`);
     const oldName = agent.name;
     agent.name = newName;

@@ -2439,7 +2439,7 @@ async function recordLowRiskAudit(
 //
 // The operation handlers live in self-registry.ts (the single source of
 // truth). Each self-config capability is now a DIRECT deferred tool whose
-// name IS the op name; this dispatcher routes the 9 tool cases through one
+// name IS the op name; this dispatcher routes the 10 tool cases through one
 // helper. Query ops resolve synchronously; mutate ops route through the
 // generic self.config approval branch (auto-approved in `auto`, gated in
 // `strict`), with the actual handler re-run in agent.executeApprovedAction
@@ -2452,7 +2452,7 @@ async function dispatchSelfOp(
   opName: string,
   args: Record<string, unknown>
 ): Promise<DispatchResult> {
-  // The 9 tool cases are the only callers, and each name is a registered op,
+  // The 10 tool cases are the only callers, and each name is a registered op,
   // so findSelfOperation always resolves here.
   const op = findSelfOperation(opName)!;
   if (op.tag === "query") {

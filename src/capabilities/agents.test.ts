@@ -228,6 +228,54 @@ describe("createAgent", () => {
     expect(after.agents.find((agent) => agent.id === created.id)?.name).toBe("Bob");
   });
 
+  test("renameAgent resolves id-first so a name colliding with an id can't shadow", async () => {
+    // One agent's NAME is set to another agent's id. A name-first or
+    // `id || name` first-match lookup would resolve the wrong record;
+    // id-first must target the agent whose id is passed.
+    const config = buildConfig(workspaceRoot, "rename-agent-id-first", root);
+    await install(config);
+    const target = await createAgent(config, { name: "Mansour" });
+    const decoy = await createAgent(config, { name: "decoy" });
+    // Point the decoy's name at the target's id.
+    await mutateState(config.instance, (state) => {
+      const a = state.agents.find((agent) => agent.id === decoy.id)!;
+      a.name = target.id;
+      return a;
+    });
+    const renamed = await renameAgent(config, target.id, "Bob");
+    expect(renamed.id).toBe(target.id);
+    const after = readState(config.instance);
+    expect(after.agents.find((agent) => agent.id === target.id)?.name).toBe("Bob");
+    // The decoy (whose name equals target.id) is left untouched.
+    expect(after.agents.find((agent) => agent.id === decoy.id)?.name).toBe(target.id);
+  });
+
+  test("renameAgent rejects the reserved name \"default\"", async () => {
+    // "default" is the sentinel the renameDefaultAgentToGini migration keys
+    // on, so a rename to it would silently drift back to "Gini".
+    const config = buildConfig(workspaceRoot, "rename-agent-reserved", root);
+    await install(config);
+    const created = await createAgent(config, { name: "Mansour" });
+    await expect(renameAgent(config, created.id, "default")).rejects.toThrow(
+      '"default" is a reserved name.'
+    );
+  });
+
+  test("renameAgent is a no-op when the new name equals the current name", async () => {
+    // Same-name rename must not bump updatedAt or write a from===to audit row.
+    const config = buildConfig(workspaceRoot, "rename-agent-noop", root);
+    await install(config);
+    const created = await createAgent(config, { name: "Mansour" });
+    const before = readState(config.instance);
+    const beforeUpdatedAt = before.agents.find((agent) => agent.id === created.id)?.updatedAt;
+    const renamed = await renameAgent(config, created.id, "Mansour");
+    expect(renamed.id).toBe(created.id);
+    expect(renamed.name).toBe("Mansour");
+    const after = readState(config.instance);
+    expect(after.agents.find((agent) => agent.id === created.id)?.updatedAt).toBe(beforeUpdatedAt);
+    expect(after.audit.some((event) => event.action === "agent.renamed" && event.target === created.id)).toBe(false);
+  });
+
   test("deleteAgent removes the agent, its memories, and its hindsight bank", async () => {
     const config = buildConfig(workspaceRoot, "delete-agent-cascade", root);
     await install(config);

@@ -376,17 +376,7 @@ export function renameSeededSoulName(
   const cleanOld = sanitizeAgentName(oldName);
   const cleanNew = sanitizeAgentName(newName);
   if (!cleanNew) return false;
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch {
-    return false;
-  }
-  if (raw.trim() !== `Your name is ${cleanOld}.`) return false;
-  try {
-    writeFileSafe(path, `Your name is ${cleanNew}.`);
-    return true;
-  } catch (error) {
+  const logError = (error: unknown): void => {
     try {
       appendLog(instance, "identity.rename.error", {
         file: "SOUL.md",
@@ -397,6 +387,20 @@ export function renameSeededSoulName(
     } catch {
       // Best-effort — see seedAgentSoulFile.
     }
+  };
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    logError(error);
+    return false;
+  }
+  if (raw.trim() !== `Your name is ${cleanOld}.`) return false;
+  try {
+    writeFileSafe(path, `Your name is ${cleanNew}.`);
+    return true;
+  } catch (error) {
+    logError(error);
     return false;
   }
 }

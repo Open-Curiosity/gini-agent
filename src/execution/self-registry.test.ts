@@ -4,7 +4,7 @@
 // The registry (self-registry.ts) is the single source of truth for the
 // self-config operation BEHAVIOR (handler + tag + audit). Each capability is
 // exposed to the agent loop as a direct deferred tool whose NAME is the op
-// name; dispatch routes the 9 tool cases through dispatchSelfOp. The
+// name; dispatch routes the 10 tool cases through dispatchSelfOp. The
 // dispatch-level tests exercise the route-by-tag logic (query sync, mutate
 // gated-vs-auto) against a seeded RuntimeConfig + state, reusing the same
 // fixture shape as tool-dispatch.test.ts. Args are passed at TOP LEVEL (no
