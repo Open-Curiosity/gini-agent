@@ -51,7 +51,7 @@ import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./
 import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableMessagingBridge, listAllowedChats, listMessagingMessages, receiveMessagingInput, rejectPendingChat, removeMessagingBridge, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalogWithStatus } from "./provider";
-import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
+import { createAgent, deleteAgent, listAgents, renameAgent, useAgent } from "./capabilities/agents";
 import {
   approveSoul,
   approveUserProfile,
@@ -77,6 +77,7 @@ import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime
 import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
+import { sttStatus } from "./stt";
 import { resumeChatTask } from "./execution/chat-task";
 import { persistConnectOutcome, safeResume } from "./execution/safe-resume";
 import { approvalToolCallId } from "./execution/tool-dispatch";
@@ -223,7 +224,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!(file instanceof Blob)) return json({ error: "Missing 'file' part" }, 400);
       const filename = file instanceof File ? file.name : undefined;
       const mimeType = file.type || "application/octet-stream";
-      if (!mimeType.startsWith("image/")) {
+      if (!mimeType.startsWith("image/") && !mimeType.startsWith("audio/")) {
         return json({ error: `Unsupported upload type: ${mimeType}` }, 415);
       }
       const bytes = new Uint8Array(await file.arrayBuffer());
@@ -254,6 +255,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         }
       });
     }],
+    // Speech-to-text readiness. Lets clients warn before the first voice
+    // message that the local whisper model still needs its one-time download.
+    ["GET", /^\/api\/stt\/status$/, () => json(sttStatus())],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
     // ChatBlock protocol endpoints (ADR chat-block-protocol.md). The
     // /blocks endpoint returns the full ordered list for initial render;
@@ -1361,6 +1365,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],
     ["POST", /^\/api\/agents$/, async (request) => json(await createAgent(config, await body(request)), 201)],
     ["POST", /^\/api\/agents\/([^/]+)\/use$/, async (_request, params) => json(await useAgent(config, params[0]))],
+    ["PATCH", /^\/api\/agents\/([^/]+)$/, async (request, params) => json(await renameAgent(config, decodeURIComponent(params[0]), String((await body(request)).name ?? "")))],
     ["DELETE", /^\/api\/agents\/([^/]+)$/, async (_request, params) => json(await deleteAgent(config, params[0]))],
     ["GET", /^\/api\/parity\/hermes$/, () => json(hermesParityChecks(config))],
     ["GET", /^\/api\/readiness\/v1$/, () => json(v1Readiness(config))],
@@ -1817,6 +1822,11 @@ function agentIdFilter(request: Request): string | undefined {
 function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Job not found") || message.startsWith("Job run not found")) return 404;
   if (message.startsWith("Agent not found")) return 404;
+  // Agent create/rename name validation throws user-input errors that should
+  // surface as 400 rather than the catch-all 500.
+  if (message === "Agent name is required.") return 400;
+  if (message === "New agent name is required.") return 400;
+  if (message === '"default" is a reserved name.') return 400;
   if (message.startsWith("Invalid input")) return 400;
   // Agent delete guards (default agent, active agent) throw user-input
   // errors that should surface as 400.
