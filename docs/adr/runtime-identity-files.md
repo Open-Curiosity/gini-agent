@@ -11,7 +11,7 @@ Gini has three memory surfaces, no fourth:
 | Surface | Mechanism | Scope | Injection cadence | Edit path |
 |---|---|---|---|---|
 | User identity | `USER.md` | instance (cross-agent) | always inject | `edit_user_profile` (auto-approved when injection scan passes) |
-| Agent persona | `SOUL.md` | per-agent | always inject | `edit_soul` (propose → approve) |
+| Agent persona | `SOUL.md` | per-agent | always inject | `edit_soul` (auto-approved when injection scan passes) |
 | Everything else | Hindsight units | per-agent bank | recall on demand | auto-retain at task end; `recall_memory` on demand |
 
 The partition is intentional: always-inject and recall-on-demand serve different needs. `USER.md` and `SOUL.md` are user-curated, bounded, and ride the prompt every turn so the model never has to "remember" who it is talking to or how it is supposed to sound. Hindsight is unbounded and indexed (semantic + BM25 + temporal + graph recall) so episodic facts surface when the conversation makes them relevant without bloating the prompt.
@@ -31,7 +31,7 @@ Gini exposes three markdown files at the runtime root that the agent loop loads 
 | File | Path | Scope | Edit policy |
 |---|---|---|---|
 | `INSTRUCTIONS.md` | `~/.gini/instances/<inst>/INSTRUCTIONS.md` | instance | user-only; never edited by the agent |
-| `SOUL.md` | `~/.gini/instances/<inst>/agents/<agentId>/SOUL.md` | per-agent | agent may propose edits via `edit_soul` (proposed → approved) |
+| `SOUL.md` | `~/.gini/instances/<inst>/agents/<agentId>/SOUL.md` | per-agent | agent edits via `edit_soul`; clean bodies auto-approve, the injection scanner routes hostile bodies through proposed → approved |
 | `USER.md` | `~/.gini/instances/<inst>/USER.md` | instance | agent edits via `edit_user_profile`; clean bodies auto-approve, the injection scanner routes hostile bodies through proposed → approved |
 
 The three files are a curated layer over the Hindsight memory pipeline. USER.md (instance), SOUL.md (per-agent), and Hindsight (per-agent bank) are the three memory surfaces (see the Memory surfaces section above).
@@ -75,7 +75,7 @@ The three new files are additive to that stack — a slow-moving, human-curated 
   - `writeSoul(instance, agentId, content, status)` and `writeUserProfile(instance, content, status)` write `<file>` for approved content and `<file>.proposed` for proposed content. The gateway only reads the approved file into the prompt; proposals require approval via the API.
   - `scanForInjection(content, filename)` ports Hermes' `_CONTEXT_THREAT_PATTERNS` and `_CONTEXT_INVISIBLE_CHARS`.
 - `src/execution/chat-task.ts` (modern agent loop) and `src/provider.ts::generateTaskSummary` (legacy single-shot path) load the three files via `identity-files.ts` and pass them through `buildAgentSystemContext`.
-- `src/execution/tool-catalog.ts` adds `edit_soul` and `edit_user_profile` tools (toolset `identity`, always exposed). The `edit_soul` tool proposes a new SOUL.md body; the body lands as `SOUL.md.proposed` and is reflected in the audit + trace stream until the user approves. The `edit_user_profile` tool auto-approves clean bodies — writes land directly at `USER.md` with the injection scan still gating threat patterns (hostile bodies route through `USER.md.proposed`).
+- `src/execution/tool-catalog.ts` adds `edit_soul` and `edit_user_profile` tools (toolset `identity`, always exposed). Both auto-approve clean bodies — writes land directly at `SOUL.md` / `USER.md` and are effective on the next system prompt — with the injection scan still gating threat patterns (hostile bodies route through `SOUL.md.proposed` / `USER.md.proposed` and stay out of the prompt until the user approves).
 - `src/execution/tool-dispatch.ts` routes `edit_soul` / `edit_user_profile` to handlers that call into `identity-files.ts`. The handlers are sync (no approval gate at dispatch time) and rely on the proposed-vs-approved file split to keep unreviewed content out of the prompt.
 - Both `edit_soul` and `edit_user_profile` accept an `action` field with three values:
   - `set` — replace the whole file body with `content` (default).
@@ -110,7 +110,7 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 
 - **One `IDENTITY.md` carrying all three concerns.** Rejected. Operating rules (the model's behavior contract), persona (the agent's voice), and user identity (who the user is) have different scopes and different edit policies. Collapsing them would either force per-agent operating rules (defeating the instance-level baseline) or instance-level persona (breaking the multi-agent product story).
 - **Persist file content inside `state.json`.** Rejected. Markdown is human-edited; round-tripping through JSON serialization adds friction for what should be `vim ~/.gini/instances/<inst>/USER.md`.
-- **Skip the proposed-file split and rely on inline approval.** Rejected for `SOUL.md` — the persona surface materially changes agent behavior across every turn, so the second pair of eyes earns its keep. `USER.md` auto-approves clean bodies (smaller blast radius); the injection scanner still routes hostile bodies through `.proposed`.
+- **Gate every `SOUL.md` write behind explicit approval.** Rejected. `SOUL.md` and `USER.md` use the same policy: clean bodies auto-approve (effective immediately), and the injection scanner routes hostile bodies through `.proposed`. The persona surface changes every turn, but a clean persona edit is the user shaping their own agent — making them approve their own non-hostile change is friction, not safety. The scanner-gated `.proposed` split is what keeps a tainted body out of the prompt.
 - **Apply the injection scan only to `SOUL.md`.** Rejected. All three files reach the system prompt; all three need the same scan. A user pasting a hostile USER.md from a stranger is the realistic threat — same shape as the Hermes context-file model.
 
 ## Acceptance Checks
@@ -123,7 +123,7 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 - Writing `~/.gini/instances/<inst>/agents/<agentId>/SOUL.md` causes the next chat turn (under that active agent) to include the SOUL block after the instructions and before the identity block.
 - Writing `~/.gini/instances/<inst>/USER.md` causes the next chat turn to include the USER block ahead of any Hindsight-recalled context.
 - A file containing `ignore previous instructions` is replaced in the prompt by `[BLOCKED: <filename> contained potential prompt injection (prompt_injection). Content not loaded.]` and a warning is emitted to the runtime trace.
-- `edit_soul` writes `SOUL.md.proposed` and creates an `identity.soul.proposed` audit row; the new content does not appear in the next turn's prompt until approval via `POST /api/identity-files/soul/approve`.
+- `edit_soul` writes a clean body directly to SOUL.md and emits `identity.soul.approved` with `autoApproved: true`; a body the injection scanner flags lands at SOUL.md.proposed instead and emits `identity.soul.proposed` (operator promotes via `POST /api/identity-files/soul/approve`).
 - `edit_user_profile` writes a clean body directly to USER.md and emits `identity.user_profile.approved` with `autoApproved: true`; a body the injection scanner flags lands at USER.md.proposed instead and emits `identity.user_profile.proposed` (operator promotes via `POST /api/identity-files/user/approve`).
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` are green.
 

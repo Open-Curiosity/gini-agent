@@ -1096,3 +1096,28 @@ export function previewRemoveUserProfileSection(
   const scan = scanForInjection(result, "USER.md");
   return { ok: true, scanFindings: scan.findings, nextBody: result };
 }
+
+// Preview a remove against the active agent's SOUL.md without writing.
+// Same role as previewRemoveUserProfileSection: lets the dispatch layer
+// route a hostile residue body through the propose-gate instead of
+// auto-approving. Never touches disk.
+export function previewRemoveSoulSection(
+  instance: Instance,
+  agentId: string,
+  needle: string
+):
+  | { ok: true; scanFindings: string[]; nextBody: string }
+  | { ok: false; reason: "no source" | "no match" } {
+  const approvedPath = soulPath(instance, agentId);
+  if (!existsSync(approvedPath)) return { ok: false, reason: "no source" };
+  let raw: string;
+  try {
+    raw = readFileSync(approvedPath, "utf8");
+  } catch {
+    return { ok: false, reason: "no source" };
+  }
+  const { changed, result } = dropParagraphContaining(raw, needle);
+  if (!changed) return { ok: false, reason: "no match" };
+  const scan = scanForInjection(result, "SOUL.md");
+  return { ok: true, scanFindings: scan.findings, nextBody: result };
+}

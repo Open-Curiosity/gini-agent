@@ -18,6 +18,7 @@ import {
   loadSoul,
   loadUserProfile,
   migrateInstructionsIdentityLine,
+  previewRemoveSoulSection,
   removeSoulSection,
   removeUserProfileSection,
   renameSeededSoulName,
@@ -338,6 +339,43 @@ describe("identity-files", () => {
       expect(result.ok).toBe(true);
       const proposed = readFileSync(userProfileProposedPath(INSTANCE), "utf8");
       expect(proposed.trim()).toBe("");
+    });
+  });
+
+  describe("previewRemoveSoulSection", () => {
+    // Mirrors the dispatch layer's pre-scan: previews the post-remove
+    // body so a hostile residue can route through .proposed without
+    // touching disk.
+    test("returns the next body and clean scan when the needle matches", () => {
+      writeSoul(INSTANCE, AGENT, "Persona one.\n\nFavorite color: blue.\n\nPersona three.", "approved");
+      const result = previewRemoveSoulSection(INSTANCE, AGENT, "Favorite color");
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.scanFindings).toEqual([]);
+        expect(result.nextBody).toContain("Persona one.");
+        expect(result.nextBody).toContain("Persona three.");
+        expect(result.nextBody).not.toContain("Favorite color");
+      }
+      // Preview never writes — approved file untouched, no proposal.
+      expect(readFileSync(soulPath(INSTANCE, AGENT), "utf8")).toContain("Favorite color");
+      expect(existsSync(soulProposedPath(INSTANCE, AGENT))).toBe(false);
+    });
+
+    test("returns { ok: false, reason: 'no match' } when the needle isn't found", () => {
+      writeSoul(INSTANCE, AGENT, "A single paragraph.", "approved");
+      const result = previewRemoveSoulSection(INSTANCE, AGENT, "absent-marker");
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe("no match");
+      }
+    });
+
+    test("returns { ok: false, reason: 'no source' } when no approved SOUL.md exists", () => {
+      const result = previewRemoveSoulSection(INSTANCE, AGENT, "anything");
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe("no source");
+      }
     });
   });
 
