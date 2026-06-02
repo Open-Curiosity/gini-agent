@@ -4565,8 +4565,10 @@ describe("GET /api/docs", () => {
     const config = testConfig("docs-traversal");
     const handler = createHandler(config);
 
-    // Encoded slashes survive URL normalization, so the captured path reaches
-    // the docsRoot confinement guard instead of collapsing to a 404.
+    // Percent-encode the slashes so the WHATWG URL parser doesn't collapse the
+    // `..` segments away — a literal `/api/docs/../package` normalizes to
+    // `/api/package` and 404s before this route matches. Encoded, the route
+    // matches and resolveDocPath's confinement check rejects the escaping path.
     const response = await rawCall(handler, config, "/api/docs/..%2F..%2Fpackage", {}, config.token);
     expect(response.status).toBe(400);
   });
