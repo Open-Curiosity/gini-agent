@@ -4687,6 +4687,23 @@ describe("GET /api/files", () => {
 
     rmSync(workspace, { recursive: true, force: true });
   });
+
+  test("raw=1 download for a non-ASCII filename returns 200 with both header forms", async () => {
+    const config = testConfig("files-raw-unicode");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-raw-unicode`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/café.md`, "# Hello\n");
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, `/api/files?path=${encodeURIComponent("café.md")}&raw=1`, {}, config.token);
+    expect(response.status).toBe(200);
+    const disposition = response.headers.get("content-disposition") ?? "";
+    expect(disposition).toContain(`filename="caf_.md"`);
+    expect(disposition).toContain("filename*=UTF-8''");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

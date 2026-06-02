@@ -69,7 +69,7 @@ function DrawerBody({ path }: { path: string }) {
 
   return (
     <>
-      <SheetDescription className="sr-only">{path}</SheetDescription>
+      <SheetDescription className="sr-only">{data?.absolutePath ?? path}</SheetDescription>
       <header className="flex h-[60px] shrink-0 items-center justify-between border-b border-[#23232A] px-6">
         <div className="flex min-w-0 items-center gap-2.5">
           <span
@@ -78,10 +78,10 @@ function DrawerBody({ path }: { path: string }) {
           >
             <FileText className="size-4 text-[#6B97FF]" />
           </span>
-          <span className="flex min-w-0 items-baseline gap-1.5">
-            {dir ? <span className="shrink-0 truncate font-mono text-xs text-[#7A7A80]">{dir}</span> : null}
+          <div className="flex min-w-0 items-baseline gap-1.5">
+            {dir ? <span className="truncate font-mono text-xs text-[#7A7A80]">{dir}</span> : null}
             <SheetTitle className="truncate font-mono text-sm font-semibold text-white">{filename}</SheetTitle>
-          </span>
+          </div>
           {ext ? (
             <span className="shrink-0 rounded-[5px] border border-[#243A6F] bg-[#16264D] px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide text-[#8FB1FF]">
               {ext}

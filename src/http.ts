@@ -440,11 +440,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           if (code === "ENOENT") return json({ error: "File not found" }, 404);
           return json({ error: error instanceof Error ? error.message : String(error) }, 500);
         }
-        const filename = basename(absolutePath).replace(/"/g, "");
+        // POSIX filenames may contain bytes (CR/LF, high-bit chars) that Bun
+        // rejects as a header value, which would 500 the download. Emit an
+        // ASCII-safe `filename` fallback plus an RFC 5987 `filename*` form
+        // that carries the original bytes percent-encoded as UTF-8.
+        const rawName = basename(absolutePath);
+        const asciiName = rawName.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_");
+        const contentDisposition = `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(rawName)}`;
         return new Response(Bun.file(absolutePath), {
           headers: {
             "content-type": "application/octet-stream",
-            "content-disposition": `attachment; filename="${filename}"`,
+            "content-disposition": contentDisposition,
             "cache-control": "private, max-age=0"
           }
         });
