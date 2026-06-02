@@ -146,6 +146,13 @@ When an integration needs the actual file (not an upload id) — e.g. a git flow
 1. `skill_run({skill: "attachments", script: "materialize", args: {uploadId: "<id-from-marker>"}})` → `{path, absPath}`.
 2. Hand off `absPath` to the integration skill that consumes a file — it owns the provider-specific attach flow (e.g. github-issues' "Attaching an image to an issue").
 
+### Reading a chat-attached non-image file (PDF, CSV, log, code)
+
+When the user attaches a non-image file in chat, it is NOT inlined into the conversation. It appears in the user message under an `Attached files (in order):` marker — one line per file as `- <id> — <filename> (<mime>, <bytes> bytes)`. The bytes live in upload space, not on disk yet. To use one:
+
+1. `skill_run({skill: "attachments", script: "materialize", args: {uploadId: "<id-from-marker>"}})` → `{path, absPath}` writes it into the workspace.
+2. Read the contents with `file_read` (or hand `absPath` to `code_exec` / `terminal_exec` for binary formats like PDF).
+
 ## Rules
 
 1. **Always invoke through `skill_run`** with `skill: "attachments"`. The scripts read JSON from stdin and write JSON to stdout — don't try to `terminal_exec` them by hand.

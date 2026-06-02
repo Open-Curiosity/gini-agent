@@ -234,7 +234,12 @@ remote previews, screen readers) would need the same translation code.
   - `submitChatMessage` inserts the `user_text` block alongside the
     legacy ChatMessageRecord. The block carries optional `images` and
     `audio` upload refs (`{ id, mimeType, size }`); clients fetch the
-    bytes via `GET /api/uploads/:id`. A voice message's `audio` is
+    bytes via `GET /api/uploads/:id`. The `images` field name is
+    retained for wire compatibility but now carries refs to any attached
+    file (PDF, CSV, logs), not only images — non-image files reach the
+    model by reference rather than inline (see
+    [chat-file-attachments.md](chat-file-attachments.md)). A voice
+    message's `audio` is
     render-only — it is transcribed on the gateway and only the
     transcript becomes the block text and model input (see
     [voice-messages-and-local-stt.md](voice-messages-and-local-stt.md)).
