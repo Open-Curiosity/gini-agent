@@ -45,9 +45,16 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[]) {
     items.push({ kind: "block", block: exchange[i]! });
   }
   items.push({ kind: "tool_group", id: `group-${calls[0]!.id}`, calls });
+  for (let i = firstCallIdx + 1; i < exchange.length; i++) {
+    const b = exchange[i]!;
+    if (b.kind === "tool_call" || b.kind === "tool_result") continue;
+    items.push({ kind: "block", block: b });
+  }
   // Group every successfully generated file into one always-visible card so
   // the user can open them directly instead of digging through the collapsed
-  // tool group. Dedupe by path, keeping the last write's toolName.
+  // tool group. Dedupe by path, keeping the last write's toolName. The card is
+  // pushed after the trailing blocks (assistant_text) so it renders below the
+  // agent's reply rather than above it.
   const filesByPath = new Map<string, string>();
   for (const call of calls) {
     if (call.toolName !== "file_write" && call.toolName !== "file_patch") continue;
@@ -59,11 +66,6 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[]) {
   if (filesByPath.size > 0) {
     const files = Array.from(filesByPath, ([path, toolName]) => ({ path, toolName }));
     items.push({ kind: "file_artifact", id: `files-${calls[0]!.id}`, files });
-  }
-  for (let i = firstCallIdx + 1; i < exchange.length; i++) {
-    const b = exchange[i]!;
-    if (b.kind === "tool_call" || b.kind === "tool_result") continue;
-    items.push({ kind: "block", block: b });
   }
 }
 

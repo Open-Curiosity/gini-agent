@@ -49,6 +49,12 @@ describe("groupExchanges file artifacts", () => {
     expect(artifacts.length).toBe(1);
     expect(artifacts[0]!.files.length).toBe(1);
     expect(artifacts[0]!.files[0]).toMatchObject({ path: "note.md", toolName: "file_write" });
+    // The card renders below the agent's reply: file_artifact comes after the
+    // assistant_text block.
+    const assistantIdx = items.findIndex((i) => i.kind === "block" && i.block.kind === "assistant_text");
+    const artifactIdx = items.findIndex((i) => i.kind === "file_artifact");
+    expect(assistantIdx).toBeGreaterThanOrEqual(0);
+    expect(artifactIdx).toBeGreaterThan(assistantIdx);
   });
 
   test("two distinct paths group into one artifact carrying both files", () => {
