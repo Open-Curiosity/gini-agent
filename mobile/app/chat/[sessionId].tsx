@@ -565,9 +565,11 @@ export default function ChatDetailScreen() {
               accessibilityLabel="Message input"
             />
             {/* Trailing control mirrors Telegram/iMessage: the send arrow
-                appears once there's text or a ready image; an empty
-                composer shows the press-and-hold mic instead. */}
-            {trimmed || readyImages.length > 0 ? (
+                appears once there's text or a ready image; an empty composer
+                shows the press-and-hold mic instead. The recorder targets
+                iOS LinearPCM WAV, so non-iOS platforms always show the send
+                arrow (disabled when empty) rather than the mic. */}
+            {trimmed || readyImages.length > 0 || Platform.OS !== "ios" ? (
               <Pressable
                 onPress={submit}
                 disabled={sendDisabled}
