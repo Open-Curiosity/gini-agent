@@ -1200,6 +1200,16 @@ async function runLoop(
           } else {
             const setupRow = stateForBlock.setupRequests.find((s) => s.id === dispatch.approvalId);
             if (setupRow) {
+              // connector.request renders a minimal card (no inline reason),
+              // so the model's reason — its natural "here's why connecting
+              // helps" explanation — is surfaced as its own assistant bubble
+              // above the card. Without this the reason would be invisible in
+              // the block UI (the legacy ChatMessageRecord persisted in
+              // tool-dispatch only feeds the deprecated getChatSession path).
+              if (setupRow.action === "connector.request" && setupRow.reason) {
+                const reasonBlock = emitAssistantTextStart(emitCtx, setupRow.reason);
+                if (reasonBlock?.id) finalizeAssistantText(emitCtx, reasonBlock.id, setupRow.reason);
+              }
               emitSetupRequested(emitCtx, {
                 setupRequestId: setupRow.id,
                 action: setupRow.action,
