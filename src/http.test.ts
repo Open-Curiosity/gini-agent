@@ -4573,6 +4573,56 @@ describe("runtime api", () => {
   });
 });
 
+describe("GET /api/files", () => {
+  test("returns content, absolute path, and name for an existing text file", async () => {
+    const config = testConfig("files-read-ok");
+    const workspace = `/tmp/gini-files-test-${Date.now()}`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/note.md`, "# Hello\n");
+    const handler = createHandler(config);
+
+    const file = await call(handler, config, "/api/files?path=note.md");
+    expect(file.name).toBe("note.md");
+    expect(file.absolutePath).toBe(`${workspace}/note.md`);
+    expect(file.content).toBe("# Hello\n");
+    expect(file.binary).toBe(false);
+    expect(file.truncated).toBe(false);
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("rejects a path that escapes the workspace with 400", async () => {
+    const config = testConfig("files-escape-400");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-escape`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=../outside.txt", {}, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("outside workspace");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("returns 404 for a non-existent file", async () => {
+    const config = testConfig("files-missing-404");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-missing`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=nope.txt", {}, config.token);
+    expect(response.status).toBe(404);
+    const body = await response.json();
+    expect(body.error).toBe("File not found");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+});
+
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
   return callWithToken(handler, config, config.token, path, init);
 }

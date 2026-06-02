@@ -6,6 +6,7 @@ import {
   addAudit,
   addSseSubscription,
   appendTrace,
+  assertInsideWorkspace,
   createSetupRequest,
   getDevice,
   listChatBlocks,
@@ -84,7 +85,8 @@ import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
 import { projectRoot, webPortPath } from "./paths";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { basename } from "node:path";
 import { tunnelManager, bootstrapUrl, renderQrSvg, renderQrAnsi } from "./runtime/tunnel";
 import type { RedactedTunnelSnapshot, TunnelSnapshot } from "./runtime/tunnel/types";
 
@@ -410,6 +412,35 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           "cache-control": "private, max-age=31536000, immutable"
         }
       });
+    }],
+    // Read a workspace file by relative path so the web app can show the
+    // contents (and absolute path) of files the agent generated in chat. The
+    // path is resolved and validated inside the workspace root;
+    // `assertInsideWorkspace` throws on escape, which we map to 400 rather
+    // than letting it bubble to the default 500.
+    ["GET", /^\/api\/files$/, (request) => {
+      const path = new URL(request.url).searchParams.get("path");
+      if (!path) return json({ error: "Missing 'path' query parameter" }, 400);
+      let absolutePath: string;
+      try {
+        absolutePath = assertInsideWorkspace(config.workspaceRoot, path);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
+      if (!existsSync(absolutePath)) return json({ error: "File not found" }, 404);
+      const stat = statSync(absolutePath);
+      if (!stat.isFile()) return json({ error: "Not a file" }, 400);
+      const name = basename(absolutePath);
+      const MAX = 512 * 1024;
+      const bytes = readFileSync(absolutePath);
+      const sample = bytes.subarray(0, 8000);
+      const binary = sample.includes(0);
+      if (binary) {
+        return json({ path, absolutePath, name, bytes: stat.size, content: null, truncated: false, binary: true });
+      }
+      const truncated = stat.size > MAX;
+      const content = bytes.subarray(0, MAX).toString("utf8");
+      return json({ path, absolutePath, name, bytes: stat.size, content, truncated, binary: false });
     }],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
     // ChatBlock protocol endpoints (ADR chat-block-protocol.md). The
