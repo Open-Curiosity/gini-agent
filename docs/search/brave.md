@@ -9,7 +9,7 @@ Web search via Brave's Data-for-Search API. The free tier covers 2k queries/mont
 
 ## Connect it to Gini
 
-Paste the key into the **Connect Brave Search** card in Gini chat (or on `/connectors`) and submit. Gini verifies the key against the live search endpoint before saving.
+When Gini needs web search it shows a **Connect Brave Search** card in the chat — paste the key there and submit. You can also connect it from a skill's **Set up** button on the Skills page. Gini verifies the key against the live search endpoint before saving.
 
 ## Use it
 

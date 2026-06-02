@@ -9,7 +9,7 @@ Neural web search + content extraction via [Exa](https://exa.ai). Paid, with fre
 
 ## Connect it to Gini
 
-Paste the key into the **Connect Exa** card in Gini chat (or on `/connectors`) and submit. Gini verifies the key against the live search endpoint before saving.
+When Gini needs web search it shows a **Connect Exa** card in the chat — paste the key there and submit. You can also connect it from a skill's **Set up** button on the Skills page. Gini verifies the key against the live search endpoint before saving.
 
 ## Use it
 
