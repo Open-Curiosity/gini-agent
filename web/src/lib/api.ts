@@ -54,3 +54,20 @@ export async function uploadImage(file: File): Promise<UploadRef> {
 export function uploadUrl(id: string): string {
   return `/api/runtime/uploads/${encodeURIComponent(id)}`;
 }
+
+// A workspace file read via GET /api/files. `content` is the utf8 text (null
+// for binary files); `truncated` is set when the file exceeds the gateway's
+// read cap.
+export interface WorkspaceFile {
+  path: string;
+  absolutePath: string;
+  name: string;
+  bytes: number;
+  content: string | null;
+  truncated: boolean;
+  binary: boolean;
+}
+
+export function fetchWorkspaceFile(path: string): Promise<WorkspaceFile> {
+  return api<WorkspaceFile>(`/files?path=${encodeURIComponent(path)}`);
+}

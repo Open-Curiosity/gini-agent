@@ -7,7 +7,8 @@ import type { ChatBlock, ToolCallBlock } from "@runtime/types";
 // inline so the user sees progress as it streams.
 export type ChatRenderItem =
   | { kind: "block"; block: ChatBlock }
-  | { kind: "tool_group"; id: string; calls: ToolCallBlock[] };
+  | { kind: "tool_group"; id: string; calls: ToolCallBlock[] }
+  | { kind: "file_artifact"; id: string; path: string; toolName: string };
 
 export function groupExchanges(blocks: ChatBlock[]): ChatRenderItem[] {
   const items: ChatRenderItem[] = [];
@@ -44,6 +45,22 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[]) {
     items.push({ kind: "block", block: exchange[i]! });
   }
   items.push({ kind: "tool_group", id: `group-${calls[0]!.id}`, calls });
+  // Surface each successfully generated file as a dedicated, always-visible
+  // card so the user can open it directly instead of digging through the
+  // collapsed tool group. Dedupe by path, keeping the last write's toolName.
+  const filesByPath = new Map<string, string>();
+  for (const call of calls) {
+    if (call.toolName !== "file_write" && call.toolName !== "file_patch") continue;
+    if (call.status !== "ok") continue;
+    const path = String(call.argsFull?.path ?? call.argsPreview ?? "").trim();
+    if (!path) continue;
+    filesByPath.set(path, call.toolName);
+  }
+  let artifactIndex = 0;
+  for (const [path, toolName] of filesByPath) {
+    items.push({ kind: "file_artifact", id: `file-${calls[0]!.id}-${artifactIndex}`, path, toolName });
+    artifactIndex++;
+  }
   for (let i = firstCallIdx + 1; i < exchange.length; i++) {
     const b = exchange[i]!;
     if (b.kind === "tool_call" || b.kind === "tool_result") continue;
