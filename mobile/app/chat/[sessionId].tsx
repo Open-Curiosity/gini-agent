@@ -20,6 +20,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError, uploadImage, type UploadRef } from "@/src/api";
+import { ActionSheet } from "@/src/components/ActionSheet";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
@@ -109,6 +110,7 @@ export default function ChatDetailScreen() {
 
   const [text, setText] = useState("");
   const [images, setImages] = useState<PendingImage[]>([]);
+  const [attachMenuVisible, setAttachMenuVisible] = useState(false);
   const scrollRef = useRef<ScrollView | null>(null);
 
   // Tracks whether the ScrollView is currently pinned near the bottom.
@@ -394,11 +396,7 @@ export default function ChatDetailScreen() {
         }
       );
     } else {
-      Alert.alert("Attach photo", undefined, [
-        { text: "Take Photo", onPress: () => void takePhoto() },
-        { text: "Choose From Library", onPress: () => void pickFromLibrary() },
-        { text: "Cancel", style: "cancel" }
-      ]);
+      setAttachMenuVisible(true);
     }
   };
 
@@ -583,6 +581,15 @@ export default function ChatDetailScreen() {
           </View>
         </View>
       </KeyboardAvoidingView>
+      <ActionSheet
+        visible={attachMenuVisible}
+        title="Attach photo"
+        options={[
+          { label: "Take Photo", onPress: () => void takePhoto() },
+          { label: "Choose From Library", onPress: () => void pickFromLibrary() }
+        ]}
+        onClose={() => setAttachMenuVisible(false)}
+      />
     </SafeAreaView>
   );
 }
