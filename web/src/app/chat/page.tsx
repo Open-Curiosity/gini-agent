@@ -17,7 +17,7 @@ import {
 } from "@/components/ui/dialog";
 import { BlockRenderer } from "@/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/components/chat/BlockToolCallsCollapsed";
-import { FileArtifactCard } from "@/components/chat/FileArtifactCard";
+import { GeneratedFilesCard } from "@/components/chat/GeneratedFilesCard";
 import { Composer } from "@/components/chat/Composer";
 import { SessionItem } from "@/components/chat/SessionItem";
 import { api, type UploadRef } from "@/lib/api";
@@ -304,7 +304,7 @@ export default function ChatPage() {
                       if (item.kind === "file_artifact") {
                         return (
                           <li key={item.id}>
-                            <FileArtifactCard path={item.path} toolName={item.toolName} />
+                            <GeneratedFilesCard files={item.files} />
                           </li>
                         );
                       }

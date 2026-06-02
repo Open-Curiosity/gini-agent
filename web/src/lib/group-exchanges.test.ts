@@ -1,8 +1,9 @@
 // Unit tests for the file-artifact extraction in groupExchanges. A completed
 // exchange that contains successful file_write/file_patch tool calls should
-// emit one "file_artifact" render item per unique generated-file path, so the
-// chat UI can show an always-visible card for each. These are pure-JS tests:
-// they build minimal ChatBlock fixtures and assert on the render-item shape.
+// emit one "file_artifact" render item carrying every unique generated-file
+// path, so the chat UI can show one grouped card for the exchange. These are
+// pure-JS tests: they build minimal ChatBlock fixtures and assert on the
+// render-item shape.
 
 import { describe, expect, test } from "bun:test";
 import type { ChatBlock, ToolCallBlock } from "@runtime/types";
@@ -38,7 +39,7 @@ function toolCall(overrides: Partial<ToolCallBlock>): ChatBlock {
 }
 
 describe("groupExchanges file artifacts", () => {
-  test("a completed exchange with a successful file_write yields a file_artifact", () => {
+  test("a completed exchange with a successful file_write yields one grouped file_artifact", () => {
     const items = groupExchanges([
       user("write a note"),
       toolCall({ toolName: "file_write", argsFull: { path: "note.md" }, status: "ok" }),
@@ -46,10 +47,24 @@ describe("groupExchanges file artifacts", () => {
     ]);
     const artifacts = items.filter((i) => i.kind === "file_artifact");
     expect(artifacts.length).toBe(1);
-    expect(artifacts[0]).toMatchObject({ kind: "file_artifact", path: "note.md", toolName: "file_write" });
+    expect(artifacts[0]!.files.length).toBe(1);
+    expect(artifacts[0]!.files[0]).toMatchObject({ path: "note.md", toolName: "file_write" });
   });
 
-  test("two writes to the same path dedupe to one artifact", () => {
+  test("two distinct paths group into one artifact carrying both files", () => {
+    const items = groupExchanges([
+      user("write two"),
+      toolCall({ toolName: "file_write", argsFull: { path: "a.md" }, status: "ok" }),
+      toolCall({ toolName: "file_write", argsFull: { path: "b.md" }, status: "ok" }),
+      assistant("done")
+    ]);
+    const artifacts = items.filter((i) => i.kind === "file_artifact");
+    expect(artifacts.length).toBe(1);
+    expect(artifacts[0]!.files.length).toBe(2);
+    expect(artifacts[0]!.files.map((f) => f.path)).toEqual(["a.md", "b.md"]);
+  });
+
+  test("two writes to the same path dedupe to one file", () => {
     const items = groupExchanges([
       user("write twice"),
       toolCall({ toolName: "file_write", argsFull: { path: "note.md" }, status: "ok" }),
@@ -58,8 +73,9 @@ describe("groupExchanges file artifacts", () => {
     ]);
     const artifacts = items.filter((i) => i.kind === "file_artifact");
     expect(artifacts.length).toBe(1);
+    expect(artifacts[0]!.files.length).toBe(1);
     // Last occurrence's toolName wins.
-    expect(artifacts[0]).toMatchObject({ path: "note.md", toolName: "file_patch" });
+    expect(artifacts[0]!.files[0]).toMatchObject({ path: "note.md", toolName: "file_patch" });
   });
 
   test("a failed file_write yields no artifact", () => {

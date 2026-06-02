@@ -71,3 +71,10 @@ export interface WorkspaceFile {
 export function fetchWorkspaceFile(path: string): Promise<WorkspaceFile> {
   return api<WorkspaceFile>(`/files?path=${encodeURIComponent(path)}`);
 }
+
+// Direct BFF URL for downloading a workspace file. The gateway's raw mode
+// streams the bytes back as an attachment, so this is safe to use as an
+// <a download href={...}> target.
+export function fileRawUrl(path: string): string {
+  return `/api/runtime/files?path=${encodeURIComponent(path)}&raw=1`;
+}
