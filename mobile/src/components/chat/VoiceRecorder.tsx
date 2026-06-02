@@ -161,19 +161,34 @@ export function VoiceRecorder({
       await finish();
       return;
     }
-    await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-    await recorder.prepareToRecordAsync();
-    if (cancelDuringPrepRef.current) {
+    try {
+      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      await recorder.prepareToRecordAsync();
+      if (cancelDuringPrepRef.current) {
+        activeRef.current = false;
+        recordingRef.current = false;
+        await finish();
+        return;
+      }
+      recorder.record();
+      recordingRef.current = true;
+      startedAtRef.current = Date.now();
+      setCancelling(false);
+      setRecording(true);
+    } catch (err) {
+      // The recorder couldn't be prepared or started — e.g. there's no
+      // microphone input available (a simulator/host with no mic) and the
+      // native layer rejects with "Failed to prepare recorder". Reset the
+      // take and tear down the audio session so a failed prep doesn't leak
+      // as an uncaught promise rejection or leave the take stuck active.
       activeRef.current = false;
       recordingRef.current = false;
       await finish();
-      return;
+      Alert.alert(
+        "Couldn't start recording",
+        "Gini couldn't access the microphone to record a voice message. Please try again."
+      );
     }
-    recorder.record();
-    recordingRef.current = true;
-    startedAtRef.current = Date.now();
-    setCancelling(false);
-    setRecording(true);
   }, [recorder, finish]);
 
   const stop = useCallback(
