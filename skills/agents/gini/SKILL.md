@@ -68,6 +68,10 @@ The self-config tools (load the ones you need):
   SOUL.md/toolset filter follow the new active row on the next turn.
 - `create_agent` (mutate) — create a new agent row. The new agent is
   NOT activated; follow up with `use_agent`.
+- `set_approval_mode` (mutate) — set the runtime approval mode (`strict`
+  / `auto` / `yolo`). Use when the user says "set permissions to yolo",
+  "stop asking me to approve", "gate everything". In `strict` this change
+  itself requires approval.
 
 Query tools resolve immediately; mutate tools (`set_provider`,
 `use_agent`, `create_agent`) may require user approval.
@@ -115,6 +119,13 @@ and `echo` — see `list_providers` for the full catalog.
 2. Call `use_agent({ agentId: "<id or name>" })`.
 3. The new agent's SOUL.md and provider override take effect on the
    next turn.
+
+### Recipe — "set permissions to yolo" / "stop asking for approval"
+
+1. `load_tools({ names: ["set_approval_mode"] })`, then call
+   `set_approval_mode({ mode: "yolo" })` (or `"auto"` / `"strict"`).
+2. Never shell out to `curl`/the settings API for this — that bypasses
+   the registered tool and fails on auth.
 
 ### Recipe — "what skills do you have"
 

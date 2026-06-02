@@ -130,7 +130,7 @@ const ALWAYS_ON = new Set([
   // USER.md edits. The propose-vs-approve file split is the gate.
   "edit_soul",
   "edit_user_profile"
-  // The 9 self-config tools (get_self, list_*, set_provider, …) live under
+  // The self-config tools (get_self, list_*, set_provider, …) live under
   // the "self" toolset (not in defaults) and pass gating, but they are
   // DEFERRED — they only join the live tools array once the model loads
   // them. They are asserted separately (see "deferred tools" below), not
@@ -138,7 +138,7 @@ const ALWAYS_ON = new Set([
   // (post-deferral) catalog with no toolsets enabled.
 ]);
 
-// The 9 self-config / introspection tools, now direct deferred tools.
+// The self-config / introspection tools, now direct deferred tools.
 const SELF_TOOLS = [
   "get_self",
   "list_providers",
@@ -148,7 +148,8 @@ const SELF_TOOLS = [
   "list_connectors",
   "set_provider",
   "use_agent",
-  "create_agent"
+  "create_agent",
+  "set_approval_mode"
 ];
 
 describe("buildToolCatalog", () => {
@@ -158,7 +159,7 @@ describe("buildToolCatalog", () => {
     // buildToolCatalog returns the gated catalog INCLUDING deferred tools;
     // the self tools bypass toolset gating (deferral, applied later, is what
     // hides them from the live array). So every tool here is either always-on
-    // or one of the 9 self tools.
+    // or one of the self tools.
     for (const tool of catalog) {
       expect(ALWAYS_ON.has(tool.function.name) || tool.toolset === "self").toBe(true);
     }
@@ -167,7 +168,7 @@ describe("buildToolCatalog", () => {
     for (const expected of ALWAYS_ON) {
       expect(names.has(expected)).toBe(true);
     }
-    // The 9 self tools surface (ungated) and are marked deferred.
+    // The self tools surface (ungated) and are marked deferred.
     for (const name of SELF_TOOLS) {
       const tool = catalog.find((t) => t.function.name === name);
       expect(tool).toBeDefined();
@@ -386,7 +387,7 @@ describe("deferred tools", () => {
     expect(filtered.every((t) => !t.deferred)).toBe(true);
   });
 
-  test("the 9 self-config tools are deferred and absent from applyDeferralFilter(catalog, ∅)", () => {
+  test("the self-config tools are deferred and absent from applyDeferralFilter(catalog, ∅)", () => {
     const catalog = buildToolCatalog(fullState);
     for (const name of SELF_TOOLS) {
       const tool = catalog.find((t) => t.function.name === name);
