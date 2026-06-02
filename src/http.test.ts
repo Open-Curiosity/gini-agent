@@ -4621,6 +4621,54 @@ describe("GET /api/files", () => {
 
     rmSync(workspace, { recursive: true, force: true });
   });
+
+  test("reports a binary file without returning its content", async () => {
+    const config = testConfig("files-binary");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-binary`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/blob.bin`, Buffer.from([0x89, 0x50, 0x00, 0x01]));
+    const handler = createHandler(config);
+
+    const file = await call(handler, config, "/api/files?path=blob.bin");
+    expect(file.binary).toBe(true);
+    expect(file.content).toBe(null);
+    expect(file.bytes).toBe(4);
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("returns 400 for a directory", async () => {
+    const config = testConfig("files-directory");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-directory`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    mkdirSync(`${workspace}/sub`);
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=sub", {}, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toBe("Not a file");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("truncates a file larger than the read cap", async () => {
+    const config = testConfig("files-truncate");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-truncate`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/big.txt`, "a".repeat(600 * 1024));
+    const handler = createHandler(config);
+
+    const file = await call(handler, config, "/api/files?path=big.txt");
+    expect(file.truncated).toBe(true);
+    expect(file.content.length).toBe(512 * 1024);
+    expect(file.bytes).toBe(600 * 1024);
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

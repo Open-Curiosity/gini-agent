@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogTrigger
@@ -51,10 +52,14 @@ function FileViewer({ path, name, open }: { path: string; name: string; open: bo
 
   const onCopy = async () => {
     if (!data) return;
-    await navigator.clipboard.writeText(data.absolutePath);
-    setCopied(true);
-    toast.success("Path copied");
-    setTimeout(() => setCopied(false), 1500);
+    try {
+      await navigator.clipboard.writeText(data.absolutePath);
+      setCopied(true);
+      toast.success("Path copied");
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      toast.error("Failed to copy path");
+    }
   };
 
   const isMarkdown = /\.(md|markdown)$/i.test(name);
@@ -63,6 +68,7 @@ function FileViewer({ path, name, open }: { path: string; name: string; open: bo
     <>
       <DialogHeader>
         <DialogTitle className="truncate font-mono">{name}</DialogTitle>
+        <DialogDescription className="sr-only">File contents and absolute path</DialogDescription>
         {isLoading ? (
           <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
             <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />

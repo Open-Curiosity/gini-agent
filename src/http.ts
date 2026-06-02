@@ -85,7 +85,7 @@ import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
 import { projectRoot, webPortPath } from "./paths";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { basename } from "node:path";
 import { tunnelManager, bootstrapUrl, renderQrSvg, renderQrAnsi } from "./runtime/tunnel";
 import type { RedactedTunnelSnapshot, TunnelSnapshot } from "./runtime/tunnel/types";
@@ -427,20 +427,39 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 400);
       }
-      if (!existsSync(absolutePath)) return json({ error: "File not found" }, 404);
-      const stat = statSync(absolutePath);
-      if (!stat.isFile()) return json({ error: "Not a file" }, 400);
-      const name = basename(absolutePath);
       const MAX = 512 * 1024;
-      const bytes = readFileSync(absolutePath);
-      const sample = bytes.subarray(0, 8000);
-      const binary = sample.includes(0);
-      if (binary) {
-        return json({ path, absolutePath, name, bytes: stat.size, content: null, truncated: false, binary: true });
+      try {
+        const stat = statSync(absolutePath);
+        if (!stat.isFile()) return json({ error: "Not a file" }, 400);
+        const name = basename(absolutePath);
+        // Read at most MAX bytes through a file descriptor so memory stays
+        // bounded no matter how large the file is on disk.
+        const cap = Math.min(stat.size, MAX);
+        const buffer = Buffer.alloc(cap);
+        const fd = openSync(absolutePath, "r");
+        let read = 0;
+        try {
+          while (read < cap) {
+            const n = readSync(fd, buffer, read, cap - read, read);
+            if (n === 0) break;
+            read += n;
+          }
+        } finally {
+          closeSync(fd);
+        }
+        const data = buffer.subarray(0, read);
+        // A NUL byte in the leading sample is the standard text/binary
+        // heuristic (matches git / `grep -I`).
+        const binary = data.subarray(0, 8000).includes(0);
+        if (binary) {
+          return json({ path, absolutePath, name, bytes: stat.size, content: null, truncated: false, binary: true });
+        }
+        return json({ path, absolutePath, name, bytes: stat.size, content: data.toString("utf8"), truncated: stat.size > MAX, binary: false });
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException)?.code;
+        if (code === "ENOENT") return json({ error: "File not found" }, 404);
+        return json({ error: error instanceof Error ? error.message : String(error) }, 500);
       }
-      const truncated = stat.size > MAX;
-      const content = bytes.subarray(0, MAX).toString("utf8");
-      return json({ path, absolutePath, name, bytes: stat.size, content, truncated, binary: false });
     }],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
     // ChatBlock protocol endpoints (ADR chat-block-protocol.md). The
