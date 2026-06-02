@@ -232,9 +232,10 @@ export function scaffoldInstanceIdentityFiles(instance: Instance): ScaffoldInsta
 // bleeds into a non-default agent's self-description as "your Gini ...").
 const LEGACY_INSTRUCTIONS_IDENTITY_LINES = new Set<string>([
   "You are Gini, a personal agent.",
-  "You are a personal assistant running on the gini-agent framework."
+  "You are a personal assistant running on the gini-agent framework.",
+  "You are a personal agent."
 ]);
-const CURRENT_INSTRUCTIONS_IDENTITY_LINE = "You are a personal agent.";
+const CURRENT_INSTRUCTIONS_IDENTITY_LINE = "You are a personal agent running on the gini-agent framework.";
 
 // One-time, per-boot migration: when the on-disk INSTRUCTIONS.md leads with
 // a known legacy identity sentence, rewrite ONLY that first line to the

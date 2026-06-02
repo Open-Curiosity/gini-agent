@@ -518,20 +518,27 @@ describe("identity-files", () => {
   });
 
   describe("migrateInstructionsIdentityLine", () => {
+    const CURRENT_LINE = "You are a personal agent running on the gini-agent framework.";
+
     test("rewrites a legacy 'You are Gini, a personal agent.' first line, preserving the rest", () => {
       const path = instructionsPath(INSTANCE);
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, "You are Gini, a personal agent.\nReply directly and concisely.\nMore rules.");
       expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(true);
-      expect(readFileSync(path, "utf8")).toBe("You are a personal agent.\nReply directly and concisely.\nMore rules.");
+      expect(readFileSync(path, "utf8")).toBe(`${CURRENT_LINE}\nReply directly and concisely.\nMore rules.`);
     });
 
-    test("rewrites the interim framework wording too", () => {
+    test("rewrites the interim wordings (assistant-framework and the bare line) too", () => {
       const path = instructionsPath(INSTANCE);
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, "You are a personal assistant running on the gini-agent framework.\nReply directly.");
       expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(true);
-      expect(readFileSync(path, "utf8")).toBe("You are a personal agent.\nReply directly.");
+      expect(readFileSync(path, "utf8")).toBe(`${CURRENT_LINE}\nReply directly.`);
+      // The interim name-free line (shipped briefly) also rolls forward to
+      // include the framework so existing instances aren't left behind.
+      writeFileSync(path, "You are a personal agent.\nReply directly.");
+      expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(true);
+      expect(readFileSync(path, "utf8")).toBe(`${CURRENT_LINE}\nReply directly.`);
     });
 
     test("is idempotent — a second pass does not rewrite", () => {
@@ -540,7 +547,7 @@ describe("identity-files", () => {
       writeFileSync(path, "You are Gini, a personal agent.\nReply directly.");
       expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(true);
       expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(false);
-      expect(readFileSync(path, "utf8")).toBe("You are a personal agent.\nReply directly.");
+      expect(readFileSync(path, "utf8")).toBe(`${CURRENT_LINE}\nReply directly.`);
     });
 
     test("leaves a user-customized first line untouched", () => {
