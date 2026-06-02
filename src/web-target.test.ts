@@ -111,6 +111,14 @@ describe("resolveWebPort", () => {
     expect(await resolveWebPort(c, { fetch: h.fn })).toBeNull();
   });
 
+  test("returns null without probing when the recorded port equals the gateway port", async () => {
+    const c = cfg("p-self");
+    writePort("p-self", String(c.port)); // web.port == gateway port (stale/corrupt)
+    const h = healthz({ service: "gini-web", instance: "p-self" });
+    expect(await resolveWebPort(c, { fetch: h.fn })).toBeNull();
+    expect(h.calls()).toBe(0); // never probes (would loop back into us)
+  });
+
   test("returns null when healthz answers with a redirect (foreign squatter)", async () => {
     const c = cfg("p-redirect");
     writePort("p-redirect", "3097");

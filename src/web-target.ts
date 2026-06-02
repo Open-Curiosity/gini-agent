@@ -53,6 +53,10 @@ export function clearWebTargetCache(instance?: string): void {
 export async function resolveWebPort(config: RuntimeConfig, deps: WebTargetDeps = {}): Promise<number | null> {
   const port = recordedWebPort(config);
   if (port === null) return null;
+  // Never proxy to our own listener. A stale/corrupt web.port equal to the
+  // gateway port would otherwise make the healthz probe (and every proxied
+  // request) loop back through the /api/runtime carve-out into this process.
+  if (port === config.port) return null;
   const fetchImpl = deps.fetch ?? fetch;
   const now = deps.now ?? Date.now;
   const ttlMs = deps.ttlMs ?? 5000;
