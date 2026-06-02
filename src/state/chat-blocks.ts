@@ -24,8 +24,10 @@ import type {
   ChatBlock,
   ChatBlockKind,
   Instance,
+  ProviderName,
   RiskLevel,
   SetupRequestAction,
+  SystemNoteAuthError,
   ToolCallBlock,
   ToolCallStatus
 } from "../types";
@@ -218,8 +220,30 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
         action: String(payload.action ?? "") as SetupRequestAction,
         summary: String(payload.summary ?? "")
       };
-    case "system_note":
-      return { ...base, kind: "system_note", text: String(payload.text ?? "") };
+    case "system_note": {
+      const raw =
+        payload.authError && typeof payload.authError === "object"
+          ? (payload.authError as Partial<SystemNoteAuthError>)
+          : undefined;
+      // Backfill the routing fields for rows written before they existed so
+      // every returned block satisfies SystemNoteAuthError (the renderer never
+      // sees a half-populated authError).
+      const authError: SystemNoteAuthError | undefined = raw
+        ? {
+            provider: raw.provider as ProviderName,
+            providerLabel: String(raw.providerLabel ?? raw.provider ?? ""),
+            detail: String(raw.detail ?? ""),
+            reauthKind: raw.reauthKind === "docs" ? "docs" : "settings",
+            reauthUrl: typeof raw.reauthUrl === "string" ? raw.reauthUrl : "/settings"
+          }
+        : undefined;
+      return {
+        ...base,
+        kind: "system_note",
+        text: String(payload.text ?? ""),
+        ...(authError ? { authError } : {})
+      };
+    }
     default: {
       // Exhaustiveness guard. CHECK constraint on the kind column makes
       // this unreachable for rows we wrote, but a hand-edited DB might
@@ -276,7 +300,10 @@ function payloadFor(block: ChatBlock): string {
         summary: block.summary
       });
     case "system_note":
-      return JSON.stringify({ text: block.text });
+      return JSON.stringify({
+        text: block.text,
+        ...(block.authError ? { authError: block.authError } : {})
+      });
   }
 }
 
@@ -381,7 +408,12 @@ export function insertChatBlock(
             summary: input.summary
           };
         case "system_note":
-          return { ...base, kind: "system_note", text: input.text };
+          return {
+            ...base,
+            kind: "system_note",
+            text: input.text,
+            ...(input.authError ? { authError: input.authError } : {})
+          };
       }
     })();
 

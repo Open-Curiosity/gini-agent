@@ -27,6 +27,7 @@ import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
   isTaskInFlight,
+  useCancelTask,
   useChatStream,
   useSendMessage,
   useVoiceStatus
@@ -77,6 +78,24 @@ function describeAsset(asset: ImagePicker.ImagePickerAsset): {
 // stable, conversation-derived label is more useful than "New chat" in
 // the gap between the user's first send and the auto-rename completing.
 const DEFAULT_TITLE_FALLBACKS = new Set<string>(["Untitled chat", "New chat"]);
+const TERMINAL_PHASE_LABELS = new Set<string>(["Completed", "Cancelled", "Failed"]);
+
+function findInFlightTaskId(blocks: ChatBlock[]): string | null {
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const b = blocks[i]!;
+    if (b.kind === "phase") {
+      if (TERMINAL_PHASE_LABELS.has(b.label)) return null;
+      return b.taskId ?? null;
+    }
+    if (b.kind === "setup_requested" || b.kind === "authorization_requested") {
+      return b.taskId ?? null;
+    }
+    if (b.kind === "tool_call" && b.status === "running") {
+      return b.taskId ?? null;
+    }
+  }
+  return null;
+}
 
 // Three sections: a header with back arrow + centered title, the
 // scrolling conversation, and the input bar (pill + circular send
@@ -88,6 +107,7 @@ export default function ChatDetailScreen() {
   const stream = useChatStream(sessionId ?? null);
   const send = useSendMessage(sessionId ?? null);
   const voice = useVoiceStatus();
+  const cancel = useCancelTask();
   const qc = useQueryClient();
 
   const [text, setText] = useState("");
@@ -232,6 +252,7 @@ export default function ChatDetailScreen() {
   }, [list, stream.session]);
 
   const inFlight = useMemo(() => isTaskInFlight(list), [list]);
+  const inFlightTaskId = useMemo(() => findInFlightTaskId(list), [list]);
 
   // The most recent assistant_text block's updatedAt advances on every
   // streaming delta. Including it in the scroll dep array means the
@@ -275,6 +296,7 @@ export default function ChatDetailScreen() {
   const showSendBusy = send.isPending || inFlight;
   const sendDisabled =
     (!trimmed && readyImages.length === 0) || showSendBusy || anyUploading || !sessionId || voiceBusy;
+  const canStop = Boolean(inFlightTaskId) && !cancel.isPending;
 
   const submit = () => {
     // Hardware-keyboard onSubmitEditing can fire mid-task; `showSendBusy`
@@ -317,6 +339,15 @@ export default function ChatDetailScreen() {
         }
       }
     );
+  };
+
+  const stopTask = () => {
+    if (!inFlightTaskId || cancel.isPending) return;
+    cancel.mutate(inFlightTaskId, {
+      onError: (err) => {
+        Alert.alert("Stop failed", err.message);
+      }
+    });
   };
 
   // Each picker asset gets a local id so the tray entry can be replaced
@@ -440,7 +471,13 @@ export default function ChatDetailScreen() {
 
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : undefined}
-        keyboardVerticalOffset={Platform.OS === "ios" ? 80 : 0}
+        // No vertical offset: the SafeAreaView is this screen's root view
+        // (the native stack header is hidden), so KeyboardAvoidingView's
+        // own onLayout frame is already in screen coordinates and accounts
+        // for the custom header + top inset. Any non-zero offset here is
+        // pure over-padding and leaves a gap between the composer and the
+        // keyboard.
+        keyboardVerticalOffset={0}
         style={styles.flex}
       >
         {stream.isPending && !stream.blocks ? (
@@ -452,6 +489,13 @@ export default function ChatDetailScreen() {
             ref={scrollRef}
             contentContainerStyle={styles.messages}
             keyboardShouldPersistTaps="handled"
+            // Dragging the transcript dismisses the keyboard so the user
+            // can read the conversation or recover screen space without
+            // sending. on-drag (not interactive) so scrolling up to older
+            // messages dismisses too, not just a downward drag toward the
+            // keyboard. Taps on non-interactive content still dismiss via
+            // keyboardShouldPersistTaps; taps on buttons stay handled.
+            keyboardDismissMode="on-drag"
             scrollEventThrottle={16}
             onScroll={(e) => {
               const { contentOffset, contentSize, layoutMeasurement } =
@@ -570,14 +614,33 @@ export default function ChatDetailScreen() {
               style={styles.inputText}
               accessibilityLabel="Message input"
             />
-            {/* Trailing control mirrors Telegram/iMessage: the send arrow
-                appears once there's text or a ready image; an empty composer
-                shows the press-and-hold mic instead. The recorder targets
-                iOS LinearPCM WAV, so non-iOS platforms always show the send
-                arrow (disabled when empty) rather than the mic. While a voice
-                take is in flight we keep the recorder mounted so its upload
-                can't resolve from an unmounted component and race a text send. */}
-            {!voiceBusy && (trimmed || readyImages.length > 0 || Platform.OS !== "ios") ? (
+            {/* Trailing control: while a task is in flight, show the Stop
+                button (cancels the run). Otherwise mirror Telegram/iMessage —
+                the send arrow appears once there's text or a ready image (or
+                on non-iOS, where the recorder can't emit a decodable WAV),
+                and an empty iOS composer shows the press-and-hold mic. While a
+                voice take is in flight we keep the recorder mounted so its
+                upload can't resolve from an unmounted component and race a
+                text send. */}
+            {canStop ? (
+              <Pressable
+                onPress={stopTask}
+                disabled={cancel.isPending}
+                style={[
+                  styles.sendButton,
+                  styles.stopButton,
+                  cancel.isPending && styles.sendButtonDisabled
+                ]}
+                accessibilityRole="button"
+                accessibilityLabel="Stop response"
+              >
+                {cancel.isPending ? (
+                  <ActivityIndicator color={theme.buttonText} />
+                ) : (
+                  <Feather name="square" size={16} color={theme.buttonText} />
+                )}
+              </Pressable>
+            ) : !voiceBusy && (trimmed || readyImages.length > 0 || Platform.OS !== "ios") ? (
               <Pressable
                 onPress={submit}
                 disabled={sendDisabled}
@@ -754,6 +817,7 @@ const styles = StyleSheet.create({
     justifyContent: "center"
   },
   sendButtonDisabled: { backgroundColor: theme.buttonDisabled },
+  stopButton: { backgroundColor: theme.danger },
 
   // Right-aligned pending indicator for an in-flight voice message.
   // Mirrors the user-bubble row alignment but uses a muted gray surface

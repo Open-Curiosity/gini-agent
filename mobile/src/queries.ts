@@ -14,7 +14,8 @@ import type {
   AgentsResponse,
   ChatBlock,
   ChatSession,
-  RuntimeStatus
+  RuntimeStatus,
+  Task
 } from "./types";
 
 // Web parity: chat task statuses where partial text is no longer arriving.
@@ -762,6 +763,17 @@ export function useSendMessage(sessionId: string | null) {
       // (transcription ran), so re-fetch readiness — the first-run setup
       // notice should only appear once.
       qc.invalidateQueries({ queryKey: ["voice-status"] });
+    }
+  });
+}
+
+export function useCancelTask() {
+  const qc = useQueryClient();
+  return useMutation<Task, Error, string>({
+    mutationFn: (taskId: string) => api<Task>(`/tasks/${taskId}/cancel`, { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["chat"] });
+      qc.invalidateQueries({ queryKey: ["chats"] });
     }
   });
 }
