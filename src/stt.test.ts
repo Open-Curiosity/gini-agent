@@ -4,6 +4,8 @@
 // dynamic import via __setTransformersLoaderForTests so the local-provider
 // code path runs without the network or the native binding.
 
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   __setTransformersLoaderForTests,
@@ -11,8 +13,10 @@ import {
   decodeWav,
   echoProvider,
   getSttProvider,
+  localCacheDir,
   localProvider,
-  resolveSttChoice
+  resolveSttChoice,
+  sttStatus
 } from "./stt";
 
 afterEach(() => {
@@ -167,5 +171,46 @@ describe("local provider via test seam", () => {
     }));
     const provider = localProvider();
     expect(await provider.transcribe(makeWav([0], 16000, 1))).toBe("ok");
+  });
+});
+
+describe("sttStatus", () => {
+  // Use a unique model id so the on-disk onnx files we create can't collide
+  // with the real whisper cache, and clean them up after each case.
+  const modelId = `test-org/stt-status-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  const onnxDir = join(localCacheDir(), modelId, "onnx");
+
+  afterEach(() => {
+    rmSync(join(localCacheDir(), modelId.split("/")[0]!), { recursive: true, force: true });
+  });
+
+  test("echo provider is always ready", () => {
+    process.env.GINI_STT_PROVIDER = "echo";
+    const status = sttStatus();
+    expect(status.provider).toBe("echo");
+    expect(status.ready).toBe(true);
+  });
+
+  test("local is not ready when the onnx weights are absent", () => {
+    process.env.GINI_LOCAL_STT_MODEL = modelId;
+    const status = sttStatus();
+    expect(status.provider).toBe("local");
+    expect(status.model).toBe(modelId);
+    expect(status.ready).toBe(false);
+  });
+
+  test("local is ready once both onnx files exist for the configured dtype", () => {
+    process.env.GINI_LOCAL_STT_MODEL = modelId;
+    mkdirSync(onnxDir, { recursive: true });
+    writeFileSync(join(onnxDir, "encoder_model_q4.onnx"), "");
+    writeFileSync(join(onnxDir, "decoder_model_merged_q4.onnx"), "");
+    expect(sttStatus().ready).toBe(true);
+  });
+
+  test("requires both encoder and decoder files", () => {
+    process.env.GINI_LOCAL_STT_MODEL = modelId;
+    mkdirSync(onnxDir, { recursive: true });
+    writeFileSync(join(onnxDir, "encoder_model_q4.onnx"), "");
+    expect(sttStatus().ready).toBe(false);
   });
 });

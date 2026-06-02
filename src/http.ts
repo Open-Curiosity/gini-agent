@@ -77,6 +77,7 @@ import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime
 import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
+import { sttStatus } from "./stt";
 import { resumeChatTask } from "./execution/chat-task";
 import { persistConnectOutcome, safeResume } from "./execution/safe-resume";
 import { approvalToolCallId } from "./execution/tool-dispatch";
@@ -411,6 +412,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         }
       });
     }],
+    // Speech-to-text readiness. Lets clients warn before the first voice
+    // message that the local whisper model still needs its one-time download.
+    ["GET", /^\/api\/stt\/status$/, () => json(sttStatus())],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
     // ChatBlock protocol endpoints (ADR chat-block-protocol.md). The
     // /blocks endpoint returns the full ordered list for initial render;

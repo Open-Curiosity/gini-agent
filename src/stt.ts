@@ -22,7 +22,7 @@
 // decodes the RIFF header with the tiny pure-JS parser below and feeds the
 // Float32Array straight to the pipeline (which expects 16 kHz mono samples).
 
-import { mkdirSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -88,6 +88,35 @@ export function resolveSttChoice(): SttChoice {
     model: localModelId(),
     reason: "default",
     cacheDir: localCacheDir()
+  };
+}
+
+// Whether the local model's onnx weights are already on disk, so the first
+// voice message can be transcribed without the one-time ~727MB download. The
+// onnx-community build stores the encoder + merged decoder for the configured
+// dtype under <cacheDir>/<modelId>/onnx (q4 → encoder_model_q4.onnx +
+// decoder_model_merged_q4.onnx; fp32 omits the dtype suffix). Pure disk check —
+// no model load, no download.
+export function isLocalSttModelCached(modelId: string = localModelId()): boolean {
+  const dtype = localDtype();
+  const onnxDir = join(localCacheDir(), modelId, "onnx");
+  const suffix = dtype === "fp32" ? "" : `_${dtype}`;
+  return (
+    existsSync(join(onnxDir, `encoder_model${suffix}.onnx`)) &&
+    existsSync(join(onnxDir, `decoder_model_merged${suffix}.onnx`))
+  );
+}
+
+// Lightweight readiness signal for clients. `ready` is true when a voice
+// message can be transcribed immediately: always for echo, and for local only
+// once the model weights are cached (otherwise the first request blocks on a
+// one-time download). No model load, no download.
+export function sttStatus(): { provider: SttProviderName; model: string; ready: boolean } {
+  const choice = resolveSttChoice();
+  return {
+    provider: choice.name,
+    model: choice.model,
+    ready: choice.name === "echo" ? true : isLocalSttModelCached(choice.model)
   };
 }
 
