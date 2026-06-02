@@ -35,7 +35,7 @@ import {
   type MessageContentPart,
   type ToolCall
 } from "../provider";
-import { uploadDataUrl } from "../state/uploads";
+import { uploadDataUrl, uploadStat } from "../state/uploads";
 import {
   SOUL_SOFT_CAP_CHARS,
   USER_SOFT_CAP_CHARS,
@@ -603,7 +603,7 @@ function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessag
     }
     if (m.role === "user" || m.role === "assistant") {
       if (m.role === "user" && m.images && m.images.length > 0) {
-        mapped.push({ role: "user", content: buildVisionContent(config, m.content, m.images) });
+        mapped.push({ role: "user", content: buildAttachmentContent(config, m.content, m.images) });
       } else {
         mapped.push({ role: m.role, content: m.content });
       }
@@ -661,22 +661,27 @@ function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessag
 // otherwise it stays a plain string (the legacy text-only path).
 function buildUserMessage(config: RuntimeConfig, task: Task): ToolCallingMessage {
   if (task.images && task.images.length > 0) {
-    return { role: "user", content: buildVisionContent(config, task.input, task.images) };
+    return { role: "user", content: buildAttachmentContent(config, task.input, task.images) };
   }
   return { role: "user", content: task.input };
 }
 
-// Render image refs as data URLs at dispatch time. The provider can't
-// authenticate against /api/uploads/:id, so we inline base64 bytes. A
-// missing/unreadable upload is dropped with a trace; the text part is
-// retained so the model still gets the user's words.
-function buildVisionContent(
+// Render attachment refs into provider content parts at dispatch time.
+// Images are inlined as data URLs (the provider can't authenticate against
+// /api/uploads/:id, so we inline base64 bytes); a missing/unreadable image
+// is dropped with a trace. Non-image files don't go inline — they're named
+// in a text marker that tells the model to materialize + read them on
+// demand. The text part is always retained so the model still gets the
+// user's words.
+function buildAttachmentContent(
   config: RuntimeConfig,
   text: string,
-  images: ReadonlyArray<{ id: string; mimeType: string; size: number }>
+  attachments: ReadonlyArray<{ id: string; mimeType: string; size: number }>
 ): MessageContentPart[] {
   const parts: MessageContentPart[] = [];
   if (text.length > 0) parts.push({ type: "text", text });
+  const images = attachments.filter((a) => a.mimeType.startsWith("image/"));
+  const files = attachments.filter((a) => !a.mimeType.startsWith("image/"));
   const loaded: Array<{ id: string; mimeType: string; size: number }> = [];
   for (const image of images) {
     const dataUrl = uploadDataUrl(config.instance, image.id);
@@ -703,9 +708,28 @@ function buildVisionContent(
       text: `Attached image uploads (in order):\n${lines.join("\n")}`
     });
   }
-  // Provider requires non-empty content. If every image failed to load and
-  // there was no text, fall through to an empty text part so we never send
-  // an empty parts array.
+  // Non-image files reach the model by reference, not inline: storage keeps
+  // the bytes in the upload space and the model pulls them into the
+  // workspace on demand via the attachments skill's `materialize` script.
+  // The marker names each file (id, filename, mime, size) so the model has
+  // the uploadId to materialize and enough metadata to decide how to read it.
+  if (files.length > 0) {
+    const lines = files.map((f) => {
+      const name = uploadStat(config.instance, f.id)?.filename;
+      return `- ${f.id}${name ? ` — ${name}` : ""} (${f.mimeType}, ${f.size} bytes)`;
+    });
+    parts.push({
+      type: "text",
+      text:
+        "Attached files (in order). Each is in Gini's upload space by id — NOT yet on disk. " +
+        "To read or use one, load the attachments skill (read_skill name=\"attachments\") and run its " +
+        "`materialize` script with the uploadId to write it into the workspace, then read it with file_read:\n" +
+        lines.join("\n")
+    });
+  }
+  // Provider requires non-empty content. If every attachment failed to load
+  // and there was no text, fall through to an empty text part so we never
+  // send an empty parts array.
   if (parts.length === 0) parts.push({ type: "text", text: "" });
   return parts;
 }

@@ -25,6 +25,7 @@ import {
   subscribeChatSession,
   unreadCountForDevice,
   uploadStat,
+  isPlausibleMime,
   upsertDevice
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
@@ -230,7 +231,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["DELETE", /^\/api\/chat\/([^/]+)$/, async (_request, params) => { await deleteChat(config, params[0]); return json({ ok: true }); }],
     ["PATCH", /^\/api\/chat\/([^/]+)$/, async (request, params) => json(await renameChat(config, params[0], await body(request)))],
     ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
-    // Image upload. Accepts multipart/form-data with a `file` part. The bytes
+    // File upload. Accepts multipart/form-data with a `file` part. The bytes
     // are stored on disk under ~/.gini/instances/<instance>/uploads/<id>.<ext>
     // and the response carries the upload ref the client attaches to the
     // next chat message via /messages { content, images: [{ id, ... }] }.
@@ -244,10 +245,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!(file instanceof Blob)) return json({ error: "Missing 'file' part" }, 400);
       const filename = file instanceof File ? file.name : undefined;
       const mimeType = file.type || "application/octet-stream";
-      if (!mimeType.startsWith("image/") && !mimeType.startsWith("audio/")) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      // Accept any plausible MIME — storage already handles arbitrary file
+      // types (PDF, CSV, logs, code). Vision-only callers gate on image/*
+      // downstream (vision_query, the image_url path in buildAttachmentContent),
+      // so a non-image upload never lands in a vision call. Reject only
+      // structurally invalid mimes (415) and empty bodies (400).
+      if (!isPlausibleMime(mimeType)) {
         return json({ error: `Unsupported upload type: ${mimeType}` }, 415);
       }
-      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (bytes.length === 0) return json({ error: "Upload is empty." }, 400);
       const stored = storeUpload(config.instance, bytes, mimeType, filename);
       return json(stored, 201);
     }],

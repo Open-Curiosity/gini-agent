@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHandler } from "./http";
-import { addAudit, appendEvent, mutateState, readState, readTrace } from "./state";
+import { addAudit, appendEvent, mutateState, readState, readTrace, isPlausibleMime } from "./state";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
 import { listProviders } from "./integrations/connectors/registry";
@@ -4539,6 +4539,68 @@ describe("GET /api/files", () => {
     expect(response.headers.get("content-disposition") ?? "").toContain("attachment");
 
     rmSync(workspace, { recursive: true, force: true });
+  });
+
+  // The upload gate accepts any plausible MIME, not just images/audio. These
+  // build the multipart request directly (not via call/rawCall, which pin
+  // content-type: application/json) so FormData sets its own multipart
+  // boundary header.
+  test("POST /api/uploads accepts an application/pdf file and serves it back", async () => {
+    const config = testConfig("uploads-pdf");
+    const handler = createHandler(config);
+    const form = new FormData();
+    form.set("file", new File([new Uint8Array([0x25, 0x50, 0x44, 0x46])], "report.pdf", { type: "application/pdf" }));
+    const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/uploads`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${config.token}` },
+      body: form
+    }));
+    expect(response.status).toBe(201);
+    const ref = await response.json();
+    expect(ref.mimeType).toBe("application/pdf");
+
+    const fetched = await rawCall(handler, config, `/api/uploads/${ref.id}`, {}, config.token);
+    expect(fetched.status).toBe(200);
+    expect(fetched.headers.get("content-type")).toBe("application/pdf");
+  });
+
+  test("POST /api/uploads accepts a text/csv file", async () => {
+    const config = testConfig("uploads-csv");
+    const handler = createHandler(config);
+    const form = new FormData();
+    form.set("file", new File(["a,b\n1,2\n"], "data.csv", { type: "text/csv" }));
+    const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/uploads`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${config.token}` },
+      body: form
+    }));
+    expect(response.status).toBe(201);
+    const ref = await response.json();
+    expect(ref.mimeType).toBe("text/csv");
+  });
+
+  // The 415 gate fires on a structurally-invalid mime (no slash / whitespace).
+  // Bun's multipart encoder ignores a part's declared content-type and sniffs
+  // the mime from the filename extension, so an invalid mime can't be smuggled
+  // through a `File` part — it always arrives plausible. The gate predicate is
+  // exercised directly to pin the 415-triggering condition.
+  test("isPlausibleMime rejects structurally-invalid mimes (the 415 gate)", () => {
+    expect(isPlausibleMime("notamime")).toBe(false);
+    expect(isPlausibleMime("text/csv")).toBe(true);
+    expect(isPlausibleMime("application/pdf")).toBe(true);
+  });
+
+  test("POST /api/uploads rejects an empty file with 400", async () => {
+    const config = testConfig("uploads-empty");
+    const handler = createHandler(config);
+    const form = new FormData();
+    form.set("file", new File([], "empty.csv", { type: "text/csv" }));
+    const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/uploads`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${config.token}` },
+      body: form
+    }));
+    expect(response.status).toBe(400);
   });
 });
 
