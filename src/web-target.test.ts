@@ -133,6 +133,24 @@ describe("resolveWebPort", () => {
     expect(sawManual).toBe(true);
   });
 
+  test("a validation racing an invalidation does not repopulate the cache", async () => {
+    const c = cfg("p-gen");
+    writePort("p-gen", "3088");
+    const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+    const slow = (async () => {
+      await gate; // hold the probe open while we invalidate
+      return new Response(JSON.stringify({ service: "gini-web", instance: "p-gen" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const inFlight = resolveWebPort(c, { fetch: slow });
+    clearWebTargetCache("p-gen"); // bump generation mid-probe
+    release();
+    expect(await inFlight).toBe(3088); // still returns the just-validated port
+    // The racing probe must NOT have cached; the next call re-validates.
+    const fresh = healthz({ service: "gini-web", instance: "p-gen" });
+    await resolveWebPort(c, { fetch: fresh.fn });
+    expect(fresh.calls()).toBe(1);
+  });
+
   test("returns null when the healthz request throws", async () => {
     const c = cfg("p-throw");
     writePort("p-throw", "3097");

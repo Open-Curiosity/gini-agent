@@ -1519,6 +1519,11 @@ async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Prom
   }
 }
 
+// How long to wait for a proxied upstream WebSocket to finish its handshake
+// before tearing it down. Next HMR opens in well under a second; this is a
+// generous ceiling that just bounds buffering on a hung/slow upstream.
+const WS_HANDSHAKE_TIMEOUT_MS = 15_000;
+
 // WebSocket close codes that close() accepts: 1000, or the 3000-4999
 // application range. Upstream may report reserved codes (1005/1006/1015) that
 // throw if forwarded; normalize anything else to 1011 (internal error).
@@ -1563,7 +1568,13 @@ export async function proxyWebSocketUpgrade(request: Request, server: Server<WsP
     : new WebSocket(wsUrl);
   upstream.binaryType = "arraybuffer";
   const data: WsProxyData = { upstream, toClient: [], toUpstream: [], clientOpen: false, upstreamOpen: false, upstreamClosed: false };
+  // Bound the handshake: if the upstream never opens (slow/hung web server),
+  // tear it down rather than buffering client frames into toUpstream forever.
+  const handshakeTimer = setTimeout(() => {
+    if (!data.upstreamOpen) { try { upstream.close(); } catch { /* already closing */ } }
+  }, WS_HANDSHAKE_TIMEOUT_MS);
   upstream.addEventListener("open", () => {
+    clearTimeout(handshakeTimer);
     data.upstreamOpen = true;
     for (const m of data.toUpstream) { try { upstream.send(m); } catch { /* dropped */ } }
     data.toUpstream = [];
@@ -1578,6 +1589,7 @@ export async function proxyWebSocketUpgrade(request: Request, server: Server<WsP
   // otherwise leave the client half-open with frames buffered forever. If the
   // client is already up we close it now; if not, open() reads upstreamClosed.
   const onUpstreamDown = (code?: number) => {
+    clearTimeout(handshakeTimer);
     data.upstreamClosed = true;
     // Normalize the code (reserved codes like 1006 throw) and omit the reason
     // (an over-long upstream reason would also throw on close()).

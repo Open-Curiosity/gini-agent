@@ -36,10 +36,22 @@ interface CacheEntry {
 // round-trip off the hot path while still catching a port that goes stale.
 const validationCache = new Map<string, CacheEntry>();
 
+// Per-instance generation counter, bumped on every invalidation. A validation
+// that started before an invalidation must NOT repopulate the cache afterward
+// (an in-flight probe resolving late could otherwise resurrect a port a fresh
+// failure just dropped). resolveWebPort captures the generation before its
+// async probe and only writes the cache if it hasn't changed.
+const generation = new Map<string, number>();
+
 // Drop a cached validation. Exposed for tests.
 export function clearWebTargetCache(instance?: string): void {
-  if (instance === undefined) validationCache.clear();
-  else validationCache.delete(instance);
+  if (instance === undefined) {
+    validationCache.clear();
+    generation.clear();
+  } else {
+    validationCache.delete(instance);
+    generation.set(instance, (generation.get(instance) ?? 0) + 1);
+  }
 }
 
 // Resolve the loopback port of THIS instance's Next.js web server, VALIDATED
@@ -62,6 +74,7 @@ export async function resolveWebPort(config: RuntimeConfig, deps: WebTargetDeps 
   const ttlMs = deps.ttlMs ?? 5000;
   const cached = validationCache.get(config.instance);
   if (cached && cached.port === port && cached.validUntil > now()) return port;
+  const gen = generation.get(config.instance) ?? 0;
   try {
     const res = await fetchImpl(`http://127.0.0.1:${port}/api/runtime/__healthz`, {
       signal: AbortSignal.timeout(2000),
@@ -77,7 +90,11 @@ export async function resolveWebPort(config: RuntimeConfig, deps: WebTargetDeps 
     }
     const body = (await res.json()) as { service?: unknown; instance?: unknown };
     if (body.service === "gini-web" && body.instance === config.instance) {
-      validationCache.set(config.instance, { port, validUntil: now() + ttlMs });
+      // Only cache if no invalidation raced this probe. Either way the port is
+      // valid as of this just-completed healthz, so still return it.
+      if ((generation.get(config.instance) ?? 0) === gen) {
+        validationCache.set(config.instance, { port, validUntil: now() + ttlMs });
+      }
       return port;
     }
   } catch {
