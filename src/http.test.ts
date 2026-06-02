@@ -4542,6 +4542,36 @@ describe("GET /api/files", () => {
   });
 });
 
+describe("GET /api/docs", () => {
+  test("returns the requested doc section markdown and title", async () => {
+    const config = testConfig("docs-section");
+    const handler = createHandler(config);
+
+    const doc = await call(handler, config, "/api/docs/providers/codex?section=re-authentication");
+    expect(doc.title).toBe("Codex");
+    expect(doc.anchor).toBe("re-authentication");
+    expect(doc.markdown).toContain("## Re-authentication");
+  });
+
+  test("requires authentication", async () => {
+    const config = testConfig("docs-unauth");
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/docs/providers/codex");
+    expect(response.status).toBe(401);
+  });
+
+  test("rejects a traversal path with 400", async () => {
+    const config = testConfig("docs-traversal");
+    const handler = createHandler(config);
+
+    // Encoded slashes survive URL normalization, so the captured path reaches
+    // the docsRoot confinement guard instead of collapsing to a 404.
+    const response = await rawCall(handler, config, "/api/docs/..%2F..%2Fpackage", {}, config.token);
+    expect(response.status).toBe(400);
+  });
+});
+
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
   return callWithToken(handler, config, config.token, path, init);
 }

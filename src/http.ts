@@ -86,6 +86,7 @@ import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
 import { projectRoot } from "./paths";
+import { readDocSection } from "./docs";
 import { clearWebTargetCache, resolveWebPort } from "./web-target";
 import { basename } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
@@ -365,6 +366,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         const code = (error as NodeJS.ErrnoException)?.code;
         if (code === "ENOENT") return json({ error: "File not found" }, 404);
         return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+      }
+    }],
+    // Serve a doc (or a single #anchor section) from the repo docs/ tree so the
+    // app can render referenced docs inline instead of linking out. The web
+    // DocReference component derives `<path>?section=<slug>` from the hosted
+    // docs URL. Read-only and confined under docs/; the central bearer gate
+    // already covers it.
+    ["GET", /^\/api\/docs\/(.+)$/, (request, params) => {
+      const path = params[0];
+      const section = new URL(request.url).searchParams.get("section") ?? undefined;
+      try {
+        return json(readDocSection(path, section));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+          return json({ error: "Doc not found" }, 404);
+        }
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
       }
     }],
     // Speech-to-text readiness. Lets clients warn before the first voice
