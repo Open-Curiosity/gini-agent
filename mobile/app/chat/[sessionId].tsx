@@ -22,6 +22,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError, uploadImage, type UploadRef } from "@/src/api";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
+import { GeneratedFilesCard } from "@/src/components/chat/GeneratedFilesCard";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
@@ -476,6 +477,8 @@ export default function ChatDetailScreen() {
                     calls={item.calls}
                     resultsByCallId={toolResultsByCallId}
                   />
+                ) : item.kind === "file_artifact" ? (
+                  <GeneratedFilesCard key={item.id} files={item.files} />
                 ) : (
                   <BlockRenderer
                     key={item.block.id}
