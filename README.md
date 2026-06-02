@@ -127,18 +127,6 @@ gini smoke                  # ephemeral instance under /tmp
 
 Multiple agents can run smoke tests concurrently without colliding.
 
-## Mobile tunnel
-
-Expose the running gateway over a Cloudflare quick tunnel so your phone can reach it:
-
-```bash
-gini tunnel enable          # spawn cloudflared + mint a bootstrap URL
-gini tunnel qr              # render an ASCII QR for the URL
-gini tunnel disable         # stop cloudflared + clear the URL
-```
-
-No manual install of `cloudflared` is required: the gateway provisions the binary automatically on first enable. A system `cloudflared` on `PATH` (Homebrew, apt, a hand-placed binary) is used if present; otherwise the runtime downloads the official build into `~/.gini/bin/`. The installer pre-fetches it so a normal install has it ready before the first enable. See [tunnel-and-mobile-access.md](docs/adr/tunnel-and-mobile-access.md) for the trust boundary, secret rotation, and Bearer-auth contract.
-
 ## Messaging channels
 
 Gini can bridge to messaging channels such as Telegram and Discord. These bridges were added to exercise the gateway's messaging contract and are **not** being actively worked on. We highly recommend interacting with Gini through the native web app and iOS app. Those are the primary, actively developed surfaces. See [telegram-bridge.md](docs/adr/telegram-bridge.md) and [discord-bridge.md](docs/adr/discord-bridge.md) for the bridge contracts.

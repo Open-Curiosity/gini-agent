@@ -5,7 +5,6 @@ import {
   readCachedCredentials,
   type AuthCredentials
 } from "./auth";
-import { inferTunnelTransport } from "./transport";
 
 // Defense-in-depth runtime gate against credentials persisted by an
 // older build that didn't enforce the local-only http allowlist (or
@@ -215,22 +214,6 @@ export function resolveStreamEndpoint(path: string): {
       ...resolveDeviceTokenHeader()
     }
   };
-}
-
-/** True when the cached gateway base URL points at a Cloudflare quick
- *  tunnel hostname (`*.trycloudflare.com`, case-insensitive). Quick
- *  tunnels drop `text/event-stream` at the edge, so chat streaming has
- *  to fall back to long-polling — `react-native-sse` would otherwise
- *  open an XHR that never receives frames. Returns false on missing /
- *  malformed credentials so the SSE path (which handles its own 401)
- *  stays the default.
- *
- *  Delegates host classification to the shared `inferTunnelTransport`
- *  helper so the mobile, web, and runtime copies stay in lockstep —
- *  parity is pinned in src/runtime/tunnel/transport.parity.test.ts. */
-export function gatewayUsesQuickTunnel(): boolean {
-  const creds = readCachedCredentials();
-  return inferTunnelTransport(creds?.baseUrl ?? null) === "poll";
 }
 
 // Pull the cached APNs token from push.ts on every call. We avoid a
