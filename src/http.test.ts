@@ -650,7 +650,7 @@ describe("runtime api", () => {
     expect(String(errorBody.error)).toContain("slack");
   });
 
-  test("returns a JSON pointer at GET / instead of static HTML", async () => {
+  test("GET / returns the runtime banner when the web server is not running", async () => {
     const config = testConfig("root-pointer");
     const handler = createHandler(config);
 
@@ -661,6 +661,39 @@ describe("runtime api", () => {
     expect(value.name).toBe("gini-runtime");
     expect(value.instance).toBe(config.instance);
     expect(String(value.message)).toContain("Next.js");
+  });
+
+  // The web reverse proxy: non-/api traffic and the /api/runtime/* BFF
+  // namespace route to the Next.js server, while native /api/* stays
+  // bearer-gated. With no web server running in tests, the proxy falls back
+  // to the runtime banner — which is exactly what proves the routing: a path
+  // that reached the bearer gate would 401, not return the banner.
+  test("/api/runtime/* bypasses the gateway bearer gate and reaches the web proxy", async () => {
+    const config = testConfig("bff-carveout");
+    const handler = createHandler(config);
+
+    // No Authorization header. A native /api/* path is gated → 401.
+    const native = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`));
+    expect(native.status).toBe(401);
+
+    // The BFF namespace is carved out of the gate; with web down it falls
+    // through to the proxy. An API-shaped path gets a 502 (not the 401 it
+    // would get if it had hit the bearer gate, and not a 200 banner a caller
+    // could mistake for success).
+    const bff = await handler(new Request(`http://127.0.0.1:${config.port}/api/runtime/status`));
+    expect(bff.status).toBe(502);
+    const body = (await bff.json()) as { error?: string };
+    expect(String(body.error)).toContain("Web UI not running");
+  });
+
+  test("non-/api paths proxy to the web server (banner fallback when web is down)", async () => {
+    const config = testConfig("web-proxy-fallback");
+    const handler = createHandler(config);
+
+    const page = await handler(new Request(`http://127.0.0.1:${config.port}/some/app/route`));
+    expect(page.status).toBe(200);
+    const body = (await page.json()) as { name?: string };
+    expect(body.name).toBe("gini-runtime");
   });
 
   test("preserves full terminal stdout in a trace artifact when audit evidence is truncated", async () => {
