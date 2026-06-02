@@ -25,6 +25,30 @@ const ANIM_DURATION = 220;
 // the entrance/exit use the cached measured height once it's known.
 const FALLBACK_OFFSCREEN = 800;
 
+// Slide the sheet up from `fromHeight` to its rest position while fading the
+// backdrop in. Callers park translateY at `fromHeight` and opacity at 0 first.
+function startEntrance(
+  translateY: Animated.Value,
+  opacity: Animated.Value,
+  fromHeight: number
+) {
+  translateY.setValue(fromHeight);
+  const anim = Animated.parallel([
+    Animated.timing(translateY, {
+      toValue: 0,
+      duration: ANIM_DURATION,
+      useNativeDriver: USE_NATIVE_DRIVER
+    }),
+    Animated.timing(opacity, {
+      toValue: 1,
+      duration: ANIM_DURATION,
+      useNativeDriver: USE_NATIVE_DRIVER
+    })
+  ]);
+  anim.start();
+  return anim;
+}
+
 export interface ActionSheetOption {
   label: string;
   onPress: () => void;
@@ -51,36 +75,47 @@ export function ActionSheet({
   // `mounted` decouples render lifetime from `visible` so the exit
   // animation runs to completion before the Modal unmounts.
   const [mounted, setMounted] = useState(visible);
+  // Ref mirror of `mounted` so the effect can read mount state without
+  // depending on it (which would re-run the effect on every mount toggle).
+  const mountedRef = useRef(mounted);
+  mountedRef.current = mounted;
   const translateY = useRef(new Animated.Value(FALLBACK_OFFSCREEN)).current;
   const opacity = useRef(new Animated.Value(0)).current;
   // Cache the measured sheet height so entrance/exit always travel exactly
-  // the sheet's own height. `onLayout` fills this on first render.
-  const sheetHeight = useRef(FALLBACK_OFFSCREEN);
+  // the sheet's own height. 0 means "not yet measured"; `onLayout` fills it.
+  const sheetHeight = useRef(0);
+  // True while an open is in progress but the entrance slide hasn't started
+  // yet — i.e. we're waiting on the first `onLayout` to learn the height.
+  // Lets `onLayout` start the entrance exactly once per open.
+  const enteringRef = useRef(false);
 
   useEffect(() => {
     if (visible) {
+      // Mount first and park the sheet fully off-screen with the backdrop
+      // transparent, so nothing flashes at the rest position before measuring.
       setMounted(true);
-      translateY.setValue(sheetHeight.current);
-      const anim = Animated.parallel([
-        Animated.timing(translateY, {
-          toValue: 0,
-          duration: ANIM_DURATION,
-          useNativeDriver: USE_NATIVE_DRIVER
-        }),
-        Animated.timing(opacity, {
-          toValue: 1,
-          duration: ANIM_DURATION,
-          useNativeDriver: USE_NATIVE_DRIVER
-        })
-      ]);
-      anim.start();
-      return () => {
-        anim.stop();
-      };
+      const offscreen = sheetHeight.current || FALLBACK_OFFSCREEN;
+      translateY.setValue(offscreen);
+      opacity.setValue(0);
+      if (sheetHeight.current > 0) {
+        // Re-open: height is already known, run the entrance now.
+        enteringRef.current = false;
+        const anim = startEntrance(translateY, opacity, sheetHeight.current);
+        return () => {
+          anim.stop();
+        };
+      }
+      // First open: defer the entrance to `onLayout`, once we know the height.
+      enteringRef.current = true;
+      return;
     }
+    enteringRef.current = false;
+    // Nothing is mounted (e.g. the initial render with visible=false), so
+    // skip the exit animation — there's no rendered sheet to slide away.
+    if (!mountedRef.current) return;
     const anim = Animated.parallel([
       Animated.timing(translateY, {
-        toValue: sheetHeight.current,
+        toValue: sheetHeight.current || FALLBACK_OFFSCREEN,
         duration: ANIM_DURATION,
         useNativeDriver: USE_NATIVE_DRIVER
       }),
@@ -120,7 +155,14 @@ export function ActionSheet({
         <Animated.View
           onLayout={(event) => {
             const height = event.nativeEvent.layout.height;
-            if (height > 0) sheetHeight.current = height;
+            if (height <= 0) return;
+            sheetHeight.current = height;
+            // First open deferred its entrance until the height was known.
+            // Start it now, exactly once, from the measured height.
+            if (enteringRef.current) {
+              enteringRef.current = false;
+              startEntrance(translateY, opacity, height);
+            }
           }}
           style={[
             styles.sheet,
