@@ -6,6 +6,7 @@ import {
   CHROME_LAUNCH_ARGS,
   cleanChromeUserAgent,
   findChromePath,
+  launchPersistentChrome,
   platformCandidates,
   resolveBrowserLaunchTarget
 } from "./chrome-discovery";
@@ -157,34 +158,32 @@ describe("CHROME_LAUNCH_ARGS", () => {
 });
 
 describe("resolveBrowserLaunchTarget", () => {
-  test("GINI_CHROME_PATH override yields the explicit binary with no channel", async () => {
+  test("GINI_CHROME_PATH override yields the explicit binary, not branded", async () => {
     await withFakeBinary(async (path) => {
       process.env["GINI_CHROME_PATH"] = path;
       const target = await resolveBrowserLaunchTarget();
       expect(target.executablePath).toBe(path);
-      expect(target.channel).toBeUndefined();
+      expect(target.branded).toBe(false);
     });
   });
 
-  test("invariant: a chrome-channel target always carries a non-null executablePath", async () => {
+  test("invariant: a branded target always carries a non-null executablePath", async () => {
     delete process.env["GINI_CHROME_PATH"];
     const target = await resolveBrowserLaunchTarget();
-    if (target.channel === "chrome") {
+    if (target.branded) {
       expect(target.executablePath).not.toBeNull();
-    } else {
-      expect(target.channel).toBeUndefined();
     }
   });
 });
 
 describe("cleanChromeUserAgent", () => {
-  test("returns undefined for a null path", () => {
-    expect(cleanChromeUserAgent(null)).toBeUndefined();
+  test("returns undefined for a null path", async () => {
+    expect(await cleanChromeUserAgent(null)).toBeUndefined();
   });
 
   test("derives a reduced Chrome UA (major only) with no Headless token", async () => {
-    await withVersionBinary("Google Chrome 142.0.7000.1", (path) => {
-      const ua = cleanChromeUserAgent(path, "darwin");
+    await withVersionBinary("Google Chrome 142.0.7000.1", async (path) => {
+      const ua = await cleanChromeUserAgent(path, "darwin");
       expect(ua).toBeDefined();
       expect(ua!).toContain("Chrome/142.0.0.0");
       expect(ua!).toContain("Macintosh; Intel Mac OS X 10_15_7");
@@ -195,11 +194,74 @@ describe("cleanChromeUserAgent", () => {
   // Separate binaries per platform: the UA is cached per execPath, so reusing
   // one path would return the first platform's cached result for the second.
   test("uses the platform token for the passed platform", async () => {
-    await withVersionBinary("Google Chrome 142.0.7000.1", (linuxPath) => {
-      expect(cleanChromeUserAgent(linuxPath, "linux")!).toContain("X11; Linux x86_64");
+    await withVersionBinary("Google Chrome 142.0.7000.1", async (linuxPath) => {
+      expect((await cleanChromeUserAgent(linuxPath, "linux"))!).toContain("X11; Linux x86_64");
     });
-    await withVersionBinary("Google Chrome 142.0.7000.1", (winPath) => {
-      expect(cleanChromeUserAgent(winPath, "win32")!).toContain("Windows NT 10.0; Win64; x64");
+    await withVersionBinary("Google Chrome 142.0.7000.1", async (winPath) => {
+      expect((await cleanChromeUserAgent(winPath, "win32"))!).toContain(
+        "Windows NT 10.0; Win64; x64"
+      );
+    });
+  });
+});
+
+describe("launchPersistentChrome", () => {
+  // GINI_CHROME_PATH pins the binary so resolveBrowserLaunchTarget is
+  // deterministic (branded=false), independent of what Chrome the host has.
+  test("headless launch uses the resolved binary, stealth args, and a clean UA", async () => {
+    await withVersionBinary("Google Chrome 142.0.7000.1", async (binary) => {
+      process.env["GINI_CHROME_PATH"] = binary;
+      let recorded: Record<string, unknown> | undefined;
+      const chromium = {
+        launchPersistentContext: async (_dir: string, options: Record<string, unknown>) => {
+          recorded = options;
+          return { sentinel: true };
+        }
+      };
+      const { context, chromePath } = await launchPersistentChrome(chromium, "/tmp/data", {
+        headless: true
+      });
+      expect((context as { sentinel: boolean }).sentinel).toBe(true);
+      expect(chromePath).toBe(binary);
+      expect(recorded!["executablePath"]).toBe(binary);
+      expect(recorded!["headless"]).toBe(true);
+      expect(recorded!["args"]).toContain("--disable-blink-features=AutomationControlled");
+      expect(recorded!["userAgent"]).toContain("Chrome/142.0.0.0");
+      expect(recorded!["userAgent"]).not.toContain("Headless");
+    });
+  });
+
+  test("headed launch sets no userAgent override", async () => {
+    await withVersionBinary("Google Chrome 142.0.7000.1", async (binary) => {
+      process.env["GINI_CHROME_PATH"] = binary;
+      let recorded: Record<string, unknown> | undefined;
+      const chromium = {
+        launchPersistentContext: async (_dir: string, options: Record<string, unknown>) => {
+          recorded = options;
+          return {};
+        }
+      };
+      await launchPersistentChrome(chromium, "/tmp/data", { headless: false });
+      expect(recorded!["userAgent"]).toBeUndefined();
+    });
+  });
+
+  // A non-branded target (here, the override) has no better fallback, so a
+  // launch failure rethrows instead of retrying on the bundled Chromium.
+  test("a non-branded target rethrows without a second launch attempt", async () => {
+    await withVersionBinary("Google Chrome 142.0.7000.1", async (binary) => {
+      process.env["GINI_CHROME_PATH"] = binary;
+      let calls = 0;
+      const chromium = {
+        launchPersistentContext: async () => {
+          calls += 1;
+          throw new Error("launch failed");
+        }
+      };
+      await expect(
+        launchPersistentChrome(chromium, "/tmp/data", { headless: true })
+      ).rejects.toThrow("launch failed");
+      expect(calls).toBe(1);
     });
   });
 });
