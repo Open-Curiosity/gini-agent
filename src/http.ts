@@ -85,6 +85,8 @@ import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
 import { projectRoot } from "./paths";
+import { recordedWebPort } from "./cli/process";
+import type { Server, ServerWebSocket } from "bun";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
@@ -1392,7 +1394,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     if (request.method === "OPTIONS" && request.headers.get("access-control-request-method")) {
       return preflightResponse(request);
     }
-    if (url.pathname.startsWith("/api/")) {
+    // The gateway owns only its NATIVE /api/* surface. The Next BFF namespace
+    // (/api/runtime/*) is proxied to the web server instead, so the browser's
+    // token-injecting BFF calls reach Next rather than hitting this bearer gate.
+    if (url.pathname.startsWith("/api/") && !url.pathname.startsWith("/api/runtime/")) {
       if (request.method === "POST" && url.pathname === "/api/pairing/claim") {
         try {
           return withCors(request, json(await claimPairing(config, await body(request)), 201));
@@ -1414,16 +1419,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       return withCors(request, json({ error: "Not found" }, 404));
     }
-    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
-      return withCors(request, json({
-        name: "gini-runtime",
-        instance: config.instance,
-        port: config.port,
-        message: "Gini runtime API. The Next.js control plane runs on a separate port; see `gini status`.",
-        ui_url_hint: process.env.GINI_WEB_URL ?? null
-      }));
-    }
-    return withCors(request, json({ error: "Not found" }, 404));
+    return proxyWeb(request, url, config);
   };
 }
 
@@ -1461,6 +1457,120 @@ function corsOriginFor(request: Request): string | undefined {
   if (!origin) return undefined;
   return allowedOrigins().includes(origin) ? origin : undefined;
 }
+
+// Reverse-proxy non-native traffic (the web UI, its assets, and the Next BFF
+// namespace) to the live Next.js server on loopback. When no web port is
+// recorded (web down, or a --no-web instance) we self-describe with the
+// runtime banner instead of failing — the banner's natural home is exactly the
+// case where the UI isn't there to serve.
+function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Response | Promise<Response> {
+  const port = recordedWebPort(config);
+  if (port === null) {
+    return withCors(request, json({
+      name: "gini-runtime",
+      instance: config.instance,
+      port: config.port,
+      message: "Gini runtime API. The Next.js control plane runs on a separate port; see `gini status`.",
+      ui_url_hint: process.env.GINI_WEB_URL ?? null
+    }));
+  }
+  const target = `http://127.0.0.1:${port}${url.pathname}${url.search}`;
+  // decompress: false tells Bun not to auto-decompress the upstream response.
+  // That keeps Content-Encoding and Content-Length consistent so the browser
+  // can decompress normally. Without it, Bun decompresses the body but leaves
+  // the stale headers, causing ERR_CONTENT_DECODING_FAILED in browsers.
+  const init: BunFetchRequestInit = {
+    method: request.method,
+    headers: request.headers,
+    redirect: "manual",
+    decompress: false,
+  };
+  if (request.signal) init.signal = request.signal;
+  if (request.method !== "GET" && request.method !== "HEAD") init.body = request.body;
+  return fetch(target, init);
+}
+
+// Per-connection state for a proxied WebSocket. Frames are normalized to
+// `string | ArrayBuffer` (binary coerced to a concrete ArrayBuffer) so both
+// the upstream and client send() signatures accept them. Frames that arrive
+// before the far side's handshake completes are buffered so the HMR handshake
+// (and any early client frame) is never dropped.
+interface WsProxyData {
+  upstream: WebSocket;
+  toClient: Array<string | ArrayBuffer>;
+  toUpstream: Array<string | ArrayBuffer>;
+  clientOpen: boolean;
+  upstreamOpen: boolean;
+  client?: ServerWebSocket<WsProxyData>;
+}
+
+// Coerce a Buffer/typed-array frame to a standalone ArrayBuffer (copying the
+// exact byte window), leaving strings untouched.
+function wsFrame(data: string | ArrayBuffer | ArrayBufferView): string | ArrayBuffer {
+  if (typeof data === "string" || data instanceof ArrayBuffer) return data;
+  return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+}
+
+// Reverse-proxy a WebSocket upgrade (Next.js HMR lives at /_next/webpack-hmr)
+// to the live web server. fetch() can't carry an upgrade, so we bridge two
+// sockets: dial the upstream WS, accept the client WS via server.upgrade, and
+// pump frames both ways. The websocket handler below does the pumping.
+export function proxyWebSocketUpgrade(request: Request, server: Server<WsProxyData>, config: RuntimeConfig): Response | undefined {
+  const port = recordedWebPort(config);
+  if (port === null) return new Response("Web UI not running", { status: 502 });
+  const url = new URL(request.url);
+  const wsUrl = `ws://127.0.0.1:${port}${url.pathname}${url.search}`;
+  const proto = request.headers.get("sec-websocket-protocol");
+  const upstream = proto
+    ? new WebSocket(wsUrl, proto.split(",").map((p) => p.trim()))
+    : new WebSocket(wsUrl);
+  upstream.binaryType = "arraybuffer";
+  const data: WsProxyData = { upstream, toClient: [], toUpstream: [], clientOpen: false, upstreamOpen: false };
+  upstream.addEventListener("open", () => {
+    data.upstreamOpen = true;
+    for (const m of data.toUpstream) { try { upstream.send(m); } catch { /* dropped */ } }
+    data.toUpstream = [];
+  });
+  upstream.addEventListener("message", (event) => {
+    const payload = wsFrame(event.data as string | ArrayBuffer | ArrayBufferView);
+    if (data.clientOpen && data.client) { try { data.client.send(payload); } catch { /* dropped */ } }
+    else data.toClient.push(payload);
+  });
+  if (!server.upgrade(request, { data })) {
+    upstream.close();
+    return new Response("WebSocket upgrade failed", { status: 426 });
+  }
+  return undefined;
+}
+
+// Bun.serve `websocket` handler for proxied client sockets. Wired in
+// src/server.ts. Pairs with proxyWebSocketUpgrade above.
+//
+// perMessageDeflate is OFF: the upstream client already hands us decompressed
+// frames, so re-compressing on the browser leg only risks RSV-bit mismatches
+// (the browser rejecting frames it didn't negotiate compression for). Frames
+// pass through uncompressed end to end.
+export const webSocketProxyHandler = {
+  perMessageDeflate: false as const,
+  open(ws: ServerWebSocket<WsProxyData>) {
+    ws.data.client = ws;
+    ws.data.clientOpen = true;
+    for (const m of ws.data.toClient) { try { ws.send(m); } catch { /* dropped */ } }
+    ws.data.toClient = [];
+    ws.data.upstream.addEventListener("close", (event) => {
+      try { ws.close(event.code || 1000, event.reason); } catch { /* already closed */ }
+    });
+    ws.data.upstream.addEventListener("error", () => { try { ws.close(); } catch { /* already closed */ } });
+  },
+  message(ws: ServerWebSocket<WsProxyData>, message: string | Buffer) {
+    const frame = wsFrame(message);
+    if (ws.data.upstreamOpen) { try { ws.data.upstream.send(frame); } catch { /* dropped */ } }
+    else ws.data.toUpstream.push(frame);
+  },
+  close(ws: ServerWebSocket<WsProxyData>) {
+    try { ws.data.upstream.close(); } catch { /* already closed */ }
+  },
+};
 
 // Wrap any Response with the CORS allow-origin headers when the
 // caller's Origin matches the allowlist. Returns the response

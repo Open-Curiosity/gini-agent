@@ -1,5 +1,5 @@
 import { writeFileSync } from "node:fs";
-import { createHandler, writePid } from "./http";
+import { createHandler, proxyWebSocketUpgrade, webSocketProxyHandler, writePid } from "./http";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
@@ -145,6 +145,7 @@ syncProviderMcpServers(config)
 // unset, so dev installs without push creds are unaffected.
 const apnsDispatcher = createApnsDispatcher(config.instance);
 
+const httpHandler = createHandler(config);
 const server = Bun.serve({
   port: config.port,
   hostname: "127.0.0.1",
@@ -155,7 +156,17 @@ const server = Bun.serve({
   // 255s is the per-request ceiling (Bun's max), high enough that operations
   // complete and low enough that genuinely hung sockets still get reaped.
   idleTimeout: 255,
-  fetch: createHandler(config)
+  fetch(request, server) {
+    // WebSocket upgrades (e.g. Next.js HMR at /_next/webpack-hmr) can't ride
+    // through the HTTP handler's fetch()/Response model, so bridge them
+    // socket-to-socket to the web server. Everything else is normal HTTP.
+    if ((request.headers.get("upgrade") ?? "").toLowerCase() === "websocket") {
+      return proxyWebSocketUpgrade(request, server, config);
+    }
+    return httpHandler(request);
+  },
+  // Bun.serve websocket handler for the bridged client sockets above.
+  websocket: webSocketProxyHandler
 });
 
 // Record the live port so clients (CLI status, autostart web shim, BFF
