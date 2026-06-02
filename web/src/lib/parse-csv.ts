@@ -1,13 +1,16 @@
 // Dependency-free CSV/TSV parser for the file preview drawer. Handles
 // double-quote-quoted fields (with `""` as an escaped quote), the configured
 // delimiter inside and outside quotes, and CRLF/LF row breaks. Returns a grid
-// of rows; a single trailing empty row (from a trailing newline) is dropped.
+// of rows; a single trailing empty row is dropped only when the input ended
+// with a line break (so an explicit empty final row is preserved).
 export function parseCsv(text: string, delimiter = ","): string[][] {
   const rows: string[][] = [];
   let field = "";
   let row: string[] = [];
   let inQuotes = false;
   let i = 0;
+  const endedWithBreak =
+    text.length > 0 && (text[text.length - 1] === "\n" || text[text.length - 1] === "\r");
 
   const endField = () => {
     row.push(field);
@@ -66,7 +69,7 @@ export function parseCsv(text: string, delimiter = ","): string[][] {
 
   // Drop a single trailing empty row produced by a trailing newline.
   const last = rows[rows.length - 1];
-  if (rows.length > 1 && last && last.length === 1 && last[0] === "") {
+  if (endedWithBreak && rows.length > 1 && last && last.length === 1 && last[0] === "") {
     rows.pop();
   }
   return rows;

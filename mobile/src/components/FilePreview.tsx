@@ -13,6 +13,7 @@ import {
   ActivityIndicator,
   Alert,
   Image,
+  Platform,
   Pressable,
   ScrollView,
   Share,
@@ -36,6 +37,7 @@ import { fetchWorkspaceFile, fileRawSource, type WorkspaceFile } from "@/src/api
 import { fileAccent, previewKind } from "@/src/file-accent";
 import { parseCsv } from "@/src/parse-csv";
 import { family, theme } from "@/src/theme";
+import { markdownRules } from "./chat/BlockAssistantText";
 
 // Blue swatch + accent for the previewer's title/header (matches the card's
 // doc tint). Kept local since it's specific to this sheet's chrome.
@@ -257,15 +259,7 @@ function PreviewBody({
   accent: { bg: string; fg: string };
 }) {
   if (kind === "image") {
-    const source = fileRawSource(path, { inline: true });
-    return (
-      <Image
-        source={source}
-        style={styles.image}
-        resizeMode="contain"
-        accessibilityLabel={filename}
-      />
-    );
+    return <ImagePreviewBody path={path} filename={filename} accent={accent} />;
   }
   if (kind === "pdf") {
     return <BinaryFallback accent={accent} />;
@@ -292,7 +286,7 @@ function PreviewBody({
   if (kind === "markdown") {
     return (
       <View>
-        <Markdown style={markdownStyles} markdownit={markdownIt}>
+        <Markdown style={markdownStyles} markdownit={markdownIt} rules={markdownRules}>
           {content}
         </Markdown>
         {data.truncated ? <Text style={styles.truncated}>[truncated]</Text> : null}
@@ -315,6 +309,33 @@ function PreviewBody({
         {data.truncated ? "\n\n[truncated]" : ""}
       </Text>
     </View>
+  );
+}
+
+// Decodes the image straight from the gateway. A 401/missing/decode failure
+// would otherwise leave a blank ~320px box, so we fall back to the same
+// binary notice (pointing at Download/Share) when <Image> reports an error.
+function ImagePreviewBody({
+  path,
+  filename,
+  accent
+}: {
+  path: string;
+  filename: string;
+  accent: { bg: string; fg: string };
+}) {
+  const [failed, setFailed] = useState(false);
+  if (failed) {
+    return <BinaryFallback accent={accent} />;
+  }
+  return (
+    <Image
+      source={fileRawSource(path, { inline: true })}
+      style={styles.image}
+      resizeMode="contain"
+      accessibilityLabel={filename}
+      onError={() => setFailed(true)}
+    />
   );
 }
 
@@ -398,7 +419,14 @@ function DownloadToolbar({
       const safeName = filename.replace(/[^A-Za-z0-9._-]/g, "_") || "file";
       const dest = `${FileSystem.cacheDirectory}${safeName}`;
       const result = await FileSystem.downloadAsync(uri, dest, { headers });
-      await Share.share({ url: result.uri });
+      // RN core Share can't attach a file on Android; full file save/share
+      // there needs expo-sharing (native module → new build). iOS shares the
+      // file via the share sheet ("Save to Files").
+      if (Platform.OS === "ios") {
+        await Share.share({ url: result.uri });
+      } else {
+        await Share.share({ message: result.uri, title: filename });
+      }
     } catch (err) {
       Alert.alert("Download failed", err instanceof Error ? err.message : String(err));
     } finally {

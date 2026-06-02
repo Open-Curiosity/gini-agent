@@ -25,6 +25,17 @@ describe("parseCsv", () => {
     ]);
   });
 
+  test("drops the spurious trailing row but keeps both real rows", () => {
+    expect(parseCsv("a,b\nc,d\n")).toEqual([
+      ["a", "b"],
+      ["c", "d"]
+    ]);
+  });
+
+  test("preserves an explicit empty final row when input has no trailing break", () => {
+    expect(parseCsv('a\n""')).toEqual([["a"], [""]]);
+  });
+
   test("handles quoted fields containing the delimiter", () => {
     expect(parseCsv('name,note\n"Doe, John","hello"')).toEqual([
       ["name", "note"],
