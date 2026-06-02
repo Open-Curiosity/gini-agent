@@ -264,7 +264,8 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
   // A voice message arrives with empty content — transcribe the recording so
   // the transcript becomes the message content. The audio itself never
   // reaches the provider; only this transcript does. A transcription failure
-  // leaves content empty so the message still posts with its audio bubble.
+  // surfaces as a user-facing error so the client retries rather than posting
+  // a do-nothing task with no prompt.
   if (audio && !content) {
     const upload = readUpload(config.instance, audio.id);
     if (upload) {
@@ -276,11 +277,14 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
           uploadId: audio.id,
           error: error instanceof Error ? error.message : String(error)
         });
+        throw new Error("Could not transcribe the voice message. Please try again.");
       }
     }
   }
-  if (!content && images.length === 0 && !audio) {
-    throw new Error("Chat message content is required.");
+  if (!content && images.length === 0) {
+    throw new Error(
+      audio ? "No speech detected in the voice message." : "Chat message content is required."
+    );
   }
   const state = readState(config.instance);
   const session = state.chatSessions.find((item) => item.id === sessionId);

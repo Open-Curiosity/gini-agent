@@ -27,6 +27,7 @@ import {
   normalizeProvider
 } from "../provider";
 import { decideApproval } from "../agent";
+import { __setTransformersLoaderForTests } from "../stt";
 import { createChatMessage, insertChatBlock, listChatBlocks, mutateState, readState } from "../state";
 import { storeUpload } from "../state/uploads";
 import { createScheduledJob } from "../jobs";
@@ -38,6 +39,33 @@ import {
   createChat
 } from "./chat";
 import type { Authorization, RuntimeConfig, SetupRequest, Task } from "../types";
+
+// Minimal valid 16 kHz mono 16-bit PCM WAV so decodeWav succeeds and the
+// stubbed transcriber actually runs (a malformed buffer would fail in the
+// decoder before the provider is reached).
+function makeWav(samples: number[]): Uint8Array {
+  const dataLength = samples.length * 2;
+  const buffer = new ArrayBuffer(44 + dataLength);
+  const view = new DataView(buffer);
+  const writeTag = (offset: number, tag: string) => {
+    for (let i = 0; i < tag.length; i++) view.setUint8(offset + i, tag.charCodeAt(i));
+  };
+  writeTag(0, "RIFF");
+  view.setUint32(4, 36 + dataLength, true);
+  writeTag(8, "WAVE");
+  writeTag(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, 16000, true);
+  view.setUint32(28, 16000 * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeTag(36, "data");
+  view.setUint32(40, dataLength, true);
+  for (let i = 0; i < samples.length; i++) view.setInt16(44 + i * 2, samples[i]!, true);
+  return new Uint8Array(buffer);
+}
 
 function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
   return {
@@ -437,6 +465,66 @@ describe("chat session waiting-approval placeholder", () => {
       expect(userMsg?.audio?.id).toBe(ref.id);
     } finally {
       delete process.env.GINI_STT_PROVIDER;
+    }
+  });
+
+  test("rejects a voice message when transcription fails, creating no task or block", async () => {
+    const config = buildConfig(workspaceRoot, "chat-voice-stt-failure");
+
+    // Force the local provider to fail at load via the transformers seam — a
+    // transcription error must surface to the client, not silently land an
+    // empty-prompt task.
+    process.env.GINI_STT_PROVIDER = "local";
+    __setTransformersLoaderForTests(async () => {
+      throw new Error("model load failed");
+    });
+    try {
+      const ref = storeUpload(config.instance, makeWav([0, 1, -1]), "audio/wav", "voice.wav");
+      const session = await createChat(config, { title: "voice-fail" });
+      await expect(
+        submitChatMessage(config, session.id, {
+          content: "",
+          audio: { id: ref.id, mimeType: ref.mimeType, size: ref.size, durationMs: 1200 }
+        })
+      ).rejects.toThrow(/Could not transcribe/);
+
+      const stateNow = readState(config.instance);
+      expect(stateNow.tasks).toHaveLength(0);
+      expect(stateNow.chatMessages).toHaveLength(0);
+      expect(listChatBlocks(config.instance, session.id)).toHaveLength(0);
+    } finally {
+      delete process.env.GINI_STT_PROVIDER;
+      __setTransformersLoaderForTests(null);
+    }
+  });
+
+  test("rejects a silent voice message (empty transcript) with no speech detected", async () => {
+    const config = buildConfig(workspaceRoot, "chat-voice-silent");
+
+    // A successful transcription that yields no words (silence) must not
+    // create a do-nothing task either.
+    process.env.GINI_STT_PROVIDER = "local";
+    __setTransformersLoaderForTests(async () => ({
+      env: {},
+      pipeline: async () => async () => ({ text: "   " })
+    }));
+    try {
+      const ref = storeUpload(config.instance, makeWav([0, 1, -1]), "audio/wav", "voice.wav");
+      const session = await createChat(config, { title: "voice-silent" });
+      await expect(
+        submitChatMessage(config, session.id, {
+          content: "",
+          audio: { id: ref.id, mimeType: ref.mimeType, size: ref.size, durationMs: 800 }
+        })
+      ).rejects.toThrow(/No speech detected/);
+
+      const stateNow = readState(config.instance);
+      expect(stateNow.tasks).toHaveLength(0);
+      expect(stateNow.chatMessages).toHaveLength(0);
+      expect(listChatBlocks(config.instance, session.id)).toHaveLength(0);
+    } finally {
+      delete process.env.GINI_STT_PROVIDER;
+      __setTransformersLoaderForTests(null);
     }
   });
 
