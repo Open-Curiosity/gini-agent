@@ -92,6 +92,23 @@ import type { RedactedTunnelSnapshot, TunnelSnapshot } from "./runtime/tunnel/ty
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
+// Extensions the browser can safely render inline (PDFs + raster images) when
+// GET /api/files is called with `inline=1`. Everything else — html/htm, svg,
+// xml, js, and any unlisted type — is deliberately excluded so it falls
+// through to the octet-stream + attachment download path and can never execute
+// script in the app origin.
+const INLINE_MIME: Record<string, string> = {
+  pdf: "application/pdf",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  avif: "image/avif",
+  bmp: "image/bmp",
+  ico: "image/x-icon"
+};
+
 function redactedSnapshot(snapshot: TunnelSnapshot): RedactedTunnelSnapshot {
   return {
     enabled: snapshot.enabled,
@@ -439,6 +456,22 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           const code = (error as NodeJS.ErrnoException)?.code;
           if (code === "ENOENT") return json({ error: "File not found" }, 404);
           return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+        }
+        // Inline mode: for an allowlist of types the browser can safely embed
+        // (PDFs + raster images), serve with the real content-type and
+        // content-disposition: inline so the preview drawer can render them in
+        // an <iframe>/<img>. Non-allowlisted types (html/svg/xml/js/etc.) skip
+        // this branch and fall through to the attachment download below.
+        const dot = basename(absolutePath).lastIndexOf(".");
+        const ext = dot > 0 ? basename(absolutePath).slice(dot + 1).toLowerCase() : "";
+        if (new URL(request.url).searchParams.get("inline") && INLINE_MIME[ext]) {
+          return new Response(Bun.file(absolutePath), {
+            headers: {
+              "content-type": INLINE_MIME[ext],
+              "content-disposition": "inline",
+              "cache-control": "private, max-age=0"
+            }
+          });
         }
         // POSIX filenames may contain bytes (CR/LF, high-bit chars) that Bun
         // rejects as a header value, which would 500 the download. Emit an

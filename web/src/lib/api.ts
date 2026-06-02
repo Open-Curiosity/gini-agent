@@ -78,3 +78,11 @@ export function fetchWorkspaceFile(path: string): Promise<WorkspaceFile> {
 export function fileRawUrl(path: string): string {
   return `/api/runtime/files?path=${encodeURIComponent(path)}&raw=1`;
 }
+
+// Direct BFF URL for embedding a workspace file inline. The gateway's inline
+// mode serves an allowlist of safe types (PDFs + raster images) with their real
+// content-type + content-disposition: inline, so this is suitable as an
+// <img>/<iframe> src in the preview drawer.
+export function fileInlineUrl(path: string): string {
+  return `/api/runtime/files?path=${encodeURIComponent(path)}&raw=1&inline=1`;
+}

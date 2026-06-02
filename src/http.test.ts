@@ -4704,6 +4704,70 @@ describe("GET /api/files", () => {
 
     rmSync(workspace, { recursive: true, force: true });
   });
+
+  test("inline=1 serves a PDF inline with the application/pdf content-type", async () => {
+    const config = testConfig("files-inline-pdf");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-inline-pdf`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/doc.pdf`, Buffer.from("%PDF-1.4\n"));
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=doc.pdf&raw=1&inline=1", {}, config.token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/pdf");
+    expect(response.headers.get("content-disposition")).toBe("inline");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("inline=1 serves a PNG inline with the image/png content-type", async () => {
+    const config = testConfig("files-inline-png");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-inline-png`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/pic.png`, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=pic.png&raw=1&inline=1", {}, config.token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("image/png");
+    expect(response.headers.get("content-disposition")).toBe("inline");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("inline=1 never serves an SVG inline — falls back to attachment download", async () => {
+    const config = testConfig("files-inline-svg");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-inline-svg`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/evil.svg`, "<svg onload=\"alert(1)\"></svg>");
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=evil.svg&raw=1&inline=1", {}, config.token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/octet-stream");
+    expect(response.headers.get("content-disposition") ?? "").toContain("attachment");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("inline=1 never serves HTML inline — falls back to attachment download", async () => {
+    const config = testConfig("files-inline-html");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-inline-html`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/evil.html`, "<script>alert(1)</script>");
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=evil.html&raw=1&inline=1", {}, config.token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/octet-stream");
+    expect(response.headers.get("content-disposition") ?? "").toContain("attachment");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

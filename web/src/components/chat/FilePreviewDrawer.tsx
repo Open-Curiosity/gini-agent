@@ -12,7 +12,24 @@ import {
   SheetTitle
 } from "@/components/ui/sheet";
 import { MarkdownContent } from "@/components/chat/MarkdownContent";
-import { fetchWorkspaceFile, fileRawUrl } from "@/lib/api";
+import { fetchWorkspaceFile, fileInlineUrl, fileRawUrl } from "@/lib/api";
+import { parseCsv } from "@/lib/parse-csv";
+
+type PreviewKind = "markdown" | "image" | "pdf" | "csv" | "text";
+
+// Pick the render strategy for a file from its extension. Images and PDFs are
+// embedded inline (via fileInlineUrl); markdown is rendered; csv/tsv become a
+// table; everything else falls back to a text block (or the binary notice when
+// the gateway flags the bytes as non-text).
+function previewKind(filename: string): PreviewKind {
+  const dot = filename.lastIndexOf(".");
+  const ext = dot > 0 ? filename.slice(dot + 1).toLowerCase() : "";
+  if (ext === "md" || ext === "markdown") return "markdown";
+  if (["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"].includes(ext)) return "image";
+  if (ext === "pdf") return "pdf";
+  if (ext === "csv" || ext === "tsv") return "csv";
+  return "text";
+}
 
 // Notion-style right-side "side peek" previewer for a single generated file.
 // The Sheet (Radix Dialog) supplies the slide-in, dimmed scrim, Esc,
@@ -53,7 +70,7 @@ function DrawerBody({ path }: { path: string }) {
   const dir = lastSlash > 0 ? path.slice(0, lastSlash + 1) : "";
   const dot = filename.lastIndexOf(".");
   const ext = dot > 0 ? filename.slice(dot + 1).toUpperCase() : "";
-  const isMarkdown = /\.(md|markdown)$/i.test(filename);
+  const kind = previewKind(filename);
 
   const onCopy = async () => {
     if (!data) return;
@@ -106,33 +123,59 @@ function DrawerBody({ path }: { path: string }) {
         </div>
       </header>
 
-      <div className="flex-1 overflow-auto px-10 py-8">
-        {isLoading ? (
-          <div className="flex items-center justify-center py-8">
-            <Loader2 className="size-5 animate-spin text-[#9A9AA0]" aria-label="Loading" />
-          </div>
-        ) : error ? (
-          <p className="text-[13px] text-red-400/90">
-            {error instanceof Error ? error.message : "Failed to load file"}
-          </p>
-        ) : data?.binary ? (
-          <p className="text-[13px] text-[#9A9AA0]">
-            Binary file — {data.bytes} bytes. Use Download to save it.
-          </p>
-        ) : data ? (
-          isMarkdown ? (
-            <>
-              <MarkdownContent text={data.content ?? ""} />
-              {data.truncated ? <p className="mt-2 text-xs text-[#9A9AA0]">[truncated]</p> : null}
-            </>
-          ) : (
-            <pre className="whitespace-pre-wrap break-words rounded-[10px] border border-[#23232A] bg-[#0E0F14] p-4 font-mono text-[13px] leading-relaxed text-[#D6D6DC]">
-              {data.content ?? ""}
-              {data.truncated ? "\n\n[truncated]" : ""}
-            </pre>
-          )
-        ) : null}
-      </div>
+      {kind === "pdf" ? (
+        // PDFs embed inline and fill the drawer body, so this container is
+        // full-height with no padding (unlike the padded scroll body the other
+        // formats use). The iframe renders as soon as the path is known — it
+        // doesn't wait on the JSON content query.
+        <div className="min-h-0 flex-1">
+          <iframe src={fileInlineUrl(path)} title={filename} className="size-full border-0" />
+        </div>
+      ) : (
+        <div className="flex-1 overflow-auto px-10 py-8">
+          {kind === "image" ? (
+            // Images embed inline and don't need the JSON content query. A
+            // plain <img> is correct here: the source is raw BFF-streamed
+            // workspace bytes, not an asset next/image can optimize.
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={fileInlineUrl(path)}
+              alt={filename}
+              className="mx-auto max-w-full rounded-md"
+            />
+          ) : isLoading ? (
+            <div className="flex items-center justify-center py-8">
+              <Loader2 className="size-5 animate-spin text-[#9A9AA0]" aria-label="Loading" />
+            </div>
+          ) : error ? (
+            <p className="text-[13px] text-red-400/90">
+              {error instanceof Error ? error.message : "Failed to load file"}
+            </p>
+          ) : data?.binary ? (
+            <p className="text-[13px] text-[#9A9AA0]">
+              Binary file — {data.bytes} bytes. Use Download to save it.
+            </p>
+          ) : data ? (
+            kind === "markdown" ? (
+              <>
+                <MarkdownContent text={data.content ?? ""} />
+                {data.truncated ? <p className="mt-2 text-xs text-[#9A9AA0]">[truncated]</p> : null}
+              </>
+            ) : kind === "csv" ? (
+              <CsvTable
+                content={data.content ?? ""}
+                delimiter={filename.toLowerCase().endsWith(".tsv") ? "\t" : ","}
+                truncated={data.truncated}
+              />
+            ) : (
+              <pre className="whitespace-pre-wrap break-words rounded-[10px] border border-[#23232A] bg-[#0E0F14] p-4 font-mono text-[13px] leading-relaxed text-[#D6D6DC]">
+                {data.content ?? ""}
+                {data.truncated ? "\n\n[truncated]" : ""}
+              </pre>
+            )
+          ) : null}
+        </div>
+      )}
 
       <footer className="flex h-[44px] shrink-0 items-center justify-between border-t border-[#23232A] bg-[#0E0F14] px-6">
         <span className="min-w-0 flex-1 truncate font-mono text-xs text-[#7A7A80]">
@@ -148,6 +191,61 @@ function DrawerBody({ path }: { path: string }) {
           Copy path
         </button>
       </footer>
+    </>
+  );
+}
+
+// Render parsed CSV/TSV content as a table: the first row is the header, the
+// rest are body rows. Empty/whitespace-only content shows the binary-style
+// muted notice instead of an empty grid.
+function CsvTable({
+  content,
+  delimiter,
+  truncated
+}: {
+  content: string;
+  delimiter: string;
+  truncated: boolean;
+}) {
+  if (!content.trim()) {
+    return <p className="text-[13px] text-[#9A9AA0]">Empty file.</p>;
+  }
+  const rows = parseCsv(content, delimiter);
+  const header = rows[0] ?? [];
+  const body = rows.slice(1);
+  return (
+    <>
+      <div className="overflow-auto rounded-[10px] border border-[#23232A]">
+        <table className="w-full border-collapse font-mono text-[12px]">
+          <thead>
+            <tr>
+              {header.map((cell, c) => (
+                <th
+                  key={c}
+                  className="whitespace-nowrap border-b border-[#1C1C22] bg-[#0E0F14] px-3 py-1.5 text-left font-semibold text-[#9A9AA0]"
+                >
+                  {cell}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {body.map((row, r) => (
+              <tr key={r}>
+                {row.map((cell, c) => (
+                  <td
+                    key={c}
+                    className="whitespace-nowrap border-b border-[#1C1C22] px-3 py-1.5 text-left text-[#D6D6DC]"
+                  >
+                    {cell}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {truncated ? <p className="mt-2 text-xs text-[#9A9AA0]">[truncated]</p> : null}
     </>
   );
 }
