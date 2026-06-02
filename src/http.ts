@@ -355,16 +355,20 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           });
         }
         await emitConnectorRequestAudit(config, setup, connector.id);
+        // Resume the paused agent run in the background: the connector is
+        // already saved + probed healthy, so the modal should close now
+        // rather than hang until the resumed run finishes streaming.
         await resolveSetupRequest(config, setupId, "complete", {
           actor: "user",
-          toolResult: `Connected to ${providerLabel}. Proceed with the original request.`
+          toolResult: `Connected to ${providerLabel}. Proceed with the original request.`,
+          awaitResume: false
         });
         return json({ ok: true, connector: probed });
       }
 
       if (setup.action === "browser.connect") {
         const { ok, result } = await completeBrowserConnectSetup(config, setup);
-        await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result });
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result, awaitResume: false });
         return json({ ok });
       }
 
