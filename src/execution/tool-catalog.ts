@@ -116,6 +116,33 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Web search via a configured provider connector (Brave Search or Exa).
+    // Backed by `src/integrations/connectors/{brave-search,exa}.ts`. The
+    // tool picks a healthy backend automatically when `provider` is
+    // omitted, preferring Brave (free tier) over Exa (paid). Returns up
+    // to `count` ranked results as compact text the model can cite.
+    toolset: "web_search",
+    displayLabel: "Web search",
+    type: "function",
+    function: {
+      name: "web_search",
+      description: "Search the public web. Returns up to `count` ranked results, each as `[N] title — url\\n    snippet`. Use this instead of guessing URLs or asking the user — it's the agent's primary way to discover fresh information. Backends: Brave returns keyword web results (broad, fresh, free tier). Exa returns semantically-matched results with extracted content highlights (better for research / discovering substantive content on a concept). Default picks the first healthy connector (Brave preferred). If results don't fit the task, you may suggest the user set up the other backend via request_connector — never hardcode a choice; let the user decide. If this tool errors because no connector is configured, call request_connector for 'brave-search' (default) or 'exa' to have the user add an API key, then retry — do NOT fall back to web_fetch on guessed URLs, since that defeats the user's intent to search the live web.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query." },
+          count: { type: "number", description: "Max results to return. Defaults to 5; capped at 10.", default: 5 },
+          provider: {
+            type: "string",
+            enum: ["brave-search", "exa"],
+            description: "Optional explicit backend. When omitted, picks the first healthy connector (Brave preferred)."
+          }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  {
     toolset: "messaging",
     displayLabel: "Fetch URL",
     type: "function",
@@ -2095,6 +2122,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.path) || previewValue(safe.pattern));
     case "web_fetch":
       return truncatePreview(previewValue(safe.url));
+    case "web_search":
+      return truncatePreview(previewValue(safe.query));
     case "load_tools":
       return truncatePreview(Array.isArray(safe.names) ? safe.names.join(", ") : previewValue(safe.names));
     case "terminal_exec":

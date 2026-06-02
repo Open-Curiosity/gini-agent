@@ -518,7 +518,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           return json({ ok: false, connector: probed, message });
         }
         await emitConnectorRequestAudit(config, setup, connector.id);
-
         // Auto-grant to the requesting skill (LOCKED decision). When the
         // dispatcher minted this card with a `skillId`, the human entering the
         // secret for that named skill IS the consent — so completing the card
@@ -564,9 +563,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // now-completed row). A losing racer never reaches here. Route it
         // through safeResume so a throw from the chat-task loop AFTER the
         // mutations landed flips the task out of the orphan-running state
-        // instead of being left dangling.
+        // instead of being left dangling. Fire it DETACHED (no await): the
+        // connector is already saved + granted, so the connect modal should
+        // close as soon as this responds rather than hang until the resumed
+        // agent run finishes streaming. safeResume owns its own failure
+        // recovery (trace + failTask), so the detached run can't reject
+        // unhandled.
         if (setup.taskId && toolCallId) {
-          await safeResume(
+          void safeResume(
             config,
             setup.taskId,
             toolCallId,
@@ -614,7 +618,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
 
       if (setup.action === "browser.connect") {
         const { ok, result } = await completeBrowserConnectSetup(config, setup);
-        await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result });
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result, awaitResume: false });
         return json({ ok });
       }
 
@@ -1093,6 +1097,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       id: p.id,
       label: p.label,
       description: p.description,
+      docsUrl: p.docsUrl,
       fields: p.fields,
       secrets: p.secrets,
       hasProbe: Boolean(p.probe),
