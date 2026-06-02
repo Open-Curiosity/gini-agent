@@ -7,7 +7,7 @@
 //   - resume after approval → task completes
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -34,7 +34,7 @@ import {
 import { echoEmbed } from "../embeddings";
 import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
-import { buildAgentIdentity, buildInactiveSkillsBlock } from "./chat-task";
+import { buildAgentIdentity, buildInactiveSkillsBlock, buildMcpServersBlock, buildSkillScriptsBlock } from "./chat-task";
 import type { EffectiveContext } from "./effective-context";
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
@@ -2181,6 +2181,337 @@ describe("chat-task loop", () => {
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
+
+  test("advertises deferred tools on demand and loads one via load_tools, feeding back a callable confirmation", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-load");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: load the browser_navigate schema via load_tools. (We stop at the
+    // load round-trip rather than driving a real browser — the load branch is
+    // what this test pins; the browser dispatch itself is exercised live.)
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_navigate"] }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: final answer (no browser call, to keep the test hermetic).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Browser tools are ready.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "get ready to browse", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Browser tools are ready.");
+    // loadedTools is cleared on terminal completion.
+    expect(finished.loadedTools).toBeUndefined();
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    // First model call: system prompt advertises the on-demand index with
+    // browser_navigate by name.
+    const firstSystem = String(calls[0]!.find((m) => m.role === "system")?.content ?? "");
+    expect(firstSystem).toContain("Tools available on demand");
+    expect(firstSystem).toContain("browser_navigate");
+
+    // After the load, the second model call's message history carries the
+    // load_tools tool result confirming the tool is now callable.
+    const secondTurn = calls[1]!;
+    const loadResult = secondTurn.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("callable directly")
+    );
+    expect(loadResult).toBeDefined();
+    const envelope = JSON.parse(String((loadResult as { content: string }).content)) as {
+      ok: boolean;
+      loaded: string[];
+    };
+    expect(envelope.ok).toBe(true);
+    expect(envelope.loaded).toContain("browser_navigate");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("the dispatcher's deferred guard nudges toward load_tools and does not over-trigger", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-nudge");
+
+    const { dispatchToolCall } = await import("./tool-dispatch");
+    const { isDeferredToolName } = await import("./tool-catalog");
+    const { createTask, upsertTask } = await import("../state");
+    const taskRow = createTask(config.instance, "nudge probe");
+    await mutateState(config.instance, (state) => upsertTask(state, taskRow));
+
+    // A genuinely unknown (non-deferred) tool still throws Unknown tool —
+    // the guard is scoped to deferred names and does not over-trigger.
+    expect(isDeferredToolName("totally_made_up_tool")).toBe(false);
+    let threw = false;
+    try {
+      await dispatchToolCall(config, taskRow.id, "totally_made_up_tool", "call_x", "{}");
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+
+    // browser_navigate is a known deferred tool. The guard helper classifies
+    // it as deferred so a not-yet-loaded reference reaching the dispatcher's
+    // default case would return the recoverable load_tools nudge rather than
+    // throwing Unknown tool.
+    expect(isDeferredToolName("browser_navigate")).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The riskiest invariant: a deferred tool the model loaded must stay live
+  // across an approval pause/resume. We load two deferred self tools
+  // (set_provider + get_self), call set_provider (strict → gates), assert the
+  // paused task carries loadedTools, then approve and — on the RESUMED turn —
+  // call get_self directly. get_self only dispatches successfully if it is
+  // still in providerTools after the resume, which proves runLoop re-seeds
+  // loadedToolNames from task.loadedTools (a merely-completing final-text turn
+  // would not prove the loaded schema survived).
+  test("loaded deferred tool set persists across an approval pause/resume and dispatches after resume", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    // strict so set_provider gates instead of auto-resolving.
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-resume");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: load set_provider AND get_self.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["set_provider", "get_self"] }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: call set_provider directly (top-level args). Strict → pauses.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_sp", type: "function", function: { name: "set_provider", arguments: JSON.stringify({ provider: "echo" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 3 (the RESUMED turn): call the previously-loaded get_self directly.
+    // It's a query op → resolves sync (no second gate) and writes a self.get
+    // audit row, proving the loaded schema survived the resume.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_gs", type: "function", function: { name: "get_self", arguments: "{}" } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 4: final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Provider set.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "switch to echo", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id, 10000);
+    expect(paused.status).toBe("waiting_approval");
+    // The loaded set survived onto the task across the pause snapshot.
+    expect(paused.loadedTools).toContain("set_provider");
+    expect(paused.loadedTools).toContain("get_self");
+    expect(paused.toolCallState).toBeDefined();
+    expect(paused.toolCallState?.pending[0]?.toolName).toBe("set_provider");
+    expect(paused.approvalIds.length).toBe(1);
+
+    // Approve → resume. runLoop re-seeds loadedToolNames from task.loadedTools
+    // so get_self is live again on the resumed iteration.
+    await decideApproval(config, paused.approvalIds[0]!, "approve");
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Provider set.");
+    // get_self dispatched on the resumed turn — proving the loaded deferred
+    // tool was in providerTools post-resume (not nudged as unloaded).
+    const state = readState(config.instance);
+    const reads = state.audit.filter((a) => a.action === "self.get" && a.taskId === task.id);
+    expect(reads).toHaveLength(1);
+    // Cleared on terminal completion.
+    expect(finished.loadedTools).toBeUndefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Loop gate, never-loaded case: the model emits a deferred tool it never
+  // loaded. The chat-task loop gate (NOT the dispatcher's default-case
+  // backstop, which browser_navigate never reaches — it has its own dispatch
+  // case) must block execution and feed back a "not loaded yet" nudge, and the
+  // loop must continue to a final answer. We assert NO browser.navigate audit
+  // row exists (proving the thunk never ran).
+  test("loop gate blocks a deferred tool the model never loaded and nudges toward load_tools", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-unloaded");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: jump straight to browser_navigate without loading it first.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_nav", type: "function", function: { name: "browser_navigate", arguments: JSON.stringify({ url: "https://example.com" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: model recovers with a final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Understood — I'll load the browser tools first next time.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "open example.com", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Understood — I'll load the browser tools first next time.");
+
+    const state = readState(config.instance);
+    // The browser thunk never ran: no browser.navigate audit row.
+    const navAudits = state.audit.filter((a) => a.action === "browser.navigate" && a.taskId === task.id);
+    expect(navAudits).toHaveLength(0);
+
+    // The second model turn's history carries the "not loaded yet" nudge as the
+    // tool result for the unloaded browser_navigate call.
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    const nudge = calls[1]!.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("not loaded yet")
+    );
+    expect(nudge).toBeDefined();
+    const envelope = JSON.parse(String((nudge as { content: string }).content)) as { ok: boolean; error: string };
+    expect(envelope.ok).toBe(false);
+    expect(envelope.error).toContain("browser_navigate");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Loop gate, same-batch case: the model emits load_tools AND the tool it just
+  // loaded in ONE tool_calls array. The provider generated browser_navigate
+  // without ever having its schema (it wasn't in the tools array that turn), so
+  // the loaded set as it stood at turn start does NOT contain it — the gate
+  // must block browser_navigate this turn while load_tools still succeeds. A
+  // subsequent turn can then call browser_navigate for real (now loadable).
+  test("loop gate blocks a same-batch load+call but lets the tool through on the next turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-samebatch");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: load_tools(browser_navigate) AND browser_navigate(...) together.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_navigate"] }) } },
+        { id: "call_nav", type: "function", function: { name: "browser_navigate", arguments: JSON.stringify({ url: "https://example.com" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: model recovers with a final answer (we stop before a real browser
+    // call to keep the test hermetic; the point is that the same-batch call was
+    // gated while load_tools succeeded).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Browser tools loaded; ready to navigate.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "open example.com", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+
+    const state = readState(config.instance);
+    // browser_navigate was NOT executed this turn — no browser.navigate audit.
+    const navAudits = state.audit.filter((a) => a.action === "browser.navigate" && a.taskId === task.id);
+    expect(navAudits).toHaveLength(0);
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    const secondTurn = calls[1]!;
+    // load_tools succeeded: its tool result confirms callability.
+    const loadResult = secondTurn.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("callable directly")
+    );
+    expect(loadResult).toBeDefined();
+    // browser_navigate got the "not loaded yet" nudge this turn.
+    const navResult = secondTurn.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("not loaded yet")
+    );
+    expect(navResult).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // create_agent approve/resume regression: the direct self tool routes
+  // through the unchanged self.config approval branch. Approving the gate
+  // must run the create_agent handler (agent row lands) and resume the loop.
+  test("create_agent direct tool gates, then approval lands the agent and resumes", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-create-agent-resume");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: load create_agent.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["create_agent"] }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: call create_agent directly. Strict → gates.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_ca", type: "function", function: { name: "create_agent", arguments: JSON.stringify({ name: "E2E2" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 3: final answer after approval.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Agent created.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "create an agent called E2E2", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id, 10000);
+    expect(paused.status).toBe("waiting_approval");
+
+    const stateBefore = readState(config.instance);
+    const approval = stateBefore.authorizations.find((a) => a.id === paused.approvalIds[0]!)!;
+    expect(approval.action).toBe("self.config");
+    expect(approval.payload.opName).toBe("create_agent");
+    // No agent yet — the side effect is deferred to approval time.
+    expect(stateBefore.agents.some((a) => a.name === "E2E2")).toBe(false);
+
+    await decideApproval(config, approval.id, "approve");
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Agent created.");
+
+    // The handler ran on approval — the agent row now exists.
+    const stateAfter = readState(config.instance);
+    expect(stateAfter.agents.some((a) => a.name === "E2E2")).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
 });
 
 describe("buildAgentIdentity", () => {
@@ -2307,12 +2638,14 @@ describe("buildAgentIdentity", () => {
 
 describe("buildInactiveSkillsBlock", () => {
   // Minimal SkillRecord factory. Only the fields the block builder
-  // reads (name, description, status, requiredConnectors, source) carry
-  // meaningful values; the rest are stubbed so the type checks.
+  // reads (name, description, status, requiredCredentials, source) carry
+  // meaningful values; the rest are stubbed so the type checks. Skills now
+  // declare credentials BY NAME; the block maps each name to its provider
+  // (LINEAR_API_KEY → linear, google-workspace-oauth → google-oauth-desktop).
   function makeSkill(opts: {
     name: string;
     description?: string;
-    requiredConnectors?: Array<{ provider: string; scopes?: string[] }>;
+    requiredCredentials?: string[];
     status?: SkillRecord["status"];
     source?: SkillRecord["source"];
   }): SkillRecord {
@@ -2335,18 +2668,19 @@ describe("buildInactiveSkillsBlock", () => {
       failureCount: 0,
       previousVersions: [],
       body: "",
-      requiredConnectors: opts.requiredConnectors,
+      requiredCredentials: opts.requiredCredentials,
       source: opts.source
     };
   }
 
   test("routes setup-skill providers to the setup skill instead of request_connector", () => {
-    // google-oauth-desktop declares setupSkill: "google-workspace-setup".
-    // The block must point the model at that skill, NOT at request_connector.
+    // google-workspace-oauth maps to google-oauth-desktop, which declares
+    // setupSkill: "google-workspace-setup". The block must point the model at
+    // that skill, NOT at request_connector.
     const skill = makeSkill({
       name: "google-calendar",
       description: "Google Calendar",
-      requiredConnectors: [{ provider: "google-oauth-desktop" }]
+      requiredCredentials: ["google-workspace-oauth"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toContain("google-oauth-desktop");
@@ -2356,13 +2690,13 @@ describe("buildInactiveSkillsBlock", () => {
     expect(block).not.toContain("call `request_connector` with provider id `google-oauth-desktop`");
   });
 
-  test("collapses multiple skills sharing one setup-skill provider into a single line", () => {
-    // All six Google Workspace product skills share one connector — the
-    // block should emit ONE provider line, not six per-skill lines.
+  test("collapses multiple skills sharing one credential into a single line", () => {
+    // All Google Workspace product skills share one credential — the block
+    // should emit ONE provider line, not one per skill.
     const skills = [
-      makeSkill({ name: "google-calendar", requiredConnectors: [{ provider: "google-oauth-desktop" }] }),
-      makeSkill({ name: "google-gmail", requiredConnectors: [{ provider: "google-oauth-desktop" }] }),
-      makeSkill({ name: "google-drive", requiredConnectors: [{ provider: "google-oauth-desktop" }] })
+      makeSkill({ name: "google-calendar", requiredCredentials: ["google-workspace-oauth"] }),
+      makeSkill({ name: "google-gmail", requiredCredentials: ["google-workspace-oauth"] }),
+      makeSkill({ name: "google-drive", requiredCredentials: ["google-workspace-oauth"] })
     ];
     const block = buildInactiveSkillsBlock(skills);
     const providerLines = block.split("\n").filter((line) => line.includes("google-oauth-desktop"));
@@ -2374,12 +2708,12 @@ describe("buildInactiveSkillsBlock", () => {
   });
 
   test("falls back to request_connector guidance for providers without a setup skill", () => {
-    // The linear provider does not declare setupSkill, so the block must
-    // emit the default request_connector instruction.
+    // LINEAR_API_KEY → linear, which does not declare setupSkill, so the
+    // block must emit the default request_connector instruction.
     const skill = makeSkill({
       name: "needs-linear",
       description: "Test skill that needs Linear.",
-      requiredConnectors: [{ provider: "linear" }]
+      requiredCredentials: ["LINEAR_API_KEY"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toContain("linear");
@@ -2388,23 +2722,101 @@ describe("buildInactiveSkillsBlock", () => {
     expect(block).not.toMatch(/read_skill/);
   });
 
-  test("returns an empty string when no inactive-with-connector skills are present", () => {
+  test("instructs a templateless request_connector for a credential with no registered provider", () => {
+    // SOME_SERVICE_API_KEY maps to no provider module, so providerForCredential
+    // falls back to the name itself. The block must NOT emit the bare
+    // provider-id shortcut (there is no provider to connect) — it must tell the
+    // model to call request_connector with the {name, type, skillId} shape so
+    // the user can enter the secret in chat. The name is UPPER_SNAKE so the
+    // inferred type is api-key.
+    const skill = makeSkill({
+      name: "needs-some-service",
+      description: "Test skill that needs an unmapped credential.",
+      requiredCredentials: ["SOME_SERVICE_API_KEY"]
+    });
+    const block = buildInactiveSkillsBlock([skill]);
+    expect(block).toContain("SOME_SERVICE_API_KEY");
+    expect(block).toContain('name: "SOME_SERVICE_API_KEY"');
+    expect(block).toContain('type: "api-key"');
+    expect(block).toContain(`skillId: "${skill.id}"`);
+    // No provider-id shortcut and no read_skill dead-end for a name with no
+    // registered provider.
+    expect(block).not.toContain("call `request_connector` with provider id `SOME_SERVICE_API_KEY`");
+    expect(block).not.toMatch(/read_skill/);
+    expect(block).not.toContain("will be rejected");
+  });
+
+  // Minimal RuntimeState carrying only the connectors the block reads.
+  function stateWithConnectors(connectors: RuntimeState["connectors"]): RuntimeState {
+    return {
+      version: 1,
+      instance: "test",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
+      connectors, improvements: [], pairingCodes: [], devices: [],
+      promotions: [], snapshots: [], tools: [], toolsets: [], subagents: [],
+      mcpServers: [], messagingBridges: [], importReports: [], agents: [],
+      activeAgentId: undefined, relays: [], notifications: [], events: [],
+      jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
+      runs: [], planSteps: []
+    };
+  }
+
+  test("a disabled generic connector sharing the credential name still yields the api-key templateless line by NAME", () => {
+    // Regression: a disabled/unhealthy "generic" connector row sharing the
+    // credential name must NOT masquerade as the owning provider. The earlier
+    // code returned the row's provider ("generic"), grouped under that key, and
+    // emitted a bogus `{name:"generic", type:"oauth2"}` line. The line must name
+    // the actual credential and be api-key (templateless is api-key only).
+    const skill = makeSkill({
+      name: "needs-some-service",
+      requiredCredentials: ["SOME_SERVICE_API_KEY"]
+    });
+    const state = stateWithConnectors([
+      {
+        id: "id_generic_row",
+        instance: "test",
+        name: "SOME_SERVICE_API_KEY",
+        provider: "generic",
+        status: "disabled",
+        scopes: [],
+        secretRefs: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        health: "unknown",
+        source: "user"
+      }
+    ]);
+    const block = buildInactiveSkillsBlock([skill], state);
+    expect(block).toContain('name: "SOME_SERVICE_API_KEY"');
+    expect(block).toContain('type: "api-key"');
+    // Never the bogus generic/oauth2 line.
+    expect(block).not.toContain('name: "generic"');
+    expect(block).not.toContain('type: "oauth2"');
+  });
+
+  test("returns an empty string when no inactive-with-credential skills are present", () => {
     expect(buildInactiveSkillsBlock([])).toBe("");
-    // Skills with no requiredConnectors are filtered out before the
+    // Skills with no requiredCredentials are filtered out before the
     // grouping step.
-    const skill = makeSkill({ name: "no-conn", requiredConnectors: [] });
+    const skill = makeSkill({ name: "no-cred", requiredCredentials: [] });
     expect(buildInactiveSkillsBlock([skill])).toBe("");
   });
 
   test("opens with the dual-path intro so the model knows both routing options", () => {
     const skill = makeSkill({
       name: "needs-linear",
-      requiredConnectors: [{ provider: "linear" }]
+      requiredCredentials: ["LINEAR_API_KEY"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toMatch(/^Skills below need an external connector\./);
-    expect(block).toContain("setup skill");
+    // Both request_connector routing options are advertised: a registered
+    // provider id, and the templateless api-key {name, type:"api-key", skillId}
+    // shape for a credential with no registered provider.
     expect(block).toContain("request_connector");
+    expect(block).toContain("provider id");
+    expect(block).toContain('{name, type:"api-key", skillId}');
   });
 
   test("appends a no-browser-shortcut directive when a setup-skill provider is present", () => {
@@ -2415,7 +2827,7 @@ describe("buildInactiveSkillsBlock", () => {
     // only sanctioned route.
     const skill = makeSkill({
       name: "google-calendar",
-      requiredConnectors: [{ provider: "google-oauth-desktop" }]
+      requiredCredentials: ["google-workspace-oauth"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toContain("ONLY correct path");
@@ -2437,10 +2849,182 @@ describe("buildInactiveSkillsBlock", () => {
     // declared, so the browser-shortcut directive is unnecessary noise.
     const skill = makeSkill({
       name: "needs-linear",
-      requiredConnectors: [{ provider: "linear" }]
+      requiredCredentials: ["LINEAR_API_KEY"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).not.toContain("ONLY correct path");
     expect(block).not.toContain("browser_navigate");
+  });
+});
+
+describe("buildMcpServersBlock", () => {
+  function stateWith(servers: RuntimeState["mcpServers"]): RuntimeState {
+    return {
+      version: 1,
+      instance: "test",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
+      connectors: [], improvements: [], pairingCodes: [], devices: [],
+      promotions: [], snapshots: [], tools: [], toolsets: [], subagents: [],
+      mcpServers: servers, messagingBridges: [], importReports: [], agents: [],
+      activeAgentId: undefined, relays: [], notifications: [], events: [],
+      jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
+      runs: [], planSteps: []
+    };
+  }
+
+  function server(name: string, tools: Array<{ name: string }>): RuntimeState["mcpServers"][number] {
+    return {
+      id: `mcp_${name}`,
+      instance: "test",
+      name,
+      command: "",
+      args: [],
+      envKeys: [],
+      status: "configured",
+      exposedTools: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      transport: "http",
+      url: "https://example.test/mcp",
+      tools
+    };
+  }
+
+  test("returns empty string when no servers are configured", () => {
+    expect(buildMcpServersBlock(stateWith([]))).toBe("");
+  });
+
+  test("lists tool names per server so the model has the full inventory", () => {
+    // The inventory line is what lets the model reach for a tool the skill
+    // never documented. Skills should not have to be re-edited every time
+    // an MCP server adds a tool.
+    const state = stateWith([
+      server("linear", [
+        { name: "list_issues" },
+        { name: "save_issue" },
+        { name: "list_initiatives" },
+        { name: "extract_images" }
+      ])
+    ]);
+    const block = buildMcpServersBlock(state);
+    expect(block).toContain("- linear (4 tools)");
+    expect(block).toContain("tools: extract_images, list_initiatives, list_issues, save_issue");
+  });
+
+  test("includes the default-yes posture instruction", () => {
+    // Without this, the model treats the skill's documented tools as
+    // exhaustive and refuses tasks for tools that actually exist on the
+    // server's inventory list.
+    const state = stateWith([server("linear", [{ name: "list_issues" }])]);
+    const block = buildMcpServersBlock(state);
+    expect(block).toContain("Do not refuse");
+    expect(block).toContain("validation error on bad args");
+  });
+
+  test("omits the per-server inventory line when a server has no cached tools yet", () => {
+    // Health probe hasn't populated tools yet — show the server but skip
+    // the inventory line so we don't lie about emptiness. (The default-yes
+    // posture sentence below still mentions the word `tools:`, so we
+    // assert on the indented inventory line specifically.)
+    const state = stateWith([server("linear", [])]);
+    const block = buildMcpServersBlock(state);
+    expect(block).toContain("- linear");
+    expect(block).not.toMatch(/^ {2}tools:/m);
+  });
+
+  test("alphabetizes both servers and their tool name lists for determinism", () => {
+    // Toolset hashes and prompt-cache stability depend on stable ordering
+    // across boots even when the order tools were registered varies.
+    const state = stateWith([
+      server("zenith", [{ name: "z_one" }, { name: "a_two" }]),
+      server("acme", [{ name: "c_one" }, { name: "a_two" }])
+    ]);
+    const block = buildMcpServersBlock(state);
+    const acmeIdx = block.indexOf("- acme");
+    const zenithIdx = block.indexOf("- zenith");
+    expect(acmeIdx).toBeGreaterThanOrEqual(0);
+    expect(zenithIdx).toBeGreaterThan(acmeIdx);
+    expect(block).toContain("tools: a_two, c_one");
+    expect(block).toContain("tools: a_two, z_one");
+  });
+});
+
+describe("buildSkillScriptsBlock", () => {
+  // listEnabledSkillScripts statSyncs the real scripts/ dir under each
+  // skill's manifestPath, so the seeded skills need real files on disk.
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "gini-skill-scripts-block-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function seedSkill(
+    state: RuntimeState,
+    name: string,
+    scripts: string[],
+    opts: { status?: SkillRecord["status"] } = {}
+  ): void {
+    const skillDir = join(dir, name);
+    const scriptsDir = join(skillDir, "scripts");
+    mkdirSync(scriptsDir, { recursive: true });
+    for (const script of scripts) {
+      writeFileSync(join(scriptsDir, script), "console.log('{}')");
+    }
+    state.skills.push({
+      id: `skill_${name}`,
+      instance: state.instance,
+      name,
+      description: "",
+      trigger: "",
+      steps: [],
+      requiredTools: [],
+      requiredPermissions: [],
+      status: opts.status ?? "enabled",
+      version: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tests: [],
+      successCount: 0,
+      failureCount: 0,
+      previousVersions: [],
+      body: "",
+      source: "bundled",
+      manifestPath: join(skillDir, "SKILL.md")
+    });
+  }
+
+  test("returns empty string when no visible skill ships scripts", () => {
+    const state = createEmptyState("test");
+    seedSkill(state, "no-scripts", []);
+    expect(buildSkillScriptsBlock(state, new Set(["no-scripts"]))).toBe("");
+  });
+
+  test("lists each visible skill's scripts, alphabetized by skill and script", () => {
+    const state = createEmptyState("test");
+    seedSkill(state, "bbb", ["alpha.sh"]);
+    seedSkill(state, "aaa", ["two.ts", "one.ts"]);
+    const block = buildSkillScriptsBlock(state, new Set(["aaa", "bbb"]));
+    expect(block).toBe(
+      [
+        "Skill scripts (invoke with skill_run, never re-implement in terminal_exec):",
+        "- aaa: one, two",
+        "- bbb: alpha"
+      ].join("\n")
+    );
+  });
+
+  test("omits skills that are enabled but not visible (inactive connector)", () => {
+    const state = createEmptyState("test");
+    seedSkill(state, "visible", ["go.ts"]);
+    seedSkill(state, "hidden", ["go.ts"]);
+    const block = buildSkillScriptsBlock(state, new Set(["visible"]));
+    expect(block).toContain("- visible: go");
+    expect(block).not.toContain("hidden");
   });
 });

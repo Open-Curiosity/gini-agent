@@ -42,6 +42,7 @@ import { doctorCmd, install_, reset, runForeground, start, statusCmd, stop, unin
 import { setup } from "./commands/setup";
 import { autostart } from "./commands/autostart";
 import { identity } from "./commands/identity";
+import { watchdog } from "./commands/watchdog";
 
 export async function run(): Promise<void> {
   const args = Bun.argv.slice(2);
@@ -157,6 +158,7 @@ export async function run(): Promise<void> {
     case "evidence": evidence(ctx); break;
     case "smoke": await smoke(ctx); break;
     case "identity": await identity(ctx); break;
+    case "watchdog": await watchdog(ctx); break;
     default: help();
   }
 }

@@ -124,6 +124,10 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 - `/api/audit`, `/api/events`, `/api/events/stream`
 - `/api/parity/hermes`, `/api/readiness/v1`
 
+## On-Machine Lifecycle
+
+On macOS a launchd-managed instance is supervised to stay up across crashes, clean exits, and auto-update self-restarts. Three per-instance LaunchAgents — gateway, web, and a periodic watchdog — keep it running: `KeepAlive` is always-respawn, so `gini stop` unloads the services via `launchctl bootout` (the only way to keep a supervised instance down), and the watchdog covers the gaps KeepAlive can't (a wedged-but-alive process and a launchd-deferred respawn). When the runtime (or the watchdog, for web) detects a crash, it captures a redacted report to a local queue and, on the next restart of the `default` instance, asks the user whether to file it as a GitHub issue — nothing is published without consent. Foreground / `gini run` / conductor / tmux instances keep PID-kill stop and are unaffected. See [Always-Up Supervision](./adr/always-up-supervision.md) and [Crash Reporting And Issue Filing](./adr/crash-reporting-and-issue-filing.md).
+
 ## Off-LAN Access
 
 Off-LAN access is not built today — the gateway binds to loopback and the web control plane is reached over localhost or a same-network / Tailscale address. The planned surface is a relay: a hosted (and self-hostable) switchboard that splices outbound connections from the gateway and clients and forwards opaque, end-to-end-encrypted bytes it cannot read, with the gateway staying the sole authority for access. See "Not Yet Built" below.
@@ -132,7 +136,6 @@ Off-LAN access is not built today — the gateway binds to loopback and the web 
 
 - Production relay for off-LAN access (a hosted, self-hostable switchboard that forwards end-to-end-encrypted bytes; the gateway stays the source of truth and sole authority for access).
 - Push notification delivery.
-- LaunchAgent-style auto-start.
 
 A basic Expo mobile client lives under `mobile/` — agent picker, per-agent chat list, and chat detail with task polling. It speaks the same `/api/*` contract directly with its own bearer token (no BFF), so it does not change the runtime/source-of-truth model.
 
