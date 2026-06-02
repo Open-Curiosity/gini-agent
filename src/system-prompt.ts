@@ -70,20 +70,7 @@ export function __resetDefaultGiniInstructionsCacheForTest(overridePath?: string
   activeInstructionsPath = overridePath ?? DEFAULT_INSTRUCTIONS_PATH;
 }
 
-// Matches a leading "You are <name>, a personal agent." identity sentence
-// (the bundled default's first line, and any on-disk INSTRUCTIONS.md seeded
-// before the name moved to the agent record). Consumes the trailing newline
-// so the agent-derived identity line can take its place cleanly.
-const LEADING_IDENTITY_SENTENCE = /^You are [^\n]*?a personal agent\.[ \t]*\r?\n?/i;
-
 export interface AgentSystemContextOptions {
-  // Per-agent name from `AgentRecord.name`. When set, it sources the
-  // "You are X, a personal agent." identity line, replacing any leading
-  // identity sentence carried in the instructions so a non-default agent
-  // self-identifies by its own name rather than the bundled default's
-  // "Gini". When absent, the instructions are emitted verbatim — the
-  // identity line stays whatever the file (override or default) carries.
-  agentName?: string;
   // When set, replaces the default operating-rules preamble (from
   // `getDefaultGiniInstructions`). Sourced from
   // ~/.gini/instances/<inst>/INSTRUCTIONS.md by the call sites; absent
@@ -182,9 +169,9 @@ export function identityBudgetState(
 // The legacy "Pinned memories about this user" block was removed when
 // `state.memories` was consolidated into USER.md / SOUL.md / Hindsight.
 // See ADR runtime-identity-files.md.
-// Agent names flow into the system prompt (the "You are X, a personal
-// agent." line and the runtime-identity block), so they must stay a
-// single-line label. Collapse every whitespace run (incl. embedded
+// Agent names flow into the system prompt (the runtime-identity block's
+// "- agent: <name>" line and the per-agent SOUL.md seed), so they must
+// stay a single-line label. Collapse every whitespace run (incl. embedded
 // \n/\r/\t) to a single space and trim. Returns undefined when nothing
 // is left, so callers can fall back. "Gini" is unchanged → byte-identical.
 export function sanitizeAgentName(name: string | undefined): string | undefined {
@@ -193,29 +180,9 @@ export function sanitizeAgentName(name: string | undefined): string | undefined 
 }
 
 export function buildAgentSystemContext(options?: AgentSystemContextOptions): string {
-  let instructions = options?.instructionsOverride && options.instructionsOverride.trim().length > 0
+  const instructions = options?.instructionsOverride && options.instructionsOverride.trim().length > 0
     ? options.instructionsOverride
     : getDefaultGiniInstructions();
-  // Source the identity sentence from the per-agent name when supplied.
-  // The name is the single owner of "You are X, a personal agent."; the
-  // operating-rules file no longer owns it, so we strip any leading
-  // identity sentence the file still carries and prepend the
-  // agent-derived one. Joined with a single `\n` to match the default
-  // file's line-1/line-2 separator, so the default agent named "Gini"
-  // against the unmodified default file is byte-identical to omitting
-  // agentName. Absent/blank name leaves the instructions untouched.
-  //
-  // The name becomes verbatim system-prompt text, so collapse every
-  // whitespace run (incl. embedded \n/\r/\t) to a single space before
-  // trimming — a name carrying a newline would otherwise inject a second
-  // system-prompt line. "Gini" has no whitespace, so it is byte-identical
-  // after this and the backward-compat pin still holds.
-  const agentName = sanitizeAgentName(options?.agentName);
-  if (agentName) {
-    const rules = instructions.replace(LEADING_IDENTITY_SENTENCE, "").replace(/^\n+/, "");
-    const identityLine = `You are ${agentName}, a personal agent.`;
-    instructions = rules.length > 0 ? `${identityLine}\n${rules}` : identityLine;
-  }
   const parts: string[] = [instructions];
   if (options?.soul && options.soul.trim().length > 0) {
     // BLOCKED notices are emitted by the load path as a one-line

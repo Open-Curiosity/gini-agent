@@ -9,7 +9,7 @@ import {
   readState
 } from "../state";
 import { addAudit } from "../state/audit";
-import { scaffoldAgentSoulFile } from "../runtime/identity-files";
+import { seedAgentSoulFile } from "../runtime/identity-files";
 import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
 
 export function listAgents(config: RuntimeConfig) {
@@ -18,10 +18,11 @@ export function listAgents(config: RuntimeConfig) {
 }
 
 export async function createAgent(config: RuntimeConfig, input: Record<string, unknown>) {
-  // The name flows into the system prompt as the "You are X, a personal
-  // agent." identity line, so collapse every whitespace run (incl.
-  // embedded \n/\r/\t) to a single space and trim — this keeps the stored
-  // name a clean single-line label and rejects whitespace-only input.
+  // The name is seeded into the agent's SOUL.md (`Your name is <name>.`)
+  // and surfaced in the runtime-identity block, so collapse every
+  // whitespace run (incl. embedded \n/\r/\t) to a single space and trim —
+  // this keeps the stored name a clean single-line label and rejects
+  // whitespace-only input.
   const name = String(input.name ?? "").replace(/\s+/g, " ").trim();
   if (!name) throw new Error("Agent name is required.");
   const record = await mutateState(config.instance, (state) => {
@@ -82,13 +83,11 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
   // there's no copying of memories or hindsight units from the default
   // agent or any other agent.
   ensureAgentBank(config.instance, record.id);
-  // Scaffold the per-agent SOUL.md as a zero-byte placeholder so the
-  // user can fill it in without first having to create the directory.
-  // The load path treats an empty file as absent, so this does not
-  // change prompt behavior — it only surfaces the file on disk.
+  // Seed the per-agent SOUL.md with `Your name is <name>.` so the new
+  // agent self-identifies by its own name (INSTRUCTIONS.md is generic).
   // Order matters: state has already been persisted, so a crash here
   // can never leave a SOUL.md for a non-existent agent.
-  scaffoldAgentSoulFile(config.instance, record.id);
+  seedAgentSoulFile(config.instance, record.id, record.name);
   return record;
 }
 

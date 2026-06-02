@@ -363,22 +363,9 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
       }
     }
   }
-  // Resolve the active agent so its name sources the "You are X, a
-  // personal agent." identity line. Mirrors the lookup buildAgentIdentity
-  // does below; an undefined agentId or missing record leaves agentName
-  // undefined, in which case the instructions emit verbatim.
-  const activeAgent = effectiveForAgent.agentId
-    ? state.agents.find((a) => a.id === effectiveForAgent.agentId)
-    : undefined;
-  // agentName applies only to the non-subagent path. This same
-  // buildAgentSystemContext call is also the fallback for a subagent whose
-  // systemPrompt is empty; feeding the parent agent's name there would
-  // change the subagent fallback preamble, so it stays undefined for
-  // subagents (their persona is the parent's responsibility).
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt
     : buildAgentSystemContext({
-        agentName: subagent ? undefined : activeAgent?.name,
         instructionsOverride,
         soul: soulBlock,
         userProfile: userProfileBlock

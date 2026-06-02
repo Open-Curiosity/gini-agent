@@ -36,7 +36,7 @@ import {
 import { basename, dirname, join } from "node:path";
 import { instanceRoot } from "../paths";
 import { appendLog } from "../state/trace";
-import { DEFAULT_INSTRUCTIONS_PATH } from "../system-prompt";
+import { DEFAULT_INSTRUCTIONS_PATH, sanitizeAgentName } from "../system-prompt";
 import type { Instance } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -94,12 +94,13 @@ export function soulHistoryDir(instance: Instance, agentId: string): string {
 // `src/runtime/defaults/INSTRUCTIONS.md` so a user opening the file has a
 // working preamble to edit against; the seed has no header comment or
 // other meta text because any byte in the file goes verbatim into the
-// system prompt. USER.md and per-agent SOUL.md stay zero-byte — no
-// defaults exist for them.
+// system prompt. USER.md stays zero-byte — no default exists for it.
+// Per-agent SOUL.md is seeded with `Your name is <name>.` so a new agent
+// self-identifies by its own name (see `seedAgentSoulFile`).
 //
 // Reads still go through the load-and-scan helpers, which treat a zero-byte
 // (or whitespace-only) file as absent and fall back to defaults — so a
-// zero-byte USER.md or SOUL.md does not change prompt behavior.
+// zero-byte USER.md does not change prompt behavior.
 //
 // Filesystem errors on the user-instance write side are swallowed and
 // logged through `appendLog` (a permission glitch on the instance dir
@@ -226,14 +227,40 @@ export interface ScaffoldAgentResult {
   created: string | null;
 }
 
-// Touch agents/<agentId>/SOUL.md at the instance root if absent. Never
-// overwrites. Returns the created path or null when the file already
-// existed (or the touch failed and was logged).
-export function scaffoldAgentSoulFile(instance: Instance, agentId: string): ScaffoldAgentResult {
+// Seed agents/<agentId>/SOUL.md with `Your name is <name>.` so a freshly
+// created agent self-identifies by its own name (INSTRUCTIONS.md is
+// generic — it carries no name). The name lives in SOUL.md, the per-agent
+// "about the agent" file, so it flows through the same load→scan→budget
+// pipeline as any other persona content. See ADR runtime-identity-files.md.
+//
+// Guards:
+//   - No-op when the name sanitizes to empty (never write "Your name is .").
+//   - NEVER clobber an existing SOUL — only seeds when the file is absent
+//     or empty/whitespace-only (e.g. the legacy zero-byte scaffold). A
+//     user/agent-authored body is left untouched.
+//
+// Best-effort: a per-instance filesystem error is swallowed and logged
+// via `appendLog`; the load path tolerates a missing SOUL. Returns the
+// seeded path or null (already populated, empty name, or write failed).
+export function seedAgentSoulFile(instance: Instance, agentId: string, name: string | undefined): ScaffoldAgentResult {
+  const clean = sanitizeAgentName(name);
+  if (!clean) return { created: null };
   const path = soulPath(instance, agentId);
   try {
-    if (touchIfMissing(path)) return { created: path };
-    return { created: null };
+    // Don't overwrite a SOUL that already has content. existsSync +
+    // trimmed-length check treats a zero-byte / whitespace-only file (the
+    // legacy scaffold) as seedable, matching how the load path treats it
+    // as absent.
+    if (existsSync(path)) {
+      try {
+        if (readFileSync(path, "utf8").trim().length > 0) return { created: null };
+      } catch {
+        // Unreadable file — treat as absent and reseed below.
+      }
+    }
+    ensureDir(dirname(path));
+    writeFileSync(path, `Your name is ${clean}.`);
+    return { created: path };
   } catch (error) {
     try {
       appendLog(instance, "identity.scaffold.error", {
