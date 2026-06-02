@@ -43,12 +43,8 @@ import { id, now } from "./ids";
 // devices are dropped (no devices → no badge to bias).
 //
 // Bumped to 7 for devices.origin: tags each push-device row with the
-// network path it arrived over. New tunneled rows are flagged
-// `origin = 'tunnel'`; rows that came in over loopback (or any pre-v7
-// row backfilled by the ensureColumn helper) stay `origin = 'loopback'`.
-// rotateSecret / disable purge every `origin = 'tunnel'` row so a leaked
-// QR-bootstrap holder loses their APNs subscription as soon as the
-// operator rotates or disables the tunnel.
+// network path it arrived over. Always `loopback` now — the operator's
+// local browser or a device paired over the LAN.
 export const MEMORY_SCHEMA_VERSION = 7;
 export const DEFAULT_BANK_ID = "bank_default";
 
@@ -390,15 +386,14 @@ function applyMigrations(db: Database): void {
       bundle_id TEXT NOT NULL,
       registered_at TEXT NOT NULL,
       last_seen_at TEXT NOT NULL,
-      origin TEXT NOT NULL DEFAULT 'loopback' CHECK (origin IN ('loopback','tunnel'))
+      origin TEXT NOT NULL DEFAULT 'loopback' CHECK (origin IN ('loopback'))
     );
     CREATE INDEX IF NOT EXISTS devices_by_credential ON devices(credential_id);
   `);
   // Pre-v7 installs already have a devices table without the origin
   // column; the CREATE TABLE IF NOT EXISTS above is a no-op against
-  // them. Add the column with the same default so legacy loopback
-  // registrations retain their identity instead of getting purged on
-  // the next rotate. Index creation is deferred until after the
+  // them. Add the column with the same default so legacy registrations
+  // retain their identity. Index creation is deferred until after the
   // column exists, otherwise SQLite's parse-time validation would
   // reject `CREATE INDEX ... ON devices(origin)` on the legacy shape.
   ensureColumn(db, "devices", "origin", "TEXT NOT NULL DEFAULT 'loopback'");

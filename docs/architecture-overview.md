@@ -126,11 +126,11 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 
 ## Off-LAN Access
 
-Cloudflare quick tunnels are the current off-LAN surface — the gateway manages a single `cloudflared` subprocess that bridges the loopback web port to a rotating `*.trycloudflare.com` URL, and the Next.js proxy gates inbound traffic on a per-instance secret (via cookie or `Authorization: Bearer`) before forwarding to the BFF. See [Tunnel And Mobile Access](./adr/tunnel-and-mobile-access.md) for the full trust model, auth paths, and deny list.
+Off-LAN access is not built today — the gateway binds to loopback and the web control plane is reached over localhost or a same-network / Tailscale address. The planned surface is a relay: a hosted (and self-hostable) switchboard that splices outbound connections from the gateway and clients and forwards opaque, end-to-end-encrypted bytes it cannot read, with the gateway staying the sole authority for access. See "Not Yet Built" below.
 
 ## Not Yet Built
 
-- Production relay on a stable hostname (the current quick tunnel rotates on every gateway restart).
+- Production relay for off-LAN access (a hosted, self-hostable switchboard that forwards end-to-end-encrypted bytes; the gateway stays the source of truth and sole authority for access).
 - Push notification delivery.
 - LaunchAgent-style auto-start.
 

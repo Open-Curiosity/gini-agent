@@ -1,8 +1,6 @@
-// Mirror of src/runtime/tunnel/canonicalize.test.ts — pins the web copy
-// against the same invariants. Both files are tested independently so a
-// drift between the two (e.g., a developer edits one and forgets the
-// other) is caught by CI. See docs/adr/tunnel-and-mobile-access.md
-// "Architecture (summary)".
+// Pins the BFF path canonicalizer used by the /api/runtime/[...path] proxy
+// route — rejecting traversal, duplicate slashes, embedded delimiters, and
+// over-long input before a request path is forwarded to the gateway.
 import { describe, expect, test } from "bun:test";
 import { canonicalizePath, noTrailingSlash } from "./canonicalize";
 
