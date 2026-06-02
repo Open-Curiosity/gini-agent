@@ -86,11 +86,20 @@ export function VoiceRecorder({
   const [cancelling, setCancelling] = useState(false);
   const [uploading, setUploading] = useState(false);
   const startedAtRef = useRef<number>(0);
-  // Synchronous mirror of "a take is in progress". The gesture's end /
-  // finalize callbacks both route here via runOnJS, and a permission
-  // denial leaves the take unstarted — gating on this ref keeps us from
-  // calling recorder.stop() when nothing is recording.
+  // Synchronous mirror of "a take is in progress". Set true at the very top
+  // of start() (before any await) so a finger lifting during the permission
+  // dialog or the prepare window is never mistaken for "nothing running".
+  // The gesture's end / finalize callbacks both route through stop() via
+  // runOnJS.
   const activeRef = useRef(false);
+  // True only after recorder.record() has actually started capturing. While
+  // a take is active but not yet recording (permission/prepare still
+  // awaiting), stop() can't call recorder.stop() — there's nothing to stop.
+  const recordingRef = useRef(false);
+  // Set by stop() when the finger lifts before recording begins. start()
+  // checks it after each await and aborts the take without ever recording,
+  // owning the cleanup so the mic never gets stuck on.
+  const cancelDuringPrepRef = useRef(false);
 
   // Drives the slide-to-cancel hint translation and the pulsing dot. Both
   // live on the UI thread so the drag and pulse stay smooth regardless of
@@ -117,30 +126,60 @@ export function VoiceRecorder({
   }, [dragX]);
 
   const start = useCallback(async () => {
+    // Claim the take synchronously before any await so a finger lifting
+    // mid-prep routes through stop()'s cancel-during-prep path rather than
+    // no-opping and leaving start() to record with no gesture-end to stop it.
+    activeRef.current = true;
+    recordingRef.current = false;
+    cancelDuringPrepRef.current = false;
     const perm = await requestRecordingPermissionsAsync();
     if (!perm.granted) {
+      activeRef.current = false;
       Alert.alert(
         "Microphone access required",
         "Enable microphone access in Settings to record voice messages."
       );
+      await finish();
+      return;
+    }
+    // A release during the permission dialog or the prepare window asks us to
+    // abort — finish() owns the cleanup and we never start recording.
+    if (cancelDuringPrepRef.current) {
+      activeRef.current = false;
+      recordingRef.current = false;
+      await finish();
       return;
     }
     await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
     await recorder.prepareToRecordAsync();
+    if (cancelDuringPrepRef.current) {
+      activeRef.current = false;
+      recordingRef.current = false;
+      await finish();
+      return;
+    }
     recorder.record();
+    recordingRef.current = true;
     startedAtRef.current = Date.now();
-    activeRef.current = true;
     setCancelling(false);
     setRecording(true);
-  }, [recorder]);
+  }, [recorder, finish]);
 
   const stop = useCallback(
     async (cancel: boolean) => {
-      // A lifted-too-fast tap (gesture never activated) or a denied
-      // permission prompt reaches here with no take running — nothing to
-      // stop, and recorder.stop() would reject.
+      // A lifted-too-fast tap (gesture never activated) reaches here with no
+      // take running — nothing to stop.
       if (!activeRef.current) return;
+      // The take is claimed but recording hasn't started yet (start() is
+      // still awaiting permission/prepare). Hand cleanup to start(), which
+      // checks cancelDuringPrepRef after each await and aborts without ever
+      // calling recorder.stop() on a take that only prepared.
+      if (!recordingRef.current) {
+        cancelDuringPrepRef.current = true;
+        return;
+      }
       activeRef.current = false;
+      recordingRef.current = false;
       const durationMs = Date.now() - startedAtRef.current;
       await recorder.stop();
       const uri = recorder.uri;
