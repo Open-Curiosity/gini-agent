@@ -97,6 +97,12 @@ export default function ChatDetailScreen() {
   // thread; on the very first voice message the local whisper model still
   // has to download, so the bubble's label switches to a setup notice.
   const [voicePending, setVoicePending] = useState(false);
+  // True while the recorder is recording or its WAV is still uploading.
+  // Keeps the trailing control on the recorder (never the send arrow) so it
+  // can't unmount mid-upload, and blocks a typed/return-key send until the
+  // voice op finishes — otherwise a voice message could post around a
+  // separate text send.
+  const [voiceBusy, setVoiceBusy] = useState(false);
   const scrollRef = useRef<ScrollView | null>(null);
 
   // Tracks whether the ScrollView is currently pinned near the bottom.
@@ -268,7 +274,7 @@ export default function ChatDetailScreen() {
   const anyUploading = images.some((image) => image.status === "uploading");
   const showSendBusy = send.isPending || inFlight;
   const sendDisabled =
-    (!trimmed && readyImages.length === 0) || showSendBusy || anyUploading || !sessionId;
+    (!trimmed && readyImages.length === 0) || showSendBusy || anyUploading || !sessionId || voiceBusy;
 
   const submit = () => {
     // Hardware-keyboard onSubmitEditing can fire mid-task; `showSendBusy`
@@ -568,8 +574,10 @@ export default function ChatDetailScreen() {
                 appears once there's text or a ready image; an empty composer
                 shows the press-and-hold mic instead. The recorder targets
                 iOS LinearPCM WAV, so non-iOS platforms always show the send
-                arrow (disabled when empty) rather than the mic. */}
-            {trimmed || readyImages.length > 0 || Platform.OS !== "ios" ? (
+                arrow (disabled when empty) rather than the mic. While a voice
+                take is in flight we keep the recorder mounted so its upload
+                can't resolve from an unmounted component and race a text send. */}
+            {!voiceBusy && (trimmed || readyImages.length > 0 || Platform.OS !== "ios") ? (
               <Pressable
                 onPress={submit}
                 disabled={sendDisabled}
@@ -590,6 +598,7 @@ export default function ChatDetailScreen() {
               <VoiceRecorder
                 disabled={!sessionId || showSendBusy || anyUploading}
                 onSend={sendVoice}
+                onBusyChange={setVoiceBusy}
               />
             )}
           </View>

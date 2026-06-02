@@ -75,10 +75,12 @@ export interface VoiceRef {
 // recording is discarded silently.
 export function VoiceRecorder({
   disabled,
-  onSend
+  onSend,
+  onBusyChange
 }: {
   disabled: boolean;
   onSend: (ref: VoiceRef) => void;
+  onBusyChange?: (busy: boolean) => void;
 }) {
   const recorder = useAudioRecorder(RECORD_OPTIONS);
   const recorderState = useAudioRecorderState(recorder);
@@ -115,6 +117,15 @@ export function VoiceRecorder({
       pulse.value = 0;
     }
   }, [recording, pulse]);
+
+  // Surface a "voice busy" signal to the composer so it keeps this recorder
+  // mounted from record-start through the upload until send/discard finishes.
+  // Without it, the composer can swap the trailing control to the send arrow
+  // (and unmount this component) mid-upload, so the in-flight upload would
+  // resolve and call onSend after a competing text send.
+  useEffect(() => {
+    onBusyChange?.(recording || uploading);
+  }, [recording, uploading, onBusyChange]);
 
   // Reset the audio session and visual state once a take finishes (sent or
   // discarded). Kept in one place so every exit path converges here.
