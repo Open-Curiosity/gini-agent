@@ -21,9 +21,9 @@
 // audit write is inlined below against ../state so the registry pulls in no
 // helper that transitively re-enters agent.ts and forms a cycle.
 
-import type { RuntimeConfig, RuntimeState } from "../types";
+import type { ApprovalMode, RuntimeConfig, RuntimeState } from "../types";
 import { addAudit, appendTrace, mutateState, now, readState } from "../state";
-import { status as runtimeStatus } from "../runtime";
+import { status as runtimeStatus, updateAutoApproveSettings } from "../runtime";
 import { providerCatalogWithStatus } from "../provider";
 import { setSetupProvider } from "../runtime/setup-api";
 import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability } from "../capabilities/agents";
@@ -290,6 +290,27 @@ async function setProvider(
   });
 }
 
+async function setApprovalMode(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const mode = typeof args.mode === "string" ? args.mode.trim() : "";
+  if (!["strict", "auto", "yolo"].includes(mode)) {
+    return JSON.stringify({ ok: false, error: "set_approval_mode requires 'mode' to be one of: strict, auto, yolo." });
+  }
+  const result = updateAutoApproveSettings(config, { approvalMode: mode as ApprovalMode });
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Set approval mode",
+    data: { approvalMode: result.approvalMode }
+  });
+  await recordLowRiskAudit(config, taskId, "approval_mode.set", result.approvalMode, {
+    approvalMode: result.approvalMode
+  });
+  return JSON.stringify({ ok: true, approvalMode: result.approvalMode });
+}
+
 async function useAgent(
   config: RuntimeConfig,
   taskId: string,
@@ -473,6 +494,19 @@ export const SELF_OPERATIONS: SelfOperation[] = [
       required: ["name"]
     },
     handler: (config, taskId, args) => createAgent(config, taskId, args)
+  },
+  {
+    name: "set_approval_mode",
+    summary: "Set the runtime approval mode: strict (gate every high-risk action), auto (auto-approve safe actions, gate dangerous shell), or yolo (skip the per-action gate).",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        mode: { type: "string", enum: ["strict", "auto", "yolo"], description: "strict | auto | yolo." }
+      },
+      required: ["mode"]
+    },
+    handler: (config, taskId, args) => setApprovalMode(config, taskId, args)
   }
 ];
 

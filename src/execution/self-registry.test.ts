@@ -4,7 +4,7 @@
 // The registry (self-registry.ts) is the single source of truth for the
 // self-config operation BEHAVIOR (handler + tag + audit). Each capability is
 // exposed to the agent loop as a direct deferred tool whose NAME is the op
-// name; dispatch routes the 9 tool cases through dispatchSelfOp. The
+// name; dispatch routes the self tool cases through dispatchSelfOp. The
 // dispatch-level tests exercise the route-by-tag logic (query sync, mutate
 // gated-vs-auto) against a seeded RuntimeConfig + state, reusing the same
 // fixture shape as tool-dispatch.test.ts. Args are passed at TOP LEVEL (no
@@ -47,8 +47,8 @@ async function newTask(config: RuntimeConfig): Promise<string> {
 }
 
 describe("self operation registry", () => {
-  test("SELF_OPERATIONS carries the 9 expected ops with name, summary, tag, handler", () => {
-    expect(SELF_OPERATIONS.length).toBe(9);
+  test("SELF_OPERATIONS carries the 10 expected ops with name, summary, tag, handler", () => {
+    expect(SELF_OPERATIONS.length).toBe(10);
     for (const op of SELF_OPERATIONS) {
       expect(typeof op.name).toBe("string");
       expect(op.name.length).toBeGreaterThan(0);
@@ -66,6 +66,7 @@ describe("self operation registry", () => {
       "list_mcp_servers",
       "list_providers",
       "list_skills",
+      "set_approval_mode",
       "set_provider",
       "use_agent"
     ]);
@@ -82,7 +83,7 @@ describe("self operation registry", () => {
       "list_providers",
       "list_skills"
     ]);
-    expect(mutates).toEqual(["create_agent", "set_provider", "use_agent"]);
+    expect(mutates).toEqual(["create_agent", "set_approval_mode", "set_provider", "use_agent"]);
   });
 
   test("findSelfOperation resolves known names and rejects unknown ones", () => {
@@ -196,5 +197,46 @@ describe("direct self tools — mutate", () => {
       const payloadArgs = approval?.payload.args as Record<string, unknown> | undefined;
       expect(payloadArgs?.provider).toBe("echo");
     }
+  });
+
+  test("set_approval_mode auto-resolves in auto mode and lands the side effect on config", async () => {
+    const instance = `self-approval-auto-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "set_approval_mode",
+      "call_1",
+      JSON.stringify({ mode: "yolo" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as { ok: boolean; approvalMode?: string };
+      expect(parsed.ok).toBe(true);
+      expect(parsed.approvalMode).toBe("yolo");
+    }
+    // updateAutoApproveSettings mutates the live config object in-process.
+    expect(config.approvalMode).toBe("yolo");
+  });
+
+  test("set_approval_mode rejects an invalid mode without throwing", async () => {
+    const instance = `self-approval-bad-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "set_approval_mode",
+      "call_1",
+      JSON.stringify({ mode: "nope" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as { ok: boolean };
+      expect(parsed.ok).toBe(false);
+    }
+    // The bad call left the config's mode untouched.
+    expect(config.approvalMode).toBe("auto");
   });
 });

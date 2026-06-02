@@ -1408,6 +1408,24 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         required: ["name"]
       }
     }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Set approval mode",
+    deferred: true,
+    indexSummary: "Set the runtime approval mode (strict / auto / yolo).",
+    type: "function",
+    function: {
+      name: "set_approval_mode",
+      description: "Set the runtime approval mode: strict (gate every high-risk action), auto (auto-approve safe actions, gate dangerous shell), or yolo (skip the per-action gate). Use when the user says 'set permissions to yolo' or 'stop asking me to approve'. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          mode: { type: "string", enum: ["strict", "auto", "yolo"], description: "strict | auto | yolo." }
+        },
+        required: ["mode"]
+      }
+    }
   }
 ];
 
@@ -1561,15 +1579,16 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // prompt regardless of toolset state, so always-on here is safe.
     if (tool.function.name === "edit_soul") return true;
     if (tool.function.name === "edit_user_profile") return true;
-    // Self-knowledge surface. The 9 self-config / introspection tools
-    // (get_self, list_*, set_provider, use_agent, create_agent) are direct
-    // deferred tools on the "self" toolset, which is not a legacy default;
+    // Self-knowledge surface. The self-config / introspection tools
+    // (get_self, list_*, set_provider, use_agent, create_agent,
+    // set_approval_mode) are direct deferred tools on the "self" toolset,
+    // which is not a legacy default;
     // gating on enable would mean a fresh instance couldn't answer "what
     // model are you using" or "switch to deepseek" — the exact asks the
     // surface exists for. They pass gating here; deferral (applied later by
     // applyDeferralFilter) is what keeps them out of the live tools array
-    // until the model loads them. Query tools are read-only; the three
-    // mutate tools gate via the self.config approval branch in dispatch.
+    // until the model loads them. Query tools are read-only; the mutate
+    // tools gate via the self.config approval branch in dispatch.
     if (tool.toolset === "self") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
@@ -1896,6 +1915,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.agentId));
     case "create_agent":
       return truncatePreview(previewValue(safe.name));
+    case "set_approval_mode":
+      return truncatePreview(previewValue(safe.mode));
     default: {
       // Generic fallback: key=value, ... for the first few entries.
       // Keeps unmapped or future tools from emitting an empty preview.
