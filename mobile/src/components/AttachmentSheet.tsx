@@ -1,3 +1,4 @@
+import { Feather } from "@expo/vector-icons";
 import { useEffect, useRef, useState } from "react";
 import {
   Animated,
@@ -11,11 +12,10 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { family, theme } from "@/src/theme";
 
-// Bottom-docked action sheet built on <Modal> + the legacy Animated API,
-// mirroring the agent-drawer pattern in app/agents.tsx. iOS native callers
-// should prefer ActionSheetIOS; this is the cross-surface fallback (RN Web,
-// Android) so the menu slides up from the bottom instead of rendering as a
-// centered Alert card.
+// "Attachments" bottom sheet built on <Modal> + the legacy Animated API,
+// matching the Pencil "Add to Chat" design (grabber, header with close +
+// title, source tiles). Renders on all platforms — the source tiles below
+// the header host Camera / Photos.
 
 // react-native-web warns when useNativeDriver is true (no native animated
 // module on web), so opt out there while keeping the native driver on device.
@@ -49,23 +49,22 @@ function startEntrance(
   return anim;
 }
 
-export interface ActionSheetOption {
+export interface AttachmentSource {
+  key: string;
   label: string;
+  icon: React.ComponentProps<typeof Feather>["name"];
   onPress: () => void;
-  destructive?: boolean;
 }
 
-export function ActionSheet({
+export function AttachmentSheet({
   visible,
-  title,
-  options,
-  cancelLabel = "Cancel",
+  title = "Attachments",
+  sources,
   onClose
 }: {
   visible: boolean;
   title?: string;
-  options: ActionSheetOption[];
-  cancelLabel?: string;
+  sources: AttachmentSource[];
   onClose: () => void;
 }) {
   // Read insets from context rather than wrapping in <SafeAreaView>: the
@@ -158,7 +157,7 @@ export function ActionSheet({
           style={StyleSheet.absoluteFill}
           onPress={onClose}
           accessibilityRole="button"
-          accessibilityLabel="Dismiss menu"
+          accessibilityLabel="Dismiss attachments"
         >
           <Animated.View style={[styles.backdrop, { opacity }]} />
         </Pressable>
@@ -177,50 +176,43 @@ export function ActionSheet({
           style={[
             styles.sheet,
             {
-              paddingBottom: insets.bottom + 8,
+              paddingBottom: insets.bottom + 20,
               transform: [{ translateY }]
             }
           ]}
         >
-          <View style={styles.optionGroup}>
-            {title ? (
-              <View style={styles.titleRow}>
-                <Text style={styles.titleText}>{title}</Text>
-              </View>
-            ) : null}
-            {options.map((option, index) => (
+          <View style={styles.grabberRow}>
+            <View style={styles.grabber} />
+          </View>
+          <View style={styles.header}>
+            <Pressable
+              onPress={onClose}
+              style={styles.closeButton}
+              accessibilityRole="button"
+              accessibilityLabel="Close"
+            >
+              <Feather name="x" size={18} color={theme.text} />
+            </Pressable>
+            <Text style={styles.title}>{title}</Text>
+            <View style={styles.headerSpacer} />
+          </View>
+          <View style={styles.sourceRow}>
+            {sources.map((source) => (
               <Pressable
-                key={option.label}
+                key={source.key}
                 onPress={() => {
                   onClose();
-                  option.onPress();
+                  source.onPress();
                 }}
-                style={({ pressed }) => [
-                  styles.optionRow,
-                  index > 0 && styles.optionDivider,
-                  pressed && styles.pressed
-                ]}
+                style={({ pressed }) => [styles.tile, pressed && { opacity: 0.6 }]}
                 accessibilityRole="button"
+                accessibilityLabel={source.label}
               >
-                <Text
-                  style={[
-                    styles.optionLabel,
-                    option.destructive && styles.destructiveLabel
-                  ]}
-                >
-                  {option.label}
-                </Text>
+                <Feather name={source.icon} size={26} color={theme.text} />
+                <Text style={styles.tileLabel}>{source.label}</Text>
               </Pressable>
             ))}
           </View>
-          <Pressable
-            onPress={onClose}
-            style={({ pressed }) => [styles.cancelGroup, pressed && styles.pressed]}
-            accessibilityRole="button"
-            accessibilityLabel={cancelLabel}
-          >
-            <Text style={styles.cancelLabel}>{cancelLabel}</Text>
-          </Pressable>
         </Animated.View>
       </View>
     </Modal>
@@ -229,44 +221,57 @@ export function ActionSheet({
 
 const styles = StyleSheet.create({
   root: { flex: 1, justifyContent: "flex-end" },
-  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.4)" },
-  sheet: { paddingHorizontal: 8 },
-  optionGroup: {
+  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)" },
+  sheet: {
     backgroundColor: theme.bg,
-    borderRadius: 14,
-    overflow: "hidden"
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    borderTopWidth: 1,
+    borderTopColor: theme.border,
+    paddingHorizontal: 20,
+    paddingTop: 10
   },
-  titleRow: {
+  grabberRow: { height: 14, alignItems: "center", justifyContent: "center" },
+  grabber: {
+    width: 40,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: theme.borderStrong
+  },
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingTop: 6,
+    paddingBottom: 18
+  },
+  closeButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
     alignItems: "center",
     justifyContent: "center",
-    paddingVertical: 14,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: theme.border
+    backgroundColor: theme.bgDrawer
   },
-  titleText: { color: theme.muted, fontSize: 13 },
-  optionRow: { height: 57, alignItems: "center", justifyContent: "center" },
-  optionDivider: {
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: theme.border
+  title: {
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 17,
+    color: theme.text
   },
-  optionLabel: {
-    fontSize: 20,
-    fontFamily: family("HankenGrotesk", 500),
-    color: theme.accent
-  },
-  destructiveLabel: { color: theme.danger },
-  cancelGroup: {
-    marginTop: 8,
-    height: 57,
+  headerSpacer: { width: 32, height: 32 },
+  sourceRow: { flexDirection: "row", gap: 12 },
+  tile: {
+    flex: 1,
+    height: 96,
+    borderRadius: 18,
+    backgroundColor: theme.bgDrawer,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: theme.bg,
-    borderRadius: 14
+    gap: 10
   },
-  cancelLabel: {
-    fontSize: 20,
+  tileLabel: {
     fontFamily: family("HankenGrotesk", 600),
-    color: theme.accent
-  },
-  pressed: { backgroundColor: "rgba(0,0,0,0.06)" }
+    fontSize: 15,
+    color: theme.text
+  }
 });

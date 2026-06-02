@@ -4,7 +4,6 @@ import * as ImagePicker from "expo-image-picker";
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  ActionSheetIOS,
   ActivityIndicator,
   Alert,
   Image,
@@ -20,7 +19,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError, uploadImage, type UploadRef } from "@/src/api";
-import { ActionSheet } from "@/src/components/ActionSheet";
+import { AttachmentSheet } from "@/src/components/AttachmentSheet";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
@@ -384,20 +383,7 @@ export default function ChatDetailScreen() {
   };
 
   const openAttachmentMenu = (): void => {
-    if (Platform.OS === "ios") {
-      ActionSheetIOS.showActionSheetWithOptions(
-        {
-          options: ["Cancel", "Take Photo", "Choose From Library"],
-          cancelButtonIndex: 0
-        },
-        (index) => {
-          if (index === 1) void takePhoto();
-          else if (index === 2) void pickFromLibrary();
-        }
-      );
-    } else {
-      setAttachMenuVisible(true);
-    }
+    setAttachMenuVisible(true);
   };
 
   const removeImage = (localId: string): void => {
@@ -581,12 +567,11 @@ export default function ChatDetailScreen() {
           </View>
         </View>
       </KeyboardAvoidingView>
-      <ActionSheet
+      <AttachmentSheet
         visible={attachMenuVisible}
-        title="Attach photo"
-        options={[
-          { label: "Take Photo", onPress: () => void takePhoto() },
-          { label: "Choose From Library", onPress: () => void pickFromLibrary() }
+        sources={[
+          { key: "camera", label: "Camera", icon: "camera", onPress: () => void takePhoto() },
+          { key: "photos", label: "Photos", icon: "image", onPress: () => void pickFromLibrary() }
         ]}
         onClose={() => setAttachMenuVisible(false)}
       />
