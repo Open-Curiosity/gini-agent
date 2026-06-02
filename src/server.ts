@@ -1,5 +1,5 @@
 import { writeFileSync } from "node:fs";
-import { createHandler, proxyWebSocketUpgrade, webSocketProxyHandler, writePid } from "./http";
+import { createHandler, isWebProxyPath, proxyWebSocketUpgrade, webSocketProxyHandler, writePid } from "./http";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
@@ -159,8 +159,11 @@ const server = Bun.serve({
   fetch(request, server) {
     // WebSocket upgrades (e.g. Next.js HMR at /_next/webpack-hmr) can't ride
     // through the HTTP handler's fetch()/Response model, so bridge them
-    // socket-to-socket to the web server. Everything else is normal HTTP.
-    if ((request.headers.get("upgrade") ?? "").toLowerCase() === "websocket") {
+    // socket-to-socket to the web server — but ONLY for web-bound paths, the
+    // same split the HTTP router uses. An upgrade aimed at the gateway's own
+    // /api surface (which has no WS endpoints) falls through to normal HTTP.
+    if ((request.headers.get("upgrade") ?? "").toLowerCase() === "websocket"
+        && isWebProxyPath(new URL(request.url).pathname)) {
       return proxyWebSocketUpgrade(request, server, config);
     }
     return httpHandler(request);

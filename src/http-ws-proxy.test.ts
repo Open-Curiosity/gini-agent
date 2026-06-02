@@ -1,7 +1,7 @@
 import { describe, expect, test, beforeEach } from "bun:test";
 import { rmSync } from "node:fs";
 import type { Server } from "bun";
-import { proxyWebSocketUpgrade, webSocketProxyHandler } from "./http";
+import { isWebProxyPath, proxyWebSocketUpgrade, webSocketProxyHandler } from "./http";
 import { clearWebTargetCache } from "./web-target";
 import type { RuntimeConfig } from "./types";
 
@@ -45,6 +45,16 @@ function fakeUpstream() {
     close() { closed = true; }
   };
 }
+
+describe("isWebProxyPath", () => {
+  test("web-bound paths (non-/api and /api/runtime/*) are proxied; native /api is not", () => {
+    expect(isWebProxyPath("/")).toBe(true);
+    expect(isWebProxyPath("/_next/webpack-hmr")).toBe(true);
+    expect(isWebProxyPath("/api/runtime/chat/x/stream")).toBe(true);
+    expect(isWebProxyPath("/api/status")).toBe(false);
+    expect(isWebProxyPath("/api/events/stream")).toBe(false);
+  });
+});
 
 describe("proxyWebSocketUpgrade", () => {
   beforeEach(() => clearWebTargetCache());

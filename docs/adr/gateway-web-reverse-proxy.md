@@ -68,13 +68,28 @@ bearer-injecting BFF calls to a foreign instance.
   bff-trust-boundary.md).
 - `src/http.ts` no longer imports from `src/cli/*`; web-port discovery lives in
   the runtime-safe `src/web-target.ts`.
+- The healthz-validated port is cached briefly (`ttlMs`, default 5s) to keep the
+  probe off the per-request hot path. This leaves a bounded window in which a
+  port that dies and is immediately reused by another process could be trusted;
+  it is an accepted tradeoff (per-request healthz would tax every asset fetch)
+  and is narrowed by `redirect: "manual"` on the probe (a foreign squatter
+  can't redirect its way to validation) and by dropping the cache entry on any
+  upstream fetch failure.
+- WebSocket upgrades are bridged only for web-bound paths (`isWebProxyPath`),
+  the same split the HTTP router uses, so an upgrade aimed at the gateway's
+  native `/api` surface is not proxied. Upstream close codes are normalized
+  before being forwarded to the browser socket (reserved codes like 1006 throw
+  if passed to `close()`).
 
 ## Acceptance Checks
 
-- `GET /` (browser `Accept`) through the gateway returns the proxied Next.js
-  HTML; a JSON client / web-down returns the `gini-runtime` banner.
+- `GET /` through the gateway returns the proxied Next.js HTML when web is up
+  (regardless of `Accept` — there is no content negotiation); when web is down
+  it returns the `gini-runtime` banner.
 - `GET /api/status` (no bearer) returns 401; `GET /api/runtime/status` is NOT
-  bearer-gated by the gateway (routes to the proxy / BFF).
+  bearer-gated by the gateway (routes to the proxy / BFF). When web is
+  unreachable, API-shaped proxy paths return 502, while page/asset paths return
+  the banner.
 - A chat turn driven through the gateway origin (`/api/runtime/chat/*`) reaches
   the BFF, injects the token, and returns the assistant reply.
 - HMR: editing a `web/` source file hot-updates a page loaded through the

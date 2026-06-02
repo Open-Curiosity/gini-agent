@@ -1458,13 +1458,17 @@ function corsOriginFor(request: Request): string | undefined {
   return allowedOrigins().includes(origin) ? origin : undefined;
 }
 
-// Reverse-proxy non-native traffic (the web UI, its assets, and the Next BFF
-// namespace) to the live Next.js server on loopback. When no web port is
-// recorded (web down, or a --no-web instance) we self-describe with the
-// runtime banner instead of failing — the banner's natural home is exactly the
-// case where the UI isn't there to serve.
-// The runtime self-describe banner. Served on any proxy-bound path when the
-// web server isn't reachable — the natural home for "the UI isn't here."
+// A path is web-bound — reverse-proxied to Next.js (UI, assets, the
+// /api/runtime BFF namespace, HMR) — when it is NOT part of the gateway's own
+// native /api surface. Shared by the HTTP fall-through and the WS upgrade so
+// the two routings can't drift.
+export function isWebProxyPath(pathname: string): boolean {
+  return !pathname.startsWith("/api/") || pathname.startsWith("/api/runtime/");
+}
+
+// The runtime self-describe banner — served on a web PAGE path when the web
+// server isn't reachable (web down, or a --no-web instance). The banner's
+// natural home is exactly the case where the UI isn't there to serve.
 function runtimeBanner(request: Request, config: RuntimeConfig): Response {
   return withCors(request, json({
     name: "gini-runtime",
@@ -1475,9 +1479,20 @@ function runtimeBanner(request: Request, config: RuntimeConfig): Response {
   }));
 }
 
+// Fallback when the web upstream can't be reached. API-shaped paths (the
+// /api/runtime BFF namespace) get a 502 so a programmatic caller sees a clear
+// failure rather than a 200 banner it might parse as success; page/asset paths
+// get the self-describe banner.
+function proxyFallback(request: Request, url: URL, config: RuntimeConfig): Response {
+  if (url.pathname.startsWith("/api/")) {
+    return withCors(request, json({ error: "Web UI not running" }, 502));
+  }
+  return runtimeBanner(request, config);
+}
+
 async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Promise<Response> {
   const port = await resolveWebPort(config);
-  if (port === null) return runtimeBanner(request, config);
+  if (port === null) return proxyFallback(request, url, config);
   const target = `http://127.0.0.1:${port}${url.pathname}${url.search}`;
   // decompress: false tells Bun not to auto-decompress the upstream response.
   // That keeps Content-Encoding and Content-Length consistent so the browser
@@ -1496,10 +1511,17 @@ async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Prom
   } catch {
     // The port validated but the upstream died inside the validation-cache
     // window (web restart/crash). Drop the stale entry so the next request
-    // re-validates, and self-describe instead of surfacing a generic 500.
+    // re-validates, and fall back instead of surfacing a generic 500.
     clearWebTargetCache(config.instance);
-    return runtimeBanner(request, config);
+    return proxyFallback(request, url, config);
   }
+}
+
+// WebSocket close codes that close() accepts: 1000, or the 3000-4999
+// application range. Upstream may report reserved codes (1005/1006/1015) that
+// throw if forwarded; normalize anything else to 1011 (internal error).
+function safeCloseCode(code?: number): number {
+  return code === 1000 || (typeof code === "number" && code >= 3000 && code <= 4999) ? code : 1011;
 }
 
 // Per-connection state for a proxied WebSocket. Frames are normalized to
@@ -1553,11 +1575,13 @@ export async function proxyWebSocketUpgrade(request: Request, server: Server<WsP
   // client socket opens (e.g. a refused dial during a web restart) would
   // otherwise leave the client half-open with frames buffered forever. If the
   // client is already up we close it now; if not, open() reads upstreamClosed.
-  const onUpstreamDown = (code?: number, reason?: string) => {
+  const onUpstreamDown = (code?: number) => {
     data.upstreamClosed = true;
-    if (data.client) { try { data.client.close(code || 1000, reason); } catch { /* already closed */ } }
+    // Normalize the code (reserved codes like 1006 throw) and omit the reason
+    // (an over-long upstream reason would also throw on close()).
+    if (data.client) { try { data.client.close(safeCloseCode(code)); } catch { /* already closed */ } }
   };
-  upstream.addEventListener("close", (event) => onUpstreamDown(event.code, event.reason));
+  upstream.addEventListener("close", (event) => onUpstreamDown(event.code));
   upstream.addEventListener("error", () => onUpstreamDown());
   if (!server.upgrade(request, { data })) {
     upstream.close();

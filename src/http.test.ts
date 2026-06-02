@@ -677,11 +677,13 @@ describe("runtime api", () => {
     expect(native.status).toBe(401);
 
     // The BFF namespace is carved out of the gate; with web down it falls
-    // through to the proxy's banner (200), NOT a 401.
+    // through to the proxy. An API-shaped path gets a 502 (not the 401 it
+    // would get if it had hit the bearer gate, and not a 200 banner a caller
+    // could mistake for success).
     const bff = await handler(new Request(`http://127.0.0.1:${config.port}/api/runtime/status`));
-    expect(bff.status).toBe(200);
-    const body = (await bff.json()) as { name?: string };
-    expect(body.name).toBe("gini-runtime");
+    expect(bff.status).toBe(502);
+    const body = (await bff.json()) as { error?: string };
+    expect(String(body.error)).toContain("Web UI not running");
   });
 
   test("non-/api paths proxy to the web server (banner fallback when web is down)", async () => {
