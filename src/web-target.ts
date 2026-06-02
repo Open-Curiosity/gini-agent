@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import type { RuntimeConfig } from "./types";
 import { webPortPath } from "./paths";
 
@@ -6,11 +6,18 @@ import { webPortPath } from "./paths";
 // server. Deliberately NOT imported from src/cli/process: that module binds a
 // loopback socket and spawns subprocesses at import time, which the always-on
 // gateway must not pull in. This is a pure file read of the per-instance
-// web.port file (written by the CLI when it launches the web server).
+// web.port file (written by the CLI when it launches the web server). The read
+// is fault-tolerant: a missing file (web down) OR a file deleted between a
+// stat and the read (a concurrent `gini stop`/restart) both yield null rather
+// than throwing past the caller's fallback.
 export function recordedWebPort(config: RuntimeConfig): number | null {
-  const path = webPortPath(config.instance);
-  if (!existsSync(path)) return null;
-  const value = Number(readFileSync(path, "utf8").trim());
+  let raw: string;
+  try {
+    raw = readFileSync(webPortPath(config.instance), "utf8");
+  } catch {
+    return null;
+  }
+  const value = Number(raw.trim());
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
@@ -53,7 +60,12 @@ export async function resolveWebPort(config: RuntimeConfig, deps: WebTargetDeps 
   if (cached && cached.port === port && cached.validUntil > now()) return port;
   try {
     const res = await fetchImpl(`http://127.0.0.1:${port}/api/runtime/__healthz`, {
-      signal: AbortSignal.timeout(2000)
+      signal: AbortSignal.timeout(2000),
+      // Never follow redirects: a foreign listener squatting on a reused port
+      // could 3xx the probe to the real gini-web healthz and pass validation
+      // while still serving proxied traffic itself. A 3xx is not `ok`, so the
+      // check below rejects it.
+      redirect: "manual"
     });
     if (!res.ok) {
       validationCache.delete(config.instance);

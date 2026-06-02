@@ -650,7 +650,7 @@ describe("runtime api", () => {
     expect(String(errorBody.error)).toContain("slack");
   });
 
-  test("returns a JSON pointer at GET / instead of static HTML", async () => {
+  test("GET / returns the runtime banner when the web server is not running", async () => {
     const config = testConfig("root-pointer");
     const handler = createHandler(config);
 

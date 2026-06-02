@@ -85,7 +85,7 @@ import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
 import { projectRoot } from "./paths";
-import { resolveWebPort } from "./web-target";
+import { clearWebTargetCache, resolveWebPort } from "./web-target";
 import type { Server, ServerWebSocket } from "bun";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
@@ -1463,17 +1463,21 @@ function corsOriginFor(request: Request): string | undefined {
 // recorded (web down, or a --no-web instance) we self-describe with the
 // runtime banner instead of failing — the banner's natural home is exactly the
 // case where the UI isn't there to serve.
+// The runtime self-describe banner. Served on any proxy-bound path when the
+// web server isn't reachable — the natural home for "the UI isn't here."
+function runtimeBanner(request: Request, config: RuntimeConfig): Response {
+  return withCors(request, json({
+    name: "gini-runtime",
+    instance: config.instance,
+    port: config.port,
+    message: "Gini runtime API. The Next.js control plane runs on a separate port; see `gini status`.",
+    ui_url_hint: process.env.GINI_WEB_URL ?? null
+  }));
+}
+
 async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Promise<Response> {
   const port = await resolveWebPort(config);
-  if (port === null) {
-    return withCors(request, json({
-      name: "gini-runtime",
-      instance: config.instance,
-      port: config.port,
-      message: "Gini runtime API. The Next.js control plane runs on a separate port; see `gini status`.",
-      ui_url_hint: process.env.GINI_WEB_URL ?? null
-    }));
-  }
+  if (port === null) return runtimeBanner(request, config);
   const target = `http://127.0.0.1:${port}${url.pathname}${url.search}`;
   // decompress: false tells Bun not to auto-decompress the upstream response.
   // That keeps Content-Encoding and Content-Length consistent so the browser
@@ -1487,7 +1491,15 @@ async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Prom
   };
   if (request.signal) init.signal = request.signal;
   if (request.method !== "GET" && request.method !== "HEAD") init.body = request.body;
-  return fetch(target, init);
+  try {
+    return await fetch(target, init);
+  } catch {
+    // The port validated but the upstream died inside the validation-cache
+    // window (web restart/crash). Drop the stale entry so the next request
+    // re-validates, and self-describe instead of surfacing a generic 500.
+    clearWebTargetCache(config.instance);
+    return runtimeBanner(request, config);
+  }
 }
 
 // Per-connection state for a proxied WebSocket. Frames are normalized to

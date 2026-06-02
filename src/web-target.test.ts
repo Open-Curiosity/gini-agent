@@ -111,6 +111,20 @@ describe("resolveWebPort", () => {
     expect(await resolveWebPort(c, { fetch: h.fn })).toBeNull();
   });
 
+  test("returns null when healthz answers with a redirect (foreign squatter)", async () => {
+    const c = cfg("p-redirect");
+    writePort("p-redirect", "3097");
+    // A 3xx is not `ok`; resolveWebPort must reject it rather than trust a
+    // body it never sees (redirect: "manual" keeps fetch from following it).
+    let sawManual = false;
+    const fn = (async (_url: string, init?: { redirect?: string }) => {
+      if (init?.redirect === "manual") sawManual = true;
+      return new Response(null, { status: 302, headers: { location: "http://127.0.0.1:9/api/runtime/__healthz" } });
+    }) as unknown as typeof fetch;
+    expect(await resolveWebPort(c, { fetch: fn })).toBeNull();
+    expect(sawManual).toBe(true);
+  });
+
   test("returns null when the healthz request throws", async () => {
     const c = cfg("p-throw");
     writePort("p-throw", "3097");
