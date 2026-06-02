@@ -7,6 +7,7 @@ import {
   ActivityIndicator,
   Alert,
   Image,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -383,6 +384,7 @@ export default function ChatDetailScreen() {
   };
 
   const openAttachmentMenu = (): void => {
+    Keyboard.dismiss();
     setAttachMenuVisible(true);
   };
 
