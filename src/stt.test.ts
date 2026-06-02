@@ -180,7 +180,7 @@ describe("local provider via test seam", () => {
       pipeline: async (task: string, model: string, options?: { dtype?: string }) => {
         expect(task).toBe("automatic-speech-recognition");
         expect(model).toBe(DEFAULT_LOCAL_STT_MODEL);
-        expect(options?.dtype).toBe("q4");
+        expect(options?.dtype).toBe("q8");
         return async (audio: Float32Array) => {
           received = audio;
           return { text: " hello world " };
@@ -269,8 +269,8 @@ describe("sttStatus", () => {
   test("local is ready once both onnx files exist", () => {
     process.env.GINI_LOCAL_STT_MODEL = modelId;
     mkdirSync(onnxDir, { recursive: true });
-    writeFileSync(join(onnxDir, "encoder_model_q4.onnx"), "");
-    writeFileSync(join(onnxDir, "decoder_model_merged_q4.onnx"), "");
+    writeFileSync(join(onnxDir, "encoder_model_quantized.onnx"), "");
+    writeFileSync(join(onnxDir, "decoder_model_merged_quantized.onnx"), "");
     expect(sttStatus().ready).toBe(true);
   });
 
@@ -292,7 +292,7 @@ describe("sttStatus", () => {
   test("requires both encoder and decoder files", () => {
     process.env.GINI_LOCAL_STT_MODEL = modelId;
     mkdirSync(onnxDir, { recursive: true });
-    writeFileSync(join(onnxDir, "encoder_model_q4.onnx"), "");
+    writeFileSync(join(onnxDir, "encoder_model_quantized.onnx"), "");
     expect(sttStatus().ready).toBe(false);
   });
 });

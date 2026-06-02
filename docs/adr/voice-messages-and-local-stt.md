@@ -15,14 +15,26 @@ artifact, not model input.
 
 Transcription is a new local-model capability that mirrors the
 embeddings/reranker pattern (`src/stt.ts`): in-process Transformers.js
-running `onnx-community/whisper-large-v3-turbo`, lazy-loaded on first
-use, cached under the shared `~/.gini/models` dir. Selection is
+running `onnx-community/whisper-small` at `q8` by default, lazy-loaded on
+first use, cached under the shared `~/.gini/models` dir. Selection is
 env-driven (`GINI_STT_PROVIDER` = `local` | `echo`, default `local`;
 `GINI_LOCAL_STT_MODEL`, `GINI_STT_DTYPE`). The `echo` provider is
 **test-only** and selected solely by explicit opt-in — a local load
 failure surfaces as a thrown error (which the chat path turns into a
 user-facing "couldn't transcribe" message), never a fabricated
 transcript.
+
+The default is the **small** model, not large-v3-turbo, because voice
+messages are short clips. Whisper always encodes a fixed 30-second
+window, so the **encoder** size — not the decoder — sets the latency;
+"turbo" only prunes the decoder, which speeds up long-audio decoding a
+short message never needs. On CPU, `whisper-small` transcribes a ~5s
+clip in ~1.5s (vs ~14s for large-v3-turbo) at a ~237 MB download. For
+small models CPU beats the WebGPU/CoreML execution providers (GPU
+dispatch overhead dominates), so no GPU plumbing is used. Operators who
+want maximum accuracy on hard audio can set
+`GINI_LOCAL_STT_MODEL=onnx-community/whisper-large-v3-turbo` with
+`GINI_STT_DTYPE=q4`.
 
 ## Context
 
@@ -97,7 +109,7 @@ Pro:
 
 Con:
 
-- The first voice message blocks on a ~700 MB model download + load
+- The first voice message blocks on a ~237 MB model download + load
   (synchronous on submit). The client shows a one-time "setting up"
   notice via `/api/stt/status` and a transcribing indicator, but the
   first turn is slow.
@@ -119,6 +131,6 @@ Con:
   the audio attachment, and the post-transcription session re-check.
 - Live-gateway verification: a recorded 16 kHz WAV uploaded to
   `/api/uploads`, posted to `/api/chat/:id/messages` with empty content,
-  is transcribed by local whisper-turbo into the message content and the
+  is transcribed by the local whisper model into the message content and the
   `user_text` block carries the `audio` attachment, while the task input
   is transcript-only (no audio reaches the provider).

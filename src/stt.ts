@@ -4,11 +4,17 @@
 //
 // Two implementations:
 //   - local: in-process Transformers.js automatic-speech-recognition
-//            pipeline running onnx-community/whisper-large-v3-turbo (this IS
-//            whisper turbo). Pure JS + native onnxruntime; no external
-//            service, no ffmpeg. Lazy-imports `@huggingface/transformers`
-//            only on first use so the native-binding + model download cost
-//            is paid only when someone actually records a voice message.
+//            pipeline running onnx-community/whisper-small at q8 by default.
+//            small (not turbo/large) because voice messages are short clips:
+//            whisper always encodes a fixed 30s window, so the encoder size —
+//            not the decoder — sets the latency. small transcribes a short
+//            clip in ~1.5s on CPU (~30x faster than large-v3-turbo) at ~237MB.
+//            Override the model/dtype with GINI_LOCAL_STT_MODEL / GINI_STT_DTYPE
+//            (e.g. onnx-community/whisper-large-v3-turbo + q4 for max accuracy).
+//            Pure JS + native onnxruntime; no external service, no ffmpeg.
+//            Lazy-imports `@huggingface/transformers` only on first use so the
+//            native-binding + model download cost is paid only when someone
+//            actually records a voice message.
 //   - echo:  deterministic stub. transcribe() always returns "[voice
 //            message]" — for tests + offline dev so the chat path works
 //            without downloading whisper. Test-only: never a production
@@ -28,9 +34,11 @@ import { mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-// Default local model — onnx-community/whisper-large-v3-turbo. This is the
-// whisper-turbo build the feature targets. Override with GINI_LOCAL_STT_MODEL.
-export const DEFAULT_LOCAL_STT_MODEL = "onnx-community/whisper-large-v3-turbo";
+// Default local model — onnx-community/whisper-small. Small keeps short-clip
+// transcription fast (~1.5s on CPU) since whisper's fixed 30s-window encoder
+// dominates latency; large-v3-turbo only speeds up long-audio decoding, which
+// a voice message doesn't need. Override with GINI_LOCAL_STT_MODEL.
+export const DEFAULT_LOCAL_STT_MODEL = "onnx-community/whisper-small";
 
 export interface SttProvider {
   name: string;
@@ -62,7 +70,7 @@ function localModelId(): string {
 
 function localDtype(): string {
   const override = process.env.GINI_STT_DTYPE;
-  return override && override.length > 0 ? override : "q4";
+  return override && override.length > 0 ? override : "q8";
 }
 
 // Pure-data view of the configured STT choice. Doesn't trigger a model
@@ -110,7 +118,7 @@ const DTYPE_FILE_SUFFIX: Record<string, string> = {
 
 // Whether the local model's onnx weights for the ACTIVE dtype are already on
 // disk, so the first voice message can be transcribed without the one-time
-// ~727MB download. The onnx-community build stores the encoder + merged decoder
+// model download. The onnx-community build stores the encoder + merged decoder
 // under <cacheDir>/<modelId>/onnx with a dtype-specific suffix (q4 → _q4, q8 →
 // _quantized, fp32 → "", ...). The check keys off the configured dtype so a
 // dtype the loader will fetch but hasn't cached reports not-ready (rather than
