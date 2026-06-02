@@ -156,7 +156,14 @@ const SELF_TOOLS = [
   "delete_agent",
   "remove_provider",
   "set_auto_approve_commands",
-  "set_dangerous_patterns"
+  "set_dangerous_patterns",
+  "add_mcp_server",
+  "remove_mcp_server",
+  "remove_connector",
+  "rotate_connector",
+  "update_self",
+  "rollback_skill",
+  "test_skill"
 ];
 
 describe("buildToolCatalog", () => {

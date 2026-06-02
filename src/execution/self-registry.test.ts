@@ -47,8 +47,8 @@ async function newTask(config: RuntimeConfig): Promise<string> {
 }
 
 describe("self operation registry", () => {
-  test("SELF_OPERATIONS carries the 17 expected ops with name, summary, tag, handler", () => {
-    expect(SELF_OPERATIONS.length).toBe(17);
+  test("SELF_OPERATIONS carries the 24 expected ops with name, summary, tag, handler", () => {
+    expect(SELF_OPERATIONS.length).toBe(24);
     for (const op of SELF_OPERATIONS) {
       expect(typeof op.name).toBe("string");
       expect(op.name.length).toBeGreaterThan(0);
@@ -59,6 +59,7 @@ describe("self operation registry", () => {
     }
     const names = SELF_OPERATIONS.map((op) => op.name).sort();
     expect(names).toEqual([
+      "add_mcp_server",
       "create_agent",
       "delete_agent",
       "disable_toolset",
@@ -70,11 +71,17 @@ describe("self operation registry", () => {
       "list_providers",
       "list_skills",
       "list_toolsets",
+      "remove_connector",
+      "remove_mcp_server",
       "remove_provider",
+      "rollback_skill",
+      "rotate_connector",
       "set_approval_mode",
       "set_auto_approve_commands",
       "set_dangerous_patterns",
       "set_provider",
+      "test_skill",
+      "update_self",
       "use_agent"
     ]);
   });
@@ -89,18 +96,25 @@ describe("self operation registry", () => {
       "list_mcp_servers",
       "list_providers",
       "list_skills",
-      "list_toolsets"
+      "list_toolsets",
+      "test_skill"
     ]);
     expect(mutates).toEqual([
+      "add_mcp_server",
       "create_agent",
       "delete_agent",
       "disable_toolset",
       "enable_toolset",
+      "remove_connector",
+      "remove_mcp_server",
       "remove_provider",
+      "rollback_skill",
+      "rotate_connector",
       "set_approval_mode",
       "set_auto_approve_commands",
       "set_dangerous_patterns",
       "set_provider",
+      "update_self",
       "use_agent"
     ]);
   });
@@ -145,6 +159,24 @@ describe("direct self tools — query", () => {
       const parsed = JSON.parse(result.result) as { ok: boolean; toolsets: unknown[] };
       expect(parsed.ok).toBe(true);
       expect(Array.isArray(parsed.toolsets)).toBe(true);
+    }
+  });
+
+  test("test_skill is a query and reports a missing skill as {ok:false} without throwing", async () => {
+    const instance = `self-testskill-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "test_skill",
+      "call_1",
+      JSON.stringify({ skillId: "does_not_exist" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as { ok: boolean };
+      expect(parsed.ok).toBe(false);
     }
   });
 
