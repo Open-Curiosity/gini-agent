@@ -9,9 +9,9 @@ export interface CanonicalizeResult {
    *  had one; collapses multiple trailing slashes to one. Bare "/" stays as
    *  "/". */
   path: string;
-  /** True when the canonical path ends in a single trailing slash. The deny
-   *  list treats `/foo` and `/foo/` as equivalent; this flag lets callers
-   *  forward the form the client actually sent without recomputing it. */
+  /** True when the canonical path ends in a single trailing slash, so a
+   *  consumer can preserve the exact form the client sent rather than
+   *  recomputing it. */
   hadTrailingSlash: boolean;
 }
 
