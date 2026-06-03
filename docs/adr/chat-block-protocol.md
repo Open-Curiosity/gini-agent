@@ -240,16 +240,15 @@ remote previews, screen readers) would need the same translation code.
     `POST /api/uploads` gate accepts any plausible MIME (storage was
     already generic), and the stored `mimeType`/`size` are authoritative
     so a client-forged MIME can't steer how the bytes are delivered.
-    Images inline as `image_url` data URLs; **non-image files reach the
-    model by reference**, named in an `Attached files (in order):` text
-    marker (id, filename, mime, size) that the agent reads on demand via
-    the `attachments` skill's `materialize` script. We deliberately do
-    not add provider-native `document` content parts — that is
-    provider-specific, costs per-turn context, and duplicates
-    infrastructure the `attachments` skill already owns. The inline
-    `image_url` path and `vision_query` stay image-only. Served uploads
-    are returned `Content-Disposition: attachment` + `nosniff` so an
-    arbitrary-MIME upload can't execute as a same-origin document. A
+    Images inline as `image_url` data URLs; **non-image files are
+    delivered to the model in core, by provider capability** — a native
+    `document` content part when the provider ingests documents, else
+    inlined extracted text (boundary-wrapped, capped), else a workspace
+    path reference — and are always materialized into the agent's
+    workspace (see [chat-file-attachments.md](chat-file-attachments.md)).
+    The inline `image_url` path and `vision_query` stay image-only. Served
+    uploads are returned `Content-Disposition: attachment` + `nosniff` so
+    an arbitrary-MIME upload can't execute as a same-origin document. A
     voice message's `audio` is
     render-only — it is transcribed on the gateway and only the
     transcript becomes the block text and model input (see
