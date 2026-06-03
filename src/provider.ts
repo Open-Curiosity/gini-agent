@@ -324,7 +324,14 @@ export type ChatMessageRole = "system" | "user" | "assistant" | "tool";
 // auth-gates upload reads and the provider can't authenticate.
 export type MessageContentPart =
   | { type: "text"; text: string }
-  | { type: "image_url"; image_url: { url: string } };
+  | { type: "image_url"; image_url: { url: string } }
+  // Native document part for providers that ingest files directly (PDF →
+  // text + page-images on the provider side). `data` is raw base64 with no
+  // `data:` prefix; serializers re-wrap it into the per-endpoint data-URL
+  // shape. Only ever produced upstream when the resolved provider's
+  // `nativeDocs === true` (see src/provider-capabilities.ts), so it never
+  // reaches echo/deepseek/local; serializers still drop it defensively.
+  | { type: "document"; document: { mimeType: string; data: string; filename?: string } };
 
 export interface ToolCallingMessage {
   role: ChatMessageRole;
@@ -533,11 +540,36 @@ async function callToolCallingChatCompletions(
 
 function serializeChatMessage(message: ToolCallingMessage): Record<string, unknown> {
   // OpenAI chat-completions accepts the wire shape directly. Strip
-  // undefined fields so they don't leak into the JSON body.
-  const out: Record<string, unknown> = { role: message.role, content: message.content };
+  // undefined fields so they don't leak into the JSON body. A content
+  // array carrying `document` parts is the one shape that doesn't map
+  // 1:1 — translate those into the OpenAI/OpenRouter `file` part shape
+  // (text/image_url pass through unchanged).
+  const content = Array.isArray(message.content)
+    ? serializeChatContentParts(message.content)
+    : message.content;
+  const out: Record<string, unknown> = { role: message.role, content };
   if (message.name !== undefined) out.name = message.name;
   if (message.tool_call_id !== undefined) out.tool_call_id = message.tool_call_id;
   if (message.tool_calls !== undefined) out.tool_calls = message.tool_calls;
+  return out;
+}
+
+function serializeChatContentParts(parts: MessageContentPart[]): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (const part of parts) {
+    if (part.type === "document") {
+      out.push({
+        type: "file",
+        file: {
+          filename: part.document.filename,
+          file_data: `data:${part.document.mimeType};base64,${part.document.data}`
+        }
+      });
+      continue;
+    }
+    // text / image_url already match the chat-completions wire shape.
+    out.push(part as unknown as Record<string, unknown>);
+  }
   return out;
 }
 
@@ -767,6 +799,13 @@ function translateMessagesToResponsesInput(messages: ToolCallingMessage[]): Resp
         for (const part of message.content) {
           if (part.type === "text") parts.push({ type: "input_text", text: part.text });
           else if (part.type === "image_url") parts.push({ type: "input_image", image_url: part.image_url.url });
+          else if (part.type === "document") {
+            parts.push({
+              type: "input_file",
+              filename: part.document.filename,
+              file_data: `data:${part.document.mimeType};base64,${part.document.data}`
+            });
+          }
         }
         input.push({ role: "user", content: parts });
         continue;
