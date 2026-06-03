@@ -158,6 +158,76 @@ describe("proxyRequest — upload size cap", () => {
       delete process.env.GINI_MAX_UPLOAD_BYTES;
     }
   });
+
+  test("non-upload POST is not capped (forwards even over the cap)", async () => {
+    process.env.GINI_MAX_UPLOAD_BYTES = "10";
+    try {
+      let forwarded = false;
+      const fetcher = (async () => {
+        forwarded = true;
+        return new Response("{}", { status: 200 });
+      }) as unknown as typeof fetch;
+      const req = new Request("http://127.0.0.1:7777/api/runtime/chat/abc/messages", {
+        method: "POST",
+        headers: {
+          host: "127.0.0.1:7777",
+          origin: "http://127.0.0.1:7777",
+          "content-length": "11",
+          "content-type": "application/json"
+        },
+        body: "this is more than ten bytes"
+      });
+      const res = await proxyRequest(req, ["chat", "abc", "messages"], {
+        runtimeUrl: "http://127.0.0.1:9999",
+        token: "t",
+        fetcher
+      });
+      expect(forwarded).toBe(true);
+      expect(res.status).toBe(200);
+    } finally {
+      delete process.env.GINI_MAX_UPLOAD_BYTES;
+    }
+  });
+
+  test("header-less over-cap upload returns 413 after buffering", async () => {
+    process.env.GINI_MAX_UPLOAD_BYTES = "10";
+    try {
+      let forwarded = false;
+      const fetcher = (async () => {
+        forwarded = true;
+        return new Response("{}", { status: 201 });
+      }) as unknown as typeof fetch;
+      // A streamed body has no content-length, so the early-reject can't catch
+      // it — the post-read buffered-length check must enforce the cap.
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(20).fill(0x41));
+          controller.close();
+        }
+      });
+      const req = new Request("http://127.0.0.1:7777/api/runtime/uploads", {
+        method: "POST",
+        headers: {
+          host: "127.0.0.1:7777",
+          origin: "http://127.0.0.1:7777",
+          "content-type": "application/octet-stream"
+        },
+        body: stream,
+        // @ts-expect-error duplex is required for a stream request body
+        duplex: "half"
+      });
+      expect(req.headers.get("content-length")).toBeNull();
+      const res = await proxyRequest(req, ["uploads"], {
+        runtimeUrl: "http://127.0.0.1:9999",
+        token: "t",
+        fetcher
+      });
+      expect(res.status).toBe(413);
+      expect(forwarded).toBe(false);
+    } finally {
+      delete process.env.GINI_MAX_UPLOAD_BYTES;
+    }
+  });
 });
 
 describe("pickForwardHeaders", () => {
