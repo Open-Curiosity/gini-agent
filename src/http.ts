@@ -1716,7 +1716,21 @@ async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Prom
   if (request.signal) init.signal = request.signal;
   if (request.method !== "GET" && request.method !== "HEAD") init.body = request.body;
   try {
-    return await fetch(target, init);
+    const upstream = await fetch(target, init);
+    // Rewrite an absolute redirect that points back at the loopback web target
+    // into a relative path. The web child builds redirects (e.g. the setup
+    // gate's /setup) from the loopback Host the gateway forwarded, so an
+    // absolute Location would send a remote tunnel browser to its own
+    // 127.0.0.1. A relative Location resolves against the origin the browser
+    // actually used (relay or loopback).
+    const location = upstream.headers.get("location");
+    const loopbackBase = `http://127.0.0.1:${port}`;
+    if (location && location.startsWith(loopbackBase)) {
+      const headers = new Headers(upstream.headers);
+      headers.set("location", location.slice(loopbackBase.length) || "/");
+      return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers });
+    }
+    return upstream;
   } catch {
     // The port validated but the upstream died inside the validation-cache
     // window (web restart/crash). Drop the stale entry so the next request

@@ -127,6 +127,12 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     if (isPageNav && !pathname.startsWith("/setup") && !pathname.startsWith("/api/")) {
       const configured = await isProviderConfigured();
       if (configured === false) {
+        // The gateway rewrites Host to loopback before proxying, so this absolute
+        // redirect resolves to the loopback web port — which would point a remote
+        // tunnel browser at its own 127.0.0.1. The gateway rewrites a loopback
+        // Location back to a relative path on the way out (see src/http.ts
+        // proxyWeb), so the browser resolves /setup against the origin it used
+        // (relay or loopback).
         const setupUrl = new URL("/setup", request.url);
         return applyResponsePolicy(NextResponse.redirect(setupUrl));
       }

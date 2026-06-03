@@ -854,6 +854,41 @@ describe("runtime api", () => {
     }
   });
 
+  // The web child builds redirects from the loopback Host the gateway forwarded,
+  // so an absolute Location points at the loopback web port — which would send a
+  // remote tunnel browser to its own 127.0.0.1. The gateway rewrites it to a
+  // relative path so the browser resolves it against the origin it used.
+  test("proxyWeb rewrites an absolute loopback redirect Location to a relative path", async () => {
+    const config = testConfig("web-proxy-redirect");
+    const handler = createHandler(config);
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const u = new URL(req.url);
+        if (u.pathname === "/api/runtime/__healthz") {
+          return Response.json({ ok: true, service: "gini-web", instance: config.instance });
+        }
+        // Emulate the setup gate building an absolute redirect from its (gateway-
+        // rewritten, loopback) Host.
+        return new Response(null, { status: 307, headers: { location: `http://${req.headers.get("host")}/setup` } });
+      }
+    });
+    try {
+      mkdirSync(dirname(webPortPath(config.instance)), { recursive: true });
+      writeFileSync(webPortPath(config.instance), String(upstream.port));
+      clearWebTargetCache(config.instance);
+      const res = await handler(new Request(`http://127.0.0.1:${config.port}/chat`, {
+        headers: { origin: `http://127.0.0.1:${config.port}` }
+      }));
+      expect(res.status).toBe(307);
+      expect(res.headers.get("location")).toBe("/setup");
+    } finally {
+      await upstream.stop(true);
+      clearWebTargetCache(config.instance);
+    }
+  });
+
   test("preserves full terminal stdout in a trace artifact when audit evidence is truncated", async () => {
     // Master plan §6.2 requires that "outputs are truncated intelligently
     // with full logs stored." The audit `evidence` field caps stdout/stderr
