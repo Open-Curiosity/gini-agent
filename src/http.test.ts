@@ -5,7 +5,9 @@ import { addAudit, appendEvent, mutateState, readState, readTrace, isPlausibleMi
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
 import { listProviders } from "./integrations/connectors/registry";
+import { awaitTunnelSettled, setTunnelDeps, type TunnelChild } from "./integrations/tunnel";
 import type { RuntimeConfig } from "./types";
+import type { LoginHandle, RelayDefaults, Session, Store, TunnelOptions } from "gini-relay";
 
 // Stub a provider's host-environment `detect()` so the connector-detection
 // endpoint test stays deterministic AND fast regardless of what's installed
@@ -348,6 +350,109 @@ describe("runtime api", () => {
     expect(health.status).toBe("degraded");
     expect(notification.status).toBe("queued");
     expect(sent.some((item: { id: string; status: string }) => item.id === notification.id && item.status === "sent")).toBe(true);
+  });
+
+  test("tunnel routes return the full TunnelState across the select/connect/disconnect flow", async () => {
+    const config = testConfig("tunnel-routes");
+    const handler = createHandler(config);
+
+    // Inject fake gini-relay seams so the connect flow exercises the
+    // connecting -> connected transition without OAuth, the host browser, or a
+    // spawned frpc child. Restored in the finally.
+    const session: Session = { token: "gsk_x", subdomain: "subroute", account: "u@test" };
+    const relay: RelayDefaults = {
+      relayUrl: "https://relay.test", frpsAddr: "relay.test", frpsPort: 7000,
+      relayDomain: "relay.test", tlsServerName: "relay.test", frpToken: "t",
+      caFile: "/tmp/ca", loopbackPorts: [8765], bandwidth: "1220KB"
+    };
+    const child: TunnelChild = {
+      start: () => Promise.resolve(),
+      stop: () => Promise.resolve(0),
+      exited: Promise.withResolvers<number>().promise
+    };
+    const store: Store = { home: "/tmp/h", deviceId: () => "d1", readSession: () => session, writeSession: () => {} };
+    const handle: LoginHandle = {
+      url: "https://relay.test/consent", redirectUri: "http://127.0.0.1:8765/cb",
+      waitForSession: () => Promise.resolve(session), cancel: () => {}
+    };
+    setTunnelDeps({
+      loginUrl: () => Promise.resolve(handle),
+      buildTunnel: (_opts: TunnelOptions) => child,
+      createStore: () => store,
+      resolveDefaults: () => relay,
+      openBrowser: () => {},
+      resolveLocalPort: () => 4321,
+      probeLocalPort: () => Promise.resolve(true)
+    });
+
+    try {
+      // GET on a fresh instance: catalog present, nothing selected, idle.
+      const initial = await call(handler, config, "/api/tunnel");
+      expect(initial.status).toBe("idle");
+      expect(initial.selectedProvider).toBeNull();
+      expect(initial.providers.map((p: { id: string }) => p.id)).toEqual([
+        "gini-relay",
+        "tailscale",
+        "ngrok",
+        "cloudflare"
+      ]);
+
+      // select saves the choice without connecting.
+      const selected = await call(handler, config, "/api/tunnel/select", {
+        method: "POST",
+        body: JSON.stringify({ provider: "gini-relay" })
+      });
+      expect(selected.selectedProvider).toBe("gini-relay");
+      expect(selected.status).toBe("idle");
+
+      // connect (no body provider) uses the saved selection; the route returns
+      // "connecting" immediately while the background handshake runs.
+      const connecting = await call(handler, config, "/api/tunnel/connect", {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      expect(connecting.status).toBe("connecting");
+      expect(connecting.url).toBeUndefined();
+
+      // Let the background flow settle, then GET reflects connected + url.
+      await awaitTunnelSettled(config.instance);
+      const connected = await call(handler, config, "/api/tunnel");
+      expect(connected.status).toBe("connected");
+      expect(connected.url).toBe("https://subroute.relay.test");
+
+      // cancel returns to idle keeping the selection.
+      const cancelled = await call(handler, config, "/api/tunnel/cancel", { method: "POST" });
+      expect(cancelled.status).toBe("idle");
+      expect(cancelled.selectedProvider).toBe("gini-relay");
+
+      // connect with an explicit provider in the body overrides selection.
+      const reconnecting = await call(handler, config, "/api/tunnel/connect", {
+        method: "POST",
+        body: JSON.stringify({ provider: "gini-relay" })
+      });
+      expect(reconnecting.status).toBe("connecting");
+      await awaitTunnelSettled(config.instance);
+      expect((await call(handler, config, "/api/tunnel")).status).toBe("connected");
+
+      // disconnect tears down, keeps the selection.
+      const disconnected = await call(handler, config, "/api/tunnel/disconnect", { method: "POST" });
+      expect(disconnected.status).toBe("idle");
+      expect(disconnected.selectedProvider).toBe("gini-relay");
+    } finally {
+      setTunnelDeps();
+    }
+  });
+
+  test("POST /api/tunnel/select rejects a disabled provider with a 400", async () => {
+    const config = testConfig("tunnel-reject");
+    const handler = createHandler(config);
+    const response = await rawCall(handler, config, "/api/tunnel/select", {
+      method: "POST",
+      body: JSON.stringify({ provider: "ngrok" })
+    }, config.token);
+    expect(response.status).toBe(400);
+    const value = await response.json();
+    expect(value.error).toContain("not available");
   });
 
   test("supports V1 skill governance and job run history workflows", async () => {

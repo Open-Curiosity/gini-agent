@@ -65,7 +65,8 @@ export function createEmptyState(instance: Instance): RuntimeState {
     chatMessages: [],
     messagingMessages: [],
     runs: [],
-    planSteps: []
+    planSteps: [],
+    tunnel: null
   };
 }
 
@@ -1300,6 +1301,10 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
       state.browser = null;
     }
   }
+  // Tunnel selection singleton is purely opt-in (see ADR
+  // tunnel-connectivity.md). Backfill null so legacy state files and
+  // hand-edited files alike present a consistent shape to consumers.
+  state.tunnel ??= null;
   expirePairingCodes(state);
   return state;
 }

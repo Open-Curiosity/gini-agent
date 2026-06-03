@@ -17,6 +17,7 @@ import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
 import { createApnsDispatcher } from "./integrations/apns/dispatcher";
 import { fireCacheWarmerProbe } from "./runtime/cache-warmer";
+import { reconcileTunnelOnStartup, stopAllTunnels } from "./integrations/tunnel";
 
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
@@ -74,6 +75,20 @@ setBrowserInstance(config.instance);
       });
   }
 }
+
+// Reconcile the tunnel singleton on startup. A persisted "connected" /
+// "connecting" record describes an frpc child the runtime spawned before it
+// restarted — that child is gone now, so the record is stale and would make
+// GET /api/tunnel falsely read connected. There is never a live tunnel
+// supervisor right after a fresh boot, so reset any non-idle record to
+// "idle" (keeping the selection). Awaited BEFORE Bun.serve binds so the first
+// GET /api/tunnel can't read the stale "connected"; the .catch keeps the
+// never-crash-boot guarantee. See ADR tunnel-connectivity.md.
+await reconcileTunnelOnStartup(config).catch((error) => {
+  appendLog(config.instance, "tunnel.reconcile.error", {
+    error: error instanceof Error ? error.message : String(error)
+  });
+});
 
 // Legacy Hindsight-migration opportunistic seam. The
 // state.memories surface was retired in the memory-surface
@@ -403,7 +418,12 @@ process.on("SIGTERM", async () => {
       // processes exit cleanly with the runtime instead of being reaped
       // by the OS at the very end. Errors are swallowed — a stuck
       // close shouldn't block runtime shutdown.
-      closeBrowserSessions().catch(() => {})
+      closeBrowserSessions().catch(() => {}),
+      // Stop any live frpc tunnel child so it's torn down gracefully (its
+      // relay registration severed) with the runtime instead of left
+      // forwarding to a server that's going down. Errors swallowed — a stuck
+      // stop shouldn't block shutdown; the OS reaps the child on exit.
+      stopAllTunnels().catch(() => {})
     ]),
     Bun.sleep(SCHEDULER_DRAIN_TIMEOUT_MS)
   ]);

@@ -25,6 +25,7 @@ import type {
   SnapshotRecord,
   SubagentRecord,
   Task,
+  TunnelSelectionRecord,
   PlanStepRecord
 } from "../types";
 import { id, now } from "./ids";
@@ -1003,6 +1004,33 @@ export function createRelayRecord(
     { system: true }
   );
   return item;
+}
+
+// Mint (or, on re-entry, the field-default shape for) the tunnel selection
+// singleton. Unlike most create* helpers this does NOT push onto a list —
+// the tunnel is a singleton stored at `state.tunnel`, mirroring
+// `state.browser`. The integration module assigns the returned record to
+// `state.tunnel` inside its mutateState callback. No audit row here; the
+// integration emits action-specific audit rows (select/connect/disconnect)
+// at its side-effecting call sites, matching createRelayRecord's split of
+// "record shape" from "side-effect audit".
+export function createTunnelRecord(
+  state: RuntimeState,
+  tunnel: Omit<TunnelSelectionRecord, "instance" | "createdAt" | "updatedAt">
+): TunnelSelectionRecord {
+  const at = now();
+  // Authoritative metadata is spread LAST so it always wins: callers build
+  // `tunnel` by spreading the prior persisted record (`...state.tunnel`), which
+  // carries its own instance/createdAt/updatedAt — putting those first would let
+  // stale values survive and freeze `updatedAt`. `createdAt` is preserved from
+  // the prior record (or stamped now on first creation); `updatedAt` always
+  // advances to now.
+  return {
+    ...tunnel,
+    instance: state.instance,
+    createdAt: state.tunnel?.createdAt ?? at,
+    updatedAt: at
+  };
 }
 
 export function createNotificationRecord(

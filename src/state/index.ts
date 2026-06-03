@@ -160,6 +160,7 @@ export {
   createImportReport,
   createAgentRecord,
   createRelayRecord,
+  createTunnelRecord,
   createNotificationRecord,
   activateAgent,
   updateConnectorHealth

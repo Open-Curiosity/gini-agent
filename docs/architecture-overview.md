@@ -124,6 +124,7 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
 - `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
+- `/api/tunnel`, `/api/tunnel/select`, `/api/tunnel/connect`, `/api/tunnel/cancel`, `/api/tunnel/disconnect`
 - `/api/audit`, `/api/events`, `/api/events/stream`
 - `/api/parity/hermes`, `/api/readiness/v1`
 
@@ -133,11 +134,10 @@ On macOS a launchd-managed instance is supervised to stay up across crashes, cle
 
 ## Off-LAN Access
 
-Off-LAN access is not built today — the gateway binds to loopback and the web control plane is reached over localhost or a same-network / Tailscale address. The planned surface is a relay: a hosted (and self-hostable) switchboard that splices outbound connections from the gateway and clients and forwards opaque, end-to-end-encrypted bytes it cannot read, with the gateway staying the sole authority for access. See "Not Yet Built" below.
+Off-LAN access is available through the **gini-relay tunnel**. The user picks a tunnel provider and connects (`gini tunnel`, or the web tunnel panel over `/api/tunnel*`); the gateway runs an OAuth-loopback login in a browser on the host, the relay assigns the device a session and a subdomain, and a supervised native `frpc` child exposes the instance's local Next.js web port. The instance is then reachable at `https://<subdomain>.<relayDomain>` (`relayDomain` default `gini-relay.lilaclabs.ai`, overridable via `GINI_RELAY_DOMAIN`). `gini-relay` is the only enabled provider today; `tailscale`, `ngrok`, and `cloudflare` are catalog placeholders surfaced with the prerequisite they require. The app served through the tunnel can call the BFF because the BFF trusts the relay domain's per-device subdomains as a third trust lane. See [Tunnel Connectivity](./adr/tunnel-connectivity.md) and [BFF Trust Boundary](./adr/bff-trust-boundary.md).
 
 ## Not Yet Built
 
-- Production relay for off-LAN access (a hosted, self-hostable switchboard that forwards end-to-end-encrypted bytes; the gateway stays the source of truth and sole authority for access).
 - Push notification delivery.
 
 A basic Expo mobile client lives under `mobile/` — agent picker, per-agent chat list, and chat detail with task polling. It speaks the same `/api/*` contract directly with its own bearer token (no BFF), so it does not change the runtime/source-of-truth model.

@@ -6,14 +6,20 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { guardCsrf, pickForwardHeaders, proxyRequest } from "./runtime";
 
 const originalTrusted = process.env.GINI_TRUSTED_ORIGINS;
+const originalRelayDomain = process.env.GINI_RELAY_DOMAIN;
 
 beforeEach(() => {
   delete process.env.GINI_TRUSTED_ORIGINS;
+  // Force the default relay domain so the literal *.gini-relay.lilaclabs.ai
+  // expectations hold regardless of any GINI_RELAY_DOMAIN set in the CI/dev env.
+  delete process.env.GINI_RELAY_DOMAIN;
 });
 
 afterEach(() => {
   if (originalTrusted === undefined) delete process.env.GINI_TRUSTED_ORIGINS;
   else process.env.GINI_TRUSTED_ORIGINS = originalTrusted;
+  if (originalRelayDomain === undefined) delete process.env.GINI_RELAY_DOMAIN;
+  else process.env.GINI_RELAY_DOMAIN = originalRelayDomain;
 });
 
 function makeReq(opts: {
@@ -81,6 +87,52 @@ describe("guardCsrf — safe methods", () => {
   test("HEAD with no Origin on loopback Host → pass", () => {
     const res = guardCsrf(makeReq({ method: "HEAD", host: "127.0.0.1:7777" }), []);
     expect(res).toBeNull();
+  });
+});
+
+describe("guardCsrf — gini-relay tunnel front", () => {
+  const SUB = "g3100.gini-relay.lilaclabs.ai";
+
+  test("POST + relay-subdomain Origin (no allowlist) → pass", () => {
+    const res = guardCsrf(
+      makeReq({ method: "POST", origin: `https://${SUB}`, host: SUB, secFetchSite: "same-origin", url: `https://${SUB}/api/runtime/tunnel` }),
+      []
+    );
+    expect(res).toBeNull();
+  });
+
+  test("GET + relay-subdomain Host, no Origin → pass", () => {
+    const res = guardCsrf(makeReq({ method: "GET", host: SUB, url: `https://${SUB}/api/runtime/tunnel` }), []);
+    expect(res).toBeNull();
+  });
+
+  test("the bare relay apex host is trusted too", () => {
+    const res = guardCsrf(makeReq({ method: "GET", host: "gini-relay.lilaclabs.ai", url: "https://gini-relay.lilaclabs.ai/api/runtime/tunnel" }), []);
+    expect(res).toBeNull();
+  });
+
+  test("relay Origin bypasses a configured allowlist", () => {
+    process.env.GINI_TRUSTED_ORIGINS = "https://allowed.example";
+    const res = guardCsrf(
+      makeReq({ method: "POST", origin: `https://${SUB}`, host: SUB, secFetchSite: "same-origin", url: `https://${SUB}/api/runtime/tunnel` }),
+      []
+    );
+    expect(res).toBeNull();
+  });
+
+  test("relay Host no-Origin GET passes even with an allowlist set", () => {
+    process.env.GINI_TRUSTED_ORIGINS = "https://allowed.example";
+    const res = guardCsrf(makeReq({ method: "GET", host: SUB, url: `https://${SUB}/api/runtime/tunnel` }), []);
+    expect(res).toBeNull();
+  });
+
+  test("relay Origin with cross-site Sec-Fetch-Site is still rejected", () => {
+    const res = guardCsrf(
+      makeReq({ method: "POST", origin: `https://${SUB}`, host: SUB, secFetchSite: "cross-site", url: `https://${SUB}/api/runtime/tunnel` }),
+      []
+    );
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(403);
   });
 });
 

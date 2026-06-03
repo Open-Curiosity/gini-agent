@@ -75,6 +75,7 @@ import { resolveEffectiveContext } from "./execution/effective-context";
 import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
+import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, selectProvider } from "./integrations/tunnel";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
@@ -1546,6 +1547,20 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/relays$/, () => json(listRelays(config))],
     ["POST", /^\/api\/relays$/, async (request) => json(await configureRelay(config, await body(request)), 201)],
     ["POST", /^\/api\/relays\/([^/]+)\/health$/, async (_request, params) => json(await checkRelay(config, params[0]))],
+    // Tunnel connectivity (ADR tunnel-connectivity.md). Every route returns
+    // the full TunnelState so one fetch drives the selection/connect/connected
+    // UI. connect() flips to "connecting" and runs the gini-relay OAuth-loopback
+    // login + frpc handshake in the background; the UI polls GET /api/tunnel
+    // until status flips to "connected" (with url) or "error".
+    ["GET", /^\/api\/tunnel$/, () => json(getTunnel(config))],
+    ["POST", /^\/api\/tunnel\/select$/, async (request) => json(await selectProvider(config, String((await body(request)).provider ?? "")))],
+    ["POST", /^\/api\/tunnel\/connect$/, async (request) => {
+      const payload = await body(request);
+      const provider = typeof payload.provider === "string" && payload.provider.length > 0 ? payload.provider : undefined;
+      return json(await connectTunnel(config, provider));
+    }],
+    ["POST", /^\/api\/tunnel\/cancel$/, async () => json(await cancelTunnel(config))],
+    ["POST", /^\/api\/tunnel\/disconnect$/, async () => json(await disconnectTunnel(config))],
     ["GET", /^\/api\/notifications$/, () => json(readState(config.instance).notifications)],
     ["POST", /^\/api\/notifications$/, async (request) => json(await queueNotification(config, await body(request)), 201)],
     ["POST", /^\/api\/notifications\/send$/, async () => json(await sendQueuedNotifications(config))],
@@ -2223,6 +2238,12 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Chat allowlist only applies")) return 400;
   if (message.startsWith("chatId must be")) return 400;
   if (/^Target '.+' not permitted by active agent/.test(message)) return 400;
+  // Tunnel selection/connect surface user-input failures (unknown or
+  // disabled provider, nothing selected) as plain Error strings. Map them
+  // to 400 so the panel can render the original reason rather than a 500.
+  if (message.startsWith("Unknown tunnel provider")) return 400;
+  if (message.startsWith("No tunnel provider selected")) return 400;
+  if (/^Tunnel provider .+ is not available/.test(message)) return 400;
   return 500;
 }
 

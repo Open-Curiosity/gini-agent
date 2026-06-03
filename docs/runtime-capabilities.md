@@ -52,6 +52,7 @@ bun run gini evidence
 | Self-improvement proposals | `gini improvements propose/approve/reject`, trace-backed application |
 | Observability | `gini trace`, `gini audit`, `gini events`, `/api/events/stream`, `gini evidence` |
 | Web control plane | Next.js app at `web/`, launched by `gini start` or `gini run` unless `--no-web` is set |
+| Off-LAN access (tunnel) | `gini tunnel [select <provider> \| connect [provider] \| cancel \| disconnect]`, `/api/tunnel{,/select,/connect,/cancel,/disconnect}`. The gini-relay provider runs an OAuth-loopback login on the host, assigns a per-device subdomain, and runs a supervised `frpc` child exposing the local web port at `https://<subdomain>.<relayDomain>`; `tailscale`/`ngrok`/`cloudflare` are disabled catalog placeholders. See [tunnel-connectivity.md](adr/tunnel-connectivity.md) |
 
 ## Runtime Contracts
 
@@ -66,6 +67,7 @@ Stable local clients use the gateway API:
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
 - `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
+- `/api/tunnel`, `/api/tunnel/select`, `/api/tunnel/connect`, `/api/tunnel/cancel`, `/api/tunnel/disconnect`
 - `/api/audit`, `/api/events`, `/api/events/stream`
 - `/api/settings/auto-approve`
 - `/api/parity/hermes`, `/api/readiness/v1`
@@ -74,4 +76,4 @@ All routes require `Authorization: Bearer <token>` except health checks and the 
 
 ## Boundaries
 
-Current runtime work is local-first. Future mobile, relay, push notifications, and richer live external transports should consume these contracts rather than adding a second source of truth.
+Current runtime work is local-first, with off-LAN reach available through the gini-relay tunnel (see the capability map above). Future mobile, push notifications, and richer live external transports should consume these contracts rather than adding a second source of truth.

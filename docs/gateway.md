@@ -98,6 +98,8 @@ Every BFF request to `/api/runtime/*` carries a CSRF guard before the gateway be
 
 2. **`GINI_TRUSTED_ORIGINS` unset** — local-dev fallback. The guard accepts requests only when both the request `Host` is loopback (`localhost`, `127.0.0.1`, or `[::1]`) and the `Origin` matches `Host`. Any non-loopback Host is refused without an explicit allowlist, so a BFF run on a tailnet hostname without `GINI_TRUSTED_ORIGINS` will see every privileged POST 403'd — set the env var or bind the BFF to loopback only.
 
+3. **gini-relay tunnel front** — independent of `GINI_TRUSTED_ORIGINS`. When the request `Host`/`Origin` is the relay domain (`GINI_RELAY_DOMAIN`, default `gini-relay.lilaclabs.ai`) or one of its per-device subdomains, the guard trusts it so the app served *through* the operator's own tunnel can call the BFF. This is safe because the relay controls DNS for `*.<relayDomain>` and routes each random per-device subdomain only to its owner's `frpc` tunnel — an attacker cannot rebind a relay name to this machine — and the `Sec-Fetch-Site` cross-site check still applies. See [ADR: BFF trust boundary](adr/bff-trust-boundary.md) and [ADR: Tunnel connectivity](adr/tunnel-connectivity.md).
+
 Closing the non-loopback fallback path blocks the DNS-rebinding shape where an attacker page sets `Origin` to a hostname they control but rebinds DNS to the BFF's loopback / tailnet IP — the rebound host equals itself, so a Host-comparison alone would pass. The allowlist (or the loopback restriction) takes that codepath off the table.
 
 ## Lifecycle Commands

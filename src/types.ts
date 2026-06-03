@@ -86,6 +86,55 @@ export interface BrowserConnectionRecord {
 
 export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 
+// Tunnel connectivity (see ADR tunnel-connectivity.md). The tunnel gateway
+// exposes a remote URL for this instance through one of several providers.
+// Only "gini-relay" is enabled for now; the rest are catalog placeholders
+// surfaced to the UI with a `requires` explanation of what's missing.
+export type TunnelProviderId = "gini-relay" | "tailscale" | "ngrok" | "cloudflare";
+
+// One row in the provider catalog. Drives the selection panel: disabled
+// rows render their `requires` string as the reason they can't be picked.
+export interface TunnelProvider {
+  id: TunnelProviderId;
+  name: string;
+  enabled: boolean;
+  requires?: string;
+}
+
+// The connection lifecycle status surfaced to clients.
+//   idle       — no active tunnel; selection may or may not be set.
+//   connecting — a login/connect is pending; the panel shows "Pending Login…".
+//   connected  — the tunnel is live; `url` is present.
+//   error      — the last connect failed; `message` carries the reason.
+export type TunnelStatus = "idle" | "connecting" | "connected" | "error";
+
+// The full state object EVERY /api/tunnel route returns — one fetch drives
+// the whole panel. `providers` is the catalog, `selectedProvider`/`status`
+// derive the view, `url` is present only when connected, `message` only on
+// error.
+export interface TunnelState {
+  providers: TunnelProvider[];
+  selectedProvider: TunnelProviderId | null;
+  status: TunnelStatus;
+  url?: string;
+  message?: string;
+}
+
+// Persisted singleton on RuntimeState. Mirrors the BrowserConnectionRecord
+// opt-in shape: absent/null until the user first selects a provider. The
+// catalog itself is NOT persisted — it's rebuilt from code on every read so
+// adding a provider doesn't require a state migration.
+export interface TunnelSelectionRecord {
+  instance: Instance;
+  selectedProvider: TunnelProviderId | null;
+  status: TunnelStatus;
+  url?: string;
+  subdomain?: string;
+  message?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type NotificationStatus = "queued" | "sent" | "failed" | "acknowledged";
 export type MessagingMessageStatus = "received" | "queued" | "sent" | "failed";
 
@@ -502,6 +551,10 @@ export interface RuntimeState {
   // so authenticated state lives in the user's Chrome profile, not the
   // ephemeral test context. Purely opt-in; legacy state files omit it.
   browser?: BrowserConnectionRecord | null;
+  // Optional tunnel selection singleton (see ADR tunnel-connectivity.md).
+  // Populated by the tunnel integration when the user selects/connects a
+  // provider; null until then. Mirrors the `browser` opt-in field above.
+  tunnel?: TunnelSelectionRecord | null;
   // Per-conversation snapshot of the runtime identity last shown to the
   // agent (instance, port, agent, provider, toolsets, namespace). Drives
   // tell-once-plus-delta system-prompt injection in runChatTask:

@@ -24,6 +24,18 @@ read at request time:
   to be loopback — a non-loopback Host without an allowlist is
   refused regardless of method.
 
+- **gini-relay tunnel front** — when the app is served through the
+  gini-relay tunnel (see [Tunnel Connectivity](tunnel-connectivity.md)),
+  the public host is a per-device subdomain under the relay domain
+  (`<subdomain>.<relayDomain>`, `relayDomain` default
+  `gini-relay.lilaclabs.ai`, overridable via `GINI_RELAY_DOMAIN`). A
+  request whose `Host`/`Origin` host is a relay subdomain is trusted
+  regardless of `GINI_TRUSTED_ORIGINS`, so an operator who connects a
+  tunnel does not also have to enumerate the (randomly assigned)
+  subdomain in the env var. This lane lives in `web/src/proxy.ts`
+  (`classifyHost`) and `web/src/lib/runtime.ts`
+  (`isRelayHost` / `guardCsrf`).
+
 Method-tiered fail-closed behavior: unsafe methods (POST, PUT, PATCH,
 DELETE) additionally require `Origin` to be present at all. A modern
 browser always sends Origin on unsafe methods, so the only callers
@@ -62,6 +74,17 @@ why the loopback fallback is safe — `Host` on a loopback BFF is always
 `localhost`/`127.0.0.1`/`[::1]`, and JS can't lie about it. But rebinding
 moves the attack into the operator's *own* browser, where `Host` is
 honestly attacker-controlled because the URL bar is attacker-controlled.
+
+The gini-relay lane is the same reasoning applied to the relay's DNS.
+The relay controls DNS for `*.<relayDomain>` and routes each random,
+per-device subdomain only to its owner's `frpc` tunnel — an attacker
+cannot make `<their-subdomain>.<relayDomain>` resolve to the operator's
+machine, and cannot rebind a relay subdomain because the relay (not the
+operator's resolver) owns those names. So a relay `Host` is as
+trustworthy as a loopback `Host`: it can only be present on a request
+that actually arrived through the operator's own tunnel. `Sec-Fetch-Site`
+still applies as the secondary signal — a genuine cross-site request
+through the tunnel front is rejected just as it is on the other lanes.
 
 ## Consequences
 
@@ -137,7 +160,12 @@ behind the gateway does not remove that requirement.
 - The same-origin loopback case (`Origin: http://localhost`,
   `Host: localhost`) passes whether the env var is set (and matches)
   or unset.
-- The `GINI_TRUSTED_ORIGINS` / loopback / Origin-match cases are pinned
-  by `bun test src/integration.test.ts`, with pure-helper coverage in
+- A request whose `Origin`/`Host` is a relay subdomain
+  (`<subdomain>.<relayDomain>`) passes with `GINI_TRUSTED_ORIGINS`
+  unset, while a non-relay, non-loopback `Host` without
+  `GINI_TRUSTED_ORIGINS` still returns 403.
+- The `GINI_TRUSTED_ORIGINS` / loopback / relay / Origin-match cases are
+  pinned by `web/src/lib/runtime.test.ts` (`guardCsrf`) and
+  `web/src/proxy.test.ts` (`classifyHost`), with pure-helper coverage in
   `web/src/lib/trusted-origins.test.ts`. End-to-end coverage of the
   proxy / BFF interaction is a documented gap.

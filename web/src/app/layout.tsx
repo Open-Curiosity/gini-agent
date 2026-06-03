@@ -3,6 +3,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Providers } from "@/components/providers";
 import { MobileTopBar, Sidebar } from "@/components/Sidebar";
+import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +24,14 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
             <Sidebar />
             <div className="flex flex-1 flex-col overflow-hidden">
               <MobileTopBar />
-              <main className="flex flex-1 flex-col overflow-hidden">{children}</main>
+              <main className="relative flex flex-1 flex-col overflow-hidden">
+                <div className="pointer-events-none absolute right-4 top-4 z-30">
+                  <div className="pointer-events-auto">
+                    <TunnelMenu />
+                  </div>
+                </div>
+                {children}
+              </main>
             </div>
           </div>
         </Providers>
