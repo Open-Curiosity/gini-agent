@@ -1,0 +1,147 @@
+"use client";
+
+import { AlertTriangle } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import {
+  usePairingRequests,
+  useApprovePairing,
+  useRejectPairing,
+  isLoopbackFront,
+  type PairingRequestView
+} from "@/lib/pairing";
+import { useRuntimeStream } from "@/lib/useRuntimeStream";
+import { Button } from "@/components/ui/button";
+
+/**
+ * Compact relative-time label for a request's createdAt. Pairing requests live
+ * for minutes, so seconds/minutes granularity is all the operator needs to tell
+ * a stale request from a fresh one — no date library required.
+ */
+function relativeTime(iso: string): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "";
+  const seconds = Math.floor((Date.now() - then) / 1000);
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ago`;
+}
+
+/**
+ * Operator's live "Pair requests" list. Only the loopback front may approve, so
+ * this gates its actionable UI on `isLoopbackFront()` and otherwise renders a
+ * note pointing the user at the machine that started the tunnel.
+ *
+ * The list polls every 3s as a backstop (see usePairingRequests); the SSE
+ * "pairing" tick invalidates the query for instant updates the moment a device
+ * scans, approves, or expires.
+ */
+export function PairRequestsPanel() {
+  const enabled = isLoopbackFront();
+  const { data: requests = [] } = usePairingRequests(enabled);
+  const approve = useApprovePairing();
+  const reject = useRejectPairing();
+  const qc = useQueryClient();
+
+  useRuntimeStream((e) => {
+    if (e.kind === "pairing") {
+      qc.invalidateQueries({ queryKey: ["pairingRequests"] });
+      qc.invalidateQueries({ queryKey: ["devices"] });
+    }
+  });
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-sm font-semibold leading-none">Pair requests</span>
+        <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+          <span className="relative flex h-2 w-2 shrink-0">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/60 motion-reduce:animate-none" />
+            <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+          </span>
+          Listening…
+        </span>
+      </div>
+
+      {!enabled ? (
+        <p className="text-xs text-muted-foreground">
+          Approvals happen on the computer that started the tunnel.
+        </p>
+      ) : requests.length === 0 ? (
+        <div className="grid place-items-center gap-1 rounded-lg border border-border bg-muted/20 px-3 py-6 text-center">
+          <p className="text-sm font-medium text-muted-foreground">
+            Waiting for a device to scan…
+          </p>
+          <p className="text-xs text-muted-foreground">
+            Open the link or scan the code on the device you want to add.
+          </p>
+        </div>
+      ) : (
+        <ul className="divide-y divide-border rounded-lg border border-border">
+          {requests.map((item) => (
+            <PairRequestRow
+              key={item.id}
+              item={item}
+              approving={approve.isPending}
+              rejecting={reject.isPending}
+              onApprove={() =>
+                approve.mutate(item.id, {
+                  onSuccess: () => toast.success("Device approved"),
+                  onError: (error) => toast.error(error.message)
+                })
+              }
+              onReject={() =>
+                reject.mutate(item.id, {
+                  onSuccess: () => toast.success("Request rejected"),
+                  onError: (error) => toast.error(error.message)
+                })
+              }
+            />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function PairRequestRow({
+  item,
+  approving,
+  rejecting,
+  onApprove,
+  onReject
+}: {
+  item: PairingRequestView;
+  approving: boolean;
+  rejecting: boolean;
+  onApprove: () => void;
+  onReject: () => void;
+}) {
+  return (
+    <li className="flex flex-col gap-3 p-3 sm:flex-row sm:items-start sm:justify-between">
+      <div className="min-w-0 space-y-1.5">
+        <div className="font-mono text-2xl font-semibold tracking-widest text-foreground tabular-nums">
+          {item.code}
+        </div>
+        <div className="text-xs text-muted-foreground">
+          <span className="text-foreground">{item.deviceName}</span>
+          {" · "}
+          {relativeTime(item.createdAt)}
+        </div>
+        <div className="flex items-center gap-1.5 text-xs text-amber-500 dark:text-amber-400">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span>Approve only if this code matches the one shown on that device.</span>
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-2 sm:pt-1">
+        <Button variant="outline" size="sm" onClick={onReject} disabled={rejecting}>
+          Reject
+        </Button>
+        <Button variant="default" size="sm" onClick={onApprove} disabled={approving}>
+          Approve
+        </Button>
+      </div>
+    </li>
+  );
+}

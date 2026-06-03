@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
+import { PairDeviceDialog } from "@/components/pairing/PairDeviceDialog";
 import { TunnelQR } from "./TunnelQR";
 import type { TunnelState } from "./types";
 
@@ -167,6 +168,8 @@ export function TunnelConnectedPopover({
         </div>
 
         <Separator />
+
+        <PairDeviceDialog className="w-full" />
 
         <Button variant="destructive" size="sm" className="w-full gap-1.5" onClick={onDisconnect}>
           <Unplug className="h-3.5 w-3.5" />
