@@ -72,6 +72,38 @@ export function trustedOrigins(): ReadonlySet<string> | null {
   return out;
 }
 
+// Default-port-equivalent Host match against GINI_TRUSTED_ORIGINS, mirroring the
+// BFF proxy classifier (host:443 ≡ host for https, host:80 ≡ host for http). A
+// no-Origin top-level navigation to an operator-listed front (e.g. a Tailscale
+// host reached through a reverse proxy) carries no Origin to match, but its Host
+// should still be trusted.
+function hostInTrustedAllowlist(host: string): boolean {
+  const raw = process.env.GINI_TRUSTED_ORIGINS;
+  if (!raw || !raw.trim()) return false;
+  const strip = (h: string): string => h.toLowerCase().replace(/:(?:80|443)$/, "");
+  const target = strip(host);
+  for (const candidate of raw.split(",")) {
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = new URL(trimmed);
+      if (
+        (parsed.pathname !== "" && parsed.pathname !== "/")
+        || parsed.search !== ""
+        || parsed.hash !== ""
+        || parsed.username !== ""
+        || parsed.password !== ""
+      ) {
+        continue;
+      }
+      if (strip(parsed.host) === target) return true;
+    } catch {
+      // Skip malformed entries individually.
+    }
+  }
+  return false;
+}
+
 const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 // The host/origin trust decision (the Sec-Fetch-Site check is applied
@@ -81,18 +113,20 @@ const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 //   - No Origin: allow only safe methods on a Host that is itself trusted —
 //     loopback (covers local dev AND the runtime's own loopback probes, e.g.
 //     the tunnel readiness probe GET /api/runtime/__healthz which carries no
-//     Origin) or the relay front (top-level navigations over the tunnel).
-//     Loopback/relay are trusted regardless of GINI_TRUSTED_ORIGINS — a
-//     rebinding page cannot forge a loopback Host and the relay owns its DNS.
-//     An unsafe no-Origin request must use the native /api/* surface with its
-//     own bearer.
+//     Origin), the relay front (top-level navigations over the tunnel), or a
+//     Host the operator listed in GINI_TRUSTED_ORIGINS (a top-level navigation
+//     to a reverse-proxy front carries no Origin to match). Loopback/relay are
+//     trusted regardless of GINI_TRUSTED_ORIGINS — a rebinding page cannot forge
+//     a loopback Host and the relay owns its DNS. An unsafe no-Origin request
+//     must use the native /api/* surface with its own bearer.
 //   - Origin present: a relay Origin is trusted regardless of Host (the browser
 //     cannot forge Origin); a loopback Origin on a loopback Host is local;
 //     otherwise the Origin must match GINI_TRUSTED_ORIGINS (or, with no
 //     allowlist, equal a loopback Host).
 function hostOriginTrusted(origin: string | null, isUnsafe: boolean, expectedHost: string): boolean {
   if (!origin) {
-    return !isUnsafe && (isLoopbackHost(expectedHost) || isRelayHost(expectedHost));
+    if (isUnsafe) return false;
+    return isLoopbackHost(expectedHost) || isRelayHost(expectedHost) || hostInTrustedAllowlist(expectedHost);
   }
   let originUrl: URL;
   try {

@@ -134,6 +134,33 @@ describe("webBoundRequestAllowed — loopback trusted regardless of allowlist", 
   });
 });
 
+describe("webBoundRequestAllowed — no-Origin navigation to a GINI_TRUSTED_ORIGINS host", () => {
+  test("a no-Origin safe request to an allowlisted host passes (top-level nav to a reverse-proxy front)", () => {
+    process.env.GINI_TRUSTED_ORIGINS = "https://gini.tailnet.example";
+    expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "gini.tailnet.example", url: "https://gini.tailnet.example/", secFetchDest: "document" }))).toBe(true);
+  });
+
+  test("default-port equivalence: a Host without :443 matches an https allowlist entry that has it", () => {
+    process.env.GINI_TRUSTED_ORIGINS = "https://gini.tailnet.example:443";
+    expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "gini.tailnet.example", url: "https://gini.tailnet.example/", secFetchDest: "document" }))).toBe(true);
+  });
+
+  test("an unsafe no-Origin request to an allowlisted host is still refused", () => {
+    process.env.GINI_TRUSTED_ORIGINS = "https://gini.tailnet.example";
+    expect(webBoundRequestAllowed(makeReq({ method: "POST", host: "gini.tailnet.example", url: "https://gini.tailnet.example/api/runtime/x" }))).toBe(false);
+  });
+
+  test("a no-Origin request to a non-allowlisted host is refused", () => {
+    process.env.GINI_TRUSTED_ORIGINS = "https://gini.tailnet.example";
+    expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "evil.example", url: "https://evil.example/", secFetchDest: "document" }))).toBe(false);
+  });
+
+  test("malformed and path-bearing allowlist entries are skipped for host matching", () => {
+    process.env.GINI_TRUSTED_ORIGINS = "not-a-url, https://has.path.example/x";
+    expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "has.path.example", url: "https://has.path.example/", secFetchDest: "document" }))).toBe(false);
+  });
+});
+
 describe("webBoundRequestAllowed — Origin present", () => {
   test("malformed Origin is refused", () => {
     expect(webBoundRequestAllowed(makeReq({ method: "POST", origin: "not a url", host: "127.0.0.1:7778" }))).toBe(false);
