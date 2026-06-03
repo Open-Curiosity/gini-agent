@@ -43,7 +43,22 @@ import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embeddin
 import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
-import { authorizedBearer, claimPairing, createPairing, resolveCredentialFromBearer, revokePairedDevice } from "./governance/pairing";
+import {
+  approvePairing,
+  authorizedBearer,
+  cancelPairing,
+  claimPairing,
+  claimPairingSession,
+  createPairing,
+  getPairingRequestStatus,
+  listPairingRequests,
+  rejectPairing,
+  requestPairing,
+  resolveCredentialFromBearer,
+  resolveSessionFromCookie,
+  revokePairedDevice,
+  touchPairedSession
+} from "./governance/pairing";
 import { proposePromotion, reviewPromotion } from "./governance/promotions";
 import { status, updateAutoApproveSettings } from "./runtime";
 import { searchSessions } from "./execution/search";
@@ -76,7 +91,10 @@ import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrow
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, selectProvider } from "./integrations/tunnel";
-import { webBoundRequestAllowed } from "./lib/origin-trust";
+import { isLoopbackHost, webBoundRequestAllowed } from "./lib/origin-trust";
+import { cookieValue, serializeCookie } from "./lib/cookies";
+import { RateLimiter } from "./lib/rate-limit";
+import { hashSecret } from "./state/security";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
@@ -1595,6 +1613,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           return withCors(request, json({ error: error instanceof Error ? error.message : String(error) }, 400));
         }
       }
+      // Relay device-pairing API: gateway-handled before the bearer gate so it
+      // can enforce its own loopback-vs-public rules from the true inbound Host.
+      // Covers /api/pairing/request* and /api/pairing/requests* (not the
+      // bearer-gated /api/pairing code-generation route).
+      if (url.pathname.startsWith("/api/pairing/request")) {
+        return handlePairingRoutes(request, url, config);
+      }
       if (!await authorized(request, config)) return withCors(request, json({ error: "Unauthorized" }, 401));
       for (const [method, pattern, handler] of routes) {
         const match = url.pathname.match(pattern);
@@ -1619,6 +1644,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return url.pathname.startsWith("/api/")
         ? withCors(request, json({ error: "Forbidden" }, 403))
         : withCors(request, new Response("Not found", { status: 404 }));
+    }
+    // Relay session gate: a web request on a non-loopback (relay/allowlisted)
+    // front must carry a valid gini_session cookie. Loopback is trusted with no
+    // pairing. Unpaired page navigations are redirected to /pair; unpaired
+    // /api/runtime/* calls get a 401. Bootstrap paths (the /pair page + assets)
+    // stay reachable so a new device can run the handshake. See ADR
+    // device-pairing-auth.md.
+    const webHost = request.headers.get("host") ?? url.host;
+    if (!isLoopbackHost(webHost) && !isPairingBootstrapPath(url.pathname)) {
+      const sessionToken = cookieValue(request, SESSION_COOKIE);
+      if (!sessionToken || !resolveSessionFromCookie(config, sessionToken)) {
+        return url.pathname.startsWith("/api/")
+          ? withCors(request, json({ error: "Unauthorized" }, 401))
+          : new Response(null, { status: 302, headers: { location: "/pair" } });
+      }
+      // Refresh last-seen on full page loads only (not every asset) so the
+      // Active Sessions list stays current without per-request writes.
+      if (request.headers.get("sec-fetch-dest") === "document") void touchPairedSession(config, sessionToken);
     }
     return proxyWeb(request, url, config);
   };
@@ -2131,6 +2174,136 @@ async function rollbackIdentityFile(
     };
   }
   return { ok: false, reason: "kind must be one of: user, soul" };
+}
+
+// --- Relay device-pairing (operator-approved cookie sessions) ---------------
+// See ADR device-pairing-auth.md. gini_pair carries the per-request binding
+// secret (scoped to /api/pairing so it only rides pairing calls); gini_session
+// carries the minted session token (scoped to the whole app).
+const PAIR_BIND_COOKIE = "gini_pair";
+const SESSION_COOKIE = "gini_session";
+const SESSION_COOKIE_TTL_SECONDS = 30 * 24 * 60 * 60;
+const PAIR_BIND_COOKIE_TTL_SECONDS = 3600;
+// Cap on concurrent pending requests so a flood can't bury the operator panel.
+const MAX_PENDING_PAIRING_REQUESTS = 20;
+// Token bucket: 10 request-creations burst, refilling at 10/min, keyed by the
+// best available client identifier (XFF first hop, else Host).
+const pairingCreateLimiter = new RateLimiter({ capacity: 10, refillPerSec: 10 / 60 });
+
+const sessionCookieAttributes = { httpOnly: true, secure: true, sameSite: "Lax" as const, path: "/" };
+const bindCookieAttributes = { httpOnly: true, secure: true, sameSite: "Lax" as const, path: "/api/pairing" };
+
+function randomBindSecret(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function pairingRateLimitKey(request: Request): string {
+  const xff = request.headers.get("x-forwarded-for");
+  if (xff && xff.trim()) return xff.split(",")[0]!.trim();
+  return request.headers.get("host") ?? "global";
+}
+
+// Paths an UNPAIRED relay browser may still reach so it can run the pairing
+// handshake: the /pair page, Next's build assets, and static files. Never an
+// /api path (those are gated separately).
+export function isPairingBootstrapPath(pathname: string): boolean {
+  if (pathname.startsWith("/api/")) return false;
+  if (pathname === "/pair" || pathname.startsWith("/pair/")) return true;
+  if (pathname.startsWith("/_next/")) return true;
+  if (pathname === "/favicon.ico") return true;
+  return /\.(png|jpe?g|svg|gif|webp|ico|woff2?|ttf|otf|css|js|map|json|txt)$/.test(pathname);
+}
+
+// Gateway-handled pairing API. Lives on the native /api surface but is
+// special-cased BEFORE the bearer gate so it can apply its own trust rules from
+// the TRUE inbound Host/Origin: operator routes are loopback-only; device
+// routes are public but bound to the gini_pair cookie.
+async function handlePairingRoutes(request: Request, url: URL, config: RuntimeConfig): Promise<Response> {
+  // Host/Origin/CSRF trust for every pairing call (same gate as the proxied
+  // surface). Blocks cross-site POSTs and untrusted hosts.
+  if (!webBoundRequestAllowed(request)) return json({ error: "Forbidden" }, 403);
+  const host = request.headers.get("host") ?? url.host;
+  const path = url.pathname;
+  const method = request.method;
+
+  // Operator (loopback-only) routes — unreachable over the relay even with a
+  // cookie or a leaked bearer, because a relay request cannot present a
+  // loopback Host.
+  const isList = path === "/api/pairing/requests";
+  const approve = path.match(/^\/api\/pairing\/requests\/([^/]+)\/approve$/);
+  const reject = path.match(/^\/api\/pairing\/requests\/([^/]+)\/reject$/);
+  if (isList || approve || reject) {
+    if (!isLoopbackHost(host)) return json({ error: "Forbidden" }, 403);
+    if (method === "GET" && isList) return json({ requests: await listPairingRequests(config) });
+    if (method === "POST" && approve) return json({ request: await approvePairing(config, approve[1]!) });
+    if (method === "POST" && reject) return json({ request: await rejectPairing(config, reject[1]!) });
+    return json({ error: "Not found" }, 404);
+  }
+
+  // Device: create a request (public, rate-limited, sets the binding cookie).
+  if (method === "POST" && path === "/api/pairing/request") {
+    if (!pairingCreateLimiter.tryConsume(pairingRateLimitKey(request))) {
+      return json({ error: "Too many pairing requests. Try again shortly." }, 429);
+    }
+    if ((await listPairingRequests(config)).length >= MAX_PENDING_PAIRING_REQUESTS) {
+      return json({ error: "Too many pending pairing requests." }, 429);
+    }
+    const bindSecret = randomBindSecret();
+    const created = await requestPairing(config, {
+      userAgent: request.headers.get("user-agent") ?? "",
+      relayHost: host,
+      bindHash: hashSecret(bindSecret)
+    });
+    const response = json({ id: created.id, code: created.code }, 201);
+    response.headers.append(
+      "set-cookie",
+      serializeCookie(PAIR_BIND_COOKIE, bindSecret, { ...bindCookieAttributes, maxAge: PAIR_BIND_COOKIE_TTL_SECONDS })
+    );
+    return response;
+  }
+
+  // Device: poll own request status (requires the binding cookie to exist).
+  const poll = path.match(/^\/api\/pairing\/request\/([^/]+)$/);
+  if (method === "GET" && poll) {
+    if (!cookieValue(request, PAIR_BIND_COOKIE)) return json({ error: "Unauthorized" }, 401);
+    const status = await getPairingRequestStatus(config, poll[1]!);
+    if (!status) return json({ error: "Pairing request not found" }, 404);
+    return json({ status: status.status });
+  }
+
+  // Device: claim an approved request → mint the session, set the cookie.
+  const claim = path.match(/^\/api\/pairing\/request\/([^/]+)\/claim$/);
+  if (method === "POST" && claim) {
+    const bindSecret = cookieValue(request, PAIR_BIND_COOKIE);
+    if (!bindSecret) return json({ error: "Unauthorized" }, 401);
+    const result = await claimPairingSession(config, claim[1]!, bindSecret);
+    if (!result.ok) {
+      const code = result.reason === "not_found" ? 404 : result.reason === "bind_mismatch" ? 403 : 409;
+      return json({ error: result.reason }, code);
+    }
+    const response = json({ status: "approved" });
+    response.headers.append(
+      "set-cookie",
+      serializeCookie(SESSION_COOKIE, result.token, { ...sessionCookieAttributes, maxAge: SESSION_COOKIE_TTL_SECONDS })
+    );
+    // The binding cookie is single-use; clear it now that the session is minted.
+    response.headers.append("set-cookie", serializeCookie(PAIR_BIND_COOKIE, "", { ...bindCookieAttributes, maxAge: 0 }));
+    return response;
+  }
+
+  // Device: cancel own pending/approved request (binding cookie required).
+  const cancel = path.match(/^\/api\/pairing\/request\/([^/]+)\/cancel$/);
+  if (method === "POST" && cancel) {
+    const bindSecret = cookieValue(request, PAIR_BIND_COOKIE);
+    if (!bindSecret) return json({ error: "Unauthorized" }, 401);
+    const result = await cancelPairing(config, cancel[1]!, bindSecret);
+    if (!result.ok) return json({ error: result.reason }, result.reason === "not_found" ? 404 : 403);
+    const response = json({ ok: true });
+    response.headers.append("set-cookie", serializeCookie(PAIR_BIND_COOKIE, "", { ...bindCookieAttributes, maxAge: 0 }));
+    return response;
+  }
+
+  return json({ error: "Not found" }, 404);
 }
 
 async function authorized(request: Request, config: RuntimeConfig): Promise<boolean> {

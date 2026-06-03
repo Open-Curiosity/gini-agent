@@ -1,6 +1,8 @@
 import { writeFileSync } from "node:fs";
-import { createHandler, isWebProxyPath, proxyWebSocketUpgrade, webSocketProxyHandler, writePid } from "./http";
-import { webBoundRequestAllowed } from "./lib/origin-trust";
+import { createHandler, isPairingBootstrapPath, isWebProxyPath, proxyWebSocketUpgrade, webSocketProxyHandler, writePid } from "./http";
+import { isLoopbackHost, webBoundRequestAllowed } from "./lib/origin-trust";
+import { cookieValue } from "./lib/cookies";
+import { resolveSessionFromCookie } from "./governance/pairing";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
@@ -184,6 +186,16 @@ const server = Bun.serve({
       // rebound/untrusted WS upgrade before bridging it to the loopback web child.
       if (!webBoundRequestAllowed(request)) {
         return new Response("Forbidden", { status: 403 });
+      }
+      // Relay session gate, mirroring the HTTP path: a non-loopback WS upgrade
+      // must carry a valid session cookie unless it targets a bootstrap path
+      // (Next HMR lives at /_next/webpack-hmr, which the unpaired /pair page
+      // needs in dev). Reject fully before bridging so no frame is accepted.
+      const wsPath = new URL(request.url).pathname;
+      const wsHost = request.headers.get("host") ?? new URL(request.url).host;
+      if (!isLoopbackHost(wsHost) && !isPairingBootstrapPath(wsPath)
+          && !resolveSessionFromCookie(config, cookieValue(request, "gini_session"))) {
+        return new Response("Unauthorized", { status: 401 });
       }
       return proxyWebSocketUpgrade(request, server, config);
     }

@@ -150,6 +150,7 @@ export type RuntimeEventKind =
   | "messaging"
   | "provider"
   | "runtime"
+  | "pairing"
   | "notification";
 
 export type JobRunStatus = "running" | "completed" | "failed";
@@ -525,6 +526,7 @@ export interface RuntimeState {
   connectors: ConnectorRecord[];
   improvements: ImprovementProposal[];
   pairingCodes: PairingCode[];
+  pairingRequests: PairingRequest[];
   devices: PairedDevice[];
   promotions: PromotionProposal[];
   snapshots: SnapshotRecord[];
@@ -1579,6 +1581,57 @@ export interface PairedDevice {
   updatedAt: string;
   lastSeenAt?: string;
   revokedAt?: string;
+  // Network front the session connected over: "loopback" for a local browser
+  // or LAN-paired device, or the relay Host (e.g.
+  // <sub>.gini-relay.lilaclabs.ai) for a tunnel-paired browser. Surfaced in the
+  // Active Sessions UI to distinguish local vs remote sessions. Absent on
+  // legacy/mobile rows minted before browser pairing existed.
+  origin?: string;
+  // Raw User-Agent captured at pairing time, for the Active Sessions list.
+  // Absent on legacy/mobile rows.
+  userAgent?: string;
+  // Optional session expiry for relay browser sessions. Bearer/mobile devices
+  // omit it (no expiry). The read-only session validator treats a past
+  // expiresAt as inactive even while status is still "active".
+  expiresAt?: string;
+}
+
+export type PairingRequestStatus =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "claimed"
+  | "expired"
+  | "cancelled";
+
+// A relay device's request to be paired, awaiting operator approval on the
+// loopback front. Distinct from PairingCode (which is operator-initiated,
+// device-claimed-by-code): a PairingRequest is device-initiated and
+// operator-approved. The `code` is stored in plaintext on purpose — it is a
+// human-comparison artifact shown on BOTH the device screen and the operator's
+// approval panel so the operator can confirm they are approving the device in
+// front of them, not a concurrent attacker's request. The actual credential is
+// the device token minted on claim (hashed), never the code.
+export interface PairingRequest {
+  id: string;
+  instance: Instance;
+  code: string;
+  // hashSecret(binding secret). The binding secret is set as an HttpOnly cookie
+  // on the requesting browser at creation and re-sent on poll/cancel, so only
+  // the browser that created the request can claim its approved session or
+  // cancel it — knowing the request id alone is not enough.
+  bindHash: string;
+  status: PairingRequestStatus;
+  // Human-readable label derived from the User-Agent (e.g. "Safari · iPhone").
+  deviceName: string;
+  userAgent: string;
+  // The Host the request arrived on, for operator display.
+  relayHost: string;
+  createdAt: string;
+  expiresAt: string;
+  resolvedAt?: string;
+  // Set when a claim mints the session device, linking request → PairedDevice.
+  deviceId?: string;
 }
 
 export interface PromotionProposal {

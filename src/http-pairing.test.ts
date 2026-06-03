@@ -1,0 +1,439 @@
+import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { RuntimeConfig } from "./types";
+import { createHandler, isPairingBootstrapPath } from "./http";
+
+function testConfig(instance: string): RuntimeConfig {
+  const root = mkdtempSync(join(tmpdir(), `gini-pair-${instance}-`));
+  process.env.GINI_STATE_ROOT = root;
+  process.env.GINI_LOG_ROOT = `${root}-logs`;
+  rmSync(`${root}/instances/${instance}`, { recursive: true, force: true });
+  return {
+    instance,
+    port: 7337,
+    token: "test-token",
+    provider: { name: "echo", model: "gini-echo-v0" },
+    workspaceRoot: "/tmp",
+    stateRoot: `${root}/instances/${instance}`,
+    logRoot: `${root}-logs/${instance}`,
+    approvalMode: "strict"
+  };
+}
+
+const RELAY = (instance: string) => `${instance}.gini-relay.lilaclabs.ai`;
+
+interface CallOpts {
+  method?: string;
+  host?: string;
+  origin?: string;
+  cookie?: string;
+  secFetchDest?: string;
+  secFetchSite?: string;
+  xff?: string;
+  userAgent?: string;
+  body?: unknown;
+}
+
+function makeHandler(instance: string) {
+  const config = testConfig(instance);
+  return { config, handler: createHandler(config) };
+}
+
+async function pair(handler: ReturnType<typeof createHandler>, path: string, opts: CallOpts = {}): Promise<Response> {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (opts.host) headers.host = opts.host;
+  if (opts.origin) headers.origin = opts.origin;
+  if (opts.cookie) headers.cookie = opts.cookie;
+  if (opts.secFetchDest) headers["sec-fetch-dest"] = opts.secFetchDest;
+  if (opts.secFetchSite) headers["sec-fetch-site"] = opts.secFetchSite;
+  if (opts.xff) headers["x-forwarded-for"] = opts.xff;
+  if (opts.userAgent) headers["user-agent"] = opts.userAgent;
+  return handler(
+    new Request(`http://127.0.0.1:7337${path}`, {
+      method: opts.method ?? "GET",
+      headers,
+      body: opts.body === undefined ? undefined : JSON.stringify(opts.body)
+    })
+  );
+}
+
+// Read a single cookie value out of a response's Set-Cookie list.
+function setCookieValue(response: Response, name: string): string | undefined {
+  for (const raw of response.headers.getSetCookie()) {
+    const [pair] = raw.split(";");
+    const eq = pair!.indexOf("=");
+    if (pair!.slice(0, eq).trim() === name) return decodeURIComponent(pair!.slice(eq + 1).trim());
+  }
+  return undefined;
+}
+
+// Drive the full happy path and return the handler + the minted session cookie.
+async function pairedSession(instance: string) {
+  const { config, handler } = makeHandler(instance);
+  const relay = RELAY(instance);
+  const created = await pair(handler, "/api/pairing/request", {
+    method: "POST",
+    host: relay,
+    origin: `https://${relay}`,
+    secFetchSite: "same-origin",
+    userAgent: "Mozilla/5.0 (iPhone) Safari",
+    body: {}
+  });
+  expect(created.status).toBe(201);
+  const createdBody = await created.json();
+  const bind = setCookieValue(created, "gini_pair")!;
+  expect(bind).toBeTruthy();
+  // operator approves over loopback
+  const approved = await pair(handler, `/api/pairing/requests/${createdBody.id}/approve`, {
+    method: "POST",
+    host: "127.0.0.1:7337",
+    origin: "http://127.0.0.1:7337",
+    secFetchSite: "same-origin",
+    body: {}
+  });
+  expect(approved.status).toBe(200);
+  // device claims
+  const claimed = await pair(handler, `/api/pairing/request/${createdBody.id}/claim`, {
+    method: "POST",
+    host: relay,
+    origin: `https://${relay}`,
+    secFetchSite: "same-origin",
+    cookie: `gini_pair=${encodeURIComponent(bind)}`,
+    body: {}
+  });
+  expect(claimed.status).toBe(200);
+  const session = setCookieValue(claimed, "gini_session")!;
+  expect(session).toBeTruthy();
+  return { config, handler, relay, requestId: createdBody.id as string, session, bind };
+}
+
+describe("isPairingBootstrapPath", () => {
+  test.each([
+    ["/pair", true],
+    ["/pair/anything", true],
+    ["/_next/static/chunk.js", true],
+    ["/favicon.ico", true],
+    ["/gini-agent-logo.png", true],
+    ["/styles.css", true],
+    ["/", false],
+    ["/chat", false],
+    ["/api/runtime/state", false],
+    ["/api/pairing/request", false]
+  ])("%p -> %p", (path, expected) => {
+    expect(isPairingBootstrapPath(path)).toBe(expected);
+  });
+});
+
+describe("pairing routes — CSRF / host trust", () => {
+  test("rejects a cross-site POST", async () => {
+    const { handler } = makeHandler("pair-csrf");
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST",
+      host: RELAY("pair-csrf"),
+      origin: "https://evil.example",
+      secFetchSite: "cross-site",
+      body: {}
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe("pairing routes — device create + poll", () => {
+  test("create returns id+code and sets the binding cookie", async () => {
+    const { handler } = makeHandler("pair-create");
+    const relay = RELAY("pair-create");
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+      userAgent: "Mozilla/5.0 (Macintosh) Chrome/120 Safari/537", body: {}
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.id).toMatch(/^preq_/);
+    expect(body.code).toMatch(/^\d{3}-\d{3}$/);
+    const cookie = res.headers.getSetCookie().find((c) => c.startsWith("gini_pair="));
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("Secure");
+    expect(cookie).toContain("Path=/api/pairing");
+  });
+
+  test("poll without the binding cookie is 401", async () => {
+    const { handler } = makeHandler("pair-poll-nocookie");
+    const relay = RELAY("pair-poll-nocookie");
+    const res = await pair(handler, "/api/pairing/request/preq_x", {
+      host: relay, secFetchSite: "same-origin"
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("poll with cookie for unknown id is 404", async () => {
+    const { handler } = makeHandler("pair-poll-404");
+    const relay = RELAY("pair-poll-404");
+    const res = await pair(handler, "/api/pairing/request/preq_missing", {
+      host: relay, secFetchSite: "same-origin", cookie: "gini_pair=whatever"
+    });
+    expect(res.status).toBe(404);
+  });
+
+  test("poll returns the pending status", async () => {
+    const { handler } = makeHandler("pair-poll-pending");
+    const relay = RELAY("pair-poll-pending");
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
+    });
+    const { id } = await created.json();
+    const bind = setCookieValue(created, "gini_pair")!;
+    const res = await pair(handler, `/api/pairing/request/${id}`, {
+      host: relay, secFetchSite: "same-origin", cookie: `gini_pair=${encodeURIComponent(bind)}`
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("pending");
+  });
+
+  test("unknown pairing path under the prefix is 404", async () => {
+    const { handler } = makeHandler("pair-unknown");
+    const relay = RELAY("pair-unknown");
+    const res = await pair(handler, "/api/pairing/request", {
+      host: relay, secFetchSite: "same-origin" // GET with no id, no create
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("pairing routes — operator (loopback-only)", () => {
+  test("list/approve/reject require a loopback host", async () => {
+    const { handler } = makeHandler("pair-op-relay");
+    const relay = RELAY("pair-op-relay");
+    for (const [method, path] of [
+      ["GET", "/api/pairing/requests"],
+      ["POST", "/api/pairing/requests/preq_x/approve"],
+      ["POST", "/api/pairing/requests/preq_x/reject"]
+    ] as const) {
+      const res = await pair(handler, path, { method, host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {} });
+      expect(res.status).toBe(403);
+    }
+  });
+
+  test("loopback list shows a pending request and approve/reject resolve it", async () => {
+    const { handler } = makeHandler("pair-op-flow");
+    const relay = RELAY("pair-op-flow");
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", userAgent: "X Safari", body: {}
+    });
+    const { id, code } = await created.json();
+    const listed = await pair(handler, "/api/pairing/requests", { host: "127.0.0.1:7337", secFetchSite: "same-origin" });
+    expect(listed.status).toBe(200);
+    const listBody = await listed.json();
+    expect(listBody.requests.find((r: { id: string }) => r.id === id)?.code).toBe(code);
+    // the list must never leak the binding hash
+    expect(JSON.stringify(listBody)).not.toContain("bindHash");
+
+    const approve = await pair(handler, `/api/pairing/requests/${id}/approve`, {
+      method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+    });
+    expect(approve.status).toBe(200);
+    expect((await approve.json()).request.status).toBe("approved");
+  });
+
+  test("reject resolves a pending request", async () => {
+    const { handler } = makeHandler("pair-op-reject");
+    const relay = RELAY("pair-op-reject");
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
+    });
+    const { id } = await created.json();
+    const reject = await pair(handler, `/api/pairing/requests/${id}/reject`, {
+      method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+    });
+    expect(reject.status).toBe(200);
+    expect((await reject.json()).request.status).toBe("rejected");
+  });
+
+  test("a bad method on an operator path is 404", async () => {
+    const { handler } = makeHandler("pair-op-badmethod");
+    const res = await pair(handler, "/api/pairing/requests", {
+      method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("pairing routes — claim", () => {
+  test("claim without the binding cookie is 401", async () => {
+    const { handler } = makeHandler("pair-claim-nocookie");
+    const relay = RELAY("pair-claim-nocookie");
+    const res = await pair(handler, "/api/pairing/request/preq_x/claim", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("claim of an unknown request is 404", async () => {
+    const { handler } = makeHandler("pair-claim-404");
+    const relay = RELAY("pair-claim-404");
+    const res = await pair(handler, "/api/pairing/request/preq_missing/claim", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie: "gini_pair=abc", body: {}
+    });
+    expect(res.status).toBe(404);
+  });
+
+  test("claim with the wrong binding secret is 403", async () => {
+    const { handler } = makeHandler("pair-claim-mismatch");
+    const relay = RELAY("pair-claim-mismatch");
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
+    });
+    const { id } = await created.json();
+    await pair(handler, `/api/pairing/requests/${id}/approve`, {
+      method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+    });
+    const res = await pair(handler, `/api/pairing/request/${id}/claim`, {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie: "gini_pair=wrong", body: {}
+    });
+    expect(res.status).toBe(403);
+  });
+
+  test("claim before approval is 409", async () => {
+    const { handler } = makeHandler("pair-claim-early");
+    const relay = RELAY("pair-claim-early");
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
+    });
+    const { id } = await created.json();
+    const bind = setCookieValue(created, "gini_pair")!;
+    const res = await pair(handler, `/api/pairing/request/${id}/claim`, {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie: `gini_pair=${encodeURIComponent(bind)}`, body: {}
+    });
+    expect(res.status).toBe(409);
+  });
+
+  test("approved claim mints a session cookie and clears the binding cookie", async () => {
+    const { session, requestId } = await pairedSession("pair-claim-ok");
+    expect(session).toMatch(/^gini_device_/);
+    expect(requestId).toMatch(/^preq_/);
+  });
+});
+
+describe("pairing routes — cancel", () => {
+  test("cancel without the binding cookie is 401", async () => {
+    const { handler } = makeHandler("pair-cancel-nocookie");
+    const relay = RELAY("pair-cancel-nocookie");
+    const res = await pair(handler, "/api/pairing/request/preq_x/cancel", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("cancel of an unknown request is 404", async () => {
+    const { handler } = makeHandler("pair-cancel-404");
+    const relay = RELAY("pair-cancel-404");
+    const res = await pair(handler, "/api/pairing/request/preq_missing/cancel", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie: "gini_pair=abc", body: {}
+    });
+    expect(res.status).toBe(404);
+  });
+
+  test("cancel with a mismatched secret is 403", async () => {
+    const { handler } = makeHandler("pair-cancel-mismatch");
+    const relay = RELAY("pair-cancel-mismatch");
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
+    });
+    const { id } = await created.json();
+    const res = await pair(handler, `/api/pairing/request/${id}/cancel`, {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie: "gini_pair=wrong", body: {}
+    });
+    expect(res.status).toBe(403);
+  });
+
+  test("cancel of own pending request succeeds and clears the cookie", async () => {
+    const { handler } = makeHandler("pair-cancel-ok");
+    const relay = RELAY("pair-cancel-ok");
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
+    });
+    const { id } = await created.json();
+    const bind = setCookieValue(created, "gini_pair")!;
+    const res = await pair(handler, `/api/pairing/request/${id}/cancel`, {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie: `gini_pair=${encodeURIComponent(bind)}`, body: {}
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).ok).toBe(true);
+    expect(res.headers.getSetCookie().some((c) => c.startsWith("gini_pair=") && c.includes("Max-Age=0"))).toBe(true);
+  });
+});
+
+describe("pairing routes — rate limit + pending cap", () => {
+  test("creation is rate limited per client key", async () => {
+    const { handler } = makeHandler("pair-ratelimit");
+    const relay = RELAY("pair-ratelimit");
+    let last = 201;
+    for (let i = 0; i < 11; i++) {
+      const res = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", xff: "9.9.9.9", body: {}
+      });
+      last = res.status;
+    }
+    expect(last).toBe(429);
+  });
+
+  test("pending cap rejects creation beyond the cap", async () => {
+    const { handler } = makeHandler("pair-pendingcap");
+    const relay = RELAY("pair-pendingcap");
+    // Vary XFF per create so the per-key rate limiter never trips; the pending
+    // cap should be what stops us.
+    let last = 201;
+    for (let i = 0; i < 21; i++) {
+      const res = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", xff: `10.0.0.${i}`, body: {}
+      });
+      last = res.status;
+    }
+    expect(last).toBe(429);
+  });
+});
+
+describe("relay session gate (web-bound branch)", () => {
+  test("unpaired relay page navigation redirects to /pair", async () => {
+    const { handler } = makeHandler("gate-redirect");
+    const relay = RELAY("gate-redirect");
+    const res = await pair(handler, "/", { host: relay, secFetchDest: "document" });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/pair");
+  });
+
+  test("unpaired relay /api/runtime call is 401", async () => {
+    const { handler } = makeHandler("gate-api-401");
+    const relay = RELAY("gate-api-401");
+    const res = await pair(handler, "/api/runtime/state", {
+      host: relay, origin: `https://${relay}`, secFetchSite: "same-origin"
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("a bootstrap path is reachable unpaired (not redirected)", async () => {
+    const { handler } = makeHandler("gate-bootstrap");
+    const relay = RELAY("gate-bootstrap");
+    const res = await pair(handler, "/pair", { host: relay, secFetchDest: "document" });
+    expect(res.status).not.toBe(302);
+    expect(res.status).not.toBe(401);
+  });
+
+  test("a valid session cookie passes the gate", async () => {
+    const { handler, relay, session } = await pairedSession("gate-allow");
+    const res = await pair(handler, "/", {
+      host: relay, secFetchDest: "document", cookie: `gini_session=${encodeURIComponent(session)}`
+    });
+    // Past the gate → proxyWeb fallback (no web child in tests), never 302/401.
+    expect(res.status).not.toBe(302);
+    expect(res.status).not.toBe(401);
+  });
+
+  test("loopback is never gated", async () => {
+    const { handler } = makeHandler("gate-loopback");
+    const res = await pair(handler, "/", { host: "127.0.0.1:7337", secFetchDest: "document" });
+    expect(res.status).not.toBe(302);
+    expect(res.status).not.toBe(401);
+  });
+});

@@ -1,5 +1,22 @@
-import type { RuntimeConfig } from "../types";
-import { claimPairingCode, createPairingCode, findActiveDeviceByToken, mutateState, readState, revokeDevice } from "../state";
+import type { PairedDevice, RuntimeConfig } from "../types";
+import {
+  approvePairingRequest,
+  cancelPairingRequest,
+  claimPairingCode,
+  claimPairingRequest,
+  createPairingCode,
+  createPairingRequest,
+  findActiveDeviceByToken,
+  findActiveSessionByToken,
+  getPairingRequest,
+  listPendingPairingRequests,
+  mutateState,
+  readState,
+  redactPairingRequest,
+  rejectPairingRequest,
+  revokeDevice,
+  touchSessionLastSeen
+} from "../state";
 
 export async function createPairing(config: RuntimeConfig, input: Record<string, unknown>) {
   const ttlSeconds = Math.min(3600, Math.max(60, Number(input.ttlSeconds ?? 600)));
@@ -65,6 +82,73 @@ export function redactDevice(device: ReturnType<typeof readState>["devices"][num
     createdAt: device.createdAt,
     updatedAt: device.updatedAt,
     lastSeenAt: device.lastSeenAt,
-    revokedAt: device.revokedAt
+    revokedAt: device.revokedAt,
+    origin: device.origin,
+    expiresAt: device.expiresAt
   };
+}
+
+// ---------------------------------------------------------------------------
+// Relay device-pairing request flow (operator-approved). These wrap the state
+// mutators with mutateState + redaction so the HTTP layer stays thin. See ADR
+// device-pairing-auth.md.
+
+// A relay device opens a pairing request. `bindHash` is hashSecret of the
+// per-request binding secret the route stores as the gini_pair cookie.
+export async function requestPairing(
+  config: RuntimeConfig,
+  input: { userAgent: string; relayHost: string; bindHash: string; ttlSeconds?: number }
+) {
+  const request = await mutateState(config.instance, (state) => createPairingRequest(state, input));
+  return redactPairingRequest(request);
+}
+
+// Operator-facing list of pending requests (loopback-only at the route). Uses
+// mutateState so the lazy expiry sweep persists.
+export async function listPairingRequests(config: RuntimeConfig) {
+  const pending = await mutateState(config.instance, (state) => listPendingPairingRequests(state));
+  return pending.map(redactPairingRequest);
+}
+
+// Device-facing status poll. Returns the redacted request or null when unknown.
+export async function getPairingRequestStatus(config: RuntimeConfig, id: string) {
+  const request = await mutateState(config.instance, (state) => getPairingRequest(state, id));
+  return request ? redactPairingRequest(request) : null;
+}
+
+export async function approvePairing(config: RuntimeConfig, id: string) {
+  return redactPairingRequest(await mutateState(config.instance, (state) => approvePairingRequest(state, id)));
+}
+
+export async function rejectPairing(config: RuntimeConfig, id: string) {
+  return redactPairingRequest(await mutateState(config.instance, (state) => rejectPairingRequest(state, id)));
+}
+
+// Device cancels its own request; bindSecret must match the gini_pair cookie.
+export async function cancelPairing(config: RuntimeConfig, id: string, bindSecret: string) {
+  return mutateState(config.instance, (state) => cancelPairingRequest(state, id, bindSecret));
+}
+
+// Device claims its approved request, minting the session device and returning
+// the raw token exactly once (the route sets it as the gini_session cookie).
+export async function claimPairingSession(config: RuntimeConfig, id: string, bindSecret: string) {
+  return mutateState(config.instance, (state) => claimPairingRequest(state, id, bindSecret));
+}
+
+// Read-only session validation for the gateway's hot relay cookie gate. Sync —
+// readState is a lock-free atomic read and the gate runs on every proxied
+// request, so this never writes (no lastSeenAt bump). Returns the active,
+// unexpired session device or undefined.
+export function resolveSessionFromCookie(config: RuntimeConfig, token: string | undefined): PairedDevice | undefined {
+  if (!token) return undefined;
+  return findActiveSessionByToken(readState(config.instance), token);
+}
+
+// Bump lastSeenAt for a session. Called by the gate on document navigations
+// (infrequent) so the Active Sessions list shows a useful "last seen" without a
+// write on every asset request.
+export async function touchPairedSession(config: RuntimeConfig, token: string): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    touchSessionLastSeen(state, token);
+  });
 }

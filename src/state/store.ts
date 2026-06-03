@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import type { Authorization, ConnectorRecord, Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState, SetupRequest, SetupRequestAction, SetupRequestStatus, TaskStatus } from "../types";
+import type { Authorization, ConnectorRecord, Instance, PairingRequestStatus, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState, SetupRequest, SetupRequestAction, SetupRequestStatus, TaskStatus } from "../types";
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
 import { defaultAgent, defaultTools, defaultToolsets } from "./defaults";
@@ -46,6 +46,7 @@ export function createEmptyState(instance: Instance): RuntimeState {
     ],
     improvements: [],
     pairingCodes: [],
+    pairingRequests: [],
     devices: [],
     promotions: [],
     snapshots: [],
@@ -137,6 +138,19 @@ export function expirePairingCodes(state: RuntimeState): void {
   }
 }
 
+// Lazily expire stale pending pairing requests, mirroring expirePairingCodes.
+// Called at the top of every pairing-request read/mutate so a request that
+// timed out before the operator acted resolves to "expired" rather than
+// lingering as an approvable row.
+export function expirePairingRequests(state: RuntimeState): void {
+  const at = Date.now();
+  for (const request of state.pairingRequests) {
+    if (request.status === "pending" && new Date(request.expiresAt).getTime() <= at) {
+      request.status = "expired" satisfies PairingRequestStatus;
+    }
+  }
+}
+
 // Pre-rename state files persisted a `lane` field on every record (top-level
 // state.lane plus a lane field on every Task/Audit/Memory/Skill/etc.). After
 // the lane→instance rename these files still exist on disk; we rewrite them
@@ -163,6 +177,7 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
     "connectors",
     "improvements",
     "pairingCodes",
+    "pairingRequests",
     "devices",
     "promotions",
     "snapshots",
@@ -1061,6 +1076,7 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.skills ??= [];
   state.jobs ??= [];
   state.pairingCodes ??= [];
+  state.pairingRequests ??= [];
   state.devices ??= [];
   state.promotions ??= [];
   state.snapshots ??= [];
