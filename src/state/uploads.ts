@@ -47,7 +47,7 @@ function ensureUploadsDir(instance: Instance): string {
   return dir;
 }
 
-function extensionFor(mimeType: string): string {
+export function extensionFor(mimeType: string): string {
   switch (mimeType) {
     case "image/png": return "png";
     case "image/jpeg": return "jpg";
