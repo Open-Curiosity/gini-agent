@@ -133,4 +133,31 @@ describe("materializeUpload", () => {
     // Nothing was written through the link.
     expect(() => statSync(join(outside, upload.id, "evil.txt"))).toThrow();
   });
+
+  test("does not blindly return a same-size destination that is a symlink escaping the workspace", () => {
+    const cfg = config("mc-symlink-fastpath");
+    const bytes = new TextEncoder().encode("same-size payload");
+    const upload = storeUpload(cfg.instance, bytes, "text/plain", "escape.txt");
+
+    // Plant an outside file with the SAME byte length as the upload, then make
+    // the destination path a symlink to it. existsSync + size-match would let
+    // the idempotent fast path return the symlink and read through it (escape),
+    // so the fast path must run the symlink-safe guard first.
+    const outsideDir = join(ROOT, cfg.instance, "outside");
+    mkdirSync(outsideDir, { recursive: true });
+    const outsideFile = join(outsideDir, "outside.txt");
+    writeFileSync(outsideFile, bytes);
+
+    const destDir = join(cfg.workspaceRoot, "uploads", upload.id);
+    mkdirSync(destDir, { recursive: true });
+    const destLink = join(destDir, "escape.txt");
+    symlinkSync(outsideFile, destLink);
+
+    // The escaping symlink must not be blindly returned. The guarded rewrite
+    // rejects the symlinked destination component.
+    expect(() => materializeUpload(cfg, upload.id)).toThrow(/symlink/i);
+    // The outside file was not overwritten through the link, and no path that
+    // resolves outside the workspace was returned.
+    expect(new Uint8Array(readFileSync(outsideFile))).toEqual(bytes);
+  });
 });

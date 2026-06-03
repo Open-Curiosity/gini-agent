@@ -12,6 +12,7 @@ import { existsSync } from "node:fs";
 import { basename, join, relative } from "node:path";
 import type { RuntimeConfig } from "../types";
 import { readUpload, sanitizeFilename, extensionFor } from "../state/uploads";
+import { assertInsideWorkspaceNoSymlinkEscape } from "../state";
 import { writeInsideWorkspace } from "./workspace-write";
 
 export interface MaterializedUpload {
@@ -38,6 +39,20 @@ function safeSegment(name: string): string {
   return base.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "");
 }
 
+// True when an already-existing destination resolves (through any symlinks on
+// its path) to a location inside the workspace. The escape guard throws on a
+// symlink that walks out of the workspace, so a false return means the fast
+// path must not trust the existing file — the caller rewrites through the
+// guarded write, which rejects the escape.
+function existingPathIsSafe(workspaceRoot: string, dest: string): boolean {
+  try {
+    assertInsideWorkspaceNoSymlinkEscape(workspaceRoot, dest);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Write the upload's bytes to `<workspaceRoot>/uploads/<id>/<name>` and
 // return its metadata. Idempotent: if the destination already exists with
 // the same byte length, skip the rewrite. Returns null when the upload
@@ -56,9 +71,17 @@ export function materializeUpload(
 
   // Write-if-missing: only write when absent or a stale partial (different
   // size). Upload bytes are immutable for a given id, so a same-size file is
-  // treated as already materialized.
+  // treated as already materialized. The skip-rewrite optimization only holds
+  // when the existing destination resolves safely inside the workspace — a
+  // same-size symlink pointing outside would otherwise be returned and later
+  // read through, escaping the workspace. When the guard rejects, fall through
+  // to writeInsideWorkspace, which re-runs the symlink walk and throws.
   let absPath: string;
-  if (existsSync(expectedAbs) && Bun.file(expectedAbs).size === upload.bytes.length) {
+  if (
+    existsSync(expectedAbs) &&
+    Bun.file(expectedAbs).size === upload.bytes.length &&
+    existingPathIsSafe(config.workspaceRoot, dest)
+  ) {
     absPath = expectedAbs;
   } else {
     absPath = writeInsideWorkspace(config.workspaceRoot, dest, upload.bytes);

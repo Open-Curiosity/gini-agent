@@ -7,10 +7,20 @@ function provider(name: ProviderConfig["name"], model: string): ProviderConfig {
 }
 
 describe("resolveProviderModality", () => {
-  test("openai models support vision and native docs", () => {
+  test("known openai families support vision and native docs", () => {
     expect(resolveProviderModality(provider("openai", "gpt-5.5"))).toEqual({ vision: true, nativeDocs: true });
     expect(resolveProviderModality(provider("openai", "gpt-4o"))).toEqual({ vision: true, nativeDocs: true });
+    expect(resolveProviderModality(provider("openai", "gpt-4.1-mini"))).toEqual({ vision: true, nativeDocs: true });
     expect(resolveProviderModality(provider("openai", "o4-mini"))).toEqual({ vision: true, nativeDocs: true });
+    expect(resolveProviderModality(provider("openai", "ChatGPT-4o-latest"))).toEqual({ vision: true, nativeDocs: true });
+  });
+
+  test("unknown openai model ids fall back to conservative false", () => {
+    // A custom OpenAI-compatible endpoint (or an unrecognized model) must not
+    // be handed a document part it can't ingest.
+    expect(resolveProviderModality(provider("openai", "llama-3-70b"))).toEqual({ vision: false, nativeDocs: false });
+    expect(resolveProviderModality(provider("openai", "text-davinci-003"))).toEqual({ vision: false, nativeDocs: false });
+    expect(resolveProviderModality(provider("openai", ""))).toEqual({ vision: false, nativeDocs: false });
   });
 
   test("openrouter supported families resolve to both true", () => {

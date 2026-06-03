@@ -5,6 +5,7 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
+import { resolveProviderModality } from "./provider-capabilities";
 import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -343,6 +344,32 @@ export interface ToolCallingMessage {
   tool_calls?: ToolCall[];
 }
 
+// Defensive guard at the request-build boundary: a `document` content part is
+// only ever produced upstream when the resolved provider's `nativeDocs` is
+// true (see src/provider-capabilities.ts). But a task that paused for approval
+// can resume after the active provider changed (openai → deepseek/local), and
+// resumeChatTask replays the persisted message snapshot without re-resolving
+// modality — so a stale `document` part can reach a provider that 400s on it.
+// Strip document parts from every parts-array message when the resolved
+// provider can't ingest documents. Text/image_url parts pass through; a
+// message left with no parts keeps a single empty-text part so `content` is
+// never an empty array.
+function stripDocumentPartsIfUnsupported(
+  messages: ToolCallingMessage[],
+  provider: ProviderConfig
+): ToolCallingMessage[] {
+  if (resolveProviderModality(provider).nativeDocs) return messages;
+  return messages.map((message) => {
+    if (!Array.isArray(message.content)) return message;
+    if (!message.content.some((part) => part.type === "document")) return message;
+    const kept = message.content.filter((part) => part.type !== "document");
+    return {
+      ...message,
+      content: kept.length > 0 ? kept : [{ type: "text", text: "" }]
+    };
+  });
+}
+
 export interface ToolCallingResult {
   provider: ProviderConfig;
   text: string;
@@ -501,10 +528,11 @@ async function callToolCallingChatCompletions(
   };
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   const wantStream = Boolean(onDelta);
+  const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
   const body: Record<string, unknown> = {
     ...sanitizeExtraBody(provider.extraBody),
     model: provider.model,
-    messages: messages.map(serializeChatMessage),
+    messages: safeMessages.map(serializeChatMessage),
     stream: wantStream,
     // Pin the default (non-extended) prompt cache tier on every
     // OpenAI-compatible chat-completions call. "in_memory" is what the
@@ -743,7 +771,8 @@ async function callToolCallingResponses(
   return withCodexSessionRetry(async () => {
     const bearer = readCodexBearer(provider);
     const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
-    const { instructions, input } = translateMessagesToResponsesInput(messages);
+    const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
+    const { instructions, input } = translateMessagesToResponsesInput(safeMessages);
     const responsesTools = tools.map((tool) => ({
       type: "function" as const,
       name: tool.function.name,

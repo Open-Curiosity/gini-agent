@@ -42,6 +42,16 @@ function documentParts(parts: MessageContentPart[]) {
   return parts.filter((p) => p.type === "document");
 }
 
+// Find a BEGIN/END UNTRUSTED FILE block carrying a matching random nonce and
+// return the body between the markers. The nonce is per-file and unpredictable
+// (anti-spoofing), so the test matches on structure, not literal marker text.
+const UNTRUSTED_BLOCK = /<<<BEGIN UNTRUSTED FILE ([0-9a-f-]+)>>>\n([\s\S]*)\n<<<END UNTRUSTED FILE \1>>>/;
+
+function untrustedBlockBody(text: string): string | null {
+  const m = text.match(UNTRUSTED_BLOCK);
+  return m ? m[2]! : null;
+}
+
 describe("attachment delivery", () => {
   let root: string;
   let workspaceRoot: string;
@@ -109,9 +119,9 @@ describe("attachment delivery", () => {
 
     expect(documentParts(parts).length).toBe(0);
     const joined = textParts(parts).join("\n");
-    expect(joined).toContain("<<<FILE CONTENT START: report.pdf>>>");
-    expect(joined).toContain("<<<FILE CONTENT END: report.pdf>>>");
-    expect(joined).toContain("Hello Gini PDF fixture");
+    const body = untrustedBlockBody(joined);
+    expect(body).not.toBeNull();
+    expect(body!).toContain("Hello Gini PDF fixture");
     expect(joined).toContain("untrusted external data");
   });
 
@@ -129,8 +139,9 @@ describe("attachment delivery", () => {
 
     expect(documentParts(parts).length).toBe(0);
     const joined = textParts(parts).join("\n");
-    expect(joined).toContain("<<<FILE CONTENT START: scores.csv>>>");
-    expect(joined).toContain("ada,99");
+    const body = untrustedBlockBody(joined);
+    expect(body).not.toBeNull();
+    expect(body!).toContain("ada,99");
     expect(joined).toContain("saved to your workspace at uploads/" + upload.id);
     expect(existsSync(join(workspaceRoot, "uploads", upload.id, "scores.csv"))).toBe(true);
   });
@@ -149,7 +160,7 @@ describe("attachment delivery", () => {
 
     expect(documentParts(parts).length).toBe(0);
     const joined = textParts(parts).join("\n");
-    expect(joined).not.toContain("<<<FILE CONTENT START");
+    expect(untrustedBlockBody(joined)).toBeNull();
     expect(joined).toContain("[Attached file: report.pdf (application/pdf");
     expect(joined).toContain("saved to your workspace at uploads/" + upload.id);
     // Still materialized on replay.
@@ -169,7 +180,7 @@ describe("attachment delivery", () => {
 
     expect(documentParts(parts).length).toBe(0);
     const joined = textParts(parts).join("\n");
-    expect(joined).not.toContain("<<<FILE CONTENT START");
+    expect(untrustedBlockBody(joined)).toBeNull();
     expect(joined).toContain("[Attached file: bundle.zip (application/zip");
     expect(joined).toContain("saved to your workspace at uploads/" + upload.id);
   });
@@ -187,15 +198,37 @@ describe("attachment delivery", () => {
       true
     );
 
-    const wrapped = textParts(parts).find((t) => t.includes("<<<FILE CONTENT START: big.txt>>>"))!;
+    const wrapped = textParts(parts).find((t) => untrustedBlockBody(t) !== null)!;
     expect(wrapped).toBeDefined();
     expect(wrapped).toContain("truncated to 256KB");
     // Inlined body (between the markers) is capped at 256KB, not the full 300KB.
-    const start = wrapped.indexOf("\n", wrapped.indexOf("<<<FILE CONTENT START")) + 1;
-    const end = wrapped.indexOf("\n<<<FILE CONTENT END");
-    const body = wrapped.slice(start, end);
+    const body = untrustedBlockBody(wrapped)!;
     expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(256 * 1024);
     expect(body.length).toBeLessThan(big.length);
+  });
+
+  test("truncation cuts on a UTF-8 boundary: no replacement char, strictly under the byte cap", async () => {
+    // "中" is a 3-byte UTF-8 char; 256KB is not a multiple of 3, so a naive
+    // byte slice at exactly MAX_INLINE_BYTES would split the final char into a
+    // U+FFFD replacement char and push the result over the cap.
+    const big = "中".repeat(100 * 1024); // ~300KB of 3-byte chars
+    const upload = storeUpload(config.instance, new TextEncoder().encode(big), "text/plain", "cjk.txt");
+
+    const parts = await buildAttachmentContent(
+      config,
+      "read it",
+      [{ id: upload.id, mimeType: "text/plain", size: upload.size }],
+      TEXT_ONLY,
+      true
+    );
+
+    const wrapped = textParts(parts).find((t) => untrustedBlockBody(t) !== null)!;
+    const body = untrustedBlockBody(wrapped)!;
+    expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(256 * 1024);
+    // The cut landed on a char boundary — no corrupted tail.
+    expect(body).not.toContain("�");
+    // Body is whole 3-byte chars only.
+    expect(Buffer.byteLength(body, "utf8") % 3).toBe(0);
   });
 
   test("a non-nativeDocs provider never yields a document part even for a PDF", async () => {

@@ -23,6 +23,12 @@ export interface ProviderModality {
   nativeDocs: boolean;
 }
 
+// Known OpenAI vision/document model families. The `openai` provider name
+// also covers custom OpenAI-compatible endpoints (a user-set baseUrl + an
+// arbitrary model id), so gating on a known family keeps an unrecognized or
+// text-only compatible model from being handed a `document` part it 400s on.
+const OPENAI_NATIVE_FAMILY = /^(gpt-4o|gpt-4\.1|gpt-5|o1|o3|o4|chatgpt-4o)/i;
+
 // OpenRouter routes to many upstream models under `<vendor>/<model>` slugs.
 // The families below are documented to accept image + file input via
 // OpenRouter's unified `file` content part. Anything outside these families
@@ -41,8 +47,12 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
   switch (provider.name) {
     case "openai":
       // gpt-4o / 4.1 / 5.x / o-series accept image input and ingest files
-      // natively (Responses input_file / Chat-Completions file).
-      return { vision: true, nativeDocs: true };
+      // natively (Responses input_file / Chat-Completions file). Gate on a
+      // known family so an unknown model id (or a custom OpenAI-compatible
+      // endpoint pointed at a text-only model) stays conservatively false.
+      return OPENAI_NATIVE_FAMILY.test(model)
+        ? { vision: true, nativeDocs: true }
+        : { vision: false, nativeDocs: false };
     case "openrouter":
       return openrouterModality(model);
     case "deepseek":

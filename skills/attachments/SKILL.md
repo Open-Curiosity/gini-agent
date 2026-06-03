@@ -148,7 +148,7 @@ When an integration needs the actual file (not an upload id) — e.g. a git flow
 
 ### Chat-attached files are already delivered for you
 
-When the user attaches a file in chat, the runtime delivers it to you in core — you do **not** need this skill to read it. The content arrives in the user message (a native document part, or inlined extracted text wrapped in `<<<FILE CONTENT START/END>>>` markers), and the file is already saved to your workspace at the `uploads/<id>/<name>` path named in the message. Read the workspace file directly with `file_read` / `code_exec` when you need more than the inlined preview. See ADR chat-file-attachments.md. This skill is for **agent-initiated** byte movement (URL downloads, promoting generated files, sending to an external system), not for reading the user's chat uploads.
+When the user attaches a file in chat, the runtime delivers it to you in core — you do **not** need this skill to read it. The content arrives in the user message (a native document part, or inlined extracted text wrapped in `<<<BEGIN/END UNTRUSTED FILE <nonce>>>>` markers), and the file is already saved to your workspace at the `uploads/<id>/<name>` path named in the message. Read the workspace file directly with `file_read` / `code_exec` when you need more than the inlined preview. See ADR chat-file-attachments.md. This skill is for **agent-initiated** byte movement (URL downloads, promoting generated files, sending to an external system), not for reading the user's chat uploads.
 
 ## Rules
 
