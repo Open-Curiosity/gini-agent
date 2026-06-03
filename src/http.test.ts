@@ -849,7 +849,7 @@ describe("runtime api", () => {
       expect(captured.host).toBe(`127.0.0.1:${upstream.port}`);
       expect(captured.origin).toBe(`http://127.0.0.1:${upstream.port}`);
     } finally {
-      upstream.stop(true);
+      await upstream.stop(true);
       clearWebTargetCache(config.instance);
     }
   });

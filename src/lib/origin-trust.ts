@@ -74,50 +74,47 @@ export function trustedOrigins(): ReadonlySet<string> | null {
 
 const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
+// The host/origin trust decision (the Sec-Fetch-Site check is applied
+// separately by the caller). Returns true when the inbound Host/Origin may be
+// reverse-proxied to the inner web child.
+//
+//   - No Origin: allow only safe methods on a Host that is itself trusted —
+//     loopback (covers local dev AND the runtime's own loopback probes, e.g.
+//     the tunnel readiness probe GET /api/runtime/__healthz which carries no
+//     Origin) or the relay front (top-level navigations over the tunnel).
+//     Loopback/relay are trusted regardless of GINI_TRUSTED_ORIGINS — a
+//     rebinding page cannot forge a loopback Host and the relay owns its DNS.
+//     An unsafe no-Origin request must use the native /api/* surface with its
+//     own bearer.
+//   - Origin present: a relay Origin is trusted regardless of Host (the browser
+//     cannot forge Origin); a loopback Origin on a loopback Host is local;
+//     otherwise the Origin must match GINI_TRUSTED_ORIGINS (or, with no
+//     allowlist, equal a loopback Host).
+function hostOriginTrusted(origin: string | null, isUnsafe: boolean, expectedHost: string): boolean {
+  if (!origin) {
+    return !isUnsafe && (isLoopbackHost(expectedHost) || isRelayHost(expectedHost));
+  }
+  let originUrl: URL;
+  try {
+    originUrl = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (isRelayHost(originUrl.host)) return true;
+  if (isLoopbackHost(expectedHost) && isLoopbackHost(originUrl.host)) return true;
+  const allowlist = trustedOrigins();
+  if (allowlist) return allowlist.has(`${originUrl.protocol}//${originUrl.host}`);
+  return isLoopbackHost(expectedHost) && originUrl.host === expectedHost;
+}
+
 // The web-bound trust decision for the gateway. Returns true when the request
 // may be reverse-proxied to the inner web child, false when it must be refused.
-//
-// Tiered by method, identical in spirit to the BFF guard it replaces:
-//   - Unsafe methods (POST/PUT/PATCH/DELETE) require an Origin; absence means a
-//     non-browser client that should hit the gateway's native /api/* with its
-//     own token, not the token-injecting proxied surface.
-//   - Safe methods (GET/HEAD) may omit Origin (top-level navigations), so the
-//     Host is validated instead: loopback or relay-subdomain pass; with
-//     GINI_TRUSTED_ORIGINS set we fail closed for everything except the relay
-//     front. When Origin IS present it is validated against the relay lane, the
-//     allowlist, or loopback-Host equality.
-//   - Sec-Fetch-Site, when present, must be same-origin or none.
+// Sec-Fetch-Site, when present, must be same-origin or none.
 export function webBoundRequestAllowed(request: Request): boolean {
   const origin = request.headers.get("origin");
   const isUnsafe = UNSAFE_METHODS.has(request.method);
   const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
-
-  if (!origin) {
-    if (isUnsafe) return false;
-    const allowlist = trustedOrigins();
-    if (allowlist) {
-      if (!isRelayHost(expectedHost)) return false;
-    } else if (!isLoopbackHost(expectedHost) && !isRelayHost(expectedHost)) {
-      return false;
-    }
-  } else {
-    let originUrl: URL;
-    try {
-      originUrl = new URL(origin);
-    } catch {
-      return false;
-    }
-    if (!isRelayHost(originUrl.host)) {
-      const allowlist = trustedOrigins();
-      if (allowlist) {
-        if (!allowlist.has(`${originUrl.protocol}//${originUrl.host}`)) return false;
-      } else {
-        if (!isLoopbackHost(expectedHost)) return false;
-        if (originUrl.host !== expectedHost) return false;
-      }
-    }
-  }
-
+  if (!hostOriginTrusted(origin, isUnsafe, expectedHost)) return false;
   const fetchSite = request.headers.get("sec-fetch-site");
   if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") return false;
   return true;

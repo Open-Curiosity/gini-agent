@@ -112,10 +112,23 @@ describe("webBoundRequestAllowed — no Origin", () => {
   test("safe method on an unknown Host (no allowlist) is refused", () => {
     expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "evil.example", url: "https://evil.example/" }))).toBe(false);
   });
-  test("with an allowlist set, safe method on relay Host passes but unknown Host is refused", () => {
+  test("with an allowlist set, relay and loopback hosts still pass safe no-Origin requests; unknown hosts are refused", () => {
     process.env.GINI_TRUSTED_ORIGINS = "https://allowed.example";
+    // Relay front is auto-trusted.
     expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "g31.gini-relay.lilaclabs.ai", url: "https://g31.gini-relay.lilaclabs.ai/" }))).toBe(true);
-    expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "127.0.0.1:7778" }))).toBe(false);
+    // Loopback is trusted regardless of the allowlist — this is the runtime's own
+    // readiness probe shape (no-Origin loopback GET to /api/runtime/__healthz),
+    // which the tunnel connect flow runs against the gateway port.
+    expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "127.0.0.1:7778", url: "http://127.0.0.1:7778/api/runtime/__healthz" }))).toBe(true);
+    // An unknown non-loopback, non-relay Host with no Origin is still refused.
+    expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "evil.example", url: "https://evil.example/" }))).toBe(false);
+  });
+});
+
+describe("webBoundRequestAllowed — loopback trusted regardless of allowlist", () => {
+  test("loopback Origin on a loopback Host passes even with an allowlist set", () => {
+    process.env.GINI_TRUSTED_ORIGINS = "https://allowed.example";
+    expect(webBoundRequestAllowed(makeReq({ method: "POST", host: "127.0.0.1:7778", origin: "http://127.0.0.1:7778" }))).toBe(true);
   });
 });
 
