@@ -92,20 +92,12 @@ export default function PairPage() {
         const { status } = await pollPairingRequest(id);
         if (cancelled) return;
         if (status === "approved") {
+          // Hand off to the dedicated claim effect below. We must NOT claim
+          // inline here: setPhase("claiming") re-runs THIS effect, whose
+          // cleanup sets `cancelled = true`, which would then abort the
+          // post-claim reload even though the claim succeeded.
           stopPolling();
           setPhase("claiming");
-          try {
-            await claimPairingRequest(id);
-            if (cancelled) return;
-            setPhase("paired");
-            // The claim set the gini_session cookie; a full reload re-enters
-            // the app authenticated instead of bouncing back to /pair.
-            window.location.assign("/");
-          } catch (e) {
-            if (cancelled) return;
-            setError(e instanceof Error ? e.message : String(e));
-            setPhase("claim-error");
-          }
           return;
         }
         if (status === "rejected") {
@@ -130,6 +122,35 @@ export default function PairPage() {
       stopPolling();
     };
   }, [phase, id, stopPolling]);
+
+  // Claim runs in its OWN effect, entered when the poll flips us to "claiming".
+  // It is deliberately separate from the poll effect: doing the claim inside the
+  // poll tick self-cancelled, because setPhase("claiming") re-runs the poll
+  // effect and its cleanup sets that tick's `cancelled` flag — so the post-claim
+  // reload never fired even though the claim (and the gini_session cookie) had
+  // succeeded. Here, nothing mutates [phase, id] during the claim await, so the
+  // success path always completes.
+  useEffect(() => {
+    if (phase !== "claiming" || !id) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        await claimPairingRequest(id);
+        if (cancelled) return;
+        setPhase("paired");
+        // The claim set the gini_session cookie; a full reload re-enters the
+        // app authenticated instead of bouncing back to /pair.
+        window.location.assign("/");
+      } catch (e) {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setPhase("claim-error");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [phase, id]);
 
   const cancel = useCallback(async () => {
     stopPolling();

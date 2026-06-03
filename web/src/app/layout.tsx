@@ -2,8 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Providers } from "@/components/providers";
-import { MobileTopBar, Sidebar } from "@/components/Sidebar";
-import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
+import { AppShell } from "@/components/AppShell";
 
 export const dynamic = "force-dynamic";
 
@@ -20,20 +19,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
     <html lang="en" suppressHydrationWarning className={`${geistSans.variable} ${geistMono.variable} h-full`}>
       <body suppressHydrationWarning className="min-h-full bg-background text-foreground">
         <Providers>
-          <div className="flex h-screen">
-            <Sidebar />
-            <div className="flex flex-1 flex-col overflow-hidden">
-              <MobileTopBar />
-              <main className="relative flex flex-1 flex-col overflow-hidden">
-                <div className="pointer-events-none absolute right-4 top-4 z-30">
-                  <div className="pointer-events-auto">
-                    <TunnelMenu />
-                  </div>
-                </div>
-                {children}
-              </main>
-            </div>
-          </div>
+          <AppShell>{children}</AppShell>
         </Providers>
       </body>
     </html>

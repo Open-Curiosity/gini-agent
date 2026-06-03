@@ -3,6 +3,7 @@
 import { ThemeProvider } from "next-themes";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
+import { usePathname } from "next/navigation";
 import { Toaster } from "sonner";
 import { RuntimeStreamBridge } from "./RuntimeStreamBridge";
 
@@ -38,6 +39,12 @@ if (!(console.error as WrappedConsoleError).__giniNextThemesFilter) {
 }
 
 export function Providers({ children }: { children: ReactNode }) {
+  // The /pair page is shown to an UNPAIRED device with no session. The global
+  // SSE bridge opens an EventSource to /api/runtime/events/stream, which 401s
+  // (and auto-retries) over the relay until the device is paired — pure console
+  // noise on the pairing screen. Skip it on /pair; every other route mounts it.
+  const pathname = usePathname();
+  const onPairPage = pathname?.startsWith("/pair") ?? false;
   const [client] = useState(() => new QueryClient({
     defaultOptions: {
       // SSE-driven invalidation (via RuntimeStreamBridge) handles freshness.
@@ -49,7 +56,7 @@ export function Providers({ children }: { children: ReactNode }) {
   return (
     <ThemeProvider attribute="class" defaultTheme="dark" enableSystem={false} disableTransitionOnChange>
       <QueryClientProvider client={client}>
-        <RuntimeStreamBridge />
+        {!onPairPage && <RuntimeStreamBridge />}
         {children}
         <Toaster richColors position="bottom-right" />
       </QueryClientProvider>
