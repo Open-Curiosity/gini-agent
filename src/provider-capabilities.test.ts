@@ -21,6 +21,10 @@ describe("resolveProviderModality", () => {
     expect(resolveProviderModality(provider("openai", "llama-3-70b"))).toEqual({ vision: false, nativeDocs: false });
     expect(resolveProviderModality(provider("openai", "text-davinci-003"))).toEqual({ vision: false, nativeDocs: false });
     expect(resolveProviderModality(provider("openai", ""))).toEqual({ vision: false, nativeDocs: false });
+    // Prefix collisions must NOT match a known family (no boundary → false).
+    expect(resolveProviderModality(provider("openai", "gpt-5foo"))).toEqual({ vision: false, nativeDocs: false });
+    expect(resolveProviderModality(provider("openai", "gpt-4oish"))).toEqual({ vision: false, nativeDocs: false });
+    expect(resolveProviderModality(provider("openai", "o1derful"))).toEqual({ vision: false, nativeDocs: false });
   });
 
   test("openrouter supported families resolve to both true", () => {

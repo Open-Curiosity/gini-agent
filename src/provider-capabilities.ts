@@ -27,7 +27,11 @@ export interface ProviderModality {
 // also covers custom OpenAI-compatible endpoints (a user-set baseUrl + an
 // arbitrary model id), so gating on a known family keeps an unrecognized or
 // text-only compatible model from being handed a `document` part it 400s on.
-const OPENAI_NATIVE_FAMILY = /^(gpt-4o|gpt-4\.1|gpt-5|o1|o3|o4|chatgpt-4o)/i;
+// The trailing boundary (end-of-string, `-`, or `.`) prevents prefix
+// collisions: `gpt-5.4`/`gpt-4o-mini`/`o1-mini` match, but a colliding id
+// like `gpt-5foo`/`gpt-4oish`/`o1derful` does not (defaults conservatively
+// to false rather than being handed a document part).
+const OPENAI_NATIVE_FAMILY = /^(gpt-4o|gpt-4\.1|gpt-5|o1|o3|o4|chatgpt-4o)(?=$|[-.])/i;
 
 // OpenRouter routes to many upstream models under `<vendor>/<model>` slugs.
 // The families below are documented to accept image + file input via
