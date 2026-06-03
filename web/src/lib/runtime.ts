@@ -160,6 +160,14 @@ export async function proxyRequest(
   const signal = options.signal ?? request.signal;
   if (signal) init.signal = signal;
   if (!["GET", "HEAD"].includes(request.method)) {
+    // Bound the buffered body. 50MB is far above any legitimate runtime POST
+    // (chat/config payloads are tiny), so this only stops oversized uploads.
+    // GINI_MAX_UPLOAD_BYTES overrides it to mirror the gateway's cap.
+    const cap = Number(process.env.GINI_MAX_UPLOAD_BYTES);
+    const maxBytes = Number.isFinite(cap) && cap > 0 ? cap : 50 * 1024 * 1024;
+    if (Number(request.headers.get("content-length") ?? 0) > maxBytes) {
+      return Response.json({ error: "Upload too large." }, { status: 413 });
+    }
     const body = await request.arrayBuffer();
     if (body.byteLength > 0) init.body = body;
   }
@@ -183,9 +191,13 @@ export async function proxyRequest(
   // Binary passthrough for non-text payloads (image uploads, file
   // downloads). Routing on text() would UTF-8-decode bytes and corrupt
   // them. Anything not obviously text streams the upstream body through
-  // unbuffered, mirroring the SSE branch above.
+  // unbuffered, mirroring the SSE branch above. Served uploads carry
+  // Content-Disposition: attachment and may have a text/* mime (csv, log,
+  // code) holding non-UTF-8 bytes — stream those opaquely too so the
+  // download is byte-identical rather than decode/re-encoded.
   const isText = /^(application\/(json|xml|.*\+json|.*\+xml)|text\/)/i.test(upstreamContentType);
-  if (!isText) {
+  const isAttachment = (upstream.headers.get("content-disposition") ?? "").toLowerCase().includes("attachment");
+  if (!isText || isAttachment) {
     const passthroughHeaders = new Headers();
     passthroughHeaders.set("content-type", upstreamContentType);
     for (const name of PASSTHROUGH_RESPONSE_HEADERS) {

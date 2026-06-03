@@ -35,7 +35,7 @@ import {
   type MessageContentPart,
   type ToolCall
 } from "../provider";
-import { uploadDataUrl, uploadStat } from "../state/uploads";
+import { uploadDataUrl, uploadStat, sanitizeFilename } from "../state/uploads";
 import {
   SOUL_SOFT_CAP_CHARS,
   USER_SOFT_CAP_CHARS,
@@ -715,7 +715,10 @@ function buildAttachmentContent(
   // the uploadId to materialize and enough metadata to decide how to read it.
   if (files.length > 0) {
     const lines = files.map((f) => {
-      const name = uploadStat(config.instance, f.id)?.filename;
+      // Sanitize here because signed-download/promote-file write manifests
+      // directly (bypassing storeUpload) and this is the model-facing boundary.
+      const rawName = uploadStat(config.instance, f.id)?.filename;
+      const name = rawName ? sanitizeFilename(rawName) : undefined;
       return `- ${f.id}${name ? ` — ${name}` : ""} (${f.mimeType}, ${f.size} bytes)`;
     });
     parts.push({

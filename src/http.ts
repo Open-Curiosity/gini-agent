@@ -93,6 +93,15 @@ import type { Server, ServerWebSocket } from "bun";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
+// Cap on stored uploads. 50MB by default (matches signed-download's body
+// cap); GINI_MAX_UPLOAD_BYTES overrides it (positive finite number) so tests
+// can drive the 413 path with a tiny limit.
+const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+function maxUploadBytes(): number {
+  const raw = Number(process.env.GINI_MAX_UPLOAD_BYTES);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_UPLOAD_BYTES;
+}
+
 // Extensions the browser can safely render inline (PDFs + raster images) when
 // GET /api/files is called with `inline=1`. Everything else — html/htm, svg,
 // xml, js, and any unlisted type — is deliberately excluded so it falls
@@ -240,6 +249,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!contentType.toLowerCase().includes("multipart/form-data")) {
         return json({ error: "Expected multipart/form-data with a 'file' part" }, 400);
       }
+      // Bound stored uploads. Reject on the declared content-length before
+      // buffering the body, then re-check the decoded byte length below so a
+      // missing/forged header still can't exceed the cap.
+      const cap = maxUploadBytes();
+      if (Number(request.headers.get("content-length") ?? 0) > cap) {
+        return json({ error: "Upload too large." }, 413);
+      }
       const form = await request.formData();
       const file = form.get("file");
       if (!(file instanceof Blob)) return json({ error: "Missing 'file' part" }, 400);
@@ -263,6 +279,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         return json({ error: `Unsupported upload type: ${mimeType}` }, 415);
       }
       if (bytes.length === 0) return json({ error: "Upload is empty." }, 400);
+      if (bytes.length > cap) return json({ error: "Upload too large." }, 413);
       const stored = storeUpload(config.instance, bytes, mimeType, filename);
       return json(stored, 201);
     }],

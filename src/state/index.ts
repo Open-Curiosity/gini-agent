@@ -81,7 +81,8 @@ export {
   uploadDataUrl,
   uploadExists,
   uploadStat,
-  isPlausibleMime
+  isPlausibleMime,
+  sanitizeFilename
 } from "./uploads";
 export {
   insertChatBlock,

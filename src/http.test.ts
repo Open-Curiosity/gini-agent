@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHandler } from "./http";
-import { addAudit, appendEvent, mutateState, readState, readTrace, isPlausibleMime, storeUpload, uploadStat } from "./state";
+import { addAudit, appendEvent, mutateState, readState, readTrace, isPlausibleMime, storeUpload, uploadStat, sanitizeFilename } from "./state";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
 import { listProviders } from "./integrations/connectors/registry";
@@ -4609,12 +4609,37 @@ describe("GET /api/files", () => {
     expect(response.status).toBe(400);
   });
 
+  test("POST /api/uploads rejects a file over the size cap with 413", async () => {
+    process.env.GINI_MAX_UPLOAD_BYTES = "10";
+    try {
+      const config = testConfig("uploads-toolarge");
+      const handler = createHandler(config);
+      const form = new FormData();
+      form.set("file", new File(["this body is well over ten bytes"], "big.csv", { type: "text/csv" }));
+      const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/uploads`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${config.token}` },
+        body: form
+      }));
+      expect(response.status).toBe(413);
+    } finally {
+      delete process.env.GINI_MAX_UPLOAD_BYTES;
+    }
+  });
+
   test("storeUpload sanitizes a filename with embedded newline/control chars to a single line", () => {
     const config = testConfig("uploads-filename");
     const ref = storeUpload(config.instance, new Uint8Array([1, 2, 3]), "text/csv", "a\nb\t\rc.csv");
     const stat = uploadStat(config.instance, ref.id);
     expect(stat?.filename).toBe("a b c.csv");
     expect(stat?.filename).not.toContain("\n");
+  });
+
+  // The exported sanitizeFilename is also applied at the model-facing render
+  // in buildAttachmentContent, covering manifests written outside storeUpload.
+  test("sanitizeFilename strips control chars, collapses whitespace, and caps length", () => {
+    expect(sanitizeFilename("a\nb\tc.csv")).toBe("a b c.csv");
+    expect(sanitizeFilename("x".repeat(300)).length).toBe(255);
   });
 });
 

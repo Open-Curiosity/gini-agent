@@ -37,7 +37,7 @@ export function isPlausibleMime(mimeType: string): boolean {
 // Strip control/newline chars and collapse whitespace before persisting a
 // filename — it is later rendered into the model-facing attachment marker,
 // where an embedded newline could spoof extra marker lines / inject text.
-function sanitizeFilename(name: string): string {
+export function sanitizeFilename(name: string): string {
   return name.replace(/[\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 255);
 }
 

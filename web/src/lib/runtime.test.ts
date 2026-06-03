@@ -3,7 +3,7 @@
 // the browser-facing BFF and the bearer-gated gateway.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { guardCsrf, pickForwardHeaders } from "./runtime";
+import { guardCsrf, pickForwardHeaders, proxyRequest } from "./runtime";
 
 const originalTrusted = process.env.GINI_TRUSTED_ORIGINS;
 
@@ -96,6 +96,67 @@ describe("guardCsrf — Sec-Fetch-Site", () => {
     );
     expect(res).not.toBeNull();
     expect(res!.status).toBe(403);
+  });
+});
+
+describe("proxyRequest — served downloads", () => {
+  test("attachment text/csv passes through byte-identical (no UTF-8 re-encode)", async () => {
+    // Raw bytes including a lone 0xff that a text() decode would mangle into
+    // U+FFFD. A served upload carries Content-Disposition: attachment, so the
+    // proxy must stream it opaquely.
+    const raw = new Uint8Array([0x68, 0x69, 0xff, 0x0a]);
+    const fetcher = (async () =>
+      new Response(raw, {
+        status: 200,
+        headers: {
+          "content-type": "text/csv",
+          "content-disposition": "attachment"
+        }
+      })) as unknown as typeof fetch;
+    const req = new Request("http://127.0.0.1:7777/api/runtime/uploads/abc", {
+      method: "GET",
+      headers: { host: "127.0.0.1:7777" }
+    });
+    const res = await proxyRequest(req, ["uploads", "abc"], {
+      runtimeUrl: "http://127.0.0.1:9999",
+      token: "t",
+      fetcher
+    });
+    expect(res.status).toBe(200);
+    const out = new Uint8Array(await res.arrayBuffer());
+    expect(Array.from(out)).toEqual(Array.from(raw));
+  });
+});
+
+describe("proxyRequest — upload size cap", () => {
+  test("content-length over the cap returns 413 before forwarding", async () => {
+    process.env.GINI_MAX_UPLOAD_BYTES = "10";
+    try {
+      let forwarded = false;
+      const fetcher = (async () => {
+        forwarded = true;
+        return new Response("{}", { status: 201 });
+      }) as unknown as typeof fetch;
+      const req = new Request("http://127.0.0.1:7777/api/runtime/uploads", {
+        method: "POST",
+        headers: {
+          host: "127.0.0.1:7777",
+          origin: "http://127.0.0.1:7777",
+          "content-length": "11",
+          "content-type": "multipart/form-data; boundary=x"
+        },
+        body: "this is more than ten bytes"
+      });
+      const res = await proxyRequest(req, ["uploads"], {
+        runtimeUrl: "http://127.0.0.1:9999",
+        token: "t",
+        fetcher
+      });
+      expect(res.status).toBe(413);
+      expect(forwarded).toBe(false);
+    } finally {
+      delete process.env.GINI_MAX_UPLOAD_BYTES;
+    }
   });
 });
 
