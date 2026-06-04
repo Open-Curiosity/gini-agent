@@ -12,7 +12,14 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { normalizeBaseUrl, readCachedCredentials, saveCredentials } from "@/src/auth";
+import { QrScanner } from "@/src/components/QrScanner";
 import { createPairingClient, PairingError, type PairingClient } from "@/src/pairing";
+import {
+  clearPendingPair,
+  isPendingPairLive,
+  readCachedPendingPair,
+  savePendingPair
+} from "@/src/pending-pair";
 import { isGatewaySwitch, isPairableHost } from "@/src/relay-link";
 import { family, theme } from "@/src/theme";
 
@@ -52,8 +59,12 @@ function hostOf(url: string | null | undefined): string {
 }
 
 export default function PairScreen() {
-  const params = useLocalSearchParams<{ relay?: string | string[] }>();
+  const params = useLocalSearchParams<{ relay?: string | string[]; resume?: string | string[] }>();
   const relayParam = Array.isArray(params.relay) ? params.relay[0] : params.relay;
+  // Set by the auth gate (app/index.tsx) when it resumes an interrupted pairing
+  // after a cold relaunch — tells us to re-poll the persisted request rather than
+  // mint a fresh one.
+  const resumeParam = Array.isArray(params.resume) ? params.resume[0] : params.resume;
 
   // A deep link to a relay host that differs from an already-stored gateway must
   // be confirmed (a silent switch could repoint the app to an attacker's relay);
@@ -68,6 +79,8 @@ export default function PairScreen() {
   const [linkInput, setLinkInput] = useState("");
   const [code, setCode] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Whether the in-app QR scanner overlay is open (input phase only).
+  const [scanning, setScanning] = useState(false);
 
   // The handshake client + the live request id/secret for this attempt.
   const clientRef = useRef<PairingClient | null>(null);
@@ -160,6 +173,16 @@ export default function PairScreen() {
         requestRef.current = { id: handshake.id, secret: handshake.bindSecret };
         setCode(handshake.code);
         setPhase("pending");
+        // Breadcrumb so a cold relaunch resumes THIS request (same id/secret)
+        // instead of bouncing to /setup. client.origin is the validated origin.
+        void savePendingPair({
+          kind: "request",
+          relayOrigin: client.origin,
+          id: handshake.id,
+          bindSecret: handshake.bindSecret,
+          code: handshake.code,
+          createdAt: Date.now()
+        });
       } catch (e) {
         if (genRef.current !== myGen) return;
         setError(e instanceof Error ? e.message : String(e));
@@ -174,6 +197,29 @@ export default function PairScreen() {
   useEffect(() => {
     if (!relayParam || startedRef.current === relayParam) return;
     startedRef.current = relayParam;
+    // Cold-relaunch resume: rehydrate the persisted request and re-poll the SAME
+    // handshake. Minting a new one would orphan the live request and miss an
+    // approval that landed while the app was dead. Falls through to a fresh start
+    // if the breadcrumb is missing, stale, or for a different host.
+    if (resumeParam) {
+      const pending = readCachedPendingPair();
+      if (
+        pending &&
+        pending.kind === "request" &&
+        isPendingPairLive(pending, Date.now()) &&
+        hostOf(pending.relayOrigin) === hostOf(relayParam)
+      ) {
+        try {
+          clientRef.current = createPairingClient(pending.relayOrigin);
+          requestRef.current = { id: pending.id, secret: pending.bindSecret };
+          setCode(pending.code);
+          setPhase("pending");
+          return;
+        } catch {
+          // Couldn't rebuild the client for a persisted origin — fall through.
+        }
+      }
+    }
     // Switching an already-paired app to a different relay host needs explicit
     // confirmation; a first-time or same-host pair auto-starts.
     if (isGatewaySwitch(readCachedCredentials()?.baseUrl, relayParam)) {
@@ -186,12 +232,14 @@ export default function PairScreen() {
       cancelActiveRequest();
       clientRef.current = null;
       requestRef.current = null;
+      // A switch to a different relay supersedes any persisted breadcrumb.
+      void clearPendingPair();
       setPendingOrigin(relayParam);
       setPhase("confirm");
       return;
     }
     void start(relayParam);
-  }, [relayParam, start, stopPolling, cancelActiveRequest]);
+  }, [relayParam, resumeParam, start, stopPolling, cancelActiveRequest]);
 
   // Component-wide unmount cleanup, installed regardless of entry path (manual
   // paste OR deep link). Bumps the generation so any in-flight create/poll/claim
@@ -203,8 +251,36 @@ export default function PairScreen() {
       // Best-effort cancel an in-flight request so it doesn't linger pending
       // server-side after the screen is gone.
       cancelActiveRequest();
+      // Intentional in-app navigation away from /pair (header back to /setup, or
+      // into the app after a successful pair) discards the resume breadcrumb. A
+      // process kill never runs this cleanup, so a genuine interruption still
+      // resumes on the next launch.
+      void clearPendingPair();
     };
   }, [stopPolling, cancelActiveRequest]);
+
+  // Persist a lightweight breadcrumb for the input screen too, so a cold relaunch
+  // while the user is still typing a link resumes /pair rather than /setup.
+  useEffect(() => {
+    if (phase === "input") {
+      void savePendingPair({ kind: "input", createdAt: Date.now() });
+    }
+  }, [phase]);
+
+  // Drop the breadcrumb as soon as the handshake reaches any terminal state, so a
+  // later relaunch can't resume a dead request.
+  useEffect(() => {
+    if (
+      phase === "paired" ||
+      phase === "rejected" ||
+      phase === "expired" ||
+      phase === "cancelled" ||
+      phase === "create-error" ||
+      phase === "claim-error"
+    ) {
+      void clearPendingPair();
+    }
+  }, [phase]);
 
   // Poll while pending. On approval we hand off to the claim effect rather than
   // claiming inline, so flipping to "claiming" can't self-cancel this tick.
@@ -290,6 +366,24 @@ export default function PairScreen() {
     // non-pairable link surfaces the same guidance there.
     void start(origin);
   }, [linkInput, start]);
+
+  // Decoded a QR from the in-app scanner. Funnel its payload through the exact same
+  // normalize + start path as a pasted link, so the relay/loopback host check and
+  // error messaging are identical for both entry methods.
+  const onScanned = useCallback(
+    (data: string) => {
+      setScanning(false);
+      let origin: string;
+      try {
+        origin = normalizeBaseUrl(data);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "That QR code isn't a Gini link.");
+        return;
+      }
+      void start(origin);
+    },
+    [start]
+  );
 
   const cancel = useCallback(() => {
     // Move to the terminal state and drop the refs SYNCHRONOUSLY, before the
@@ -383,6 +477,15 @@ export default function PairScreen() {
               <TouchableOpacity onPress={submitLink} style={styles.button}>
                 <Text style={styles.buttonText}>Connect</Text>
               </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => {
+                  setError(null);
+                  setScanning(true);
+                }}
+                style={styles.ghostButton}
+              >
+                <Text style={styles.ghostButtonText}>Scan QR code</Text>
+              </TouchableOpacity>
             </>
           ) : (
             <>
@@ -390,10 +493,15 @@ export default function PairScreen() {
                 <Text style={[styles.code, (phase === "expired" || phase === "cancelled") && styles.codeDimmed]}>
                   {code}
                 </Text>
-              ) : phase === "creating" || phase === "pending" || phase === "claiming" ? (
-                // Spinner only while genuinely working — terminal states (e.g.
-                // create-error, cancelled) show their StatusRow message, not a spinner.
-                <ActivityIndicator color={theme.accent} style={styles.codeSpinner} />
+              ) : null}
+              {/* Spinner whenever genuinely working — shown alongside the code while
+                  pending/claiming (so "Waiting for approval…" reads as active) and on
+                  its own during create. Terminal states show their StatusRow instead. */}
+              {phase === "creating" || phase === "pending" || phase === "claiming" ? (
+                <ActivityIndicator
+                  color={theme.accent}
+                  style={code ? styles.pendingSpinner : styles.codeSpinner}
+                />
               ) : null}
 
               <StatusRow phase={phase} error={error} />
@@ -403,6 +511,9 @@ export default function PairScreen() {
           )}
         </ScrollView>
       </KeyboardAvoidingView>
+      {scanning ? (
+        <QrScanner onScanned={onScanned} onClose={() => setScanning(false)} />
+      ) : null}
     </SafeAreaView>
   );
 }
@@ -510,6 +621,7 @@ const styles = StyleSheet.create({
   },
   codeDimmed: { opacity: 0.4 },
   codeSpinner: { marginTop: 28, marginBottom: 8 },
+  pendingSpinner: { marginTop: 16, marginBottom: 4 },
   status: {
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 14,

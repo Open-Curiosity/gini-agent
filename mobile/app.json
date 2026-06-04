@@ -55,6 +55,14 @@
         {
           "microphonePermission": "Allow Gini to record voice messages."
         }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Gini uses the camera to scan pairing QR codes and to capture photos for chat.",
+          "barcodeScannerEnabled": true,
+          "recordAudioAndroid": false
+        }
       ]
     ],
     "experiments": { "typedRoutes": true },
