@@ -390,9 +390,11 @@ export default function PairScreen() {
                 <Text style={[styles.code, (phase === "expired" || phase === "cancelled") && styles.codeDimmed]}>
                   {code}
                 </Text>
-              ) : (
+              ) : phase === "creating" || phase === "pending" || phase === "claiming" ? (
+                // Spinner only while genuinely working — terminal states (e.g.
+                // create-error, cancelled) show their StatusRow message, not a spinner.
                 <ActivityIndicator color={theme.accent} style={styles.codeSpinner} />
-              )}
+              ) : null}
 
               <StatusRow phase={phase} error={error} />
 
