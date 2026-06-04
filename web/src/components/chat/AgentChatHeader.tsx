@@ -3,19 +3,22 @@ import { AgentAvatar } from "./AgentAvatar";
 import { formatRelativeTime } from "./relative-time";
 
 // Per-agent (or channel) chat header — design `zFqWM`. 52px colored-initial
-// avatar, name, a green "Ready · last active …" status row, and a non-wired
-// "Search in chat" affordance (parity with the design; search isn't a backend
-// surface yet).
+// avatar, name, a green "Ready · last active …" status row, and a right-side
+// affordance. When `right` is provided (the chat surface passes a wired
+// in-chat search control) it renders there; otherwise the static "Search in
+// chat" pill stands in for design parity on surfaces with no transcript.
 export function AgentChatHeader({
   name,
   seed,
   lastActiveAt,
-  subtitle
+  subtitle,
+  right
 }: {
   name: string;
   seed?: string;
   lastActiveAt?: string;
   subtitle?: string;
+  right?: React.ReactNode;
 }) {
   const lastActive = lastActiveAt ? formatRelativeTime(lastActiveAt) : "";
   return (
@@ -41,10 +44,12 @@ export function AgentChatHeader({
           </div>
         </div>
       </div>
-      <div className="hidden items-center gap-2 rounded-md border border-[#2A2A2E] bg-[#15161C] px-2.5 py-1.5 text-[12px] font-medium text-[#7A7A80] sm:flex">
-        <Search className="size-3.5" />
-        Search in chat
-      </div>
+      {right ?? (
+        <div className="hidden items-center gap-2 rounded-md border border-[#2A2A2E] bg-[#15161C] px-2.5 py-1.5 text-[12px] font-medium text-[#7A7A80] sm:flex">
+          <Search className="size-3.5" />
+          Search in chat
+        </div>
+      )}
     </header>
   );
 }

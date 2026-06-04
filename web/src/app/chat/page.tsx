@@ -10,6 +10,7 @@ import { BlockToolCallsCollapsed } from "@/components/chat/BlockToolCallsCollaps
 import { GeneratedFilesCard } from "@/components/chat/GeneratedFilesCard";
 import { Composer } from "@/components/chat/Composer";
 import { AgentChatHeader } from "@/components/chat/AgentChatHeader";
+import { ChatSearchBox } from "@/components/chat/ChatSearchBox";
 import { ChatTabBar, type ChatTab } from "@/components/chat/ChatTabBar";
 import { ThreadChip } from "@/components/chat/ThreadChip";
 import { ReplyInThreadButton } from "@/components/chat/ReplyInThreadButton";
@@ -118,6 +119,10 @@ function ChatSurface({
   const [tab, setTab] = useState<ChatTab>("messages");
   const [openThread, setOpenThread] = useState<ThreadSummary | null>(null);
   const [text, setText] = useState("");
+  // In-chat search: client-side find over the loaded transcript. `query` is the
+  // raw input; `activeMatch` indexes into the matched-block list below.
+  const [query, setQuery] = useState("");
+  const [activeMatch, setActiveMatch] = useState(0);
   const invalidate = useInvalidate();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -200,6 +205,43 @@ function ChatSurface({
   const renderItems = useMemo<ChatRenderItem[]>(() => groupExchanges(visibleBlocks), [visibleBlocks]);
   const hasBlocks = visibleBlocks.length > 0;
 
+  // Block ids whose message text contains the query, in display order. Only
+  // the searchable message kinds count (not tool calls / phases / files).
+  const matches = useMemo<string[]>(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return [];
+    const ids: string[] = [];
+    for (const item of renderItems) {
+      if (item.kind !== "block") continue;
+      const block = item.block;
+      if (
+        block.kind !== "user_text" &&
+        block.kind !== "assistant_text" &&
+        block.kind !== "system_note"
+      ) {
+        continue;
+      }
+      if (block.text.toLowerCase().includes(needle)) ids.push(block.id);
+    }
+    return ids;
+  }, [renderItems, query]);
+  const matchCount = matches.length;
+  const activeMatchId = matchCount > 0 ? matches[Math.min(activeMatch, matchCount - 1)] : undefined;
+
+  // Keep the active index in range as matches change (query edits reset it to
+  // 0 at the call site; this guards stream-driven match-set shrinkage).
+  useEffect(() => {
+    if (activeMatch > 0 && activeMatch >= matchCount) setActiveMatch(matchCount === 0 ? 0 : matchCount - 1);
+  }, [matchCount, activeMatch]);
+
+  // Scroll the active match into view when it (or the query) changes.
+  useEffect(() => {
+    if (!activeMatchId) return;
+    document
+      .getElementById(`chat-msg-${activeMatchId}`)
+      ?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [activeMatchId]);
+
   return (
     <>
       <section className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -208,6 +250,24 @@ function ChatSurface({
           seed={headerSeed}
           lastActiveAt={session.updatedAt}
           subtitle={isChannel ? "recurring job channel" : undefined}
+          right={
+            <ChatSearchBox
+              value={query}
+              onChange={(q) => {
+                setQuery(q);
+                setActiveMatch(0);
+                if (q && tab !== "messages") setTab("messages");
+              }}
+              matchCount={matchCount}
+              activeIndex={activeMatch}
+              onPrev={() => setActiveMatch((i) => (i - 1 + matchCount) % matchCount)}
+              onNext={() => setActiveMatch((i) => (i + 1) % matchCount)}
+              onClose={() => {
+                setQuery("");
+                setActiveMatch(0);
+              }}
+            />
+          }
         />
         <ChatTabBar active={tab} onChange={setTab} threadCount={threads.length} />
 
@@ -248,8 +308,20 @@ function ChatSurface({
                       // branch a new thread off it (Slack-style).
                       const canStartThread =
                         block.kind === "assistant_text" && !block.streaming && !thread;
+                      const isMatch = matches.includes(block.id);
+                      const isActiveMatch = block.id === activeMatchId;
                       return (
-                        <li key={block.id} className="space-y-2">
+                        <li
+                          key={block.id}
+                          id={`chat-msg-${block.id}`}
+                          className={`space-y-2 transition-colors ${
+                            isActiveMatch
+                              ? "rounded-lg bg-[#4277FB]/5 ring-2 ring-[#4277FB]/70"
+                              : isMatch
+                                ? "rounded-lg bg-[#4277FB]/5"
+                                : ""
+                          }`}
+                        >
                           <BlockRenderer
                             block={block}
                             toolResult={
