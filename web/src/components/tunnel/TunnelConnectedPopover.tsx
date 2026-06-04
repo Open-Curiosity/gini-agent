@@ -6,7 +6,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
-import { PairDeviceDialog } from "@/components/pairing/PairDeviceDialog";
+import { PairRequestsPanel } from "@/components/pairing/PairRequestsPanel";
 import { TunnelQR } from "./TunnelQR";
 import type { TunnelState } from "./types";
 
@@ -169,7 +169,10 @@ export function TunnelConnectedPopover({
 
         <Separator />
 
-        <PairDeviceDialog className="w-full" />
+        {/* The live approval panel inline — the QR above is already the thing a
+            new device scans, so there's no separate "Pair a device" step: open
+            the tunnel menu and incoming requests appear here to approve. */}
+        <PairRequestsPanel />
 
         <Button variant="destructive" size="sm" className="w-full gap-1.5" onClick={onDisconnect}>
           <Unplug className="h-3.5 w-3.5" />
