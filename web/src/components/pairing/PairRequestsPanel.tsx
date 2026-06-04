@@ -66,7 +66,7 @@ export function PairRequestsPanel() {
           </p>
         </div>
       ) : (
-        <ul className="divide-y divide-border rounded-lg border border-border">
+        <ul className="max-h-72 divide-y divide-border overflow-y-auto overscroll-contain rounded-lg border border-border">
           {requests.map((item) => (
             <PairRequestRow
               key={item.id}
@@ -107,28 +107,36 @@ function PairRequestRow({
   onReject: () => void;
 }) {
   return (
-    <li className="flex flex-col gap-3 p-3 sm:flex-row sm:items-start sm:justify-between">
-      <div className="min-w-0 space-y-1.5">
-        <div className="font-mono text-2xl font-semibold tracking-widest text-foreground tabular-nums">
-          {item.code}
+    // The warning spans the FULL row width below the code+actions line. Keying the
+    // old two-column layout off `sm:` broke here: `sm:` is the viewport width, not
+    // this row's, so inside the narrow tunnel popover the warning was squeezed into
+    // a thin left column beside the buttons (a big empty gap on the right). A
+    // top row (code/device left, actions right) + a full-width warning works in
+    // both the narrow popover and the wider settings dialog.
+    <li className="space-y-2 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 space-y-1">
+          <div className="font-mono text-2xl font-semibold tracking-widest text-foreground tabular-nums">
+            {item.code}
+          </div>
+          <div className="text-xs text-muted-foreground">
+            <span className="text-foreground">{item.deviceName}</span>
+            {" · "}
+            {relativeTime(item.createdAt)}
+          </div>
         </div>
-        <div className="text-xs text-muted-foreground">
-          <span className="text-foreground">{item.deviceName}</span>
-          {" · "}
-          {relativeTime(item.createdAt)}
-        </div>
-        <div className="flex items-center gap-1.5 text-xs text-amber-500 dark:text-amber-400">
-          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-          <span>Approve only if this code matches the one shown on that device.</span>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button variant="outline" size="sm" onClick={onReject} disabled={rejecting}>
+            Reject
+          </Button>
+          <Button variant="default" size="sm" onClick={onApprove} disabled={approving}>
+            Approve
+          </Button>
         </div>
       </div>
-      <div className="flex shrink-0 items-center gap-2 sm:pt-1">
-        <Button variant="outline" size="sm" onClick={onReject} disabled={rejecting}>
-          Reject
-        </Button>
-        <Button variant="default" size="sm" onClick={onApprove} disabled={approving}>
-          Approve
-        </Button>
+      <div className="flex items-start gap-1.5 text-xs text-amber-500 dark:text-amber-400">
+        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+        <span>Approve only if this code matches the one shown on that device.</span>
       </div>
     </li>
   );
