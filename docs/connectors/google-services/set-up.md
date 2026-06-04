@@ -1,0 +1,57 @@
+# Google Workspace setup
+
+Connect Gini to your Google account so it can work with **Gmail, Calendar, Drive, Docs, Sheets, Forms, and Meet** on your behalf. Setup is a one-time, guided flow that runs inside chat — the first time you ask Gini to do anything with Google ("check my calendar," "find that Drive doc"), it walks you through everything below.
+
+The OAuth client Gini uses lives in **your own** Google Cloud project. Your credentials are stored in Gini's encrypted secret store and are never written to chat, logs, or disk.
+
+## What you need
+
+- A Google account. A personal **@gmail.com** works — you do **not** need a paid Google Workspace subscription.
+- **No credit card.** The Google Workspace APIs are free, so there's no billing account and no card on file. This is the exception to Google Cloud's usual rules: most Cloud APIs require billing, but the Workspace ones don't.
+- macOS or Linux with Homebrew (or another package manager). Gini installs the `gws` and `gcloud` command-line tools for you.
+
+## How setup works
+
+Gini drives this in chat; you only act at the browser steps.
+
+1. **Confirm.** Gini tells you Google isn't connected yet and asks to set it up.
+2. **Install tools.** Gini installs `gws` and `gcloud` in the background.
+3. **Sign in.** Gini runs `gcloud auth login` and your browser opens to Google's sign-in. Use the account you want Gini to act as.
+4. **Project + APIs.** Gini creates a Cloud project named **Gini Workspace** in your account and enables the seven Workspace APIs. (If a previous run already made one, it reuses it.)
+5. **Connect form.** Gini posts a card in chat with two Cloud Console links — one to configure the consent screen, one to create a **Desktop OAuth client**. You create the client, then paste the **Client ID** and **Client Secret** into the form and click **Save**.
+6. **Grant access.** Gini runs `gws auth login` and your browser opens to Google's consent screen, which lists each product as its own checkbox. Tick what you want Gini to access and continue.
+
+Your original request then resumes automatically.
+
+## First-time Google Cloud users
+
+If you've never opened Google Cloud before, the project step (4) stops with **"Callers must accept Terms of Service."** Your Google login works, but the account has never initialized Google Cloud.
+
+To fix it, open **<https://console.cloud.google.com/>**, pick your country, and accept the Terms of Service. **This is free** — you do **not** need to start the free trial or add a credit card, even though Google offers that prominently. Once you've accepted, tell Gini **done** and it continues.
+
+## Work or school accounts
+
+Managed Google Workspace accounts (for example `you@yourcompany.com`) are often configured so only admins can create Cloud projects. If creation fails with **"You do not have permission to create projects,"** accepting the Terms of Service won't help. Either:
+
+- give Gini an existing Cloud project ID you're allowed to use (ask your Workspace admin), or
+- run setup with a personal **@gmail.com** account instead.
+
+## What Gini can access
+
+Gini asks for all seven products up front so you don't have to repeat setup when you move from, say, Calendar to Drive. You decide what to actually grant on Google's consent screen — each product is its own checkbox. You can also tell Gini "read-only" or "Gmail only" before that step to narrow what it requests.
+
+## Use it
+
+Once setup finishes, just ask — "what's on my calendar today?", "share that doc with Sam," "draft a reply to the last email from Pat." Gini runs the request through `gws` against your account.
+
+## Troubleshooting
+
+- **"Callers must accept Terms of Service"** — first-time Cloud account; accept the terms in the console (see above). Free, no card.
+- **"You do not have permission to create projects"** — managed-account restriction; use an existing project or a personal account (see above).
+- **Rate-limited project creation** — Google caps how many projects you can create in a short window; wait ~10 minutes and retry, or point Gini at an existing project.
+- **"invalid_client" at the consent step** — the Client ID or Secret was mistyped; redo the Connect form.
+- **"redirect_uri mismatch"** — the OAuth client was created as a *Web* application; recreate it as a **Desktop app** and paste the new credentials.
+
+---
+
+Under the hood, Gini follows the `google-workspace-setup` skill, and credentials are captured through the inline Connect form described in [Chat credential provisioning](../../adr/chat-credential-provisioning.md).
