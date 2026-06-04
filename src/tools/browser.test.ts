@@ -2242,6 +2242,59 @@ describe("dispatchToolCall(browser_connect)", () => {
     rmSync(ROOT, { recursive: true, force: true });
   });
 
+  // Loop guard: a task surfaces a Connect card at most once per sign-in wall.
+  // The first call pauses the task for the user; a second browser_connect for
+  // the same site must NOT mint another card (the runaway-loop the user hit) —
+  // it returns a sync "stop and wait" result so the agent pauses instead of
+  // spamming identical approval cards.
+  test("refuses a second browser_connect for the same site without minting another card", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-loop");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect loop", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://www.aircanada.com/login",
+      close: () => Promise.resolve()
+    });
+    const connectCards = () =>
+      readState(config.instance).setupRequests.filter(
+        (a) => a.taskId === taskId && a.action === "browser.connect"
+      ).length;
+
+    // First call: a real Connect card (pending approval).
+    const first = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_loop_1",
+      JSON.stringify({ reason: "Sign in to Air Canada" })
+    );
+    expect(first.kind).toBe("pending");
+    expect(connectCards()).toBe(1);
+
+    // Second call for the same site: refused, no new card.
+    const second = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_loop_2",
+      JSON.stringify({ reason: "Sign in to Air Canada" })
+    );
+    expect(second.kind).toBe("sync");
+    if (second.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(second.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toMatch(/already shown|wait for the user/i);
+    // Still exactly one card — the loop did not spam approvals.
+    expect(connectCards()).toBe(1);
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
   // A session can exist but still sit on about:blank (or another non-http(s)
   // page) when nothing real has been navigated to yet. That can't host a
   // sign-in wall, so the navigate-first guard must still refuse — same as a
