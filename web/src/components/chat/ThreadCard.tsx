@@ -60,14 +60,13 @@ export function ThreadCard({
   const { blocks } = useThread(expanded ? thread.sessionId : null, expanded ? thread.threadId : null);
 
   // The thread-blocks endpoint returns the thread span (excluding the root
-  // main-chat message). Show the most recent two by default once expanded; a
-  // future "show all" could lift this, but the design caps the preview.
+  // main-chat message). Once expanded, show every reply so "Show N replies"
+  // reveals exactly N rows.
   const replyBlocks = useMemo(
     () => blocks.filter((b) => previewText(b) != null),
     [blocks]
   );
-  const previewReplies = expanded ? replyBlocks.slice(-2) : [];
-  const hiddenCount = expanded ? Math.max(0, replyBlocks.length - previewReplies.length) : 0;
+  const visibleReplies = expanded ? replyBlocks : [];
 
   const lastReply = thread.lastReplyAt ? formatRelativeTime(thread.lastReplyAt) : "";
 
@@ -106,14 +105,16 @@ export function ThreadCard({
       {/* Expand to show replies */}
       {expanded ? (
         <div className="flex flex-col gap-3.5 pl-2">
-          {hiddenCount > 0 ? (
-            <span className="text-[13px] font-semibold text-[#4277FB]">
-              {hiddenCount} more {hiddenCount === 1 ? "reply" : "replies"} above
-            </span>
-          ) : null}
-          {previewReplies.map((b) => (
+          {visibleReplies.map((b) => (
             <ReplyRow key={b.id} block={b} agentName={agentName} />
           ))}
+          <button
+            type="button"
+            onClick={() => setExpanded(false)}
+            className="self-start text-[13px] font-semibold text-[#4277FB] hover:underline"
+          >
+            Hide replies
+          </button>
         </div>
       ) : thread.replyCount > 0 ? (
         <button
