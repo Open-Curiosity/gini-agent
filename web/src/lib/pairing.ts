@@ -2,22 +2,22 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { PairingRequestStatus } from "@runtime/types";
-import { api } from "@/lib/api";
 
 // Re-export the runtime contract's status union so callers keep importing it from
 // here, but the single source of truth stays in @runtime/types (no hand-copied
 // duplicate that could drift from the wire).
 export type { PairingRequestStatus };
 
-// Two surfaces, deliberately split (see ADR device-pairing-auth.md):
-//   - DEVICE handshake (request/poll/claim/cancel): the UNPAIRED device on /pair
-//     has no session, so it cannot use the bearer-injecting BFF. These hit the
-//     gateway's NATIVE /api/pairing/* SAME-ORIGIN (public, gini_pair-bound).
-//   - ADMIN routes (list/approve/reject): used by a PAIRED session. They go
-//     through the BFF (/api/runtime/pairing/*) so a paired relay session reaches
-//     them exactly like loopback — once paired, the relay is a mirror of
-//     127.0.0.1; the only relay-specific gate is the initial pairing handshake.
-// The gini_pair / gini_session cookies are HttpOnly, managed by the gateway.
+// All pairing calls hit the gateway's NATIVE /api/pairing/* surface SAME-ORIGIN
+// (NOT the bearer-injecting /api/runtime BFF). Same-origin matters twice: the
+// browser sends a same-origin Origin (so the gateway's CSRF check passes) AND it
+// auto-attaches the HttpOnly gini_pair / gini_session cookies the routes need.
+//   - DEVICE handshake (request/poll/claim/cancel): public, gini_pair-bound — the
+//     UNPAIRED device on /pair runs these with no session.
+//   - ADMIN routes (list/approve/reject): handlePairingRoutes accepts loopback OR
+//     a valid gini_session, so a PAIRED relay session is admin exactly like
+//     127.0.0.1 (the mirror model; the only relay-specific gate is the initial
+//     pairing handshake). See ADR device-pairing-auth.md.
 
 export interface PairingRequestView {
   id: string;
@@ -61,19 +61,18 @@ export function cancelPairingRequest(id: string): Promise<{ ok: true }> {
 }
 
 // --- Admin side (the approval panel — any paired session, loopback or relay) ---
-// Routed through the BFF (/api/runtime/pairing/*, via the api() helper) so a
-// paired relay session reaches these exactly like loopback: the BFF re-presents
-// the request to the gateway over loopback. An unpaired relay visitor has no
-// session and is 401'd at the relay gate before reaching the BFF, so it can never
-// hit these. See ADR device-pairing-auth.md ("Relay sessions mirror loopback").
+// Native same-origin /api/pairing/* so the request carries both the relay Origin
+// (for the gateway's CSRF check) AND the gini_session cookie that
+// handlePairingRoutes validates (loopback OR a valid session passes). An unpaired
+// relay visitor has no session and is refused. See ADR device-pairing-auth.md.
 export function listPairingRequests(): Promise<{ requests: PairingRequestView[] }> {
-  return api<{ requests: PairingRequestView[] }>("/pairing/requests");
+  return pairingFetch("/requests");
 }
 export function approvePairingRequest(id: string): Promise<{ request: PairingRequestView }> {
-  return api<{ request: PairingRequestView }>(`/pairing/requests/${encodeURIComponent(id)}/approve`, { method: "POST", body: "{}" });
+  return pairingFetch(`/requests/${encodeURIComponent(id)}/approve`, { method: "POST", body: "{}" });
 }
 export function rejectPairingRequest(id: string): Promise<{ request: PairingRequestView }> {
-  return api<{ request: PairingRequestView }>(`/pairing/requests/${encodeURIComponent(id)}/reject`, { method: "POST", body: "{}" });
+  return pairingFetch(`/requests/${encodeURIComponent(id)}/reject`, { method: "POST", body: "{}" });
 }
 
 // Live list of pending pairing requests for the admin approval panel. Polls

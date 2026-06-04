@@ -244,8 +244,11 @@ describe("pairing routes — device create + poll", () => {
   });
 });
 
-describe("pairing routes — operator (loopback-only)", () => {
-  test("list/approve/reject require a loopback host", async () => {
+describe("pairing routes — admin (loopback or paired session)", () => {
+  test("list/approve/reject refuse an UNPAIRED relay request (no session)", async () => {
+    // The trust anchor of the mirror model: a relay request with no gini_session
+    // (and a non-loopback Host) is not an admin and is refused. A PAIRED relay
+    // session IS admin — covered by the "relay session gate" mirror tests.
     const { handler } = makeHandler("pair-op-relay");
     const relay = RELAY("pair-op-relay");
     for (const [method, path] of [
@@ -552,38 +555,44 @@ describe("relay session gate (web-bound branch)", () => {
   });
 
   // A paired relay session is a full MIRROR of loopback (ADR device-pairing-auth
-  // "Relay sessions mirror loopback"): it is NOT blocked from the pairing BFF
-  // namespace (admin approve/reject/list + legacy create). It passes the relay
-  // gate and proxies to the BFF; in tests there's no web child, so it falls
-  // through to the 502 proxy fallback — the point is it is neither 401'd nor 403'd.
-  test("a paired relay session reaches the pairing BFF namespace like loopback", async () => {
+  // "Relay sessions mirror loopback"): on the native admin routes the gate accepts
+  // loopback OR a valid gini_session, so a paired relay session can list AND
+  // approve another device exactly like 127.0.0.1.
+  test("a paired relay session can list and approve via the native admin routes", async () => {
     const { handler, relay, session } = await pairedSession("gate-mirror");
     const cookie = `gini_session=${encodeURIComponent(session)}`;
-    const list = await pair(handler, "/api/runtime/pairing/requests", {
+    const list = await pair(handler, "/api/pairing/requests", {
       host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie
     });
-    expect(list.status).not.toBe(401);
-    expect(list.status).not.toBe(403);
-    const approve = await pair(handler, "/api/runtime/pairing/requests/preq_x/approve", {
+    expect(list.status).toBe(200);
+    // A SECOND device requests pairing; the relay-paired admin approves it.
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+      userAgent: "Mozilla/5.0 (Macintosh) Chrome", body: {}
+    });
+    const id = (await created.json()).id as string;
+    const approved = await pair(handler, `/api/pairing/requests/${id}/approve`, {
       method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie, body: {}
     });
-    expect(approve.status).not.toBe(401);
-    expect(approve.status).not.toBe(403);
-    const create = await pair(handler, "/api/runtime/pairing", {
-      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie, body: { ttlSeconds: 600 }
-    });
-    expect(create.status).not.toBe(401);
-    expect(create.status).not.toBe(403);
+    expect(approved.status).toBe(200);
+    expect((await approved.json()).request.status).toBe("approved");
   });
 
-  test("an UNPAIRED relay session cannot reach the pairing BFF namespace (401)", async () => {
-    // The trust anchor: no gini_session → the relay gate 401s /api/runtime/*
-    // before the BFF, so an unpaired visitor can never reach the admin routes.
+  test("an UNPAIRED relay session cannot reach the admin routes (403)", async () => {
+    // The trust anchor: no gini_session and a non-loopback Host → refused.
     const { handler } = makeHandler("gate-mirror-unpaired");
     const relay = RELAY("gate-mirror-unpaired");
-    const res = await pair(handler, "/api/runtime/pairing/requests", {
+    const res = await pair(handler, "/api/pairing/requests", {
       host: relay, origin: `https://${relay}`, secFetchSite: "same-origin"
     });
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(403);
+  });
+
+  test("loopback reaches the admin routes with no session (operator)", async () => {
+    const { handler } = makeHandler("gate-mirror-loopback");
+    const res = await pair(handler, "/api/pairing/requests", {
+      host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin"
+    });
+    expect(res.status).toBe(200);
   });
 });

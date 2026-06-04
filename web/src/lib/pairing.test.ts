@@ -83,38 +83,38 @@ describe("pairing fetchers", () => {
     expect(lastCall?.init.method).toBe("POST");
   });
 
-  test("listPairingRequests GETs the BFF /pairing/requests", async () => {
+  test("listPairingRequests GETs /requests", async () => {
     stubFetch({ requests: [] });
     const out = await listPairingRequests();
     expect(out).toEqual({ requests: [] });
-    expect(lastCall?.url).toBe("/api/runtime/pairing/requests");
+    expect(lastCall?.url).toBe("/api/pairing/requests");
   });
 
-  test("approvePairingRequest POSTs the BFF /pairing/requests/:id/approve", async () => {
+  test("approvePairingRequest POSTs /requests/:id/approve", async () => {
     stubFetch({ request: { id: "1" } });
     await approvePairingRequest("1");
-    expect(lastCall?.url).toBe("/api/runtime/pairing/requests/1/approve");
+    expect(lastCall?.url).toBe("/api/pairing/requests/1/approve");
     expect(lastCall?.init.method).toBe("POST");
   });
 
-  test("rejectPairingRequest POSTs the BFF /pairing/requests/:id/reject", async () => {
+  test("rejectPairingRequest POSTs /requests/:id/reject", async () => {
     stubFetch({ request: { id: "1" } });
     await rejectPairingRequest("1");
-    expect(lastCall?.url).toBe("/api/runtime/pairing/requests/1/reject");
+    expect(lastCall?.url).toBe("/api/pairing/requests/1/reject");
     expect(lastCall?.init.method).toBe("POST");
   });
 
-  test("a non-ok device response with an error body throws that message", async () => {
+  test("a non-ok response with an error body throws that message", async () => {
     stubFetch({ error: "nope" }, { ok: false, status: 403 });
     await expect(createPairingRequest()).rejects.toThrow("nope");
   });
 
-  test("a non-ok admin response with no error body throws an HTTP fallback", async () => {
+  test("a non-ok response with no error body throws an HTTP fallback", async () => {
     stubFetch({}, { ok: false, status: 500 });
     await expect(listPairingRequests()).rejects.toThrow("HTTP 500");
   });
 
-  test("a device body that fails to parse as json is treated as empty (HTTP fallback on error)", async () => {
+  test("a body that fails to parse as json is treated as empty (HTTP fallback on error)", async () => {
     fetchMock = mock(async (url: string, init: RequestInit = {}) => {
       lastCall = { url, init };
       return {
@@ -126,6 +126,6 @@ describe("pairing fetchers", () => {
       } as unknown as Response;
     });
     globalThis.fetch = fetchMock as unknown as typeof fetch;
-    await expect(createPairingRequest()).rejects.toThrow("HTTP 502");
+    await expect(listPairingRequests()).rejects.toThrow("HTTP 502");
   });
 });

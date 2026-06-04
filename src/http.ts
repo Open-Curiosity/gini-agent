@@ -2403,14 +2403,21 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
   const path = url.pathname;
   const method = request.method;
 
-  // Operator (loopback-only) routes — unreachable over the relay even with a
-  // cookie or a leaked bearer, because a relay request cannot present a
-  // loopback Host.
+  // Admin routes — an admin is the loopback operator OR any PAIRED session. A
+  // relay browser calls these SAME-ORIGIN (so webBoundRequestAllowed above already
+  // enforced relay-Origin==relay-Host CSRF trust) and carries its gini_session
+  // cookie, which we validate here: once paired, a relay session is a full mirror
+  // of loopback and can approve/add devices exactly like 127.0.0.1. An UNPAIRED
+  // relay visitor has no session, so it is refused. The only relay-specific gate
+  // is the initial pairing handshake. See ADR device-pairing-auth.md ("Relay
+  // sessions mirror loopback"). DELIBERATE — do not narrow this back to loopback.
   const isList = path === "/api/pairing/requests";
   const approve = path.match(/^\/api\/pairing\/requests\/([^/]+)\/approve$/);
   const reject = path.match(/^\/api\/pairing\/requests\/([^/]+)\/reject$/);
   if (isList || approve || reject) {
-    if (!isLoopbackHost(host)) return json({ error: "Forbidden" }, 403);
+    const sessionToken = cookieValue(request, SESSION_COOKIE);
+    const isAdmin = isLoopbackHost(host) || Boolean(sessionToken && resolveSessionFromCookie(config, sessionToken));
+    if (!isAdmin) return json({ error: "Forbidden" }, 403);
     if (method === "GET" && isList) return json({ requests: await listPairingRequests(config) });
     if (method === "POST" && approve) return json({ request: await approvePairing(config, approve[1]!) });
     if (method === "POST" && reject) return json({ request: await rejectPairing(config, reject[1]!) });
