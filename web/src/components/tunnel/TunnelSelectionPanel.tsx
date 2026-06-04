@@ -93,7 +93,14 @@ export function TunnelSelectionPanel({
               }}
               className={cn(
                 "flex min-h-15 items-center gap-3 rounded-lg border px-3 py-2.5 outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50",
-                isSelected ? "border-emerald-500/60 bg-emerald-500/5" : "border-border",
+                // Green is reserved for a LIVE connection. A selected-but-not-yet-
+                // connected provider gets a neutral highlight, so it reads as
+                // "chosen, still needs Connect" rather than "connected/good".
+                isSelected
+                  ? connected
+                    ? "border-emerald-500/60 bg-emerald-500/5"
+                    : "border-foreground/30 bg-foreground/5"
+                  : "border-border",
                 rowDisabled
                   ? "cursor-not-allowed opacity-50"
                   : "cursor-pointer hover:border-foreground/30"
@@ -103,7 +110,9 @@ export function TunnelSelectionPanel({
                 className={cn(
                   "flex size-8 shrink-0 items-center justify-center rounded-md border",
                   isSelected
-                    ? "border-emerald-500/50 text-emerald-500"
+                    ? connected
+                      ? "border-emerald-500/50 text-emerald-500"
+                      : "border-foreground/40 text-foreground"
                     : "border-border text-muted-foreground"
                 )}
               >
@@ -113,7 +122,14 @@ export function TunnelSelectionPanel({
                 <div className="flex items-center gap-2">
                   <span className="truncate text-sm font-medium">{p.name}</span>
                   {isSelected && (
-                    <span className="shrink-0 text-xs font-medium text-emerald-500">Selected</span>
+                    <span
+                      className={cn(
+                        "shrink-0 text-xs font-medium",
+                        connected ? "text-emerald-500" : "text-muted-foreground"
+                      )}
+                    >
+                      {connected ? "Connected" : "Selected"}
+                    </span>
                   )}
                 </div>
                 {!p.enabled && p.requires && (
@@ -150,9 +166,10 @@ export function TunnelSelectionPanel({
                     Disconnect
                   </Button>
                 ) : (
+                  // Selected but not connected: a filled (primary) Connect so the
+                  // call-to-action is unmistakable — the row itself is neutral now.
                   <Button
                     size="sm"
-                    variant="outline"
                     onClick={(e) => {
                       e.stopPropagation();
                       onConnect(p.id);
