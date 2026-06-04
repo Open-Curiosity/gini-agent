@@ -1,5 +1,5 @@
 import type { RuntimeConfig } from "../types";
-import { readState } from "../state";
+import { readState, redactPairingRequest } from "../state";
 import { redactDevice } from "../governance/pairing";
 import { status } from "./index";
 
@@ -50,6 +50,10 @@ export function publicState(config: RuntimeConfig) {
       claimedAt: pairing.claimedAt,
       claimedByDeviceId: pairing.claimedByDeviceId
     })),
-    devices: state.devices.map(redactDevice)
+    devices: state.devices.map(redactDevice),
+    // Strip the binding-secret hash (and userAgent) from pending pairing
+    // requests — publicState is served to clients (incl. owner-equivalent relay
+    // browsers via the BFF), and bindHash must never leave the gateway.
+    pairingRequests: state.pairingRequests.map(redactPairingRequest)
   };
 }

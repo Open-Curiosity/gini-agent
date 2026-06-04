@@ -223,7 +223,11 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
   const banner: Record<string, unknown> = runtimeStarted
     ? { started: true, url: url(config), instance: config.instance }
     : { running: true, url: url(config), instance: config.instance };
-  if (webUrlValue) banner.webUrl = webUrlValue;
+  // Advertise the GATEWAY origin as the operator's Web link, not the inner
+  // Next port: the gateway is the single front that serves the UI AND natively
+  // handles /api/pairing/* (device pairing 404s on the direct Next port). The
+  // inner port is kept only for liveness detection (webUrlValue).
+  if (webUrlValue) banner.webUrl = operatorWebUrl(config);
   if (foreground) banner.foreground = true;
   return { runtimeStarted, banner, children };
 }
@@ -239,6 +243,13 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
  *      case where the port file is missing — e.g. pre-upgrade install — but
  *      the user is likely on the default or an explicit --web-port).
  */
+// The web URL shown to the operator: the GATEWAY origin (it reverse-proxies the
+// UI and natively serves /api/pairing/*), not the inner Next port. localhost is
+// friendlier than 127.0.0.1 and resolves to the loopback the gateway binds.
+export function operatorWebUrl(config: RuntimeConfig): string {
+  return `http://localhost:${config.port}`;
+}
+
 export async function existingWebUrl(config: RuntimeConfig, webPort: number): Promise<string | null> {
   const path = join(config.stateRoot, "web.pid");
   if (!existsSync(path)) return null;
@@ -568,9 +579,9 @@ export async function remoteOrLocalStatus(config: RuntimeConfig, options: WebOpt
   const webUrl = await existingWebUrl(config, options.webPort);
   try {
     const remote = await api(config, "/api/status");
-    return { ...remote, web: { running: Boolean(webUrl), url: webUrl } };
+    return { ...remote, web: { running: Boolean(webUrl), url: webUrl ? operatorWebUrl(config) : null } };
   } catch {
-    return { ...status(config), ok: false, running: false, web: { running: Boolean(webUrl), url: webUrl } };
+    return { ...status(config), ok: false, running: false, web: { running: Boolean(webUrl), url: webUrl ? operatorWebUrl(config) : null } };
   }
 }
 
@@ -631,7 +642,7 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
         recorded: recordedWebPort(config)
       }
     },
-    web: { running: webPidAlive, pid: webPid ?? null, url: webHealthyUrl },
+    web: { running: webPidAlive, pid: webPid ?? null, url: webHealthyUrl ? operatorWebUrl(config) : null },
     tokenConfigured: Boolean(config.token),
     provider: providerHealth(config),
     tasks: state.tasks.length,

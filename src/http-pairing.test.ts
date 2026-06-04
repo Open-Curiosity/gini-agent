@@ -1,9 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RuntimeConfig } from "./types";
 import { createHandler, isPairingBootstrapPath } from "./http";
+import { createPairingRequest, mutateState } from "./state";
 
 function testConfig(instance: string): RuntimeConfig {
   const root = mkdtempSync(join(tmpdir(), `gini-pair-${instance}-`));
@@ -158,6 +159,28 @@ describe("pairing routes — device create + poll", () => {
     expect(cookie).toContain("Path=/api/pairing");
   });
 
+  test("create over a plain-http trusted front omits Secure on the binding cookie", async () => {
+    // A non-relay, non-loopback GINI_TRUSTED_ORIGINS front served over plain
+    // http would have a Secure cookie silently dropped by the browser, so
+    // pairingCookieSecure returns false here and the cookie carries no Secure.
+    const front = "pair-front.test:7337";
+    const previous = process.env.GINI_TRUSTED_ORIGINS;
+    process.env.GINI_TRUSTED_ORIGINS = `http://${front}`;
+    try {
+      const { handler } = makeHandler("pair-create-insecure");
+      const res = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: front, origin: `http://${front}`, secFetchSite: "same-origin", body: {}
+      });
+      expect(res.status).toBe(201);
+      const cookie = res.headers.getSetCookie().find((c) => c.startsWith("gini_pair="));
+      expect(cookie).toContain("HttpOnly");
+      expect(cookie).not.toContain("Secure");
+    } finally {
+      if (previous === undefined) delete process.env.GINI_TRUSTED_ORIGINS;
+      else process.env.GINI_TRUSTED_ORIGINS = previous;
+    }
+  });
+
   test("poll without the binding cookie is 401", async () => {
     const { handler } = makeHandler("pair-poll-nocookie");
     const relay = RELAY("pair-poll-nocookie");
@@ -189,6 +212,21 @@ describe("pairing routes — device create + poll", () => {
     });
     expect(res.status).toBe(200);
     expect((await res.json()).status).toBe("pending");
+  });
+
+  test("poll with a mismatched binding cookie is 403", async () => {
+    const { handler } = makeHandler("pair-poll-mismatch");
+    const relay = RELAY("pair-poll-mismatch");
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
+    });
+    const { id } = await created.json();
+    // The request exists, but the presented secret doesn't match its bindHash:
+    // bind_mismatch maps to 403, not the 404 reserved for an unknown id.
+    const res = await pair(handler, `/api/pairing/request/${id}`, {
+      host: relay, secFetchSite: "same-origin", cookie: "gini_pair=not-the-real-secret"
+    });
+    expect(res.status).toBe(403);
   });
 
   test("unknown pairing path under the prefix is 404", async () => {
@@ -256,6 +294,51 @@ describe("pairing routes — operator (loopback-only)", () => {
       method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
     });
     expect(res.status).toBe(404);
+  });
+
+  test("approve of a missing request is a 404 JSON envelope", async () => {
+    const { handler } = makeHandler("pair-op-approve-missing");
+    // approvePairing throws "Pairing request not found." which the wrapping
+    // try/catch maps through statusFromErrorMessage to 404 JSON, not 500.
+    const res = await pair(handler, "/api/pairing/requests/preq_missing/approve", {
+      method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+    });
+    expect(res.status).toBe(404);
+    expect((await res.json()).error).toBeTruthy();
+  });
+
+  test("approve of an already-resolved request is a 409 JSON envelope", async () => {
+    const { handler } = makeHandler("pair-op-approve-twice");
+    const relay = RELAY("pair-op-approve-twice");
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
+    });
+    const { id } = await created.json();
+    const first = await pair(handler, `/api/pairing/requests/${id}/approve`, {
+      method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+    });
+    expect(first.status).toBe(200);
+    // The second approve throws "Pairing request is already approved." which
+    // maps to 409 JSON, never the catch-all 500.
+    const second = await pair(handler, `/api/pairing/requests/${id}/approve`, {
+      method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+    });
+    expect(second.status).toBe(409);
+    expect((await second.json()).error).toBeTruthy();
+  });
+});
+
+describe("pairing routes — dispatch predicate", () => {
+  test("a near-miss path falls through to the bearer gate (401, not the pairing handler)", async () => {
+    const { handler } = makeHandler("pair-predicate");
+    const relay = RELAY("pair-predicate");
+    // "/api/pairing/request-foo" is NOT a device-pairing path (isDevicePairingPath
+    // is enumerated, not prefix-matched), so it skips the pairing handler and
+    // hits the bearer gate. No bearer → 401.
+    const res = await pair(handler, "/api/pairing/request-foo", {
+      host: relay, secFetchSite: "same-origin"
+    });
+    expect(res.status).toBe(401);
   });
 });
 
@@ -365,32 +448,41 @@ describe("pairing routes — cancel", () => {
 });
 
 describe("pairing routes — rate limit + pending cap", () => {
-  test("creation is rate limited per client key", async () => {
+  // The module-level limiters use the wall clock by default and aren't exported,
+  // so freeze the system clock for the create loop: with the clock frozen the
+  // per-host bucket never refills, so the 11th create on the same host (capacity
+  // 10) reliably trips the limit.
+  afterEach(() => setSystemTime());
+
+  test("creation is rate limited per host", async () => {
     const { handler } = makeHandler("pair-ratelimit");
     const relay = RELAY("pair-ratelimit");
+    setSystemTime(new Date("2025-01-01T00:00:00.000Z"));
     let last = 201;
     for (let i = 0; i < 11; i++) {
       const res = await pair(handler, "/api/pairing/request", {
-        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", xff: "9.9.9.9", body: {}
+        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
       });
       last = res.status;
     }
     expect(last).toBe(429);
   });
 
-  test("pending cap rejects creation beyond the cap", async () => {
-    const { handler } = makeHandler("pair-pendingcap");
+  test("the pending cap maps to 429", async () => {
+    const { config, handler } = makeHandler("pair-pendingcap");
     const relay = RELAY("pair-pendingcap");
-    // Vary XFF per create so the per-key rate limiter never trips; the pending
-    // cap should be what stops us.
-    let last = 201;
-    for (let i = 0; i < 21; i++) {
-      const res = await pair(handler, "/api/pairing/request", {
-        method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", xff: `10.0.0.${i}`, body: {}
-      });
-      last = res.status;
-    }
-    expect(last).toBe(429);
+    // Pre-seed the cap of pending requests directly through the state mutation
+    // (no rate-limiter tokens consumed) so the cap — not the host limiter — is
+    // what the create has to clear. A fresh host keeps the host limiter happy.
+    await mutateState(config.instance, (state) => {
+      for (let i = 0; i < 20; i++) {
+        createPairingRequest(state, { userAgent: "seed", relayHost: relay, bindHash: `seed-${i}` });
+      }
+    });
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
+    });
+    expect(res.status).toBe(429);
   });
 });
 

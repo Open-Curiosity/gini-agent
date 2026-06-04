@@ -65,14 +65,14 @@ Stable local clients use the gateway API:
 - `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`, `/api/stt/status`
 - `/api/uploads` (POST `image/*` or `audio/*`), `GET /api/uploads/:id`
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
-- `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
+- `/api/pairing`, `/api/pairing/claim`, `/api/pairing/request*`, `/api/devices`, `/api/mobile/bootstrap`
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
 - `/api/tunnel`, `/api/tunnel/select`, `/api/tunnel/connect`, `/api/tunnel/cancel`, `/api/tunnel/disconnect`
 - `/api/audit`, `/api/events`, `/api/events/stream`
 - `/api/settings/auto-approve`
 - `/api/parity/hermes`, `/api/readiness/v1`
 
-All routes require `Authorization: Bearer <token>` except health checks and the limited SSE token compatibility path.
+Native gateway `/api/*` routes require `Authorization: Bearer <token>` except health checks, the limited SSE token compatibility path, and the device-pairing routes under `/api/pairing/*`. Pairing has its own trust model (see [ADR: Device-pairing authentication](adr/device-pairing-auth.md)): `POST /api/pairing/claim` and the device routes (`POST /api/pairing/request`, `GET /api/pairing/request/:id`, `POST /api/pairing/request/:id/{claim,cancel}`) are public/rate-limited and bound to the single-use `gini_pair` cookie rather than a bearer; the operator routes (`GET /api/pairing/requests`, `POST /api/pairing/requests/:id/{approve,reject}`) are loopback-only. Separately, web-bound `/api/runtime/*` calls arriving on a non-loopback (relay/allowlisted) front are authenticated by the `gini_session` cookie minted at pairing claim, not a bearer.
 
 ## Boundaries
 

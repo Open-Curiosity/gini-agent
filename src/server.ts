@@ -1,5 +1,5 @@
 import { writeFileSync } from "node:fs";
-import { createHandler, isPairingBootstrapPath, isWebProxyPath, proxyWebSocketUpgrade, webSocketProxyHandler, writePid } from "./http";
+import { createHandler, isPairingBootstrapPath, isWebProxyPath, proxyWebSocketUpgrade, SESSION_COOKIE, webSocketProxyHandler, writePid } from "./http";
 import { isLoopbackHost, webBoundRequestAllowed } from "./lib/origin-trust";
 import { cookieValue } from "./lib/cookies";
 import { resolveSessionFromCookie } from "./governance/pairing";
@@ -194,7 +194,7 @@ const server = Bun.serve({
       const wsPath = new URL(request.url).pathname;
       const wsHost = request.headers.get("host") ?? new URL(request.url).host;
       if (!isLoopbackHost(wsHost) && !isPairingBootstrapPath(wsPath)
-          && !resolveSessionFromCookie(config, cookieValue(request, "gini_session"))) {
+          && !resolveSessionFromCookie(config, cookieValue(request, SESSION_COOKIE))) {
         return new Response("Unauthorized", { status: 401 });
       }
       return proxyWebSocketUpgrade(request, server, config);

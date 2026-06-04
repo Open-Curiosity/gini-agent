@@ -15,6 +15,7 @@ import {
   markUnread,
   mutateState,
   now,
+  PairingCapExceededError,
   readState,
   unreadCountsByDevice,
   readTrace,
@@ -50,8 +51,8 @@ import {
   claimPairing,
   claimPairingSession,
   createPairing,
-  getPairingRequestStatus,
   listPairingRequests,
+  pollPairingStatus,
   rejectPairing,
   requestPairing,
   resolveCredentialFromBearer,
@@ -91,7 +92,7 @@ import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrow
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, selectProvider } from "./integrations/tunnel";
-import { isLoopbackHost, webBoundRequestAllowed } from "./lib/origin-trust";
+import { isLoopbackHost, isRelayHost, webBoundRequestAllowed } from "./lib/origin-trust";
 import { cookieValue, serializeCookie } from "./lib/cookies";
 import { RateLimiter } from "./lib/rate-limit";
 import { hashSecret } from "./state/security";
@@ -1615,10 +1616,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       // Relay device-pairing API: gateway-handled before the bearer gate so it
       // can enforce its own loopback-vs-public rules from the true inbound Host.
-      // Covers /api/pairing/request* and /api/pairing/requests* (not the
-      // bearer-gated /api/pairing code-generation route).
-      if (url.pathname.startsWith("/api/pairing/request")) {
-        return handlePairingRoutes(request, url, config);
+      // The paths are enumerated (isDevicePairingPath) rather than prefix-matched
+      // so a future /api/pairing/request-* route can't silently bypass the bearer
+      // gate. The handler can throw (approve/reject of a stale request), so wrap
+      // it in the same JSON error envelope the route table uses.
+      if (isDevicePairingPath(url.pathname)) {
+        try {
+          return await handlePairingRoutes(request, url, config);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return withCors(request, json({ error: message }, statusFromErrorMessage(message)));
+        }
       }
       if (!await authorized(request, config)) return withCors(request, json({ error: "Unauthorized" }, 401));
       for (const [method, pattern, handler] of routes) {
@@ -2181,26 +2189,40 @@ async function rollbackIdentityFile(
 // secret (scoped to /api/pairing so it only rides pairing calls); gini_session
 // carries the minted session token (scoped to the whole app).
 const PAIR_BIND_COOKIE = "gini_pair";
-const SESSION_COOKIE = "gini_session";
+export const SESSION_COOKIE = "gini_session";
 const SESSION_COOKIE_TTL_SECONDS = 30 * 24 * 60 * 60;
 const PAIR_BIND_COOKIE_TTL_SECONDS = 3600;
-// Cap on concurrent pending requests so a flood can't bury the operator panel.
-const MAX_PENDING_PAIRING_REQUESTS = 20;
-// Token bucket: 10 request-creations burst, refilling at 10/min, keyed by the
-// best available client identifier (XFF first hop, else Host).
-const pairingCreateLimiter = new RateLimiter({ capacity: 10, refillPerSec: 10 / 60 });
+// Flood control on the public create endpoint. Keyed on the inbound Host (the
+// relay subdomain is un-forgeable — the relay owns its DNS), NOT on
+// X-Forwarded-For, which a client can spoof to mint fresh buckets. A separate
+// global bucket backstops the per-host limit so many distinct hosts can't add
+// up to an unbounded flood. The MAX_PENDING cap is enforced atomically inside
+// createPairingRequest (see src/state/records.ts), not here.
+const pairingHostLimiter = new RateLimiter({ capacity: 10, refillPerSec: 10 / 60 });
+const pairingGlobalLimiter = new RateLimiter({ capacity: 40, refillPerSec: 40 / 60 });
 
-const sessionCookieAttributes = { httpOnly: true, secure: true, sameSite: "Lax" as const, path: "/" };
-const bindCookieAttributes = { httpOnly: true, secure: true, sameSite: "Lax" as const, path: "/api/pairing" };
+const sessionCookieAttributes = { httpOnly: true, sameSite: "Lax" as const, path: "/" };
+const bindCookieAttributes = { httpOnly: true, sameSite: "Lax" as const, path: "/api/pairing" };
 
 function randomBindSecret(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function pairingRateLimitKey(request: Request): string {
-  const xff = request.headers.get("x-forwarded-for");
-  if (xff && xff.trim()) return xff.split(",")[0]!.trim();
-  return request.headers.get("host") ?? "global";
+// Whether to set Secure on pairing cookies. The relay front is always HTTPS and
+// loopback is a secure context, so both get Secure. A plain-http
+// GINI_TRUSTED_ORIGINS front would otherwise have its Secure cookie silently
+// dropped by the browser; honor X-Forwarded-Proto / the request scheme so such
+// a front can still pair.
+function pairingCookieSecure(request: Request, host: string): boolean {
+  if (isRelayHost(host) || isLoopbackHost(host)) return true;
+  if ((request.headers.get("x-forwarded-proto") ?? "").toLowerCase() === "https") return true;
+  return new URL(request.url).protocol === "https:";
+}
+
+function pairingCreateAllowed(request: Request): boolean {
+  const host = request.headers.get("host") ?? new URL(request.url).host;
+  // Both buckets must admit the request; consume per-host first, then global.
+  return pairingHostLimiter.tryConsume(host) && pairingGlobalLimiter.tryConsume("global");
 }
 
 // Paths an UNPAIRED relay browser may still reach so it can run the pairing
@@ -2212,6 +2234,16 @@ export function isPairingBootstrapPath(pathname: string): boolean {
   if (pathname.startsWith("/_next/")) return true;
   if (pathname === "/favicon.ico") return true;
   return /\.(png|jpe?g|svg|gif|webp|ico|woff2?|ttf|otf|css|js|map|json|txt)$/.test(pathname);
+}
+
+// Exactly the device-pairing paths the gateway handles natively before the
+// bearer gate — enumerated, not prefix-matched, so a future
+// /api/pairing/request-* route is NOT silently captured here and must be added
+// deliberately. Mirrors the route matching inside handlePairingRoutes.
+function isDevicePairingPath(pathname: string): boolean {
+  if (pathname === "/api/pairing/request" || pathname === "/api/pairing/requests") return true;
+  if (/^\/api\/pairing\/requests\/[^/]+\/(approve|reject)$/.test(pathname)) return true;
+  return /^\/api\/pairing\/request\/[^/]+(\/(claim|cancel))?$/.test(pathname);
 }
 
 // Gateway-handled pairing API. Lives on the native /api surface but is
@@ -2242,33 +2274,43 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
 
   // Device: create a request (public, rate-limited, sets the binding cookie).
   if (method === "POST" && path === "/api/pairing/request") {
-    if (!pairingCreateLimiter.tryConsume(pairingRateLimitKey(request))) {
+    if (!pairingCreateAllowed(request)) {
       return json({ error: "Too many pairing requests. Try again shortly." }, 429);
     }
-    if ((await listPairingRequests(config)).length >= MAX_PENDING_PAIRING_REQUESTS) {
-      return json({ error: "Too many pending pairing requests." }, 429);
-    }
     const bindSecret = randomBindSecret();
-    const created = await requestPairing(config, {
-      userAgent: request.headers.get("user-agent") ?? "",
-      relayHost: host,
-      bindHash: hashSecret(bindSecret)
-    });
+    let created: Awaited<ReturnType<typeof requestPairing>>;
+    try {
+      created = await requestPairing(config, {
+        userAgent: request.headers.get("user-agent") ?? "",
+        relayHost: host,
+        bindHash: hashSecret(bindSecret)
+      });
+    } catch (error) {
+      // Cap enforced atomically inside the create mutation.
+      if (error instanceof PairingCapExceededError) return json({ error: error.message }, 429);
+      throw error;
+    }
     const response = json({ id: created.id, code: created.code }, 201);
     response.headers.append(
       "set-cookie",
-      serializeCookie(PAIR_BIND_COOKIE, bindSecret, { ...bindCookieAttributes, maxAge: PAIR_BIND_COOKIE_TTL_SECONDS })
+      serializeCookie(PAIR_BIND_COOKIE, bindSecret, {
+        ...bindCookieAttributes,
+        secure: pairingCookieSecure(request, host),
+        maxAge: PAIR_BIND_COOKIE_TTL_SECONDS
+      })
     );
     return response;
   }
 
-  // Device: poll own request status (requires the binding cookie to exist).
+  // Device: poll own request status (bind-checked — the binding cookie must
+  // match this request, not merely exist).
   const poll = path.match(/^\/api\/pairing\/request\/([^/]+)$/);
   if (method === "GET" && poll) {
-    if (!cookieValue(request, PAIR_BIND_COOKIE)) return json({ error: "Unauthorized" }, 401);
-    const status = await getPairingRequestStatus(config, poll[1]!);
-    if (!status) return json({ error: "Pairing request not found" }, 404);
-    return json({ status: status.status });
+    const bindSecret = cookieValue(request, PAIR_BIND_COOKIE);
+    if (!bindSecret) return json({ error: "Unauthorized" }, 401);
+    const result = await pollPairingStatus(config, poll[1]!, bindSecret);
+    if (!result.ok) return json({ error: result.reason }, result.reason === "not_found" ? 404 : 403);
+    return json({ status: result.status });
   }
 
   // Device: claim an approved request → mint the session, set the cookie.
@@ -2281,13 +2323,14 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
       const code = result.reason === "not_found" ? 404 : result.reason === "bind_mismatch" ? 403 : 409;
       return json({ error: result.reason }, code);
     }
+    const secure = pairingCookieSecure(request, host);
     const response = json({ status: "approved" });
     response.headers.append(
       "set-cookie",
-      serializeCookie(SESSION_COOKIE, result.token, { ...sessionCookieAttributes, maxAge: SESSION_COOKIE_TTL_SECONDS })
+      serializeCookie(SESSION_COOKIE, result.token, { ...sessionCookieAttributes, secure, maxAge: SESSION_COOKIE_TTL_SECONDS })
     );
     // The binding cookie is single-use; clear it now that the session is minted.
-    response.headers.append("set-cookie", serializeCookie(PAIR_BIND_COOKIE, "", { ...bindCookieAttributes, maxAge: 0 }));
+    response.headers.append("set-cookie", serializeCookie(PAIR_BIND_COOKIE, "", { ...bindCookieAttributes, secure, maxAge: 0 }));
     return response;
   }
 
@@ -2299,7 +2342,10 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
     const result = await cancelPairing(config, cancel[1]!, bindSecret);
     if (!result.ok) return json({ error: result.reason }, result.reason === "not_found" ? 404 : 403);
     const response = json({ ok: true });
-    response.headers.append("set-cookie", serializeCookie(PAIR_BIND_COOKIE, "", { ...bindCookieAttributes, maxAge: 0 }));
+    response.headers.append(
+      "set-cookie",
+      serializeCookie(PAIR_BIND_COOKIE, "", { ...bindCookieAttributes, secure: pairingCookieSecure(request, host), maxAge: 0 })
+    );
     return response;
   }
 
@@ -2392,6 +2438,9 @@ function agentIdFilter(request: Request): string | undefined {
 function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Job not found") || message.startsWith("Job run not found")) return 404;
   if (message.startsWith("Agent not found")) return 404;
+  // Pairing approve/reject of a missing or already-resolved request.
+  if (message === "Pairing request not found.") return 404;
+  if (message.startsWith("Pairing request is already")) return 409;
   // Agent create/rename name validation throws user-input errors that should
   // surface as 400 rather than the catch-all 500.
   if (message === "Agent name is required.") return 400;

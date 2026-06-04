@@ -17,7 +17,17 @@
 // and for the afterAll revert. None of these specifiers is itself the SUBJECT of
 // another rendering test, so the spread keeps them harmless.
 
-import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  setSystemTime,
+  test
+} from "bun:test";
 import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -121,6 +131,13 @@ beforeEach(() => {
   toastSuccess.mockClear();
   toastError.mockClear();
   invalidateSpy.mockClear();
+});
+
+// relativeTime assertions freeze the wall clock so the createdAt offset and the
+// in-component Date.now() read share one instant (a live clock can tick mid-test
+// and flip "30s ago" -> "31s ago"). Reset to the real clock after every test.
+afterEach(() => {
+  setSystemTime();
 });
 
 describe("PairRequestsPanel", () => {
@@ -228,18 +245,21 @@ describe("PairRequestsPanel", () => {
   });
 
   test("relativeTime: 'just now' for a fresh request (<5s)", () => {
+    setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
     requests = [makeRequest({ createdAt: new Date(Date.now() - 1000).toISOString() })];
     renderPanel();
     expect(screen.queryByText(/just now/)).not.toBeNull();
   });
 
   test("relativeTime: 'Ns ago' for under a minute", () => {
+    setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
     requests = [makeRequest({ createdAt: new Date(Date.now() - 30_000).toISOString() })];
     renderPanel();
     expect(screen.queryByText(/30s ago/)).not.toBeNull();
   });
 
   test("relativeTime: 'Nm ago' for a minute or more", () => {
+    setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
     requests = [makeRequest({ createdAt: new Date(Date.now() - 120_000).toISOString() })];
     renderPanel();
     expect(screen.queryByText(/2m ago/)).not.toBeNull();

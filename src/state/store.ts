@@ -138,16 +138,37 @@ export function expirePairingCodes(state: RuntimeState): void {
   }
 }
 
-// Lazily expire stale pending pairing requests, mirroring expirePairingCodes.
-// Called at the top of every pairing-request read/mutate so a request that
-// timed out before the operator acted resolves to "expired" rather than
-// lingering as an approvable row.
+// Most recent terminal pairing requests retained for the operator's
+// recent-activity view; older terminal rows are pruned so a public create
+// endpoint can't grow durable state without bound (mirrors the events ring
+// buffer cap in src/state/audit.ts).
+const RETAINED_TERMINAL_PAIRING_REQUESTS = 50;
+const TERMINAL_PAIRING_STATUSES = new Set<PairingRequestStatus>([
+  "approved",
+  "rejected",
+  "cancelled",
+  "claimed",
+  "expired"
+]);
+
+// Lazily expire stale pending pairing requests, mirroring expirePairingCodes,
+// then prune terminal rows so the array stays bounded. Called at the top of
+// every pairing-request read/mutate.
 export function expirePairingRequests(state: RuntimeState): void {
   const at = Date.now();
   for (const request of state.pairingRequests) {
     if (request.status === "pending" && new Date(request.expiresAt).getTime() <= at) {
       request.status = "expired" satisfies PairingRequestStatus;
     }
+  }
+  // Keep every non-terminal (pending) row plus the newest N terminal rows.
+  const pending = state.pairingRequests.filter((r) => !TERMINAL_PAIRING_STATUSES.has(r.status));
+  const terminal = state.pairingRequests
+    .filter((r) => TERMINAL_PAIRING_STATUSES.has(r.status))
+    .sort((a, b) => (b.resolvedAt ?? b.createdAt).localeCompare(a.resolvedAt ?? a.createdAt))
+    .slice(0, RETAINED_TERMINAL_PAIRING_REQUESTS);
+  if (terminal.length !== state.pairingRequests.length - pending.length) {
+    state.pairingRequests = [...pending, ...terminal];
   }
 }
 

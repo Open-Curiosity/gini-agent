@@ -10,6 +10,7 @@ import {
   findActiveSessionByToken,
   getPairingRequest,
   listPendingPairingRequests,
+  pollPairingRequest,
   mutateState,
   readState,
   redactPairingRequest,
@@ -114,6 +115,12 @@ export async function listPairingRequests(config: RuntimeConfig) {
 export async function getPairingRequestStatus(config: RuntimeConfig, id: string) {
   const request = await mutateState(config.instance, (state) => getPairingRequest(state, id));
   return request ? redactPairingRequest(request) : null;
+}
+
+// Bind-checked status poll for the requesting device. Requires the gini_pair
+// binding secret so a known request id + an unrelated cookie can't read status.
+export async function pollPairingStatus(config: RuntimeConfig, id: string, bindSecret: string) {
+  return mutateState(config.instance, (state) => pollPairingRequest(state, id, bindSecret));
 }
 
 export async function approvePairing(config: RuntimeConfig, id: string) {

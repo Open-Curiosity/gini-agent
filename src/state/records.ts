@@ -676,10 +676,14 @@ export function revokeDevice(state: RuntimeState, deviceId: string): PairedDevic
 export function findActiveDeviceByToken(state: RuntimeState, token: string): PairedDevice | undefined {
   const tokenHash = hashSecret(token);
   const device = state.devices.find((item) => item.tokenHash === tokenHash && item.status === "active");
-  if (device) {
-    device.lastSeenAt = now();
-    device.updatedAt = device.lastSeenAt;
-  }
+  if (!device) return undefined;
+  // Honor session expiry on the bearer path too, exactly as findActiveSessionByToken
+  // does for the cookie path — otherwise a relay-minted session token (which carries
+  // a finite expiresAt) would outlive its expiry when presented as a Bearer. Mobile/
+  // code-claimed devices have no expiresAt, so this is a no-op for them.
+  if (device.expiresAt && new Date(device.expiresAt).getTime() <= Date.now()) return undefined;
+  device.lastSeenAt = now();
+  device.updatedAt = device.lastSeenAt;
   return device;
 }
 
@@ -694,6 +698,21 @@ const DEFAULT_SESSION_SCOPES = ["tasks:read", "tasks:write", "approvals:write", 
 // never explicitly revokes it. Revocation still takes effect immediately,
 // independent of this TTL.
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Cap on concurrent PENDING pairing requests so a public flood can't bury the
+// operator panel. Enforced INSIDE createPairingRequest (one mutateState txn) so
+// the check-and-create is atomic — a pre-read in the HTTP layer would be a
+// check-then-act race across two transactions.
+export const MAX_PENDING_PAIRING_REQUESTS = 20;
+
+// Thrown by createPairingRequest when the pending cap is hit; the HTTP layer
+// maps it to 429.
+export class PairingCapExceededError extends Error {
+  constructor() {
+    super("Too many pending pairing requests.");
+    this.name = "PairingCapExceededError";
+  }
+}
 
 // Derive a short human label ("Safari · iPhone") from a User-Agent for the
 // operator's approval panel and the Active Sessions list. Order matters:
@@ -732,6 +751,9 @@ export function createPairingRequest(
   input: { userAgent: string; relayHost: string; bindHash: string; ttlSeconds?: number }
 ): PairingRequest {
   expirePairingRequests(state);
+  if (state.pairingRequests.filter((r) => r.status === "pending").length >= MAX_PENDING_PAIRING_REQUESTS) {
+    throw new PairingCapExceededError();
+  }
   const at = now();
   const ttlSeconds = Math.min(3600, Math.max(60, Math.floor(input.ttlSeconds ?? 600)));
   const request: PairingRequest = {
@@ -915,7 +937,30 @@ export function claimPairingRequest(
     },
     { system: true }
   );
+  // A "pairing" tick so the operator's Active Sessions list refreshes the moment
+  // the new session is minted (the other pairing mutators emit one too).
+  appendEvent(
+    state,
+    { kind: "pairing", action: "resolved", target: request.id, risk: "low", summary: `Device paired: ${device.name}` },
+    { system: true }
+  );
   return { ok: true, device, token };
+}
+
+// Bind-checked status read for the device's own poll. Unlike getPairingRequest,
+// it requires the binding secret so a holder of an unrelated gini_pair cookie
+// (plus a guessed request id) cannot read another request's status. Mirrors the
+// bind check in claim/cancel.
+export function pollPairingRequest(
+  state: RuntimeState,
+  requestId: string,
+  bindSecret: string
+): { ok: true; status: PairingRequest["status"] } | { ok: false; reason: "not_found" | "bind_mismatch" } {
+  expirePairingRequests(state);
+  const request = state.pairingRequests.find((item) => item.id === requestId);
+  if (!request) return { ok: false, reason: "not_found" };
+  if (hashSecret(bindSecret) !== request.bindHash) return { ok: false, reason: "bind_mismatch" };
+  return { ok: true, status: request.status };
 }
 
 // Read-only session resolution for the gateway's hot relay cookie gate. Unlike

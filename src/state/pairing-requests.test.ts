@@ -7,9 +7,13 @@ import {
   claimPairingRequest,
   createPairingRequest,
   deviceNameFromUserAgent,
+  findActiveDeviceByToken,
   findActiveSessionByToken,
   getPairingRequest,
   listPendingPairingRequests,
+  MAX_PENDING_PAIRING_REQUESTS,
+  PairingCapExceededError,
+  pollPairingRequest,
   redactPairingRequest,
   rejectPairingRequest,
   touchSessionLastSeen
@@ -310,5 +314,125 @@ describe("expirePairingRequests", () => {
     expect(state.pairingRequests.find((r) => r.id === fresh.id)?.status).toBe("pending");
     expect(state.pairingRequests.find((r) => r.id === stale.id)?.status).toBe("expired");
     expect(state.pairingRequests.find((r) => r.id === approved.id)?.status).toBe("approved");
+  });
+
+  test("prunes terminal rows down to the newest 50, keeping every pending row", () => {
+    const state = createEmptyState("sandbox");
+    // 60 terminal rows: create then reject. Stamp each with a strictly
+    // increasing resolvedAt so the newest-50 sort is deterministic — the
+    // synchronous test would otherwise land several rejects in the same
+    // millisecond and the "oldest dropped" assertion couldn't pin a row.
+    const terminal: string[] = [];
+    for (let i = 0; i < 60; i += 1) {
+      const request = makeRequest(state);
+      rejectPairingRequest(state, request.id);
+      state.pairingRequests.find((r) => r.id === request.id)!.resolvedAt = new Date(1_000 + i).toISOString();
+      terminal.push(request.id);
+    }
+    // A couple of live pending rows that must survive the prune regardless of
+    // how many terminal rows exist.
+    const pendingA = makeRequest(state);
+    const pendingB = makeRequest(state);
+
+    expirePairingRequests(state);
+
+    const surviving = new Set(state.pairingRequests.map((r) => r.id));
+    // Both pending rows are retained.
+    expect(surviving.has(pendingA.id)).toBe(true);
+    expect(surviving.has(pendingB.id)).toBe(true);
+    // At most 50 terminal rows remain.
+    const survivingTerminal = state.pairingRequests.filter((r) => r.status === "rejected");
+    expect(survivingTerminal.length).toBe(50);
+    // The 10 oldest terminal rows (lowest resolvedAt) were dropped; the
+    // newest 50 (indices 10..59) survive.
+    for (const id of terminal.slice(0, 10)) expect(surviving.has(id)).toBe(false);
+    for (const id of terminal.slice(10)) expect(surviving.has(id)).toBe(true);
+    // Total = 50 terminal + 2 pending.
+    expect(state.pairingRequests.length).toBe(52);
+  });
+});
+
+describe("createPairingRequest pending cap", () => {
+  test("allows creating up to the cap, then throws PairingCapExceededError", () => {
+    const state = createEmptyState("sandbox");
+    for (let i = 0; i < MAX_PENDING_PAIRING_REQUESTS; i += 1) {
+      const request = makeRequest(state);
+      expect(request.status).toBe("pending");
+    }
+    expect(state.pairingRequests.filter((r) => r.status === "pending").length).toBe(MAX_PENDING_PAIRING_REQUESTS);
+    expect(() => makeRequest(state)).toThrow(PairingCapExceededError);
+  });
+
+  test("frees a slot once a pending request resolves", () => {
+    const state = createEmptyState("sandbox");
+    const requests = Array.from({ length: MAX_PENDING_PAIRING_REQUESTS }, () => makeRequest(state));
+    // At the cap — the next create throws.
+    expect(() => makeRequest(state)).toThrow(PairingCapExceededError);
+    // Resolve one pending request; a slot opens up and create succeeds again.
+    rejectPairingRequest(state, requests[0]!.id);
+    expect(makeRequest(state).status).toBe("pending");
+  });
+});
+
+describe("pollPairingRequest", () => {
+  test("returns the status for the matching binding secret", () => {
+    const state = createEmptyState("sandbox");
+    const request = makeRequest(state);
+    expect(pollPairingRequest(state, request.id, SECRET)).toEqual({ ok: true, status: "pending" });
+    approvePairingRequest(state, request.id);
+    expect(pollPairingRequest(state, request.id, SECRET)).toEqual({ ok: true, status: "approved" });
+  });
+
+  test("rejects a binding-secret mismatch", () => {
+    const state = createEmptyState("sandbox");
+    const request = makeRequest(state);
+    expect(pollPairingRequest(state, request.id, "wrong-secret")).toEqual({ ok: false, reason: "bind_mismatch" });
+  });
+
+  test("rejects an unknown request id", () => {
+    const state = createEmptyState("sandbox");
+    expect(pollPairingRequest(state, "preq_missing", SECRET)).toEqual({ ok: false, reason: "not_found" });
+  });
+});
+
+describe("claimPairingRequest events", () => {
+  test("emits a pairing tick on the broadcast stream after a successful claim", () => {
+    const state = createEmptyState("sandbox");
+    const request = makeRequest(state);
+    approvePairingRequest(state, request.id);
+    const result = claimPairingRequest(state, request.id, SECRET);
+    expect(result.ok).toBe(true);
+    // The most recent appended event is the claim's pairing tick.
+    expect(state.events[0]?.kind).toBe("pairing");
+    expect(state.events[0]?.action).toBe("resolved");
+    expect(state.events[0]?.target).toBe(request.id);
+  });
+});
+
+describe("findActiveDeviceByToken", () => {
+  function mintSession() {
+    const state = createEmptyState("sandbox");
+    const request = makeRequest(state);
+    approvePairingRequest(state, request.id);
+    const result = claimPairingRequest(state, request.id, SECRET);
+    if (!result.ok) throw new Error("expected claim to succeed");
+    return { state, token: result.token, device: result.device };
+  }
+
+  test("resolves an active, unexpired device on the bearer path", () => {
+    const { state, token, device } = mintSession();
+    expect(findActiveDeviceByToken(state, token)?.id).toBe(device.id);
+  });
+
+  test("returns undefined for a device whose expiry is in the past", () => {
+    const { state, token } = mintSession();
+    state.devices[0]!.expiresAt = new Date(Date.now() - 1000).toISOString();
+    expect(findActiveDeviceByToken(state, token)).toBeUndefined();
+  });
+
+  test("still resolves a device whose expiry is in the future", () => {
+    const { state, token, device } = mintSession();
+    state.devices[0]!.expiresAt = new Date(Date.now() + 60_000).toISOString();
+    expect(findActiveDeviceByToken(state, token)?.id).toBe(device.id);
   });
 });
