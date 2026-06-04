@@ -12,6 +12,7 @@ import { Composer } from "@/components/chat/Composer";
 import { AgentChatHeader } from "@/components/chat/AgentChatHeader";
 import { ChatTabBar, type ChatTab } from "@/components/chat/ChatTabBar";
 import { ThreadChip } from "@/components/chat/ThreadChip";
+import { ReplyInThreadButton } from "@/components/chat/ReplyInThreadButton";
 import { ThreadPanel } from "@/components/chat/ThreadPanel";
 import { ThreadsTab } from "@/components/chat/ThreadsTab";
 import { JobsTab } from "@/components/chat/JobsTab";
@@ -27,6 +28,7 @@ import {
   useStatus,
   useThreads
 } from "@/lib/queries";
+import type { ChatBlock } from "@runtime/types";
 import type { ChatSession, ThreadSummary } from "@/lib/view-types";
 
 // Phase labels the runtime emits as the final block of a task; a non-terminal
@@ -241,6 +243,11 @@ function ChatSurface({
                       const block = item.block;
                       const thread =
                         block.kind === "assistant_text" ? threadByParent.get(block.id) : undefined;
+                      // An assistant reply with no thread yet gets the always-
+                      // visible "Reply in thread" affordance so the user can
+                      // branch a new thread off it (Slack-style).
+                      const canStartThread =
+                        block.kind === "assistant_text" && !block.streaming && !thread;
                       return (
                         <li key={block.id} className="space-y-2">
                           <BlockRenderer
@@ -255,6 +262,12 @@ function ChatSurface({
                           {thread ? (
                             <div className="pl-[46px]">
                               <ThreadChip thread={thread} onOpen={() => setOpenThread(thread)} />
+                            </div>
+                          ) : canStartThread ? (
+                            <div className="pl-[46px]">
+                              <ReplyInThreadButton
+                                onClick={() => setOpenThread(newThreadFor(sessionId, block))}
+                              />
                             </div>
                           ) : null}
                         </li>
@@ -306,6 +319,25 @@ function ChatSurface({
       ) : null}
     </>
   );
+}
+
+// Build the open-thread descriptor for a brand-new thread the user is
+// starting off an assistant message. There's no ThreadSummary yet (no blocks),
+// so synthesize one with a fresh threadId and replyCount 0; ThreadPanel renders
+// the parent echo + empty replies + composer, and the first reply (carrying
+// `parentBlockId`) brings the real thread into existence.
+function newThreadFor(
+  sessionId: string,
+  block: Extract<ChatBlock, { kind: "assistant_text" }>
+): ThreadSummary {
+  return {
+    threadId: crypto.randomUUID(),
+    sessionId,
+    parentBlockId: block.id,
+    rootPreview: block.text,
+    replyCount: 0,
+    lastReplyAt: block.createdAt
+  };
 }
 
 // Resolve a pinned session from the cached chat list by id. Channels and

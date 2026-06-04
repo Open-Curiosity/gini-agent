@@ -26,7 +26,7 @@ import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
 import { GeneratedFilesCard } from "@/src/components/chat/GeneratedFilesCard";
-import { ThreadRepliesChip } from "@/src/components/chat/ThreadChip";
+import { ReplyInThreadPill, ThreadRepliesChip } from "@/src/components/chat/ThreadChip";
 import { VoiceRecorder, type VoiceRef } from "@/src/components/chat/VoiceRecorder";
 import { chatListTime, jobCadence, relativeTime } from "@/src/format";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
@@ -96,6 +96,28 @@ function describeAsset(asset: ImagePicker.ImagePickerAsset): {
 }
 
 const TERMINAL_PHASE_LABELS = new Set<string>(["Completed", "Cancelled", "Failed"]);
+
+// Mint a thread id and open the Thread View for a brand-new thread the user
+// is starting off an assistant message. The thread doesn't exist yet (no
+// blocks), so the parent block id + its text ride along as route params; the
+// Thread View renders them as the pinned parent and the first reply (carrying
+// parentBlockId) brings the thread into existence. crypto.randomUUID isn't
+// available under Hermes, so the id is timestamp + random.
+function openNewThread(
+  sessionId: string,
+  block: Extract<ChatBlock, { kind: "assistant_text" }>
+): void {
+  const threadId = `thread_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  router.push({
+    pathname: "/chat/[sessionId]/thread/[threadId]",
+    params: {
+      sessionId,
+      threadId,
+      parentBlockId: block.id,
+      rootPreview: block.text
+    }
+  });
+}
 
 function findInFlightTaskId(blocks: ChatBlock[]): string | null {
   for (let i = blocks.length - 1; i >= 0; i -= 1) {
@@ -531,18 +553,23 @@ export default function ChatDetailScreen() {
                     return <GeneratedFilesCard key={item.id} files={item.files} />;
                   }
                   // An assistant_text block can host a thread; render the
-                  // block then the inline "N replies" chip beneath it.
+                  // block then the inline "N replies" chip beneath it. A
+                  // finished assistant reply with no thread yet shows the
+                  // "Reply in thread" pill so the user can start one.
+                  const block = item.block;
                   const thread =
-                    item.block.kind === "assistant_text"
-                      ? threadByParentBlock.get(item.block.id)
+                    block.kind === "assistant_text"
+                      ? threadByParentBlock.get(block.id)
                       : undefined;
+                  const canStartThread =
+                    block.kind === "assistant_text" && !block.streaming && !thread;
                   return (
-                    <View key={item.block.id}>
+                    <View key={block.id}>
                       <BlockRenderer
-                        block={item.block}
+                        block={block}
                         toolResult={
-                          item.block.kind === "tool_call"
-                            ? toolResultsByCallId.get(item.block.callId)
+                          block.kind === "tool_call"
+                            ? toolResultsByCallId.get(block.callId)
                             : undefined
                         }
                       />
@@ -556,6 +583,12 @@ export default function ChatDetailScreen() {
                                 `/chat/${sessionId}/thread/${thread.threadId}`
                               )
                             }
+                          />
+                        </View>
+                      ) : canStartThread ? (
+                        <View style={styles.threadChipWrap}>
+                          <ReplyInThreadPill
+                            onPress={() => openNewThread(sessionId, block)}
                           />
                         </View>
                       ) : null}

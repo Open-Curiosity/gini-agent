@@ -92,6 +92,7 @@ export {
   listChatBlocksAfter,
   listThreadBlocks,
   getLastMainChatAssistantTextBlock,
+  getMainChatBlock,
   summarizeThreads,
   summarizeThreadsForInstance,
   deleteChatBlocksForSession,

@@ -5,10 +5,9 @@ import { family } from "@/src/theme";
 
 // Inline "N replies · last reply …" chip (design GmqLz, light palette)
 // rendered under a main-chat assistant bubble when that message hosts a
-// thread. Tapping opens the Slack-style Thread View. Threads are created
-// by the agent (the runtime branches a turn into a thread); the user
-// continues an existing one from here, so there's no user-initiated
-// "start a thread" affordance — only this open-the-thread chip.
+// thread. Tapping opens the Slack-style Thread View. Messages that don't
+// yet host a thread show the ReplyInThreadPill instead, so the user can
+// branch a brand-new thread off any agent reply (Slack-style).
 
 export function ThreadRepliesChip({
   replyCount,
@@ -44,7 +43,42 @@ export function ThreadRepliesChip({
   );
 }
 
+// "Reply in thread" pill (design POvIw, light palette) under a main-chat
+// assistant bubble that doesn't host a thread yet. Tapping mints a new
+// thread rooted at that message and opens the Thread View.
+export function ReplyInThreadPill({ onPress }: { onPress: () => void }) {
+  return (
+    <TouchableOpacity
+      onPress={onPress}
+      activeOpacity={0.7}
+      style={styles.replyPill}
+      accessibilityRole="button"
+      accessibilityLabel="Reply in thread"
+    >
+      <Feather name="message-square" size={14} color="#3554D1" />
+      <Text style={styles.replyPillText}>Reply in thread</Text>
+    </TouchableOpacity>
+  );
+}
+
 const styles = StyleSheet.create({
+  replyPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    alignSelf: "flex-start",
+    backgroundColor: "#EEF2FF",
+    borderWidth: 1,
+    borderColor: "#D7DEFA",
+    borderRadius: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 10
+  },
+  replyPillText: {
+    color: "#3554D1",
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 13
+  },
   chip: {
     flexDirection: "row",
     alignItems: "center",

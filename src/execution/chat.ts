@@ -6,6 +6,7 @@ import {
   createChatSession,
   deleteChatSession,
   getLatestMessagesBySession,
+  getMainChatBlock,
   insertChatBlock,
   isTerminalTaskStatus,
   listChatBlocks,
@@ -421,11 +422,17 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
   return { sessionId, runId: run.id, taskId: task.id, status: task.status };
 }
 
-// Posts a user reply inside an existing thread. The whole spawned task
-// threads (decision E: a user reply in a thread stays in the thread
-// regardless of the agent's routing directive), so threadId/parentBlockId
-// are stamped on the task up front — resolveEmitContext reads them and
-// every emit* block lands tagged with the same thread membership.
+// Posts a user reply inside a thread, creating the thread on the first reply.
+// The whole spawned task threads (decision E: a user reply in a thread stays
+// in the thread regardless of the agent's routing directive), so
+// threadId/parentBlockId are stamped on the task up front — resolveEmitContext
+// reads them and every emit* block lands tagged with the same thread
+// membership.
+//
+// Create-or-append:
+//   - Existing thread (has blocks): inherit parentBlockId from its first block.
+//   - New thread (no blocks): require `input.parentBlockId` pointing at a
+//     main-chat block in this session — the message the user branched from.
 export async function submitThreadReply(
   config: RuntimeConfig,
   sessionId: string,
@@ -439,14 +446,25 @@ export async function submitThreadReply(
   if (!state.chatSessions.find((item) => item.id === sessionId)) {
     throw new Error(`Chat session not found: ${sessionId}`);
   }
-  // Resolve the thread's parent_block_id from its existing blocks. A thread
-  // with no blocks doesn't exist — reject before doing any STT/run work.
-  const threadBlocks = listThreadBlocks(config.instance, sessionId, threadId);
-  if (threadBlocks.length === 0) throw new Error(`Thread not found: ${threadId}`);
-  // Thread blocks always carry parentBlockId by construction; a missing one
-  // is corruption, so fail loudly rather than silently dropping the tag.
-  const parentBlockId = threadBlocks[0].parentBlockId;
-  if (!parentBlockId) throw new Error("Thread is missing its parent message");
+  // Resolve the thread's parent_block_id. An existing thread inherits it from
+  // its first block (a missing one is corruption — fail loudly). A new thread
+  // (no blocks yet) must carry the parentBlockId of the main-chat message the
+  // user is branching from.
+  const existing = listThreadBlocks(config.instance, sessionId, threadId);
+  let parentBlockId: string;
+  if (existing.length > 0) {
+    const inherited = existing[0].parentBlockId;
+    if (!inherited) throw new Error("Thread is missing its parent message");
+    parentBlockId = inherited;
+  } else {
+    const requested = typeof input.parentBlockId === "string" ? input.parentBlockId : "";
+    if (!requested) throw new Error("Thread not found: a parent message is required to start a thread");
+    // The parent must be a main-chat (un-threaded) block in THIS session —
+    // a thread can't root on another session's block or on a threaded one.
+    const parent = getMainChatBlock(config.instance, sessionId, requested);
+    if (!parent) throw new Error("Thread not found: parent message not found in this chat");
+    parentBlockId = parent.id;
+  }
   const { content, images, audio, liveSession } = await prepareChatSubmission(config, sessionId, input);
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
   const task = await submitTask(config, content, {

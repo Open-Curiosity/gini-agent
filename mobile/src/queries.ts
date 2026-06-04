@@ -675,6 +675,10 @@ export interface ThreadReplyInput {
   // response) into the main chat — wired to the composer's "Also send to
   // main chat" checkbox.
   alsoToMain?: boolean;
+  // The main-chat message a brand-new thread branches from. Required only on
+  // the first reply of a thread the user is starting; replies to an existing
+  // thread omit it and the gateway inherits the parent from the thread blocks.
+  parentBlockId?: string;
 }
 
 // POST a reply into an existing thread. The gateway threads the whole
@@ -688,12 +692,13 @@ export function useReplyToThread(sessionId: string | null, threadId: string | nu
     Error,
     ThreadReplyInput
   >({
-    mutationFn: ({ content, images, audio, alsoToMain }: ThreadReplyInput) => {
+    mutationFn: ({ content, images, audio, alsoToMain, parentBlockId }: ThreadReplyInput) => {
       if (!sessionId || !threadId) throw new Error("No thread selected");
       const payload: Record<string, unknown> = { content };
       if (images && images.length > 0) payload.images = images;
       if (audio) payload.audio = audio;
       if (alsoToMain) payload.alsoToMain = true;
+      if (parentBlockId) payload.parentBlockId = parentBlockId;
       return api(`/chat/${sessionId}/threads/${threadId}/messages`, {
         method: "POST",
         body: JSON.stringify(payload)

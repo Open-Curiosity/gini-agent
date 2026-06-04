@@ -77,9 +77,14 @@ function describeAsset(asset: ImagePicker.ImagePickerAsset): {
 // still render inside a thread. The composer carries an "Also send to
 // main chat" checkbox wired to the reply endpoint's `alsoToMain`.
 export default function ThreadViewScreen() {
-  const { sessionId, threadId } = useLocalSearchParams<{
+  const { sessionId, threadId, parentBlockId, rootPreview } = useLocalSearchParams<{
     sessionId: string;
     threadId: string;
+    // Present only when starting a brand-new thread off an assistant reply:
+    // the thread has no blocks yet, so the parent block id + its text come in
+    // as route params to seed the pinned parent and the first reply's root.
+    parentBlockId?: string;
+    rootPreview?: string;
   }>();
   const stream = useChatStream(sessionId ?? null, threadId ?? null);
   const threads = useThreads(sessionId ?? null);
@@ -103,6 +108,12 @@ export default function ThreadViewScreen() {
     () => (threads.data ?? []).find((t) => t.threadId === threadId),
     [threads.data, threadId]
   );
+
+  // The parent message the thread roots at. An existing thread carries it on
+  // its summary; a brand-new one (no summary yet) gets it from the route
+  // params passed when the user tapped "Reply in thread".
+  const parentBlock = summary?.parentBlockId ?? parentBlockId;
+  const rootPreviewText = summary?.rootPreview ?? rootPreview;
 
   const agent = useMemo(() => {
     const agentId = summary?.agentId ?? stream.session?.agentId;
@@ -178,7 +189,14 @@ export default function ThreadViewScreen() {
     if (sendDisabled) return;
     pinnedToBottomRef.current = true;
     reply.mutate(
-      { content: trimmed, images: readyImages, alsoToMain },
+      {
+        content: trimmed,
+        images: readyImages,
+        alsoToMain,
+        // Carry the parent on every reply. A brand-new thread needs it to
+        // root; an existing thread inherits it server-side and ignores this.
+        ...(parentBlock ? { parentBlockId: parentBlock } : {})
+      },
       {
         onSuccess: () => {
           setText("");
@@ -320,9 +338,10 @@ export default function ThreadViewScreen() {
               pinnedToBottomRef.current = distanceFromBottom < 40;
             }}
           >
-            {/* Pinned parent message. The summary's rootPreview is the
-                main-chat block the thread branched from. */}
-            {summary?.rootPreview ? (
+            {/* Pinned parent message — the main-chat block the thread
+                branched from (from the summary, or the route params when
+                the thread is brand-new). */}
+            {rootPreviewText ? (
               <View style={styles.parent}>
                 <AgentAvatar name={agentName} size={38} />
                 <View style={styles.parentRight}>
@@ -331,7 +350,7 @@ export default function ThreadViewScreen() {
                     <View style={styles.parentPush} />
                     <Feather name="bookmark" size={14} color="#B6B6BC" />
                   </View>
-                  <Text style={styles.parentBody}>{summary.rootPreview}</Text>
+                  <Text style={styles.parentBody}>{rootPreviewText}</Text>
                 </View>
               </View>
             ) : null}

@@ -553,13 +553,21 @@ export function useThreadsInbox() {
 }
 
 // Post a reply into a thread. Invalidates chat/threads so the chip count and
-// inbox advance once the run is accepted.
+// inbox advance once the run is accepted. `parentBlockId` is required only when
+// the user starts a brand-new thread (no blocks yet) — it tells the backend
+// which main-chat message the thread branches from. Replies to an existing
+// thread omit it and the backend inherits the parent from the thread's blocks.
 export function useReplyToThread(sessionId: string | null, threadId: string | null) {
   const qc = useQueryClient();
   return useMutation<
     { sessionId: string; threadId: string; runId: string; taskId: string; status: string },
     Error,
-    { content: string; images?: { id: string; mimeType: string; size: number }[]; alsoToMain?: boolean }
+    {
+      content: string;
+      images?: { id: string; mimeType: string; size: number }[];
+      alsoToMain?: boolean;
+      parentBlockId?: string;
+    }
   >({
     mutationFn: (input) =>
       api(`/chat/${sessionId}/threads/${threadId}/messages`, {

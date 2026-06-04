@@ -4869,6 +4869,69 @@ describe("agent-chat and thread endpoints", () => {
     expect(String(value.error)).toContain("Chat session not found");
   });
 
+  test("POST /api/chat/:id/threads/:tid/messages creates a new thread off a main-chat parent block", async () => {
+    const config = testConfig("thread-reply-create");
+    const handler = createHandler(config);
+
+    const agent = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Orion" })
+    });
+    const session = await call(handler, config, `/api/agents/${agent.id}/chat`);
+
+    // A main-chat assistant block the user branches a brand-new thread from.
+    const parent = insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId: session.id,
+      text: "Here is my plan.",
+      streaming: false,
+      agentId: agent.id
+    });
+
+    // No prior blocks under thread_fresh — the parentBlockId in the body is
+    // what brings the thread into existence.
+    const submitted = await call(handler, config, `/api/chat/${session.id}/threads/thread_fresh/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "kick off the thread", parentBlockId: parent.id })
+    });
+
+    expect(submitted.threadId).toBe("thread_fresh");
+    expect(submitted.taskId).toBeString();
+
+    // The spawned task carries the new thread's membership.
+    const task = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    expect(task?.threadId).toBe("thread_fresh");
+    expect(task?.parentBlockId).toBe(parent.id);
+
+    // The user reply lands as a thread-tagged user_text block rooted at the
+    // parent, so the thread now exists and renders in the panel.
+    const threadBlocks = await call(handler, config, `/api/chat/${session.id}/threads/thread_fresh/blocks`);
+    const threadUser = threadBlocks.find(
+      (b: { kind: string; text?: string }) => b.kind === "user_text" && b.text === "kick off the thread"
+    );
+    expect(threadUser.threadId).toBe("thread_fresh");
+    expect(threadUser.parentBlockId).toBe(parent.id);
+  });
+
+  test("POST /api/chat/:id/threads/:tid/messages 404s when starting a new thread without a parent block", async () => {
+    const config = testConfig("thread-reply-create-noparent");
+    const handler = createHandler(config);
+
+    const agent = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Lyra" })
+    });
+    const session = await call(handler, config, `/api/agents/${agent.id}/chat`);
+
+    const response = await rawCall(handler, config, `/api/chat/${session.id}/threads/thread_new/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "no parent supplied" })
+    }, config.token);
+    expect(response.status).toBe(404);
+    const value = await response.json();
+    expect(String(value.error)).toContain("Thread not found");
+  });
+
   test("GET /api/threads aggregates across agent sessions with agentName, newest first", async () => {
     const config = testConfig("threads-inbox");
     const handler = createHandler(config);

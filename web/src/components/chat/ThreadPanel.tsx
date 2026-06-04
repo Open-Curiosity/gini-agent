@@ -79,7 +79,14 @@ export function ThreadPanel({
     if (reply.isPending) return;
     if (!trimmed && images.length === 0) return;
     reply.mutate(
-      { content: trimmed, ...(images.length > 0 ? { images } : {}) },
+      {
+        content: trimmed,
+        // Carry the thread's parent on every reply. On a brand-new thread (no
+        // blocks yet) the backend needs it to root the thread; on an existing
+        // thread it's inherited from the blocks and ignored.
+        ...(thread.parentBlockId ? { parentBlockId: thread.parentBlockId } : {}),
+        ...(images.length > 0 ? { images } : {})
+      },
       {
         onSuccess: () => setText(""),
         onError: (error) => toast.error(error.message)
@@ -112,7 +119,17 @@ export function ThreadPanel({
           {isLoading && blocks.length === 0 ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
           ) : renderItems.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No replies yet — start the thread.</p>
+            <div className="flex flex-col gap-3">
+              {thread.rootPreview ? (
+                <div className="rounded-lg border border-[#1C1C1E] bg-[#0B0B0E] px-3 py-2.5">
+                  <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-[#6A6A70]">
+                    Replying to {agentName}
+                  </p>
+                  <p className="text-[13px] text-[#B6BFD4]">{thread.rootPreview}</p>
+                </div>
+              ) : null}
+              <p className="text-sm text-muted-foreground">No replies yet — start the thread.</p>
+            </div>
           ) : (
             <ul className="space-y-4">
               {renderItems.map((item) => {
