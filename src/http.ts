@@ -1677,6 +1677,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           ? withCors(request, json({ error: "Unauthorized" }, 401))
           : new Response(null, { status: 302, headers: { location: "/pair" } });
       }
+      // A relay session is owner-equivalent for LIVE use, but must not mint a
+      // PERSISTENT legacy device bearer that would outlive its own revocation.
+      // The legacy code-create endpoint is reachable from a browser only via the
+      // BFF at /api/runtime/pairing (the BFF→gateway hop is loopback, so gating
+      // the native /api/pairing by Host wouldn't catch it — this is the one place
+      // the true relay Host is still visible). Refuse it here so the create→claim
+      // bootstrap can't establish a non-expiring credential. Loopback operators
+      // and the CLI (native /api/pairing with the owner bearer) are unaffected.
+      if (request.method === "POST" && url.pathname === "/api/runtime/pairing") {
+        return withCors(request, json({ error: "Forbidden" }, 403));
+      }
       // Refresh last-seen on full page loads only (not every asset) so the
       // Active Sessions list stays current without per-request writes.
       if (request.headers.get("sec-fetch-dest") === "document") void touchPairedSession(config, sessionToken);
@@ -1850,8 +1861,33 @@ async function proxyWeb(request: Request, url: URL, config: RuntimeConfig, sessi
         if (!resolveSessionFromCookie(config, sessionToken!)) controller.abort();
       }, sessionRevalidateMs());
       const clearTimer = () => clearInterval(interval);
+      // Clear the revalidation timer on EVERY termination path, not just a
+      // graceful close: abort (revocation / client disconnect), upstream error,
+      // graceful end, and downstream cancel. A TransformStream flush would only
+      // catch the graceful close and leak the interval on error/cancel, so wrap
+      // the upstream body in a reader loop that clears in all branches.
       controller.signal.addEventListener("abort", clearTimer, { once: true });
-      const body = upstream.body.pipeThrough(new TransformStream({ flush: clearTimer }));
+      const reader = upstream.body.getReader();
+      const body = new ReadableStream({
+        async pull(streamController) {
+          try {
+            const { done, value } = await reader.read();
+            if (done) {
+              clearTimer();
+              streamController.close();
+              return;
+            }
+            streamController.enqueue(value);
+          } catch (err) {
+            clearTimer();
+            streamController.error(err);
+          }
+        },
+        cancel(reason) {
+          clearTimer();
+          return reader.cancel(reason);
+        }
+      });
       return new Response(body, { status: upstream.status, statusText: upstream.statusText, headers: upstream.headers });
     }
     return upstream;

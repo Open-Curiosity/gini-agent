@@ -165,7 +165,12 @@ export function expirePairingRequests(state: RuntimeState): void {
       && new Date(request.expiresAt).getTime() <= at
     ) {
       request.status = "expired" satisfies PairingRequestStatus;
-      request.resolvedAt ??= now();
+      // Stamp the expiry moment unconditionally (not ??=) so an approved row that
+      // later expires sorts by its true expiry time in the retention prune below,
+      // not by its earlier approval timestamp — otherwise it could be evicted
+      // ahead of genuinely-older terminal rows and a claim would see 404 instead
+      // of an "expired"/not-approved state.
+      request.resolvedAt = now();
     }
   }
   // Keep every non-terminal (pending) row plus the newest N terminal rows.

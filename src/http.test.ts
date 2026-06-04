@@ -930,7 +930,6 @@ describe("runtime api", () => {
   // SSE stream must still be torn down when the session is revoked mid-stream,
   // or a revoked relay device would keep receiving the owner's event feed.
   test("proxyWeb tears down a relay SSE stream when its session is revoked", async () => {
-    process.env.GINI_SESSION_REVALIDATE_MS = "20";
     const config = testConfig("web-proxy-sse-revoke");
     const handler = createHandler(config);
     const relay = "sse.gini-relay.lilaclabs.ai";
@@ -960,6 +959,9 @@ describe("runtime api", () => {
       }
     });
     try {
+      // Set inside the try so the finally always reverts it; shrink the cadence so
+      // the post-revoke teardown lands in tens of ms.
+      process.env.GINI_SESSION_REVALIDATE_MS = "20";
       mkdirSync(dirname(webPortPath(config.instance)), { recursive: true });
       writeFileSync(webPortPath(config.instance), String(upstream.port));
       clearWebTargetCache(config.instance);
@@ -976,10 +978,18 @@ describe("runtime api", () => {
       await reader.read(); // first chunk arrives while the session is valid
       // Revoke mid-stream; the re-validation tick (20ms) must abort the stream.
       await mutateState(config.instance, (state) => revokeDevice(state, minted.deviceId));
+      // Bounded drain (1s ≈ 50 revalidation ticks of headroom) so a teardown
+      // regression fails fast instead of hanging to the 10s global cap.
       let ended = false;
+      const deadline = Date.now() + 1000;
       try {
-        for (;;) {
-          const { done } = await reader.read();
+        while (Date.now() < deadline) {
+          const { done } = await Promise.race([
+            reader.read(),
+            new Promise<{ done: boolean }>((resolve) =>
+              setTimeout(() => resolve({ done: false }), Math.max(0, deadline - Date.now()))
+            )
+          ]);
           if (done) { ended = true; break; }
         }
       } catch {

@@ -131,7 +131,13 @@ describe("pairing fetchers", () => {
 });
 
 describe("isLoopbackFront", () => {
-  let originalHostname: string;
+  // happy-dom exposes hostname as a prototype accessor with no own property on
+  // window.location. Overriding it installs an own data property; restoring a
+  // VALUE would leave that read-only own property shadowing the native accessor
+  // for every later test in this shared process. Capture and restore the
+  // original descriptor instead so the accessor shows through again.
+  const hadOwn = Object.prototype.hasOwnProperty.call(window.location, "hostname");
+  const originalDesc = Object.getOwnPropertyDescriptor(window.location, "hostname");
 
   function setHostname(host: string) {
     Object.defineProperty(window.location, "hostname", {
@@ -140,12 +146,12 @@ describe("isLoopbackFront", () => {
     });
   }
 
-  beforeEach(() => {
-    originalHostname = window.location.hostname;
-  });
-
   afterEach(() => {
-    setHostname(originalHostname);
+    if (hadOwn && originalDesc) {
+      Object.defineProperty(window.location, "hostname", originalDesc);
+    } else {
+      delete (window.location as unknown as Record<string, unknown>).hostname;
+    }
   });
 
   test("true for 127.0.0.1", () => {

@@ -147,6 +147,25 @@ describe("PairPage", () => {
     expect(assignSpy).not.toHaveBeenCalled();
   });
 
+  test("a 401 poll (missing binding cookie) is terminal, not an infinite spin", async () => {
+    jest.useFakeTimers();
+    // The gini_pair binding cookie is absent/dropped, so the poll route 401s and
+    // can never succeed; the page must surface a restartable state, not spin.
+    pollOutcome = { ok: false, status: 401, body: { error: "Unauthorized" } };
+    render(<PairPage />);
+    await flush();
+    await act(async () => {
+      jest.advanceTimersByTime(POLL_MS);
+    });
+    await flush();
+    await waitFor(
+      () => expect(screen.queryByText(/no longer valid/i)).not.toBeNull(),
+      { timeout: 2000, interval: 10 }
+    );
+    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeNull();
+    expect(assignSpy).not.toHaveBeenCalled();
+  });
+
   test("a transient (network) poll failure keeps waiting, not terminal", async () => {
     jest.useFakeTimers();
     // A non-4xx failure (e.g. a relay blip → 500) must NOT terminate the flow.

@@ -350,6 +350,37 @@ describe("expirePairingRequests", () => {
     // Total = 50 terminal + 2 pending.
     expect(state.pairingRequests.length).toBe(52);
   });
+
+  test("an approved-then-expired request is retained by its expiry time, not its approval time", () => {
+    const state = createEmptyState("sandbox");
+    // A request approved long ago (backdate its approval resolvedAt), then later
+    // expired. It must be retained by its TRUE expiry moment, not the stale
+    // approval timestamp — otherwise it sorts oldest and is wrongly pruned, and a
+    // claim sees 404 instead of an expired/not-approved state.
+    const approvedThenExpired = makeRequest(state);
+    approvePairingRequest(state, approvedThenExpired.id);
+    const row = state.pairingRequests.find((r) => r.id === approvedThenExpired.id)!;
+    row.resolvedAt = new Date(1_000).toISOString();
+    // Fill the terminal retention cap with rejects resolved AFTER that old
+    // approval time (but still long before "now").
+    const newerTerminal: string[] = [];
+    for (let i = 0; i < 50; i += 1) {
+      const r = makeRequest(state);
+      rejectPairingRequest(state, r.id);
+      state.pairingRequests.find((x) => x.id === r.id)!.resolvedAt = new Date(2_000 + i).toISOString();
+      newerTerminal.push(r.id);
+    }
+    // Now push the long-ago-approved row past its deadline and sweep.
+    row.expiresAt = new Date(Date.now() - 1000).toISOString();
+    expirePairingRequests(state);
+
+    const surviving = new Set(state.pairingRequests.map((r) => r.id));
+    // Stamped with its real expiry time (now), it sorts newest and survives; the
+    // oldest reject is evicted instead.
+    expect(surviving.has(approvedThenExpired.id)).toBe(true);
+    expect(state.pairingRequests.find((r) => r.id === approvedThenExpired.id)?.status).toBe("expired");
+    expect(surviving.has(newerTerminal[0]!)).toBe(false);
+  });
 });
 
 describe("createPairingRequest pending cap", () => {
