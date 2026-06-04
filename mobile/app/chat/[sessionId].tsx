@@ -28,7 +28,7 @@ import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCol
 import { GeneratedFilesCard } from "@/src/components/chat/GeneratedFilesCard";
 import { ThreadRepliesChip } from "@/src/components/chat/ThreadChip";
 import { VoiceRecorder, type VoiceRef } from "@/src/components/chat/VoiceRecorder";
-import { chatListTime, relativeTime } from "@/src/format";
+import { chatListTime, jobCadence, relativeTime } from "@/src/format";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
@@ -879,18 +879,6 @@ function JobsTab({ jobs, loading }: { jobs: JobRecord[]; loading: boolean }) {
       ))}
     </ScrollView>
   );
-}
-
-function jobCadence(job: JobRecord): string {
-  if (job.cronExpression) return job.cronExpression;
-  if (typeof job.intervalSeconds === "number" && job.intervalSeconds > 0) {
-    const s = job.intervalSeconds;
-    if (s % 86400 === 0) return `Every ${s / 86400}d`;
-    if (s % 3600 === 0) return `Every ${s / 3600}h`;
-    if (s % 60 === 0) return `Every ${s / 60}m`;
-    return `Every ${s}s`;
-  }
-  return "Recurring";
 }
 
 const styles = StyleSheet.create({

@@ -174,14 +174,19 @@ export function useChannels() {
   });
 }
 
-// Job records for the active agent. The Channels screen pairs each job
-// with its delivery channel (job.chatSessionId) so the "Recurring Jobs"
-// rows can show the schedule + next-run alongside the channel session.
-export function useJobs(agentId: string | null) {
+// Job records. Pass an agentId to scope to one agent (the chat detail's
+// Jobs tab); pass `"all"` to fetch every job in the instance (the
+// Channels screen pairs each job with its delivery channel via
+// job.chatSessionId so the "Recurring Jobs" rows show the schedule +
+// next-run). `null` disables the query.
+export function useJobs(agentId: string | null | "all") {
   return useQuery<JobRecord[]>({
     queryKey: ["jobs", agentId],
-    queryFn: () => api<JobRecord[]>(`/jobs?agentId=${encodeURIComponent(agentId ?? "")}`),
-    enabled: Boolean(agentId),
+    queryFn: () =>
+      api<JobRecord[]>(
+        agentId === "all" ? "/jobs" : `/jobs?agentId=${encodeURIComponent(agentId ?? "")}`
+      ),
+    enabled: agentId !== null,
     refetchInterval: 30_000
   });
 }

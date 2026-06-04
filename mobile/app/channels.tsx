@@ -14,15 +14,16 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError } from "@/src/api";
 import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
-import { chatListTime } from "@/src/format";
+import { chatListTime, jobCadence } from "@/src/format";
 import {
   useAgents,
   useChannels,
   useCreateAgent,
+  useJobs,
   useUnreadCounts
 } from "@/src/queries";
 import { family, theme } from "@/src/theme";
-import type { AgentRecord, ChatSession } from "@/src/types";
+import type { AgentRecord, ChatSession, JobRecord } from "@/src/types";
 
 // Channels — the redesigned home. Two sections: "Agents" (each agent is
 // a DM with its single canonical chat) and "Recurring Jobs" (channels =
@@ -32,9 +33,20 @@ import type { AgentRecord, ChatSession } from "@/src/types";
 export default function ChannelsScreen() {
   const agents = useAgents();
   const channels = useChannels();
+  const jobs = useJobs("all");
   const createAgent = useCreateAgent();
   const unreadCountsQuery = useUnreadCounts();
   const unreadCounts = unreadCountsQuery.data ?? {};
+
+  // Index jobs by their delivery channel so each channel row can show the
+  // job's schedule + next-run (the design's "Every day · 9:00 AM" / "2h").
+  const jobBySessionId = useMemo(() => {
+    const map = new Map<string, JobRecord>();
+    for (const job of jobs.data ?? []) {
+      if (job.chatSessionId) map.set(job.chatSessionId, job);
+    }
+    return map;
+  }, [jobs.data]);
 
   const [query, setQuery] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
@@ -209,6 +221,7 @@ export default function ChannelsScreen() {
                 <ChannelRow
                   key={channel.id}
                   channel={channel}
+                  job={jobBySessionId.get(channel.id)}
                   unreadCount={unreadCounts[channel.id] ?? 0}
                 />
               ))}
@@ -272,14 +285,24 @@ function AgentRow({
 
 function ChannelRow({
   channel,
+  job,
   unreadCount
 }: {
   channel: ChatSession;
+  job?: JobRecord;
   unreadCount: number;
 }) {
-  const title = channel.title?.trim() || "Channel";
-  const preview = channel.lastMessagePreview?.trim() || channel.summary?.trim() || "";
-  const time = chatListTime(channel.updatedAt ?? channel.createdAt);
+  const title = job?.name?.trim() || channel.title?.trim() || "Channel";
+  // Prefer the job's schedule (the design's "Every day · 9:00 AM"); fall
+  // back to the channel's last-delivery preview when there's no paired
+  // job record.
+  const schedule =
+    job
+      ? jobCadence(job)
+      : channel.lastMessagePreview?.trim() || channel.summary?.trim() || "Recurring delivery";
+  // Next-run time when paired with a job; otherwise the channel's last
+  // activity time.
+  const time = chatListTime(job?.nextRunAt ?? channel.updatedAt ?? channel.createdAt);
   const isUnread = unreadCount > 0;
   return (
     <TouchableOpacity
@@ -299,7 +322,7 @@ function ChannelRow({
         <View style={styles.channelSchedule}>
           <Feather name="repeat" size={11} color="#B0B0B6" />
           <Text style={styles.channelCadence} numberOfLines={1}>
-            {preview || "Recurring delivery"}
+            {schedule}
           </Text>
         </View>
       </View>
