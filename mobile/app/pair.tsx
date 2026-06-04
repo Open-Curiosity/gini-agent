@@ -91,12 +91,28 @@ export default function PairScreen() {
     }
   }, []);
 
+  // Best-effort cancel the CURRENT attempt's server request. Used wherever an
+  // attempt is superseded or torn down (start of a new attempt, cancel, the
+  // gateway-switch confirm, unmount) so a pending request doesn't linger
+  // server-side — the pending cap is instance-global, so orphans from rapid
+  // retries could otherwise 429 a later legitimate create. Reads the live refs,
+  // so call it BEFORE clearing them.
+  const cancelActiveRequest = useCallback(() => {
+    const client = clientRef.current;
+    const request = requestRef.current;
+    if (client && request) {
+      void client.cancel(request.id, request.secret).catch(() => {});
+    }
+  }, []);
+
   // Begin (or restart) a handshake against `origin`. Resolving the client throws
   // for a malformed/public-http origin, surfaced as a create error.
   const start = useCallback(
     async (origin: string) => {
       stopPolling();
       const myGen = ++genRef.current;
+      // Tear down a superseded prior attempt (best-effort) before dropping refs.
+      cancelActiveRequest();
       requestRef.current = null;
       clientRef.current = null;
       setError(null);
@@ -144,7 +160,7 @@ export default function PairScreen() {
         setPhase("create-error");
       }
     },
-    [stopPolling]
+    [stopPolling, cancelActiveRequest]
   );
 
   // Auto-start when a relay origin arrived via the deep link. Guarded so it runs
@@ -157,23 +173,19 @@ export default function PairScreen() {
     if (isGatewaySwitch(readCachedCredentials()?.baseUrl, relayParam)) {
       // Invalidate any in-flight prior attempt so it can't complete and save
       // credentials behind the confirm screen: bump the generation (its
-      // poll/claim closures bail), stop polling, drop its refs, and best-effort
-      // cancel its server request.
+      // poll/claim closures bail), stop polling, best-effort cancel its server
+      // request, and drop its refs.
       genRef.current += 1;
       stopPolling();
-      const prevClient = clientRef.current;
-      const prevRequest = requestRef.current;
+      cancelActiveRequest();
       clientRef.current = null;
       requestRef.current = null;
-      if (prevClient && prevRequest) {
-        void prevClient.cancel(prevRequest.id, prevRequest.secret).catch(() => {});
-      }
       setPendingOrigin(relayParam);
       setPhase("confirm");
       return;
     }
     void start(relayParam);
-  }, [relayParam, start, stopPolling]);
+  }, [relayParam, start, stopPolling, cancelActiveRequest]);
 
   // Component-wide unmount cleanup, installed regardless of entry path (manual
   // paste OR deep link). Bumps the generation so any in-flight create/poll/claim
@@ -182,8 +194,11 @@ export default function PairScreen() {
     return () => {
       genRef.current += 1;
       stopPolling();
+      // Best-effort cancel an in-flight request so it doesn't linger pending
+      // server-side after the screen is gone.
+      cancelActiveRequest();
     };
-  }, [stopPolling]);
+  }, [stopPolling, cancelActiveRequest]);
 
   // Poll while pending. On approval we hand off to the claim effect rather than
   // claiming inline, so flipping to "claiming" can't self-cancel this tick.
@@ -275,17 +290,13 @@ export default function PairScreen() {
     // network round-trip: instant cancelled feedback, and no queued transition can
     // claim once the generation is bumped and the refs are gone. The server cancel
     // is best-effort (the request may already be terminal).
-    const client = clientRef.current;
-    const request = requestRef.current;
     genRef.current += 1;
     stopPolling();
+    cancelActiveRequest();
     clientRef.current = null;
     requestRef.current = null;
     setPhase("cancelled");
-    if (client && request) {
-      void client.cancel(request.id, request.secret).catch(() => {});
-    }
-  }, [stopPolling]);
+  }, [stopPolling, cancelActiveRequest]);
 
   const retry = useCallback(() => {
     // A manual entry returns to the editable input (the typed link is preserved)

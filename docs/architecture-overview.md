@@ -78,13 +78,13 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns all du
 - Also owns local process management for install/start/run/stop/smoke workflows.
 - The `gini import apply openclaw` migrator is the one documented exception to "all writes go through the gateway." It refuses to run while the instance's gateway is alive (see [Openclaw Migration](./adr/openclaw-migration.md)) and writes directly to `state.json`, `secrets.env`, workspace files, skills, and `memory.db` through the in-process `mutateState` path. Single-process serialization is what makes the offline-only constraint necessary.
 
-### Future Clients
+### Other Clients
 
-Mobile, MCP, messaging bridges, and scripts should connect through the gateway contract. Clients that can safely hold a token may call the gateway directly. Browser clients should go through a BFF.
+The Expo mobile app is a gateway client (it holds its own bearer token and can obtain one via relay-link pairing — see [Device-Pairing Authentication](adr/device-pairing-auth.md)). MCP, messaging bridges, and scripts connect through the same gateway contract. Clients that can safely hold a token may call the gateway directly; browser clients go through a BFF.
 
 ## Why This Shape
 
-1. **Single source of truth.** Reloading the web app, running a CLI command, and opening a future mobile app all observe the same runtime state.
+1. **Single source of truth.** Reloading the web app, running a CLI command, and opening the mobile app all observe the same runtime state.
 2. **Clear token boundary.** The browser never receives a bearer token. Local clients that can safely store credentials can hold their own tokens.
 3. **Replaceable clients.** New surfaces do not require a second backend or a duplicated state model.
 4. **Parallel agent support.** Instances isolate ports, state, logs, workspaces, and runtime processes.
