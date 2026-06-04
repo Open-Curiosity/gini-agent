@@ -41,6 +41,7 @@ import {
   useThreads,
   useVoiceStatus
 } from "@/src/queries";
+import { indexThreadsByParentBlock } from "@/src/thread-routing";
 import { family, theme } from "@/src/theme";
 import type { ChatBlock, JobRecord, ThreadSummary } from "@/src/types";
 
@@ -167,13 +168,10 @@ export default function ChatDetailScreen() {
   // Index threads by the main-chat block they branched from so the
   // Messages tab can attach a "N replies" chip under that assistant
   // block. parentBlockId is the assistant_text the thread roots at.
-  const threadByParentBlock = useMemo(() => {
-    const map = new Map<string, ThreadSummary>();
-    for (const t of threadSummaries) {
-      if (t.parentBlockId) map.set(t.parentBlockId, t);
-    }
-    return map;
-  }, [threadSummaries]);
+  const threadByParentBlock = useMemo(
+    () => indexThreadsByParentBlock(threadSummaries),
+    [threadSummaries]
+  );
 
   // Mark the chat as read once we know which block id is latest.
   const lastReadBlockIdRef = useRef<string | null>(null);

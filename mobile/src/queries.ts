@@ -9,6 +9,7 @@ import { AppState, type AppStateStatus } from "react-native";
 import EventSource from "react-native-sse";
 import { api, ApiError, resolveStreamEndpoint, type UploadRef } from "./api";
 import { refreshBadge } from "./push";
+import { blockBelongsToView, filterBlocksForView } from "./thread-routing";
 import type {
   AgentRecord,
   AgentsResponse,
@@ -387,9 +388,7 @@ export function useChatStream(
       // session; the main chat (threadId == null) drops blocks tagged
       // with a thread, and a Thread View keeps only its own thread's
       // blocks. The wire cursor still advances on dropped frames below.
-      const blockThread = block.threadId ?? null;
-      const wantThread = threadId ?? null;
-      if (blockThread !== wantThread) {
+      if (!blockBelongsToView(block, threadId ?? null)) {
         // Keep the resume cursor moving so a reconnect doesn't replay
         // blocks we've already seen-and-skipped for the other view.
         if (wireEventId) lastSeenIdRef.current = wireEventId;
@@ -552,7 +551,7 @@ export function useChatStream(
         // strip threaded rows here to match the SSE upsert filter.
         const blocks = threadId
           ? rawBlocks
-          : rawBlocks.filter((b) => (b.threadId ?? null) === null);
+          : filterBlocksForView(rawBlocks, null);
         if (cancelled) return;
         // Merge by id rather than overwrite. If the AppState handler or
         // any other path opened a stream while the seed was in flight,
