@@ -8,11 +8,13 @@ export function AgentAvatar({
   name,
   seed,
   size = 24,
+  initialColor = "#FFFFFF",
   className
 }: {
   name: string;
   seed?: string;
   size?: number;
+  initialColor?: string;
   className?: string;
 }) {
   const color = agentColor(seed ?? name);
@@ -23,12 +25,13 @@ export function AgentAvatar({
   return (
     <div
       aria-hidden="true"
-      className={cn("flex shrink-0 items-center justify-center font-bold leading-none text-white select-none", className)}
+      className={cn("flex shrink-0 items-center justify-center font-bold leading-none select-none", className)}
       style={{
         width: size,
         height: size,
         backgroundColor: color,
         borderRadius: radius,
+        color: initialColor,
         fontSize
       }}
     >

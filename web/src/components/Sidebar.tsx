@@ -1,15 +1,17 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
 import {
-  Download,
+  ChevronDown,
   Loader2,
   Menu,
   MessagesSquare,
   Moon,
   Plus,
+  RefreshCw,
   Settings,
   Sun,
   WandSparkles
@@ -63,6 +65,19 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   }, [sessions.data]);
 
   const { isUnread } = useChatReadState(sessions.data);
+
+  // Per-agent unread: the sidebar shows one row per agent, but read-state is
+  // tracked per chat session. Match each agent to its canonical `kind:"agent"`
+  // session and reuse the same boolean unread signal as the channel rows.
+  const agentUnread = useMemo(() => {
+    const map = new Map<string, boolean>();
+    for (const s of sessions.data ?? []) {
+      if (s.kind !== "agent" || !s.agentId) continue;
+      if (isUnread(s)) map.set(s.agentId, true);
+    }
+    return map;
+  }, [sessions.data, isUnread]);
+
   const threadsInbox = useThreadsInbox();
   const { isThreadUnread } = useThreadReadState(threadsInbox.data);
   const unreadThreadCount = useMemo(
@@ -90,49 +105,59 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
     onNavigate?.();
   };
 
+  const navItem = (
+    active: boolean
+  ): string =>
+    cn(
+      "flex items-center gap-3 rounded-lg px-2.5 py-[9px] text-[13px] font-medium transition-colors",
+      active ? "bg-[#1C1C22] text-white" : "text-[#B6B6BC] hover:bg-[#1C1C22]/50"
+    );
+
   return (
-    <div className="flex h-full flex-col bg-sidebar text-sidebar-foreground">
-      <div className="flex items-center justify-between gap-2 px-4 pt-4 pb-2">
-        <Link href="/" onClick={onNavigate} className="flex min-w-0 flex-col leading-tight">
-          <span className="text-sm font-semibold text-foreground">Gini</span>
-          <span className="text-[11px] font-medium text-muted-foreground">Direct messages</span>
+    <div className="flex h-full flex-col bg-[#0A0A0C] text-sidebar-foreground">
+      <div className="flex items-center gap-2.5 px-3 pt-[18px] pb-2">
+        <Link href="/" onClick={onNavigate} className="flex min-w-0 items-center gap-2.5">
+          <Image src="/gini-agent-logo.png" alt="Gini" width={20} height={20} unoptimized className="size-5 shrink-0" />
+          <span className="text-sm font-semibold text-white">Gini</span>
         </Link>
+        <div className="flex-1" />
         {mounted ? (
-          <Button
-            size="icon"
-            variant="ghost"
-            className="h-7 w-7"
+          <button
+            type="button"
             onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
             aria-label="Toggle theme"
+            className="flex size-[22px] items-center justify-center rounded-md border border-[#2E2E34] bg-transparent text-[#8A8A90]"
           >
-            {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-          </Button>
+            {theme === "dark" ? <Sun className="size-3" /> : <Moon className="size-3" />}
+          </button>
         ) : null}
       </div>
 
       <ScrollArea className="min-h-0 flex-1">
-        <div className="flex flex-col gap-4 px-2 py-2">
+        <div className="flex flex-col gap-[18px] px-3 py-2">
           {/* Agents (DMs) */}
           <div className="flex flex-col gap-1">
             <div className="flex items-center justify-between px-2">
-              <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                Agents
-              </span>
+              <div className="flex items-center gap-1.5">
+                <ChevronDown className="size-3 text-[#6A6A70]" />
+                <span className="text-[11px] font-semibold tracking-[0.5px] text-[#6A6A70]">Agents</span>
+              </div>
               <button
                 type="button"
                 aria-label="New agent"
                 onClick={() => setCreateOpen(true)}
-                className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground"
+                className="flex items-center justify-center text-[#8A8A90] hover:text-white"
               >
                 <Plus className="size-3.5" />
               </button>
             </div>
             <ul className="flex flex-col gap-0.5">
               {agents.length === 0 ? (
-                <li className="px-2 py-1.5 text-xs text-muted-foreground">No agents yet</li>
+                <li className="px-2.5 py-2 text-xs text-[#6A6A70]">No agents yet</li>
               ) : (
                 agents.map((agent) => {
                   const active = onChat && !selectedSession && agent.id === activeAgentId;
+                  const unread = !active && agentUnread.get(agent.id) === true;
                   return (
                     <li key={agent.id}>
                       <button
@@ -140,19 +165,21 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                         onClick={() => selectAgent(agent.id)}
                         className={cn(
                           "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
-                          active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
+                          active ? "bg-[#1C1C22]" : "hover:bg-[#1C1C22]/50"
                         )}
                       >
-                        <AgentAvatar name={agent.name} seed={agent.id} size={22} />
+                        <AgentAvatar name={agent.name} seed={agent.id} size={22} initialColor="#0A0A0C" />
                         <span
                           className={cn(
                             "min-w-0 flex-1 truncate text-[13px]",
-                            active ? "font-semibold text-foreground" : "font-medium text-sidebar-foreground/85"
+                            active || unread ? "font-semibold text-white" : "font-medium text-[#B6B6BC]"
                           )}
                         >
                           {agent.name}
                         </span>
-                        {isAgentOnline(agent.status) ? (
+                        {unread ? (
+                          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-[#4277FB]" />
+                        ) : isAgentOnline(agent.status) ? (
                           <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-[#39C36E]" />
                         ) : null}
                       </button>
@@ -163,13 +190,14 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
             </ul>
           </div>
 
-          {/* Recurring Jobs (channels) */}
+          {/* Recurring jobs (channels) */}
           {channels.length > 0 ? (
             <div className="flex flex-col gap-1">
               <div className="flex items-center justify-between px-2">
-                <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                  Recurring Jobs
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <ChevronDown className="size-3 text-[#6A6A70]" />
+                  <span className="text-[11px] font-semibold tracking-[0.5px] text-[#6A6A70]">Recurring jobs</span>
+                </div>
               </div>
               <ul className="flex flex-col gap-0.5">
                 {channels.map((channel) => {
@@ -182,22 +210,25 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                         onClick={() => selectChannel(channel.id)}
                         className={cn(
                           "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
-                          active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
+                          active ? "bg-[#1C1C22]" : "hover:bg-[#1C1C22]/50"
                         )}
                       >
-                        <span aria-hidden className="text-muted-foreground">#</span>
+                        <span
+                          aria-hidden
+                          className="w-3.5 shrink-0 text-center text-sm font-medium text-[#6A6A70]"
+                        >
+                          #
+                        </span>
                         <span
                           className={cn(
                             "min-w-0 flex-1 truncate text-[13px]",
-                            active || unread
-                              ? "font-semibold text-foreground"
-                              : "font-medium text-sidebar-foreground/85"
+                            active || unread ? "font-semibold text-white" : "font-medium text-[#B6B6BC]"
                           )}
                         >
                           {channel.title?.trim() || "Channel"}
                         </span>
                         {unread ? (
-                          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-primary" />
+                          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-[#4277FB]" />
                         ) : null}
                       </button>
                     </li>
@@ -207,57 +238,30 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
             </div>
           ) : null}
 
-          <div className="border-t border-sidebar-border" />
+          <div className="h-px bg-[#1C1C1E]" />
 
           {/* Nav: Threads, Skills, Settings */}
           <ul className="flex flex-col gap-0.5">
             <li>
-              <Link
-                href="/threads"
-                onClick={onNavigate}
-                className={cn(
-                  "flex items-center gap-3 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-colors",
-                  onThreads
-                    ? "bg-sidebar-accent text-foreground"
-                    : "text-sidebar-foreground/85 hover:bg-sidebar-accent/50"
-                )}
-              >
-                <MessagesSquare className="size-3.5 text-muted-foreground" />
+              <Link href="/threads" onClick={onNavigate} className={navItem(onThreads)}>
+                <MessagesSquare className="size-3.5 text-[#8A8A90]" />
                 <span className="flex-1">Threads</span>
                 {unreadThreadCount > 0 ? (
-                  <span className="flex items-center justify-center rounded-full bg-primary px-1.5 py-px text-[10px] font-bold text-primary-foreground">
+                  <span className="flex items-center justify-center rounded-full bg-[#4277FB] px-[7px] py-px text-[10px] font-bold text-white">
                     {unreadThreadCount}
                   </span>
                 ) : null}
               </Link>
             </li>
             <li>
-              <Link
-                href="/skills"
-                onClick={onNavigate}
-                className={cn(
-                  "flex items-center gap-3 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-colors",
-                  pathname === "/skills"
-                    ? "bg-sidebar-accent text-foreground"
-                    : "text-sidebar-foreground/85 hover:bg-sidebar-accent/50"
-                )}
-              >
-                <WandSparkles className="size-3.5 text-muted-foreground" />
+              <Link href="/skills" onClick={onNavigate} className={navItem(pathname === "/skills")}>
+                <WandSparkles className="size-3.5 text-[#8A8A90]" />
                 Skills
               </Link>
             </li>
             <li>
-              <Link
-                href="/settings"
-                onClick={onNavigate}
-                className={cn(
-                  "flex items-center gap-3 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-colors",
-                  pathname === "/settings"
-                    ? "bg-sidebar-accent text-foreground"
-                    : "text-sidebar-foreground/85 hover:bg-sidebar-accent/50"
-                )}
-              >
-                <Settings className="size-3.5 text-muted-foreground" />
+              <Link href="/settings" onClick={onNavigate} className={navItem(pathname === "/settings")}>
+                <Settings className="size-3.5 text-[#8A8A90]" />
                 Settings
               </Link>
             </li>
@@ -331,38 +335,39 @@ function UpdateReminder() {
   const showUpdate = updateAvailable && !appliedSha;
 
   return (
-    <div className="border-t border-sidebar-border px-4 py-3">
-      <div className="flex items-center justify-between gap-2">
-        <div className="min-w-0">
-          <div className="truncate font-mono text-[10px] text-sidebar-foreground/65">
-            v{version?.packageVersion ?? "0.0.0"}{version?.git.shortSha ? ` · ${version.git.shortSha}` : ""}
-          </div>
-          {showUpdate ? (
-            <div className="text-xs font-medium text-sidebar-foreground">Update ready</div>
-          ) : (
-            <div className="text-xs text-sidebar-foreground/65">Gini agent</div>
-          )}
+    <div className="flex items-center justify-between gap-2 px-3 pb-[18px] pt-3">
+      <div className="flex min-w-0 flex-col gap-0.5">
+        <div className="truncate text-[11px] font-medium text-[#6A6A70]">
+          v{version?.packageVersion ?? "0.0.0"}{version?.git.shortSha ? ` · ${version.git.shortSha}` : ""}
         </div>
         {showUpdate ? (
-          <Button
-            size="sm"
-            variant="default"
-            className="h-7 shrink-0"
-            disabled={update.isPending || !updateSupported}
-            onClick={() => update.mutate()}
-          >
-            {update.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
-            Update
-          </Button>
-        ) : null}
+          <div className="text-[11px] font-medium text-white">Update ready</div>
+        ) : (
+          <div className="text-[11px] font-medium text-[#6A6A70]">Gini agent</div>
+        )}
       </div>
+      {showUpdate ? (
+        <button
+          type="button"
+          disabled={update.isPending || !updateSupported}
+          onClick={() => update.mutate()}
+          className="flex shrink-0 items-center gap-1.5 rounded-[7px] border border-[#2E2E34] bg-[#1C1C22] px-[11px] py-[7px] text-xs font-semibold text-white disabled:opacity-60"
+        >
+          {update.isPending ? (
+            <Loader2 className="size-[13px] animate-spin text-[#C2C2C8]" />
+          ) : (
+            <RefreshCw className="size-[13px] text-[#C2C2C8]" />
+          )}
+          Update
+        </button>
+      ) : null}
     </div>
   );
 }
 
 export function Sidebar() {
   return (
-    <aside className="hidden h-full w-[266px] shrink-0 border-r border-sidebar-border md:flex md:flex-col">
+    <aside className="hidden h-full w-[266px] shrink-0 border-r border-[#1C1C1E] md:flex md:flex-col">
       <SidebarBody />
     </aside>
   );
