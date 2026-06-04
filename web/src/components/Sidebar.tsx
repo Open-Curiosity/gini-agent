@@ -24,12 +24,12 @@ import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
-import { useChatSessions, useInvalidate, useStatus, useThreadsInbox } from "@/lib/queries";
+import { useInvalidate, useStatus, useThreadsInbox } from "@/lib/queries";
 import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
 import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 import type { AgentRow, ChatSession } from "@/lib/view-types";
-import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
+import type { GiniUpdateResult, GiniVersionInfo, JobRecord } from "@runtime/types";
 
 // "Online" is a coarse status hint on the sidebar agent rows. The runtime
 // reports a richer AgentStatus; anything that isn't an explicit error/paused
@@ -56,27 +56,45 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   });
   const agents = agentsQuery.data?.agents ?? [];
 
-  const sessions = useChatSessions();
-  const channels = useMemo<ChatSession[]>(() => {
-    const all = sessions.data ?? [];
-    return all
-      .filter((s) => s.kind === "channel" || s.origin === "job")
-      .sort((a, b) => (b.updatedAt ?? b.createdAt).localeCompare(a.updatedAt ?? a.createdAt));
-  }, [sessions.data]);
+  // Recurring jobs and channel read-state are a constant union across all
+  // agents, so both source from unscoped fetches rather than the
+  // active-agent-scoped useJobs/useChatSessions.
+  const allJobs = useQuery({
+    queryKey: ["jobs", "all"],
+    queryFn: () => api<JobRecord[]>("/jobs"),
+    refetchInterval: 3000
+  });
+  const allSessions = useQuery({
+    queryKey: ["chat", "all"],
+    queryFn: () => api<ChatSession[]>("/chat"),
+    refetchInterval: 3000
+  });
 
-  const { isUnread } = useChatReadState(sessions.data);
+  // A job is recurring when it isn't a one-shot reminder and carries an active
+  // schedule (cron or interval). Stable-sorted by createdAt (then name) so the
+  // list doesn't reorder as jobs fire.
+  const recurringJobs = useMemo<JobRecord[]>(() => {
+    return (allJobs.data ?? [])
+      .filter((j) => !j.oneShot && (j.cronExpression != null || (j.intervalSeconds ?? 0) > 0))
+      .sort(
+        (a, b) =>
+          (a.createdAt ?? "").localeCompare(b.createdAt ?? "") || a.name.localeCompare(b.name)
+      );
+  }, [allJobs.data]);
+
+  const { isUnread } = useChatReadState(allSessions.data);
 
   // Per-agent unread: the sidebar shows one row per agent, but read-state is
   // tracked per chat session. Match each agent to its canonical `kind:"agent"`
   // session and reuse the same boolean unread signal as the channel rows.
   const agentUnread = useMemo(() => {
     const map = new Map<string, boolean>();
-    for (const s of sessions.data ?? []) {
+    for (const s of allSessions.data ?? []) {
       if (s.kind !== "agent" || !s.agentId) continue;
       if (isUnread(s)) map.set(s.agentId, true);
     }
     return map;
-  }, [sessions.data, isUnread]);
+  }, [allSessions.data, isUnread]);
 
   const threadsInbox = useThreadsInbox();
   const { isThreadUnread } = useThreadReadState(threadsInbox.data);
@@ -190,8 +208,8 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
             </ul>
           </div>
 
-          {/* Recurring jobs (channels) */}
-          {channels.length > 0 ? (
+          {/* Recurring jobs */}
+          {recurringJobs.length > 0 ? (
             <div className="flex flex-col gap-1">
               <div className="flex items-center justify-between px-2">
                 <div className="flex items-center gap-1.5">
@@ -200,14 +218,23 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                 </div>
               </div>
               <ul className="flex flex-col gap-0.5">
-                {channels.map((channel) => {
-                  const active = onChat && selectedSession === channel.id;
-                  const unread = !active && isUnread(channel);
+                {recurringJobs.map((job) => {
+                  const channelSession = (allSessions.data ?? []).find((s) => s.id === job.chatSessionId);
+                  const active = onChat && selectedSession === job.chatSessionId;
+                  const unread = !active && channelSession ? isUnread(channelSession) : false;
+                  const onClick = () => {
+                    if (job.chatSessionId) {
+                      selectChannel(job.chatSessionId);
+                    } else {
+                      router.push("/jobs");
+                      onNavigate?.();
+                    }
+                  };
                   return (
-                    <li key={channel.id}>
+                    <li key={job.id}>
                       <button
                         type="button"
-                        onClick={() => selectChannel(channel.id)}
+                        onClick={onClick}
                         className={cn(
                           "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
                           active ? "bg-[#1C1C22]" : "hover:bg-[#1C1C22]/50"
@@ -225,7 +252,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                             active || unread ? "font-semibold text-white" : "font-medium text-[#B6B6BC]"
                           )}
                         >
-                          {channel.title?.trim() || "Channel"}
+                          {job.name}
                         </span>
                         {unread ? (
                           <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-[#4277FB]" />
