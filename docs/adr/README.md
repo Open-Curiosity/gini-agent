@@ -42,5 +42,6 @@ Each file in this directory captures one architecture decision: the context, the
 - [Chat-Driven Credential Provisioning](chat-credential-provisioning.md)
 - [Provider Re-Authentication Guidance](provider-reauth-guidance.md)
 - [Voice Messages With Gateway-Side Local Speech-To-Text](voice-messages-and-local-stt.md)
+- [Chat File Attachments — Capability-Driven Delivery](chat-file-attachments.md)
 - [Connector-Backed Web Search](web-search-connectors.md)
 - [In-App Doc References Render Inline](in-app-doc-references.md)

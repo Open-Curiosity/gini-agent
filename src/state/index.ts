@@ -80,7 +80,9 @@ export {
   readUpload,
   uploadDataUrl,
   uploadExists,
-  uploadStat
+  uploadStat,
+  isPlausibleMime,
+  sanitizeFilename
 } from "./uploads";
 export {
   insertChatBlock,

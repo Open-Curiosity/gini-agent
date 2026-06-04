@@ -1,20 +1,31 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Paperclip, Send, Square, X } from "lucide-react";
+import { FileText, Paperclip, Send, Square, X } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { uploadImage, uploadUrl, type UploadRef } from "@/lib/api";
 
-interface PendingImage {
+interface PendingAttachment {
   // Local id used to track the item in the list while it uploads. Replaced
   // by the server-assigned UploadRef.id on success.
   localId: string;
-  previewUrl: string;
+  kind: "image" | "file";
+  // Object-URL preview, created only for images (the tray renders a
+  // thumbnail from it). Non-image files render a chip and have none, so
+  // there's nothing to revoke for them.
+  previewUrl?: string;
   filename: string;
+  size: number;
   status: "uploading" | "ready" | "error";
   errorMessage?: string;
   ref?: UploadRef;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export interface ComposerProps {
@@ -27,8 +38,6 @@ export interface ComposerProps {
   placeholder?: string;
 }
 
-const ACCEPT = "image/png,image/jpeg,image/webp,image/gif";
-
 export function Composer({
   value,
   onChange,
@@ -40,7 +49,7 @@ export function Composer({
 }: ComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const [images, setImages] = useState<PendingImage[]>([]);
+  const [images, setImages] = useState<PendingAttachment[]>([]);
   const [dragActive, setDragActive] = useState(false);
   const dragDepth = useRef(0);
 
@@ -56,7 +65,9 @@ export function Composer({
   // blob until revokeObjectURL is called.
   useEffect(() => {
     return () => {
-      for (const image of images) URL.revokeObjectURL(image.previewUrl);
+      for (const image of images) {
+        if (image.previewUrl) URL.revokeObjectURL(image.previewUrl);
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -70,7 +81,9 @@ export function Composer({
     if (!canSend) return;
     const refs = readyRefs();
     onSubmit(refs);
-    for (const image of images) URL.revokeObjectURL(image.previewUrl);
+    for (const image of images) {
+      if (image.previewUrl) URL.revokeObjectURL(image.previewUrl);
+    }
     setImages([]);
   };
 
@@ -83,10 +96,20 @@ export function Composer({
 
   const beginUpload = async (file: File): Promise<void> => {
     const localId = crypto.randomUUID();
-    const previewUrl = URL.createObjectURL(file);
+    const isImage = file.type.startsWith("image/");
+    // Only images get a thumbnail preview; an object URL for a non-image
+    // file would never be rendered, so skip it (and skip revoking later).
+    const previewUrl = isImage ? URL.createObjectURL(file) : undefined;
     setImages((prev) => [
       ...prev,
-      { localId, previewUrl, filename: file.name, status: "uploading" }
+      {
+        localId,
+        kind: isImage ? "image" : "file",
+        previewUrl,
+        filename: file.name,
+        size: file.size,
+        status: "uploading"
+      }
     ]);
     try {
       const ref = await uploadImage(file);
@@ -107,11 +130,8 @@ export function Composer({
   };
 
   const addFiles = (files: FileList | File[]): void => {
-    const list = Array.from(files).filter((file) => file.type.startsWith("image/"));
-    if (list.length === 0) {
-      toast.error("Only image files are supported");
-      return;
-    }
+    const list = Array.from(files);
+    if (list.length === 0) return;
     for (const file of list) void beginUpload(file);
   };
 
@@ -119,7 +139,7 @@ export function Composer({
     setImages((prev) => {
       const next = prev.filter((image) => image.localId !== localId);
       const removed = prev.find((image) => image.localId === localId);
-      if (removed) URL.revokeObjectURL(removed.previewUrl);
+      if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
       return next;
     });
   };
@@ -162,7 +182,7 @@ export function Composer({
     for (const item of event.clipboardData.items) {
       if (item.kind === "file") {
         const file = item.getAsFile();
-        if (file && file.type.startsWith("image/")) files.push(file);
+        if (file) files.push(file);
       }
     }
     if (files.length > 0) {
@@ -184,41 +204,70 @@ export function Composer({
     >
       {dragActive ? (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-[24px] border-2 border-dashed border-primary bg-background/80 text-sm font-medium text-primary">
-          Drop image to attach
+          Drop file to attach
         </div>
       ) : null}
 
       {images.length > 0 ? (
         <ul className="mb-2 flex flex-wrap gap-2">
-          {images.map((image) => (
-            <li
-              key={image.localId}
-              className={cn(
-                "relative size-16 overflow-hidden rounded-lg border bg-background",
-                image.status === "error" && "border-destructive"
-              )}
-              title={image.filename}
-            >
-              <img
-                src={image.previewUrl}
-                alt={image.filename}
-                className="size-full object-cover"
-              />
-              {image.status === "uploading" ? (
-                <div className="absolute inset-0 flex items-center justify-center bg-background/60 text-[10px] font-medium uppercase text-muted-foreground">
-                  Uploading…
-                </div>
-              ) : null}
-              <button
-                type="button"
-                onClick={() => removeImage(image.localId)}
-                aria-label={`Remove ${image.filename}`}
-                className="absolute right-1 top-1 inline-flex size-5 items-center justify-center rounded-full bg-background/90 text-foreground shadow-sm hover:bg-background"
+          {images.map((image) =>
+            image.kind === "image" ? (
+              <li
+                key={image.localId}
+                className={cn(
+                  "relative size-16 overflow-hidden rounded-lg border bg-background",
+                  image.status === "error" && "border-destructive"
+                )}
+                title={image.filename}
               >
-                <X className="size-3" />
-              </button>
-            </li>
-          ))}
+                <img
+                  src={image.previewUrl}
+                  alt={image.filename}
+                  className="size-full object-cover"
+                />
+                {image.status === "uploading" ? (
+                  <div className="absolute inset-0 flex items-center justify-center bg-background/60 text-[10px] font-medium uppercase text-muted-foreground">
+                    Uploading…
+                  </div>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={() => removeImage(image.localId)}
+                  aria-label={`Remove ${image.filename}`}
+                  className="absolute right-1 top-1 inline-flex size-5 items-center justify-center rounded-full bg-background/90 text-foreground shadow-sm hover:bg-background"
+                >
+                  <X className="size-3" />
+                </button>
+              </li>
+            ) : (
+              <li
+                key={image.localId}
+                className={cn(
+                  "relative flex h-16 w-48 items-center gap-2 overflow-hidden rounded-lg border bg-background px-3",
+                  image.status === "error" && "border-destructive"
+                )}
+                title={image.filename}
+              >
+                <FileText className="size-5 shrink-0 text-muted-foreground" />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-xs font-medium text-foreground">
+                    {image.filename}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground">
+                    {image.status === "uploading" ? "Uploading…" : formatBytes(image.size)}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => removeImage(image.localId)}
+                  aria-label={`Remove ${image.filename}`}
+                  className="absolute right-1 top-1 inline-flex size-5 items-center justify-center rounded-full bg-background/90 text-foreground shadow-sm hover:bg-background"
+                >
+                  <X className="size-3" />
+                </button>
+              </li>
+            )
+          )}
         </ul>
       ) : null}
 
@@ -237,7 +286,6 @@ export function Composer({
         <input
           ref={fileInputRef}
           type="file"
-          accept={ACCEPT}
           multiple
           className="hidden"
           onChange={handleFileChange}
@@ -245,7 +293,7 @@ export function Composer({
         <button
           type="button"
           onClick={handleAttachClick}
-          aria-label="Attach image"
+          aria-label="Attach file"
           disabled={disabled}
           className="inline-flex size-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
         >

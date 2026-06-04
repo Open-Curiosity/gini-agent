@@ -12,8 +12,13 @@
 // upload-id markers; this lands them on disk so terminal_exec / code_exec
 // / git flows (e.g. committing an image to an asset branch) can use them.
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { basename, join, normalize, relative } from "node:path";
+import {
+  WorkspaceEscapeError,
+  assertInsideWorkspace,
+  writeInsideWorkspace
+} from "../../../src/capabilities/workspace-write";
 
 interface Args {
   uploadId: string;
@@ -49,28 +54,6 @@ async function readStdinJson<T>(): Promise<T> {
 function emit(result: Result, exitCode = 0): never {
   process.stdout.write(JSON.stringify(result));
   process.exit(exitCode);
-}
-
-function assertInsideWorkspace(workspaceRoot: string, target: string): string {
-  if (isAbsolute(target)) {
-    const normalized = normalize(target);
-    const root = normalize(workspaceRoot);
-    if (normalized !== root && !normalized.startsWith(`${root}/`)) {
-      throw new Error(`Path outside workspace: ${target}`);
-    }
-    return normalized;
-  }
-  const candidate = normalize(resolve(workspaceRoot, target));
-  const root = normalize(workspaceRoot);
-  if (candidate !== root && !candidate.startsWith(`${root}/`)) {
-    throw new Error(`Path outside workspace: ${target}`);
-  }
-  // Confirm relative computation doesn't reveal escape.
-  const rel = relative(root, candidate);
-  if (rel.startsWith("..")) {
-    throw new Error(`Path outside workspace: ${target}`);
-  }
-  return candidate;
 }
 
 // `uploadId` is interpolated into filesystem paths, so it must be an
@@ -138,36 +121,19 @@ async function main(): Promise<void> {
     || sanitizeFilename(manifest.filename ?? "")
     || basename(blobPath);
 
+  // The shared guard asserts the destination stays inside the workspace
+  // (lexically), rejects any symlinked path component, creates parent dirs,
+  // and writes — so a symlink can't redirect the write outside the
+  // workspace. WorkspaceEscapeError surfaces as a hard failure.
   let absolute: string;
   try {
-    absolute = assertInsideWorkspace(workspace, dest);
+    absolute = writeInsideWorkspace(workspace, dest, bytes);
   } catch (error) {
+    if (error instanceof WorkspaceEscapeError) {
+      emit({ ok: false, error: error.message }, 1);
+    }
     emit({ ok: false, error: error instanceof Error ? error.message : String(error) }, 1);
   }
-
-  // The lexical guard above can't see symlinks. Walk each path component
-  // from the workspace root down, lstat-ing (NOT following) each. Reject any
-  // symlink — dangling or live, at the destination or an intermediate dir —
-  // before creating or writing anything, so a symlink can't redirect the
-  // write (or a mkdir) outside the workspace. A missing component means
-  // everything below is created fresh under a real in-workspace dir, so stop.
-  const root = normalize(workspace);
-  const relParts = relative(root, absolute).split(sep).filter(Boolean);
-  let cur = root;
-  for (const part of relParts) {
-    cur = join(cur, part);
-    let ls;
-    try {
-      ls = lstatSync(cur);
-    } catch {
-      break;
-    }
-    if (ls.isSymbolicLink()) emit({ ok: false, error: `Path contains a symlink: ${dest}` }, 1);
-  }
-
-  const parent = dirname(absolute);
-  mkdirSync(parent, { recursive: true });
-  writeFileSync(absolute, bytes);
 
   emit({
     ok: true,

@@ -615,6 +615,152 @@ describe("provider", () => {
     }
   });
 
+  test("openai tool-calling serializes a document part as a chat-completions file part", async () => {
+    const original = process.env.OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "test-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_doc_1",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "Read the PDF." } }],
+        usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 }
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      // A known native family (gpt-4o) so the request-boundary document strip
+      // keeps the part; an unknown openai model would drop it (nativeDocs:false).
+      const provider = normalizeProvider({ name: "openai", model: "gpt-4o" });
+      await generateToolCallingResponse(
+        config(provider),
+        [{
+          role: "user",
+          content: [
+            { type: "text", text: "summarize this" },
+            { type: "document", document: { mimeType: "application/pdf", data: "QUJD", filename: "report.pdf" } }
+          ]
+        }],
+        []
+      );
+      expect(captured?.url).toContain("/chat/completions");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.messages[0].content[0]).toEqual({ type: "text", text: "summarize this" });
+      expect(sent.messages[0].content[1].type).toBe("file");
+      expect(sent.messages[0].content[1].file.filename).toBe("report.pdf");
+      expect(sent.messages[0].content[1].file.file_data).toBe("data:application/pdf;base64,QUJD");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = original;
+    }
+  });
+
+  test("codex tool-calling serializes a document part as a responses input_file part", async () => {
+    const { restore } = installCodexAuth("codex-doc-test");
+    const originalFetch = globalThis.fetch;
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      // Codex tool-calling streams; emit a minimal SSE completion.
+      const sse =
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n` +
+        `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_doc_2", output: [], usage: {} } })}\n\n` +
+        "data: [DONE]\n\n";
+      return Promise.resolve(new Response(sse, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      // Pass a tool so the codex path routes through the native
+      // function-calling /responses translator.
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "noop", parameters: { type: "object", properties: {} } }
+      }];
+      await generateToolCallingResponse(
+        config(provider),
+        [{
+          role: "user",
+          content: [
+            { type: "text", text: "summarize this" },
+            { type: "document", document: { mimeType: "application/pdf", data: "QUJD", filename: "report.pdf" } }
+          ]
+        }],
+        tools
+      );
+      expect(captured?.url.endsWith("/responses")).toBe(true);
+      const sent = JSON.parse(String(captured!.init!.body));
+      // codex modality is nativeDocs:true (verified against the live backend),
+      // so the document survives the request-boundary strip and serializes as a
+      // responses `input_file` part alongside the text.
+      expect(sent.input[0].content).toEqual([
+        { type: "input_text", text: "summarize this" },
+        { type: "input_file", filename: "report.pdf", file_data: "data:application/pdf;base64,QUJD" }
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("deepseek chat-completions strips a document part its text-only API can't take", async () => {
+    const originalKey = process.env.DEEPSEEK_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.DEEPSEEK_API_KEY = "test-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_ds_1",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 }
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "deepseek", model: "deepseek-chat" });
+      await generateToolCallingResponse(
+        config(provider),
+        [{
+          role: "user",
+          content: [
+            { type: "text", text: "summarize this" },
+            { type: "document", document: { mimeType: "application/pdf", data: "QUJD", filename: "report.pdf" } }
+          ]
+        }],
+        []
+      );
+      expect(captured?.url).toContain("/chat/completions");
+      const sent = JSON.parse(String(captured!.init!.body));
+      // deepseek modality is nativeDocs:false → the request-boundary strip drops
+      // the document part; only the text part survives, no `file` is emitted.
+      expect(sent.messages[0].content).toEqual([{ type: "text", text: "summarize this" }]);
+      const serialized = JSON.stringify(sent);
+      expect(serialized).not.toContain("file_data");
+      expect(serialized).not.toContain("QUJD");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+      else process.env.DEEPSEEK_API_KEY = originalKey;
+    }
+  });
+
   test("openai vision posts an image_url content part to /chat/completions", async () => {
     const original = process.env.OPENAI_API_KEY;
     const originalFetch = globalThis.fetch;

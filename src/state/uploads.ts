@@ -23,9 +23,9 @@ interface UploadManifest {
 // stream into the same upload space (PDFs, build logs, transcripts,
 // CSVs), so we accept any non-empty mime that looks structurally valid.
 // Vision-only callers (provider vision context) still gate at
-// `buildVisionContent` based on the stored mimeType; non-image uploads
+// `buildAttachmentContent` based on the stored mimeType; non-image uploads
 // won't accidentally land in a vision call.
-function isPlausibleMime(mimeType: string): boolean {
+export function isPlausibleMime(mimeType: string): boolean {
   if (!mimeType) return false;
   const slash = mimeType.indexOf("/");
   if (slash <= 0 || slash === mimeType.length - 1) return false;
@@ -34,13 +34,20 @@ function isPlausibleMime(mimeType: string): boolean {
 }
 
 
+// Strip control/newline chars and collapse whitespace before persisting a
+// filename — it is later rendered into the model-facing attachment marker,
+// where an embedded newline could spoof extra marker lines / inject text.
+export function sanitizeFilename(name: string): string {
+  return name.replace(/[\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 255);
+}
+
 function ensureUploadsDir(instance: Instance): string {
   const dir = uploadsDir(instance);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   return dir;
 }
 
-function extensionFor(mimeType: string): string {
+export function extensionFor(mimeType: string): string {
   switch (mimeType) {
     case "image/png": return "png";
     case "image/jpeg": return "jpg";
@@ -73,7 +80,7 @@ export function storeUpload(
   const manifest: UploadManifest = {
     id,
     mimeType,
-    filename,
+    filename: filename ? (sanitizeFilename(filename) || undefined) : undefined,
     size: bytes.length,
     createdAt: new Date().toISOString()
   };
@@ -111,7 +118,7 @@ export function uploadExists(instance: Instance, id: string): boolean {
 
 // Best-effort metadata read used by /api/uploads/:id HEAD and for
 // downstream callers that just need size/type without the bytes.
-export function uploadStat(instance: Instance, id: string): { size: number; mimeType: string } | null {
+export function uploadStat(instance: Instance, id: string): { size: number; mimeType: string; filename?: string } | null {
   const dir = uploadsDir(instance);
   const manifestPath = join(dir, `${id}.json`);
   if (!existsSync(manifestPath)) return null;
@@ -120,7 +127,7 @@ export function uploadStat(instance: Instance, id: string): { size: number; mime
     const ext = extensionFor(manifest.mimeType);
     const blobPath = join(dir, `${id}.${ext}`);
     const size = existsSync(blobPath) ? statSync(blobPath).size : manifest.size;
-    return { size, mimeType: manifest.mimeType };
+    return { size, mimeType: manifest.mimeType, filename: manifest.filename };
   } catch {
     return null;
   }

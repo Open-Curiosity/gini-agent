@@ -146,6 +146,10 @@ When an integration needs the actual file (not an upload id) — e.g. a git flow
 1. `skill_run({skill: "attachments", script: "materialize", args: {uploadId: "<id-from-marker>"}})` → `{path, absPath}`.
 2. Hand off `absPath` to the integration skill that consumes a file — it owns the provider-specific attach flow (e.g. github-issues' "Attaching an image to an issue").
 
+### Chat-attached files are already delivered for you
+
+When the user attaches a file in chat, the runtime delivers it to you in core — you do **not** need this skill to read it. The content arrives in the user message (a native document part, or inlined extracted text wrapped in `<<<BEGIN/END UNTRUSTED FILE <nonce>>>>` markers), and the file is already saved to your workspace at the `uploads/<id>/<name>` path named in the message. Read the workspace file directly with `file_read` / `code_exec` when you need more than the inlined preview. See ADR chat-file-attachments.md. This skill is for **agent-initiated** byte movement (URL downloads, promoting generated files, sending to an external system), not for reading the user's chat uploads.
+
 ## Rules
 
 1. **Always invoke through `skill_run`** with `skill: "attachments"`. The scripts read JSON from stdin and write JSON to stdout — don't try to `terminal_exec` them by hand.

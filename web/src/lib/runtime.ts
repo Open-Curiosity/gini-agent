@@ -111,14 +111,16 @@ export interface ProxyOptions {
 // browser-caching control) set `Cache-Control: no-store`; without this
 // passthrough the BFF would silently allow a browser to cache the QR
 // pixels — which encode the bootstrap URL. Other entries are headers a
-// BFF typically wants to forward (content-disposition for downloads,
-// etag/last-modified for revalidation, vary for cache key correctness).
+// BFF typically wants to forward (content-disposition + x-content-type-options
+// to keep served uploads download-only and no-sniff, etag/last-modified for
+// revalidation, vary for cache key correctness).
 const PASSTHROUGH_RESPONSE_HEADERS = [
   "cache-control",
   "etag",
   "last-modified",
   "vary",
   "content-disposition",
+  "x-content-type-options",
   "content-language",
   "content-encoding"
 ];
@@ -158,7 +160,21 @@ export async function proxyRequest(
   const signal = options.signal ?? request.signal;
   if (signal) init.signal = signal;
   if (!["GET", "HEAD"].includes(request.method)) {
+    // Bound the buffered body, but only for the uploads route — a low cap must
+    // not 413 normal POSTs (e.g. /chat/:id/messages). Enforced both before
+    // reading (content-length early-reject) and after (buffered length), so a
+    // header-less/chunked over-cap upload is rejected rather than forwarded.
+    // GINI_MAX_UPLOAD_BYTES overrides the default to mirror the gateway's cap.
+    const isUpload = canonical[0] === "uploads";
+    const cap = Number(process.env.GINI_MAX_UPLOAD_BYTES);
+    const maxBytes = Number.isFinite(cap) && cap > 0 ? cap : 50 * 1024 * 1024;
+    if (isUpload && Number(request.headers.get("content-length") ?? 0) > maxBytes) {
+      return Response.json({ error: "Upload too large." }, { status: 413 });
+    }
     const body = await request.arrayBuffer();
+    if (isUpload && body.byteLength > maxBytes) {
+      return Response.json({ error: "Upload too large." }, { status: 413 });
+    }
     if (body.byteLength > 0) init.body = body;
   }
   const fetcher = options.fetcher ?? fetch;
@@ -181,9 +197,13 @@ export async function proxyRequest(
   // Binary passthrough for non-text payloads (image uploads, file
   // downloads). Routing on text() would UTF-8-decode bytes and corrupt
   // them. Anything not obviously text streams the upstream body through
-  // unbuffered, mirroring the SSE branch above.
+  // unbuffered, mirroring the SSE branch above. Served uploads carry
+  // Content-Disposition: attachment and may have a text/* mime (csv, log,
+  // code) holding non-UTF-8 bytes — stream those opaquely too so the
+  // download is byte-identical rather than decode/re-encoded.
   const isText = /^(application\/(json|xml|.*\+json|.*\+xml)|text\/)/i.test(upstreamContentType);
-  if (!isText) {
+  const isAttachment = (upstream.headers.get("content-disposition") ?? "").toLowerCase().includes("attachment");
+  if (!isText || isAttachment) {
     const passthroughHeaders = new Headers();
     passthroughHeaders.set("content-type", upstreamContentType);
     for (const name of PASSTHROUGH_RESPONSE_HEADERS) {

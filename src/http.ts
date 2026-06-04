@@ -25,6 +25,7 @@ import {
   subscribeChatSession,
   unreadCountForDevice,
   uploadStat,
+  isPlausibleMime,
   upsertDevice
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
@@ -92,6 +93,15 @@ import { basename } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
+
+// Cap on stored uploads. 50MB by default (matches signed-download's body
+// cap); GINI_MAX_UPLOAD_BYTES overrides it (positive finite number) so tests
+// can drive the 413 path with a tiny limit.
+const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+function maxUploadBytes(): number {
+  const raw = Number(process.env.GINI_MAX_UPLOAD_BYTES);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_UPLOAD_BYTES;
+}
 
 // Extensions the browser can safely render inline (PDFs + raster images) when
 // GET /api/files is called with `inline=1`. Everything else — html/htm, svg,
@@ -231,7 +241,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["DELETE", /^\/api\/chat\/([^/]+)$/, async (_request, params) => { await deleteChat(config, params[0]); return json({ ok: true }); }],
     ["PATCH", /^\/api\/chat\/([^/]+)$/, async (request, params) => json(await renameChat(config, params[0], await body(request)))],
     ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
-    // Image upload. Accepts multipart/form-data with a `file` part. The bytes
+    // File upload. Accepts multipart/form-data with a `file` part. The bytes
     // are stored on disk under ~/.gini/instances/<instance>/uploads/<id>.<ext>
     // and the response carries the upload ref the client attaches to the
     // next chat message via /messages { content, images: [{ id, ... }] }.
@@ -240,15 +250,37 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!contentType.toLowerCase().includes("multipart/form-data")) {
         return json({ error: "Expected multipart/form-data with a 'file' part" }, 400);
       }
+      // Bound stored uploads. Reject on the declared content-length before
+      // buffering the body, then re-check the decoded byte length below so a
+      // missing/forged header still can't exceed the cap.
+      const cap = maxUploadBytes();
+      if (Number(request.headers.get("content-length") ?? 0) > cap) {
+        return json({ error: "Upload too large." }, 413);
+      }
       const form = await request.formData();
       const file = form.get("file");
       if (!(file instanceof Blob)) return json({ error: "Missing 'file' part" }, 400);
-      const filename = file instanceof File ? file.name : undefined;
+      // Prefer an explicit `filename` form field (mobile sends the original
+      // name here because expo-file-system multipart can't set the part
+      // filename) over the streamed part's name. Web doesn't send the field,
+      // so it falls back to the File part's own name.
+      const filenameField = form.get("filename");
+      const filename =
+        typeof filenameField === "string" && filenameField.length > 0
+          ? filenameField
+          : file instanceof File ? file.name : undefined;
       const mimeType = file.type || "application/octet-stream";
-      if (!mimeType.startsWith("image/") && !mimeType.startsWith("audio/")) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      // Accept any plausible MIME — storage already handles arbitrary file
+      // types (PDF, CSV, logs, code). Vision-only callers gate on image/*
+      // downstream (vision_query, the image_url path in buildAttachmentContent),
+      // so a non-image upload never lands in a vision call. Reject only
+      // structurally invalid mimes (415) and empty bodies (400).
+      if (!isPlausibleMime(mimeType)) {
         return json({ error: `Unsupported upload type: ${mimeType}` }, 415);
       }
-      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (bytes.length === 0) return json({ error: "Upload is empty." }, 400);
+      if (bytes.length > cap) return json({ error: "Upload too large." }, 413);
       const stored = storeUpload(config.instance, bytes, mimeType, filename);
       return json(stored, 201);
     }],
@@ -272,7 +304,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         headers: {
           "content-type": upload.mimeType,
           "content-length": String(upload.bytes.length),
-          "cache-control": "private, max-age=31536000, immutable"
+          "cache-control": "private, max-age=31536000, immutable",
+          // Arbitrary MIME is now accepted, so force a download + no-sniff: a
+          // text/html or SVG upload must never execute as a top-level document
+          // on the app origin. The bytes still render inline in <img>/<audio>
+          // (subresource loads ignore Content-Disposition). Bare `attachment`
+          // (no filename= param) avoids header injection from the stored name.
+          "content-disposition": "attachment",
+          "x-content-type-options": "nosniff"
         }
       });
     }],
