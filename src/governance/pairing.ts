@@ -134,13 +134,27 @@ export async function rejectPairing(config: RuntimeConfig, id: string) {
 }
 
 // Device cancels its own request; bindSecret must match the gini_pair cookie.
+// Read-only precheck first: a forged/arbitrary gini_pair cookie with a guessed
+// or absent id must NOT force a full-state disk write on not_found/bind_mismatch.
+// Only enter mutateState (which always writes) once the bind is known good — the
+// same read-before-write shape as pollPairingStatus. The locked re-run is
+// authoritative; the throwaway read copy is discarded (the mutators are pure over
+// the state passed in, so the precheck has no persisted side effect).
 export async function cancelPairing(config: RuntimeConfig, id: string, bindSecret: string) {
+  const pre = cancelPairingRequest(readState(config.instance), id, bindSecret);
+  if (!pre.ok) return pre;
   return mutateState(config.instance, (state) => cancelPairingRequest(state, id, bindSecret));
 }
 
 // Device claims its approved request, minting the session device and returning
 // the raw token exactly once (the route sets it as the gini_session cookie).
+// Read-only precheck first (same rationale as cancelPairing): bail on
+// not_found/bind_mismatch/not_approved BEFORE the full-state write. The precheck
+// mints a device on the throwaway read copy, which is discarded — only the locked
+// mutateState run mints the real, persisted session token.
 export async function claimPairingSession(config: RuntimeConfig, id: string, bindSecret: string) {
+  const pre = claimPairingRequest(readState(config.instance), id, bindSecret);
+  if (!pre.ok) return pre;
   return mutateState(config.instance, (state) => claimPairingRequest(state, id, bindSecret));
 }
 

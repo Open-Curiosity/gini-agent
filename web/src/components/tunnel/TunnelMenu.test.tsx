@@ -5,7 +5,7 @@
 // mocked so these tests drive view state directly without the network; the child
 // panels render for real so the wiring (Edit/Disconnect/Connect/Close) is exercised.
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { render as rtlRender, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -43,6 +43,11 @@ const actions = {
 
 let controller: TunnelController;
 
+// mock.module is process-wide, so capture the real module up front and restore it
+// in afterAll — otherwise this stub leaks into sibling files that render the real
+// useTunnel (e.g. PairDeviceDialog.test). The suite also runs with --isolate as
+// the structural backstop, but a self-contained restore keeps this file honest.
+const realUseTunnel = await import("./useTunnel");
 mock.module("./useTunnel", () => ({ useTunnel: (): TunnelController => controller }));
 
 const { TunnelMenu } = await import("./TunnelMenu");
@@ -58,6 +63,10 @@ beforeEach(() => {
 
 afterEach(() => {
   globalThis.fetch = realFetch;
+});
+
+afterAll(() => {
+  mock.module("./useTunnel", () => realUseTunnel);
 });
 
 const open = (user: ReturnType<typeof userEvent.setup>, name: "Open tunnel" | "Tunnel connected") =>
