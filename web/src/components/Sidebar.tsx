@@ -1,67 +1,102 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
 import {
-  Activity,
-  AlertTriangle,
-  Bug,
-  Cog,
   Download,
   Loader2,
-  ListTodo,
   Menu,
-  MessageSquare,
+  MessagesSquare,
   Moon,
-  Sparkles,
+  Plus,
+  Settings,
   Sun,
-  Timer,
-  Users,
-  Wrench
+  WandSparkles
 } from "lucide-react";
-import type { LucideIcon } from "lucide-react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
-import { useStatus } from "@/lib/queries";
-import { AgentSwitcher } from "@/components/AgentSwitcher";
+import { useChatSessions, useInvalidate, useStatus, useThreadsInbox } from "@/lib/queries";
+import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
+import { AgentAvatar } from "@/components/chat/AgentAvatar";
+import { CreateAgentDialog } from "@/components/CreateAgentDialog";
+import type { AgentRow, ChatSession } from "@/lib/view-types";
 import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
 
-const REPORT_BUG_URL = "https://github.com/Lilac-Labs/gini-agent/issues";
-
-type NavItem = { href: string; label: string; icon: LucideIcon };
-type NavGroup = readonly NavItem[];
-
-const NAV_GROUPS: readonly NavGroup[] = [
-  [
-    { href: "/chat", label: "Chat", icon: MessageSquare },
-    { href: "/tasks", label: "Tasks", icon: ListTodo },
-    { href: "/memory", label: "Memory", icon: Sparkles },
-    { href: "/subagents", label: "Subagents", icon: Users },
-    { href: "/jobs", label: "Jobs", icon: Timer }
-  ],
-  [
-    { href: "/skills", label: "Skills", icon: Wrench },
-    { href: "/permissions", label: "Permissions", icon: AlertTriangle },
-    { href: "/activity", label: "Activity", icon: Activity },
-    { href: "/settings", label: "Settings", icon: Cog }
-  ]
-] as const;
+// "Online" is a coarse status hint on the sidebar agent rows. The runtime
+// reports a richer AgentStatus; anything that isn't an explicit error/paused
+// state reads as ready, matching the green dot in the design.
+function isAgentOnline(status: string | undefined): boolean {
+  if (!status) return true;
+  return !["error", "paused", "disabled", "stopped"].includes(status);
+}
 
 function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
+  const params = useSearchParams();
+  const router = useRouter();
   const { theme, setTheme } = useTheme();
   const mounted = useMounted();
+  const invalidate = useInvalidate();
+  const [createOpen, setCreateOpen] = useState(false);
+
+  const status = useStatus();
+  const activeAgentId = status.data?.activeAgent?.id;
+  const agentsQuery = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string }>("/agents")
+  });
+  const agents = agentsQuery.data?.agents ?? [];
+
+  const sessions = useChatSessions();
+  const channels = useMemo<ChatSession[]>(() => {
+    const all = sessions.data ?? [];
+    return all
+      .filter((s) => s.kind === "channel" || s.origin === "job")
+      .sort((a, b) => (b.updatedAt ?? b.createdAt).localeCompare(a.updatedAt ?? a.createdAt));
+  }, [sessions.data]);
+
+  const { isUnread } = useChatReadState(sessions.data);
+  const threadsInbox = useThreadsInbox();
+  const { isThreadUnread } = useThreadReadState(threadsInbox.data);
+  const unreadThreadCount = useMemo(
+    () => (threadsInbox.data ?? []).filter((t) => isThreadUnread(t)).length,
+    [threadsInbox.data, isThreadUnread]
+  );
+
+  const selectedSession = params?.get("session") ?? null;
+  const onChat = pathname === "/chat";
+  const onThreads = pathname === "/threads";
+
+  const useAgentMutation = useMutation({
+    mutationFn: (id: string) => api(`/agents/${encodeURIComponent(id)}/use`, { method: "POST" }),
+    onSuccess: () => invalidate(["agents", "state", "status", "memory", "agent-chat"]),
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  const selectAgent = (id: string) => {
+    if (id !== activeAgentId) useAgentMutation.mutate(id);
+    router.push("/chat");
+    onNavigate?.();
+  };
+  const selectChannel = (sessionId: string) => {
+    router.push(`/chat?session=${sessionId}`);
+    onNavigate?.();
+  };
 
   return (
     <div className="flex h-full flex-col bg-sidebar text-sidebar-foreground">
-      <div className="flex items-center justify-between gap-2 px-3 py-4">
-        <AgentSwitcher variant="sidebar" />
+      <div className="flex items-center justify-between gap-2 px-4 pt-4 pb-2">
+        <Link href="/" onClick={onNavigate} className="flex min-w-0 flex-col leading-tight">
+          <span className="text-sm font-semibold text-foreground">Gini</span>
+          <span className="text-[11px] font-medium text-muted-foreground">Direct messages</span>
+        </Link>
         {mounted ? (
           <Button
             size="icon"
@@ -74,48 +109,164 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
           </Button>
         ) : null}
       </div>
-      <nav className="flex flex-1 flex-col gap-0.5 px-2 pb-4">
-        {NAV_GROUPS.map((group, groupIndex) => (
-          <div key={groupIndex} className="flex flex-col gap-0.5">
-            {groupIndex > 0 ? (
-              <div className="my-2 border-t border-sidebar-border" />
-            ) : null}
-            {group.map((item) => {
-              const Icon = item.icon;
-              const active = pathname === item.href;
-              return (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  onClick={onNavigate}
-                  className={cn(
-                    "flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors",
-                    active
-                      ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                      : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground"
-                  )}
-                >
-                  <Icon className="h-4 w-4" />
-                  {item.label}
-                </Link>
-              );
-            })}
+
+      <ScrollArea className="min-h-0 flex-1">
+        <div className="flex flex-col gap-4 px-2 py-2">
+          {/* Agents (DMs) */}
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center justify-between px-2">
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                Agents
+              </span>
+              <button
+                type="button"
+                aria-label="New agent"
+                onClick={() => setCreateOpen(true)}
+                className="flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground"
+              >
+                <Plus className="size-3.5" />
+              </button>
+            </div>
+            <ul className="flex flex-col gap-0.5">
+              {agents.length === 0 ? (
+                <li className="px-2 py-1.5 text-xs text-muted-foreground">No agents yet</li>
+              ) : (
+                agents.map((agent) => {
+                  const active = onChat && !selectedSession && agent.id === activeAgentId;
+                  return (
+                    <li key={agent.id}>
+                      <button
+                        type="button"
+                        onClick={() => selectAgent(agent.id)}
+                        className={cn(
+                          "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
+                          active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
+                        )}
+                      >
+                        <AgentAvatar name={agent.name} seed={agent.id} size={22} />
+                        <span
+                          className={cn(
+                            "min-w-0 flex-1 truncate text-[13px]",
+                            active ? "font-semibold text-foreground" : "font-medium text-sidebar-foreground/85"
+                          )}
+                        >
+                          {agent.name}
+                        </span>
+                        {isAgentOnline(agent.status) ? (
+                          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-[#39C36E]" />
+                        ) : null}
+                      </button>
+                    </li>
+                  );
+                })
+              )}
+            </ul>
           </div>
-        ))}
-        <div className="mt-2 border-t border-sidebar-border pt-2">
-          <a
-            href={REPORT_BUG_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            onClick={onNavigate}
-            className="flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-sm font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground"
-          >
-            <Bug className="h-4 w-4" />
-            Report a bug
-          </a>
+
+          {/* Recurring Jobs (channels) */}
+          {channels.length > 0 ? (
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center justify-between px-2">
+                <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  Recurring Jobs
+                </span>
+              </div>
+              <ul className="flex flex-col gap-0.5">
+                {channels.map((channel) => {
+                  const active = onChat && selectedSession === channel.id;
+                  const unread = !active && isUnread(channel);
+                  return (
+                    <li key={channel.id}>
+                      <button
+                        type="button"
+                        onClick={() => selectChannel(channel.id)}
+                        className={cn(
+                          "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
+                          active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
+                        )}
+                      >
+                        <span aria-hidden className="text-muted-foreground">#</span>
+                        <span
+                          className={cn(
+                            "min-w-0 flex-1 truncate text-[13px]",
+                            active || unread
+                              ? "font-semibold text-foreground"
+                              : "font-medium text-sidebar-foreground/85"
+                          )}
+                        >
+                          {channel.title?.trim() || "Channel"}
+                        </span>
+                        {unread ? (
+                          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-primary" />
+                        ) : null}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ) : null}
+
+          <div className="border-t border-sidebar-border" />
+
+          {/* Nav: Threads, Skills, Settings */}
+          <ul className="flex flex-col gap-0.5">
+            <li>
+              <Link
+                href="/threads"
+                onClick={onNavigate}
+                className={cn(
+                  "flex items-center gap-3 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-colors",
+                  onThreads
+                    ? "bg-sidebar-accent text-foreground"
+                    : "text-sidebar-foreground/85 hover:bg-sidebar-accent/50"
+                )}
+              >
+                <MessagesSquare className="size-3.5 text-muted-foreground" />
+                <span className="flex-1">Threads</span>
+                {unreadThreadCount > 0 ? (
+                  <span className="flex items-center justify-center rounded-full bg-primary px-1.5 py-px text-[10px] font-bold text-primary-foreground">
+                    {unreadThreadCount}
+                  </span>
+                ) : null}
+              </Link>
+            </li>
+            <li>
+              <Link
+                href="/skills"
+                onClick={onNavigate}
+                className={cn(
+                  "flex items-center gap-3 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-colors",
+                  pathname === "/skills"
+                    ? "bg-sidebar-accent text-foreground"
+                    : "text-sidebar-foreground/85 hover:bg-sidebar-accent/50"
+                )}
+              >
+                <WandSparkles className="size-3.5 text-muted-foreground" />
+                Skills
+              </Link>
+            </li>
+            <li>
+              <Link
+                href="/settings"
+                onClick={onNavigate}
+                className={cn(
+                  "flex items-center gap-3 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-colors",
+                  pathname === "/settings"
+                    ? "bg-sidebar-accent text-foreground"
+                    : "text-sidebar-foreground/85 hover:bg-sidebar-accent/50"
+                )}
+              >
+                <Settings className="size-3.5 text-muted-foreground" />
+                Settings
+              </Link>
+            </li>
+          </ul>
         </div>
-      </nav>
+      </ScrollArea>
+
       <UpdateReminder />
+      <CreateAgentDialog open={createOpen} onOpenChange={setCreateOpen} />
     </div>
   );
 }
@@ -180,7 +331,7 @@ function UpdateReminder() {
   const showUpdate = updateAvailable && !appliedSha;
 
   return (
-    <div className="border-t border-sidebar-border px-3 py-3">
+    <div className="border-t border-sidebar-border px-4 py-3">
       <div className="flex items-center justify-between gap-2">
         <div className="min-w-0">
           <div className="truncate font-mono text-[10px] text-sidebar-foreground/65">
@@ -211,7 +362,7 @@ function UpdateReminder() {
 
 export function Sidebar() {
   return (
-    <aside className="hidden h-full w-60 shrink-0 border-r border-border md:flex md:flex-col">
+    <aside className="hidden h-full w-[266px] shrink-0 border-r border-sidebar-border md:flex md:flex-col">
       <SidebarBody />
     </aside>
   );
@@ -227,14 +378,14 @@ export function MobileTopBar() {
             <Menu className="h-5 w-5" />
           </Button>
         </SheetTrigger>
-        <SheetContent side="left" className="w-60 p-0">
+        <SheetContent side="left" className="w-[266px] p-0">
           <SheetHeader className="sr-only">
             <SheetTitle>Navigation</SheetTitle>
           </SheetHeader>
           <SidebarBody onNavigate={() => setOpen(false)} />
         </SheetContent>
       </Sheet>
-      <AgentSwitcher variant="mobile" />
+      <span className="text-sm font-semibold">Gini</span>
     </header>
   );
 }
