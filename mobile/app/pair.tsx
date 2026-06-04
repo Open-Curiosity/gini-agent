@@ -11,9 +11,9 @@ import {
   TouchableOpacity
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { normalizeBaseUrl, saveCredentials } from "@/src/auth";
+import { normalizeBaseUrl, readCachedCredentials, saveCredentials } from "@/src/auth";
 import { createPairingClient, PairingError, type PairingClient } from "@/src/pairing";
-import { isPairableHost } from "@/src/relay-link";
+import { isGatewaySwitch, isPairableHost } from "@/src/relay-link";
 import { family, theme } from "@/src/theme";
 
 // The device-side pairing screen — the mirror of web/src/app/pair/page.tsx for
@@ -25,6 +25,7 @@ import { family, theme } from "@/src/theme";
 
 type Phase =
   | "input" // no relay yet — ask for a link
+  | "confirm" // a deep link would switch an already-paired gateway — confirm first
   | "creating"
   | "create-error"
   | "pending"
@@ -39,11 +40,31 @@ type Phase =
 // device within a couple of seconds.
 const POLL_INTERVAL_MS = 2000;
 
+// Display host for a stored/incoming URL (the parsed host is un-spoofable, unlike
+// raw link text). Empty string when absent/unparseable.
+function hostOf(url: string | null | undefined): string {
+  if (!url) return "";
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
 export default function PairScreen() {
   const params = useLocalSearchParams<{ relay?: string | string[] }>();
   const relayParam = Array.isArray(params.relay) ? params.relay[0] : params.relay;
 
-  const [phase, setPhase] = useState<Phase>(relayParam ? "creating" : "input");
+  // A deep link to a relay host that differs from an already-stored gateway must
+  // be confirmed (a silent switch could repoint the app to an attacker's relay);
+  // a first-time pair or a same-host re-pair starts straight away.
+  const [phase, setPhase] = useState<Phase>(() => {
+    if (!relayParam) return "input";
+    return isGatewaySwitch(readCachedCredentials()?.baseUrl, relayParam) ? "confirm" : "creating";
+  });
+  const [pendingOrigin, setPendingOrigin] = useState<string | null>(() =>
+    relayParam && isGatewaySwitch(readCachedCredentials()?.baseUrl, relayParam) ? relayParam : null
+  );
   const [linkInput, setLinkInput] = useState("");
   const [code, setCode] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -131,6 +152,13 @@ export default function PairScreen() {
   useEffect(() => {
     if (!relayParam || startedRef.current === relayParam) return;
     startedRef.current = relayParam;
+    // Switching an already-paired app to a different relay host needs explicit
+    // confirmation; a first-time or same-host pair auto-starts.
+    if (isGatewaySwitch(readCachedCredentials()?.baseUrl, relayParam)) {
+      setPendingOrigin(relayParam);
+      setPhase("confirm");
+      return;
+    }
     void start(relayParam);
   }, [relayParam, start]);
 
@@ -196,7 +224,12 @@ export default function PairScreen() {
       if (!client || !request) return;
       try {
         const token = await client.claim(request.id, request.secret);
-        if (genRef.current !== myGen) return;
+        // Persist BEFORE the gen guard: a successful claim already minted an
+        // active server-side device row whose token is returned exactly once, so
+        // always store it — otherwise an unmount mid-claim would orphan that row
+        // (its token lost forever). saveCredentials is an AsyncStorage write with
+        // no setState on this screen, so it's safe after unmount. Only the
+        // navigation below stays attempt-scoped.
         await saveCredentials({ baseUrl: client.origin, token });
         if (genRef.current !== myGen) return;
         setPhase("paired");
@@ -252,6 +285,9 @@ export default function PairScreen() {
     void start(relayParam);
   }, [relayParam, start]);
 
+  const confirmHost = hostOf(pendingOrigin);
+  const currentHost = hostOf(readCachedCredentials()?.baseUrl);
+
   return (
     <SafeAreaView style={styles.safe} edges={["bottom"]}>
       <Stack.Screen options={{ title: "Connect to Gini" }} />
@@ -260,13 +296,40 @@ export default function PairScreen() {
         style={styles.flex}
       >
         <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
-          <Text style={styles.heading}>Pair this device</Text>
-          <Text style={styles.subhead}>
-            A code appears below. Approve it on the computer where Gini is signed
-            in, and this device connects.
+          <Text style={styles.heading}>
+            {phase === "confirm" ? "Switch gateway?" : "Pair this device"}
           </Text>
+          {phase === "confirm" ? null : (
+            <Text style={styles.subhead}>
+              A code appears below. Approve it on the computer where Gini is signed
+              in, and this device connects.
+            </Text>
+          )}
 
-          {phase === "input" ? (
+          {phase === "confirm" ? (
+            <>
+              <Text style={styles.subhead}>
+                This connects this device to{" "}
+                <Text style={styles.confirmHost}>{confirmHost}</Text>
+                {currentHost
+                  ? `, replacing your current connection to ${currentHost}`
+                  : ""}
+                . Continue only if you opened this link yourself.
+              </Text>
+              <TouchableOpacity
+                onPress={() => {
+                  const origin = pendingOrigin;
+                  if (origin) void start(origin);
+                }}
+                style={styles.button}
+              >
+                <Text style={styles.buttonText}>Connect to {confirmHost}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => setPhase("cancelled")} style={styles.ghostButton}>
+                <Text style={styles.ghostButtonText}>Not now</Text>
+              </TouchableOpacity>
+            </>
+          ) : phase === "input" ? (
             <>
               <Text style={styles.label}>Gini link</Text>
               <TextInput
@@ -372,6 +435,11 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 20,
     marginBottom: 8
+  },
+  confirmHost: {
+    fontFamily: family("JetBrainsMono"),
+    fontSize: 14,
+    color: theme.text
   },
   label: {
     color: theme.text,
