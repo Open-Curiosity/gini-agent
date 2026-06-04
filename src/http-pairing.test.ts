@@ -706,6 +706,9 @@ describe("pairing routes — native client (mobile)", () => {
     expect(body.code).toMatch(/^\d{3}-\d{3}$/);
     // Browsers never see the secret in the body (HttpOnly cookie only); native does.
     expect(body.bindSecret).toMatch(/^[0-9a-f]{64}$/);
+    // Native is cookieless — the secret rides the body, NOT a Set-Cookie, so the
+    // iOS cookie jar never persists a gini_pair the gateway won't read.
+    expect(setCookieValue(res, "gini_pair")).toBeUndefined();
   });
 
   test("a no-Origin POST WITHOUT the native opt-in is still refused (the exemption requires opt-in)", async () => {

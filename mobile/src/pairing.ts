@@ -19,9 +19,10 @@ import { normalizeBaseUrl } from "./auth";
 export type PairingStatus = PairingRequestStatus;
 
 // The runtime ships the union as a TYPE only; this is the matching VALUE set used
-// to validate a status string off the wire before trusting it. If the union ever
-// gains/loses a member, this literal set fails typecheck against PairingStatus —
-// the drift guard.
+// to validate a status string off the wire before trusting it. Removing a member
+// from the runtime union makes the corresponding literal here fail typecheck (the
+// drift guard); a newly-ADDED member won't fail typecheck but is safely rejected
+// at runtime as off-contract until it's added here too.
 const PAIRING_STATUSES: ReadonlySet<PairingStatus> = new Set<PairingStatus>([
   "pending",
   "approved",

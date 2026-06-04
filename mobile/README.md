@@ -101,10 +101,20 @@ under your own Apple developer account. Two files to edit.
 | `expo.updates.url`                                                               | `https://u.expo.dev/<your-eas-project-id>`    |
 | `expo.extra.eas.build.experimental.ios.appExtensions[0].bundleIdentifier`        | `<your-bundle-id>.notificationservice`        |
 | `expo.plugins[…with-approval-notification-service].appleTeamId`                  | developer.apple.com → Membership → Team ID    |
+| `expo.ios.associatedDomains`                                                      | `applinks:*.<your-relay-domain>` (relay-link pairing) |
 
 **2. `mobile/eas.json` submit profile:** replace `appleTeamId` and
 `ascAppId` under `submit.production.ios` with your own before running
 `eas submit`.
+
+**Relay-link pairing (optional):** the "open the link → pair" flow assumes
+the Lilac relay domain. If you run your own relay, also (a) point
+`expo.ios.associatedDomains` at `applinks:*.<your-relay-domain>` and the
+`RELAY_DOMAIN` constant in `mobile/src/relay-link.ts` at the same domain, and
+(b) on the gateway set `GINI_RELAY_DOMAIN=<your-relay-domain>` and
+`GINI_IOS_APP_ID=<TeamID>.<your-bundle-id>` (the app id the gateway serves in
+`/.well-known/apple-app-site-association`). The manual token-paste flow needs
+none of this.
 
 Then regenerate the native project:
 

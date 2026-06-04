@@ -2429,12 +2429,16 @@ function isNativePairingClient(request: Request, host: string): boolean {
   return isRelayHost(host) || isLoopbackHost(host);
 }
 
-// The per-request binding secret: the gini_pair cookie (browsers) or, when no
-// cookie is present, the X-Gini-Pair-Secret header (the cookieless native
-// client). Cookie wins so the browser path is unchanged — a browser always
-// carries the cookie it was issued on create and never reaches the header.
-function pairBindSecret(request: Request): string | undefined {
-  return cookieValue(request, PAIR_BIND_COOKIE) ?? (request.headers.get("x-gini-pair-secret") ?? undefined);
+// The per-request binding secret, sourced by the single native gate: a verified
+// native client reads ONLY the X-Gini-Pair-Secret header, a browser ONLY the
+// HttpOnly gini_pair cookie. Header-only for native is deliberate — iOS
+// NSURLSession auto-attaches a persisted gini_pair cookie, and a cookie-first
+// read would prefer a STALE cookie from a prior/abandoned attempt over the fresh
+// header secret, yielding an intermittent bind_mismatch. Native is cookieless by
+// construction (create sets no cookie for it), so the header is the only source.
+function pairBindSecret(request: Request, native: boolean): string | undefined {
+  if (native) return request.headers.get("x-gini-pair-secret") ?? undefined;
+  return cookieValue(request, PAIR_BIND_COOKIE) ?? undefined;
 }
 
 // iOS universal-links association file. A wildcard associated domain
@@ -2566,21 +2570,25 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
       if (error instanceof PairingCapExceededError) return json({ error: error.message }, 429);
       throw error;
     }
-    // Browsers receive the binding secret ONLY as the HttpOnly gini_pair cookie
-    // (set below). A verified native client, which can't read that cookie, also
-    // gets it in the body so it can echo it back via X-Gini-Pair-Secret.
+    // Browsers receive the binding secret ONLY as the HttpOnly gini_pair cookie.
+    // A verified native client is cookieless: it gets the secret in the body and
+    // echoes it back via X-Gini-Pair-Secret, and we set NO cookie for it — an iOS
+    // cookie jar would otherwise persist a gini_pair the gateway never reads and
+    // that could go stale across attempts.
     const response = json(
       native ? { id: created.id, code: created.code, bindSecret } : { id: created.id, code: created.code },
       201
     );
-    response.headers.append(
-      "set-cookie",
-      serializeCookie(PAIR_BIND_COOKIE, bindSecret, {
-        ...bindCookieAttributes,
-        secure: pairingCookieSecure(request, host),
-        maxAge: PAIR_BIND_COOKIE_TTL_SECONDS
-      })
-    );
+    if (!native) {
+      response.headers.append(
+        "set-cookie",
+        serializeCookie(PAIR_BIND_COOKIE, bindSecret, {
+          ...bindCookieAttributes,
+          secure: pairingCookieSecure(request, host),
+          maxAge: PAIR_BIND_COOKIE_TTL_SECONDS
+        })
+      );
+    }
     return response;
   }
 
@@ -2588,7 +2596,7 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
   // match this request, not merely exist).
   const poll = path.match(/^\/api\/pairing\/request\/([^/]+)$/);
   if (method === "GET" && poll) {
-    const bindSecret = pairBindSecret(request);
+    const bindSecret = pairBindSecret(request, native);
     if (!bindSecret) return json({ error: "Unauthorized" }, 401);
     const result = pollPairingStatus(config, poll[1]!, bindSecret);
     if (!result.ok) return json({ error: result.reason }, result.reason === "not_found" ? 404 : 403);
@@ -2598,7 +2606,7 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
   // Device: claim an approved request → mint the session, set the cookie.
   const claim = path.match(/^\/api\/pairing\/request\/([^/]+)\/claim$/);
   if (method === "POST" && claim) {
-    const bindSecret = pairBindSecret(request);
+    const bindSecret = pairBindSecret(request, native);
     if (!bindSecret) return json({ error: "Unauthorized" }, 401);
     const result = await claimPairingSession(config, claim[1]!, bindSecret);
     if (!result.ok) {
@@ -2624,7 +2632,7 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
   // Device: cancel own pending/approved request (binding cookie required).
   const cancel = path.match(/^\/api\/pairing\/request\/([^/]+)\/cancel$/);
   if (method === "POST" && cancel) {
-    const bindSecret = pairBindSecret(request);
+    const bindSecret = pairBindSecret(request, native);
     if (!bindSecret) return json({ error: "Unauthorized" }, 401);
     const result = await cancelPairing(config, cancel[1]!, bindSecret);
     if (!result.ok) return json({ error: result.reason }, result.reason === "not_found" ? 404 : 403);

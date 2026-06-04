@@ -81,6 +81,25 @@ export default function PairScreen() {
       setError(null);
       setCode(null);
       setPhase("creating");
+      // Validate the host before any network call. This is the single choke point
+      // for BOTH manual paste and deep-link auto-start, so a crafted
+      // `gini://pair?relay=https://evil` (the custom scheme bypasses the relay-only
+      // link rewriter) can't drive pairing against — and persist credentials for —
+      // an arbitrary host.
+      let host: string;
+      try {
+        host = new URL(origin).host;
+      } catch {
+        host = "";
+      }
+      if (!isPairableHost(host)) {
+        if (genRef.current !== myGen) return;
+        setError(
+          "Pairing needs a Gini relay link (…gini-relay.lilaclabs.ai). For a gateway on your own network, use its bearer token on the previous screen."
+        );
+        setPhase("create-error");
+        return;
+      }
       let client: PairingClient;
       try {
         client = createPairingClient(origin);
@@ -198,20 +217,14 @@ export default function PairScreen() {
       setError(e instanceof Error ? e.message : "Enter a valid Gini link.");
       return;
     }
-    // Pairing runs only against a relay link (or loopback in dev) — the gateway's
-    // native gate refuses LAN hosts. Guide the user instead of letting create 403.
-    if (!isPairableHost(new URL(origin).host)) {
-      setError(
-        "Pairing needs a Gini relay link (…gini-relay.lilaclabs.ai). For a gateway on your own network, use its bearer token on the previous screen."
-      );
-      return;
-    }
+    // start() applies the relay/loopback host check (the single choke point), so a
+    // non-pairable link surfaces the same guidance there.
     void start(origin);
   }, [linkInput, start]);
 
   const cancel = useCallback(async () => {
     // Bump the generation so any in-flight poll/claim from this attempt bails.
-    genRef.current += 1;
+    const myGen = ++genRef.current;
     stopPolling();
     const client = clientRef.current;
     const request = requestRef.current;
@@ -222,6 +235,9 @@ export default function PairScreen() {
         // Already terminal server-side — we surface the cancelled state anyway.
       }
     }
+    // Match the gen discipline of every other post-await write: if a new attempt
+    // started during the cancel round-trip, don't clobber it back to "cancelled".
+    if (genRef.current !== myGen) return;
     setPhase("cancelled");
   }, [stopPolling]);
 

@@ -211,10 +211,14 @@ all three native deviations:
   confused deputy. Browsers still go through the full gate, and the admin routes
   still re-validate the session, so this never widens admin reach.
 - **Binding secret in the body + header.** `POST /api/pairing/request` returns the
-  `bindSecret` in the JSON body for a native client (browsers get it only as the
-  HttpOnly cookie). The client echoes it back as `X-Gini-Pair-Secret` on
-  poll/claim/cancel; the gateway reads the secret as the `gini_pair` cookie **OR**
-  that header (`pairBindSecret`), cookie first, so the browser path is unchanged.
+  `bindSecret` in the JSON body for a native client and sets **no** `gini_pair`
+  cookie for it (browsers get it only as the HttpOnly cookie). The client echoes
+  it back as `X-Gini-Pair-Secret` on poll/claim/cancel; `pairBindSecret` reads the
+  secret by the same single gate — **header only** for native, **cookie only** for
+  a browser — so the browser path is byte-for-byte unchanged. Header-only for
+  native is deliberate: iOS NSURLSession auto-attaches any persisted `gini_pair`,
+  and a cookie-first read could prefer a stale cookie over the fresh header secret
+  (an intermittent `bind_mismatch`); making native cookieless removes that hazard.
 - **Session token in the claim body.** `POST …/claim` returns
   `{ ok: true, token }` for a native client — the same `gini_device_<uuid>` token
   the cookie would carry, just the transport a non-browser needs. The client
