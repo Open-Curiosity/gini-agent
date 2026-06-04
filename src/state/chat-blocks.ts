@@ -789,6 +789,29 @@ export function listMainChatBlocks(instance: Instance, sessionId: string): ChatB
     .map(rowToBlock);
 }
 
+// Returns the most recent main-chat (un-threaded) assistant_text block in a
+// session, or undefined when none exists. The per-turn routing decision
+// branches a new thread off this block: when the agent emits
+// `<route>thread</route>`, the thread roots at the assistant message it just
+// finished in the main chat. Returns undefined for the very first turn (no
+// prior assistant message to branch from), in which case the turn stays in
+// the main chat.
+export function getLastMainChatAssistantTextBlock(
+  instance: Instance,
+  sessionId: string
+): ChatBlock | undefined {
+  const db = getMemoryDb(instance);
+  const row = db
+    .query<ChatBlockRow, [string]>(
+      `SELECT * FROM chat_blocks
+       WHERE session_id = ? AND thread_id IS NULL AND kind = 'assistant_text'
+       ORDER BY ordinal DESC
+       LIMIT 1`
+    )
+    .get(sessionId);
+  return row ? rowToBlock(row) : undefined;
+}
+
 // Truncates a preview string to a chip-friendly length without splitting
 // mid-word awkwardly — a hard cut is fine here since previews are advisory.
 function truncatePreview(text: string, max = 140): string {
