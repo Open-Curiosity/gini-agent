@@ -1304,10 +1304,11 @@ async function runLoop(
   // but the directive is still stripped. Persists the thread fields onto the
   // Task so an approval-resume (which re-runs resolveEmitContext) keeps
   // threading from the same parent.
-  const switchTurnToThread = async (): Promise<void> => {
-    if (!emitCtx || emitCtx.threadId) return;
+  const switchTurnToThread = async (): Promise<"switched" | "already-threaded" | "no-parent"> => {
+    if (!emitCtx) return "no-parent";
+    if (emitCtx.threadId) return "already-threaded";
     const parent = getLastMainChatAssistantTextBlock(config.instance, emitCtx.sessionId);
-    if (!parent) return; // First-ever turn — stay in main chat.
+    if (!parent) return "no-parent"; // First-ever turn — stay in main chat.
     const threadId = makeId("thread");
     const parentBlockId = parent.id;
     emitCtx = { ...emitCtx, threadId, parentBlockId };
@@ -1319,6 +1320,7 @@ async function runLoop(
         item.updatedAt = now();
       }
     });
+    return "switched";
   };
 
   // Resolve the per-turn route from the model's final text and return the
@@ -1780,6 +1782,47 @@ async function runLoop(
         });
         const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
         return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
+      }
+      // start_thread is the agent-decided threading CONTROL tool, handled
+      // INLINE here (before any phase/tool_call/tool_result emission) so it
+      // produces NO visible chat block — it's a control action, not work.
+      // It reuses the same switchTurnToThread() helper the `<route>`
+      // directive path uses, so the minted threadId / persisted task fields
+      // are identical. Once the switch lands, emitCtx is threaded for the
+      // rest of this turn, so any sibling tool calls later in this batch and
+      // all continued text/tools/final answer in later iterations thread too.
+      // The only state mutation is updateRecentToolCall(done); a tool result
+      // is always pushed so the provider sees the call resolved (a dangling
+      // tool_call breaks the next provider turn).
+      if (call.function.name === "start_thread") {
+        // Detection only fires on the first model call of a fresh turn; a
+        // resume continuation or an already-threaded task can't re-route.
+        const canRoute = isFirstModelCall && threadDetectionEnabled();
+        let resultPayload: { ok: true; threaded: boolean; note: string };
+        if (!canRoute) {
+          resultPayload = emitCtx?.threadId
+            ? { ok: true, threaded: true, note: "Already in a thread." }
+            : { ok: true, threaded: false, note: "Already in the main chat — staying here." };
+        } else {
+          const outcome = await switchTurnToThread();
+          if (outcome === "switched") {
+            routeResolved = true; // The `<route>` text parser must not also re-route this turn.
+            resultPayload = { ok: true, threaded: true, note: "Replying in a thread now. Continue normally." };
+          } else if (outcome === "already-threaded") {
+            resultPayload = { ok: true, threaded: true, note: "Already in a thread." };
+          } else {
+            resultPayload = { ok: true, threaded: false, note: "No earlier message to branch from — replying in the main chat." };
+          }
+        }
+        const content = JSON.stringify(resultPayload);
+        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content });
+        await mutateState(config.instance, (state) => {
+          const item = findTask(state, taskId);
+          if (isTerminalTaskStatus(item.status)) return;
+          updateRecentToolCall(item, call.id, "done");
+          item.updatedAt = now();
+        });
+        continue;
       }
       // Per-tool phase + tool_call(running) emission. Args are parsed
       // leniently — emission must never abort dispatch on malformed
