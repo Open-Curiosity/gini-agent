@@ -551,52 +551,39 @@ describe("relay session gate (web-bound branch)", () => {
     expect(res.status).not.toBe(401);
   });
 
-  test("a relay session cannot create legacy pairing codes (POST /api/runtime/pairing is 403)", async () => {
-    // A relay session is owner-equivalent for live use but must not mint a
-    // persistent, non-expiring legacy device bearer that would outlive its own
-    // revocation. The only browser path to legacy creation is the BFF
-    // (/api/runtime/pairing); the gateway refuses it for relay sessions.
-    const { handler, relay, session } = await pairedSession("gate-legacy-create");
-    const res = await pair(handler, "/api/runtime/pairing", {
-      method: "POST",
-      host: relay,
-      origin: `https://${relay}`,
-      secFetchSite: "same-origin",
-      cookie: `gini_session=${encodeURIComponent(session)}`,
-      body: { ttlSeconds: 600 }
+  // A paired relay session is a full MIRROR of loopback (ADR device-pairing-auth
+  // "Relay sessions mirror loopback"): it is NOT blocked from the pairing BFF
+  // namespace (admin approve/reject/list + legacy create). It passes the relay
+  // gate and proxies to the BFF; in tests there's no web child, so it falls
+  // through to the 502 proxy fallback — the point is it is neither 401'd nor 403'd.
+  test("a paired relay session reaches the pairing BFF namespace like loopback", async () => {
+    const { handler, relay, session } = await pairedSession("gate-mirror");
+    const cookie = `gini_session=${encodeURIComponent(session)}`;
+    const list = await pair(handler, "/api/runtime/pairing/requests", {
+      host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie
     });
-    expect(res.status).toBe(403);
+    expect(list.status).not.toBe(401);
+    expect(list.status).not.toBe(403);
+    const approve = await pair(handler, "/api/runtime/pairing/requests/preq_x/approve", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie, body: {}
+    });
+    expect(approve.status).not.toBe(401);
+    expect(approve.status).not.toBe(403);
+    const create = await pair(handler, "/api/runtime/pairing", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie, body: { ttlSeconds: 600 }
+    });
+    expect(create.status).not.toBe(401);
+    expect(create.status).not.toBe(403);
   });
 
-  test("encoded /api/runtime/pairing variants are also refused for a relay session", async () => {
-    // url.pathname is not percent-decoded, so a literal compare alone would miss
-    // /api/runtime/%70airing — but the BFF recursively decodes it back to
-    // "pairing" and forwards legacy create. The gate decodes before comparing.
-    const { handler, relay, session } = await pairedSession("gate-legacy-create-encoded");
-    for (const path of ["/api/runtime/%70airing", "/api/runtime/%2570airing", "/api/runtime/pa%69ring"]) {
-      const res = await pair(handler, path, {
-        method: "POST",
-        host: relay,
-        origin: `https://${relay}`,
-        secFetchSite: "same-origin",
-        cookie: `gini_session=${encodeURIComponent(session)}`,
-        body: { ttlSeconds: 600 }
-      });
-      expect(res.status).toBe(403);
-    }
-  });
-
-  test("loopback is NOT refused for legacy create (no relay gate)", async () => {
-    const { handler } = makeHandler("gate-legacy-create-loopback");
-    const res = await pair(handler, "/api/runtime/pairing", {
-      method: "POST",
-      host: "127.0.0.1:7337",
-      origin: "http://127.0.0.1:7337",
-      secFetchSite: "same-origin",
-      body: { ttlSeconds: 600 }
+  test("an UNPAIRED relay session cannot reach the pairing BFF namespace (401)", async () => {
+    // The trust anchor: no gini_session → the relay gate 401s /api/runtime/*
+    // before the BFF, so an unpaired visitor can never reach the admin routes.
+    const { handler } = makeHandler("gate-mirror-unpaired");
+    const relay = RELAY("gate-mirror-unpaired");
+    const res = await pair(handler, "/api/runtime/pairing/requests", {
+      host: relay, origin: `https://${relay}`, secFetchSite: "same-origin"
     });
-    // Loopback isn't relay-gated, so it proxies to the (absent in tests) web
-    // child and falls back — never the relay-only 403.
-    expect(res.status).not.toBe(403);
+    expect(res.status).toBe(401);
   });
 });

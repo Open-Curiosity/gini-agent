@@ -6,7 +6,6 @@ import {
   usePairingRequests,
   useApprovePairing,
   useRejectPairing,
-  isLoopbackFront,
   type PairingRequestView
 } from "@/lib/pairing";
 import { Button } from "@/components/ui/button";
@@ -27,9 +26,11 @@ function relativeTime(iso: string): string {
 }
 
 /**
- * Operator's live "Pair requests" list. Only the loopback front may approve, so
- * this gates its actionable UI on `isLoopbackFront()` and otherwise renders a
- * note pointing the user at the machine that started the tunnel.
+ * The admin "Pair requests" list. Shown to any PAIRED session — loopback OR a
+ * relay browser paired earlier — both of which are admins that can approve/add
+ * devices (see ADR device-pairing-auth.md, "Relay sessions mirror loopback").
+ * It mounts only inside the (open-gated) Pair-device dialog, itself reachable
+ * only by a paired/loopback session, so there is no front to gate on here.
  *
  * The list polls every 3s as a backstop (see usePairingRequests). Instant SSE
  * refresh is handled app-wide by RuntimeStreamBridge, which invalidates
@@ -38,8 +39,7 @@ function relativeTime(iso: string): string {
  * bridge is active).
  */
 export function PairRequestsPanel() {
-  const enabled = isLoopbackFront();
-  const { data: requests = [] } = usePairingRequests(enabled);
+  const { data: requests = [] } = usePairingRequests();
   const approve = useApprovePairing();
   const reject = useRejectPairing();
 
@@ -56,11 +56,7 @@ export function PairRequestsPanel() {
         </span>
       </div>
 
-      {!enabled ? (
-        <p className="text-xs text-muted-foreground">
-          Approvals happen on the computer that started the tunnel.
-        </p>
-      ) : requests.length === 0 ? (
+      {requests.length === 0 ? (
         <div className="grid place-items-center gap-1 rounded-lg border border-border bg-muted/20 px-3 py-6 text-center">
           <p className="text-sm font-medium text-muted-foreground">
             Waiting for a device to scan…

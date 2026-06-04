@@ -441,6 +441,9 @@ describe("claimPairingRequest events", () => {
 });
 
 describe("findActiveDeviceByToken", () => {
+  // A relay session IS a PairedDevice; its token is a full credential (the mirror
+  // model — see ADR device-pairing-auth.md), so it resolves on the bearer path,
+  // honoring the session's finite expiry.
   function mintSession() {
     const state = createEmptyState("sandbox");
     const request = makeRequest(state);

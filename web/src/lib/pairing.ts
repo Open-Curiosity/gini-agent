@@ -2,20 +2,22 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { PairingRequestStatus } from "@runtime/types";
+import { api } from "@/lib/api";
 
 // Re-export the runtime contract's status union so callers keep importing it from
 // here, but the single source of truth stays in @runtime/types (no hand-copied
 // duplicate that could drift from the wire).
 export type { PairingRequestStatus };
 
-// The device-pairing API lives on the gateway's NATIVE /api/pairing surface and
-// is reached SAME-ORIGIN — NOT through the /api/runtime BFF (so it does NOT use
-// the `api()` helper). Same-origin matters: on the loopback front the browser's
-// origin is the gateway itself, so these fetches carry the true loopback Host
-// the operator-only routes require; over the relay the same fetches reach the
-// public device routes. The gini_pair / gini_session cookies are HttpOnly and
-// managed entirely by the gateway — the client never reads them.
-// See ADR device-pairing-auth.md.
+// Two surfaces, deliberately split (see ADR device-pairing-auth.md):
+//   - DEVICE handshake (request/poll/claim/cancel): the UNPAIRED device on /pair
+//     has no session, so it cannot use the bearer-injecting BFF. These hit the
+//     gateway's NATIVE /api/pairing/* SAME-ORIGIN (public, gini_pair-bound).
+//   - ADMIN routes (list/approve/reject): used by a PAIRED session. They go
+//     through the BFF (/api/runtime/pairing/*) so a paired relay session reaches
+//     them exactly like loopback — once paired, the relay is a mirror of
+//     127.0.0.1; the only relay-specific gate is the initial pairing handshake.
+// The gini_pair / gini_session cookies are HttpOnly, managed by the gateway.
 
 export interface PairingRequestView {
   id: string;
@@ -58,35 +60,32 @@ export function cancelPairingRequest(id: string): Promise<{ ok: true }> {
   return pairingFetch(`/request/${encodeURIComponent(id)}/cancel`, { method: "POST", body: "{}" });
 }
 
-// --- Operator side (the loopback approval panel) ---------------------------
+// --- Admin side (the approval panel — any paired session, loopback or relay) ---
+// Routed through the BFF (/api/runtime/pairing/*, via the api() helper) so a
+// paired relay session reaches these exactly like loopback: the BFF re-presents
+// the request to the gateway over loopback. An unpaired relay visitor has no
+// session and is 401'd at the relay gate before reaching the BFF, so it can never
+// hit these. See ADR device-pairing-auth.md ("Relay sessions mirror loopback").
 export function listPairingRequests(): Promise<{ requests: PairingRequestView[] }> {
-  return pairingFetch("/requests");
+  return api<{ requests: PairingRequestView[] }>("/pairing/requests");
 }
 export function approvePairingRequest(id: string): Promise<{ request: PairingRequestView }> {
-  return pairingFetch(`/requests/${encodeURIComponent(id)}/approve`, { method: "POST", body: "{}" });
+  return api<{ request: PairingRequestView }>(`/pairing/requests/${encodeURIComponent(id)}/approve`, { method: "POST", body: "{}" });
 }
 export function rejectPairingRequest(id: string): Promise<{ request: PairingRequestView }> {
-  return pairingFetch(`/requests/${encodeURIComponent(id)}/reject`, { method: "POST", body: "{}" });
+  return api<{ request: PairingRequestView }>(`/pairing/requests/${encodeURIComponent(id)}/reject`, { method: "POST", body: "{}" });
 }
 
-// The operator approval panel + session revoke only function on the loopback
-// front (the gateway 403s the operator routes over the relay). Components use
-// this to gate rendering the panel to the local browser.
-export function isLoopbackFront(): boolean {
-  if (typeof window === "undefined") return false;
-  const host = window.location.hostname;
-  return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
-}
-
-// Live list of pending pairing requests for the operator panel. Polls every 3s
-// as a durability backstop; callers also invalidate ["pairingRequests"] from
-// the SSE "pairing" tick for instant updates. Enable only on the loopback front.
-export function usePairingRequests(enabled: boolean) {
+// Live list of pending pairing requests for the admin approval panel. Polls
+// every 3s as a durability backstop; the SSE "pairing" tick also invalidates
+// ["pairingRequests"] for instant updates. The panel mounts only inside the
+// (open-gated) Pair-device dialog, so this query is active only while shown —
+// on loopback OR any paired relay session (both are admins).
+export function usePairingRequests() {
   return useQuery({
     queryKey: ["pairingRequests"],
     queryFn: async () => (await listPairingRequests()).requests,
-    refetchInterval: enabled ? 3000 : false,
-    enabled
+    refetchInterval: 3000
   });
 }
 

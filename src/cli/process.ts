@@ -232,6 +232,13 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
   return { runtimeStarted, banner, children };
 }
 
+// The web URL shown to the operator: the GATEWAY origin (it reverse-proxies the
+// UI and natively serves /api/pairing/*), not the inner Next port. localhost is
+// friendlier than 127.0.0.1 and resolves to the loopback the gateway binds.
+export function operatorWebUrl(config: RuntimeConfig): string {
+  return `http://localhost:${config.port}`;
+}
+
 /**
  * Returns the live web URL if the recorded pid is both alive AND serving
  * Next.js (via /api/runtime/__healthz). Cleans up stale pidfiles when the
@@ -243,13 +250,6 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
  *      case where the port file is missing — e.g. pre-upgrade install — but
  *      the user is likely on the default or an explicit --web-port).
  */
-// The web URL shown to the operator: the GATEWAY origin (it reverse-proxies the
-// UI and natively serves /api/pairing/*), not the inner Next port. localhost is
-// friendlier than 127.0.0.1 and resolves to the loopback the gateway binds.
-export function operatorWebUrl(config: RuntimeConfig): string {
-  return `http://localhost:${config.port}`;
-}
-
 export async function existingWebUrl(config: RuntimeConfig, webPort: number): Promise<string | null> {
   const path = join(config.stateRoot, "web.pid");
   if (!existsSync(path)) return null;

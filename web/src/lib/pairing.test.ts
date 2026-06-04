@@ -1,11 +1,12 @@
 /// <reference lib="dom" />
 
-// Raw @/lib/pairing fetchers + isLoopbackFront. The global fetch is stubbed so we
-// can assert each fetcher's URL/method/credentials and the shared error path
-// (non-ok response throws the server's error or an HTTP fallback).
+// Raw @/lib/pairing fetchers. The global fetch is stubbed so we can assert each
+// fetcher's URL/method and the shared error path. Device fetchers hit the native
+// same-origin /api/pairing/* surface; admin fetchers hit the BFF
+// /api/runtime/pairing/* surface (the mirror model — usable by any paired
+// session, loopback or relay). See ADR device-pairing-auth.md.
 //
-// fetch is restored in afterEach; window.location.hostname is overridden per test
-// for the loopback checks and reset after.
+// fetch is restored in afterEach.
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import {
@@ -13,7 +14,6 @@ import {
   cancelPairingRequest,
   claimPairingRequest,
   createPairingRequest,
-  isLoopbackFront,
   listPairingRequests,
   pollPairingRequest,
   rejectPairingRequest
@@ -83,38 +83,38 @@ describe("pairing fetchers", () => {
     expect(lastCall?.init.method).toBe("POST");
   });
 
-  test("listPairingRequests GETs /requests", async () => {
+  test("listPairingRequests GETs the BFF /pairing/requests", async () => {
     stubFetch({ requests: [] });
     const out = await listPairingRequests();
     expect(out).toEqual({ requests: [] });
-    expect(lastCall?.url).toBe("/api/pairing/requests");
+    expect(lastCall?.url).toBe("/api/runtime/pairing/requests");
   });
 
-  test("approvePairingRequest POSTs /requests/:id/approve", async () => {
+  test("approvePairingRequest POSTs the BFF /pairing/requests/:id/approve", async () => {
     stubFetch({ request: { id: "1" } });
     await approvePairingRequest("1");
-    expect(lastCall?.url).toBe("/api/pairing/requests/1/approve");
+    expect(lastCall?.url).toBe("/api/runtime/pairing/requests/1/approve");
     expect(lastCall?.init.method).toBe("POST");
   });
 
-  test("rejectPairingRequest POSTs /requests/:id/reject", async () => {
+  test("rejectPairingRequest POSTs the BFF /pairing/requests/:id/reject", async () => {
     stubFetch({ request: { id: "1" } });
     await rejectPairingRequest("1");
-    expect(lastCall?.url).toBe("/api/pairing/requests/1/reject");
+    expect(lastCall?.url).toBe("/api/runtime/pairing/requests/1/reject");
     expect(lastCall?.init.method).toBe("POST");
   });
 
-  test("a non-ok response with an error body throws that message", async () => {
+  test("a non-ok device response with an error body throws that message", async () => {
     stubFetch({ error: "nope" }, { ok: false, status: 403 });
     await expect(createPairingRequest()).rejects.toThrow("nope");
   });
 
-  test("a non-ok response with no error body throws an HTTP fallback", async () => {
+  test("a non-ok admin response with no error body throws an HTTP fallback", async () => {
     stubFetch({}, { ok: false, status: 500 });
     await expect(listPairingRequests()).rejects.toThrow("HTTP 500");
   });
 
-  test("a body that fails to parse as json is treated as empty (HTTP fallback on error)", async () => {
+  test("a device body that fails to parse as json is treated as empty (HTTP fallback on error)", async () => {
     fetchMock = mock(async (url: string, init: RequestInit = {}) => {
       lastCall = { url, init };
       return {
@@ -126,53 +126,6 @@ describe("pairing fetchers", () => {
       } as unknown as Response;
     });
     globalThis.fetch = fetchMock as unknown as typeof fetch;
-    await expect(listPairingRequests()).rejects.toThrow("HTTP 502");
-  });
-});
-
-describe("isLoopbackFront", () => {
-  // happy-dom exposes hostname as a prototype accessor with no own property on
-  // window.location. Overriding it installs an own data property; restoring a
-  // VALUE would leave that read-only own property shadowing the native accessor
-  // for every later test in this shared process. Capture and restore the
-  // original descriptor instead so the accessor shows through again.
-  const hadOwn = Object.prototype.hasOwnProperty.call(window.location, "hostname");
-  const originalDesc = Object.getOwnPropertyDescriptor(window.location, "hostname");
-
-  function setHostname(host: string) {
-    Object.defineProperty(window.location, "hostname", {
-      configurable: true,
-      value: host
-    });
-  }
-
-  afterEach(() => {
-    if (hadOwn && originalDesc) {
-      Object.defineProperty(window.location, "hostname", originalDesc);
-    } else {
-      delete (window.location as unknown as Record<string, unknown>).hostname;
-    }
-  });
-
-  test("true for 127.0.0.1", () => {
-    setHostname("127.0.0.1");
-    expect(isLoopbackFront()).toBe(true);
-  });
-
-  test("true for localhost", () => {
-    setHostname("localhost");
-    expect(isLoopbackFront()).toBe(true);
-  });
-
-  test("true for ::1 and [::1]", () => {
-    setHostname("::1");
-    expect(isLoopbackFront()).toBe(true);
-    setHostname("[::1]");
-    expect(isLoopbackFront()).toBe(true);
-  });
-
-  test("false for a public relay host", () => {
-    setHostname("g31.relay.example");
-    expect(isLoopbackFront()).toBe(false);
+    await expect(createPairingRequest()).rejects.toThrow("HTTP 502");
   });
 });

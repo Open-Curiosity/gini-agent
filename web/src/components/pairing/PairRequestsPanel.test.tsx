@@ -1,9 +1,9 @@
 /// <reference lib="dom" />
 
-// PairRequestsPanel gates its actionable UI on isLoopbackFront() and renders the
-// operator's live "Pair requests" list. These tests mock the @/lib/pairing data
-// hooks and sonner's toast so every branch is driven without the network: the
-// non-loopback note, the idle empty-list block, populated rows with the
+// PairRequestsPanel renders the admin "Pair requests" list for any paired session
+// (loopback or relay — the mirror model; see ADR device-pairing-auth.md). These
+// tests mock the @/lib/pairing data hooks and sonner's toast so every branch is
+// driven without the network: the idle empty-list block, populated rows with the
 // relativeTime variants, the approve/reject mutate -> toast (success + error)
 // wiring, and the isPending disabled state. The panel no longer subscribes to the
 // runtime stream — RuntimeStreamBridge owns "pairing"-event invalidation app-wide
@@ -37,7 +37,6 @@ const realPairing = await import("@/lib/pairing");
 const realSonner = await import("sonner");
 
 // --- Controllable mock surface --------------------------------------------
-let loopback = true;
 let requests: PairingRequestView[] = [];
 
 type Mutation = {
@@ -55,8 +54,7 @@ let PairRequestsPanel: typeof import("./PairRequestsPanel").PairRequestsPanel;
 beforeAll(async () => {
   mock.module("@/lib/pairing", () => ({
     ...realPairing,
-    isLoopbackFront: () => loopback,
-    usePairingRequests: (_enabled: boolean) => ({ data: requests }),
+    usePairingRequests: () => ({ data: requests }),
     useApprovePairing: () => approve,
     useRejectPairing: () => reject
   }));
@@ -98,7 +96,6 @@ function renderPanel() {
 }
 
 beforeEach(() => {
-  loopback = true;
   requests = [];
   approve = { mutate: mock(() => {}), isPending: false };
   reject = { mutate: mock(() => {}), isPending: false };
@@ -114,29 +111,16 @@ afterEach(() => {
 });
 
 describe("PairRequestsPanel", () => {
-  test("not loopback: renders only the off-machine note, no list", () => {
-    loopback = false;
-    renderPanel();
-    expect(
-      screen.queryByText("Approvals happen on the computer that started the tunnel.")
-    ).not.toBeNull();
-    expect(screen.queryByText("Waiting for a device to scan…")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
-  });
-
-  test("loopback + empty list: renders the idle waiting block", () => {
+  test("empty list: renders the idle waiting block", () => {
     requests = [];
     renderPanel();
     expect(screen.queryByText("Waiting for a device to scan…")).not.toBeNull();
     expect(
       screen.queryByText("Open the link or scan the code on the device you want to add.")
     ).not.toBeNull();
-    expect(
-      screen.queryByText("Approvals happen on the computer that started the tunnel.")
-    ).toBeNull();
   });
 
-  test("loopback + requests: renders code, device name, warning, and action buttons", () => {
+  test("requests: renders code, device name, warning, and action buttons", () => {
     requests = [makeRequest()];
     renderPanel();
     expect(screen.queryByText("428913")).not.toBeNull();
