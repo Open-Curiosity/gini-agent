@@ -10,16 +10,26 @@
 // stores the token for use as `Authorization: Bearer`. See ADR
 // device-pairing-auth.md ("Native pairing client").
 
+import type { PairingRequestStatus } from "@runtime/types";
 import { normalizeBaseUrl } from "./auth";
 
-// The wire status union, mirroring the gateway's PairingRequestStatus.
-export type PairingStatus =
-  | "pending"
-  | "approved"
-  | "rejected"
-  | "claimed"
-  | "expired"
-  | "cancelled";
+// Re-export the runtime contract's status union so the mobile client can't drift
+// from the wire (mirrors web/src/lib/pairing.ts). It's a type-only import,
+// erased at build, so no server code enters the RN bundle.
+export type PairingStatus = PairingRequestStatus;
+
+// The runtime ships the union as a TYPE only; this is the matching VALUE set used
+// to validate a status string off the wire before trusting it. If the union ever
+// gains/loses a member, this literal set fails typecheck against PairingStatus —
+// the drift guard.
+const PAIRING_STATUSES: ReadonlySet<PairingStatus> = new Set<PairingStatus>([
+  "pending",
+  "approved",
+  "rejected",
+  "claimed",
+  "expired",
+  "cancelled"
+]);
 
 // Carries the HTTP status so the pair screen can tell a terminal 401/403/404
 // (start over) from a transient relay blip (keep polling).
@@ -114,7 +124,7 @@ export function createPairingClient(relayUrl: string, fetchImpl: FetchFn = fetch
     async poll(id, bindSecret) {
       const body = await call(`/request/${encodeURIComponent(id)}`, { secret: bindSecret });
       const status = (body as { status?: unknown } | null)?.status;
-      if (typeof status !== "string") {
+      if (typeof status !== "string" || !PAIRING_STATUSES.has(status as PairingStatus)) {
         throw new PairingError(0, "Gateway returned a malformed status response.");
       }
       return status as PairingStatus;

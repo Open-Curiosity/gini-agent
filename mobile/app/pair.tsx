@@ -51,9 +51,12 @@ export default function PairScreen() {
   const clientRef = useRef<PairingClient | null>(null);
   const requestRef = useRef<{ id: string; secret: string } | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Disarmed synchronously by cancel()/unmount so an in-flight tick can't pair
-  // after the user backs out.
-  const activeRef = useRef(true);
+  // Per-attempt generation. Bumped on every start(), on cancel(), and on unmount.
+  // Every async closure captures the gen it was dispatched under and bails if the
+  // current gen has moved on — so a stale create()/poll()/claim() from a
+  // superseded attempt (e.g. cancel → retry while a poll is mid-flight) can never
+  // clobber the current attempt's state or pair with mismatched refs.
+  const genRef = useRef(0);
   // Exactly-once mount guard (Expo Router can re-run effects).
   const startedRef = useRef(false);
 
@@ -69,7 +72,9 @@ export default function PairScreen() {
   const start = useCallback(
     async (origin: string) => {
       stopPolling();
-      activeRef.current = true;
+      const myGen = ++genRef.current;
+      requestRef.current = null;
+      clientRef.current = null;
       setError(null);
       setCode(null);
       setPhase("creating");
@@ -77,19 +82,21 @@ export default function PairScreen() {
       try {
         client = createPairingClient(origin);
       } catch (e) {
+        if (genRef.current !== myGen) return;
         setError(e instanceof Error ? e.message : "That doesn't look like a Gini link.");
         setPhase("create-error");
         return;
       }
+      if (genRef.current !== myGen) return;
       clientRef.current = client;
       try {
         const handshake = await client.create();
-        if (!activeRef.current) return;
+        if (genRef.current !== myGen) return;
         requestRef.current = { id: handshake.id, secret: handshake.bindSecret };
         setCode(handshake.code);
         setPhase("pending");
       } catch (e) {
-        if (!activeRef.current) return;
+        if (genRef.current !== myGen) return;
         setError(e instanceof Error ? e.message : String(e));
         setPhase("create-error");
       }
@@ -103,23 +110,30 @@ export default function PairScreen() {
     if (!relayParam || startedRef.current) return;
     startedRef.current = true;
     void start(relayParam);
+  }, [relayParam, start]);
+
+  // Component-wide unmount cleanup, installed regardless of entry path (manual
+  // paste OR deep link). Bumps the generation so any in-flight create/poll/claim
+  // bails instead of calling setState after unmount, and tears down the poller.
+  useEffect(() => {
     return () => {
-      activeRef.current = false;
+      genRef.current += 1;
       stopPolling();
     };
-  }, [relayParam, start, stopPolling]);
+  }, [stopPolling]);
 
   // Poll while pending. On approval we hand off to the claim effect rather than
   // claiming inline, so flipping to "claiming" can't self-cancel this tick.
   useEffect(() => {
     if (phase !== "pending") return;
+    const myGen = genRef.current;
     const tick = async () => {
       const client = clientRef.current;
       const request = requestRef.current;
       if (!client || !request) return;
       try {
         const status = await client.poll(request.id, request.secret);
-        if (!activeRef.current) return;
+        if (genRef.current !== myGen) return;
         if (status === "approved") {
           stopPolling();
           setPhase("claiming");
@@ -135,7 +149,7 @@ export default function PairScreen() {
         }
         // "pending" / "claimed" → keep waiting.
       } catch (e) {
-        if (!activeRef.current) return;
+        if (genRef.current !== myGen) return;
         // 401/403/404 are terminal for this request (gone/expired/binding lost);
         // anything else is a transient relay blip — let the next tick retry.
         const status = e instanceof PairingError ? e.status : 0;
@@ -153,27 +167,24 @@ export default function PairScreen() {
   // Claim once approved: mint + store the device token, then drop into the app.
   useEffect(() => {
     if (phase !== "claiming") return;
-    let cancelled = false;
+    const myGen = genRef.current;
     void (async () => {
       const client = clientRef.current;
       const request = requestRef.current;
       if (!client || !request) return;
       try {
         const token = await client.claim(request.id, request.secret);
-        if (cancelled || !activeRef.current) return;
+        if (genRef.current !== myGen) return;
         await saveCredentials({ baseUrl: client.origin, token });
-        if (cancelled || !activeRef.current) return;
+        if (genRef.current !== myGen) return;
         setPhase("paired");
         router.replace("/agents");
       } catch (e) {
-        if (cancelled) return;
+        if (genRef.current !== myGen) return;
         setError(e instanceof Error ? e.message : String(e));
         setPhase("claim-error");
       }
     })();
-    return () => {
-      cancelled = true;
-    };
   }, [phase]);
 
   const submitLink = useCallback(() => {
@@ -188,7 +199,8 @@ export default function PairScreen() {
   }, [linkInput, start]);
 
   const cancel = useCallback(async () => {
-    activeRef.current = false;
+    // Bump the generation so any in-flight poll/claim from this attempt bails.
+    genRef.current += 1;
     stopPolling();
     const client = clientRef.current;
     const request = requestRef.current;
@@ -203,9 +215,14 @@ export default function PairScreen() {
   }, [stopPolling]);
 
   const retry = useCallback(() => {
-    const origin = clientRef.current?.origin ?? relayParam;
-    if (origin) void start(origin);
-    else setPhase("input");
+    // A manual entry returns to the editable input (the typed link is preserved)
+    // so a well-formed-but-wrong link can be corrected instead of retried forever.
+    // A deep-link entry has no input to return to, so it re-runs the same origin.
+    if (!relayParam) {
+      setPhase("input");
+      return;
+    }
+    void start(relayParam);
   }, [relayParam, start]);
 
   return (

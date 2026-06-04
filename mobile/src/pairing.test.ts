@@ -55,7 +55,7 @@ describe("create", () => {
 
   test("throws on a malformed create response", async () => {
     const { fn } = fakeFetch(() => ({ status: 201, body: { id: "preq_1", code: "123-456" } }));
-    expect(createPairingClient(RELAY, fn).create()).rejects.toThrow(PairingError);
+    await expect(createPairingClient(RELAY, fn).create()).rejects.toThrow(PairingError);
   });
 
   test("surfaces the gateway error + status on a non-2xx", async () => {
@@ -96,7 +96,12 @@ describe("poll", () => {
 
   test("throws on a malformed poll response", async () => {
     const { fn } = fakeFetch(() => ({ body: { notStatus: true } }));
-    expect(createPairingClient(RELAY, fn).poll("preq_1", "s")).rejects.toThrow(PairingError);
+    await expect(createPairingClient(RELAY, fn).poll("preq_1", "s")).rejects.toThrow(PairingError);
+  });
+
+  test("throws on an unrecognized status string (off-contract value)", async () => {
+    const { fn } = fakeFetch(() => ({ body: { status: "approvedish" } }));
+    await expect(createPairingClient(RELAY, fn).poll("preq_1", "s")).rejects.toThrow(PairingError);
   });
 
   test("percent-encodes the request id", async () => {
@@ -119,7 +124,7 @@ describe("claim", () => {
 
   test("throws when the gateway returns no token", async () => {
     const { fn } = fakeFetch(() => ({ body: { ok: true } }));
-    expect(createPairingClient(RELAY, fn).claim("preq_1", "s")).rejects.toThrow(PairingError);
+    await expect(createPairingClient(RELAY, fn).claim("preq_1", "s")).rejects.toThrow(PairingError);
   });
 });
 
