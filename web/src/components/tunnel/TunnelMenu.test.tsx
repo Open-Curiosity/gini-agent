@@ -5,11 +5,22 @@
 // mocked so these tests drive view state directly without the network; the child
 // panels render for real so the wiring (Edit/Disconnect/Connect/Close) is exercised.
 
-import { beforeEach, describe, expect, mock, test } from "bun:test";
-import { render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { render as rtlRender, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { TunnelProvider, TunnelState } from "./types";
 import type { TunnelController } from "./useTunnel";
+
+// The connected popover embeds the real PairRequestsPanel (useQuery), so renders
+// need a QueryClient; stub fetch so its list query resolves empty with no real
+// network. (This file previously passed only because a sibling test leaked a
+// PairRequestsPanel stub — wrapping renders here removes that order-dependence.)
+const realFetch = globalThis.fetch;
+function render(ui: Parameters<typeof rtlRender>[0]) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return rtlRender(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+}
 
 const PROVIDERS: TunnelProvider[] = [
   { id: "gini-relay", name: "Gini Relay", enabled: true },
@@ -39,6 +50,14 @@ const { TunnelMenu } = await import("./TunnelMenu");
 beforeEach(() => {
   for (const fn of Object.values(actions)) fn.mockClear();
   controller = { state: makeState(), loading: false, error: null, ...actions };
+  globalThis.fetch = mock(
+    async () =>
+      new Response(JSON.stringify({ requests: [] }), { headers: { "content-type": "application/json" } })
+  ) as unknown as typeof fetch;
+});
+
+afterEach(() => {
+  globalThis.fetch = realFetch;
 });
 
 const open = (user: ReturnType<typeof userEvent.setup>, name: "Open tunnel" | "Tunnel connected") =>

@@ -614,6 +614,11 @@ export function createPairingCode(
 // claimPairingCode (code-claimed mobile devices) and claimPairingRequest (relay
 // cookie sessions) so the two grant an identical surface and can't silently
 // drift when one is updated.
+//
+// NOTE: scopes are forward-looking capability/display metadata — they are NOT
+// consulted for authorization today. A paired device/session is owner-equivalent
+// (the mirror model; see ADR device-pairing-auth.md), so the bearer/cookie's
+// validity is the entire access decision. Do not assume per-scope enforcement.
 const DEFAULT_SESSION_SCOPES = ["tasks:read", "tasks:write", "approvals:write", "state:read"];
 
 export function claimPairingCode(

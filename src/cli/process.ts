@@ -325,7 +325,14 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // is hostile to fresh-clone "gini start" workflows: a stale .next/ from a
   // previous checkout will silently serve outdated code. Dev mode compiles
   // on demand and always reflects the current source.
-  const command = ["run", "dev", "--", "-p", String(port)];
+  // Bind the inner Next server to loopback (-H 127.0.0.1). Next defaults to
+  // 0.0.0.0 (all interfaces), which would make the web port LAN-reachable; the
+  // BFF trusts a loopback `Host` for its owner-bearer injection, and a Host
+  // header is forgeable by a non-browser client, so a LAN peer hitting the inner
+  // port directly could obtain owner access and bypass the gateway's
+  // Host/Origin + relay-session gate. The gateway (the only intended ingress)
+  // already binds 127.0.0.1 and reverse-proxies to this child over loopback.
+  const command = ["run", "dev", "--", "-H", "127.0.0.1", "-p", String(port)];
   // detached: true puts the child in its own process group so we can SIGTERM
   // the entire group on stop (`bun run dev` re-execs into Next.js, leaving an
   // orphaned grandchild if we only kill the recorded pid).

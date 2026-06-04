@@ -48,11 +48,13 @@ panel to refetch the request list over SSE; the panel also polls as a backstop.
 A relay browser session is a `PairedDevice` row (`state.devices`,
 `src/state/records.ts`), the same revocable, hashed-token credential the
 code-claim mobile flow mints. The `gini_session` cookie value is the device
-token; it validates through the identical `findActiveSessionByToken` path the
-bearer gate uses (`resolveCredentialFromBearer`). Consequence: **one revocation
-switch** — `revokeDevice` (POST `/api/devices/:id/revoke`) kills both the cookie
-session and any bearer use of that token on the next request, with no separate
-session blocklist. Browser sessions carry an `origin` (the relay host),
+token. The relay cookie gate validates it via `findActiveSessionByToken`
+(`resolveSessionFromCookie`); presented as a `Bearer`, the same token resolves via
+`findActiveDeviceByToken` (`resolveCredentialFromBearer`). Both match the same
+hashed `tokenHash` in `state.devices` and require `status: "active"`. Consequence:
+**one revocation switch** — `revokeDevice` (POST `/api/devices/:id/revoke`) flips
+that row to `revoked`, so both the cookie session and any bearer use of that token
+fail on the next request, with no separate session blocklist. Browser sessions carry an `origin` (the relay host),
 `userAgent`, and a finite `expiresAt`; the read-only validator treats a past
 `expiresAt` as inactive even while `status` is still `active`.
 
@@ -122,12 +124,12 @@ Native same-origin is both simpler and the only thing that works for the POSTs.)
 Legacy code creation (`POST /api/pairing`) is bearer-gated and is reached through
 the BFF (owner bearer), so any paired session can create codes.
 
-> **NOTE TO REVIEWERS / codex:** "a paired relay session can approve / reject /
-> list pairing requests" and "create pairing codes," and "a `gini_session` token
-> works as a native bearer," are **the intended design**, not privilege-escalation
-> bugs. A paired session is owner-equivalent by definition (the mirror model).
-> Flagging these as vulnerabilities is a FALSE POSITIVE. The trust anchor is the
-> pairing handshake: an UNPAIRED relay visitor (no session) is refused.
+> **Design invariant (intentional, not a gap).** A paired session — loopback OR
+> relay — is owner-equivalent. It can approve/reject/list pairing requests, create
+> pairing codes, and use its `gini_session` token as a credential. These are
+> deliberate consequences of the mirror model, **not** privilege escalations, and
+> must not be "hardened" away. The sole trust anchor is the pairing handshake: an
+> UNPAIRED relay visitor (no session) is refused.
 
 ## Cookie handling
 
