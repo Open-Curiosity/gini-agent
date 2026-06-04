@@ -318,6 +318,28 @@ export async function dispatchToolCall(
           })
         };
       }
+      // Loop guard: surface a Connect card at most once per sign-in wall in a
+      // task. The first call pauses the task for the user; if the model calls
+      // connect AGAIN for the same site, the user either hasn't signed in yet
+      // or signing in didn't clear the wall — re-prompting just spams identical
+      // cards (the runaway loop). Stop and tell the model to wait instead.
+      const wall = connectWallHost(resolveConnectUrl(args, taskId));
+      const alreadyAsked = readState(config.instance).setupRequests.some(
+        (r) =>
+          r.taskId === taskId &&
+          r.action === "browser.connect" &&
+          connectWallHost(typeof r.payload?.url === "string" ? r.payload.url : undefined) === wall
+      );
+      if (alreadyAsked) {
+        return {
+          kind: "sync",
+          result: JSON.stringify({
+            ok: false,
+            error:
+              "A Connect card for this site was already shown in this task. Do NOT call browser_connect again — stop and wait for the user to sign in; the task resumes automatically once they do. If the page is already signed in or you can finish without signing in, just continue; otherwise tell the user you're waiting on their sign-in."
+          })
+        };
+      }
       const approvalId = await requestBrowserConnect(config, taskId, toolCallId, args);
       return { kind: "pending", approvalId };
     }
@@ -2743,6 +2765,27 @@ async function requestBrowserUpload(
   });
 }
 
+// The page a browser_connect call targets: the explicit `url` arg if the
+// model supplied one, else the live page the agent is sitting on. Used both as
+// the visible-Chrome landing URL and as the dedupe key for the loop guard, so
+// the two always agree on what wall is being cleared.
+function resolveConnectUrl(args: Record<string, unknown>, taskId: string): string | undefined {
+  const urlArg = typeof args.url === "string" ? args.url.trim() : "";
+  return urlArg.length > 0 ? urlArg : peekCurrentBrowserUrl(taskId);
+}
+
+// Host of a connect target, used to dedupe repeated Connect cards within a
+// task so query/path churn on the same site doesn't read as a new wall.
+// Returns "" when no URL resolves (all such calls share one bucket).
+function connectWallHost(url: string | undefined): string {
+  if (!url) return "";
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
+}
+
 // Approval-gated browser_connect. Spawns a visible managed Chrome
 // after user consent. The reason flows onto the approval row's
 // evidence so the UI can render a friendlier label ("Open a browser
@@ -2764,13 +2807,14 @@ async function requestBrowserConnect(
   // executor in agent.ts can pass it through to connectBrowser when the
   // user approves.
   const headless = args.headless === true;
-  // Optional target URL — the page the agent was trying to reach. When the
-  // user clicks "Connect" the open-browser endpoint launches visible Chrome
-  // and navigates here directly, so the user lands on the sign-in form
-  // instead of an empty about:blank. Validated minimally; safetyCheck runs
-  // server-side in the open-browser endpoint before navigation.
-  const urlArg = typeof args.url === "string" ? args.url.trim() : "";
-  const url = urlArg.length > 0 ? urlArg : undefined;
+  // Target URL — the page the agent was trying to reach. When the user clicks
+  // "Connect" the open-browser endpoint launches visible Chrome and navigates
+  // here directly, so the user lands on the sign-in form instead of an empty
+  // about:blank. Falls back to the live page URL when the model omits `url`,
+  // which also keeps the loop-guard dedupe key consistent with the dispatch.
+  // Validated minimally; safetyCheck runs server-side in the open-browser
+  // endpoint before navigation.
+  const url = resolveConnectUrl(args, taskId);
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     if (isTerminalTaskStatus(item.status)) {
