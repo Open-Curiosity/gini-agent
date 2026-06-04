@@ -1677,7 +1677,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     const webHost = request.headers.get("host") ?? url.host;
     let gatedSessionToken: string | undefined;
     if (relaySessionGateRequired(webHost, url.pathname)) {
-      const sessionToken = cookieValue(request, SESSION_COOKIE);
+      const sessionToken = sessionCookieValue(request);
       if (!sessionToken || !resolveSessionFromCookie(config, sessionToken)) {
         return url.pathname.startsWith("/api/")
           ? withCors(request, json({ error: "Unauthorized" }, 401))
@@ -2297,19 +2297,44 @@ async function rollbackIdentityFile(
 // See ADR device-pairing-auth.md. gini_pair carries the per-request binding
 // secret (scoped to /api/pairing so it only rides pairing calls); gini_session
 // carries the minted session token (scoped to the whole app).
-// Plain cookie names (no `__Host-` prefix) are deliberate: `__Host-` mandates
-// Secure, but pairingCookieSecure() sets Secure conditionally so a plain-http
-// GINI_TRUSTED_ORIGINS front can still pair (see ADR device-pairing-auth.md).
-// The protections `__Host-` would enforce are already met independently — the
-// cookies are host-only (no Domain) and Path-scoped, and Secure is set on every
-// secure transport.
+//
+// gini_session uses the `__Host-` prefix when issued over a secure transport and
+// the plain name otherwise. On the shared relay registrable domain
+// (*.gini-relay.lilaclabs.ai) a sibling tenant could set a Domain-scoped
+// `gini_session` that the browser also sends to the victim's subdomain; the
+// cookie parser's last-duplicate-wins would let it override the victim's
+// host-only cookie (a session/handshake denial — the tossed value still fails the
+// server-side hash check, so this is availability, not forgery). `__Host-`
+// cookies forbid a Domain attribute, so the browser rejects the sibling's tossed
+// cookie and the victim's prefixed cookie always wins. The prefix is conditional
+// because `__Host-` mandates Secure, which a deliberately-supported plain-http
+// GINI_TRUSTED_ORIGINS front cannot use (pairingCookieSecure() returns false
+// there) — that front keeps the plain name. gini_pair stays plain: it is
+// single-use, cleared on claim, and Path-scoped to /api/pairing (incompatible
+// with `__Host-`'s Path=/ requirement), whereas gini_session is the durable,
+// owner-equivalent credential and the high-value tossing target.
 const PAIR_BIND_COOKIE = "gini_pair";
 export const SESSION_COOKIE = "gini_session";
+const SESSION_COOKIE_SECURE = `__Host-${SESSION_COOKIE}`;
+
+// The session cookie NAME to issue: `__Host-`-prefixed on a secure front (so a
+// sibling-subdomain Domain cookie can't toss it), plain otherwise.
+function sessionCookieName(secure: boolean): string {
+  return secure ? SESSION_COOKIE_SECURE : SESSION_COOKIE;
+}
+
+// Read the session token from whichever name was issued: prefer the secure
+// `__Host-` cookie (authoritative on a secure front and un-tossable), fall back
+// to the plain name (a plain-http front, or a session minted before the prefix).
+export function sessionCookieValue(request: Request): string | undefined {
+  return cookieValue(request, SESSION_COOKIE_SECURE) ?? cookieValue(request, SESSION_COOKIE);
+}
+
 // Gateway-owned cookies that must never reach the inner web child: it is
 // relay-agnostic and authenticates via the BFF's owner bearer, never these, so
 // stripping them (in proxyWeb) keeps the pairing credentials from crossing into
-// the inner app.
-const GATEWAY_ONLY_COOKIES = new Set([SESSION_COOKIE, PAIR_BIND_COOKIE]);
+// the inner app. Both session cookie names are stripped.
+const GATEWAY_ONLY_COOKIES = new Set([SESSION_COOKIE, SESSION_COOKIE_SECURE, PAIR_BIND_COOKIE]);
 // Derived from the single source of truth so the cookie Max-Age and the
 // server-side device.expiresAt can't drift apart.
 const SESSION_COOKIE_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
@@ -2421,7 +2446,7 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
   const approve = path.match(/^\/api\/pairing\/requests\/([^/]+)\/approve$/);
   const reject = path.match(/^\/api\/pairing\/requests\/([^/]+)\/reject$/);
   if (isList || approve || reject) {
-    const sessionToken = cookieValue(request, SESSION_COOKIE);
+    const sessionToken = sessionCookieValue(request);
     const isAdmin = isLoopbackHost(host) || Boolean(sessionToken && resolveSessionFromCookie(config, sessionToken));
     if (!isAdmin) return json({ error: "Forbidden" }, 403);
     if (method === "GET" && isList) return json({ requests: await listPairingRequests(config) });
@@ -2488,7 +2513,7 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
     const response = json({ ok: true });
     response.headers.append(
       "set-cookie",
-      serializeCookie(SESSION_COOKIE, result.token, { ...sessionCookieAttributes, secure, maxAge: SESSION_COOKIE_TTL_SECONDS })
+      serializeCookie(sessionCookieName(secure), result.token, { ...sessionCookieAttributes, secure, maxAge: SESSION_COOKIE_TTL_SECONDS })
     );
     // The binding cookie is single-use; clear it now that the session is minted.
     response.headers.append("set-cookie", serializeCookie(PAIR_BIND_COOKIE, "", { ...bindCookieAttributes, secure, maxAge: 0 }));

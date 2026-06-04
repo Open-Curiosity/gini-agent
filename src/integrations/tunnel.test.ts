@@ -921,9 +921,14 @@ describe("tunnel integration", () => {
       setTunnelDeps(deps({ probeLocalPort: () => Promise.resolve(false) }));
       await seedConnectedRecord(config);
       await reconcileTunnelOnStartup(config);
+      // Capture the resume's settled promise BEFORE cancel tears down the
+      // supervisor, then await it — deterministic, no fixed sleep. The resume
+      // wakes from its poll, sees it was superseded, and bails without clobbering
+      // the idle the cancel wrote.
+      const settled = awaitTunnelSettled(config.instance);
       const cancelled = await cancelTunnel(config);
       expect(cancelled.status).toBe("idle");
-      await Bun.sleep(20);
+      await settled;
       expect(getTunnel(config).status).toBe("idle");
     } finally {
       if (prevPoll === undefined) delete process.env.GINI_TUNNEL_RESUME_POLL_MS;

@@ -110,9 +110,11 @@ async function pairedSession(instance: string) {
     body: {}
   });
   expect(claimed.status).toBe(200);
-  const session = setCookieValue(claimed, "gini_session")!;
+  // The relay front is HTTPS, so the session cookie is issued under the
+  // `__Host-` prefix (fall back to the plain name for completeness).
+  const session = (setCookieValue(claimed, "__Host-gini_session") ?? setCookieValue(claimed, "gini_session"))!;
   expect(session).toBeTruthy();
-  return { config, handler, relay, requestId: createdBody.id as string, session, bind };
+  return { config, handler, relay, requestId: createdBody.id as string, session, bind, claimed };
 }
 
 describe("isPairingBootstrapPath", () => {
@@ -403,6 +405,69 @@ describe("pairing routes — claim", () => {
     const { session, requestId } = await pairedSession("pair-claim-ok");
     expect(session).toMatch(/^gini_device_/);
     expect(requestId).toMatch(/^preq_/);
+  });
+
+  test("the relay claim mints a __Host- prefixed, Domain-less session cookie", async () => {
+    const { claimed } = await pairedSession("pair-claim-prefix");
+    const setCookies = claimed.headers.getSetCookie();
+    const prefixed = setCookies.find((c) => c.startsWith("__Host-gini_session="));
+    // The HTTPS relay front issues the session cookie under the __Host- prefix
+    // (Secure, Path=/, no Domain) so a sibling subdomain can't toss it.
+    expect(prefixed).toBeTruthy();
+    expect(prefixed).toContain("Secure");
+    expect(prefixed).toContain("Path=/");
+    expect(prefixed).not.toContain("Domain=");
+    // The plain, tossable name is NOT also set.
+    expect(setCookies.some((c) => c.startsWith("gini_session="))).toBe(false);
+  });
+
+  test("a plain-http trusted front mints the un-prefixed session cookie (no __Host-)", async () => {
+    // __Host- mandates Secure, which a plain-http GINI_TRUSTED_ORIGINS front
+    // can't use, so that front keeps the plain name (pairingCookieSecure false).
+    const front = "pair-claim-front.test:7337";
+    const previous = process.env.GINI_TRUSTED_ORIGINS;
+    process.env.GINI_TRUSTED_ORIGINS = `http://${front}`;
+    try {
+      const { handler } = makeHandler("pair-claim-plainfront");
+      const created = await pair(handler, "/api/pairing/request", {
+        method: "POST", host: front, origin: `http://${front}`, secFetchSite: "same-origin", body: {}
+      });
+      const { id } = await created.json();
+      const bind = setCookieValue(created, "gini_pair")!;
+      await pair(handler, `/api/pairing/requests/${id}/approve`, {
+        method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+      });
+      const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+        method: "POST", host: front, origin: `http://${front}`, secFetchSite: "same-origin",
+        cookie: `gini_pair=${encodeURIComponent(bind)}`, body: {}
+      });
+      expect(claimed.status).toBe(200);
+      const setCookies = claimed.headers.getSetCookie();
+      const plain = setCookies.find((c) => c.startsWith("gini_session="));
+      expect(plain).toBeTruthy();
+      expect(plain).not.toContain("Secure");
+      expect(setCookies.some((c) => c.startsWith("__Host-gini_session="))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.GINI_TRUSTED_ORIGINS;
+      else process.env.GINI_TRUSTED_ORIGINS = previous;
+    }
+  });
+
+  test("a sibling-tossed plain gini_session cannot override the __Host- session", async () => {
+    const { handler, relay, session } = await pairedSession("pair-claim-toss");
+    // The browser sends BOTH a sibling's Domain-scoped garbage gini_session and
+    // the victim's host-only __Host- cookie; the gate reads the un-tossable
+    // __Host- one, so the admin route still admits.
+    const both = `gini_session=tossed-garbage; __Host-gini_session=${encodeURIComponent(session)}`;
+    const admitted = await pair(handler, "/api/pairing/requests", {
+      host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie: both
+    });
+    expect(admitted.status).toBe(200);
+    // The tossed garbage alone (no __Host-) is refused.
+    const refused = await pair(handler, "/api/pairing/requests", {
+      host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", cookie: "gini_session=tossed-garbage"
+    });
+    expect(refused.status).toBe(403);
   });
 });
 

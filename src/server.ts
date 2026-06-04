@@ -1,7 +1,6 @@
 import { writeFileSync } from "node:fs";
-import { createHandler, isWebProxyPath, proxyWebSocketUpgrade, relaySessionGateRequired, SESSION_COOKIE, webSocketProxyHandler, writePid } from "./http";
+import { createHandler, isWebProxyPath, proxyWebSocketUpgrade, relaySessionGateRequired, sessionCookieValue, webSocketProxyHandler, writePid } from "./http";
 import { webBoundRequestAllowed } from "./lib/origin-trust";
-import { cookieValue } from "./lib/cookies";
 import { resolveSessionFromCookie } from "./governance/pairing";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
@@ -196,7 +195,7 @@ const server = Bun.serve({
       const wsPath = new URL(request.url).pathname;
       const wsHost = request.headers.get("host") ?? new URL(request.url).host;
       if (relaySessionGateRequired(wsHost, wsPath)
-          && !resolveSessionFromCookie(config, cookieValue(request, SESSION_COOKIE))) {
+          && !resolveSessionFromCookie(config, sessionCookieValue(request))) {
         return new Response("Unauthorized", { status: 401 });
       }
       // The session is validated once here, at upgrade — there is deliberately no

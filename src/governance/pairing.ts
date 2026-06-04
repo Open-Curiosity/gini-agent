@@ -154,7 +154,13 @@ export async function cancelPairing(config: RuntimeConfig, id: string, bindSecre
 // mutateState run mints the real, persisted session token.
 export async function claimPairingSession(config: RuntimeConfig, id: string, bindSecret: string) {
   const pre = claimPairingRequest(readState(config.instance), id, bindSecret);
-  if (!pre.ok) return pre;
+  // Bail before the full-state write ONLY on the forged-cookie cases (guessed or
+  // absent id / mismatched bind secret) — the DoS guard. A bind-matched
+  // not_approved (e.g. an approved row that lazily expired) still falls through to
+  // the locked mutateState so the expiry flip is persisted; the forged cookie can
+  // never reach the write either way. mutateState returns the mutator's result, so
+  // the authoritative reason still flows back to the caller.
+  if (!pre.ok && (pre.reason === "not_found" || pre.reason === "bind_mismatch")) return pre;
   return mutateState(config.instance, (state) => claimPairingRequest(state, id, bindSecret));
 }
 

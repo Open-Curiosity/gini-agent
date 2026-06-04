@@ -145,7 +145,18 @@ the BFF (owner bearer), so any paired session can create codes.
   persists. `HttpOnly; SameSite=Lax; Path=/`, `Domain` unset (host-only to the
   exact relay subdomain), finite `Max-Age`. HttpOnly because the web app
   authenticates `/api/runtime/*` via the BFF's server-side bearer — the cookie is
-  purely the gateway's relay gate, never read by JS.
+  purely the gateway's relay gate, never read by JS. On a **secure** front it is
+  issued under the **`__Host-` prefix** (`__Host-gini_session`); the gate reads
+  `__Host-gini_session` first and falls back to the plain name. `__Host-` forbids
+  a `Domain` attribute, so on the shared relay registrable domain a sibling tenant
+  cannot toss a `Domain=.gini-relay…` cookie of the same name to override (deny) a
+  victim's session — the browser rejects the sibling's prefixed-with-Domain cookie
+  and the victim's host-only one always wins. The prefix is conditional because
+  `__Host-` mandates `Secure`, which the plain-HTTP `GINI_TRUSTED_ORIGINS` front
+  (below) can't use, so that front keeps the plain name. `gini_pair` stays plain:
+  it is single-use, cleared on claim, and `Path=/api/pairing` (incompatible with
+  `__Host-`'s `Path=/`), and `gini_session` is the durable owner-equivalent
+  credential and the high-value tossing target.
 - `gini_pair`: per-request binding secret, `HttpOnly; SameSite=Lax;
   Path=/api/pairing`. Only the browser that created a request holds it, so a
   third party that learns a request id can neither claim its session nor cancel
