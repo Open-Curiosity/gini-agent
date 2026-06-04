@@ -270,6 +270,14 @@ interface ChatBlockBase {
   createdAt: string;
   taskId?: string;
   runId?: string;
+  // Thread membership. Present on blocks that belong to a thread; absent
+  // ⇒ main-chat block. Thread blocks interleave in the same session's
+  // ordinal stream and are filtered out of the main chat by `threadId`.
+  threadId?: string;
+  // The main-chat `assistant_text` block the thread branched from. Only
+  // meaningful on the thread's first block, but stamped on every thread
+  // block for simplicity.
+  parentBlockId?: string;
 }
 
 // Inline image attached to a user message. The runtime stores the bytes on
@@ -457,6 +465,24 @@ export type ChatBlock =
   | AuthorizationRequestedBlock
   | SetupRequestedBlock
   | SystemNoteBlock;
+
+// One row per distinct thread in a session, derived from the thread's
+// `chat_blocks`. Drives the inline thread chips and the cross-agent
+// Threads inbox without persisting a separate thread record.
+export interface ThreadSummary {
+  threadId: string;
+  sessionId: string;
+  agentId?: string;
+  // The main-chat `assistant_text` block the thread branched from.
+  parentBlockId?: string;
+  // Text of the parent assistant block, truncated for chip previews.
+  rootPreview?: string;
+  // Count of blocks tagged with this thread_id.
+  replyCount: number;
+  lastReplyAt: string;
+  // Truncated text of the most recent text-bearing block in the thread.
+  lastReplyPreview?: string;
+}
 
 export interface RuntimeState {
   version: 1;
@@ -761,6 +787,13 @@ export interface ChatSessionRecord {
   // render a job indicator and to keep these chats unread until a
   // human opens them.
   origin?: "job";
+  // The session's role in the new chats IA. `"agent"` = the single
+  // canonical chat for an agent; `"channel"` = a recurring-job-derived
+  // channel (always also carries `origin: "job"`). DISTINCT from
+  // `source?.kind` (the messaging-bridge kind). Legacy/non-canonical
+  // sessions may leave this undefined; the new UI treats undefined as
+  // hidden.
+  kind?: "agent" | "channel";
 }
 
 // `lastInboundMessageId` is the most recent originating-message id the

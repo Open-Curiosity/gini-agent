@@ -28,6 +28,7 @@ import type {
   RiskLevel,
   SetupRequestAction,
   SystemNoteAuthError,
+  ThreadSummary,
   ToolCallBlock,
   ToolCallStatus
 } from "../types";
@@ -84,6 +85,8 @@ interface ChatBlockRow {
   payload_json: string;
   task_id: string | null;
   run_id: string | null;
+  thread_id: string | null;
+  parent_block_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -123,7 +126,10 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
     ordinal: row.ordinal,
     createdAt: row.created_at,
     taskId: row.task_id ?? undefined,
-    runId: row.run_id ?? undefined
+    runId: row.run_id ?? undefined,
+    // Omit when NULL so main-chat blocks keep a clean payload.
+    ...(row.thread_id != null ? { threadId: row.thread_id } : {}),
+    ...(row.parent_block_id != null ? { parentBlockId: row.parent_block_id } : {})
   };
   switch (row.kind) {
     case "user_text": {
@@ -349,7 +355,9 @@ export function insertChatBlock(
         ordinal: nextOrdinal,
         createdAt: at,
         taskId: input.taskId,
-        runId: input.runId
+        runId: input.runId,
+        ...(input.threadId != null ? { threadId: input.threadId } : {}),
+        ...(input.parentBlockId != null ? { parentBlockId: input.parentBlockId } : {})
       };
       switch (input.kind) {
         case "user_text":
@@ -423,8 +431,8 @@ export function insertChatBlock(
     db.run(
       `INSERT INTO chat_blocks
          (id, session_id, instance, agent_id, ordinal, kind, payload_json,
-          task_id, run_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          task_id, run_id, thread_id, parent_block_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         block.id,
         block.sessionId,
@@ -435,6 +443,8 @@ export function insertChatBlock(
         payloadFor(block),
         block.taskId ?? null,
         block.runId ?? null,
+        input.threadId ?? null,
+        input.parentBlockId ?? null,
         block.createdAt,
         block.kind === "assistant_text" ? block.updatedAt : at
       ]
@@ -746,6 +756,153 @@ export function getLatestMessagesBySession(
     }
   }
   return map;
+}
+
+// Returns the blocks belonging to one thread, in ordinal-ascending order.
+// A thread is a span of blocks tagged with `thread_id` inside the agent's
+// single session; ordinals stay monotonic across the whole session, so
+// thread blocks may interleave with main-chat blocks in the raw stream.
+export function listThreadBlocks(
+  instance: Instance,
+  sessionId: string,
+  threadId: string
+): ChatBlock[] {
+  const db = getMemoryDb(instance);
+  return db
+    .query<ChatBlockRow, [string, string]>(
+      "SELECT * FROM chat_blocks WHERE session_id = ? AND thread_id = ? ORDER BY ordinal ASC"
+    )
+    .all(sessionId, threadId)
+    .map(rowToBlock);
+}
+
+// Returns the main-chat blocks for a session — everything NOT tagged with
+// a thread_id — in ordinal-ascending order. The chat transcript renders
+// from this so thread replies don't leak into the main stream.
+export function listMainChatBlocks(instance: Instance, sessionId: string): ChatBlock[] {
+  const db = getMemoryDb(instance);
+  return db
+    .query<ChatBlockRow, [string]>(
+      "SELECT * FROM chat_blocks WHERE session_id = ? AND thread_id IS NULL ORDER BY ordinal ASC"
+    )
+    .all(sessionId)
+    .map(rowToBlock);
+}
+
+// Truncates a preview string to a chip-friendly length without splitting
+// mid-word awkwardly — a hard cut is fine here since previews are advisory.
+function truncatePreview(text: string, max = 140): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= max) return trimmed;
+  return `${trimmed.slice(0, max).trimEnd()}…`;
+}
+
+// Pulls the renderable text off a chat_blocks payload. Only user_text and
+// assistant_text carry conversational text; everything else previews empty.
+function textFromPayload(payloadJson: string): string {
+  try {
+    const payload = JSON.parse(payloadJson) as { text?: unknown };
+    return typeof payload.text === "string" ? payload.text : "";
+  } catch {
+    return "";
+  }
+}
+
+// Aggregate row backing the thread-summary queries. One row per distinct
+// thread_id in scope, with the reply count, last-reply timestamp, and the
+// parent_block_id the thread branched from.
+interface ThreadAggRow {
+  thread_id: string;
+  session_id: string;
+  agent_id: string | null;
+  parent_block_id: string | null;
+  reply_count: number;
+  last_reply_at: string;
+}
+
+// Builds ThreadSummary objects from aggregate rows, hydrating the parent
+// preview (text of the rooted main-chat assistant block) and the
+// last-reply preview (most recent text-bearing block in the thread).
+function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAggRow[]): ThreadSummary[] {
+  return rows.map((row) => {
+    const rootRow = row.parent_block_id
+      ? db
+          .query<{ payload_json: string }, [string]>(
+            "SELECT payload_json FROM chat_blocks WHERE id = ?"
+          )
+          .get(row.parent_block_id)
+      : null;
+    const lastReplyRow = db
+      .query<{ payload_json: string }, [string, string]>(
+        `SELECT payload_json FROM chat_blocks
+         WHERE session_id = ? AND thread_id = ? AND kind IN ('user_text', 'assistant_text')
+         ORDER BY ordinal DESC
+         LIMIT 1`
+      )
+      .get(row.session_id, row.thread_id);
+    const rootPreview = rootRow ? truncatePreview(textFromPayload(rootRow.payload_json)) : "";
+    const lastReplyPreview = lastReplyRow ? truncatePreview(textFromPayload(lastReplyRow.payload_json)) : "";
+    return {
+      threadId: row.thread_id,
+      sessionId: row.session_id,
+      ...(row.agent_id != null ? { agentId: row.agent_id } : {}),
+      ...(row.parent_block_id != null ? { parentBlockId: row.parent_block_id } : {}),
+      ...(rootPreview.length > 0 ? { rootPreview } : {}),
+      replyCount: row.reply_count,
+      lastReplyAt: row.last_reply_at,
+      ...(lastReplyPreview.length > 0 ? { lastReplyPreview } : {})
+    };
+  });
+}
+
+// One ThreadSummary per distinct thread in a session, newest reply first.
+// Drives the per-agent Threads tab and the inline thread chips.
+export function summarizeThreads(instance: Instance, sessionId: string): ThreadSummary[] {
+  const db = getMemoryDb(instance);
+  const rows = db
+    .query<ThreadAggRow, [string]>(
+      `SELECT thread_id,
+              session_id,
+              MAX(agent_id) AS agent_id,
+              MAX(parent_block_id) AS parent_block_id,
+              COUNT(*) AS reply_count,
+              MAX(created_at) AS last_reply_at
+       FROM chat_blocks
+       WHERE session_id = ? AND thread_id IS NOT NULL
+       GROUP BY thread_id, session_id
+       ORDER BY last_reply_at DESC`
+    )
+    .all(sessionId);
+  return buildThreadSummaries(db, rows);
+}
+
+// Cross-agent thread inbox: one ThreadSummary per distinct thread across
+// the given canonical agent-chat sessions, newest reply first. Sessions
+// live in the JSON RuntimeState (not SQLite), so the caller resolves the
+// `kind='agent'` session ids and passes them in rather than this layer
+// joining a non-existent SQL table. An empty list yields no rows.
+export function summarizeThreadsForInstance(
+  instance: Instance,
+  agentSessionIds: string[]
+): ThreadSummary[] {
+  if (agentSessionIds.length === 0) return [];
+  const db = getMemoryDb(instance);
+  const placeholders = agentSessionIds.map(() => "?").join(", ");
+  const rows = db
+    .query<ThreadAggRow, string[]>(
+      `SELECT thread_id,
+              session_id,
+              MAX(agent_id) AS agent_id,
+              MAX(parent_block_id) AS parent_block_id,
+              COUNT(*) AS reply_count,
+              MAX(created_at) AS last_reply_at
+       FROM chat_blocks
+       WHERE instance = ? AND thread_id IS NOT NULL AND session_id IN (${placeholders})
+       GROUP BY thread_id, session_id
+       ORDER BY last_reply_at DESC`
+    )
+    .all(instance, ...agentSessionIds);
+  return buildThreadSummaries(db, rows);
 }
 
 // Cascade delete invoked by deleteChatSession in src/state/records.ts so

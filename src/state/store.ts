@@ -1209,6 +1209,14 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   migrateTaskChatSessionId(state);
   for (const session of state.chatSessions) {
     session.runIds ??= [];
+    // Backfill the chats-IA `kind` for recurring-job channels only. Job
+    // sessions map 1:1 to channels. Non-job sessions are intentionally
+    // left undefined here — an agent may own several legacy sessions, so
+    // getOrCreateAgentChat marks exactly one as the canonical "agent"
+    // chat lazily on first access rather than mass-assigning every row.
+    if (session.kind === undefined && session.origin === "job") {
+      session.kind = "channel";
+    }
   }
   for (const run of state.runs) {
     run.planStepIds ??= [];

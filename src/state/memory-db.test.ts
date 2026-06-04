@@ -498,12 +498,13 @@ describe("memory-db schema and storage", () => {
       .query<{ kind: string }, []>("SELECT kind FROM chat_blocks WHERE id = 'blk_1'")
       .get();
     expect(kept?.kind).toBe("approval_requested");
-    // The recreated table now accepts the new kinds.
+    // The recreated table now accepts the new kinds. Use explicit columns
+    // so the inserts stay valid as the recreated shape gains columns.
     db.run(
-      "INSERT INTO chat_blocks VALUES ('blk_2','chat_1','inst',NULL,2,'setup_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
+      "INSERT INTO chat_blocks (id, session_id, instance, agent_id, ordinal, kind, payload_json, task_id, run_id, created_at, updated_at) VALUES ('blk_2','chat_1','inst',NULL,2,'setup_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
     );
     db.run(
-      "INSERT INTO chat_blocks VALUES ('blk_3','chat_1','inst',NULL,3,'authorization_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
+      "INSERT INTO chat_blocks (id, session_id, instance, agent_id, ordinal, kind, payload_json, task_id, run_id, created_at, updated_at) VALUES ('blk_3','chat_1','inst',NULL,3,'authorization_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
     );
     const count = db.query<{ c: number }, []>("SELECT COUNT(*) AS c FROM chat_blocks").get();
     expect(count?.c).toBe(3);

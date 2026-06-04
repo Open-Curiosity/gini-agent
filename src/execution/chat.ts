@@ -14,7 +14,7 @@ import {
   readState,
   renameChatSession
 } from "../state";
-import type { AssistantTextBlock, AudioAttachment, ChatBlock, ChatMessageRecord, ImageAttachment, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
+import type { AssistantTextBlock, AudioAttachment, ChatBlock, ChatMessageRecord, ChatSessionRecord, ImageAttachment, Instance, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
 import { readUpload, uploadStat } from "../state/uploads";
 import { getSttProvider } from "../stt";
 import { generateStructured, providerAuthFailureText, providerDisplayLabel, providerReauth } from "../provider";
@@ -194,6 +194,42 @@ export async function createChat(config: RuntimeConfig, input: Record<string, un
   return mutateState(config.instance, (state) => {
     const effective = resolveEffectiveContext(state, config);
     return createChatSession(state, String(input.title ?? "New chat"), undefined, effective.agentId);
+  });
+}
+
+// Resolves the single canonical chat for an agent in the new chats IA.
+// Precedence:
+//   1. The most-recently-updated session already marked `kind: "agent"`.
+//   2. Otherwise the most-recently-updated non-job, non-bridge session
+//      for the agent — promoted to `kind: "agent"` and persisted.
+//   3. Otherwise a fresh `kind: "agent"` session is created.
+// Other sessions are never merged or deleted; they simply stop being
+// surfaced by the new UI. Resolution runs inside a single mutateState so
+// the promote/create branches don't race a concurrent caller into two
+// canonical chats.
+export async function getOrCreateAgentChat(
+  instance: Instance,
+  agentId: string
+): Promise<ChatSessionRecord> {
+  return mutateState(instance, (state) => {
+    const byRecency = (a: ChatSessionRecord, b: ChatSessionRecord): number =>
+      b.updatedAt.localeCompare(a.updatedAt);
+    const owned = state.chatSessions.filter((session) => session.agentId === agentId);
+
+    const canonical = owned
+      .filter((session) => session.kind === "agent")
+      .sort(byRecency)[0];
+    if (canonical) return canonical;
+
+    const promotable = owned
+      .filter((session) => session.origin !== "job" && session.source === undefined)
+      .sort(byRecency)[0];
+    if (promotable) {
+      promotable.kind = "agent";
+      return promotable;
+    }
+
+    return createChatSession(state, "New chat", undefined, agentId, undefined, "agent");
   });
 }
 

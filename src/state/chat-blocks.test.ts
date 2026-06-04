@@ -19,7 +19,11 @@ import {
   insertChatBlock,
   listChatBlocks,
   listChatBlocksAfter,
+  listMainChatBlocks,
+  listThreadBlocks,
   subscribeChatBlocks,
+  summarizeThreads,
+  summarizeThreadsForInstance,
   updateToolCallBlock,
   upsertAssistantTextBlock
 } from "./index";
@@ -661,5 +665,202 @@ describe("chat-blocks persistence", () => {
       reauthKind: "settings",
       reauthUrl: "/settings"
     });
+  });
+});
+
+describe("chat-blocks threading", () => {
+  test("thread_id and parent_block_id round-trip through insert → list", () => {
+    const instance = "chat-blocks-thread-roundtrip";
+    const inserted = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_th",
+      text: "thread reply",
+      streaming: false,
+      threadId: "thread_1",
+      parentBlockId: "block_root"
+    });
+    expect(inserted.threadId).toBe("thread_1");
+    expect(inserted.parentBlockId).toBe("block_root");
+
+    const [block] = listChatBlocks(instance, "chat_th");
+    expect(block?.threadId).toBe("thread_1");
+    expect(block?.parentBlockId).toBe("block_root");
+
+    // Columns are persisted (not just round-tripped through the payload).
+    const db = getMemoryDb(instance);
+    const row = db
+      .query<{ thread_id: string | null; parent_block_id: string | null }, [string]>(
+        "SELECT thread_id, parent_block_id FROM chat_blocks WHERE id = ?"
+      )
+      .get(inserted.id);
+    expect(row?.thread_id).toBe("thread_1");
+    expect(row?.parent_block_id).toBe("block_root");
+  });
+
+  test("main-chat blocks omit thread fields", () => {
+    const instance = "chat-blocks-thread-omit";
+    const inserted = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: "chat_main",
+      text: "no thread"
+    });
+    expect(inserted.threadId).toBeUndefined();
+    expect(inserted.parentBlockId).toBeUndefined();
+    const [block] = listChatBlocks(instance, "chat_main");
+    expect(block?.threadId).toBeUndefined();
+    expect(block?.parentBlockId).toBeUndefined();
+  });
+
+  test("upsertAssistantTextBlock preserves thread fields across deltas", () => {
+    const instance = "chat-blocks-thread-upsert";
+    const initial = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_up",
+      text: "",
+      streaming: true,
+      threadId: "thread_u",
+      parentBlockId: "block_pu"
+    });
+    const updated = upsertAssistantTextBlock(instance, initial.id, {
+      text: "growing reply",
+      streaming: false
+    });
+    expect(updated?.threadId).toBe("thread_u");
+    expect(updated?.parentBlockId).toBe("block_pu");
+  });
+
+  test("updateToolCallBlock preserves thread fields across status flips", () => {
+    const instance = "chat-blocks-thread-toolcall";
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: "chat_tc",
+      toolName: "file_read",
+      displayLabel: "Read file",
+      argsPreview: "x.md",
+      argsFull: { path: "x.md" },
+      status: "running",
+      callId: "call_th",
+      threadId: "thread_tc",
+      parentBlockId: "block_tc"
+    });
+    const flipped = updateToolCallBlock(instance, "call_th", "chat_tc", { status: "ok" });
+    expect(flipped?.threadId).toBe("thread_tc");
+    expect(flipped?.parentBlockId).toBe("block_tc");
+  });
+
+  test("listThreadBlocks and listMainChatBlocks split the interleaved stream", () => {
+    const instance = "chat-blocks-thread-split";
+    const session = "chat_split";
+    // Interleave main-chat and thread blocks in one ordinal stream.
+    const m1 = insertChatBlock(instance, { kind: "user_text", sessionId: session, text: "main 1" });
+    const t1 = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "thread 1",
+      streaming: false,
+      threadId: "thread_x",
+      parentBlockId: m1.id
+    });
+    const m2 = insertChatBlock(instance, { kind: "assistant_text", sessionId: session, text: "main 2", streaming: false });
+    const t2 = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "thread 2",
+      threadId: "thread_x",
+      parentBlockId: m1.id
+    });
+
+    const threadBlocks = listThreadBlocks(instance, session, "thread_x");
+    expect(threadBlocks.map((b) => b.id)).toEqual([t1.id, t2.id]);
+
+    const mainBlocks = listMainChatBlocks(instance, session);
+    expect(mainBlocks.map((b) => b.id)).toEqual([m1.id, m2.id]);
+
+    // Raw list still carries everything in ordinal order.
+    expect(listChatBlocks(instance, session).map((b) => b.ordinal)).toEqual([1, 2, 3, 4]);
+  });
+
+  test("summarizeThreads returns one row per thread with counts and previews", () => {
+    const instance = "chat-blocks-thread-summary";
+    const session = "chat_sum";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Here is a research plan you can branch on.",
+      streaming: false
+    });
+    // Thread A: two replies.
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "Follow up on step one",
+      threadId: "thread_a",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Step one is done.",
+      streaming: false,
+      threadId: "thread_a",
+      parentBlockId: root.id
+    });
+    // Thread B: one reply, rooted at the same parent.
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "Different tangent",
+      threadId: "thread_b",
+      parentBlockId: root.id
+    });
+
+    const summaries = summarizeThreads(instance, session);
+    expect(summaries).toHaveLength(2);
+    const byId = new Map(summaries.map((s) => [s.threadId, s]));
+    const a = byId.get("thread_a");
+    const b = byId.get("thread_b");
+    expect(a?.replyCount).toBe(2);
+    expect(b?.replyCount).toBe(1);
+    expect(a?.parentBlockId).toBe(root.id);
+    expect(a?.rootPreview).toBe("Here is a research plan you can branch on.");
+    expect(a?.lastReplyPreview).toBe("Step one is done.");
+    expect(b?.lastReplyPreview).toBe("Different tangent");
+    expect(a?.sessionId).toBe(session);
+  });
+
+  test("summarizeThreadsForInstance scopes to the supplied agent sessions", () => {
+    const instance = "chat-blocks-thread-instance";
+    const agentSession = "chat_agent";
+    const otherSession = "chat_other";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: agentSession,
+      text: "Root in the agent chat.",
+      streaming: false,
+      agentId: "agent_1"
+    });
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: agentSession,
+      text: "Agent thread reply",
+      threadId: "thread_agent",
+      parentBlockId: root.id,
+      agentId: "agent_1"
+    });
+    // A thread in a session NOT in the agent-session set — must be excluded.
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: otherSession,
+      text: "Channel thread reply",
+      threadId: "thread_other",
+      parentBlockId: "block_other"
+    });
+
+    const scoped = summarizeThreadsForInstance(instance, [agentSession]);
+    expect(scoped.map((s) => s.threadId)).toEqual(["thread_agent"]);
+    expect(scoped[0]?.agentId).toBe("agent_1");
+
+    // Empty agent-session list yields no rows.
+    expect(summarizeThreadsForInstance(instance, [])).toHaveLength(0);
   });
 });
