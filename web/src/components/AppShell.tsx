@@ -12,7 +12,9 @@ import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
 // device-pairing-auth.md.
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  if (pathname?.startsWith("/pair")) {
+  // Exact /pair (or its subpaths) only — not a broad prefix, so a future route
+  // like /pairing isn't accidentally treated as the bare pairing page.
+  if (pathname === "/pair" || pathname?.startsWith("/pair/")) {
     return <>{children}</>;
   }
   return (

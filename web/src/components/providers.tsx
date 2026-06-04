@@ -44,7 +44,9 @@ export function Providers({ children }: { children: ReactNode }) {
   // (and auto-retries) over the relay until the device is paired — pure console
   // noise on the pairing screen. Skip it on /pair; every other route mounts it.
   const pathname = usePathname();
-  const onPairPage = pathname?.startsWith("/pair") ?? false;
+  // Exact /pair (or subpaths) only — a broad prefix would also match a future
+  // route like /pairing.
+  const onPairPage = pathname === "/pair" || (pathname?.startsWith("/pair/") ?? false);
   const [client] = useState(() => new QueryClient({
     defaultOptions: {
       // SSE-driven invalidation (via RuntimeStreamBridge) handles freshness.

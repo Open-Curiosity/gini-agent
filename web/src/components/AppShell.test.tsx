@@ -109,6 +109,16 @@ describe("AppShell", () => {
     expect(screen.queryByRole("button", { name: /tunnel/i })).toBeNull();
   });
 
+  test("a /pair-prefixed route like /pairing still gets the full shell (exact match, not prefix)", async () => {
+    pathname = "/pairing";
+    const { container } = renderShell();
+    expect(screen.queryByTestId("sidebar-stub")).not.toBeNull();
+    expect(container.querySelector(".flex.h-screen")).not.toBeNull();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /tunnel/i })).not.toBeNull()
+    );
+  });
+
   test("/pair/* subpaths also render bare", () => {
     pathname = "/pair/done";
     const { container } = renderShell();

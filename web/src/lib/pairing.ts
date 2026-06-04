@@ -36,7 +36,13 @@ async function pairingFetch<T>(path: string, init: RequestInit = {}): Promise<T>
     credentials: "same-origin"
   });
   const value = (await response.json().catch(() => ({}))) as { error?: string };
-  if (!response.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
+  if (!response.ok) {
+    // Attach the HTTP status so callers (e.g. the /pair poll loop) can tell a
+    // terminal 403/404 from a transient network blip.
+    const error = new Error(value.error ?? `HTTP ${response.status}`) as Error & { status?: number };
+    error.status = response.status;
+    throw error;
+  }
   return value as T;
 }
 

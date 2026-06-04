@@ -111,8 +111,18 @@ export default function PairPage() {
           setPhase("cancelled");
         }
         // "pending" / "claimed" → keep waiting.
-      } catch {
-        // Transient poll failure (relay blip): swallow and retry next tick.
+      } catch (e) {
+        if (cancelled) return;
+        // A 404 (request gone/expired) or 403 (binding mismatch — e.g. another
+        // /pair tab overwrote this browser's gini_pair cookie) is terminal for
+        // THIS request: stop polling and surface a restartable state instead of
+        // spinning forever. Any other failure is a transient relay blip — retry.
+        const httpStatus = (e as { status?: number } | null)?.status;
+        if (httpStatus === 403 || httpStatus === 404) {
+          stopPolling();
+          setError("This pairing request is no longer valid. Start a new one.");
+          setPhase("claim-error");
+        }
       }
     };
 

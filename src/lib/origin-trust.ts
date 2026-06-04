@@ -119,9 +119,10 @@ const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 //     trusted regardless of GINI_TRUSTED_ORIGINS — a rebinding page cannot forge
 //     a loopback Host and the relay owns its DNS. An unsafe no-Origin request
 //     must use the native /api/* surface with its own bearer.
-//   - Origin present: a relay Origin is trusted regardless of Host (the browser
-//     cannot forge Origin); a loopback Origin on a loopback Host is local;
-//     otherwise the Origin must match GINI_TRUSTED_ORIGINS (or, with no
+//   - Origin present: a relay Origin is trusted only when it equals the inbound
+//     relay Host (same subdomain — a different relay subdomain is a cross-site
+//     peer and must not be trusted); a loopback Origin on a loopback Host is
+//     local; otherwise the Origin must match GINI_TRUSTED_ORIGINS (or, with no
 //     allowlist, equal a loopback Host).
 function hostOriginTrusted(origin: string | null, isUnsafe: boolean, expectedHost: string): boolean {
   if (!origin) {

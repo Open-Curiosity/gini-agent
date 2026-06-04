@@ -26,9 +26,10 @@ const POLL_MS = 2000;
 
 // Per-route response programming. Each test sets the desired outcomes; the fetch
 // stub matches on URL + method and returns the configured payload.
-type Outcome = { ok?: boolean; body: unknown };
+type Outcome = { ok?: boolean; body: unknown; status?: number };
 let createOutcome: Outcome;
 let pollStatus: PairingRequestStatus;
+let pollOutcome: Outcome | null;
 let claimOutcome: Outcome;
 let cancelOutcome: Outcome;
 
@@ -36,13 +37,14 @@ const realFetch = globalThis.fetch;
 let assignSpy: ReturnType<typeof mock>;
 let originalAssign: typeof window.location.assign;
 
-function jsonResponse({ ok = true, body }: Outcome): Response {
-  return { ok, status: ok ? 200 : 400, json: async () => body } as Response;
+function jsonResponse({ ok = true, body, status }: Outcome): Response {
+  return { ok, status: ok ? 200 : (status ?? 400), json: async () => body } as Response;
 }
 
 beforeEach(() => {
   createOutcome = { body: { id: "req-1", code: "428913" } };
   pollStatus = "pending";
+  pollOutcome = null;
   claimOutcome = { body: { status: "approved" } };
   cancelOutcome = { body: { ok: true } };
 
@@ -54,8 +56,9 @@ beforeEach(() => {
     }
     if (url.includes("/claim") && method === "POST") return jsonResponse(claimOutcome);
     if (url.includes("/cancel") && method === "POST") return jsonResponse(cancelOutcome);
-    // GET /api/pairing/request/:id — the poll.
-    return jsonResponse({ body: { status: pollStatus } });
+    // GET /api/pairing/request/:id — the poll. pollOutcome overrides (e.g. a
+    // 403/404 hard failure); otherwise return the current pollStatus.
+    return jsonResponse(pollOutcome ?? { body: { status: pollStatus } });
   }) as unknown as typeof fetch;
   globalThis.fetch = fetchStub;
 
@@ -121,6 +124,41 @@ describe("PairPage", () => {
       timeout: 2000,
       interval: 10
     });
+    expect(assignSpy).not.toHaveBeenCalled();
+  });
+
+  test("a 403/404 poll (e.g. binding cookie overwritten) is terminal, not an infinite spin", async () => {
+    jest.useFakeTimers();
+    // The request is gone for this browser (bind mismatch). Earlier this was
+    // swallowed and the page spun forever; now it surfaces a restartable state.
+    pollOutcome = { ok: false, status: 403, body: { error: "bind_mismatch" } };
+    render(<PairPage />);
+    await flush();
+    await act(async () => {
+      jest.advanceTimersByTime(POLL_MS);
+    });
+    await flush();
+    await waitFor(
+      () => expect(screen.queryByText(/no longer valid/i)).not.toBeNull(),
+      { timeout: 2000, interval: 10 }
+    );
+    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeNull();
+    expect(assignSpy).not.toHaveBeenCalled();
+  });
+
+  test("a transient (network) poll failure keeps waiting, not terminal", async () => {
+    jest.useFakeTimers();
+    // A non-4xx failure (e.g. a relay blip → 500) must NOT terminate the flow.
+    pollOutcome = { ok: false, status: 500, body: { error: "blip" } };
+    render(<PairPage />);
+    await flush();
+    await act(async () => {
+      jest.advanceTimersByTime(POLL_MS);
+    });
+    await flush();
+    // Still pending (the spinner copy), no terminal error, no reload.
+    expect(screen.queryByText("Waiting for approval on your computer…")).not.toBeNull();
+    expect(screen.queryByText(/no longer valid/i)).toBeNull();
     expect(assignSpy).not.toHaveBeenCalled();
   });
 
