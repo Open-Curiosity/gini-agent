@@ -18,7 +18,7 @@ import { ThreadPanel } from "@/components/chat/ThreadPanel";
 import { ThreadsTab } from "@/components/chat/ThreadsTab";
 import { JobsTab } from "@/components/chat/JobsTab";
 import { api, type UploadRef } from "@/lib/api";
-import { useThreadReadState } from "@/lib/use-chat-read-state";
+import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
 import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
 import {
   splitBlocks,
@@ -131,6 +131,21 @@ function ChatSurface({
   const threadsQuery = useThreads(sessionId);
   const threads = useMemo(() => threadsQuery.data ?? [], [threadsQuery.data]);
   const { markThreadRead } = useThreadReadState(threads);
+
+  const sessionsQuery = useChatSessions();
+  const { markRead, activityAt } = useChatReadState(sessionsQuery.data);
+  // Mark read using the LIST session (it carries `runs`) so the stored
+  // timestamp matches what the sidebar's isUnread compares against; fall back
+  // to the prop session if the list hasn't resolved.
+  const liveSession =
+    (sessionsQuery.data ?? []).find((s) => s.id === sessionId) ?? session;
+  const liveActivityAt = activityAt(liveSession);
+  useEffect(() => {
+    markRead(liveSession);
+    // Re-mark when activity advances while the chat is open (a task finishes
+    // or a job run lands) so it doesn't flip back to unread under the user.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, liveActivityAt, markRead]);
 
   // Mark the open thread read using the live summary, so a reply that lands
   // while the panel is open clears too instead of re-flagging it as unread.
