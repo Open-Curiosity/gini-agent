@@ -828,6 +828,74 @@ describe("chat-blocks threading", () => {
     expect(a?.sessionId).toBe(session);
   });
 
+  test("summarizeThreads reply count excludes phase and tool blocks", () => {
+    const instance = "chat-blocks-thread-count";
+    const session = "chat_count";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Root message.",
+      streaming: false
+    });
+    // Two real messages in the thread.
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "Run the check",
+      threadId: "thread_c",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Done.",
+      streaming: false,
+      threadId: "thread_c",
+      parentBlockId: root.id
+    });
+    // Transient/auxiliary blocks sharing the thread id — must not be counted.
+    insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Thinking",
+      threadId: "thread_c",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: session,
+      toolName: "file_read",
+      displayLabel: "Read file",
+      argsPreview: "x.md",
+      argsFull: { path: "x.md" },
+      status: "ok",
+      callId: "call_count",
+      threadId: "thread_c",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "tool_result",
+      sessionId: session,
+      callId: "call_count",
+      preview: "ok",
+      truncated: false,
+      threadId: "thread_c",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "system_note",
+      sessionId: session,
+      text: "note",
+      threadId: "thread_c",
+      parentBlockId: root.id
+    });
+
+    const summaries = summarizeThreads(instance, session);
+    const thread = summaries.find((s) => s.threadId === "thread_c");
+    // Only the user_text + assistant_text blocks count toward replies.
+    expect(thread?.replyCount).toBe(2);
+  });
+
   test("summarizeThreadsForInstance scopes to the supplied agent sessions", () => {
     const instance = "chat-blocks-thread-instance";
     const agentSession = "chat_agent";

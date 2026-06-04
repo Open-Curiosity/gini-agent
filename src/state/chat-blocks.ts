@@ -912,7 +912,7 @@ export function summarizeThreads(instance: Instance, sessionId: string): ThreadS
               session_id,
               MAX(agent_id) AS agent_id,
               MAX(parent_block_id) AS parent_block_id,
-              COUNT(*) AS reply_count,
+              SUM(CASE WHEN kind IN ('user_text','assistant_text') THEN 1 ELSE 0 END) AS reply_count,
               MAX(created_at) AS last_reply_at
        FROM chat_blocks
        WHERE session_id = ? AND thread_id IS NOT NULL
@@ -941,7 +941,7 @@ export function summarizeThreadsForInstance(
               session_id,
               MAX(agent_id) AS agent_id,
               MAX(parent_block_id) AS parent_block_id,
-              COUNT(*) AS reply_count,
+              SUM(CASE WHEN kind IN ('user_text','assistant_text') THEN 1 ELSE 0 END) AS reply_count,
               MAX(created_at) AS last_reply_at
        FROM chat_blocks
        WHERE instance = ? AND thread_id IS NOT NULL AND session_id IN (${placeholders})
