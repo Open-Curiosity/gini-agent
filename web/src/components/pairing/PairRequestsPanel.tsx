@@ -1,7 +1,6 @@
 "use client";
 
 import { AlertTriangle } from "lucide-react";
-import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   usePairingRequests,
@@ -10,7 +9,6 @@ import {
   isLoopbackFront,
   type PairingRequestView
 } from "@/lib/pairing";
-import { useRuntimeStream } from "@/lib/useRuntimeStream";
 import { Button } from "@/components/ui/button";
 
 /**
@@ -33,23 +31,17 @@ function relativeTime(iso: string): string {
  * this gates its actionable UI on `isLoopbackFront()` and otherwise renders a
  * note pointing the user at the machine that started the tunnel.
  *
- * The list polls every 3s as a backstop (see usePairingRequests); the SSE
- * "pairing" tick invalidates the query for instant updates the moment a device
- * scans, approves, or expires.
+ * The list polls every 3s as a backstop (see usePairingRequests). Instant SSE
+ * refresh is handled app-wide by RuntimeStreamBridge, which invalidates
+ * ["pairingRequests"]/["devices"] on every "pairing" event — so this panel does
+ * not subscribe to the stream itself (it only ever mounts on routes where the
+ * bridge is active).
  */
 export function PairRequestsPanel() {
   const enabled = isLoopbackFront();
   const { data: requests = [] } = usePairingRequests(enabled);
   const approve = useApprovePairing();
   const reject = useRejectPairing();
-  const qc = useQueryClient();
-
-  useRuntimeStream((e) => {
-    if (e.kind === "pairing") {
-      qc.invalidateQueries({ queryKey: ["pairingRequests"] });
-      qc.invalidateQueries({ queryKey: ["devices"] });
-    }
-  });
 
   return (
     <div className="space-y-3">

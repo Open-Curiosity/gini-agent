@@ -161,6 +161,7 @@ export {
   deviceNameFromUserAgent,
   MAX_PENDING_PAIRING_REQUESTS,
   PairingCapExceededError,
+  SESSION_TTL_MS,
   createPromotionProposal,
   decidePromotion,
   createSnapshotRecord,

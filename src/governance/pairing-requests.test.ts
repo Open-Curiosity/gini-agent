@@ -3,7 +3,6 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PairedDevice, RuntimeConfig } from "../types";
-import { hashSecret } from "../state/security";
 import {
   approvePairing,
   cancelPairing,
@@ -39,7 +38,7 @@ async function open(config: RuntimeConfig) {
   return requestPairing(config, {
     userAgent: "Mozilla/5.0 (iPhone) Safari",
     relayHost: "sub.gini-relay.lilaclabs.ai",
-    bindHash: hashSecret(SECRET)
+    bindSecret: SECRET
   });
 }
 

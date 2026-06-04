@@ -697,7 +697,7 @@ const DEFAULT_SESSION_SCOPES = ["tasks:read", "tasks:write", "approvals:write", 
 // get a finite one so an abandoned cookie eventually dies even if the operator
 // never explicitly revokes it. Revocation still takes effect immediately,
 // independent of this TTL.
-const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 // Cap on concurrent PENDING pairing requests so a public flood can't bury the
 // operator panel. Enforced INSIDE createPairingRequest (one mutateState txn) so
@@ -742,13 +742,14 @@ export function deviceNameFromUserAgent(userAgent: string): string {
 
 // A relay device opens a pairing request. The plaintext code is returned to the
 // caller (it is displayed on the device AND, via the loopback list, on the
-// operator's panel for visual comparison). `bindHash` is hashSecret(secret) of
-// the per-request binding secret the route stored as an HttpOnly cookie on the
-// requesting browser. ttlSeconds is clamped to the same 60-3600s window as
-// createPairing.
+// operator's panel for visual comparison). `bindSecret` is the per-request
+// binding secret the route stored as an HttpOnly cookie on the requesting
+// browser; only its hash is persisted (credential hashing stays in this state
+// layer, matching claim/cancel/poll). ttlSeconds is clamped to the same
+// 60-3600s window as createPairing.
 export function createPairingRequest(
   state: RuntimeState,
-  input: { userAgent: string; relayHost: string; bindHash: string; ttlSeconds?: number }
+  input: { userAgent: string; relayHost: string; bindSecret: string; ttlSeconds?: number }
 ): PairingRequest {
   expirePairingRequests(state);
   if (state.pairingRequests.filter((r) => r.status === "pending").length >= MAX_PENDING_PAIRING_REQUESTS) {
@@ -760,7 +761,7 @@ export function createPairingRequest(
     id: id("preq"),
     instance: state.instance,
     code: randomPairingCode(),
-    bindHash: input.bindHash,
+    bindHash: hashSecret(input.bindSecret),
     status: "pending",
     deviceName: deviceNameFromUserAgent(input.userAgent),
     userAgent: input.userAgent,

@@ -122,7 +122,7 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 - `/api/tasks`, `/api/chat`, `/api/runs`, `/api/authorizations`, `/api/setup-requests`
 - `/api/memory/retain`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks`, `/api/embedding/*`, `/api/reranker/status`
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
-- `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
+- `/api/pairing`, `/api/pairing/request*` (relay device pairing), `/api/devices`, `/api/mobile/bootstrap`
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
 - `/api/tunnel`, `/api/tunnel/select`, `/api/tunnel/connect`, `/api/tunnel/cancel`, `/api/tunnel/disconnect`
 - `/api/audit`, `/api/events`, `/api/events/stream`
@@ -134,7 +134,7 @@ On macOS a launchd-managed instance is supervised to stay up across crashes, cle
 
 ## Off-LAN Access
 
-Off-LAN access is available through the **gini-relay tunnel**. The user picks a tunnel provider and connects (`gini tunnel`, or the web tunnel panel over `/api/tunnel*`); the gateway runs an OAuth-loopback login in a browser on the host, the relay assigns the device a session and a subdomain, and a supervised native `frpc` child exposes the instance's gateway port (the single origin fronting UI + API). The instance is then reachable at `https://<subdomain>.<relayDomain>` (`relayDomain` default `gini-relay.lilaclabs.ai`, overridable via `GINI_RELAY_DOMAIN`). `gini-relay` is the only enabled provider today; `tailscale`, `ngrok`, and `cloudflare` are catalog placeholders surfaced with the prerequisite they require. The gateway owns the relay / loopback / `GINI_TRUSTED_ORIGINS` trust decision for web-bound requests and rewrites `Host`/`Origin` to loopback before proxying, so the inner web child (BFF) stays relay-agnostic. See [Tunnel Connectivity](./adr/tunnel-connectivity.md) and [BFF Trust Boundary](./adr/bff-trust-boundary.md).
+Off-LAN access is available through the **gini-relay tunnel**. The user picks a tunnel provider and connects (`gini tunnel`, or the web tunnel panel over `/api/tunnel*`); the gateway runs an OAuth-loopback login in a browser on the host, the relay assigns the device a session and a subdomain, and a supervised native `frpc` child exposes the instance's gateway port (the single origin fronting UI + API). The instance is then reachable at `https://<subdomain>.<relayDomain>` (`relayDomain` default `gini-relay.lilaclabs.ai`, overridable via `GINI_RELAY_DOMAIN`). `gini-relay` is the only enabled provider today; `tailscale`, `ngrok`, and `cloudflare` are catalog placeholders surfaced with the prerequisite they require. The gateway owns the relay / loopback / `GINI_TRUSTED_ORIGINS` trust decision for web-bound requests and rewrites `Host`/`Origin` to loopback before proxying, so the inner web child (BFF) stays relay-agnostic. On top of that host trust, a web request on a non-loopback front must also be **paired**: it needs a `gini_session` cookie minted through an operator-approved device-pairing handshake, or its page navigations are redirected to `/pair` and its `/api/runtime/*` calls 401. Loopback is trusted with no pairing. See [Tunnel Connectivity](./adr/tunnel-connectivity.md), [BFF Trust Boundary](./adr/bff-trust-boundary.md), and [Device-Pairing Authentication](./adr/device-pairing-auth.md).
 
 ## Not Yet Built
 

@@ -2,20 +2,20 @@
 
 // PairRequestsPanel gates its actionable UI on isLoopbackFront() and renders the
 // operator's live "Pair requests" list. These tests mock the @/lib/pairing data
-// hooks, the @/lib/useRuntimeStream subscriber, and sonner's toast so every
-// branch is driven without the network: the non-loopback note, the idle
-// empty-list block, populated rows with the relativeTime variants, the
-// approve/reject mutate -> toast (success + error) wiring, the isPending disabled
-// state, and the SSE "pairing" tick invalidation (vs an ignored kind).
+// hooks and sonner's toast so every branch is driven without the network: the
+// non-loopback note, the idle empty-list block, populated rows with the
+// relativeTime variants, the approve/reject mutate -> toast (success + error)
+// wiring, and the isPending disabled state. The panel no longer subscribes to the
+// runtime stream — RuntimeStreamBridge owns "pairing"-event invalidation app-wide
+// — so there is no SSE wiring to exercise here.
 //
 // LEAK SAFETY: mock.module is process-wide in `bun test` and can outlive the file
 // that set it, so every override SPREADS the real module and changes only the
 // exports this file needs. That way, if an override is still live when a sibling
-// test runs, the other exports it relies on (e.g. __streamTestHooks on
-// useRuntimeStream, mergeSeedWithLive's react-query deps, sonner's Toaster) are
-// preserved. The canonical (no-query) real namespaces are captured for spreading
-// and for the afterAll revert. None of these specifiers is itself the SUBJECT of
-// another rendering test, so the spread keeps them harmless.
+// test runs, the other exports it relies on (e.g. sonner's Toaster) are
+// preserved. The real namespaces are captured for spreading and for the afterAll
+// revert. Neither specifier is itself the SUBJECT of another rendering test, so
+// the spread keeps them harmless.
 
 import {
   afterAll,
@@ -32,12 +32,9 @@ import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { PairingRequestView } from "@/lib/pairing";
-import type { RuntimeStreamEvent } from "@/lib/useRuntimeStream";
 
 const realPairing = await import("@/lib/pairing");
-const realStream = await import("@/lib/useRuntimeStream");
 const realSonner = await import("sonner");
-const realRQ = await import("@tanstack/react-query");
 
 // --- Controllable mock surface --------------------------------------------
 let loopback = true;
@@ -50,14 +47,8 @@ type Mutation = {
 let approve: Mutation;
 let reject: Mutation;
 
-// Captured SSE callback so a test can fire a fake event at the component.
-let streamCallback: ((e: RuntimeStreamEvent) => void) | null = null;
-
 const toastSuccess = mock((_: string) => {});
 const toastError = mock((_: string) => {});
-
-// invalidateQueries spy — the panel calls qc.invalidateQueries on a pairing tick.
-const invalidateSpy = mock((_: unknown) => {});
 
 let PairRequestsPanel: typeof import("./PairRequestsPanel").PairRequestsPanel;
 
@@ -69,24 +60,10 @@ beforeAll(async () => {
     useApprovePairing: () => approve,
     useRejectPairing: () => reject
   }));
-  // Spread realStream so __streamTestHooks survives for useRuntimeStream.test;
-  // override only the hook to capture the callback.
-  mock.module("@/lib/useRuntimeStream", () => ({
-    ...realStream,
-    useRuntimeStream: (cb: (e: RuntimeStreamEvent) => void) => {
-      streamCallback = cb;
-    }
-  }));
   // Spread the real sonner so non-`toast` exports survive; override only `toast`.
   mock.module("sonner", () => ({
     ...realSonner,
     toast: { success: toastSuccess, error: toastError }
-  }));
-  // Override only useQueryClient; keep the real QueryClient/QueryClientProvider
-  // so renderPanel's real provider works.
-  mock.module("@tanstack/react-query", () => ({
-    ...realRQ,
-    useQueryClient: () => ({ invalidateQueries: invalidateSpy })
   }));
   // Cache-bust suffix in a variable so tsc doesn't try to resolve the path.
   const panelPath = "./PairRequestsPanel?panel-test";
@@ -95,9 +72,7 @@ beforeAll(async () => {
 
 afterAll(() => {
   mock.module("@/lib/pairing", () => realPairing);
-  mock.module("@/lib/useRuntimeStream", () => realStream);
   mock.module("sonner", () => realSonner);
-  mock.module("@tanstack/react-query", () => realRQ);
 });
 
 function makeRequest(over: Partial<PairingRequestView> = {}): PairingRequestView {
@@ -125,12 +100,10 @@ function renderPanel() {
 beforeEach(() => {
   loopback = true;
   requests = [];
-  streamCallback = null;
   approve = { mutate: mock(() => {}), isPending: false };
   reject = { mutate: mock(() => {}), isPending: false };
   toastSuccess.mockClear();
   toastError.mockClear();
-  invalidateSpy.mockClear();
 });
 
 // relativeTime assertions freeze the wall clock so the createdAt offset and the
@@ -270,19 +243,5 @@ describe("PairRequestsPanel", () => {
     renderPanel();
     expect(screen.queryByText("iPhone")).not.toBeNull();
     expect(screen.queryByText(/ago/)).toBeNull();
-  });
-
-  test("SSE 'pairing' event invalidates pairingRequests + devices queries", () => {
-    renderPanel();
-    expect(streamCallback).not.toBeNull();
-    act(() => streamCallback?.({ kind: "pairing", data: "{}" }));
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["pairingRequests"] });
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["devices"] });
-  });
-
-  test("SSE non-pairing event is ignored", () => {
-    renderPanel();
-    act(() => streamCallback?.({ kind: "task", data: "{}" }));
-    expect(invalidateSpy).not.toHaveBeenCalled();
   });
 });

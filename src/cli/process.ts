@@ -579,9 +579,12 @@ export async function remoteOrLocalStatus(config: RuntimeConfig, options: WebOpt
   const webUrl = await existingWebUrl(config, options.webPort);
   try {
     const remote = await api(config, "/api/status");
+    // The gateway answered, so it's up — safe to advertise its URL as the web front.
     return { ...remote, web: { running: Boolean(webUrl), url: webUrl ? operatorWebUrl(config) : null } };
   } catch {
-    return { ...status(config), ok: false, running: false, web: { running: Boolean(webUrl), url: webUrl ? operatorWebUrl(config) : null } };
+    // The gateway is unreachable; the gateway URL would only mislead. Report the
+    // inner web's liveness but no operator URL (the single front is down).
+    return { ...status(config), ok: false, running: false, web: { running: Boolean(webUrl), url: null } };
   }
 }
 
@@ -642,7 +645,10 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
         recorded: recordedWebPort(config)
       }
     },
-    web: { running: webPidAlive, pid: webPid ?? null, url: webHealthyUrl ? operatorWebUrl(config) : null },
+    // Advertise the gateway URL only when the gateway is actually up (running) —
+    // it's the single front, so a healthy inner web process behind a down
+    // gateway has no usable operator URL.
+    web: { running: webPidAlive, pid: webPid ?? null, url: running && webHealthyUrl ? operatorWebUrl(config) : null },
     tokenConfigured: Boolean(config.token),
     provider: providerHealth(config),
     tasks: state.tasks.length,

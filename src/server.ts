@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
-import { createHandler, isPairingBootstrapPath, isWebProxyPath, proxyWebSocketUpgrade, SESSION_COOKIE, webSocketProxyHandler, writePid } from "./http";
-import { isLoopbackHost, webBoundRequestAllowed } from "./lib/origin-trust";
+import { createHandler, isWebProxyPath, proxyWebSocketUpgrade, relaySessionGateRequired, SESSION_COOKIE, webSocketProxyHandler, writePid } from "./http";
+import { webBoundRequestAllowed } from "./lib/origin-trust";
 import { cookieValue } from "./lib/cookies";
 import { resolveSessionFromCookie } from "./governance/pairing";
 import { runDueJobs } from "./jobs";
@@ -193,7 +193,7 @@ const server = Bun.serve({
       // needs in dev). Reject fully before bridging so no frame is accepted.
       const wsPath = new URL(request.url).pathname;
       const wsHost = request.headers.get("host") ?? new URL(request.url).host;
-      if (!isLoopbackHost(wsHost) && !isPairingBootstrapPath(wsPath)
+      if (relaySessionGateRequired(wsHost, wsPath)
           && !resolveSessionFromCookie(config, cookieValue(request, SESSION_COOKIE))) {
         return new Response("Unauthorized", { status: 401 });
       }

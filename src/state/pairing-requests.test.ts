@@ -28,7 +28,7 @@ function makeRequest(state = createEmptyState("sandbox"), overrides: { userAgent
   return createPairingRequest(state, {
     userAgent: overrides.userAgent ?? SAFARI_IPHONE,
     relayHost: overrides.relayHost ?? "sub.gini-relay.lilaclabs.ai",
-    bindHash: BIND,
+    bindSecret: SECRET,
     ttlSeconds: overrides.ttlSeconds
   });
 }
@@ -434,5 +434,34 @@ describe("findActiveDeviceByToken", () => {
     const { state, token, device } = mintSession();
     state.devices[0]!.expiresAt = new Date(Date.now() + 60_000).toISOString();
     expect(findActiveDeviceByToken(state, token)?.id).toBe(device.id);
+  });
+});
+
+describe("approved request lifecycle (not terminal)", () => {
+  test("an approved request past its expiry is no longer claimable", () => {
+    const state = createEmptyState("sandbox");
+    const request = makeRequest(state);
+    approvePairingRequest(state, request.id);
+    // Backdate the approval past its deadline.
+    state.pairingRequests.find((r) => r.id === request.id)!.expiresAt = new Date(Date.now() - 1000).toISOString();
+    const result = claimPairingRequest(state, request.id, SECRET);
+    expect(result).toEqual({ ok: false, reason: "not_approved" });
+    // expirePairingRequests (run at the top of claim) flipped it to "expired".
+    expect(state.pairingRequests.find((r) => r.id === request.id)?.status).toBe("expired");
+  });
+
+  test("a live approved request is never pruned, even behind many terminal rows", () => {
+    const state = createEmptyState("sandbox");
+    const approved = makeRequest(state);
+    approvePairingRequest(state, approved.id);
+    // Pile up more than the terminal retention cap of rejected rows after it.
+    // (Each is rejected immediately so the pending cap is never hit.)
+    for (let i = 0; i < 60; i++) {
+      rejectPairingRequest(state, makeRequest(state).id);
+    }
+    expirePairingRequests(state);
+    // The approved row is ACTIVE (not terminal) so it survives; terminal capped at 50.
+    expect(state.pairingRequests.find((r) => r.id === approved.id)?.status).toBe("approved");
+    expect(state.pairingRequests.filter((r) => r.status === "rejected").length).toBe(50);
   });
 });

@@ -88,14 +88,19 @@ session gate.
 ## Cookie handling
 
 - `gini_session`: value is a `gini_device_<uuid>` token; only `hashSecret(token)`
-  persists. `HttpOnly; Secure; SameSite=Lax; Path=/`, `Domain` unset (host-only
-  to the exact relay subdomain), finite `Max-Age`. HttpOnly because the web app
+  persists. `HttpOnly; SameSite=Lax; Path=/`, `Domain` unset (host-only to the
+  exact relay subdomain), finite `Max-Age`. HttpOnly because the web app
   authenticates `/api/runtime/*` via the BFF's server-side bearer — the cookie is
   purely the gateway's relay gate, never read by JS.
-- `gini_pair`: per-request binding secret, `HttpOnly; Secure; SameSite=Lax;
+- `gini_pair`: per-request binding secret, `HttpOnly; SameSite=Lax;
   Path=/api/pairing`. Only the browser that created a request holds it, so a
   third party that learns a request id can neither claim its session nor cancel
   it. Cleared on claim/cancel.
+- `Secure` is conditional (`pairingCookieSecure`): set on relay (always HTTPS)
+  and loopback fronts and any HTTPS request, and omitted only on a deliberately
+  plain-HTTP `GINI_TRUSTED_ORIGINS` front — where a `Secure` cookie would be
+  silently dropped by the browser and the whole connection is already cleartext
+  by the operator's transport choice. Use HTTPS for any remote front.
 
 ## Context
 

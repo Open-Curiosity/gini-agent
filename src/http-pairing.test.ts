@@ -1,10 +1,15 @@
-import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RuntimeConfig } from "./types";
-import { createHandler, isPairingBootstrapPath } from "./http";
+import { createHandler, isPairingBootstrapPath, resetPairingLimiters } from "./http";
 import { createPairingRequest, mutateState } from "./state";
+
+// The pairing rate limiters are module-level singletons shared across this
+// file's many create calls; reset their buckets before each test so tests stay
+// hermetic regardless of order.
+beforeEach(() => resetPairingLimiters());
 
 function testConfig(instance: string): RuntimeConfig {
   const root = mkdtempSync(join(tmpdir(), `gini-pair-${instance}-`));
@@ -476,7 +481,7 @@ describe("pairing routes — rate limit + pending cap", () => {
     // what the create has to clear. A fresh host keeps the host limiter happy.
     await mutateState(config.instance, (state) => {
       for (let i = 0; i < 20; i++) {
-        createPairingRequest(state, { userAgent: "seed", relayHost: relay, bindHash: `seed-${i}` });
+        createPairingRequest(state, { userAgent: "seed", relayHost: relay, bindSecret: `seed-${i}` });
       }
     });
     const res = await pair(handler, "/api/pairing/request", {

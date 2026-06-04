@@ -143,22 +143,29 @@ export function expirePairingCodes(state: RuntimeState): void {
 // endpoint can't grow durable state without bound (mirrors the events ring
 // buffer cap in src/state/audit.ts).
 const RETAINED_TERMINAL_PAIRING_REQUESTS = 50;
+// "approved" is deliberately NOT terminal: an approved request is still
+// claimable and cancellable, so it must never be pruned and must still expire.
 const TERMINAL_PAIRING_STATUSES = new Set<PairingRequestStatus>([
-  "approved",
   "rejected",
   "cancelled",
   "claimed",
   "expired"
 ]);
 
-// Lazily expire stale pending pairing requests, mirroring expirePairingCodes,
-// then prune terminal rows so the array stays bounded. Called at the top of
-// every pairing-request read/mutate.
+// Lazily expire stale pairing requests, mirroring expirePairingCodes, then prune
+// terminal rows so the array stays bounded. Called at the top of every
+// pairing-request read/mutate. Both pending AND approved-but-unclaimed requests
+// expire once past their deadline — so a claim arriving after expiry sees
+// "expired", not a stale "approved".
 export function expirePairingRequests(state: RuntimeState): void {
   const at = Date.now();
   for (const request of state.pairingRequests) {
-    if (request.status === "pending" && new Date(request.expiresAt).getTime() <= at) {
+    if (
+      (request.status === "pending" || request.status === "approved")
+      && new Date(request.expiresAt).getTime() <= at
+    ) {
       request.status = "expired" satisfies PairingRequestStatus;
+      request.resolvedAt ??= now();
     }
   }
   // Keep every non-terminal (pending) row plus the newest N terminal rows.

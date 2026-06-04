@@ -1,5 +1,5 @@
 import type { RuntimeConfig } from "../types";
-import { readState, redactPairingRequest } from "../state";
+import { readState } from "../state";
 import { redactDevice } from "../governance/pairing";
 import { status } from "./index";
 
@@ -50,10 +50,10 @@ export function publicState(config: RuntimeConfig) {
       claimedAt: pairing.claimedAt,
       claimedByDeviceId: pairing.claimedByDeviceId
     })),
-    devices: state.devices.map(redactDevice),
-    // Strip the binding-secret hash (and userAgent) from pending pairing
-    // requests — publicState is served to clients (incl. owner-equivalent relay
-    // browsers via the BFF), and bindHash must never leave the gateway.
-    pairingRequests: state.pairingRequests.map(redactPairingRequest)
+    devices: state.devices.map(redactDevice)
+    // pairingRequests is intentionally NOT exposed here. No client reads it off
+    // /api/state; the operator panel fetches it from the dedicated loopback-only
+    // GET /api/pairing/requests (which redacts the bindHash). Keeping it out of
+    // the broadly-readable state payload avoids leaking pending-request metadata.
   };
 }

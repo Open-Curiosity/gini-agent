@@ -17,6 +17,7 @@ import {
   now,
   PairingCapExceededError,
   readState,
+  SESSION_TTL_MS,
   unreadCountsByDevice,
   readTrace,
   readUpload,
@@ -95,7 +96,6 @@ import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, selectProvide
 import { isLoopbackHost, isRelayHost, webBoundRequestAllowed } from "./lib/origin-trust";
 import { cookieValue, serializeCookie } from "./lib/cookies";
 import { RateLimiter } from "./lib/rate-limit";
-import { hashSecret } from "./state/security";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
@@ -1660,7 +1660,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // stay reachable so a new device can run the handshake. See ADR
     // device-pairing-auth.md.
     const webHost = request.headers.get("host") ?? url.host;
-    if (!isLoopbackHost(webHost) && !isPairingBootstrapPath(url.pathname)) {
+    if (relaySessionGateRequired(webHost, url.pathname)) {
       const sessionToken = cookieValue(request, SESSION_COOKIE);
       if (!sessionToken || !resolveSessionFromCookie(config, sessionToken)) {
         return url.pathname.startsWith("/api/")
@@ -2190,7 +2190,9 @@ async function rollbackIdentityFile(
 // carries the minted session token (scoped to the whole app).
 const PAIR_BIND_COOKIE = "gini_pair";
 export const SESSION_COOKIE = "gini_session";
-const SESSION_COOKIE_TTL_SECONDS = 30 * 24 * 60 * 60;
+// Derived from the single source of truth so the cookie Max-Age and the
+// server-side device.expiresAt can't drift apart.
+const SESSION_COOKIE_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
 const PAIR_BIND_COOKIE_TTL_SECONDS = 3600;
 // Flood control on the public create endpoint. Keyed on the inbound Host (the
 // relay subdomain is un-forgeable — the relay owns its DNS), NOT on
@@ -2200,6 +2202,13 @@ const PAIR_BIND_COOKIE_TTL_SECONDS = 3600;
 // createPairingRequest (see src/state/records.ts), not here.
 const pairingHostLimiter = new RateLimiter({ capacity: 10, refillPerSec: 10 / 60 });
 const pairingGlobalLimiter = new RateLimiter({ capacity: 40, refillPerSec: 40 / 60 });
+
+// Test hook: drop the in-process pairing limiter buckets so a test file's many
+// create calls don't deplete the shared module-level buckets across tests.
+export function resetPairingLimiters(): void {
+  pairingHostLimiter.reset();
+  pairingGlobalLimiter.reset();
+}
 
 const sessionCookieAttributes = { httpOnly: true, sameSite: "Lax" as const, path: "/" };
 const bindCookieAttributes = { httpOnly: true, sameSite: "Lax" as const, path: "/api/pairing" };
@@ -2234,6 +2243,15 @@ export function isPairingBootstrapPath(pathname: string): boolean {
   if (pathname.startsWith("/_next/")) return true;
   if (pathname === "/favicon.ico") return true;
   return /\.(png|jpe?g|svg|gif|webp|ico|woff2?|ttf|otf|css|js|map|json|txt)$/.test(pathname);
+}
+
+// True when a web-bound request must carry a valid gini_session cookie: a
+// non-loopback (relay/allowlisted) front on a non-bootstrap path. Shared by the
+// HTTP fall-through (src/http.ts) and the WS upgrade (src/server.ts) so the two
+// relay-session gates can't drift; each caller keeps its own transport-specific
+// rejection (HTTP redirects page navs / 401s the API; WS returns a flat 401).
+export function relaySessionGateRequired(host: string, pathname: string): boolean {
+  return !isLoopbackHost(host) && !isPairingBootstrapPath(pathname);
 }
 
 // Exactly the device-pairing paths the gateway handles natively before the
@@ -2283,7 +2301,7 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
       created = await requestPairing(config, {
         userAgent: request.headers.get("user-agent") ?? "",
         relayHost: host,
-        bindHash: hashSecret(bindSecret)
+        bindSecret
       });
     } catch (error) {
       // Cap enforced atomically inside the create mutation.

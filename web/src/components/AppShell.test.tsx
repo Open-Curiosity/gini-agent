@@ -14,15 +14,24 @@
 // for the 100% coverage gate without covering it. The stub fully replaces it.
 // We also do NOT mock @/components/tunnel/TunnelMenu or its useTunnel hook —
 // those ARE subjects of the tunnel tests, and stubbing them leaks. Instead the
-// REAL TunnelMenu renders (its on-mount tunnel fetch rejects harmlessly on
-// happy-dom and is swallowed by useTunnel), so the shell branch is observable via
-// the Sidebar stub + the real tunnel trigger.
+// REAL TunnelMenu renders, so the shell branch is observable via the Sidebar stub
+// + the real tunnel trigger.
+//
+// DETERMINISM: TunnelMenu's useTunnel() fires a GET on mount. happy-dom restores
+// the native fetch, so that real async call would resolve AFTER the synchronous
+// assertions and commit React state outside act() (the "not wrapped in act(...)"
+// warning, and a risk of a post-teardown setState). We stub globalThis.fetch with
+// a resolved tunnel-state Response (leak-safe: snapshot the real fetch in a
+// closure and restore it in afterEach), and the shell-rendering tests await the
+// in-flight read inside act via waitFor before they finish. The /pair tests render
+// children bare (no TunnelMenu mounts), so there is nothing to drain there.
 
-import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { render, screen } from "@testing-library/react";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 const realNav = await import("next/navigation");
+const realFetch = globalThis.fetch;
 
 let pathname: string | null = "/";
 let AppShell: typeof import("./AppShell").AppShell;
@@ -58,10 +67,23 @@ function renderShell() {
 
 beforeEach(() => {
   pathname = "/";
+  // Resolve useTunnel's on-mount GET deterministically so its state commit lands
+  // inside act (drained via waitFor below) rather than after teardown.
+  globalThis.fetch = mock(
+    async () =>
+      new Response(
+        JSON.stringify({ providers: [], selectedProvider: null, status: "idle" }),
+        { headers: { "content-type": "application/json" } }
+      )
+  ) as unknown as typeof fetch;
+});
+
+afterEach(() => {
+  globalThis.fetch = realFetch;
 });
 
 describe("AppShell", () => {
-  test("normal route: wraps children in the full shell (Sidebar + MobileTopBar + tunnel chrome)", () => {
+  test("normal route: wraps children in the full shell (Sidebar + MobileTopBar + tunnel chrome)", async () => {
     pathname = "/chat";
     const { container } = renderShell();
     expect(screen.queryByTestId("sidebar-stub")).not.toBeNull();
@@ -69,8 +91,12 @@ describe("AppShell", () => {
     expect(screen.queryByTestId("child")).not.toBeNull();
     // The shell's distinctive flex container is present on non-/pair routes.
     expect(container.querySelector(".flex.h-screen")).not.toBeNull();
-    // The real tunnel trigger renders inside the shell.
-    expect(screen.queryByRole("button", { name: /tunnel/i })).not.toBeNull();
+    // The real tunnel trigger renders inside the shell. Awaiting it also drains
+    // useTunnel's on-mount GET inside act, so the state commit doesn't fire after
+    // teardown.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /tunnel/i })).not.toBeNull()
+    );
   });
 
   test("/pair: renders only children, no app chrome", () => {
@@ -91,10 +117,15 @@ describe("AppShell", () => {
     expect(container.querySelector(".flex.h-screen")).toBeNull();
   });
 
-  test("a null pathname falls through to the full shell", () => {
+  test("a null pathname falls through to the full shell", async () => {
     pathname = null;
     renderShell();
     expect(screen.queryByTestId("sidebar-stub")).not.toBeNull();
     expect(screen.queryByTestId("child")).not.toBeNull();
+    // This route also mounts the real TunnelMenu; drain its on-mount GET inside
+    // act so the state commit lands before teardown.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /tunnel/i })).not.toBeNull()
+    );
   });
 });
