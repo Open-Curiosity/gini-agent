@@ -133,12 +133,24 @@ function readRecordedPort(path: string): number | null {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+// Read the recorded port from the on-disk file by instance NAME, without
+// materializing a RuntimeConfig. The config-based readers below delegate
+// here; callers that only have the instance name (e.g. `autostart enable`,
+// which deliberately never loads config) use these directly.
+export function recordedRuntimePortForInstance(instance: string): number | null {
+  return readRecordedPort(runtimePortPath(instance));
+}
+
+export function recordedWebPortForInstance(instance: string): number | null {
+  return readRecordedPort(webPortPath(instance));
+}
+
 export function recordedRuntimePort(config: RuntimeConfig): number | null {
-  return readRecordedPort(runtimePortPath(config.instance));
+  return recordedRuntimePortForInstance(config.instance);
 }
 
 export function recordedWebPort(config: RuntimeConfig): number | null {
-  return readRecordedPort(webPortPath(config.instance));
+  return recordedWebPortForInstance(config.instance);
 }
 
 export async function start(config: RuntimeConfig, options: WebOptions): Promise<{ runtimeStarted: boolean; banner: Record<string, unknown>; children: ForegroundChildren }> {
