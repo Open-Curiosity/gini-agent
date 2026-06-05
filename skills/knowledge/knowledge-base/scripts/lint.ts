@@ -118,13 +118,15 @@ function parseFrontmatter(fm: string): Record<string, unknown> {
       }
       continue;
     }
-    // Block list: collect following `- ` lines.
+    // Block list: collect following `- ` lines. Accept both indented and
+    // column-0 sequences, since YAML allows a block sequence at the same
+    // indent as its key.
     const items: string[] = [];
     let j = i + 1;
     for (; j < lines.length; j += 1) {
       const next = lines[j]!;
       if (!next.trim()) continue;
-      const m = next.match(/^\s+-\s+(.*)$/);
+      const m = next.match(/^\s*-\s+(.*)$/);
       if (!m) break;
       items.push(unquote(m[1]!.trim()));
     }
