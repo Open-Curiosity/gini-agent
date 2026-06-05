@@ -269,6 +269,29 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // start_thread: the agent-decided threading control tool. CORE
+    // (always-on, never deferred, never approval-gated). Handled INLINE in
+    // the chat-task loop (not via the dispatch switch) so it branches the
+    // current turn into a thread WITHOUT emitting any phase/tool_call/
+    // tool_result chat block — it's a control action, not visible work.
+    // The `<route>thread</route>` text directive remains as a silent
+    // fallback; this tool is the primary mechanism because models call
+    // tools reliably but don't reliably emit the leading directive token.
+    toolset: "core",
+    displayLabel: "Start thread",
+    type: "function",
+    function: {
+      name: "start_thread",
+      description: "Branch your reply into a thread off your previous message, keeping the main chat scannable. Call this as your FIRST action (before any text or other tool) when the user's message opens multi-turn work — research, brainstorming, debugging, planning, a comparison, anything you expect follow-ups about. Do nothing (reply in the main chat) for quick answers, confirmations, single facts, or one-shot actions. Never call it when you are already replying inside a thread.",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: { type: "string", description: "Optional short thread title / summary of what the thread is about." }
+        }
+      }
+    }
+  },
+  {
     toolset: "browser",
     displayLabel: "Open page",
     type: "function",
@@ -1771,6 +1794,10 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // the live tools array. Deferral itself is applied later by
     // applyDeferralFilter, not by this gate — load_tools is never deferred.
     if (tool.function.name === "load_tools") return true;
+    // start_thread is the always-on threading control tool. Core, never
+    // deferred; the agent needs it on every turn to branch multi-turn work
+    // into a thread regardless of which toolsets are enabled.
+    if (tool.function.name === "start_thread") return true;
     // Always expose read_skill so the model can load any enabled skill the
     // system prompt advertises. The "skills" toolset isn't part of the
     // legacy default toolsets; gating it on enable would mean a fresh

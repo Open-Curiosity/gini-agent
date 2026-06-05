@@ -57,6 +57,12 @@ export interface ChatEmitContext {
   agentId?: string;
   runId?: string;
   taskId: string;
+  // Thread membership stamped onto every block emitted through this context.
+  // Set when the turn routes into a thread (either pre-seeded from the Task
+  // for a thread-reply, or minted mid-turn when the `<route>thread</route>`
+  // directive fires). Absent for main-chat turns.
+  threadId?: string;
+  parentBlockId?: string;
 }
 
 // Resolve the emission context for a task. Returns undefined when the
@@ -81,14 +87,19 @@ export function resolveEmitContext(
     sessionId: task.chatSessionId,
     agentId: task.agentId ?? session.agentId,
     runId: task.runId,
-    taskId
+    taskId,
+    // Pre-thread the context when the task was spawned to reply inside a
+    // thread (or had its thread fields persisted mid-turn). The whole
+    // response then threads with no directive — user context wins.
+    ...(task.threadId ? { threadId: task.threadId } : {}),
+    ...(task.parentBlockId ? { parentBlockId: task.parentBlockId } : {})
   };
 }
 
 // Common bookkeeping fields shared by every emit helper. Callers omit
 // the kind-specific narrowing fields and we fill in sessionId, taskId,
 // runId, agentId from the ChatEmitContext.
-type EmitBookkeeping = Pick<ChatEmitContext, "sessionId" | "taskId" | "runId"> & {
+type EmitBookkeeping = Pick<ChatEmitContext, "sessionId" | "taskId" | "runId" | "threadId" | "parentBlockId"> & {
   agentId?: string | null;
 };
 
@@ -97,7 +108,12 @@ function bookkeepingFor(ctx: ChatEmitContext): EmitBookkeeping {
     sessionId: ctx.sessionId,
     taskId: ctx.taskId,
     runId: ctx.runId,
-    agentId: ctx.agentId
+    agentId: ctx.agentId,
+    // Stamp thread membership onto every kind of block (assistant text, tool
+    // calls, tool results, phases, …) so an entire threaded turn stays in the
+    // thread. insertChatBlock already persists these columns.
+    ...(ctx.threadId ? { threadId: ctx.threadId } : {}),
+    ...(ctx.parentBlockId ? { parentBlockId: ctx.parentBlockId } : {})
   };
 }
 

@@ -50,7 +50,14 @@ import { id, now } from "./ids";
 // devices.origin CHECK to `IN ('loopback')` and purges any legacy
 // non-loopback (tunnel-paired) rows on open, so a device paired over the
 // removed tunnel can no longer receive pushes.
-export const MEMORY_SCHEMA_VERSION = 8;
+//
+// Bumped to 9 for chat-block threading: adds thread_id / parent_block_id
+// columns to chat_blocks so a thread is a span of blocks inside an
+// agent's single session (no per-thread session). Fresh installs get the
+// columns through CREATE TABLE; existing installs add them via additive
+// ensureColumn calls. The (session_id, thread_id, ordinal) index covers
+// thread playback; the existing UNIQUE(session_id, ordinal) is untouched.
+export const MEMORY_SCHEMA_VERSION = 9;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
@@ -357,6 +364,8 @@ function applyMigrations(db: Database): void {
       payload_json TEXT NOT NULL,
       task_id TEXT,
       run_id TEXT,
+      thread_id TEXT,
+      parent_block_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE (session_id, ordinal)
@@ -365,6 +374,16 @@ function applyMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_task ON chat_blocks(task_id) WHERE task_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_agent ON chat_blocks(agent_id);
   `);
+
+  // Pre-v9 installs already have a chat_blocks table without the thread
+  // columns; the CREATE TABLE IF NOT EXISTS above is a no-op against them.
+  // Add the columns in-place so existing rows read back as main-chat
+  // (NULL thread_id). The (session_id, thread_id, ordinal) index is
+  // deferred until after the columns exist, otherwise SQLite's parse-time
+  // validation would reject it on the legacy shape.
+  ensureColumn(db, "chat_blocks", "thread_id", "TEXT");
+  ensureColumn(db, "chat_blocks", "parent_block_id", "TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_chat_blocks_thread ON chat_blocks(session_id, thread_id, ordinal);");
 
   // Recreate chat_blocks if its CHECK constraint predates the
   // authorization_requested / setup_requested kinds. The old single
@@ -535,6 +554,11 @@ export function ensureChatBlocksKindConstraint(db: Database): void {
     )
     .get();
   if (!row || row.sql.includes("setup_requested")) return;
+  // The copy-forward below selects thread_id / parent_block_id. A pre-split
+  // table predates those columns too, so add them first — this keeps the
+  // recreate self-sufficient regardless of migration call order.
+  ensureColumn(db, "chat_blocks", "thread_id", "TEXT");
+  ensureColumn(db, "chat_blocks", "parent_block_id", "TEXT");
   db.exec(`
     CREATE TABLE chat_blocks_v3 (
       id TEXT PRIMARY KEY,
@@ -550,19 +574,22 @@ export function ensureChatBlocksKindConstraint(db: Database): void {
       payload_json TEXT NOT NULL,
       task_id TEXT,
       run_id TEXT,
+      thread_id TEXT,
+      parent_block_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE (session_id, ordinal)
     );
     INSERT INTO chat_blocks_v3
-      (id, session_id, instance, agent_id, ordinal, kind, payload_json, task_id, run_id, created_at, updated_at)
-      SELECT id, session_id, instance, agent_id, ordinal, kind, payload_json, task_id, run_id, created_at, updated_at
+      (id, session_id, instance, agent_id, ordinal, kind, payload_json, task_id, run_id, thread_id, parent_block_id, created_at, updated_at)
+      SELECT id, session_id, instance, agent_id, ordinal, kind, payload_json, task_id, run_id, thread_id, parent_block_id, created_at, updated_at
       FROM chat_blocks;
     DROP TABLE chat_blocks;
     ALTER TABLE chat_blocks_v3 RENAME TO chat_blocks;
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_session ON chat_blocks(session_id, ordinal);
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_task ON chat_blocks(task_id) WHERE task_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_agent ON chat_blocks(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_chat_blocks_thread ON chat_blocks(session_id, thread_id, ordinal);
   `);
 }
 

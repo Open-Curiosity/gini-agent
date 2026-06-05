@@ -90,6 +90,24 @@ function startOfDay(d: Date): Date {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
 }
 
+// Human-readable cadence for a recurring job. Cron-driven jobs show the
+// raw 5-field expression (the runtime validates it on create); interval
+// jobs collapse to the largest whole unit ("Every 6h", "Every 30m").
+export function jobCadence(job: {
+  cronExpression?: string;
+  intervalSeconds?: number;
+}): string {
+  if (job.cronExpression) return job.cronExpression;
+  if (typeof job.intervalSeconds === "number" && job.intervalSeconds > 0) {
+    const s = job.intervalSeconds;
+    if (s % 86400 === 0) return `Every ${s / 86400}d`;
+    if (s % 3600 === 0) return `Every ${s / 3600}h`;
+    if (s % 60 === 0) return `Every ${s / 60}m`;
+    return `Every ${s}s`;
+  }
+  return "Recurring";
+}
+
 function formatClockTime(d: Date): string {
   // Locale-independent rendering — the design's "5:52 PM" / "10:46 AM"
   // shape is the same on every device, and toLocaleTimeString varies
