@@ -53,23 +53,8 @@ import {
   type IdentityFileStatus
 } from "../runtime/identity-files";
 import { resolveEffectiveContext } from "./effective-context";
-import {
-  buildContactQuery as buildContactQueryFromGetters,
-  importContactsFromFile,
-  relateContacts,
-  relationViews,
-  resolveContactRef,
-  upsertContact
-} from "../contacts";
-import {
-  companyBreakdown,
-  countContacts,
-  mutualConnections,
-  queryContacts,
-  type Contact,
-  type ContactInput,
-  type ContactQuery
-} from "../state";
+import { importTableFromFile } from "../data/import-table";
+import { dbExecute, dbListTables, dbQuery } from "../state";
 import { resolveEmitContext, setToolCallRunningHint } from "./chat-task-emit";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
@@ -184,18 +169,14 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await runJobTool(config, taskId, args) };
     case "recall_memory":
       return { kind: "sync", result: await recallMemoryTool(config, taskId, args) };
-    case "contacts_import":
-      return { kind: "sync", result: await contactsImportTool(config, taskId, args) };
-    case "contacts_query":
-      return { kind: "sync", result: await contactsQueryTool(config, taskId, args) };
-    case "contacts_count":
-      return { kind: "sync", result: await contactsCountTool(config, taskId, args) };
-    case "contacts_upsert":
-      return { kind: "sync", result: await contactsUpsertTool(config, taskId, args) };
-    case "contacts_relate":
-      return { kind: "sync", result: await contactsRelateTool(config, taskId, args) };
-    case "contacts_relations":
-      return { kind: "sync", result: await contactsRelationsTool(config, taskId, args) };
+    case "db_query":
+      return { kind: "sync", result: await dbQueryTool(config, taskId, args) };
+    case "db_execute":
+      return { kind: "sync", result: await dbExecuteTool(config, taskId, args) };
+    case "db_import":
+      return { kind: "sync", result: await dbImportTool(config, taskId, args) };
+    case "db_schema":
+      return { kind: "sync", result: await dbSchemaTool(config, taskId, args) };
     case "edit_soul":
       return { kind: "sync", result: await editSoulTool(config, taskId, args) };
     case "edit_user_profile":
@@ -1931,12 +1912,14 @@ async function recallMemoryTool(
   });
 }
 
-// ---- People-CRM contacts tools (ADR people-crm-store.md) ----
+// ---- Agent-database primitive tools (ADR agent-database.md) ----
 //
-// All contacts tools resolve the active agent and scope every read/write to its
-// per-agent contact namespace, mirroring recall_memory's isolation. They are
-// low-risk / no-approval: writes are local, reversible, and explicitly
-// user-requested, matching the auto-retain memory-write philosophy.
+// db_query / db_execute / db_import / db_schema operate on the active agent's
+// own sandboxed SQLite file (src/state/agent-data-db.ts), isolated from Gini's
+// system data. Low-risk / no-approval: it's the agent's private data store, like
+// memory; the file-level isolation is the safety boundary. AgentDataError from
+// the storage layer propagates as the tool result so the model can correct its
+// SQL.
 
 function requireAgentId(config: RuntimeConfig, what: string): string {
   const state = readState(config.instance);
@@ -1955,227 +1938,53 @@ function optStr(args: Record<string, unknown>, key: string): string | undefined 
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function optBool(args: Record<string, unknown>, key: string): boolean | undefined {
-  const value = args[key];
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "boolean") throw new Error(`Argument ${key} must be a boolean.`);
-  return value;
+function queryParams(args: Record<string, unknown>): unknown[] {
+  if (args.params === undefined || args.params === null) return [];
+  if (!Array.isArray(args.params)) throw new Error("Argument params must be an array.");
+  return args.params;
 }
 
-function buildContactQuery(args: Record<string, unknown>): ContactQuery {
-  return buildContactQueryFromGetters(
-    (key) => optStr(args, key),
-    (key) => optBool(args, key),
-    (key) => (args[key] === undefined || args[key] === null ? undefined : optionalNumber(args, key, 0))
-  );
-}
-
-// Compact contact shape for tool output — drop nulls so the model isn't paying
-// for empty fields on every row of a large result set.
-function summarizeContact(c: Contact): Record<string, unknown> {
-  const out: Record<string, unknown> = { id: c.id, name: c.fullName };
-  if (c.company) out.company = c.company;
-  if (c.title) out.title = c.title;
-  if (c.location) out.location = c.location;
-  if (c.email) out.email = c.email;
-  if (c.linkedinUrl) out.linkedinUrl = c.linkedinUrl;
-  if (c.connectedAt) out.connectedAt = c.connectedAt;
-  if (c.notes) out.notes = c.notes;
-  return out;
-}
-
-async function contactsImportTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  const path = requireString(args, "path");
-  const source = optionalString(args, "source", "linkedin_import");
-  const agentId = requireAgentId(config, "import contacts");
-  const report = await importContactsFromFile(config, agentId, path, source);
-  appendTrace(config.instance, taskId, {
-    type: "tool",
-    message: "Contacts imported",
-    data: { path, created: report.created, updated: report.updated, skipped: report.skipped }
+async function dbQueryTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const agentId = requireAgentId(config, "query the database");
+  const sql = requireString(args, "sql");
+  const result = dbQuery(config.instance, agentId, sql, queryParams(args));
+  await recordLowRiskAudit(config, taskId, "db.query", sql.slice(0, 200), {
+    rows: result.rowCount,
+    truncated: result.truncated
   });
-  await recordLowRiskAudit(config, taskId, "contacts.imported", path, {
-    created: report.created,
-    updated: report.updated,
-    skipped: report.skipped,
-    total: report.contactsTotal
+  return JSON.stringify(result);
+}
+
+async function dbExecuteTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const agentId = requireAgentId(config, "use the database");
+  const sql = requireString(args, "sql");
+  const result = dbExecute(config.instance, agentId, sql, queryParams(args));
+  appendTrace(config.instance, taskId, { type: "tool", message: "Database write", data: { sql: sql.slice(0, 200), changes: result.changes } });
+  await recordLowRiskAudit(config, taskId, "db.execute", sql.slice(0, 200), { changes: result.changes });
+  return JSON.stringify(result);
+}
+
+async function dbImportTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const agentId = requireAgentId(config, "import into the database");
+  const path = requireString(args, "path");
+  const table = requireString(args, "table");
+  const skipLines = typeof args.skipLines === "number" ? args.skipLines : undefined;
+  const recreate = args.recreate === true;
+  const report = await importTableFromFile(config, agentId, path, table, { skipLines, recreate });
+  appendTrace(config.instance, taskId, { type: "tool", message: "Table imported", data: { ...report } });
+  await recordLowRiskAudit(config, taskId, "db.import", `${path} -> ${report.table}`, {
+    rowsInserted: report.rowsInserted,
+    rowsSkipped: report.rowsSkipped
   });
   return JSON.stringify(report);
 }
 
-async function contactsQueryTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  const agentId = requireAgentId(config, "query contacts");
-  const query = buildContactQuery(args);
-  const result = queryContacts(config.instance, agentId, query);
-  await recordLowRiskAudit(config, taskId, "contacts.queried", JSON.stringify(query).slice(0, 200), {
-    total: result.total,
-    returned: result.contacts.length
-  });
-  return JSON.stringify({
-    total: result.total,
-    returned: result.contacts.length,
-    offset: result.offset,
-    hasMore: result.hasMore,
-    contacts: result.contacts.map(summarizeContact)
-  });
-}
-
-async function contactsCountTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  const agentId = requireAgentId(config, "count contacts");
-  const query = buildContactQuery(args);
-  const count = countContacts(config.instance, agentId, query);
-  const out: Record<string, unknown> = { count };
-  if (optStr(args, "breakdown") === "company") {
-    out.companies = companyBreakdown(config.instance, agentId, 50);
-  }
-  await recordLowRiskAudit(config, taskId, "contacts.counted", JSON.stringify(query).slice(0, 200), { count });
-  return JSON.stringify(out);
-}
-
-// Build a ContactInput patch from only the keys the model actually supplied, so
-// updateContact's merge semantics hold (an omitted key is left untouched; an
-// explicit "" clears the column).
-function collectContactInput(args: Record<string, unknown>): ContactInput {
-  const patch: Record<string, unknown> = {};
-  const fields = [
-    "fullName", "firstName", "lastName", "company", "title",
-    "location", "email", "linkedinUrl", "connectedAt", "notes"
-  ];
-  for (const key of fields) {
-    if (key in args && args[key] !== undefined) {
-      const value = args[key];
-      if (value !== null && typeof value !== "string") throw new Error(`Argument ${key} must be a string.`);
-      patch[key] = value;
-    }
-  }
-  return patch as ContactInput;
-}
-
-// Format a one-line message describing why a contact ref couldn't be resolved,
-// so the model gets an actionable next step instead of a bare failure.
-function unresolvedMessage(role: string, ref: string, candidates: Contact[] | undefined): string {
-  if (candidates && candidates.length > 0) {
-    const names = candidates.map((c) => `${c.fullName}${c.company ? ` (${c.company}, id ${c.id})` : ` (id ${c.id})`}`);
-    return `${role} "${ref}" is ambiguous: ${names.join("; ")}. Re-run with the contact id.`;
-  }
-  return `No contact found for ${role} "${ref}". Add them first with contacts_upsert.`;
-}
-
-async function contactsUpsertTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  const agentId = requireAgentId(config, "save a contact");
-  const input: ContactInput & { id?: string } = collectContactInput(args);
-  const explicitId = optStr(args, "id");
-  if (explicitId) input.id = explicitId;
-
-  const result = upsertContact(config.instance, agentId, input, "chat");
-  if (result.action === "ambiguous") {
-    return JSON.stringify({
-      action: "ambiguous",
-      message: `More than one contact named "${result.name}". Confirm which one (pass its id), or include a distinguishing field.`,
-      candidates: result.candidates.map(summarizeContact)
-    });
-  }
-  await recordLowRiskAudit(config, taskId, `contacts.${result.action}`, result.contact.fullName, {
-    id: result.contact.id
-  });
-  return JSON.stringify({ action: result.action, contact: summarizeContact(result.contact) });
-}
-
-async function contactsRelateTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  const agentId = requireAgentId(config, "relate contacts");
-  const fromRef = requireString(args, "from");
-  const toRef = requireString(args, "to");
-  const relationType = optionalString(args, "relationType", "knows");
-  const note = optStr(args, "note") ?? null;
-
-  const result = relateContacts(config.instance, agentId, fromRef, toRef, relationType, note, "chat");
-  if (!result.ok) {
-    if (result.reason === "self") {
-      return JSON.stringify({ action: "error", message: "A contact cannot be related to itself." });
-    }
-    return JSON.stringify({
-      action: "unresolved",
-      message: unresolvedMessage(result.role ?? "contact", result.ref ?? "", result.candidates)
-    });
-  }
-  await recordLowRiskAudit(
-    config,
-    taskId,
-    "contacts.related",
-    `${result.from.fullName} ${result.relationType} ${result.to.fullName}`,
-    { from: result.from.id, to: result.to.id, relationType: result.relationType }
-  );
-  return JSON.stringify({
-    action: "related",
-    from: summarizeContact(result.from),
-    to: summarizeContact(result.to),
-    relationType: result.relationType
-  });
-}
-
-async function contactsRelationsTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  const agentId = requireAgentId(config, "read contact relations");
-  const ref = optStr(args, "id") ?? optStr(args, "name");
-  if (!ref) throw new Error("Provide a contact name or id.");
-  const primary = resolveContactRef(config.instance, agentId, ref);
-  if (!("contact" in primary)) {
-    return JSON.stringify({
-      action: "unresolved",
-      message: unresolvedMessage("contact", ref, "candidates" in primary ? primary.candidates : undefined)
-    });
-  }
-
-  const mutualRef = optStr(args, "mutualWith");
-  if (mutualRef) {
-    const other = resolveContactRef(config.instance, agentId, mutualRef);
-    if (!("contact" in other)) {
-      return JSON.stringify({
-        action: "unresolved",
-        message: unresolvedMessage("mutualWith", mutualRef, "candidates" in other ? other.candidates : undefined)
-      });
-    }
-    const mutual = mutualConnections(config.instance, agentId, primary.contact.id, other.contact.id);
-    await recordLowRiskAudit(config, taskId, "contacts.mutual", `${primary.contact.fullName} ∩ ${other.contact.fullName}`, {
-      count: mutual.length
-    });
-    return JSON.stringify({
-      a: summarizeContact(primary.contact),
-      b: summarizeContact(other.contact),
-      mutualConnections: mutual.map(summarizeContact)
-    });
-  }
-
-  const relations = relationViews(config.instance, agentId, primary.contact.id).map((view) => ({
-    relationType: view.relationType,
-    note: view.note ?? undefined,
-    contact: view.contact ? summarizeContact(view.contact) : undefined
-  }));
-  await recordLowRiskAudit(config, taskId, "contacts.relations", primary.contact.fullName, { count: relations.length });
-  return JSON.stringify({ contact: summarizeContact(primary.contact), relations });
+async function dbSchemaTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const agentId = requireAgentId(config, "read the database schema");
+  void args;
+  const tables = dbListTables(config.instance, agentId);
+  await recordLowRiskAudit(config, taskId, "db.schema", "", { tables: tables.length });
+  return JSON.stringify({ tables });
 }
 
 // Edit the active agent's SOUL.md. Same flow as edit_user_profile:

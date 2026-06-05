@@ -6,7 +6,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
-- Add a people-CRM contacts store: import a LinkedIn `Connections.csv`/XLSX export (or any roster file) into a structured, exhaustively-queryable database, then find/count people by company, title, location, or free text; save and update people from chat; and map person-to-person relationships including mutual connections. Available as `contacts_*` agent tools, `/api/contacts*` routes, and a `gini contacts` CLI. See [People-CRM Contacts Store](docs/adr/people-crm-store.md).
+- Add a per-agent structured database primitive so the agent can keep and exhaustively query structured records (the access pattern memory recall can't serve). New `db_query`/`db_execute`/`db_import`/`db_schema` tools over a sandboxed per-agent SQLite database, isolated from Gini's system data. `db_import` loads a CSV/XLSX file into a table deterministically. See [Per-Agent Structured Database Primitive](docs/adr/agent-database.md).
+- Add a `people-crm` skill that turns a LinkedIn `Connections.csv` export into a queryable personal CRM (find/count people by company/role/location, track who people are, map who-knows-whom) on top of the database primitive.
 
 ## [0.2.0] - 2026-06-02
 

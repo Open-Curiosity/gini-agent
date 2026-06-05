@@ -48,22 +48,6 @@ import { migrateLegacyMemories, recall, reflect, retain } from "./memory";
 import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embedding";
 import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
-import {
-  countContacts,
-  companyBreakdown,
-  deleteContact,
-  getContact,
-  mutualConnections,
-  queryContacts,
-  type ContactInput
-} from "./state";
-import {
-  buildContactQuery,
-  importContactsFromFile,
-  relateContacts,
-  relationViews,
-  upsertContact
-} from "./contacts";
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
 import {
   approvePairing,
@@ -1188,105 +1172,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         limit
       });
       return json(units.map((unit) => ({ ...unit, kind: "hindsight" })));
-    }],
-    // People-CRM contacts routes (ADR people-crm-store.md). The same
-    // exhaustive structured store the contacts_* agent tools use, exposed to
-    // web/CLI/mobile clients. Scoped to the active agent like the memory
-    // routes. Specific paths precede the /contacts/:id catch-all.
-    ["GET", /^\/api\/contacts\/count$/, (request) => {
-      const effective = resolveEffectiveContext(readState(config.instance), config);
-      if (!effective.agentId) return json({ error: "no active agent" }, 400);
-      const url = new URL(request.url);
-      const query = contactQueryFromParams(url.searchParams);
-      const count = countContacts(config.instance, effective.agentId, query);
-      const out: Record<string, unknown> = { count };
-      if (url.searchParams.get("breakdown") === "company") {
-        out.companies = companyBreakdown(config.instance, effective.agentId, 50);
-      }
-      return json(out);
-    }],
-    ["GET", /^\/api\/contacts\/mutual$/, (request) => {
-      const effective = resolveEffectiveContext(readState(config.instance), config);
-      if (!effective.agentId) return json({ error: "no active agent" }, 400);
-      const url = new URL(request.url);
-      const a = url.searchParams.get("a");
-      const b = url.searchParams.get("b");
-      if (!a || !b) return json({ error: "both a and b contact ids are required" }, 400);
-      // Validate both endpoints belong to the active agent so a stray id
-      // returns 404 rather than a misleading empty result.
-      if (!getContact(config.instance, effective.agentId, a) || !getContact(config.instance, effective.agentId, b)) {
-        return json({ error: "Contact not found" }, 404);
-      }
-      return json({ mutualConnections: mutualConnections(config.instance, effective.agentId, a, b) });
-    }],
-    ["POST", /^\/api\/contacts\/import$/, async (request) => {
-      const effective = resolveEffectiveContext(readState(config.instance), config);
-      if (!effective.agentId) return json({ error: "no active agent" }, 400);
-      const payload = await body(request);
-      const path = String(payload.path ?? "").trim();
-      if (!path) return json({ error: "path is required" }, 400);
-      const source = typeof payload.source === "string" ? payload.source : "linkedin_import";
-      const report = await importContactsFromFile(config, effective.agentId, path, source);
-      return json(report, 201);
-    }],
-    ["POST", /^\/api\/contacts\/relations$/, async (request) => {
-      const effective = resolveEffectiveContext(readState(config.instance), config);
-      if (!effective.agentId) return json({ error: "no active agent" }, 400);
-      const payload = await body(request);
-      const from = String(payload.from ?? "").trim();
-      const to = String(payload.to ?? "").trim();
-      if (!from || !to) return json({ error: "from and to are required" }, 400);
-      const result = relateContacts(
-        config.instance,
-        effective.agentId,
-        from,
-        to,
-        typeof payload.relationType === "string" ? payload.relationType : "knows",
-        typeof payload.note === "string" ? payload.note : null,
-        "api"
-      );
-      if (!result.ok) return json({ error: "unresolved", reason: result.reason, role: result.role, ref: result.ref }, 400);
-      return json(result, 201);
-    }],
-    ["GET", /^\/api\/contacts\/([^/]+)\/relations$/, (_request, params) => {
-      const effective = resolveEffectiveContext(readState(config.instance), config);
-      if (!effective.agentId) return json({ error: "no active agent" }, 400);
-      const contact = getContact(config.instance, effective.agentId, params[0]!);
-      if (!contact) return json({ error: "Contact not found" }, 404);
-      return json({ contact, relations: relationViews(config.instance, effective.agentId, contact.id) });
-    }],
-    ["GET", /^\/api\/contacts\/([^/]+)$/, (_request, params) => {
-      const effective = resolveEffectiveContext(readState(config.instance), config);
-      if (!effective.agentId) return json({ error: "no active agent" }, 400);
-      const contact = getContact(config.instance, effective.agentId, params[0]!);
-      if (!contact) return json({ error: "Contact not found" }, 404);
-      return json(contact);
-    }],
-    ["DELETE", /^\/api\/contacts\/([^/]+)$/, (_request, params) => {
-      const effective = resolveEffectiveContext(readState(config.instance), config);
-      if (!effective.agentId) return json({ error: "no active agent" }, 400);
-      const removed = deleteContact(config.instance, effective.agentId, params[0]!);
-      if (!removed) return json({ error: "Contact not found" }, 404);
-      return json({ ok: true, id: params[0] });
-    }],
-    ["GET", /^\/api\/contacts$/, (request) => {
-      const effective = resolveEffectiveContext(readState(config.instance), config);
-      if (!effective.agentId) return json({ error: "no active agent" }, 400);
-      const query = contactQueryFromParams(new URL(request.url).searchParams);
-      return json(queryContacts(config.instance, effective.agentId, query));
-    }],
-    ["POST", /^\/api\/contacts$/, async (request) => {
-      const effective = resolveEffectiveContext(readState(config.instance), config);
-      if (!effective.agentId) return json({ error: "no active agent" }, 400);
-      const payload = await body(request);
-      const input: ContactInput & { id?: string } = {};
-      for (const key of ["fullName", "firstName", "lastName", "company", "title", "location", "email", "linkedinUrl", "connectedAt", "notes"] as const) {
-        if (typeof payload[key] === "string") (input as Record<string, unknown>)[key] = payload[key];
-      }
-      if (typeof payload.id === "string") input.id = payload.id;
-      const result = upsertContact(config.instance, effective.agentId, input, typeof payload.source === "string" ? payload.source : "api");
-      if (result.action === "ambiguous") return json({ error: "ambiguous", name: result.name, candidates: result.candidates }, 409);
-      return json(result, result.action === "created" ? 201 : 200);
     }],
     ["GET", /^\/api\/embedding\/status$/, () => json(embeddingStatus(config))],
     ["POST", /^\/api\/embedding\/reembed$/, async (request) => {
@@ -2930,23 +2815,6 @@ function json(value: unknown, statusCode = 200): Response {
   return Response.json(value, { status: statusCode });
 }
 
-// Translate the /api/contacts query string into a ContactQuery via the shared
-// builder, so web/CLI/mobile clients use the exact filter surface the
-// contacts_query tool does.
-function contactQueryFromParams(params: URLSearchParams): ReturnType<typeof buildContactQuery> {
-  return buildContactQuery(
-    (key) => params.get(key)?.trim() || undefined,
-    (key) => {
-      const v = params.get(key);
-      return v === "true" ? true : v === "false" ? false : undefined;
-    },
-    (key) => {
-      const v = params.get(key);
-      return v !== null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : undefined;
-    }
-  );
-}
-
 // Parse the `?agentId=` filter shared by GET endpoints that return per-agent
 // record types. Returns undefined for absent or empty values so the caller
 // preserves the legacy "no filter" semantics.
@@ -2987,13 +2855,6 @@ function statusFromErrorMessage(message: string): number {
   // agent is active. Map to 400 so callers see a clean user-input error
   // rather than a 500.
   if (message.includes("no active agent")) return 400;
-  // Contacts surface: upsert by a missing id → 404; the importer's
-  // user-correctable parse failures (no header row, empty spreadsheet) and
-  // the create-without-name guard → 400, rather than collapsing to 500.
-  if (message.startsWith("Contact not found")) return 404;
-  if (message.startsWith("Could not find a recognizable contact header")) return 400;
-  if (message.startsWith("Spreadsheet has no sheets")) return 400;
-  if (message.startsWith("Provide a fullName")) return 400;
   // Browser-connect surfaces user-input failures with these prefixes;
   // forward them to 400 so the webapp can surface the original error text
   // rather than a generic "internal error". Connectivity failures
