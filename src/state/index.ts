@@ -187,11 +187,14 @@ export {
 } from "./records";
 export {
   createEmailWatcher,
+  addEmailWatcher,
+  buildWatcherQuery,
   listEmailWatchers,
   getEmailWatcher,
   updateEmailWatcher,
   removeEmailWatcher
 } from "./email-watchers";
+export type { AddEmailWatcherInput } from "./email-watchers";
 export {
   markEmailSeen,
   isEmailSeen

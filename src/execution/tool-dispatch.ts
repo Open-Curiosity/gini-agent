@@ -21,15 +21,12 @@ import {
   createAuthorization,
   createSetupRequest,
   createChatMessage,
-  createChatSession,
-  createEmailWatcher,
   isTerminalTaskStatus,
-  listEmailWatchers,
   mutateState,
   now,
-  readState,
-  removeEmailWatcher
+  readState
 } from "../state";
+import { addEmailWatcher, listEmailWatchers, removeEmailWatcher } from "../state/email-watchers";
 import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveAuthorization, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
@@ -1909,33 +1906,17 @@ async function emailWatchTool(
     }
     account = args.account;
   }
-  const query = rawQuery ?? (sender ? `from:${sender} is:unread` : "is:unread");
-
-  // Create the watcher + its dedicated chat session in ONE mutateState write
-  // so a failure leaves no orphan session. The woken turns post into this
-  // session. The session and watcher inherit the originating task's agent so
-  // attribution stays isolated.
-  const watcher = await mutateState(config.instance, (state) => {
-    const owningAgentId = state.tasks.find((t) => t.id === taskId)?.agentId ?? state.activeAgentId;
-    const title = sender ? `Email watch: ${sender}` : "Email watch";
-    const session = createChatSession(state, title, undefined, owningAgentId, "job", "channel");
-    return createEmailWatcher(state, {
-      agentId: owningAgentId,
-      provider: "gmail",
-      accountEmail: account,
-      query,
-      chatSessionId: session.id,
-      enabled: true,
-      status: "ok"
-    });
-  });
+  // Inherit the originating task's agent so the watcher + its dedicated chat
+  // session (and the future woken turns) attribute to the right agent.
+  const owningAgentId = readState(config.instance).tasks.find((t) => t.id === taskId)?.agentId;
+  const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, agentId: owningAgentId });
 
   appendTrace(config.instance, taskId, {
     type: "tool",
     message: "Created email watcher",
-    data: { watcherId: watcher.id, query, chatSessionId: watcher.chatSessionId }
+    data: { watcherId: watcher.id, query: watcher.query, chatSessionId: watcher.chatSessionId }
   });
-  return `Watching email (query: ${query}). Watcher ${watcher.id}; proposed replies will appear in its chat thread (${watcher.chatSessionId}). It polls about once a minute and never sends without your approval.`;
+  return `Watching email (query: ${watcher.query}). Watcher ${watcher.id}; proposed replies will appear in its chat thread (${watcher.chatSessionId}). It polls about once a minute and never sends without your approval.`;
 }
 
 // Explicit on-demand memory recall. Wraps the same `recall()` entrypoint

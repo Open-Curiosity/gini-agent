@@ -10,7 +10,55 @@
 import type { EmailWatcherRecord, RuntimeConfig, RuntimeState } from "../types";
 import { id, now } from "./ids";
 import { addAudit } from "./audit";
+import { createChatSession } from "./records";
 import { mutateState, readState } from "./store";
+
+export interface AddEmailWatcherInput {
+  // Watch for mail from this address (builds `from:<sender> is:unread`).
+  sender?: string;
+  // Raw Gmail search query; wins over `sender` when both are given.
+  query?: string;
+  // The account to watch. v1 watches the single signed-in gws identity;
+  // recorded for the multi-account future.
+  account?: string;
+  // Owning agent for the watcher + its dedicated chat session. Threaded by
+  // internal callers (the email_watch tool) so the woken turns attribute to
+  // the originating agent; the HTTP path leaves it to the active agent.
+  agentId?: string;
+}
+
+// Build the Gmail query for a watcher: a raw query wins; otherwise
+// `from:<sender> is:unread`; otherwise all unread mail.
+export function buildWatcherQuery(input: { sender?: string; query?: string }): string {
+  if (input.query) return input.query;
+  if (input.sender) return `from:${input.sender} is:unread`;
+  return "is:unread";
+}
+
+// Create a watcher plus its dedicated chat session in ONE mutateState write
+// so a failure leaves no orphan session. The woken turns post their proposed
+// replies into this session. Shared by the email_watch tool and the
+// POST /api/email/watchers handler so both produce identical records.
+export async function addEmailWatcher(
+  config: RuntimeConfig,
+  input: AddEmailWatcherInput
+): Promise<EmailWatcherRecord> {
+  const query = buildWatcherQuery(input);
+  return mutateState(config.instance, (state) => {
+    const owningAgentId = input.agentId ?? state.activeAgentId;
+    const title = input.sender ? `Email watch: ${input.sender}` : "Email watch";
+    const session = createChatSession(state, title, undefined, owningAgentId, "job", "channel");
+    return createEmailWatcher(state, {
+      agentId: owningAgentId,
+      provider: "gmail",
+      accountEmail: input.account,
+      query,
+      chatSessionId: session.id,
+      enabled: true,
+      status: "ok"
+    });
+  });
+}
 
 export function createEmailWatcher(
   state: RuntimeState,

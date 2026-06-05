@@ -15,6 +15,7 @@ import { embedding } from "./commands/embedding";
 import { reranker } from "./commands/reranker";
 import { skill } from "./commands/skills";
 import { job } from "./commands/jobs";
+import { email } from "./commands/email";
 import { connector } from "./commands/connectors";
 import { improvement } from "./commands/improvements";
 import { pairing, device } from "./commands/pairing";
@@ -119,6 +120,7 @@ export async function run(): Promise<void> {
     case "skills": await skill(ctx); break;
     case "job":
     case "jobs": await job(ctx); break;
+    case "email": await email(ctx); break;
     case "connector":
     case "connectors": await connector(ctx); break;
     case "improvement":
