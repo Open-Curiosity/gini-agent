@@ -49,18 +49,24 @@ import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
-const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local"] as const;
+const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local", "anthropic"] as const;
 type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
 
-// OpenAI-compatible providers that authenticate via an env var written to
+// Env-keyed providers that authenticate via an env var written to
 // ~/.gini/secrets.env. `local` allows an empty key because many local
 // gateways (Ollama, LM Studio) accept no-auth requests. Codex is excluded
-// because it uses its own OAuth/auth.json flow.
+// because it uses its own OAuth/auth.json flow. (anthropic is env-keyed but
+// speaks the native Messages API, not an OpenAI-compatible surface.)
 const ENV_KEY_PROVIDERS: Record<string, { envVar: string; allowEmptyKey: boolean; defaultModel: string }> = {
   openai: { envVar: "OPENAI_API_KEY", allowEmptyKey: false, defaultModel: "gpt-5.4-mini" },
   openrouter: { envVar: "OPENROUTER_API_KEY", allowEmptyKey: false, defaultModel: "openrouter/auto" },
   deepseek: { envVar: "DEEPSEEK_API_KEY", allowEmptyKey: false, defaultModel: "deepseek-v4-flash" },
-  local: { envVar: "GINI_LOCAL_API_KEY", allowEmptyKey: true, defaultModel: "local/default" }
+  local: { envVar: "GINI_LOCAL_API_KEY", allowEmptyKey: true, defaultModel: "local/default" },
+  // The key slot holds either a first-party Anthropic key (default baseUrl) or
+  // a Bedrock Mantle bearer token (when baseUrl points at bedrock-mantle).
+  // setSetupProvider already threads payload.baseUrl into normalizeProvider, so
+  // the browser can target either endpoint with the same row.
+  anthropic: { envVar: "ANTHROPIC_API_KEY", allowEmptyKey: false, defaultModel: "claude-opus-4-8" }
 };
 
 export interface SetupStatus {
@@ -81,7 +87,7 @@ export function getSetupStatus(config: RuntimeConfig): SetupStatus {
   // for browser onboarding. Anyone on echo needs to pick a real
   // provider in /setup. Other configured providers (openai with key,
   // codex with auth.json) pass through.
-  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local" || current === "deepseek";
+  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local" || current === "deepseek" || current === "anthropic";
   const providerConfigured = isRealProvider && Boolean(health.configured);
   return {
     ok: true,
@@ -146,12 +152,22 @@ export async function setSetupProvider(
       process.env[envKeySpec.envVar] = apiKey;
     }
 
+    // Default omitted model/baseUrl from the already-active provider so the
+    // set-active and edit-model flows (which POST {provider, model} with no
+    // baseUrl) don't silently reset a configured endpoint (e.g. a Bedrock
+    // Mantle URL) back to the per-provider default. Add Provider targets a
+    // not-yet-active provider, so `existing` is undefined there and behavior is
+    // unchanged. We deliberately do NOT preserve a custom apiKeyEnv: the key is
+    // always (re)written to envKeySpec.envVar, so keeping a CLI-set custom env
+    // var would make a web key update land in a var the resolved config never
+    // reads.
+    const existing = config.provider?.name === providerName ? config.provider : undefined;
     const model = typeof payload.model === "string" && payload.model.length > 0
       ? payload.model
-      : (config.provider?.name === providerName && config.provider.model ? config.provider.model : envKeySpec.defaultModel);
+      : (existing?.model ?? envKeySpec.defaultModel);
     const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
       ? payload.baseUrl.trim()
-      : undefined;
+      : existing?.baseUrl;
     config.provider = normalizeProvider({
       name: providerName as ProviderConfig["name"],
       model,

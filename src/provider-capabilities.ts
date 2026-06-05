@@ -62,6 +62,13 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
     case "deepseek":
       // Confirmed text-only API — no image/file content part.
       return { vision: false, nativeDocs: false };
+    case "anthropic":
+      // Claude Opus/Sonnet/Haiku accept image input and ingest documents
+      // natively via the Messages API (image + document content blocks). The
+      // family is uniformly multimodal, so unlike the openai branch there's
+      // no per-model gate. translateMessagesToAnthropic maps image_url and
+      // document parts into the corresponding base64 source blocks.
+      return { vision: true, nativeDocs: true };
     case "codex":
       // Verified empirically against the live ChatGPT-backend /responses
       // surface (gpt-5.x): it accepts a native `input_file` document part

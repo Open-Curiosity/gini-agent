@@ -10,15 +10,19 @@ import {
   generateToolCallingResponse,
   generateVisionAnalysis,
   isAuthExpiredError,
+  isProviderConfigured,
   normalizeProvider,
   providerAuthFailureText,
   providerAuthNote,
+  providerCatalog,
+  providerCatalogWithStatus,
   providerDisplayLabel,
   providerHealth,
   providerReauth,
   redactSecrets,
   setEchoToolCallingResponse,
   setEchoVisionResponse,
+  type ToolCallingMessage,
   type ToolFunctionSpec
 } from "./provider";
 import { userProfilePath } from "./runtime/identity-files";
@@ -3192,6 +3196,11 @@ describe("auth-error classification", () => {
     expect(redactSecrets("Provided authentication token is expired.")).toBe(
       "Provided authentication token is expired."
     );
+    // Bedrock Mantle bearer: the whole token (base64 body + &Version=1 tail)
+    // is masked even when no api_key/token label precedes it.
+    expect(redactSecrets("rejected key bedrock-api-key-YWJjZGVm123&Version=1 is invalid")).toBe(
+      "rejected key bedrock-api-key-*** is invalid"
+    );
   });
 
   test("providerAuthNote builds the note text + routing metadata", () => {
@@ -3206,5 +3215,592 @@ describe("auth-error classification", () => {
       }
     });
     expect(providerAuthNote("openai", "Incorrect API key").authError.reauthKind).toBe("settings");
+  });
+});
+
+// ---------------- Anthropic Messages provider ----------------
+
+// Swap globalThis.fetch for a stub that records every call and returns a
+// freshly-built Response. Mirrors the inline pattern the openai/codex tests
+// use, factored out because the anthropic suite exercises many shapes.
+function installFetch(makeResponse: () => Response): {
+  calls: Array<{ url: string; init: RequestInit }>;
+  restore: () => void;
+} {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+    calls.push({ url: String(input), init });
+    return Promise.resolve(makeResponse());
+  }) as unknown as typeof fetch;
+  return { calls, restore: () => { globalThis.fetch = originalFetch; } };
+}
+
+// Set/clear a process.env var and return a restore closure.
+function setEnv(name: string, value: string | undefined): () => void {
+  const original = process.env[name];
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+  return () => {
+    if (original === undefined) delete process.env[name];
+    else process.env[name] = original;
+  };
+}
+
+function anthropicJson(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+// Build a named-event SSE Response. When terminateLast is false the final
+// event omits its trailing "\n\n" so the reader's post-loop buffer flush runs.
+function anthropicSse(
+  events: Array<{ event?: string; data: unknown }>,
+  opts: { terminateLast?: boolean } = {}
+): Response {
+  const terminateLast = opts.terminateLast ?? true;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const enc = new TextEncoder();
+      events.forEach((ev, idx) => {
+        const last = idx === events.length - 1;
+        const prefix = ev.event ? `event: ${ev.event}\n` : "";
+        const sep = last && !terminateLast ? "" : "\n\n";
+        controller.enqueue(enc.encode(`${prefix}data: ${JSON.stringify(ev.data)}${sep}`));
+      });
+      controller.close();
+    }
+  });
+  return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+describe("anthropic provider", () => {
+  test("normalizeProvider applies defaults and preserves overrides", () => {
+    expect(normalizeProvider({ name: "anthropic", model: "" })).toEqual({
+      name: "anthropic",
+      model: "claude-opus-4-8",
+      baseUrl: "https://api.anthropic.com",
+      apiKeyEnv: "ANTHROPIC_API_KEY"
+    });
+    expect(
+      normalizeProvider({
+        name: "anthropic",
+        model: "anthropic.claude-opus-4-8",
+        baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+        apiKeyEnv: "BEDROCK_BEARER_TOKEN",
+        extraBody: { max_tokens: 256 }
+      })
+    ).toEqual({
+      name: "anthropic",
+      model: "anthropic.claude-opus-4-8",
+      baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      apiKeyEnv: "BEDROCK_BEARER_TOKEN",
+      extraBody: { max_tokens: 256 }
+    });
+  });
+
+  test("providerDisplayLabel + catalog + configured gate", () => {
+    expect(providerDisplayLabel("anthropic")).toBe("Anthropic");
+    const entry = providerCatalog().find((p) => p.name === "anthropic");
+    expect(entry?.displayName).toBe("Anthropic Compatible");
+    expect(entry?.baseUrl).toBe("https://api.anthropic.com");
+    expect(entry?.models).toContain("claude-opus-4-8");
+
+    const restore = setEnv("ANTHROPIC_API_KEY", undefined);
+    try {
+      expect(isProviderConfigured("anthropic")).toBe(false);
+      const health = providerHealth(config(normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" })));
+      expect(health.ok).toBe(false);
+      expect(health.message).toContain("ANTHROPIC_API_KEY");
+
+      process.env.ANTHROPIC_API_KEY = "sk-ant-test";
+      expect(isProviderConfigured("anthropic")).toBe(true);
+      expect(providerHealth(config(normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" }))).ok).toBe(true);
+      const withStatus = providerCatalogWithStatus().find((p) => p.name === "anthropic");
+      expect(withStatus?.configured).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  test("tool-calling: non-stream request shape, headers, and tool_use parsing", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "text", text: "Reading it." },
+          { type: "tool_use", id: "toolu_1", name: "file_read", input: { path: "a.md" } }
+        ],
+        stop_reason: "tool_use",
+        usage: { input_tokens: 11, output_tokens: 7 }
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const tools: ToolFunctionSpec[] = [
+        {
+          type: "function",
+          function: {
+            name: "file_read",
+            description: "read a file",
+            parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+          }
+        }
+      ];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [
+          { role: "system", content: "you are gini" },
+          { role: "user", content: "read a.md" }
+        ],
+        tools
+      );
+      expect(result.finishReason).toBe("tool_calls");
+      expect(result.text).toBe("Reading it.");
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls[0]?.id).toBe("toolu_1");
+      expect(result.toolCalls[0]?.function.name).toBe("file_read");
+      expect(JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}")).toEqual({ path: "a.md" });
+      expect(result.responseId).toBe("msg_1");
+      expect(result.cost?.inputTokens).toBe(11);
+      expect(result.cost?.outputTokens).toBe(7);
+
+      const call = fetchStub.calls[0]!;
+      expect(call.url).toBe("https://api.anthropic.com/v1/messages");
+      const headers = call.init.headers as Record<string, string>;
+      expect(headers["x-api-key"]).toBe("sk-ant-test");
+      expect(headers["anthropic-version"]).toBe("2023-06-01");
+      expect(headers["content-type"]).toBe("application/json");
+      const sent = JSON.parse(String(call.init.body));
+      expect(sent.model).toBe("claude-opus-4-8");
+      expect(sent.max_tokens).toBe(8192);
+      expect(sent.stream).toBe(false);
+      expect(sent.system).toBe("you are gini");
+      expect(sent.messages).toEqual([{ role: "user", content: "read a.md" }]);
+      expect(sent.tools).toEqual([
+        {
+          name: "file_read",
+          description: "read a file",
+          input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+        }
+      ]);
+      expect(sent.tool_choice).toEqual({ type: "auto" });
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("tool-calling: streaming text + tool_use, custom apiKeyEnv (Bedrock bearer)", async () => {
+    const restoreEnv = setEnv("BEDROCK_BEARER_TOKEN", "bedrock-api-key-xyz&Version=1");
+    const fetchStub = installFetch(() =>
+      anthropicSse([
+        { event: "message_start", data: { type: "message_start", message: { id: "msg_stream", usage: { input_tokens: 9 } } } },
+        { event: "content_block_start", data: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hi " } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "there" } } },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+        { event: "content_block_start", data: { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_s", name: "file_list" } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"path":' } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '"/tmp"}' } } },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 1 } },
+        { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } } },
+        { event: "message_stop", data: { type: "message_stop" } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({
+        name: "anthropic",
+        model: "anthropic.claude-opus-4-8",
+        baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+        apiKeyEnv: "BEDROCK_BEARER_TOKEN"
+      });
+      let streamed = "";
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "list /tmp" }],
+        [
+          { type: "function", function: { name: "file_list", description: "list", parameters: { type: "object" } } }
+        ],
+        (delta) => { streamed += delta; }
+      );
+      expect(streamed).toBe("Hi there");
+      expect(result.text).toBe("Hi there");
+      expect(result.finishReason).toBe("tool_calls");
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls[0]?.id).toBe("toolu_s");
+      expect(JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}")).toEqual({ path: "/tmp" });
+      expect(result.responseId).toBe("msg_stream");
+      expect(result.cost?.inputTokens).toBe(9);
+      expect(result.cost?.outputTokens).toBe(5);
+
+      const call = fetchStub.calls[0]!;
+      // baseUrl carried the /anthropic prefix → request appends /v1/messages.
+      expect(call.url).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages");
+      const headers = call.init.headers as Record<string, string>;
+      expect(headers["x-api-key"]).toBe("bedrock-api-key-xyz&Version=1");
+      expect(headers["accept"]).toBe("text/event-stream");
+      expect(JSON.parse(String(call.init.body)).stream).toBe(true);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("message translation: system hoist, tool grouping, image/document/invalid parts, assistant shapes", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const messages: ToolCallingMessage[] = [
+        { role: "system", content: "sys A" },
+        { role: "system", content: "sys B" },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "look" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+            { type: "image_url", image_url: { url: "https://not-a-data-url" } },
+            { type: "document", document: { mimeType: "application/pdf", data: "BBBB", filename: "d.pdf" } }
+          ]
+        },
+        { role: "assistant", content: "thinking", tool_calls: [{ id: "toolu_x", type: "function", function: { name: "search", arguments: '{"q":"hi"}' } }] },
+        { role: "tool", tool_call_id: "toolu_x", content: "result-1" },
+        { role: "tool", tool_call_id: "toolu_y", content: "result-2" },
+        { role: "assistant", content: [{ type: "text", text: "array text" }] },
+        { role: "assistant", content: null },
+        { role: "user", content: null }
+      ];
+      await generateToolCallingResponse(config(provider), messages, []);
+      const sent = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(sent.system).toBe("sys A\n\nsys B");
+      expect(sent.messages).toEqual([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "look" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+            { type: "document", source: { type: "base64", media_type: "application/pdf", data: "BBBB" } }
+          ]
+        },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "thinking" },
+            { type: "tool_use", id: "toolu_x", name: "search", input: { q: "hi" } }
+          ]
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_x", content: "result-1" },
+            { type: "tool_result", tool_use_id: "toolu_y", content: "result-2" }
+          ]
+        },
+        { role: "assistant", content: [{ type: "text", text: "array text" }] },
+        { role: "assistant", content: [{ type: "text", text: "" }] },
+        { role: "user", content: "" }
+      ]);
+      // No tools passed → no tools/tool_choice in the body.
+      expect(sent.tools).toBeUndefined();
+      expect(sent.tool_choice).toBeUndefined();
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("max_tokens: extraBody override wins; tool_use without id/name is skipped", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        id: "m2",
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "text", text: "hello" },
+          { type: "tool_use", id: "", name: "noid" },
+          { type: "tool_use", name: "noid2", input: {} }
+        ],
+        stop_reason: "end_turn",
+        usage: {}
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8", extraBody: { max_tokens: 1234, top_k: 5 } });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(result.finishReason).toBe("stop");
+      expect(result.toolCalls).toHaveLength(0);
+      const sent = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(sent.max_tokens).toBe(1234);
+      expect(sent.top_k).toBe(5);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("stop_reason mapping covers every branch", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const cases: Array<[string | undefined, "stop" | "length" | "tool_calls" | "unknown"]> = [
+      ["end_turn", "stop"],
+      ["stop_sequence", "stop"],
+      ["max_tokens", "length"],
+      ["tool_use", "tool_calls"],
+      ["something_new", "unknown"],
+      [undefined, "unknown"]
+    ];
+    try {
+      for (const [stopReason, expected] of cases) {
+        const fetchStub = installFetch(() =>
+          anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "x" }], stop_reason: stopReason, usage: {} })
+        );
+        try {
+          const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+          const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+          expect(result.finishReason).toBe(expected);
+        } finally {
+          fetchStub.restore();
+        }
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test("readAnthropicKey throws when the configured env var is unset", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", undefined);
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      await expect(
+        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
+      ).rejects.toThrow("ANTHROPIC_API_KEY is not set");
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test("non-stream HTTP error surfaces the Anthropic error message", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ type: "error", error: { type: "authentication_error", message: "Invalid bearer token" }, request_id: "req_1" }, 401)
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      await expect(
+        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
+      ).rejects.toThrow("Invalid bearer token");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("streaming error event and HTTP error both throw", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    try {
+      const errEvent = installFetch(() =>
+        anthropicSse([{ event: "error", data: { type: "error", error: { type: "overloaded_error", message: "Overloaded" } } }])
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        await expect(
+          generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {})
+        ).rejects.toThrow("Overloaded");
+      } finally {
+        errEvent.restore();
+      }
+
+      const httpErr = installFetch(() =>
+        new Response(JSON.stringify({ error: { message: "stream boom" } }), { status: 500, headers: { "content-type": "application/json" } })
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        await expect(
+          generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {})
+        ).rejects.toThrow("stream boom");
+      } finally {
+        httpErr.restore();
+      }
+
+      const noBody = installFetch(() => new Response(null, { status: 200, headers: { "content-type": "text/event-stream" } }));
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        await expect(
+          generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {})
+        ).rejects.toThrow("no response body");
+      } finally {
+        noBody.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test("streaming tolerates ping, unknown events, stray deltas, and an unterminated final event", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicSse(
+        [
+          { event: "ping", data: { type: "ping" } },
+          { event: "message_start", data: { type: "message_start", message: { id: "msg_u" } } },
+          // content_block_start with no content_block → defaults to a text block.
+          { event: "content_block_start", data: { type: "content_block_start", index: 0 } },
+          // input_json_delta for an index that never opened a block → ignored.
+          { event: "content_block_delta", data: { type: "content_block_delta", index: 9, delta: { type: "input_json_delta", partial_json: "{}" } } },
+          // unknown delta type → ignored.
+          { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "hmm" } } },
+          { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } } },
+          // delta event with no delta object → no-op branch.
+          { event: "content_block_delta", data: { type: "content_block_delta", index: 0 } },
+          // unknown top-level event type → ignored.
+          { event: "some_future_event", data: { type: "some_future_event" } },
+          // data with no `type` → ignored.
+          { data: { note: "no type field" } },
+          { event: "message_stop", data: { type: "message_stop" } }
+        ],
+        { terminateLast: false }
+      )
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {});
+      expect(result.text).toBe("done");
+      expect(result.toolCalls).toHaveLength(0);
+      expect(result.finishReason).toBe("unknown");
+      expect(result.responseId).toBe("msg_u");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("generateTaskSummary routes anthropic and falls back on empty text", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const withText = installFetch(() =>
+      anthropicJson({ id: "s1", type: "message", role: "assistant", content: [{ type: "text", text: "Summary here." }], stop_reason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const result = await generateTaskSummary(config(provider), "summarize");
+      expect(result.text).toBe("Summary here.");
+      expect(result.provider.name).toBe("anthropic");
+      expect(withText.calls[0]!.url).toBe("https://api.anthropic.com/v1/messages");
+    } finally {
+      withText.restore();
+    }
+    const empty = installFetch(() =>
+      anthropicJson({ id: "s2", type: "message", role: "assistant", content: [], stop_reason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const result = await generateTaskSummary(config(provider), "summarize");
+      expect(result.text).toBe("The model returned no text output.");
+    } finally {
+      empty.restore();
+      restoreEnv();
+    }
+  });
+
+  test("generateStructured (anthropic): plain JSON, fenced JSON, and invalid JSON", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const validator = { parse: (v: unknown) => v as { ok: boolean } };
+    try {
+      const plain = installFetch(() =>
+        anthropicJson({ id: "j1", type: "message", role: "assistant", content: [{ type: "text", text: '{"ok":true}' }], stop_reason: "end_turn", usage: {} })
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        const out = await generateStructured(config(provider), { system: "s", user: "u", schemaName: "Thing", validator });
+        expect(out.data).toEqual({ ok: true });
+        expect(out.raw).toBe('{"ok":true}');
+      } finally {
+        plain.restore();
+      }
+
+      const fenced = installFetch(() =>
+        anthropicJson({ id: "j2", type: "message", role: "assistant", content: [{ type: "text", text: '```json\n{"ok":false}\n```' }], stop_reason: "end_turn", usage: {} })
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        const out = await generateStructured(config(provider), { system: "s", user: "u", schemaName: "Thing", validator });
+        expect(out.data).toEqual({ ok: false });
+      } finally {
+        fenced.restore();
+      }
+
+      const bad = installFetch(() =>
+        anthropicJson({ id: "j3", type: "message", role: "assistant", content: [{ type: "text", text: "not json" }], stop_reason: "end_turn", usage: {} })
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        await expect(
+          generateStructured(config(provider), { system: "s", user: "u", schemaName: "Thing", validator })
+        ).rejects.toThrow("was not valid JSON");
+      } finally {
+        bad.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test("generateVisionAnalysis (anthropic) sends an image block with the per-call max_tokens", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ id: "v1", type: "message", role: "assistant", content: [{ type: "text", text: "a cat" }], stop_reason: "end_turn", usage: { input_tokens: 3, output_tokens: 2 } })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const result = await generateVisionAnalysis(config(provider), {
+        prompt: "what is this?",
+        imageBase64: "ZZZZ",
+        mimeType: "image/png",
+        maxTokens: 64
+      });
+      expect(result.text).toBe("a cat");
+      const sent = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(sent.max_tokens).toBe(64);
+      expect(sent.system).toBeUndefined();
+      expect(sent.messages[0].content).toEqual([
+        { type: "text", text: "what is this?" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "ZZZZ" } }
+      ]);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+});
+
+describe("codex no-tools dispatch", () => {
+  test("routes through stitchSystemFromMessages + /responses when tools are empty", async () => {
+    const { restore } = installCodexAuth("codex-no-tools");
+    const fetchStub = installFetch(() =>
+      anthropicSse([{ data: { type: "response.output_text.delta", delta: "Hi there" } }])
+    );
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [
+          { role: "system", content: "sys one" },
+          { role: "system", content: "sys two" },
+          { role: "user", content: "hello" }
+        ],
+        []
+      );
+      expect(result.text).toBe("Hi there");
+      expect(result.toolCalls).toHaveLength(0);
+      expect(result.finishReason).toBe("stop");
+      expect(fetchStub.calls[0]!.url).toContain("/responses");
+    } finally {
+      fetchStub.restore();
+      restore();
+    }
   });
 });

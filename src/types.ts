@@ -23,7 +23,7 @@ export type SkillStatus = "enabled" | "disabled" | "archived";
 
 export type JobStatus = "active" | "paused" | "failed";
 
-export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local" | "deepseek";
+export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local" | "deepseek" | "anthropic";
 
 export type ImprovementStatus = "proposed" | "approved" | "rejected" | "applied";
 
@@ -175,7 +175,9 @@ export interface ProviderConfig {
   // them. The openai provider uses /responses for generateTaskSummary, so
   // extraBody only applies on its tool-calling, structured, and vision
   // calls. Codex uses /responses with its own shape and ignores extraBody;
-  // echo bypasses HTTP entirely.
+  // echo bypasses HTTP entirely. The anthropic provider merges extraBody into
+  // its native Messages request body too (and extraBody.max_tokens overrides
+  // the runtime's default Messages max_tokens).
   //
   // Reserved keys are stripped at send time so extraBody can never override
   // runtime-controlled fields. The base denylist covers fields the runtime

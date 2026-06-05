@@ -9,6 +9,7 @@ import {
   CheckIcon,
   PencilIcon,
   PlusIcon,
+  SparklesIcon,
   Terminal as TerminalIcon,
   Trash2Icon,
   ZapIcon
@@ -29,7 +30,7 @@ import { EditProviderDialog } from "./EditProviderDialog";
 // from this UI: scrubbing the env var + secrets.env line is reversible
 // (the user can add it back). Codex is owned by the codex CLI and local
 // has no key to clear, so neither row exposes the trash button.
-const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek"]);
+const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek", "anthropic"]);
 
 export interface ProviderCatalogItem {
   id: string;
@@ -58,7 +59,7 @@ export function displayProviderName(item: { displayName: string; name: string })
 // Providers selectable on the Settings page. Echo is dev-only; the four
 // real providers map onto the Pencil mock (Codex, OpenAI, DeepSeek, Ollama
 // stand in for `local`).
-const SELECTABLE_PROVIDERS = ["codex", "openai", "deepseek", "openrouter", "local"] as const;
+const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "deepseek", "openrouter", "local"] as const;
 
 // Per-provider visual identity. Brand logos for OpenAI/DeepSeek/Ollama
 // come from the authoritative Pencil design file; codex (Terminal) and
@@ -67,6 +68,7 @@ const SELECTABLE_PROVIDERS = ["codex", "openai", "deepseek", "openrouter", "loca
 const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: string }>; authLabel: string }> = {
   codex: { icon: TerminalIcon, authLabel: "OAuth" },
   openai: { icon: OpenAILogo, authLabel: "API key" },
+  anthropic: { icon: SparklesIcon, authLabel: "API key" },
   deepseek: { icon: DeepSeekLogo, authLabel: "API key" },
   openrouter: { icon: ZapIcon, authLabel: "API key" },
   local: { icon: OllamaLogo, authLabel: "Local" }

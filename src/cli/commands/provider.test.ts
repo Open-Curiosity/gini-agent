@@ -100,8 +100,51 @@ describe("provider CLI", () => {
   });
 
   test("set rejects unknown provider names", async () => {
-    const ctx = makeCtx(["provider", "set", "anthropic"]);
+    const ctx = makeCtx(["provider", "set", "mistral"]);
     await expect(provider(ctx)).rejects.toThrow(/Usage: gini provider set/);
+  });
+
+  test("set accepts anthropic and persists a Bedrock base URL + custom key env", async () => {
+    const ctx = makeCtx([
+      "provider", "set", "anthropic", "anthropic.claude-opus-4-8",
+      "--base-url", "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      "--api-key-env", "BEDROCK_BEARER_TOKEN"
+    ]);
+    await provider(ctx);
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.name).toBe("anthropic");
+    expect(persisted.provider.model).toBe("anthropic.claude-opus-4-8");
+    expect(persisted.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+    expect(persisted.provider.apiKeyEnv).toBe("BEDROCK_BEARER_TOKEN");
+  });
+
+  test("set anthropic with no model falls back to the catalog default", async () => {
+    await provider(makeCtx(["provider", "set", "anthropic"]));
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.name).toBe("anthropic");
+    expect(persisted.provider.model).toBe("claude-opus-4-8");
+  });
+
+  test("show (default subcommand) prints provider health without a network call", async () => {
+    await provider(makeCtx(["provider"]));
+  });
+
+  test("catalog fetches the providers catalog from the gateway", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(JSON.stringify([{ id: "anthropic", name: "anthropic" }]), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        })
+      )) as unknown as typeof fetch;
+    try {
+      await provider(makeCtx(["provider", "catalog"]));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test("set rejects unknown flags instead of silently ignoring them", async () => {

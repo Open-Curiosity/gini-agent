@@ -14,6 +14,21 @@ const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_CODEX_AUTH_PATH = "~/.codex/auth.json";
 const DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
+// Anthropic Messages API. The default baseUrl is the bare first-party host
+// (no /v1) — callAnthropicMessages appends /v1/messages. Pointing baseUrl at
+// Claude in Amazon Bedrock ("https://bedrock-mantle.{region}.api.aws/anthropic")
+// yields ".../anthropic/v1/messages"; the user includes the /anthropic prefix
+// in their configured baseUrl. Both targets accept the token in the x-api-key
+// header and share the identical request/response wire shape.
+const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
+const DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-8";
+// Pinned API version sent on every Messages request. Verified current on the
+// live versioning docs (newest entry; the SSE-named-events format). Honored by
+// both the first-party API and Claude in Amazon Bedrock.
+const ANTHROPIC_VERSION = "2023-06-01";
+// The Messages API REQUIRES max_tokens. Applied when the caller didn't pin one
+// via extraBody.max_tokens; vision passes a smaller per-call budget.
+const DEFAULT_ANTHROPIC_MAX_TOKENS = 8192;
 
 export function providerHealth(config: RuntimeConfig) {
   const provider = normalizeProvider(config.provider);
@@ -58,7 +73,8 @@ const PROVIDER_API_KEY_ENV: Record<string, string> = {
   openai: "OPENAI_API_KEY",
   openrouter: "OPENROUTER_API_KEY",
   deepseek: "DEEPSEEK_API_KEY",
-  local: "GINI_LOCAL_API_KEY"
+  local: "GINI_LOCAL_API_KEY",
+  anthropic: "ANTHROPIC_API_KEY"
 };
 
 // Whether a provider has usable credentials in the current process env.
@@ -122,6 +138,22 @@ export function providerCatalog(): ProviderCatalogItem[] {
       costHint: "external"
     },
     {
+      // One provider, two targets: the default baseUrl hits the first-party
+      // Claude API with an ANTHROPIC_API_KEY; overriding baseUrl to
+      // "https://bedrock-mantle.{region}.api.aws/anthropic" (with a minted
+      // bearer token in the same key slot) targets Claude in Amazon Bedrock.
+      // The catalog ships first-party model ids; for Bedrock the user sets the
+      // anthropic.-prefixed id (e.g. "anthropic.claude-opus-4-8").
+      id: "anthropic",
+      name: "anthropic",
+      displayName: "Anthropic Compatible",
+      baseUrl: DEFAULT_ANTHROPIC_BASE_URL,
+      auth: "env",
+      models: ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
+      capabilities: ["messages", "tool-calling", "streaming", "vision"],
+      costHint: "external"
+    },
+    {
       id: "openrouter",
       name: "openrouter",
       displayName: "OpenRouter Compatible",
@@ -168,6 +200,8 @@ export function providerDisplayLabel(name: ProviderName): string {
       return "OpenRouter";
     case "deepseek":
       return "DeepSeek";
+    case "anthropic":
+      return "Anthropic";
     case "local":
       return "Local";
     case "echo":
@@ -223,6 +257,11 @@ export function isAuthExpiredError(message: string | undefined): boolean {
 export function redactSecrets(text: string): string {
   return text
     .replace(/\bsk-[A-Za-z0-9_-]{6,}/g, "sk-***")
+    // Bedrock Mantle bearer tokens (minted by aws-bedrock-token-generator,
+    // carried in x-api-key) are `bedrock-api-key-<base64>&Version=1` — the
+    // `&`/`=` fall outside the value class below, so match the whole token by
+    // its prefix to mask the base64 body and the &Version tail in one shot.
+    .replace(/\bbedrock-api-key-[^\s"']+/gi, "bedrock-api-key-***")
     .replace(/\bBearer\s+[A-Za-z0-9._-]{6,}/gi, "Bearer ***")
     .replace(/\b(api[_-]?key|token|secret|password)(["'\s:=]+)[A-Za-z0-9._-]{6,}/gi, "$1$2***");
 }
@@ -484,6 +523,10 @@ export async function generateToolCallingResponse(
       usage: text.usage,
       cost: text.cost
     };
+  }
+
+  if (provider.name === "anthropic") {
+    return callAnthropicMessages(provider, messages, tools, onDelta);
   }
 
   return callToolCallingChatCompletions(provider, messages, tools, onDelta);
@@ -1166,6 +1209,439 @@ async function readResponsesToolCallingStream(
   }
 }
 
+// ---------------- Anthropic Messages API ----------------
+//
+// Native /v1/messages provider. ONE builder serves both the first-party
+// Claude API and Claude in Amazon Bedrock — they share an identical wire
+// shape and both authenticate with a token in the x-api-key header. The only
+// per-target differences are the configured baseUrl (the user includes the
+// "/anthropic" path prefix for Bedrock Mantle) and which env var holds the
+// token (apiKeyEnv). We deliberately do NOT use the OpenAI-compatibility shim
+// (api.anthropic.com/v1/chat/completions): it drops prompt caching and ignores
+// tool `strict`, and Bedrock Mantle doesn't expose it at all.
+//
+// Mirrors callToolCallingChatCompletions/callToolCallingResponses: stream when
+// onDelta is present, otherwise parse the JSON body. No codex-style session
+// retry — an env-var key has no rotation surface.
+async function callAnthropicMessages(
+  provider: ProviderConfig,
+  messages: ToolCallingMessage[],
+  tools: ToolFunctionSpec[],
+  onDelta?: (text: string) => void,
+  // Per-call output-token override. Vision passes its small budget; the chat
+  // loop omits it and the default (or extraBody.max_tokens) applies.
+  maxTokensOverride?: number
+): Promise<ToolCallingResult> {
+  const apiKey = readAnthropicKey(provider);
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
+  const wantStream = Boolean(onDelta);
+  const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
+  const { system, messages: anthropicMessages } = translateMessagesToAnthropic(safeMessages);
+  const extras = sanitizeExtraBody(provider.extraBody);
+  const resolvedMaxTokens =
+    maxTokensOverride ?? (typeof extras.max_tokens === "number" ? extras.max_tokens : DEFAULT_ANTHROPIC_MAX_TOKENS);
+  const body: Record<string, unknown> = {
+    ...extras,
+    model: provider.model,
+    messages: anthropicMessages,
+    max_tokens: resolvedMaxTokens,
+    stream: wantStream
+  };
+  // Set AFTER the extras spread so a stray extraBody.system can't shadow the
+  // hoisted system prompt (the spread-order guard the chat-completions
+  // builders use for prompt_cache_retention). When no system messages were
+  // present we leave any user-supplied extraBody.system untouched.
+  if (system.length > 0) body.system = system;
+  const anthropicTools = translateToolsToAnthropic(tools);
+  if (anthropicTools.length > 0) {
+    body.tools = anthropicTools;
+    body.tool_choice = { type: "auto" };
+  }
+
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": ANTHROPIC_VERSION,
+      ...(wantStream ? { accept: "text/event-stream" } : {})
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (wantStream) {
+    return readAnthropicMessagesStream(response, provider, onDelta);
+  }
+
+  const rawPayload = await response.text();
+  const payload = parseJsonObject(rawPayload);
+  if (!response.ok) {
+    const fallback = rawPayload.slice(0, 500) || `Anthropic request failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  return parseAnthropicMessage(payload, provider);
+}
+
+// Read the token for the x-api-key header from the configured env var
+// (default ANTHROPIC_API_KEY). For a Bedrock Mantle target this env var holds
+// a bearer minted by aws-bedrock-token-generator; the same header carries it.
+// Mirrors readOpenAIBearer, but the value is NOT an Authorization: Bearer.
+function readAnthropicKey(provider: ProviderConfig): string {
+  const envName = provider.apiKeyEnv ?? "ANTHROPIC_API_KEY";
+  const apiKey = process.env[envName];
+  if (!apiKey) {
+    throw new Error(`Anthropic provider is configured but ${envName} is not set.`);
+  }
+  return apiKey;
+}
+
+interface AnthropicTranslation {
+  system: string;
+  messages: Array<Record<string, unknown>>;
+}
+
+// Translate the OpenAI-shaped tool-calling transcript into the Messages API
+// shape: hoist every system message to the top-level `system` string, map
+// user/assistant content, fold assistant tool_calls into tool_use blocks, and
+// group consecutive tool-result messages into a single user message whose
+// content begins with tool_result blocks (the API requires tool_result blocks
+// to lead and to immediately follow the assistant tool_use turn).
+function translateMessagesToAnthropic(messages: ToolCallingMessage[]): AnthropicTranslation {
+  const systemParts: string[] = [];
+  const out: Array<Record<string, unknown>> = [];
+  let i = 0;
+  while (i < messages.length) {
+    const message = messages[i];
+    if (message.role === "system") {
+      if (typeof message.content === "string" && message.content.length > 0) {
+        systemParts.push(message.content);
+      }
+      i++;
+      continue;
+    }
+    if (message.role === "tool") {
+      // Collapse a run of tool results into one user message.
+      const blocks: Array<Record<string, unknown>> = [];
+      while (i < messages.length && messages[i].role === "tool") {
+        const toolMessage = messages[i];
+        blocks.push({
+          type: "tool_result",
+          tool_use_id: toolMessage.tool_call_id ?? "",
+          content:
+            typeof toolMessage.content === "string"
+              ? toolMessage.content
+              : JSON.stringify(toolMessage.content ?? "")
+        });
+        i++;
+      }
+      out.push({ role: "user", content: blocks });
+      continue;
+    }
+    if (message.role === "user") {
+      out.push({ role: "user", content: translateUserContent(message.content) });
+      i++;
+      continue;
+    }
+    // assistant
+    const blocks: Array<Record<string, unknown>> = [];
+    if (typeof message.content === "string" && message.content.length > 0) {
+      blocks.push({ type: "text", text: message.content });
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part.type === "text") blocks.push({ type: "text", text: part.text });
+      }
+    }
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    for (const call of toolCalls) {
+      blocks.push({
+        type: "tool_use",
+        id: call.id,
+        name: call.function.name,
+        input: parseJsonObject(call.function.arguments || "{}")
+      });
+    }
+    // A Messages assistant turn must carry at least one block.
+    if (blocks.length === 0) blocks.push({ type: "text", text: "" });
+    out.push({ role: "assistant", content: blocks });
+    i++;
+  }
+  return { system: systemParts.join("\n\n"), messages: out };
+}
+
+// Map a user message's content to the Messages content shape. A plain string
+// passes through (the API accepts a bare string); a parts array maps text →
+// text, image_url data URLs → base64 image blocks, and document parts →
+// base64 document blocks.
+function translateUserContent(
+  content: string | MessageContentPart[] | null
+): string | Array<Record<string, unknown>> {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const blocks: Array<Record<string, unknown>> = [];
+  for (const part of content) {
+    if (part.type === "text") {
+      blocks.push({ type: "text", text: part.text });
+    } else if (part.type === "image_url") {
+      const parsed = parseDataUrl(part.image_url.url);
+      if (parsed) {
+        blocks.push({ type: "image", source: { type: "base64", media_type: parsed.mediaType, data: parsed.data } });
+      }
+    } else if (part.type === "document") {
+      blocks.push({
+        type: "document",
+        source: { type: "base64", media_type: part.document.mimeType, data: part.document.data }
+      });
+    }
+  }
+  return blocks;
+}
+
+// Split a `data:<mime>;base64,<payload>` URL into its media type and raw
+// base64 payload. Returns undefined for any other URL shape (the runtime only
+// ever inlines base64 data URLs at dispatch time).
+function parseDataUrl(url: string): { mediaType: string; data: string } | undefined {
+  const match = /^data:([^;,]+);base64,([\s\S]*)$/.exec(url);
+  if (!match) return undefined;
+  return { mediaType: match[1] ?? "", data: match[2] ?? "" };
+}
+
+// Map the chat-completions tool spec to the Messages tool shape:
+// {name, description, input_schema}.
+function translateToolsToAnthropic(tools: ToolFunctionSpec[]): Array<Record<string, unknown>> {
+  return tools.map((tool) => ({
+    name: tool.function.name,
+    description: tool.function.description,
+    input_schema: tool.function.parameters
+  }));
+}
+
+// Normalize a Messages stop_reason to the loop's finishReason vocabulary.
+function mapAnthropicStopReason(value: string | undefined): ToolCallingResult["finishReason"] {
+  switch (value) {
+    case "end_turn":
+    case "stop_sequence":
+      return "stop";
+    case "max_tokens":
+      return "length";
+    case "tool_use":
+      return "tool_calls";
+    default:
+      return "unknown";
+  }
+}
+
+// Parse a non-streamed Messages response into a ToolCallingResult: join text
+// blocks, convert tool_use blocks to ToolCall (re-encoding `input` to the JSON
+// arguments string the loop expects), and map stop_reason/usage.
+function parseAnthropicMessage(payload: Record<string, unknown>, provider: ProviderConfig): ToolCallingResult {
+  const content = Array.isArray(payload.content) ? payload.content : [];
+  const textParts: string[] = [];
+  const toolCalls: ToolCall[] = [];
+  for (const block of content) {
+    if (!isRecord(block)) continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      textParts.push(block.text);
+    } else if (block.type === "tool_use") {
+      const id = typeof block.id === "string" ? block.id : "";
+      const name = typeof block.name === "string" ? block.name : "";
+      if (!id || !name) continue;
+      toolCalls.push({
+        id,
+        type: "function",
+        function: { name, arguments: JSON.stringify(isRecord(block.input) ? block.input : {}) }
+      });
+    }
+  }
+  const usage = isRecord(payload.usage) ? payload.usage : undefined;
+  return {
+    provider,
+    text: textParts.join("").trim(),
+    toolCalls,
+    finishReason: mapAnthropicStopReason(typeof payload.stop_reason === "string" ? payload.stop_reason : undefined),
+    responseId: typeof payload.id === "string" ? payload.id : undefined,
+    usage,
+    cost: estimateCost(provider, usage)
+  };
+}
+
+// Consume the Messages SSE stream. Events are NAMED (event: <name>) and each
+// data payload repeats its own `type`. We stream text deltas (text_delta →
+// onDelta) and accumulate tool_use argument fragments (input_json_delta) per
+// content-block index, finalizing tool calls when the stream ends. stop_reason
+// and the cumulative output token count arrive on message_delta.
+async function readAnthropicMessagesStream(
+  response: Response,
+  provider: ProviderConfig,
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  if (!response.ok) {
+    const raw = await response.text();
+    const payload = parseJsonObject(raw);
+    const fallback = raw.slice(0, 500) || `Anthropic stream failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  const body = response.body;
+  if (!body) throw new Error("Anthropic stream returned no response body.");
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  const textParts: string[] = [];
+  // index → in-progress content block. Only tool_use blocks accumulate (their
+  // input arrives as input_json_delta fragments); text streams into textParts.
+  const blocks = new Map<number, { type: string; id: string; name: string; jsonBuf: string }>();
+  let finishReason: ToolCallingResult["finishReason"] = "unknown";
+  let responseId: string | undefined;
+  let usage: Record<string, unknown> | undefined;
+
+  const handleEvent = (eventText: string): void => {
+    const lines = eventText.split(/\r?\n/);
+    const dataLines: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith("data:")) dataLines.push(line.slice("data:".length).trim());
+    }
+    if (dataLines.length === 0) return;
+    const data = dataLines.join("\n");
+    if (!data) return;
+    const payload = parseJsonObject(data);
+    const type = typeof payload.type === "string" ? payload.type : undefined;
+    if (!type) return;
+
+    if (type === "error") {
+      const message =
+        isRecord(payload.error) && typeof payload.error.message === "string"
+          ? payload.error.message
+          : "Anthropic stream errored before completion.";
+      throw new Error(message);
+    }
+    if (type === "message_start") {
+      if (isRecord(payload.message)) {
+        if (typeof payload.message.id === "string") responseId = payload.message.id;
+        if (isRecord(payload.message.usage)) usage = payload.message.usage;
+      }
+      return;
+    }
+    if (type === "content_block_start") {
+      const index = typeof payload.index === "number" ? payload.index : 0;
+      const cb = isRecord(payload.content_block) ? payload.content_block : undefined;
+      blocks.set(index, {
+        type: cb && typeof cb.type === "string" ? cb.type : "text",
+        id: cb && typeof cb.id === "string" ? cb.id : "",
+        name: cb && typeof cb.name === "string" ? cb.name : "",
+        jsonBuf: ""
+      });
+      return;
+    }
+    if (type === "content_block_delta") {
+      const index = typeof payload.index === "number" ? payload.index : 0;
+      const delta = isRecord(payload.delta) ? payload.delta : undefined;
+      if (!delta) return;
+      if (delta.type === "text_delta" && typeof delta.text === "string" && delta.text.length > 0) {
+        textParts.push(delta.text);
+        if (onDelta) {
+          try {
+            onDelta(delta.text);
+          } catch {
+            // never abort the stream consumer on a UI-side error
+          }
+        }
+      } else if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
+        const existing = blocks.get(index);
+        if (existing) existing.jsonBuf += delta.partial_json;
+      }
+      return;
+    }
+    if (type === "message_delta") {
+      const delta = isRecord(payload.delta) ? payload.delta : undefined;
+      if (delta && typeof delta.stop_reason === "string") {
+        finishReason = mapAnthropicStopReason(delta.stop_reason);
+      }
+      if (isRecord(payload.usage)) usage = { ...(usage ?? {}), ...payload.usage };
+      return;
+    }
+    // content_block_stop / message_stop / ping / unknown: nothing to do — tool
+    // calls are finalized from the accumulated block map below.
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const chunk = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (chunk.trim().length > 0) handleEvent(chunk);
+        boundary = buffer.indexOf("\n\n");
+      }
+      if (done) break;
+    }
+    buffer += decoder.decode();
+    if (buffer.trim().length > 0) handleEvent(buffer);
+
+    const toolCalls: ToolCall[] = [];
+    const orderedIndices = [...blocks.keys()].sort((a, b) => a - b);
+    for (const index of orderedIndices) {
+      const block = blocks.get(index)!;
+      if (block.type !== "tool_use" || !block.id || !block.name) continue;
+      toolCalls.push({
+        id: block.id,
+        type: "function",
+        function: { name: block.name, arguments: block.jsonBuf.length > 0 ? block.jsonBuf : "{}" }
+      });
+    }
+
+    return {
+      provider,
+      text: textParts.join("").trim(),
+      toolCalls,
+      finishReason,
+      responseId,
+      usage,
+      cost: estimateCost(provider, usage)
+    };
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {}
+  }
+}
+
+// Anthropic structured-output path. The Messages API has no
+// response_format=json_object, so we prompt for JSON-only, call non-stream,
+// strip a stray ```json fence, parse, and validate — mirroring
+// callStructuredCodex.
+async function callAnthropicStructured<T>(
+  provider: ProviderConfig,
+  request: StructuredRequest<T>
+): Promise<StructuredResult<T>> {
+  const result = await callAnthropicMessages(
+    provider,
+    [
+      { role: "system", content: request.system },
+      {
+        role: "user",
+        content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema. No prose, no markdown fences.`
+      }
+    ],
+    []
+  );
+  const cleaned = stripJsonFences(result.text);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (error) {
+    throw new Error(
+      `Anthropic structured response was not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  return {
+    data: request.validator.parse(parsed),
+    raw: cleaned,
+    usage: result.usage,
+    provider
+  };
+}
+
 // Codex tool-call-as-text backstop. The Responses-API parser handles the
 // structured `function_call` items; this complements it by scanning the
 // final assistant text for literal `<tool_call>...</tool_call>` markup.
@@ -1467,6 +1943,24 @@ export async function generateTaskSummary(
   const systemContext = recalledBlock.length > 0
     ? `${stablePrefix}\n\n${recalledBlock}`
     : stablePrefix;
+  if (provider.name === "anthropic") {
+    const result = await callAnthropicMessages(
+      provider,
+      [
+        { role: "system", content: systemContext },
+        { role: "user", content: input }
+      ],
+      [],
+      onDelta
+    );
+    return {
+      provider: result.provider,
+      text: result.text || "The model returned no text output.",
+      responseId: result.responseId,
+      usage: result.usage,
+      cost: result.cost
+    };
+  }
   if (provider.name === "openrouter" || provider.name === "local" || provider.name === "deepseek") {
     return callChatCompletions(provider, input, systemContext);
   }
@@ -1568,6 +2062,13 @@ export async function generateStructured<T>(
       usage: { input_tokens: request.system.length + request.user.length, output_tokens: raw.length },
       provider
     };
+  }
+
+  // Anthropic has no response_format=json_object field, so it gets its own
+  // JSON path: prompt for JSON-only, call Messages non-stream, strip fences,
+  // parse, validate (mirrors callStructuredCodex).
+  if (provider.name === "anthropic") {
+    return callAnthropicStructured(provider, request);
   }
 
   // OpenAI / OpenRouter / local OpenAI-compatible: chat-completions with
@@ -1785,6 +2286,15 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || DEFAULT_CODEX_MODEL,
       baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_CODEX_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv
+    };
+  }
+  if (provider.name === "anthropic") {
+    return {
+      name: "anthropic",
+      model: provider.model || DEFAULT_ANTHROPIC_MODEL,
+      baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_ANTHROPIC_BASE_URL),
+      apiKeyEnv: provider.apiKeyEnv ?? "ANTHROPIC_API_KEY",
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
   return {
@@ -2493,6 +3003,7 @@ function defaultBaseUrl(provider: ProviderConfig): string {
   if (provider.name === "openrouter") return "https://openrouter.ai/api/v1";
   if (provider.name === "local") return "http://127.0.0.1:11434/v1";
   if (provider.name === "deepseek") return DEFAULT_DEEPSEEK_BASE_URL;
+  if (provider.name === "anthropic") return DEFAULT_ANTHROPIC_BASE_URL;
   return DEFAULT_OPENAI_BASE_URL;
 }
 
@@ -2555,6 +3066,17 @@ export async function generateVisionAnalysis(
   }
   if (provider.name === "codex") {
     return callVisionCodex(provider, request, maxTokens);
+  }
+  if (provider.name === "anthropic") {
+    const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
+    const result = await callAnthropicMessages(
+      provider,
+      [{ role: "user", content: [{ type: "text", text: request.prompt }, { type: "image_url", image_url: { url: dataUrl } }] }],
+      [],
+      undefined,
+      maxTokens
+    );
+    return { provider: result.provider, text: result.text, usage: result.usage, cost: result.cost };
   }
   // openai / openrouter / local — all expose chat-completions with the same
   // multi-modal content array shape (`type: "image_url"`).

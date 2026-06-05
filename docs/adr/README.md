@@ -25,6 +25,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Crash Reporting And Issue Filing](crash-reporting-and-issue-filing.md)
 - [Connector + Provider Vocabulary, Spec Compliance, And Meta-Skills](connector-provider-spec-compliance.md)
 - [Provider extraBody Escape Hatch And Reserved-Key Denylist](provider-extra-body.md)
+- [Native Anthropic Messages Provider (First-Party + Amazon Bedrock)](anthropic-messages-provider.md)
 - [Cache Warmer And The in_memory Prompt Cache Default](cache-warmer.md)
 - [Telegram Messaging Bridge](telegram-bridge.md)
 - [Discord Messaging Bridge](discord-bridge.md)

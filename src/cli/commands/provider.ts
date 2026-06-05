@@ -7,7 +7,7 @@ import { api } from "../api";
 import { print } from "../output";
 import { maybeRefreshAutostart } from "./autostart";
 
-const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deepseek [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]";
+const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deepseek|anthropic [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]";
 
 // Single source of truth for value-bearing flags on `gini provider set`.
 // `parseSubArgs` uses this to both partition positionals and extract flag
@@ -37,7 +37,8 @@ export async function provider(ctx: CliContext): Promise<void> {
       name !== "codex" &&
       name !== "openrouter" &&
       name !== "local" &&
-      name !== "deepseek"
+      name !== "deepseek" &&
+      name !== "anthropic"
     ) {
       throw new Error(USAGE);
     }
@@ -87,7 +88,7 @@ export async function provider(ctx: CliContext): Promise<void> {
 
     config.provider = normalizeProvider({
       name,
-      model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.5" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : name === "deepseek" ? "deepseek-v4-flash" : "gpt-5.4-mini"),
+      model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.5" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : name === "deepseek" ? "deepseek-v4-flash" : name === "anthropic" ? "claude-opus-4-8" : "gpt-5.4-mini"),
       ...(baseUrl ? { baseUrl } : {}),
       ...(apiKeyEnv ? { apiKeyEnv } : {}),
       ...(extraBody ? { extraBody } : {})

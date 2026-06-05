@@ -10,7 +10,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { getSetupStatus, setSetupProvider } from "./setup-api";
+import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./setup-api";
 import { loadConfig } from "../paths";
 import type { RuntimeConfig } from "../types";
 
@@ -104,7 +104,7 @@ describe("setup-api", () => {
   test("status: providerConfigured reflects the codex platform default on a fresh instance", () => {
     const status = getSetupStatus(config);
     expect(status.ok).toBe(true);
-    expect(status.providers).toEqual(["openai", "codex", "openrouter", "deepseek", "local"]);
+    expect(status.providers).toEqual(["openai", "codex", "openrouter", "deepseek", "local", "anthropic"]);
     // Platform default is "codex". providerHealth treats codex as
     // configured when the runtime can find an auth.json; in this
     // scratch env there is none (CODEX_AUTH_JSON is scrubbed in
@@ -200,9 +200,118 @@ describe("setup-api", () => {
   });
 
   test("POST unknown provider rejects with descriptive error", async () => {
-    const result = await setSetupProvider(config, { provider: "anthropic" });
+    const result = await setSetupProvider(config, { provider: "mistral" });
     expect(result.ok).toBe(false);
     expect(result.error).toContain("Unsupported provider");
+  });
+
+  test("POST anthropic with a baseUrl override targets the configured endpoint", async () => {
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    try {
+      const result = await setSetupProvider(config, {
+        provider: "anthropic",
+        apiKey: "bedrock-api-key-token&Version=1",
+        model: "anthropic.claude-opus-4-8",
+        baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic"
+      });
+      expect(result.ok).toBe(true);
+      expect(result.provider.provider.name).toBe("anthropic");
+      expect(result.provider.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+      expect(result.provider.provider.model).toBe("anthropic.claude-opus-4-8");
+      expect(process.env.ANTHROPIC_API_KEY ?? "").toBe("bedrock-api-key-token&Version=1");
+    } finally {
+      if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevKey;
+    }
+  });
+
+  test("re-setting an already-active anthropic provider preserves baseUrl + apiKeyEnv", async () => {
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    try {
+      await setSetupProvider(config, {
+        provider: "anthropic",
+        apiKey: "bedrock-token",
+        model: "anthropic.claude-opus-4-8",
+        baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic"
+      });
+      expect(config.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+
+      // Edit-model / set-active flow: POST {provider, model} with no baseUrl —
+      // the configured Bedrock endpoint and key-env must survive.
+      const edited = await setSetupProvider(config, { provider: "anthropic", model: "anthropic.claude-haiku-4-5" });
+      expect(edited.ok).toBe(true);
+      expect(config.provider.model).toBe("anthropic.claude-haiku-4-5");
+      expect(config.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+      expect(config.provider.apiKeyEnv).toBe("ANTHROPIC_API_KEY");
+
+      // Re-activate with no model either — both model and baseUrl are kept.
+      const reactivated = await setSetupProvider(config, { provider: "anthropic" });
+      expect(reactivated.ok).toBe(true);
+      expect(config.provider.model).toBe("anthropic.claude-haiku-4-5");
+      expect(config.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+    } finally {
+      if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevKey;
+    }
+  });
+
+  test("remove rejects codex, local, and unknown providers", () => {
+    expect(removeSetupProvider(config, "codex")).toMatchObject({ ok: false, error: expect.stringContaining("codex CLI") });
+    expect(removeSetupProvider(config, "local")).toMatchObject({ ok: false });
+    expect(removeSetupProvider(config, "mistral")).toMatchObject({ ok: false });
+    expect(removeSetupProvider(config, "mistral").error).toContain("Cannot remove provider 'mistral'");
+  });
+
+  test("remove scrubs the key and falls back to echo when the removed provider was active", () => {
+    const prevKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-active";
+    config.provider = { name: "openai", model: "gpt-5.4-mini", apiKeyEnv: "OPENAI_API_KEY" };
+    try {
+      const result = removeSetupProvider(config, "openai");
+      expect(result.ok).toBe(true);
+      expect(result.switched).toBe(true);
+      expect(config.provider.name).toBe("echo");
+      expect(process.env.OPENAI_API_KEY).toBeUndefined();
+    } finally {
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+    }
+  });
+
+  test("remove switches the active provider to codex when codex auth is available", () => {
+    const prevKey = process.env.OPENAI_API_KEY;
+    const authPath = join(s.stateRoot, "codex-auth.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "a", refresh_token: "b" } }));
+    process.env.CODEX_AUTH_JSON = authPath;
+    process.env.OPENAI_API_KEY = "sk-active";
+    config.provider = { name: "openai", model: "gpt-5.4-mini", apiKeyEnv: "OPENAI_API_KEY" };
+    try {
+      const result = removeSetupProvider(config, "openai");
+      expect(result.ok).toBe(true);
+      expect(result.switched).toBe(true);
+      expect(config.provider.name).toBe("codex");
+    } finally {
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+    }
+  });
+
+  test("remove scrubs the key without switching when the provider was not active", () => {
+    const prevKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-inactive";
+    // config.provider stays at the codex default — removing openai must not switch it.
+    try {
+      const result = removeSetupProvider(config, "openai");
+      expect(result.ok).toBe(true);
+      expect(result.switched).toBe(false);
+      expect(config.provider.name).toBe("codex");
+      expect(process.env.OPENAI_API_KEY).toBeUndefined();
+    } finally {
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+    }
   });
 
   test("plistRefreshNeeded:true when an autostart plist already exists (macOS only)", async () => {
