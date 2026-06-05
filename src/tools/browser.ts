@@ -920,6 +920,24 @@ function isBlockedIpv6(host: string): string | undefined {
   return undefined;
 }
 
+// The bare loopback hostnames the agent's browser may never reach. This
+// is the single source for the list: safetyCheck consumes it server-side,
+// and browser_console's in-page origin assertion receives it as a
+// page.evaluate argument. One array means the two checks can't drift.
+const LOOPBACK_HOSTS: readonly string[] = ["127.0.0.1", "0.0.0.0", "localhost", "::1"];
+
+// True when `hostname` denotes a loopback origin: an exact LOOPBACK_HOSTS
+// entry, anything in 127.0.0.0/8, or a name under the `.localhost` TLD.
+// Strips IPv6 brackets and a trailing root dot and lowercases first, so
+// bracketed / fully-qualified / mixed-case forms classify the same as
+// their bare form. Exported so the predicate is unit-testable on its own;
+// the same three rules are mirrored inline in browser_console's in-page
+// guard, which can't import module code into the page context.
+export function hostnameIsLoopback(hostname: string): boolean {
+  const h = hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  return LOOPBACK_HOSTS.includes(h) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h) || h.endsWith(".localhost");
+}
+
 // Exported for direct unit testing in src/tools/browser.test.ts.
 // Returns undefined when the URL is allowed; otherwise a human-readable
 // reason starting with "Blocked:" or "Invalid URL:".
@@ -977,8 +995,8 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
   // through the metadata path and refuse it even under
   // allowLoopback, breaking CDP attach to [::ffff:127.0.0.1]:9222.
   const host = decodeIpv4Mapped(rawHost) ?? rawHost;
-  const loopbackHosts = new Set(["127.0.0.1", "0.0.0.0", "localhost", "::1"]);
-  if (loopbackHosts.has(host) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || host.endsWith(".localhost")) {
+  const loopbackHosts = new Set(LOOPBACK_HOSTS);
+  if (hostnameIsLoopback(host)) {
     if (options.allowLoopback) return undefined;
     return `Blocked: ${host} is a loopback address; the agent's browser may not reach the local BFF / runtime.`;
   }
@@ -1017,6 +1035,34 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
     }
   }
   return undefined;
+}
+
+// Shared loopback boundary check for any tool that reads or executes
+// against the live page. browser_navigate blocks loopback targets up
+// front via safetyCheck, but a page can still settle on a loopback origin
+// afterward — JS navigation, meta-refresh, a link click, or a CDP-attached
+// tab already parked on the control plane. snapshot() calls this before
+// reading page state; browser_console calls it before evaluating agent JS.
+// Returns the block reason (and bounces the page to about:blank,
+// best-effort) when the current origin is disallowed, otherwise undefined.
+//
+// Test mocks pass minimal page stubs (often only `evaluate`). Guarding
+// url()/goto() behind typeof keeps those mocks from having to grow a
+// surface just to clear this check.
+async function assertNotLoopbackPage(page: Page): Promise<string | undefined> {
+  if (typeof page.url !== "function") return undefined;
+  const currentUrl = page.url();
+  if (!currentUrl || currentUrl === "about:blank") return undefined;
+  const blocked = safetyCheck(currentUrl);
+  if (!blocked) return undefined;
+  if (typeof page.goto === "function") {
+    try {
+      await page.goto("about:blank", { waitUntil: "domcontentloaded" });
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+  return blocked;
 }
 
 interface SnapEntry {
@@ -1070,18 +1116,9 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   // (only evaluate is mocked, since the walker only needs DOM
   // access). Guard the url()/goto() calls behind typeof checks so
   // existing unit tests don't have to grow the mock surface.
-  if (typeof page.url === "function") {
-    const currentUrl = page.url();
-    if (currentUrl && currentUrl !== "about:blank") {
-      const blocked = safetyCheck(currentUrl);
-      if (blocked) {
-        if (typeof page.goto === "function") {
-          try { await page.goto("about:blank", { waitUntil: "domcontentloaded" }); }
-          catch { /* best-effort */ }
-        }
-        throw new Error(`${blocked} (page settled on disallowed URL after a navigation; agent must not inspect this surface)`);
-      }
-    }
+  const loopbackBlock = await assertNotLoopbackPage(page);
+  if (loopbackBlock) {
+    throw new Error(`${loopbackBlock} (page settled on disallowed URL after a navigation; agent must not inspect this surface)`);
   }
   const REF_ATTR = REF_ATTR_GLOBAL;
   // First, clear stale refs from prior snapshots so id allocation stays
@@ -1972,6 +2009,18 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
   const clear = bool(args.clear, false);
   try {
     return await withSession(taskId, async (session) => {
+      // Refuse to run agent JS on a loopback control-plane page. The
+      // agent's browser is barred from loopback origins (safetyCheck at
+      // browser_navigate time); this is the one tool that executes
+      // agent-supplied code in the page's origin, so a same-origin fetch
+      // from here would reach the bearer-injecting BFF. The in-page
+      // assertion in the evaluate below closes the check-to-use race;
+      // this server-side gate handles the common case deterministically
+      // and bounces the page away.
+      const loopbackBlock = await assertNotLoopbackPage(session.page);
+      if (loopbackBlock) {
+        return fail(`${loopbackBlock} (refusing to run console JS on a loopback control-plane page)`);
+      }
       // attachConsole is now called eagerly in getOrCreate; this is a
       // belt-and-braces re-attach in case the page was somehow swapped.
       attachConsole(taskId, session.page);
@@ -1992,10 +2041,28 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       let evalError: string | undefined;
       if (expression) {
         try {
-          evalResult = await session.page.evaluate((expr) => {
-            // eslint-disable-next-line no-new-func
-            return new Function(`return (${expr});`)();
-          }, expression);
+          evalResult = await session.page.evaluate(
+            ({ expr, loopbackHosts }: { expr: string; loopbackHosts: readonly string[] }) => {
+              // In-page origin assertion — runs in the SAME execution
+              // context the agent's expression (and any fetch it issues)
+              // will. assertNotLoopbackPage above read session.page.url()
+              // a moment earlier; a navigation that commits in the gap
+              // between that read and this eval would otherwise land the
+              // expression on a loopback document with a same-origin path
+              // to the bearer-injecting BFF. Re-checking here, where there
+              // is no gap between check and use, closes that race. Mirrors
+              // hostnameIsLoopback's three rules — the host set arrives as
+              // data; the 127.0.0.0/8 and .localhost predicates are inlined
+              // because page code can't import module helpers.
+              const h = location.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+              if (loopbackHosts.includes(h) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h) || h.endsWith(".localhost")) {
+                throw new Error(`Blocked: ${h} is a loopback origin; the agent's browser may not execute JS here.`);
+              }
+              // eslint-disable-next-line no-new-func
+              return new Function(`return (${expr});`)();
+            },
+            { expr: expression, loopbackHosts: [...LOOPBACK_HOSTS] }
+          );
         } catch (error) {
           evalError = error instanceof Error ? error.message : String(error);
         }
@@ -2802,6 +2869,11 @@ export const __test = {
     // fake sessions then call this helper don't leak state into
     // subsequent tests.
     filledSecretValues.clear();
+  },
+  // Expose the server-side loopback boundary check for direct unit
+  // testing — snapshot() and browser_console both gate on it.
+  assertNotLoopbackPageForTest(page: Page): Promise<string | undefined> {
+    return assertNotLoopbackPage(page);
   },
   // Expose the in-page walker for direct unit testing. Callers supply a
   // fake Page whose `evaluate(fn, arg)` runs `fn(arg)` locally against

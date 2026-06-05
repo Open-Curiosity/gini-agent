@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   __test as browserTest,
+  browserConsole,
   browserDrag,
   browserHover,
   browserNavigate,
@@ -14,6 +15,7 @@ import {
   closeAll,
   currentDisconnectGeneration,
   disconnectSharedBrowser,
+  hostnameIsLoopback,
   redactSecretValuesFromString,
   safetyCheck,
   setBrowserInstance,
@@ -2791,5 +2793,207 @@ describe("currentDisconnectGeneration", () => {
     expect(currentDisconnectGeneration()).toBe(before);
     const after = browserTest.bumpDisconnectGenerationForTest();
     expect(currentDisconnectGeneration()).toBe(after);
+  });
+});
+
+// The agent's browser tool is barred from loopback origins so it cannot
+// pivot through the local web control plane to forge bearer-injected BFF
+// writes (issue #193). hostnameIsLoopback is the shared predicate;
+// assertNotLoopbackPage is the server-side page gate reused by snapshot()
+// and browser_console; browser_console adds an in-page assertion that
+// closes the check-to-use race the server-side gate alone can't.
+describe("hostnameIsLoopback", () => {
+  test("classifies loopback variants as loopback", () => {
+    for (const h of [
+      "127.0.0.1",
+      "localhost",
+      "0.0.0.0",
+      "::1",
+      "[::1]",
+      "127.5.9.200",
+      "LocalHost",
+      "app.localhost",
+      "localhost.",
+      "127.0.0.1."
+    ]) {
+      expect(hostnameIsLoopback(h)).toBe(true);
+    }
+  });
+
+  test("passes public hosts and loopback look-alikes", () => {
+    for (const h of [
+      "example.com",
+      "127001.example.com",
+      "notlocalhost",
+      "10.0.0.1",
+      "169.254.169.254",
+      "1.2.3.4"
+    ]) {
+      expect(hostnameIsLoopback(h)).toBe(false);
+    }
+  });
+});
+
+describe("assertNotLoopbackPage", () => {
+  test("loopback url returns the block reason and bounces to about:blank", async () => {
+    let gotoTarget: string | undefined;
+    const page = {
+      url: () => "http://127.0.0.1:7351/api/runtime/setup-requests",
+      goto: (async (u: string) => {
+        gotoTarget = u;
+        return null;
+      }) as unknown as import("playwright-core").Page["goto"]
+    } as unknown as import("playwright-core").Page;
+    const reason = await browserTest.assertNotLoopbackPageForTest(page);
+    expect(reason).toBeDefined();
+    expect(reason!).toContain("loopback");
+    expect(gotoTarget).toBe("about:blank");
+  });
+
+  test("public url returns undefined and does not bounce", async () => {
+    let bounced = false;
+    const page = {
+      url: () => "https://example.com/",
+      goto: (async () => {
+        bounced = true;
+        return null;
+      }) as unknown as import("playwright-core").Page["goto"]
+    } as unknown as import("playwright-core").Page;
+    expect(await browserTest.assertNotLoopbackPageForTest(page)).toBeUndefined();
+    expect(bounced).toBe(false);
+  });
+
+  test("about:blank, empty url, and missing url() are all treated as safe", async () => {
+    const blank = { url: () => "about:blank" } as unknown as import("playwright-core").Page;
+    expect(await browserTest.assertNotLoopbackPageForTest(blank)).toBeUndefined();
+    const empty = { url: () => "" } as unknown as import("playwright-core").Page;
+    expect(await browserTest.assertNotLoopbackPageForTest(empty)).toBeUndefined();
+    const noUrl = {} as unknown as import("playwright-core").Page;
+    expect(await browserTest.assertNotLoopbackPageForTest(noUrl)).toBeUndefined();
+  });
+
+  test("loopback url with no goto() still returns the reason without throwing", async () => {
+    const page = {
+      url: () => "http://localhost:7351/"
+    } as unknown as import("playwright-core").Page;
+    const reason = await browserTest.assertNotLoopbackPageForTest(page);
+    expect(reason).toBeDefined();
+    expect(reason!).toContain("loopback");
+  });
+
+  test("a goto() that rejects is swallowed; the reason is still returned", async () => {
+    const page = {
+      url: () => "http://127.0.0.1:7351/",
+      goto: (async () => {
+        throw new Error("navigation crashed");
+      }) as unknown as import("playwright-core").Page["goto"]
+    } as unknown as import("playwright-core").Page;
+    const reason = await browserTest.assertNotLoopbackPageForTest(page);
+    expect(reason).toBeDefined();
+    expect(reason!).toContain("loopback");
+  });
+
+  // snapshot() is the read-path chokepoint: browser_snapshot/click/type/back
+  // all route through it. A page that settled on a loopback origin (via JS
+  // navigation, meta-refresh, or a link click) must be refused before its
+  // contents are read back to the agent.
+  test("snapshot() throws and bounces when the page settled on a loopback origin", async () => {
+    let gotoTarget: string | undefined;
+    const page = {
+      url: () => "http://127.0.0.1:7351/api/runtime/whoami",
+      goto: (async (u: string) => {
+        gotoTarget = u;
+        return null;
+      }) as unknown as import("playwright-core").Page["goto"]
+    } as unknown as import("playwright-core").Page;
+    await expect(browserTest.snapshotForTest(page, false)).rejects.toThrow(
+      "settled on disallowed URL"
+    );
+    expect(gotoTarget).toBe("about:blank");
+  });
+});
+
+describe("browserConsole loopback guard", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("refuses to run console JS on a loopback control-plane page and bounces it", async () => {
+    let gotoTarget: string | undefined;
+    let evaluated = false;
+    browserTest.installFakeSessionWithPageForTest("console-loopback", {
+      url: () => "http://127.0.0.1:7351/api/runtime/setup-requests",
+      goto: (async (u: string) => {
+        gotoTarget = u;
+        return null;
+      }) as unknown as import("playwright-core").Page["goto"],
+      evaluate: (async () => {
+        evaluated = true;
+        return undefined;
+      }) as unknown as import("playwright-core").Page["evaluate"]
+    });
+    const out = JSON.parse(await browserConsole("console-loopback", { expression: "1 + 1" })) as {
+      success: boolean;
+      error?: string;
+    };
+    expect(out.success).toBe(false);
+    expect(out.error).toContain("loopback");
+    expect(gotoTarget).toBe("about:blank");
+    // Neither the secret collector nor the agent eval should have run.
+    expect(evaluated).toBe(false);
+  });
+
+  test("in-page assertion blocks even when url() reads a benign origin (check-to-use race)", async () => {
+    const savedLocation = (globalThis as { location?: unknown }).location;
+    (globalThis as { location?: unknown }).location = { hostname: "127.0.0.1" };
+    try {
+      browserTest.installFakeSessionWithPageForTest("console-race", {
+        // Server pre-check reads a benign URL and passes...
+        url: () => "https://example.com/",
+        on: (() => undefined) as unknown as import("playwright-core").Page["on"],
+        goto: (async () => null) as unknown as import("playwright-core").Page["goto"],
+        // ...but the page has actually committed to a loopback document.
+        // The mock runs the evaluated function in-process: the secret
+        // collector throws on the missing `document` (swallowed), and the
+        // agent function reads the stubbed global `location`.
+        evaluate: (async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg)) as unknown as import("playwright-core").Page["evaluate"]
+      });
+      const out = JSON.parse(
+        await browserConsole("console-race", { expression: "(globalThis.__ranRace = true)" })
+      ) as { success: boolean; evalResult: unknown; evalError: string | null };
+      expect(out.success).toBe(true);
+      expect(out.evalError).toContain("loopback origin");
+      expect(out.evalResult).toBeNull();
+      // The expression must never have executed.
+      expect((globalThis as { __ranRace?: boolean }).__ranRace).toBeUndefined();
+    } finally {
+      (globalThis as { location?: unknown }).location = savedLocation;
+      delete (globalThis as { __ranRace?: boolean }).__ranRace;
+    }
+  });
+
+  test("runs the expression normally on a public origin", async () => {
+    const savedLocation = (globalThis as { location?: unknown }).location;
+    (globalThis as { location?: unknown }).location = { hostname: "example.com" };
+    try {
+      browserTest.installFakeSessionWithPageForTest("console-ok", {
+        url: () => "https://example.com/",
+        on: (() => undefined) as unknown as import("playwright-core").Page["on"],
+        goto: (async () => null) as unknown as import("playwright-core").Page["goto"],
+        evaluate: (async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg)) as unknown as import("playwright-core").Page["evaluate"]
+      });
+      // clear: true also exercises the console-log reset branch.
+      const out = JSON.parse(await browserConsole("console-ok", { expression: "40 + 2", clear: true })) as {
+        success: boolean;
+        evalResult: unknown;
+        evalError: string | null;
+      };
+      expect(out.success).toBe(true);
+      expect(out.evalError).toBeNull();
+      expect(out.evalResult).toBe(42);
+    } finally {
+      (globalThis as { location?: unknown }).location = savedLocation;
+    }
   });
 });
