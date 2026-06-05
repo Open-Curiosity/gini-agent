@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { enable } from "./autostart";
+import { defaultRuntimePort, defaultWebPort } from "../../paths";
 import type { LaunchctlResult, PlistKind } from "../autostart";
 
 function tag(): string {
@@ -66,7 +67,8 @@ const isDarwin = process.platform === "darwin";
       kickstart: (inst: string, kind?: PlistKind) => {
         kickstartCalls.push({ inst, kind });
         return ok();
-      }
+      },
+      waitForPortFree: async () => true
     };
     const result = await enable({
       instance,
@@ -110,7 +112,10 @@ const isDarwin = process.platform === "darwin";
         if (bootstrapCalls < 3) return ok();
         return fail("Bootstrap failed: watchdog plist rejected");
       },
-      kickstart: () => ok()
+      kickstart: () => ok(),
+      // isLoaded is false in these cases, so the port-free wait never fires;
+      // stub it as already-free so the type is satisfied either way.
+      waitForPortFree: async () => true
     };
     const result = await enable({
       instance,
@@ -150,7 +155,8 @@ const isDarwin = process.platform === "darwin";
         // both branches.
         if (kickstartCalls === 1) return ok();
         return fail("Could not kickstart service: 3: No such process");
-      }
+      },
+      waitForPortFree: async () => true
     };
     const result = await enable({
       instance,
@@ -193,7 +199,10 @@ const isDarwin = process.platform === "darwin";
         if (bootstrapCalls === 1) return ok();
         return fail("Bootstrap failed: permanent fault");
       },
-      kickstart: () => ok()
+      kickstart: () => ok(),
+      // isLoaded is false in these cases, so the port-free wait never fires;
+      // stub it as already-free so the type is satisfied either way.
+      waitForPortFree: async () => true
     };
     const result = await enable({
       instance,
@@ -234,7 +243,10 @@ const isDarwin = process.platform === "darwin";
         if (bootstrapCalls === 1) return ok(); // gateway
         return fail("Bootstrap failed: web missing"); // web
       },
-      kickstart: () => ok()
+      kickstart: () => ok(),
+      // isLoaded is false in these cases, so the port-free wait never fires;
+      // stub it as already-free so the type is satisfied either way.
+      waitForPortFree: async () => true
     };
     const result = await enable({
       instance,
@@ -257,7 +269,10 @@ const isDarwin = process.platform === "darwin";
         if (bootstrapCalls === 1) return ok();
         return fail("Bootstrap failed: web missing");
       },
-      kickstart: () => ok()
+      kickstart: () => ok(),
+      // isLoaded is false in these cases, so the port-free wait never fires;
+      // stub it as already-free so the type is satisfied either way.
+      waitForPortFree: async () => true
     };
     const result = await enable({
       instance,
@@ -269,5 +284,74 @@ const isDarwin = process.platform === "darwin";
     // "Could not find service" doesn't count as a real rollback failure —
     // the service was never loaded in the first place.
     expect(result.rollbackState).toBe("rolled_back");
+  });
+});
+
+(isDarwin ? describe : describe.skip)("autostart enable (DI) — port-free wait after bootout", () => {
+  let scratch: { stateRoot: string; logRoot: string; home: string };
+  let envHome: string | undefined;
+  const instance = `enable-portwait-${tag()}`;
+
+  beforeEach(() => {
+    scratch = makeScratch("portwait");
+    envHome = process.env.HOME;
+    process.env.HOME = scratch.home;
+  });
+
+  afterEach(() => {
+    if (envHome === undefined) delete process.env.HOME;
+    else process.env.HOME = envHome;
+    rmSync(scratch.stateRoot, { recursive: true, force: true });
+    rmSync(scratch.logRoot, { recursive: true, force: true });
+    rmSync(join(scratch.home, "Library"), { recursive: true, force: true });
+  });
+
+  test("waits for the port to free after a bootout of gateway/web, but NOT watchdog", async () => {
+    const waited: number[] = [];
+    const deps = {
+      // Everything is already loaded → bootout runs → port-free wait should
+      // fire for the port-binding kinds.
+      isLoaded: () => true,
+      bootout: () => ok(),
+      bootstrap: () => ok(),
+      kickstart: () => ok(),
+      waitForPortFree: async (port: number) => {
+        waited.push(port);
+        return true;
+      }
+    };
+    const result = await enable({
+      instance,
+      testRoot: { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot },
+      kinds: ["gateway", "web", "watchdog"],
+      launchctl: deps
+    });
+    expect(result.ok).toBe(true);
+    // gateway + web each waited once; watchdog binds nothing → no wait.
+    expect(waited.length).toBe(2);
+    expect(waited).toContain(defaultRuntimePort(instance));
+    expect(waited).toContain(defaultWebPort(instance));
+  });
+
+  test("does NOT wait when nothing was loaded (no bootout → no wait)", async () => {
+    let waitCalls = 0;
+    const deps = {
+      isLoaded: () => false,
+      bootout: () => ok(),
+      bootstrap: () => ok(),
+      kickstart: () => ok(),
+      waitForPortFree: async () => {
+        waitCalls += 1;
+        return true;
+      }
+    };
+    const result = await enable({
+      instance,
+      testRoot: { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot },
+      kinds: ["gateway", "web", "watchdog"],
+      launchctl: deps
+    });
+    expect(result.ok).toBe(true);
+    expect(waitCalls).toBe(0);
   });
 });
