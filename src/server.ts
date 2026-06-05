@@ -4,13 +4,12 @@ import { webBoundRequestAllowed } from "./lib/origin-trust";
 import { resolveSessionFromCookie } from "./governance/pairing";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
-import { runGmailPollTick } from "./integrations/gmail-poll-worker";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { syncProviderMcpServers } from "./integrations/mcp-sync";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
-import { appendLog, mutateState, readState } from "./state";
+import { appendLog, backfillEmailWatcherJobs, mutateState, readState } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { installCrashHandlers } from "./runtime/crash-handlers";
@@ -155,6 +154,26 @@ syncProviderMcpServers(config)
   })
   .catch((error) => {
     appendLog(config.instance, "mcp.auto_register.error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+
+// Email-watch migration backfill (ADR job-pre-run-hooks.md). Provisions a
+// backing scheduled job (with a gmail-delta preRunHook) for any enabled watcher
+// that lacks a resolvable jobId — legacy watchers created before the hooks
+// cutover, or a watcher whose job was removed out-of-band. Idempotent: it finds
+// existing jobs and does nothing, so it's safe to run on every startup. The
+// watcher's cursor is preserved, so a migrated watcher's first hook-fire is a
+// normal steady-state tick, not a re-seed. Best-effort: a failure logs and lets
+// startup continue.
+backfillEmailWatcherJobs(config)
+  .then((provisioned) => {
+    if (provisioned > 0) {
+      appendLog(config.instance, "email.watch.backfill", { provisioned });
+    }
+  })
+  .catch((error) => {
+    appendLog(config.instance, "email.watch.backfill.error", {
       error: error instanceof Error ? error.message : String(error)
     });
   });
@@ -365,35 +384,6 @@ const cacheWarmerDone: Promise<void> = (async function cacheWarmerLoop(): Promis
   }
 })();
 
-// Gmail poll worker loop (ADR email-watch.md). Self-rescheduling like the
-// reprobe loop: each tick polls `gws` for new matching messages per enabled
-// email watcher and wakes an agent turn on a new match (0 model turns when
-// there's nothing new). Cadence defaults to 60s; GINI_GMAIL_POLL_MS overrides
-// it. We retain gmailPollDone so SIGTERM can await the in-flight tick before
-// exiting — a tick can be mid-submitTask when the signal lands.
-const GMAIL_POLL_INTERVAL_MS = Number(process.env.GINI_GMAIL_POLL_MS ?? 60_000);
-let gmailPollStopped = false;
-const gmailPollDone: Promise<void> = (async function gmailPollLoop(): Promise<void> {
-  while (!gmailPollStopped) {
-    try {
-      const report = await runGmailPollTick(config);
-      if (report.triggered > 0 || report.seeded > 0) {
-        appendLog(config.instance, "email.watch.tick", {
-          considered: report.considered,
-          triggered: report.triggered,
-          seeded: report.seeded
-        });
-      }
-    } catch (error) {
-      appendLog(config.instance, "email.watch.tick.error", {
-        error: error instanceof Error ? error.message : String(error)
-      });
-    }
-    if (gmailPollStopped) break;
-    await Bun.sleep(GMAIL_POLL_INTERVAL_MS);
-  }
-})();
-
 // Guard against concurrent SIGTERMs. launchctl bootout, `kill`, and our
 // own self-signal from src/runtime/autostart-refresh.ts can all arrive
 // in quick succession; we only want to drain + consume the refresh
@@ -412,7 +402,6 @@ process.on("SIGTERM", async () => {
   telegramStopped = true;
   discordStopped = true;
   cacheWarmerStopped = true;
-  gmailPollStopped = true;
   // Tear down the chat-blocks subscription so the dispatcher stops
   // emitting pushes during drain. The APNs HTTP/2 client owns its own
   // session and will close lazily when garbage-collected.
@@ -470,7 +459,6 @@ process.on("SIGTERM", async () => {
       discordDone.catch(() => {}),
       discordSupervisor.stopAll().catch(() => {}),
       cacheWarmerDone.catch(() => {}),
-      gmailPollDone.catch(() => {}),
       // Close any live headless browser contexts so Chromium child
       // processes exit cleanly with the runtime instead of being reaped
       // by the OS at the very end. Errors are swallowed — a stuck
