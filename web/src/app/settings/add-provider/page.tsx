@@ -66,6 +66,10 @@ export default function AddProviderPage() {
   const [deployment, setDeployment] = useState("");
   const [authScheme, setAuthScheme] = useState("bearer");
 
+  // The Azure deployment fields only make sense when the base URL points at an
+  // Azure endpoint, so they stay hidden until the user enters one.
+  const isAzure = /azure/i.test(baseUrl);
+
   // Seed once the catalog arrives: honor a ?provider= preselection from the
   // settings list (Edit button on a row), else fall back to the first tile.
   useEffect(() => {
@@ -113,7 +117,9 @@ export default function AddProviderPage() {
           // treats an empty value as "use the default endpoint".
           ...(!isCodex ? { baseUrl: baseUrl.trim() } : {}),
           ...(providerName === "openai"
-            ? { apiVersion: apiVersion.trim(), deployment: deployment.trim(), authScheme }
+            ? isAzure
+              ? { apiVersion: apiVersion.trim(), deployment: deployment.trim(), authScheme }
+              : { apiVersion: "", deployment: "", authScheme: "bearer" }
             : {})
         })
       });
@@ -285,11 +291,11 @@ export default function AddProviderPage() {
                   />
                 </div>
 
-                {providerName === "openai" ? (
-                  <div className="grid gap-3 rounded-xl border border-[#23232B] bg-[#101014] p-4">
+                {providerName === "openai" && isAzure ? (
+                  <div className="grid gap-3">
                     <p className="text-xs font-semibold text-[#C2C2C8]">
                       Azure OpenAI{" "}
-                      <span className="font-normal text-muted-foreground">— set these to target an Azure deployment</span>
+                      <span className="font-normal text-muted-foreground">— deployment settings for this endpoint</span>
                     </p>
                     <div className="grid gap-2">
                       <Label htmlFor="provider-api-version">API version</Label>

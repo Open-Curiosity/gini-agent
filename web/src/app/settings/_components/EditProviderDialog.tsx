@@ -57,6 +57,11 @@ export function EditProviderDialog({
   const [deployment, setDeployment] = useState(currentDeployment ?? "");
   const [authScheme, setAuthScheme] = useState(currentAuthScheme ?? "bearer");
 
+  // The Azure deployment fields only make sense when the base URL points at an
+  // Azure endpoint. Gate them on that so a standard OpenAI setup never shows
+  // Azure-only inputs.
+  const isAzure = /azure/i.test(baseUrl);
+
   // Reset transient inputs whenever the dialog opens for a new row.
   // currentModel can shift if the active provider changes elsewhere; we
   // want the dialog to reflect the most recent values on each open.
@@ -85,8 +90,13 @@ export function EditProviderDialog({
           // field — a blanked value clears it (e.g. blanking baseUrl +
           // apiVersion swaps an Azure config back to standard OpenAI).
           baseUrl: baseUrl.trim(),
+          // Azure fields only when the base URL is an Azure endpoint; otherwise
+          // send blanks so clearing the Azure base URL also clears them and
+          // swaps the config back to standard OpenAI.
           ...(row.name === "openai"
-            ? { apiVersion: apiVersion.trim(), deployment: deployment.trim(), authScheme }
+            ? isAzure
+              ? { apiVersion: apiVersion.trim(), deployment: deployment.trim(), authScheme }
+              : { apiVersion: "", deployment: "", authScheme: "bearer" }
             : {})
         })
       }),
@@ -202,10 +212,10 @@ export function EditProviderDialog({
             />
           </div>
 
-          {row.name === "openai" ? (
-            <div className="space-y-3 rounded-xl border border-[#23232B] bg-[#101014] p-4">
+          {row.name === "openai" && isAzure ? (
+            <div className="space-y-3">
               <p className="text-[12px] font-semibold text-[#C2C2C8]">
-                Azure OpenAI <span className="font-normal text-[#6A6A70]">— blank these to use standard OpenAI</span>
+                Azure OpenAI <span className="font-normal text-[#6A6A70]">— deployment settings for this endpoint</span>
               </p>
               <div className="space-y-2">
                 <Label htmlFor="edit-api-version" className="text-[13px] font-semibold text-[#C2C2C8]">API version</Label>
