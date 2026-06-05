@@ -76,8 +76,14 @@ the one resolver for an agent's canonical chat. It runs inside a single
 
 1. validates the agent exists (`throw "Agent not found"` → 404 — an
    arbitrary `agentId` must not mint a session);
-2. returns the most-recently-updated session already tagged
-   `kind:"agent"` for that agent;
+2. among sessions already tagged `kind:"agent"`, returns the
+   most-recently-updated one that has history (non-empty
+   `messageIds`/`taskIds`) and **demotes any other `kind:"agent"`
+   duplicates** back to `undefined`, enforcing exactly one canonical
+   chat per agent so a stray empty duplicate cannot hijack the real
+   chat. It falls back to the most-recent `kind:"agent"` session (and
+   demotes nothing) only when none has history — a legitimately empty,
+   brand-new chat;
 3. otherwise lazily promotes the most-recent non-job, non-bridge legacy
    session to `kind:"agent"` (this is the "fold one legacy session into
    the canonical chat, hide the rest" path — reversible, nothing
@@ -207,13 +213,19 @@ New routes (`src/http.ts`):
 - `GET /api/chat/:id/threads/:threadId/blocks` — the thread's blocks
   in ordinal order (`listThreadBlocks`).
 - `POST /api/chat/:id/threads/:threadId/messages` — post a user reply
-  into a thread (`submitThreadReply`). Body accepts `alsoToMain?` to
-  best-effort mirror the message into the main chat (consistent with
-  the existing dual-publish pattern). The handler validates the
-  **session** exists first (so a bad `sessionId` fails as
-  "Chat session not found" rather than a misleading "Thread not found")
-  and requires the thread's first block to carry a `parentBlockId`
-  (no silent drop).
+  into a thread (`submitThreadReply`), **create-or-append**: if the
+  thread has no blocks yet it is *created* on this first reply, rooted at
+  the `parentBlockId` supplied in the body (the main-chat message the
+  user branched from, validated to be an un-threaded block in this
+  session); if the thread already exists, the parent is inherited from
+  its first block (a missing one is an error, not a silent drop). This
+  is how a user starts a thread off any agent message (Slack-style
+  "Reply in thread"), complementing the agent-initiated `start_thread`.
+  Body also accepts `alsoToMain?` to best-effort mirror the message into
+  the main chat (consistent with the existing dual-publish pattern). The
+  handler validates the **session** exists first (so a bad `sessionId`
+  fails as "Chat session not found" rather than a misleading
+  "Thread not found").
 - `GET /api/threads` — the cross-agent inbox: every thread across all
   `kind:"agent"` sessions, enriched with the owning agent's display
   name, newest reply first. The `?filter=all|unread` query is accepted
@@ -246,7 +258,10 @@ threads for `filter=unread`; the inbox always receives the full list.
   threads and detaches its job channels (the jobs themselves survive,
   paused), while `JobRunRecord` audit history is retained.
 - **E. User reply in a thread.** User context wins — the response stays
-  in the thread regardless of any routing directive.
+  in the thread regardless of any routing directive. A user can also
+  *start* a thread off any agent message: the first reply (carrying its
+  `parentBlockId`) creates the thread, create-or-append (see Client
+  Contract), complementing the agent-initiated `start_thread`.
 - **F. Thread read-state.** Per-thread unread is computed **client-side**
   (web `localStorage`); the server's per-device read cursor stays
   session-level, and opening the main chat does not clear thread badges.
@@ -298,8 +313,9 @@ Con:
 
 - `bun test src/execution/agent-chat-resolver.test.ts` covers
   `getOrCreateAgentChat`: the agent-exists guard, returning an existing
-  `kind:"agent"` session, lazy promotion of a legacy session, and
-  fresh creation.
+  `kind:"agent"` session, preferring the non-empty chat over an empty
+  `kind:"agent"` duplicate (and demoting the duplicate), lazy promotion
+  of a legacy session, and fresh creation.
 - `bun test src/execution/route-directive.test.ts` covers the
   leading-directive parser's `none` / `incomplete` / `directive`
   states.
@@ -312,8 +328,9 @@ Con:
   `summarizeThreads` / `summarizeThreadsForInstance` aggregates.
 - `bun test src/http.test.ts` smoke-tests the new routes — the
   agent-chat resolver, the three per-session thread routes (including
-  the session-first 404 and the `parentBlockId` requirement on a thread
-  reply), and the `/api/threads` inbox.
+  create-or-append from a new thread id + `parentBlockId`, the
+  session-first 404, and the `parentBlockId` requirement), and the
+  `/api/threads` inbox.
 - The live-gateway end-to-end verification confirms the model calls
   `start_thread` on a brainstorm prompt and the resulting reply (and its
   follow-ups) thread, the web Thread panel and `/threads` inbox render
