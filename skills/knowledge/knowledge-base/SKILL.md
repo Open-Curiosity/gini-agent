@@ -143,21 +143,28 @@ If `wiki/` does not exist yet, go to **Init**.
 skill_run({ skill: "knowledge-base", script: "lint", args: { root: "wiki" } })
 ```
 
-It returns JSON: `clean`, `totalIssues`, `counts`, and arrays for
-`brokenLinks`, `orphans`, `missingFromIndex`, `indexEntriesWithoutPage`,
-`frontmatter`, `backlinkAsymmetry`, `oversized`, `stale`, `unknownTagsUsed`,
-and `nonSlugFilenames`. Fix every issue with `file_write` / `file_patch`, then
-re-run until `clean` is true:
+It returns JSON: `clean`, `totalIssues`, `counts`, and per-check arrays.
+`clean` / `totalIssues` count only the **blocking** checks below; fix every
+blocking issue with `file_write` / `file_patch` and re-run until `clean` is
+true.
+
+Blocking (gate `clean`):
 
 - **brokenLinks** → create the missing page, or fix/remove the link.
 - **orphans** → link the page from a related page (not just the index).
+- **duplicateSlugs** → two files share a slug; rename one (a slug must be unique).
 - **missingFromIndex / indexEntriesWithoutPage** → reconcile `index.md`.
-- **frontmatter** → add the missing/invalid keys; ensure ≥2 outbound links.
-- **backlinkAsymmetry** → add the reciprocal link where the relationship is real.
+- **frontmatter** → add the missing/invalid keys; ensure ≥2 *resolved* outbound links.
+- **oversized** → split the page into focused sub-pages and link them.
 - **unknownTagsUsed** → add the tag to `SCHEMA.md`'s taxonomy first, or retag the page.
 - **nonSlugFilenames** → rename to a lowercase-hyphen slug (rewrite the file at
   the new path and update links/index).
-- **oversized** → split the page; **stale** → re-check the page against sources.
+
+Advisory (reported but do NOT gate `clean` — act on them with judgment):
+
+- **backlinkAsymmetry** → add the reciprocal link *where the relationship is real*;
+  many one-directional links are legitimate, so don't force every pair.
+- **stale** → re-check the page against its sources and bump `updated` if it still holds.
 
 ## Conflict handling
 

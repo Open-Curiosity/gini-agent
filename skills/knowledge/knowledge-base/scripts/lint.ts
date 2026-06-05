@@ -16,7 +16,7 @@
 // failures surface as { ok:false, error }.
 
 import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
-import { join, relative, basename, sep } from "node:path";
+import { join, relative, basename, resolve, sep } from "node:path";
 
 interface Args {
   root?: string;
@@ -31,18 +31,21 @@ export interface LintOptions {
 }
 
 const REQUIRED_FRONTMATTER = ["title", "created", "updated", "type", "tags", "sources"];
-const ALLOWED_TYPES = ["entity", "concept", "comparison", "query", "summary", "index"];
+const ALLOWED_TYPES = ["entity", "concept", "comparison", "query", "summary"];
 const MIN_OUTBOUND_LINKS = 2;
 const SPECIAL_FILES = new Set(["index.md", "log.md", "schema.md", "readme.md"]);
 
-// Match the runtime's slugifyHeading (src/docs.ts) so a [[Display Name]]
+// Based on the runtime's slugifyHeading (src/docs.ts) so a [[Display Name]]
 // link and an `acme-robotics.md` filename resolve to the same key.
+// Additionally folds underscores to hyphens, so `my_page.md` and the link
+// `[[My Page]]` agree on the slug `my-page` (and `my_page.md` is flagged for
+// rename by the non-slug-filename check).
 function slugify(text: string): string {
   return text
     .trim()
     .toLowerCase()
     .replace(/[^\w\s-]/g, "")
-    .replace(/\s+/g, "-");
+    .replace(/[\s_]+/g, "-");
 }
 
 function readArgs(): Args {
@@ -108,7 +111,7 @@ function parseFrontmatter(fm: string): Record<string, unknown> {
     const colon = line.indexOf(":");
     if (colon < 0) continue;
     const key = line.slice(0, colon).trim();
-    const rest = line.slice(colon + 1).trim();
+    const rest = stripFmComment(line.slice(colon + 1)).trim();
     if (rest) {
       if (rest.startsWith("[") && rest.endsWith("]")) {
         const inner = rest.slice(1, -1).trim();
@@ -147,6 +150,26 @@ function unquote(s: string): string {
   return s;
 }
 
+// Strip a trailing ` # comment` from a frontmatter value, ignoring `#` inside
+// quotes or `[]`/`{}` so `tags: [a, b] # note` stays a parseable inline array
+// and a leading `#fff`-style token is left intact.
+function stripFmComment(value: string): string {
+  let inSingle = false;
+  let inDouble = false;
+  let depth = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    const ch = value[i]!;
+    if (ch === "'" && !inDouble) inSingle = !inSingle;
+    else if (ch === '"' && !inSingle) inDouble = !inDouble;
+    else if ((ch === "[" || ch === "{") && !inSingle && !inDouble) depth += 1;
+    else if ((ch === "]" || ch === "}") && !inSingle && !inDouble) depth -= 1;
+    else if (ch === "#" && !inSingle && !inDouble && depth === 0 && i > 0 && /\s/.test(value[i - 1]!)) {
+      return value.slice(0, i);
+    }
+  }
+  return value;
+}
+
 // How many leading lines a stripped frontmatter block consumed, so
 // body-relative link line numbers can be reported file-relative.
 function frontmatterOffset(text: string, body: string): number {
@@ -165,12 +188,14 @@ function extractLinks(
   const lines = body.split("\n");
   let inFence = false;
   for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i]!;
-    if (/^\s*```/.test(line)) {
+    const raw = lines[i]!;
+    if (/^\s*(```|~~~)/.test(raw)) {
       inFence = !inFence;
       continue;
     }
     if (inFence) continue;
+    // Drop inline code spans so a `[[x]]` shown as code isn't read as a link.
+    const line = raw.replace(/`[^`]*`/g, "");
     const re = /\[\[([^\]]+)\]\]/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(line)) !== null) {
@@ -199,14 +224,29 @@ function daysBetween(isoDate: string, today: Date): number {
 
 // Parse the tag taxonomy out of SCHEMA.md: collect every backtick-wrapped
 // token and `- item` bullet under any heading whose text contains "tag".
+// The tag section spans its own sub-headings (e.g. "### Models" categories)
+// and ends only at the next heading of the same or higher level. Lines inside
+// fenced code blocks are skipped so a ``` example doesn't leak tags.
 function parseTaxonomy(schemaText: string): Set<string> {
   const tags = new Set<string>();
   const lines = schemaText.split("\n");
   let inTagSection = false;
+  let openLevel = 0;
+  let inFence = false;
   for (const line of lines) {
-    const heading = line.match(/^#{1,6}\s+(.*)$/);
+    if (/^\s*(```|~~~)/.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
     if (heading) {
-      inTagSection = /tag/i.test(heading[1]!);
+      const level = heading[1]!.length;
+      if (inTagSection && level <= openLevel) inTagSection = false; // closed by a sibling/higher heading
+      if (!inTagSection && /tag/i.test(heading[2]!)) {
+        inTagSection = true;
+        openLevel = level;
+      }
       continue;
     }
     if (!inTagSection) continue;
@@ -247,6 +287,9 @@ export function lintWiki(wikiRoot: string, rootLabel: string, opts: LintOptions 
   let hasIndex = false;
   let hasSchema = false;
   let taxonomy = new Set<string>();
+  // Slugs of special files (index/log/schema/readme) that actually exist at
+  // the wiki root, so a [[log]] link is only "not broken" when log.md is there.
+  const existingSpecialSlugs = new Set<string>();
 
   for (const file of files) {
     const rel = relative(wikiRoot, file);
@@ -254,18 +297,21 @@ export function lintWiki(wikiRoot: string, rootLabel: string, opts: LintOptions 
     const isRaw = rel.split(sep)[0] === "raw";
     const text = readFileSync(file, "utf8");
 
-    if (lowerName === "schema.md") {
-      hasSchema = true;
-      taxonomy = parseTaxonomy(text);
-      continue;
+    // Special files are special ONLY at the wiki root. A nested index.md or
+    // schema.md is a normal page, not the catalog or the taxonomy source.
+    const isRootSpecial = SPECIAL_FILES.has(lowerName) && !rel.includes(sep);
+    if (isRootSpecial) {
+      existingSpecialSlugs.add(slugify(basename(file, ".md")));
+      if (lowerName === "schema.md") {
+        hasSchema = true;
+        taxonomy = parseTaxonomy(text);
+      } else if (lowerName === "index.md") {
+        hasIndex = true;
+        const { body } = splitFrontmatter(text);
+        indexLinks = extractLinks(body, frontmatterOffset(text, body));
+      }
+      continue; // log.md / readme.md at root: recorded as existing, not linted
     }
-    if (lowerName === "index.md") {
-      hasIndex = true;
-      const { body } = splitFrontmatter(text);
-      indexLinks = extractLinks(body, frontmatterOffset(text, body));
-      continue;
-    }
-    if (SPECIAL_FILES.has(lowerName) && !rel.includes(sep)) continue; // log.md, readme.md at root
     if (isRaw) continue; // immutable sources — never linted
 
     const { fm, body } = splitFrontmatter(text);
@@ -281,6 +327,19 @@ export function lintWiki(wikiRoot: string, rootLabel: string, opts: LintOptions 
 
   const slugSet = new Set(pages.map((p) => p.slug));
 
+  // Duplicate slugs corrupt the graph: orphan / backlink / index-drift checks
+  // all key off slug, so two files that slugify the same are ambiguous. Report
+  // each colliding slug with the files that share it.
+  const slugToFiles = new Map<string, string[]>();
+  for (const p of pages) {
+    const arr = slugToFiles.get(p.slug) ?? [];
+    arr.push(p.rel);
+    slugToFiles.set(p.slug, arr);
+  }
+  const duplicateSlugs = [...slugToFiles.entries()]
+    .filter(([, files]) => files.length > 1)
+    .map(([slug, files]) => ({ slug, files: files.sort() }));
+
   // Inbound link graph (page → set of pages linking to it).
   const inbound = new Map<string, Set<string>>();
   for (const p of pages) inbound.set(p.slug, new Set());
@@ -291,14 +350,16 @@ export function lintWiki(wikiRoot: string, rootLabel: string, opts: LintOptions 
     }
   }
 
-  // Broken links: a link target that resolves to no page (and isn't a
-  // special page like the index itself).
+  // A link is resolvable when it points at a page, at the page itself, or at
+  // a special root file (index/log/schema/readme) that actually exists.
+  const resolves = (targetSlug: string, selfSlug: string): boolean =>
+    targetSlug === selfSlug || slugSet.has(targetSlug) || existingSpecialSlugs.has(targetSlug);
+
+  // Broken links: a link target that resolves to nothing.
   const brokenLinks: Array<{ from: string; target: string; line: number }> = [];
   for (const p of pages) {
     for (const link of p.links) {
-      if (link.targetSlug === p.slug) continue;
-      if (slugSet.has(link.targetSlug)) continue;
-      if (SPECIAL_FILES.has(`${link.targetSlug}.md`)) continue;
+      if (resolves(link.targetSlug, p.slug)) continue;
       brokenLinks.push({ from: p.rel, target: link.targetRaw, line: link.line });
     }
   }
@@ -323,7 +384,7 @@ export function lintWiki(wikiRoot: string, rootLabel: string, opts: LintOptions 
   const indexSlugs = new Set(indexLinks.map((l) => l.targetSlug));
   const missingFromIndex = hasIndex ? pages.filter((p) => !indexSlugs.has(p.slug)).map((p) => p.rel) : [];
   const indexEntriesWithoutPage = hasIndex
-    ? indexLinks.filter((l) => !slugSet.has(l.targetSlug) && !SPECIAL_FILES.has(`${l.targetSlug}.md`)).map((l) => l.targetRaw)
+    ? indexLinks.filter((l) => !slugSet.has(l.targetSlug) && !existingSpecialSlugs.has(l.targetSlug)).map((l) => l.targetRaw)
     : [];
 
   // Frontmatter validation + outbound-link minimum.
@@ -351,9 +412,14 @@ export function lintWiki(wikiRoot: string, rootLabel: string, opts: LintOptions 
         }
       }
     }
-    const distinctOutbound = new Set(p.links.filter((l) => l.targetSlug !== p.slug).map((l) => l.targetSlug));
+    // Count only links that actually resolve (to a page or an existing
+    // special root file) — a broken or unresolved target must not pad the
+    // minimum-connectivity count.
+    const distinctOutbound = new Set(
+      p.links.filter((l) => l.targetSlug !== p.slug && resolves(l.targetSlug, p.slug)).map((l) => l.targetSlug)
+    );
     if (distinctOutbound.size < MIN_OUTBOUND_LINKS) {
-      issues.push(`fewer than ${MIN_OUTBOUND_LINKS} outbound links (${distinctOutbound.size})`);
+      issues.push(`fewer than ${MIN_OUTBOUND_LINKS} resolved outbound links (${distinctOutbound.size})`);
     }
     if (issues.length > 0) frontmatter.push({ page: p.rel, issues });
   }
@@ -376,6 +442,7 @@ export function lintWiki(wikiRoot: string, rootLabel: string, opts: LintOptions 
     pages: pages.length,
     brokenLinks: brokenLinks.length,
     orphans: orphans.length,
+    duplicateSlugs: duplicateSlugs.length,
     missingFromIndex: missingFromIndex.length,
     indexEntriesWithoutPage: indexEntriesWithoutPage.length,
     frontmatterIssues: frontmatter.length,
@@ -385,9 +452,14 @@ export function lintWiki(wikiRoot: string, rootLabel: string, opts: LintOptions 
     unknownTagsUsed: unknownTagsUsed.length,
     nonSlugFilenames: nonSlugFilenames.length
   };
+  // BLOCKING issues gate `clean`: the agent fixes these until clean is true.
+  // backlinkAsymmetry and stale are deliberately EXCLUDED — they are advisory
+  // (a one-directional link is often legitimate; staleness is a review signal,
+  // not a defect), so they never trap the agent in an unfixable loop.
   const totalIssues =
     counts.brokenLinks +
     counts.orphans +
+    counts.duplicateSlugs +
     counts.missingFromIndex +
     counts.indexEntriesWithoutPage +
     counts.frontmatterIssues +
@@ -408,16 +480,19 @@ export function lintWiki(wikiRoot: string, rootLabel: string, opts: LintOptions 
     totalIssues,
     counts,
     structure,
+    // Blocking (counted in totalIssues / clean):
     brokenLinks,
     orphans,
+    duplicateSlugs,
     missingFromIndex,
     indexEntriesWithoutPage,
     frontmatter,
-    backlinkAsymmetry: asymmetry,
     oversized,
-    stale,
     unknownTagsUsed,
-    nonSlugFilenames
+    nonSlugFilenames,
+    // Advisory (NOT counted in totalIssues / clean):
+    backlinkAsymmetry: asymmetry,
+    stale
   };
 }
 
@@ -439,13 +514,24 @@ function main() {
   }
   if (!root) fail("No wiki root found. Pass args.root (e.g. 'wiki') or create the wiki first.");
   const wikiRoot = join(workspace!, root!);
+  // Confine the root to the workspace — reject `..` traversal or an absolute
+  // path that escapes it. The linter only reads, but stay inside the sandbox.
+  const resolvedWorkspace = resolve(workspace!);
+  const resolvedWiki = resolve(wikiRoot);
+  if (resolvedWiki !== resolvedWorkspace && !resolvedWiki.startsWith(resolvedWorkspace + sep)) {
+    fail(`Wiki root must be inside the workspace: ${root}`);
+  }
   if (!existsSync(wikiRoot)) fail(`Wiki root does not exist: ${root}`);
 
-  const report = lintWiki(wikiRoot, root!, {
-    maxLines: typeof args.maxLines === "number" ? args.maxLines : undefined,
-    staleDays: typeof args.staleDays === "number" ? args.staleDays : undefined
-  });
-  process.stdout.write(JSON.stringify(report));
+  try {
+    const report = lintWiki(wikiRoot, root!, {
+      maxLines: typeof args.maxLines === "number" ? args.maxLines : undefined,
+      staleDays: typeof args.staleDays === "number" ? args.staleDays : undefined
+    });
+    process.stdout.write(JSON.stringify(report));
+  } catch (error) {
+    fail(`lint failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 if (import.meta.main) main();
