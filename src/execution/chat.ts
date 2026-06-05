@@ -201,7 +201,15 @@ export async function createChat(config: RuntimeConfig, input: Record<string, un
 
 // Resolves the single canonical chat for an agent in the new chats IA.
 // Precedence:
-//   1. The most-recently-updated session already marked `kind: "agent"`.
+//   1. Among the agent's `kind: "agent"` sessions, the most-recently-updated
+//      one that actually has history (messages or tasks). A stray empty
+//      "New chat" can be marked `kind: "agent"` and be newer than the real
+//      chat, so recency alone would surface the empty one; require content
+//      first. Sessions not chosen are demoted (kind cleared) to enforce the
+//      single-canonical-chat invariant and stop the duplicate recurring.
+//      If none have content (brand-new agent whose sole canonical chat is
+//      legitimately empty), fall back to the most-recently-updated one and
+//      demote nothing.
 //   2. Otherwise the most-recently-updated non-job, non-bridge session
 //      for the agent — promoted to `kind: "agent"` and persisted.
 //   3. Otherwise a fresh `kind: "agent"` session is created.
@@ -219,12 +227,27 @@ export async function getOrCreateAgentChat(
     }
     const byRecency = (a: ChatSessionRecord, b: ChatSessionRecord): number =>
       b.updatedAt.localeCompare(a.updatedAt);
+    const hasContent = (s: ChatSessionRecord): boolean =>
+      (s.messageIds?.length ?? 0) > 0 || (s.taskIds?.length ?? 0) > 0;
     const owned = state.chatSessions.filter((session) => session.agentId === agentId);
 
-    const canonical = owned
+    const canonicals = owned
       .filter((session) => session.kind === "agent")
-      .sort(byRecency)[0];
-    if (canonical) return canonical;
+      .sort(byRecency);
+    if (canonicals.length > 0) {
+      const withContent = canonicals.filter(hasContent);
+      if (withContent.length > 0) {
+        const chosen = withContent[0];
+        // Demote the other canonicals so the agent keeps exactly one chat.
+        // Only safe because `chosen` has history — never demote a
+        // legitimately-empty brand-new canonical chat.
+        for (const session of canonicals) {
+          if (session.id !== chosen.id) session.kind = undefined;
+        }
+        return chosen;
+      }
+      return canonicals[0];
+    }
 
     const promotable = owned
       .filter((session) => session.origin !== "job" && session.source === undefined)

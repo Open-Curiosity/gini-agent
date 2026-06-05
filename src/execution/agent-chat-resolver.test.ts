@@ -4,6 +4,8 @@
 //   - returns a stable single session across repeated calls
 //   - creates a kind:"agent" session when the agent has none
 //   - promotes the most-recent non-job, non-bridge session to kind:"agent"
+//   - prefers a canonical chat with history over an empty duplicate, and
+//     demotes the empty one so a single canonical chat remains
 //   - never returns a job (channel) or messaging-bridge session
 //
 // The resolver must be called with a real AgentRecord id: normalizeState's
@@ -81,6 +83,39 @@ describe("getOrCreateAgentChat", () => {
     const state = readState(instance);
     const older = state.chatSessions.find((s) => s.id === olderId);
     expect(older?.kind).toBeUndefined();
+  });
+
+  test("prefers the non-empty canonical chat and demotes an empty duplicate", async () => {
+    const instance = "agent-chat-duplicate";
+    await registerAgent(instance, "agent_d");
+    let realId = "";
+    let emptyId = "";
+    await mutateState(instance, (state) => {
+      // The real chat with history, marked canonical but updated earlier.
+      const real = createChatSession(state, "Real chat", undefined, "agent_d", undefined, "agent");
+      real.messageIds.push("m1", "m2");
+      real.updatedAt = "2024-01-01T00:00:00.000Z";
+      // A stray empty "New chat", also marked canonical and updated later.
+      const empty = createChatSession(state, "New chat", undefined, "agent_d", undefined, "agent");
+      empty.updatedAt = "2024-06-01T00:00:00.000Z";
+      realId = real.id;
+      emptyId = empty.id;
+    });
+
+    const resolved = await getOrCreateAgentChat(instance, "agent_d");
+    // The chat with history wins over the newer-but-empty duplicate.
+    expect(resolved.id).toBe(realId);
+    expect(resolved.kind).toBe("agent");
+
+    // The empty duplicate is demoted so only one canonical chat remains.
+    const state = readState(instance);
+    const empty = state.chatSessions.find((s) => s.id === emptyId);
+    expect(empty?.kind).toBeUndefined();
+    const canonical = state.chatSessions.filter(
+      (s) => s.agentId === "agent_d" && s.kind === "agent"
+    );
+    expect(canonical).toHaveLength(1);
+    expect(canonical[0]?.id).toBe(realId);
   });
 
   test("ignores job and bridge sessions when no agent chat exists", async () => {
