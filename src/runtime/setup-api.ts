@@ -146,22 +146,25 @@ export async function setSetupProvider(
     // starts clean — `existing` is undefined — matching the cross-provider
     // non-inheritance rule resolveEffectiveContext enforces for agents.
     const existing = config.provider?.name === providerName ? config.provider : undefined;
+    // Field resolution rule: a key PRESENT in the payload (even blank) is
+    // applied, with blank/invalid clearing the field; a key ABSENT preserves
+    // the existing value. This lets the full web Edit Provider form clear a
+    // field — blanking baseUrl/apiVersion swaps an Azure config back to
+    // standard OpenAI — while a partial `{ provider, model }` save (the model
+    // picker, the set_provider tool) still preserves transport config the
+    // caller didn't resend. normalizeProvider carries apiVersion/deployment/
+    // authScheme only for the openai provider, so they are inert elsewhere.
+    const has = (key: string): boolean => Object.prototype.hasOwnProperty.call(payload, key);
+    const trimmedString = (value: unknown): string | undefined =>
+      typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
     const model = typeof payload.model === "string" && payload.model.length > 0
       ? payload.model
       : (existing?.model || envKeySpec.defaultModel);
-    const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
-      ? payload.baseUrl.trim()
-      : existing?.baseUrl;
-    // Azure OpenAI routing fields. normalizeProvider carries them only for the
-    // openai provider, so passing them for openrouter/local/deepseek is inert.
-    const apiVersion = typeof payload.apiVersion === "string" && payload.apiVersion.trim().length > 0
-      ? payload.apiVersion.trim()
-      : existing?.apiVersion;
-    const deployment = typeof payload.deployment === "string" && payload.deployment.trim().length > 0
-      ? payload.deployment.trim()
-      : existing?.deployment;
-    const authScheme = payload.authScheme === "api-key" || payload.authScheme === "bearer"
-      ? payload.authScheme
+    const baseUrl = has("baseUrl") ? trimmedString(payload.baseUrl) : existing?.baseUrl;
+    const apiVersion = has("apiVersion") ? trimmedString(payload.apiVersion) : existing?.apiVersion;
+    const deployment = has("deployment") ? trimmedString(payload.deployment) : existing?.deployment;
+    const authScheme = has("authScheme")
+      ? (payload.authScheme === "api-key" || payload.authScheme === "bearer" ? payload.authScheme : undefined)
       : existing?.authScheme;
     // Preserve a custom apiKeyEnv (set via `gini provider set --api-key-env`)
     // across a same-provider edit; the web Edit dialog can't resend it.

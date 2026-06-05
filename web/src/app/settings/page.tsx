@@ -88,6 +88,7 @@ export default function SettingsPage() {
   // user about which entry their "Set active" click changes.
   const activeProviderName = status.data?.provider?.provider?.name;
   const activeProviderModel = status.data?.provider?.provider?.model;
+  const activeProvider = status.data?.provider?.provider;
 
   return (
     <>
@@ -97,6 +98,7 @@ export default function SettingsPage() {
           catalog={catalog.data ?? []}
           activeProviderName={activeProviderName}
           activeProviderModel={activeProviderModel}
+          activeProvider={activeProvider}
         />
 
         <CacheWarmerCard />

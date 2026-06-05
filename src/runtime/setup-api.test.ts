@@ -241,6 +241,37 @@ describe("setup-api", () => {
     expect(config.provider.baseUrl).toBe("https://lilac-labs-w.openai.azure.com");
   });
 
+  test("a full edit with blanked azure fields clears routing (swap back to standard OpenAI)", async () => {
+    // Configure Azure first.
+    await setSetupProvider(config, {
+      provider: "openai",
+      apiKey: "sk-azure",
+      model: "gpt-5.4",
+      baseUrl: "https://lilac-labs-w.openai.azure.com",
+      apiVersion: "2024-12-01-preview",
+      deployment: "gpt-5.4",
+      authScheme: "api-key"
+    });
+    // The full web Edit form posts every transport field; blank ones clear
+    // (key present + empty), so this swaps the provider back to standard OpenAI.
+    const result = await setSetupProvider(config, {
+      provider: "openai",
+      model: "gpt-5.4-mini",
+      baseUrl: "",
+      apiVersion: "",
+      deployment: "",
+      authScheme: ""
+    });
+    expect(result.ok).toBe(true);
+    const cfgPath = join(s.stateRoot, "instances", config.instance, "config.json");
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(cfg.provider?.model).toBe("gpt-5.4-mini");
+    expect(cfg.provider?.baseUrl).toBe("https://api.openai.com/v1");
+    expect(cfg.provider?.apiVersion).toBeUndefined();
+    expect(cfg.provider?.deployment).toBeUndefined();
+    expect(cfg.provider?.authScheme).toBeUndefined();
+  });
+
   test("POST openai without apiKey returns ok:false", async () => {
     const result = await setSetupProvider(config, { provider: "openai", apiKey: "" });
     expect(result.ok).toBe(false);

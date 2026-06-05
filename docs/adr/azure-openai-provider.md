@@ -43,7 +43,9 @@ Two helpers in `src/provider.ts` centralize the per-call decision so all four ch
 
 The Azure key (or Entra token) is read from the env var named by `apiKeyEnv` (default `OPENAI_API_KEY`), the same resolution path as standard OpenAI — only the header name changes under the `api-key` scheme. The `POST /api/setup/provider` flow persists the key to `~/.gini/secrets.env` exactly as it does for standard OpenAI, so no new secret-handling surface ships here. `apiVersion`, `deployment`, and `authScheme` are non-secret transport config and flow through `providerHealth` / `/api/status` / trace records like `baseUrl`.
 
-Partial provider edits preserve transport config. The web Edit Provider dialog posts only `{ provider, apiKey?, model }`, so `setSetupProvider`, on a same-provider edit, falls back to the persisted `baseUrl` / `apiKeyEnv` / `apiVersion` / `deployment` / `authScheme` for any field the payload omits — a model-only save can't silently strip an instance's Azure routing back to a plain `api.openai.com` call. A provider switch (different `name`) starts clean, matching the cross-provider non-inheritance rule for agents. The CLI's `gini provider set` takes the opposite, explicit-replace stance — it rebuilds the config from the flags given, so running it without `--base-url`/`--api-version` is the way to clear Azure routing and return to standard OpenAI.
+The web provider forms expose the routing. The Add Provider page and the Edit Provider dialog both surface a Base URL field plus an Azure section (API version, Deployment, Auth scheme) for the openai provider; the Edit dialog prefills them from the active provider's persisted config (threaded from `/status`). So configuring Azure — and swapping back to standard OpenAI by blanking the fields — is now a UI action, not CLI-only.
+
+`setSetupProvider`'s field rule makes both the full-form and partial callers correct: a key PRESENT in the payload (even blank) is applied, with a blank value clearing the field; a key ABSENT preserves the existing value. The Edit dialog posts the full transport state, so blanking Base URL + API version clears Azure routing and swaps back to `api.openai.com`. A partial caller — the model picker's `{ provider, model }`, or the `set_provider` tool — omits the transport keys, so a model-only save preserves the persisted `baseUrl` / `apiKeyEnv` / `apiVersion` / `deployment` / `authScheme` and can't silently strip Azure routing. A provider switch (different `name`) starts clean, matching the cross-provider non-inheritance rule for agents. The CLI's `gini provider set` takes the explicit-replace stance — it rebuilds the config from the flags given, so running it without `--base-url`/`--api-version` also clears Azure routing.
 
 ## Agent Override Inheritance
 
@@ -59,7 +61,6 @@ Partial provider edits preserve transport config. The web Edit Provider dialog p
 ## Out of Scope, Linked Follow-Ups
 
 - **Azure embeddings.** The default embedding provider is `local` (Transformers.js); the `openai` embedding path in `src/embeddings.ts` still targets the flat `${baseUrl}/embeddings` with a `Bearer` header. Azure embeddings need a separate embeddings deployment (a chat deployment can't serve `text-embedding-3-small`), so it is a distinct feature, not wired here.
-- **Web provider form.** The `POST /api/setup/provider` endpoint accepts the Azure fields, but the web Add/Edit Provider form does not yet expose `baseUrl` / `apiVersion` / `deployment` / `authScheme` inputs (it currently exposes only API key + model, so even `baseUrl` is CLI-only today). Adding those inputs is a purely additive follow-up.
 - **Catalog entry.** Azure is a mode of the `openai` catalog row, not a separate entry; no dedicated `azure` tile ships.
 
 ## Consequences
