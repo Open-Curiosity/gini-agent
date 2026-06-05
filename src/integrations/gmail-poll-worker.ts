@@ -52,6 +52,10 @@ export interface GmailPollDeps {
   sessionStatus?: () => Promise<GwsSessionStatus>;
   // Test seam: override "me" resolution so a stub never shells getProfile.
   resolveSelfEmail?: () => Promise<string | undefined>;
+  // Test seam: override the turn-spawn so unit tests can assert "triggered
+  // exactly once" without spawning a real model turn. Production leaves it
+  // unset and the worker calls submitTask directly.
+  spawnTurn?: (watcher: EmailWatcherRecord, prompt: string) => Promise<void>;
 }
 
 export interface GmailPollReport {
@@ -234,7 +238,8 @@ async function processWatcher(
   config: RuntimeConfig,
   watcher: EmailWatcherRecord,
   gwsSpawn: GwsSpawn,
-  selfEmail: string | undefined
+  selfEmail: string | undefined,
+  spawnTurn: (watcher: EmailWatcherRecord, prompt: string) => Promise<void>
 ): Promise<{ triggered: number; seeded: boolean }> {
   // Bound the query with `after:<epochSec>` once we have a watermark so we
   // don't re-list the whole unread history every tick. Gmail's `after:`
@@ -287,11 +292,7 @@ async function processWatcher(
     // session, then markSeen + advance the cursor for THIS item before the
     // next so a crash mid-batch never replays it.
     const prompt = buildWatchPrompt(watcher, meta);
-    await submitTask(config, prompt, {
-      mode: "chat",
-      agentId: watcher.agentId,
-      chatSessionId: watcher.chatSessionId
-    });
+    await spawnTurn(watcher, prompt);
     triggered += 1;
     markEmailSeen(config.instance, watcher.id, id);
     if (Number.isFinite(internalDate) && internalDate > 0) {
@@ -345,11 +346,17 @@ export async function runGmailPollTick(
   }
 
   const selfEmail = await (deps.resolveSelfEmail ?? (() => resolveSelfEmail(gwsSpawn)))();
+  const spawnTurn = deps.spawnTurn ?? ((watcher: EmailWatcherRecord, prompt: string) =>
+    submitTask(config, prompt, {
+      mode: "chat",
+      agentId: watcher.agentId,
+      chatSessionId: watcher.chatSessionId
+    }).then(() => undefined));
 
   for (const watcher of enabled) {
     report.considered += 1;
     try {
-      const result = await processWatcher(config, watcher, gwsSpawn, selfEmail);
+      const result = await processWatcher(config, watcher, gwsSpawn, selfEmail, spawnTurn);
       report.polled += 1;
       report.triggered += result.triggered;
       if (result.seeded) report.seeded += 1;
