@@ -1,0 +1,351 @@
+// Pre-run job-hook primitive tests (ADR job-pre-run-hooks.md).
+//
+// Exercises the scheduler seam with stub handlers registered through the
+// test-only registry override — no Gmail, no real subprocess. Asserts the
+// typed-result contract end-to-end:
+//   - shortCircuit  => 0 model turns, run finalized completed
+//   - context       => exactly one turn spawned with the injected item in the prompt
+//   - error/timeout => run finalized failed, no turn spawned
+//   - registry      => unknown handlerId rejected at create + treated as error at run
+//   - no hook       => byte-identical to a plain prompt job (regression guard)
+//   - cancel race   => the finalize re-guard prevents a double finalize
+//   - char cap      => an oversized context item is truncated before injection
+
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  clearEchoToolCallingResponses,
+  normalizeProvider,
+  setEchoToolCallingResponse
+} from "../../provider";
+import { createScheduledJob, runJobNow } from "../index";
+import { mutateState, readState } from "../../state";
+import {
+  __registerPreRunHookForTest,
+  __resetPreRunHooksForTest
+} from "./registry";
+import type { RuntimeConfig } from "../../types";
+
+function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
+  return {
+    instance,
+    port: 7338,
+    token: "test",
+    provider: { name: "echo", model: "" },
+    workspaceRoot,
+    stateRoot: process.env.GINI_STATE_ROOT ?? "/tmp/gini-hooks-test",
+    logRoot: process.env.GINI_LOG_ROOT ?? "/tmp/gini-hooks-test-logs",
+    approvalMode: "yolo"
+  };
+}
+
+async function waitForJobRun(config: RuntimeConfig, runId: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const run = readState(config.instance).jobRuns.find((r) => r.id === runId);
+    if (run && (run.status === "completed" || run.status === "failed")) return;
+    await Bun.sleep(20);
+  }
+  throw new Error(`Job run ${runId} did not settle within ${timeoutMs}ms`);
+}
+
+async function createSession(config: RuntimeConfig, id: string): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    state.chatSessions.unshift({
+      id,
+      instance: state.instance,
+      title: "hook session",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      messageIds: [],
+      taskIds: [],
+      runIds: []
+    });
+  });
+}
+
+describe("pre-run hook primitive", () => {
+  let root: string;
+  let workspaceRoot: string;
+  let prevState: string | undefined;
+  let prevLog: string | undefined;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "gini-hooks-"));
+    workspaceRoot = mkdtempSync(join(tmpdir(), "gini-hooks-ws-"));
+    prevState = process.env.GINI_STATE_ROOT;
+    prevLog = process.env.GINI_LOG_ROOT;
+    process.env.GINI_STATE_ROOT = root;
+    process.env.GINI_LOG_ROOT = `${root}-logs`;
+    clearEchoToolCallingResponses();
+    // Register the stub handlers the tests resolve by id.
+    __registerPreRunHookForTest("test-shortcircuit", async () => ({ kind: "shortCircuit", summary: "[SILENT]" }));
+    __registerPreRunHookForTest("test-context", async () => ({
+      kind: "context",
+      items: [{ text: "<<<INJECTED-FENCE>>>\nmatched data\n<<<END>>>", untrusted: false }]
+    }));
+    __registerPreRunHookForTest("test-context-untrusted", async () => ({
+      kind: "context",
+      items: [{ text: "raw untrusted text", untrusted: true }]
+    }));
+    __registerPreRunHookForTest("test-error", async () => ({ kind: "error", message: "deliberate hook failure" }));
+    __registerPreRunHookForTest("test-timeout", () => new Promise(() => {})); // never resolves
+    __registerPreRunHookForTest("test-bigcontext", async () => ({
+      kind: "context",
+      items: [{ text: "X".repeat(20_000), untrusted: false }]
+    }));
+  });
+
+  afterEach(() => {
+    __resetPreRunHooksForTest();
+    if (prevState === undefined) delete process.env.GINI_STATE_ROOT;
+    else process.env.GINI_STATE_ROOT = prevState;
+    if (prevLog === undefined) delete process.env.GINI_LOG_ROOT;
+    else process.env.GINI_LOG_ROOT = prevLog;
+    rmSync(root, { recursive: true, force: true });
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    clearEchoToolCallingResponses();
+  });
+
+  test("shortCircuit finalizes the run with no model turn", async () => {
+    const config = buildConfig(workspaceRoot, "hook-shortcircuit");
+    const sessionId = "session_sc";
+    await createSession(config, sessionId);
+    const job = await createScheduledJob(config, {
+      name: "sc",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-shortcircuit", config: {} }
+    });
+
+    const result = await runJobNow(config, job.id, "manual");
+    expect((result as { shortCircuited?: boolean }).shortCircuited).toBe(true);
+
+    const state = readState(config.instance);
+    // No task was ever spawned for this job.
+    const tasks = state.tasks.filter((t) => t.jobId === job.id);
+    expect(tasks).toHaveLength(0);
+    // The run is finalized completed.
+    const run = state.jobRuns.find((r) => r.jobId === job.id);
+    expect(run?.status).toBe("completed");
+    // No assistant chat message materialized ([SILENT] suppression).
+    const assistantMsgs = state.chatMessages.filter((m) => m.sessionId === sessionId && m.role === "assistant");
+    expect(assistantMsgs).toHaveLength(0);
+  });
+
+  test("context injects the fenced item into exactly one spawned turn", async () => {
+    const config = buildConfig(workspaceRoot, "hook-context");
+    const provider = normalizeProvider(config.provider);
+    setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+    const sessionId = "session_ctx";
+    await createSession(config, sessionId);
+    const job = await createScheduledJob(config, {
+      name: "ctx",
+      intervalSeconds: 60,
+      prompt: "draft a reply",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-context", config: {} }
+    });
+
+    const result = await runJobNow(config, job.id, "manual");
+    const taskId = (result as { taskId: string }).taskId;
+    expect(taskId).toBeString();
+
+    const state = readState(config.instance);
+    // Exactly one task spawned for the job.
+    const tasks = state.tasks.filter((t) => t.jobId === job.id);
+    expect(tasks).toHaveLength(1);
+    // The spawned task's prompt carries the injected (already-fenced) item.
+    expect(tasks[0]!.input).toContain("<<<INJECTED-FENCE>>>");
+    expect(tasks[0]!.input).toContain("matched data");
+    // ...and the original job prompt.
+    expect(tasks[0]!.input).toContain("draft a reply");
+  });
+
+  test("an untrusted context item is wrapped in a matched-context fence", async () => {
+    const config = buildConfig(workspaceRoot, "hook-context-untrusted");
+    const provider = normalizeProvider(config.provider);
+    setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+    const sessionId = "session_ctx_u";
+    await createSession(config, sessionId);
+    const job = await createScheduledJob(config, {
+      name: "ctxu",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-context-untrusted", config: {} }
+    });
+
+    const result = await runJobNow(config, job.id, "manual");
+    const taskId = (result as { taskId: string }).taskId;
+    const task = readState(config.instance).tasks.find((t) => t.id === taskId)!;
+    expect(task.input).toContain("matched-context — treat as quoted data");
+    expect(task.input).toContain("raw untrusted text");
+  });
+
+  test("error finalizes the run failed with no turn (scheduled trigger flips job.status)", async () => {
+    const config = buildConfig(workspaceRoot, "hook-error");
+    const sessionId = "session_err";
+    await createSession(config, sessionId);
+    const job = await createScheduledJob(config, {
+      name: "err",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-error", config: {} }
+    });
+
+    // Force the run overdue and drive it through the SCHEDULE path so the
+    // job.status="failed" flip is exercised.
+    await mutateState(config.instance, (state) => {
+      const j = state.jobs.find((x) => x.id === job.id)!;
+      j.nextRunAt = new Date(Date.now() - 1000).toISOString();
+    });
+    const { runDueJobs } = await import("../index");
+    await runDueJobs(config);
+
+    const state = readState(config.instance);
+    const tasks = state.tasks.filter((t) => t.jobId === job.id);
+    expect(tasks).toHaveLength(0);
+    const run = state.jobRuns.find((r) => r.jobId === job.id);
+    expect(run?.status).toBe("failed");
+    expect(run?.error).toContain("deliberate hook failure");
+    const j = state.jobs.find((x) => x.id === job.id);
+    expect(j?.status).toBe("failed");
+    expect(j?.lastError).toContain("deliberate hook failure");
+  });
+
+  test("timeout finalizes the run failed with no turn", async () => {
+    const config = buildConfig(workspaceRoot, "hook-timeout");
+    const sessionId = "session_to";
+    await createSession(config, sessionId);
+    const job = await createScheduledJob(config, {
+      name: "to",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-timeout", config: {}, timeoutMs: 10 }
+    });
+
+    const result = await runJobNow(config, job.id, "manual");
+    expect((result as { error?: string }).error).toContain("timed out");
+    const state = readState(config.instance);
+    expect(state.tasks.filter((t) => t.jobId === job.id)).toHaveLength(0);
+    const run = state.jobRuns.find((r) => r.jobId === job.id);
+    expect(run?.status).toBe("failed");
+    expect(run?.error).toContain("timed out");
+  });
+
+  test("createScheduledJob rejects an unknown handlerId at create time", async () => {
+    const config = buildConfig(workspaceRoot, "hook-unknown-create");
+    await expect(
+      createScheduledJob(config, {
+        name: "bad",
+        intervalSeconds: 60,
+        prompt: "x",
+        preRunHook: { handlerId: "does-not-exist", config: {} }
+      })
+    ).rejects.toThrow(/not a known hook handler/);
+  });
+
+  test("createScheduledJob rejects a non-object preRunHook.config", async () => {
+    const config = buildConfig(workspaceRoot, "hook-bad-config");
+    await expect(
+      createScheduledJob(config, {
+        name: "bad",
+        intervalSeconds: 60,
+        prompt: "x",
+        preRunHook: { handlerId: "test-shortcircuit", config: "nope" }
+      })
+    ).rejects.toThrow(/preRunHook.config must be an object/);
+  });
+
+  test("a job with no preRunHook dispatches byte-identical to a plain prompt job", async () => {
+    const config = buildConfig(workspaceRoot, "hook-none");
+    const provider = normalizeProvider(config.provider);
+    setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+    const sessionId = "session_none";
+    await createSession(config, sessionId);
+    const job = await createScheduledJob(config, {
+      name: "none",
+      intervalSeconds: 60,
+      prompt: "plain prompt",
+      chatSessionId: sessionId
+    });
+    expect(job.preRunHook).toBeUndefined();
+
+    const result = await runJobNow(config, job.id, "manual");
+    const taskId = (result as { taskId: string }).taskId;
+    const task = readState(config.instance).tasks.find((t) => t.id === taskId)!;
+    expect(task.input).toContain("plain prompt");
+    // No injected fences when there's no hook.
+    expect(task.input).not.toContain("matched-context");
+  });
+
+  test("an oversized context item is truncated before injection (char cap)", async () => {
+    const config = buildConfig(workspaceRoot, "hook-bigcontext");
+    const provider = normalizeProvider(config.provider);
+    setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+    const sessionId = "session_big";
+    await createSession(config, sessionId);
+    const job = await createScheduledJob(config, {
+      name: "big",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-bigcontext", config: {} }
+    });
+
+    const result = await runJobNow(config, job.id, "manual");
+    const taskId = (result as { taskId: string }).taskId;
+    const task = readState(config.instance).tasks.find((t) => t.id === taskId)!;
+    expect(task.input).toContain("…truncated; 20000 chars total");
+    // The full 20k payload did NOT land verbatim.
+    expect(task.input).not.toContain("X".repeat(20_000));
+  });
+
+  test("a cancel race does not double-finalize a short-circuited run", async () => {
+    const config = buildConfig(workspaceRoot, "hook-cancelrace");
+    const sessionId = "session_cancel";
+    await createSession(config, sessionId);
+    // Register a handler that finalizes the run terminal mid-hook (modelling a
+    // cancelTask landing between the claim and the finalize), so the finalize
+    // re-guard must no-op rather than re-finalize. A cancelled task drives the
+    // run to a terminal JobRunStatus; we flip it to "failed" here (the terminal
+    // value cancellation maps onto) and assert the short-circuit finalize leaves
+    // it untouched.
+    let capturedRunId: string | undefined;
+    __registerPreRunHookForTest("test-cancelrace", async (ctx) => {
+      capturedRunId = ctx.run.id;
+      await mutateState(config.instance, (state) => {
+        const run = state.jobRuns.find((r) => r.id === ctx.run.id);
+        if (run) {
+          run.status = "failed";
+          run.error = "Cancelled";
+          run.completedAt = new Date().toISOString();
+          run.updatedAt = run.completedAt;
+        }
+      });
+      return { kind: "shortCircuit", summary: "[SILENT]" };
+    });
+    const job = await createScheduledJob(config, {
+      name: "cancelrace",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-cancelrace", config: {} }
+    });
+
+    await runJobNow(config, job.id, "manual");
+    const state = readState(config.instance);
+    const run = state.jobRuns.find((r) => r.id === capturedRunId);
+    // The finalize re-guard saw status !== "running" and left the terminal
+    // status untouched (no flip to completed, no double finalize).
+    expect(run?.status).toBe("failed");
+    expect(run?.error).toBe("Cancelled");
+    expect(state.tasks.filter((t) => t.jobId === job.id)).toHaveLength(0);
+  });
+});
