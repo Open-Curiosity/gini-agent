@@ -1180,6 +1180,17 @@ export function isEmailSeen(instance: Instance, watcherId: string, messageId: st
   return (row?.c ?? 0) > 0;
 }
 
+// Drop every email_seen row for a watcher. Called when a watcher is removed so
+// its dedup rows don't outlive it. Returns the number of rows deleted.
+export function deleteEmailSeenForWatcher(instance: Instance, watcherId: string): number {
+  const db = getMemoryDb(instance);
+  const result = db.run(
+    "DELETE FROM email_seen WHERE instance = ? AND watcher_id = ?",
+    [instance, watcherId]
+  );
+  return result.changes ?? 0;
+}
+
 // --------------------------------------------------------------------------
 // Entity + link helpers
 // --------------------------------------------------------------------------

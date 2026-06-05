@@ -197,5 +197,6 @@ export {
 export type { AddEmailWatcherInput } from "./email-watchers";
 export {
   markEmailSeen,
-  isEmailSeen
+  isEmailSeen,
+  deleteEmailSeenForWatcher
 } from "./memory-db";

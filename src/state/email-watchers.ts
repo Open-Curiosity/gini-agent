@@ -11,6 +11,7 @@ import type { EmailWatcherRecord, RuntimeConfig, RuntimeState } from "../types";
 import { id, now } from "./ids";
 import { addAudit } from "./audit";
 import { createChatSession } from "./records";
+import { deleteEmailSeenForWatcher } from "./memory-db";
 import { mutateState, readState } from "./store";
 
 export interface AddEmailWatcherInput {
@@ -116,7 +117,7 @@ export async function updateEmailWatcher(
 }
 
 export async function removeEmailWatcher(config: RuntimeConfig, watcherId: string): Promise<EmailWatcherRecord> {
-  return mutateState(config.instance, (state) => {
+  const removed = await mutateState(config.instance, (state) => {
     const index = state.emailWatchers.findIndex((candidate) => candidate.id === watcherId);
     if (index < 0) throw new Error(`Email watcher not found: ${watcherId}`);
     const [item] = state.emailWatchers.splice(index, 1);
@@ -133,4 +134,8 @@ export async function removeEmailWatcher(config: RuntimeConfig, watcherId: strin
     );
     return item!;
   });
+  // Drop the watcher's dedup rows so they don't outlive it. Lives in memory.db
+  // (not state.json), so it's done outside the state lock.
+  deleteEmailSeenForWatcher(config.instance, watcherId);
+  return removed;
 }
