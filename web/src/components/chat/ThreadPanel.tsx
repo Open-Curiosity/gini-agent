@@ -5,10 +5,11 @@ import { X } from "lucide-react";
 import { toast } from "sonner";
 import type { ChatBlock } from "@runtime/types";
 import type { UploadRef } from "@/lib/api";
-import { useReplyToThread, useThread } from "@/lib/queries";
+import { useChatBlocks, useReplyToThread, useThread } from "@/lib/queries";
 import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
 import type { ThreadSummary } from "@/lib/view-types";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { AgentAvatar } from "./AgentAvatar";
 import { BlockRenderer } from "./BlockRenderer";
 import { BlockToolCallsCollapsed } from "./BlockToolCallsCollapsed";
 import { GeneratedFilesCard } from "./GeneratedFilesCard";
@@ -37,6 +38,12 @@ export function ThreadPanel({
   onClose: () => void;
 }) {
   const { blocks, isLoading } = useThread(sessionId, thread.threadId);
+  // Resolve the full parent block from the session's block stream so the
+  // thread's root renders identically to a real chat message. This shares the
+  // chat surface's query (react-query dedupes by key); for an inbox-opened
+  // panel it loads the parent's session to find the block.
+  const { blocks: sessionBlocks } = useChatBlocks(sessionId);
+  const parentBlock = sessionBlocks.find((b) => b.id === thread.parentBlockId);
   const reply = useReplyToThread(sessionId, thread.threadId);
   const [text, setText] = useState("");
   const endRef = useRef<HTMLDivElement | null>(null);
@@ -116,20 +123,36 @@ export function ThreadPanel({
 
       <ScrollArea className="min-h-0 flex-1">
         <div className="flex flex-col gap-4 p-[18px]">
+          {/* Parent message — the thread's root, always shown at the top.
+              Rendered through the same BlockRenderer as the main chat so it
+              looks like a real agent message (avatar + name + time + bubble).
+              Falls back to a minimal bubble while the session blocks load. */}
+          {parentBlock ? (
+            <BlockRenderer block={parentBlock} agent={agent} />
+          ) : thread.rootPreview ? (
+            <div className="flex items-start gap-2.5">
+              <AgentAvatar name={agentName} seed={agent?.id ?? agentName} size={24} className="mt-0.5" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 pl-1 pb-1 text-xs">
+                  <span className="font-semibold text-foreground">{agentName}</span>
+                </div>
+                <div className="max-w-[90%] rounded-xl bg-[#15161C] px-3 py-2.5 text-[13px] text-[#D6D6DC]">
+                  {thread.rootPreview}
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {/* Replies divider — frames the reply section even with 0 replies. */}
+          <div className="flex items-center gap-2.5">
+            <span className="text-[11px] font-semibold text-[#6A6A70]">Replies</span>
+            <div className="h-px flex-1 bg-[#1C1C1E]" />
+          </div>
+
           {isLoading && blocks.length === 0 ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
           ) : renderItems.length === 0 ? (
-            <div className="flex flex-col gap-3">
-              {thread.rootPreview ? (
-                <div className="rounded-lg border border-[#1C1C1E] bg-[#0B0B0E] px-3 py-2.5">
-                  <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-[#6A6A70]">
-                    Replying to {agentName}
-                  </p>
-                  <p className="text-[13px] text-[#B6BFD4]">{thread.rootPreview}</p>
-                </div>
-              ) : null}
-              <p className="text-sm text-muted-foreground">No replies yet — start the thread.</p>
-            </div>
+            <p className="text-sm text-muted-foreground">No replies yet.</p>
           ) : (
             <ul className="space-y-4">
               {renderItems.map((item) => {
