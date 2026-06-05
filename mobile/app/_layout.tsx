@@ -24,6 +24,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { primeCredentials, useAuth } from "@/src/auth";
 import { primePendingPair } from "@/src/pending-pair";
+import { LinkContextMenuHost } from "@/src/components/chat/linkContextMenu";
 import { FilePreviewProvider } from "@/src/components/FilePreview";
 import { ImagePreviewProvider } from "@/src/components/ImagePreview";
 import {
@@ -161,6 +162,11 @@ export default function RootLayout() {
               </Stack>
             </FilePreviewProvider>
           </ImagePreviewProvider>
+          {/* Single overlay host for the markdown link long-press menu;
+              summoned from the module-level render rules via an emitter.
+              Mounted last so its absolute-fill overlay sits above the
+              navigator. */}
+          <LinkContextMenuHost />
         </QueryClientProvider>
       </SafeAreaProvider>
     </GestureHandlerRootView>

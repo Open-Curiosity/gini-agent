@@ -1,96 +1,29 @@
-import { describe, expect, mock, test, beforeEach } from "bun:test";
-import * as ReactActual from "react";
-
-// ---------------------------------------------------------------------------
-// These RN components can't mount under bun (react-native ships untranspiled
-// Flow and there is no native runtime / test renderer in this project). So we
-// stub the native modules and invoke the exported render rules + the
-// SelectableBlockText forwardRef directly, inspecting the returned element
-// tree. `Platform.OS` is a mutable field so a test can pick the iOS vs.
-// non-iOS branch; reset it in beforeEach so mutations don't leak.
-// ---------------------------------------------------------------------------
-
-const openURL = mock((_url: string) => Promise.resolve());
-const Platform = { OS: "ios" as "ios" | "android" | "web" };
-
-// Identity-comparable stand-ins for the native primitives. We never render
-// them, so the bodies are no-ops; tests assert on element.type === Text etc.
-function Text() {
-  return null;
-}
-function TextInput() {
-  return null;
-}
-function View() {
-  return null;
-}
-function AnimatedView() {
-  return null;
-}
-
-const loopStop = mock(() => {});
-const loopStart = mock(() => {});
-
-mock.module("react-native", () => ({
+import { beforeEach, describe, expect, test } from "bun:test";
+import { createElement } from "react";
+// Importing the shared setup installs the (process-global) module mocks before
+// the components under test are imported. The same mocks are used by
+// linkContextMenu.test so the two files can run in one process.
+import {
+  effectCleanups,
+  loopStart,
+  loopStop,
+  openBrowserAsync,
   Platform,
   Text,
   TextInput,
-  View,
-  StyleSheet: { create: (styles: unknown) => styles },
-  Linking: { openURL },
-  Animated: {
-    View: AnimatedView,
-    Value: function Value(this: { v: number }, v: number) {
-      this.v = v;
-    },
-    loop: () => ({ start: loopStart, stop: loopStop }),
-    sequence: () => ({}),
-    timing: () => ({})
-  },
-  Easing: { inOut: (e: unknown) => e, ease: () => ({}) }
-}));
-
-mock.module("react-native-markdown-display", () => ({
-  __esModule: true,
-  default: function Markdown() {
-    return null;
-  },
-  MarkdownIt: (cfg: unknown) => cfg
-}));
-
-mock.module("@/src/theme", () => ({
-  theme: {
-    assistantBubble: "#E9E9EB",
-    assistantBubbleText: "#1A1A1A",
-    accent: "#007AFF",
-    codeChipBg: "#E8E8ED",
-    codeChipText: "#3A3A3C",
-    border: "#ECECEC"
-  },
-  family: (name: string, weight = 400) => `${name}_${weight}`
-}));
-
-// StreamingCursor uses useRef/useEffect; bare invocation outside a renderer
-// would throw "invalid hook call". Override just those two so the cursor's
-// effect body runs (and its cleanup is captured) without a React renderer.
-// Everything else (forwardRef, the JSX runtime) stays real.
-const effectCleanups: Array<() => void> = [];
-mock.module("react", () => ({
-  __esModule: true,
-  ...ReactActual,
-  default: (ReactActual as { default?: unknown }).default ?? ReactActual,
-  useRef: <T,>(v: T) => ({ current: v }),
-  useEffect: (fn: () => void | (() => void)) => {
-    const cleanup = fn();
-    if (typeof cleanup === "function") effectCleanups.push(cleanup);
-  }
-}));
+  View
+} from "./chatMockSetup";
 
 const { markdownRules, BlockAssistantText } = await import(
   "@/src/components/chat/BlockAssistantText"
 );
 const { SelectableBlockText } = await import(
   "@/src/components/chat/SelectableBlockText"
+);
+// The real link module (its native deps are mocked by chatMockSetup), so the
+// link rule's wiring is verified through observable behavior.
+const { subscribeLinkMenu } = await import(
+  "@/src/components/chat/linkContextMenu"
 );
 
 type Node = {
@@ -145,7 +78,7 @@ function renderBlock(ruleName: string, node: Node, children: unknown[]) {
 
 beforeEach(() => {
   Platform.OS = "ios";
-  openURL.mockClear();
+  openBrowserAsync.mockClear();
 });
 
 describe("bug: markdown links inside iOS block text are not clickable", () => {
@@ -158,7 +91,9 @@ describe("bug: markdown links inside iOS block text are not clickable", () => {
     const para: Node = { key: "p", type: "paragraph", children: [linkNode("https://example.com")] };
     const inner = renderBlock("paragraph", para, [rule("link")(linkNode("https://example.com"), "docs", [], styles)]);
     expect(inner.type).toBe(Text);
-    expect(inner.props.selectable).toBe(true);
+    // Link blocks render as a plain (non-selectable) Text so the link's
+    // gestures win over iOS text selection.
+    expect(inner.props.selectable).toBeFalsy();
   });
 
   test("iOS heading containing a link renders as Text, not TextInput", () => {
@@ -176,12 +111,55 @@ describe("bug: markdown links inside iOS block text are not clickable", () => {
     const inner = renderBlock("paragraph", nested, ["x"]);
     expect(inner.type).toBe(Text);
   });
+});
 
-  test("the link rule wires onPress to Linking.openURL", () => {
+describe("link tap and long-press wiring", () => {
+  test("a web link taps to the in-app browser and long-presses to the menu", () => {
     const el = rule("link")(linkNode("https://example.com"), "docs", [], styles);
     expect(typeof el.props.onPress).toBe("function");
     el.props.onPress();
-    expect(openURL).toHaveBeenCalledWith("https://example.com");
+    expect(openBrowserAsync).toHaveBeenCalledWith("https://example.com");
+
+    const seen: Array<{ href: string; x: number; y: number }> = [];
+    const unsub = subscribeLinkMenu((r) => seen.push(r));
+    expect(typeof el.props.onLongPress).toBe("function");
+    el.props.onLongPress({ nativeEvent: { pageX: 12, pageY: 34 } });
+    unsub();
+    expect(seen).toEqual([{ href: "https://example.com", x: 12, y: 34 }]);
+  });
+
+  test("the link is not selectable so long-press shows the menu, not selection", () => {
+    const el = rule("link")(linkNode("https://example.com"), "docs", [], styles);
+    expect(el.props.selectable).toBeFalsy();
+  });
+
+  test("the link's label children are forced non-selectable (no native Copy callout)", () => {
+    // A selectable child Text would trigger iOS's own selection menu on
+    // long-press; the link renderer clones its children with selectable off.
+    const child = createElement(Text as never, { selectable: true }, "docs");
+    const el = rule("link")(linkNode("https://example.com"), [child], [], styles);
+    const kids = (Array.isArray(el.props.children) ? el.props.children : [el.props.children]) as any[];
+    expect(kids[0].props.selectable).toBe(false);
+    // The label text is preserved (Children.map normalizes it into an array).
+    expect([kids[0].props.children].flat()).toEqual(["docs"]);
+  });
+
+  test("non-web and missing-href links are inert (no onPress / onLongPress)", () => {
+    for (const bad of [
+      "tel:18005551234",
+      "mailto:a@b.com",
+      "file:///etc/passwd",
+      "javascript:alert(1)",
+      "gini://deep/link",
+      "/relative/path",
+      "//proto.relative",
+      " https://leading.space",
+      undefined
+    ]) {
+      const el = rule("link")(linkNode(bad), "x", [], styles);
+      expect(el.props.onPress).toBeUndefined();
+      expect(el.props.onLongPress).toBeUndefined();
+    }
   });
 });
 
@@ -208,6 +186,13 @@ describe("non-regression: link-free blocks keep the iOS selection wrapper", () =
     expect(renderBlock("paragraph", para, ["x"]).type).toBe(Text);
   });
 
+  test("iOS paragraph whose only link is non-web keeps TextInput", () => {
+    // A non-web link is inert (no handlers), so it must not strip the block's
+    // selection by flipping it onto the link path.
+    const para: Node = { key: "p", type: "paragraph", children: [linkNode("tel:18005551234")] };
+    expect(renderBlock("paragraph", para, ["x"]).type).toBe(TextInput);
+  });
+
   test("iOS paragraph whose only link is a blocklink keeps TextInput", () => {
     // A blocklink (e.g. a linked image) is handled by the library's own
     // block-safe touchable plus the <Markdown onLinkPress> guard, not the
@@ -226,10 +211,10 @@ describe("non-regression: link-free blocks keep the iOS selection wrapper", () =
 });
 
 describe("SelectableBlockText branches", () => {
-  test("iOS + containsLink -> selectable Text", () => {
+  test("containsLink -> plain non-selectable Text (link gestures win)", () => {
     const out = renderSel({ style: {}, children: "x", containsLink: true });
     expect(out.type).toBe(Text);
-    expect(out.props.selectable).toBe(true);
+    expect(out.props.selectable).toBeFalsy();
   });
 
   test("iOS + no link -> TextInput", () => {
@@ -261,35 +246,6 @@ describe("markdown rules coverage", () => {
     }
   });
 
-  test("link without href has no onPress", () => {
-    const el = rule("link")(linkNode(undefined), "docs", [], styles);
-    expect(el.props.onPress).toBeUndefined();
-  });
-
-  test("link onPress opens http(s) only; other schemes inert", () => {
-    // A leading-whitespace href is rejected too (no trim, default-deny).
-    for (const ok of ["http://a.example", "https://b.example/x"]) {
-      openURL.mockClear();
-      const el = rule("link")(linkNode(ok), "x", [], styles);
-      expect(typeof el.props.onPress).toBe("function");
-      el.props.onPress();
-      expect(openURL).toHaveBeenCalledWith(ok);
-    }
-    for (const bad of [
-      "tel:18005551234",
-      "mailto:a@b.com",
-      "file:///etc/passwd",
-      "javascript:alert(1)",
-      "gini://deep/link",
-      "/relative/path",
-      "//proto.relative",
-      " https://leading.space"
-    ]) {
-      const el = rule("link")(linkNode(bad), "x", [], styles);
-      expect(el.props.onPress).toBeUndefined();
-    }
-  });
-
   test("code_block trims a single trailing newline; fence handles missing content", () => {
     const cb = rule("code_block")({ key: "c", content: "a\n", children: [] }, [], [], styles);
     expect(renderSel(cb.props).props.children).toBe("a");
@@ -308,16 +264,15 @@ describe("BlockAssistantText component + StreamingCursor", () => {
     expect(el.type).toBe(View);
   });
 
-  test("passes a web-scheme onLinkPress guard to Markdown", () => {
+  test("routes Markdown's default openers through the in-app browser", () => {
     // The library's default link/blocklink openers go through onLinkPress;
-    // it must allow http(s) and reject other schemes.
+    // it forwards to the in-app browser and returns false so the library
+    // doesn't also hand the URL to the system browser.
     const el = BlockAssistantText({ block: { text: "hi", streaming: false } as never }) as any;
     const markdownEl = el.props.children.props.children[0];
     const onLinkPress = markdownEl.props.onLinkPress;
-    expect(onLinkPress("https://ok.example")).toBe(true);
-    expect(onLinkPress("http://ok.example")).toBe(true);
-    expect(onLinkPress("tel:123")).toBe(false);
-    expect(onLinkPress("gini://x")).toBe(false);
+    expect(onLinkPress("https://ok.example")).toBe(false);
+    expect(openBrowserAsync).toHaveBeenCalledWith("https://ok.example");
   });
 
   test("renders a cursor when streaming and the cursor effect loops", () => {

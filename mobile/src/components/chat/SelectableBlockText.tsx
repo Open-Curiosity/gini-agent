@@ -25,19 +25,23 @@ import {
 // — that is a deliberate trade-off vs. losing markdown rendering or
 // shipping a native module.
 //
-// `containsLink` opts a block out of the iOS TextInput path. A multiline
-// TextInput (UITextView) owns its own touch handling and never forwards taps
-// to a nested `<Text onPress>`, so a markdown link inside one renders styled
-// but inert. When the block holds a link we fall back to `<Text selectable>`
-// so the link's onPress is reachable — at the cost of whole-block-only copy
-// (no drag handles) for that one block, which is the lesser evil vs. a dead
-// link.
+// `containsLink` opts a block out of BOTH selectable paths. A markdown link
+// is interactive (tap opens an in-app browser, long-press shows a menu): the
+// iOS TextInput wrapper would swallow the link's touches entirely, and a
+// `<Text selectable>` wrapper makes iOS raise its own text-selection "Copy"
+// callout on top of the link menu on long-press. So a link-bearing block
+// renders as a plain (non-selectable) `<Text>` — the link's gestures win, at
+// the cost of text selection for that one block (its links can still be
+// copied via the link menu's "Copy Link").
 export const SelectableBlockText = forwardRef<unknown, {
   style?: StyleProp<TextStyle>;
   children?: ReactNode;
   containsLink?: boolean;
 }>(function SelectableBlockText({ style, children, containsLink = false }, _ref) {
-  if (Platform.OS === "ios" && !containsLink) {
+  if (containsLink) {
+    return <Text style={style}>{children}</Text>;
+  }
+  if (Platform.OS === "ios") {
     return (
       <TextInput
         multiline
