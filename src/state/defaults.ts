@@ -92,18 +92,16 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
       updatedAt: at
     },
     {
-      id: "toolset_contacts",
+      id: "toolset_database",
       instance,
-      name: "contacts",
-      description: "People-CRM: import a contacts file and run exhaustive structured queries over the user's network (find/count people by company/title/location, save people, map relationships). Distinct from memory recall — contacts queries return every match, not a ranked sample.",
+      name: "database",
+      description: "The agent's own sandboxed SQL database for keeping and exhaustively querying structured records (db_query/db_execute/db_import/db_schema). Distinct from memory recall — SQL returns every matching row, not a ranked sample. Skills layer use-cases (people-CRM, expense log, …) on top.",
       status: "enabled",
       toolNames: [
-        "contacts.import",
-        "contacts.query",
-        "contacts.count",
-        "contacts.upsert",
-        "contacts.relate",
-        "contacts.relations"
+        "db.query",
+        "db.execute",
+        "db.import",
+        "db.schema"
       ],
       scopes: ["task", "job", "skill", "subagent"],
       createdAt: at,
@@ -183,7 +181,7 @@ export const DEFAULT_AGENT_TOOLSETS: readonly string[] = [
   "mcp",
   "browser",
   "web_search",
-  "contacts"
+  "database"
 ];
 
 export function defaultAgent(instance: Instance, at: string): AgentRecord {

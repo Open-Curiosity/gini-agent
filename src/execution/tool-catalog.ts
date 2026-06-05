@@ -1234,146 +1234,73 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
-    // People-CRM: import a contacts file into the structured contacts store.
-    // The store is exhaustively queryable (unlike top-K recall), so this is
-    // how the user's LinkedIn network becomes answerable. See ADR
-    // people-crm-store.md.
-    toolset: "contacts",
-    displayLabel: "Import contacts",
+    // Agent-database primitive (ADR agent-database.md): the agent's own
+    // sandboxed SQLite DB for keeping and exhaustively querying structured
+    // records. db_query is the read side — exact, complete results, the
+    // opposite of ranked top-K recall.
+    toolset: "database",
+    displayLabel: "Query database",
     type: "function",
     function: {
-      name: "contacts_import",
-      description: "Import a contacts file the user attached into their structured contact store. Accepts a LinkedIn \"Connections.csv\" export or any CSV/XLSX with a name column plus company/title/email/url. The attachment is saved in your workspace — pass its path (e.g. 'uploads/<id>/Connections.csv', shown in the attachment note). Parses EVERY row into a queryable contact and dedups on LinkedIn URL / email, so re-importing is safe. Use this whenever the user gives you their connections, network, or a contact list as a file — do NOT try to remember the rows yourself or write them to a plain file. Returns created/updated/skipped counts and a company breakdown.",
+      name: "db_query",
+      description: "Run a read-only SQL query (SELECT / WITH) against YOUR per-agent database and get back every matching row. This is your tool for EXHAUSTIVE, exact questions over structured records you've stored — 'how many / list all X where …', counts, GROUP BY, JOINs. Use it instead of recall_memory whenever completeness matters (recall is a fuzzy top-K sample and will undercount). Returns up to a row cap with a `truncated` flag — use COUNT(*) / LIMIT / OFFSET to page large sets. Use parameter placeholders (?) with `params` for any values. Call db_schema first if you don't know what tables exist.",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "Workspace-relative path to the uploaded CSV/XLSX file." },
-          source: { type: "string", description: "Optional provenance tag stored on each contact (default 'linkedin_import')." }
+          sql: { type: "string", description: "A single read-only statement (SELECT or WITH …)." },
+          params: { type: "array", description: "Values bound to ? placeholders, in order.", items: {} }
         },
-        required: ["path"]
+        required: ["sql"]
       }
     }
   },
   {
-    // People-CRM: exhaustive structured query. The key tool that makes
-    // "find ALL people at X" reliable — returns every matching row, not a
-    // ranked recall sample. Steers the model away from recall_memory for
-    // completeness-critical roster questions.
-    toolset: "contacts",
-    displayLabel: "Query contacts",
+    // Write side of the agent database: DDL + DML. One statement per call.
+    toolset: "database",
+    displayLabel: "Run SQL",
     type: "function",
     function: {
-      name: "contacts_query",
-      description: "Find people in the user's contacts (their professional network / LinkedIn connections). Returns EVERY matching contact — this is an exhaustive structured query, NOT a ranked sample. ALWAYS use this (never recall_memory) for completeness-critical questions like 'find everyone who works at Google', 'who do I know in London', 'list my connections who are founders'. recall_memory is fuzzy and top-K and WILL miss people; contacts_query will not. Combine filters to narrow (company + title + location). `company` is an exact match; the *Contains and `q` params are case-insensitive substring matches. Results are paginated: the response carries total/hasMore — when hasMore is true, call again with a larger offset to retrieve the rest before claiming a complete list.",
+      name: "db_execute",
+      description: "Run a single write/DDL statement (CREATE TABLE, ALTER, DROP, INSERT, UPDATE, DELETE) against YOUR per-agent database. Use this to set up tables for things the user wants tracked as structured records and to add or change rows. One statement per call; use parameter placeholders (?) with `params` for values. For loading a whole CSV/XLSX file, use db_import instead of many INSERTs. The database is private to you and isolated from Gini's system data.",
       parameters: {
         type: "object",
         properties: {
-          company: { type: "string", description: "Exact company match (case-insensitive). Use companyContains for partial." },
-          companyContains: { type: "string", description: "Substring match on company." },
-          title: { type: "string", description: "Substring match on job title / position (e.g. 'engineer', 'founder')." },
-          location: { type: "string", description: "Substring match on location." },
-          nameContains: { type: "string", description: "Substring match on full name." },
-          emailContains: { type: "string", description: "Substring match on email." },
-          q: { type: "string", description: "Free-text substring across name, company, and title." },
-          connectedAfter: { type: "string", description: "ISO date (YYYY-MM-DD); only contacts connected on/after this date." },
-          connectedBefore: { type: "string", description: "ISO date (YYYY-MM-DD); only contacts connected on/before this date." },
-          hasCompany: { type: "boolean", description: "true → only contacts with a company set; false → only those missing one." },
-          limit: { type: "number", description: "Max rows to return this call (default 500, max 2000)." },
-          offset: { type: "number", description: "Row offset for pagination (default 0)." }
-        }
-      }
-    }
-  },
-  {
-    // People-CRM: count / aggregate. Cheaper than query when the user only
-    // needs a number or a per-company breakdown.
-    toolset: "contacts",
-    displayLabel: "Count contacts",
-    type: "function",
-    function: {
-      name: "contacts_count",
-      description: "Count contacts matching a filter, optionally with a per-company breakdown. Use for 'how many people do I know at X', 'how many connections do I have', or 'which companies show up most in my network'. Accepts the same filters as contacts_query. Pass breakdown='company' to also get the top companies with their counts. Faster than contacts_query when you only need a number or aggregate.",
-      parameters: {
-        type: "object",
-        properties: {
-          company: { type: "string", description: "Exact company match (case-insensitive)." },
-          companyContains: { type: "string", description: "Substring match on company." },
-          title: { type: "string", description: "Substring match on title." },
-          location: { type: "string", description: "Substring match on location." },
-          nameContains: { type: "string", description: "Substring match on full name." },
-          q: { type: "string", description: "Free-text substring across name, company, and title." },
-          connectedAfter: { type: "string", description: "ISO date (YYYY-MM-DD) lower bound." },
-          connectedBefore: { type: "string", description: "ISO date (YYYY-MM-DD) upper bound." },
-          hasCompany: { type: "boolean", description: "Filter to contacts with / without a company." },
-          breakdown: { type: "string", enum: ["company"], description: "Set to 'company' to also return the top companies with counts." }
-        }
-      }
-    }
-  },
-  {
-    // People-CRM: create/update one person from natural language. Writes
-    // structured fields, not just a memory unit.
-    toolset: "contacts",
-    displayLabel: "Save contact",
-    type: "function",
-    function: {
-      name: "contacts_upsert",
-      description: "Create or update ONE contact from what the user tells you in natural language ('Sara is now Head of Eng at Stripe in NYC', 'add my friend Tom Greco, he founded Acme'). Writes structured fields (company/title/location/email/url) and free-text notes — this is the right tool when the user describes a person, NOT recall/memory. To update someone already in the store, omit id and they'll be matched by LinkedIn URL → email → name; pass id to target an exact record. If a name matches more than one person the tool returns the candidates instead of guessing — surface them and ask which one.",
-      parameters: {
-        type: "object",
-        properties: {
-          id: { type: "string", description: "Contact id to update. Omit to create or to match an existing person by url/email/name." },
-          fullName: { type: "string", description: "Full name. Required when creating a new contact (or supply firstName/lastName)." },
-          firstName: { type: "string", description: "First name." },
-          lastName: { type: "string", description: "Last name." },
-          company: { type: "string", description: "Current company. Pass an empty string to clear it." },
-          title: { type: "string", description: "Job title / role." },
-          location: { type: "string", description: "Location." },
-          email: { type: "string", description: "Email address." },
-          linkedinUrl: { type: "string", description: "LinkedIn profile URL (also used as the dedup key)." },
-          connectedAt: { type: "string", description: "Connection date (ISO YYYY-MM-DD if known)." },
-          notes: { type: "string", description: "Free-text color about the person (how you know them, what they're good at, etc.)." }
-        }
-      }
-    }
-  },
-  {
-    // People-CRM: write a person↔person edge for the relationship graph.
-    toolset: "contacts",
-    displayLabel: "Relate contacts",
-    type: "function",
-    function: {
-      name: "contacts_relate",
-      description: "Record that two contacts know each other / are connected ('Alice and Bob worked together at Google', 'Tom introduced me to Sara'). This builds the relationship graph the user can later traverse. `from` and `to` are contact names or ids; if a name is ambiguous the tool returns the candidates so you can confirm. relationType is free text — e.g. colleague, knows, reports_to, introduced_by, friend, classmate.",
-      parameters: {
-        type: "object",
-        properties: {
-          from: { type: "string", description: "First contact: a name or contact id." },
-          to: { type: "string", description: "Second contact: a name or contact id." },
-          relationType: { type: "string", description: "Relationship label (default 'knows'), e.g. colleague, introduced_by, friend." },
-          note: { type: "string", description: "Optional note about the relationship." }
+          sql: { type: "string", description: "A single SQL statement (DDL or DML)." },
+          params: { type: "array", description: "Values bound to ? placeholders, in order.", items: {} }
         },
-        required: ["from", "to"]
+        required: ["sql"]
       }
     }
   },
   {
-    // People-CRM: read the relationship graph (edges of one person, or the
-    // mutual connections between two).
-    toolset: "contacts",
-    displayLabel: "Contact relations",
+    // Bulk tabular import: file → table, deterministic, one row per record.
+    toolset: "database",
+    displayLabel: "Import table",
     type: "function",
     function: {
-      name: "contacts_relations",
-      description: "Read the relationship graph. Pass `name` (or `id`) to list everyone a contact is connected to. Pass BOTH a person (`name`/`id`) AND `mutualWith` (another name/id) to find the people those two BOTH know — their mutual connections. Use for 'who does Alice know', 'who do Alice and Bob have in common', or mapping who could introduce the user to someone.",
+      name: "db_import",
+      description: "Load a CSV or XLSX file from your workspace into a table in your per-agent database — one file row becomes one table row, deterministically (no truncation, no summarizing). Columns are derived from the file's header row, stored as TEXT; leading non-table preamble lines (e.g. an export's notes) are skipped automatically (or pin the header with skipLines). Use this whenever the user gives you a spreadsheet/export to remember and query (contacts, transactions, a roster, …). After importing, inspect with db_schema and query with db_query; reshape with db_execute if you want typed/renamed columns.",
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "The contact to look up (name or id)." },
-          id: { type: "string", description: "Contact id (alternative to name)." },
-          mutualWith: { type: "string", description: "When set (name or id), returns the mutual connections between this person and the one in name/id." }
-        }
+          path: { type: "string", description: "Workspace-relative path to the CSV/XLSX file (shown in the attachment note)." },
+          table: { type: "string", description: "Destination table name (created if absent)." },
+          skipLines: { type: "number", description: "Optional 0-based index of the header row, to skip preamble lines explicitly." },
+          recreate: { type: "boolean", description: "Drop the table first if it already exists (default false → append)." }
+        },
+        required: ["path", "table"]
       }
+    }
+  },
+  {
+    // Introspection so the agent can recall what it's already tracking.
+    toolset: "database",
+    displayLabel: "Database schema",
+    type: "function",
+    function: {
+      name: "db_schema",
+      description: "List the tables in your per-agent database with their columns and row counts. Call this to see what you're already tracking before querying or creating tables.",
+      parameters: { type: "object", properties: {} }
     }
   },
   {
@@ -2392,28 +2319,13 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.query));
     case "recall_memory":
       return truncatePreview(previewValue(safe.query));
-    case "contacts_import":
-      return truncatePreview(previewValue(safe.path));
-    case "contacts_query":
-    case "contacts_count":
-      return truncatePreview(
-        previewValue(safe.company) ||
-          previewValue(safe.q) ||
-          previewValue(safe.title) ||
-          previewValue(safe.location) ||
-          previewValue(safe.nameContains) ||
-          ""
-      );
-    case "contacts_upsert":
-      return truncatePreview(previewValue(safe.fullName) || previewValue(safe.id) || previewValue(safe.linkedinUrl));
-    case "contacts_relate":
-      return truncatePreview(`${previewValue(safe.from)} → ${previewValue(safe.to)}`);
-    case "contacts_relations":
-      return truncatePreview(
-        previewValue(safe.mutualWith)
-          ? `${previewValue(safe.name) || previewValue(safe.id)} ∩ ${previewValue(safe.mutualWith)}`
-          : previewValue(safe.name) || previewValue(safe.id)
-      );
+    case "db_query":
+    case "db_execute":
+      return truncatePreview(previewValue(safe.sql));
+    case "db_import":
+      return truncatePreview(`${previewValue(safe.path)} → ${previewValue(safe.table)}`);
+    case "db_schema":
+      return "";
     case "add_memory":
       return truncatePreview(previewValue(safe.content));
     case "update_memory":

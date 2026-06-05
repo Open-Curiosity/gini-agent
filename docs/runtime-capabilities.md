@@ -30,7 +30,7 @@ bun run gini evidence
 | Chat and session history | `gini chat new/send/sync/show/list`, `/api/chat` |
 | Execution runs | `gini runs list/show`, `/api/runs`; chat turns create durable runs with plan steps and compatibility task links |
 | Persistent memory | USER.md (instance), SOUL.md (per-agent), Hindsight (per-agent SQLite bank). `gini memory retain/recall/reflect/units/banks/migrate`, `/api/memory/{retain,recall,reflect,units,banks}` |
-| Contacts (people CRM) | Per-agent structured store for exhaustive roster queries — import a LinkedIn/CSV/XLSX export, find/count people by company/title/location/free-text (returns every match, not a recall sample), save/update people, and map person-to-person relationships. `contacts_*` tools, `gini contacts import/list/count/show/upsert/relate/relations/mutual/delete`, `/api/contacts*`. See [people-crm-store.md](adr/people-crm-store.md) |
+| Agent database | Per-agent sandboxed SQL database for keeping and exhaustively querying structured records (the access pattern memory recall can't serve). `db_query`/`db_execute`/`db_import`/`db_schema` tools; isolated per-agent file, separate from system data. Use-cases (e.g. a LinkedIn people-CRM via the `people-crm` skill) layer on top. See [agent-database.md](adr/agent-database.md) |
 | Embeddings | Local Transformers.js by default; OpenAI and echo are opt-in. `gini embedding status`, `gini embedding reembed`, `/api/embedding/*` |
 | Reranker | Local Transformers.js cross-encoder by default; echo and none are opt-in. `gini reranker status`, `/api/reranker/status` |
 | Voice messages / speech-to-text | Mobile (iOS) press-and-hold records a 16 kHz mono WAV; `/api/uploads` accepts `audio/*`, `POST /api/chat/:id/messages` takes an `audio` ref, and the gateway transcribes it locally (Transformers.js whisper-small by default; echo is opt-in) so only the transcript reaches the model — the audio is kept render-only for playback. Readiness at `/api/stt/status`. See [voice-messages-and-local-stt.md](adr/voice-messages-and-local-stt.md) |
@@ -63,7 +63,6 @@ Stable local clients use the gateway API:
 - `/api/version`, `/api/update/check`, `/api/update`
 - `/api/tasks`, `/api/chat`, `/api/runs`, `/api/authorizations`, `/api/setup-requests`
 - `/api/memory/retain`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks`, `/api/memory/migrate`
-- `/api/contacts`, `/api/contacts/count`, `/api/contacts/import`, `/api/contacts/mutual`, `/api/contacts/relations`, `/api/contacts/:id`, `/api/contacts/:id/relations`
 - `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`, `/api/stt/status`
 - `/api/uploads` (POST `image/*` or `audio/*`), `GET /api/uploads/:id`
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`

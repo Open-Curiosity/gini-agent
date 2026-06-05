@@ -76,23 +76,17 @@ export type {
   UpdateBankInput
 } from "./memory-db";
 export {
-  getContact,
-  findContactByUrl,
-  findContactByEmail,
-  findContactsByName,
-  insertContact,
-  updateContact,
-  upsertContactByKey,
-  queryContacts,
-  countContacts,
-  countAllContacts,
-  companyBreakdown,
-  deleteContact,
-  upsertRelation,
-  relationsFor,
-  mutualConnections
-} from "./contacts-db";
-export type { Contact, ContactInput, ContactQuery, ContactRelation } from "./contacts-db";
+  getAgentDataDb,
+  agentDataDbPath,
+  closeAgentDataDb,
+  closeAllAgentDataDbs,
+  dbQuery,
+  dbExecute,
+  dbListTables,
+  AgentDataError,
+  MAX_RESULT_ROWS
+} from "./agent-data-db";
+export type { QueryResult, ExecuteResult, TableInfo } from "./agent-data-db";
 export {
   storeUpload,
   readUpload,
