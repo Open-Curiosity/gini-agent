@@ -95,6 +95,9 @@ const ALWAYS_ON = new Set([
   "update_job",
   "delete_job",
   "run_job",
+  // email_watch lives under the "email" toolset (not in defaults); always-on
+  // so a fresh instance can set up an email watcher from chat. Config-only.
+  "email_watch",
   "mcp_call",
   // skill_run is the generic dispatch surface for skill-bundled
   // procedures (signed-URL uploads/downloads, format conversions,

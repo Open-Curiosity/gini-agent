@@ -21,10 +21,14 @@ import {
   createAuthorization,
   createSetupRequest,
   createChatMessage,
+  createChatSession,
+  createEmailWatcher,
   isTerminalTaskStatus,
+  listEmailWatchers,
   mutateState,
   now,
-  readState
+  readState,
+  removeEmailWatcher
 } from "../state";
 import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveAuthorization, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
@@ -157,6 +161,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await deleteJobTool(config, taskId, args) };
     case "run_job":
       return { kind: "sync", result: await runJobTool(config, taskId, args) };
+    case "email_watch":
+      return { kind: "sync", result: await emailWatchTool(config, taskId, args) };
     case "recall_memory":
       return { kind: "sync", result: await recallMemoryTool(config, taskId, args) };
     case "edit_soul":
@@ -1836,6 +1842,100 @@ async function runJobTool(
 
   const taskSuffix = spawnedTaskId ? `, task ${spawnedTaskId}` : "";
   return `Triggered job ${jobId} (\"${before.name}\") — run ${runId}${taskSuffix}.`;
+}
+
+// Email watcher management (ADR email-watch.md). One handler dispatches the
+// add / list / remove actions. Low-risk: only writes an EmailWatcherRecord
+// (and, on add, a dedicated chat session for the woken turns to post into).
+// The actual mail reading/replying happens later in the woken turn, gated by
+// terminal_exec's approval. The audit row is recorded by the state helper.
+async function emailWatchTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const action = requireString(args, "action");
+
+  if (action === "list") {
+    const watchers = listEmailWatchers(config);
+    const summary = watchers.map((w) => ({
+      id: w.id,
+      query: w.query,
+      accountEmail: w.accountEmail,
+      enabled: w.enabled,
+      status: w.status,
+      chatSessionId: w.chatSessionId,
+      lastPolledAt: w.lastPolledAt
+    }));
+    await recordLowRiskAudit(config, taskId, "email.watcher.listed", "email", { count: summary.length });
+    return JSON.stringify({ count: summary.length, watchers: summary });
+  }
+
+  if (action === "remove") {
+    const id = requireString(args, "id");
+    const removed = await removeEmailWatcher(config, id);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Removed email watcher",
+      data: { watcherId: removed.id }
+    });
+    return `Removed email watcher ${removed.id} (query: ${removed.query}).`;
+  }
+
+  if (action !== "add") {
+    throw new Error(`Invalid input: action must be one of "add" | "list" | "remove" (got ${action}).`);
+  }
+
+  // action === "add". Build the Gmail query: a raw `query` wins; otherwise
+  // `from:<sender> is:unread`; otherwise just `is:unread`.
+  let sender: string | undefined;
+  if (args.sender !== undefined && args.sender !== null) {
+    if (typeof args.sender !== "string" || args.sender.length === 0) {
+      throw new Error("Invalid input: sender must be a non-empty string.");
+    }
+    sender = args.sender;
+  }
+  let rawQuery: string | undefined;
+  if (args.query !== undefined && args.query !== null) {
+    if (typeof args.query !== "string" || args.query.length === 0) {
+      throw new Error("Invalid input: query must be a non-empty string.");
+    }
+    rawQuery = args.query;
+  }
+  let account: string | undefined;
+  if (args.account !== undefined && args.account !== null) {
+    if (typeof args.account !== "string" || args.account.length === 0) {
+      throw new Error("Invalid input: account must be a non-empty string.");
+    }
+    account = args.account;
+  }
+  const query = rawQuery ?? (sender ? `from:${sender} is:unread` : "is:unread");
+
+  // Create the watcher + its dedicated chat session in ONE mutateState write
+  // so a failure leaves no orphan session. The woken turns post into this
+  // session. The session and watcher inherit the originating task's agent so
+  // attribution stays isolated.
+  const watcher = await mutateState(config.instance, (state) => {
+    const owningAgentId = state.tasks.find((t) => t.id === taskId)?.agentId ?? state.activeAgentId;
+    const title = sender ? `Email watch: ${sender}` : "Email watch";
+    const session = createChatSession(state, title, undefined, owningAgentId, "job", "channel");
+    return createEmailWatcher(state, {
+      agentId: owningAgentId,
+      provider: "gmail",
+      accountEmail: account,
+      query,
+      chatSessionId: session.id,
+      enabled: true,
+      status: "ok"
+    });
+  });
+
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Created email watcher",
+    data: { watcherId: watcher.id, query, chatSessionId: watcher.chatSessionId }
+  });
+  return `Watching email (query: ${query}). Watcher ${watcher.id}; proposed replies will appear in its chat thread (${watcher.chatSessionId}). It polls about once a minute and never sends without your approval.`;
 }
 
 // Explicit on-demand memory recall. Wraps the same `recall()` entrypoint
