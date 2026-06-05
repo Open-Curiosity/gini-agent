@@ -198,6 +198,29 @@ export interface ProviderConfig {
   // referenced by `apiKeyEnv`, never in extraBody. Caller is responsible
   // for keeping values JSON-serializable.
   extraBody?: Record<string, unknown>;
+  // Azure OpenAI routing (openai provider only). Azure does not expose the
+  // flat `${baseUrl}/chat/completions` surface — it routes per deployment at
+  // `${baseUrl}/openai/deployments/<deployment>/chat/completions?api-version=<v>`
+  // and authenticates with an `api-key` header (or an Entra bearer token).
+  // Setting `apiVersion` is what flips the openai provider into this mode; the
+  // other two refine it. They live on the shared ProviderConfig (rather than an
+  // openai-only subtype) because every call site already threads ProviderConfig
+  // unchanged — normalizeProvider only carries them through for `openai`, so a
+  // non-openai provider with a stray value behaves exactly as before.
+  //
+  // Azure `api-version` query value (e.g. "2024-12-01-preview"). Its presence
+  // is the single signal that selects deployment-scoped routing.
+  apiVersion?: string;
+  // Azure deployment name. The path segment under /openai/deployments/. The
+  // model id stays in `model` (modality detection keys off it); `deployment`
+  // defaults to `model` when omitted, matching the common case where the Azure
+  // deployment is named after the model it serves.
+  deployment?: string;
+  // Auth header style. "bearer" (default) sends `Authorization: Bearer <key>`;
+  // "api-key" sends Azure's `api-key: <key>` header. Independent of apiVersion
+  // so both Azure auth modes work: api-key for a resource key, bearer for an
+  // Entra access token.
+  authScheme?: "bearer" | "api-key";
 }
 
 // Approval policy mode for the per-instance runtime and per-job overlay.

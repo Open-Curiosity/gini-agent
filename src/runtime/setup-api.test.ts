@@ -39,6 +39,7 @@ describe("setup-api", () => {
     HOME?: string;
     GINI_STATE_ROOT?: string;
     OPENAI_API_KEY?: string;
+    OPENROUTER_API_KEY?: string;
     CODEX_AUTH_JSON?: string;
     GINI_PROVIDER?: string;
     GINI_MODEL?: string;
@@ -53,6 +54,7 @@ describe("setup-api", () => {
       HOME: process.env.HOME,
       GINI_STATE_ROOT: process.env.GINI_STATE_ROOT,
       OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+      OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
       CODEX_AUTH_JSON: process.env.CODEX_AUTH_JSON,
       GINI_PROVIDER: process.env.GINI_PROVIDER,
       GINI_MODEL: process.env.GINI_MODEL
@@ -61,6 +63,10 @@ describe("setup-api", () => {
     process.env.HOME = s.home;
     process.env.GINI_STATE_ROOT = s.stateRoot;
     delete process.env.OPENAI_API_KEY;
+    // The openrouter test POSTs a key through production code, which writes
+    // OPENROUTER_API_KEY into process.env; scrub it for a clean baseline and
+    // restore it in afterEach so it never leaks into later tests/files.
+    delete process.env.OPENROUTER_API_KEY;
     // Scrub provider/model env so the test's assertions about the
     // platform default ("codex"/gpt-5.5) are not skewed by an ambient
     // GINI_PROVIDER=echo or similar in the caller's shell.
@@ -90,6 +96,8 @@ describe("setup-api", () => {
     else process.env.GINI_STATE_ROOT = env.GINI_STATE_ROOT;
     if (env.OPENAI_API_KEY === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = env.OPENAI_API_KEY;
+    if (env.OPENROUTER_API_KEY === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = env.OPENROUTER_API_KEY;
     if (env.CODEX_AUTH_JSON === undefined) delete process.env.CODEX_AUTH_JSON;
     else process.env.CODEX_AUTH_JSON = env.CODEX_AUTH_JSON;
     if (env.GINI_PROVIDER === undefined) delete process.env.GINI_PROVIDER;
@@ -138,6 +146,99 @@ describe("setup-api", () => {
     const status = getSetupStatus(config);
     expect(status.providerConfigured).toBe(true);
     expect(status.current).toBe("openai");
+  });
+
+  test("POST openai with azure routing fields persists baseUrl, apiVersion, deployment, authScheme", async () => {
+    const result = await setSetupProvider(config, {
+      provider: "openai",
+      apiKey: "sk-azure-key",
+      model: "gpt-5.4",
+      baseUrl: "https://lilac-labs-w.openai.azure.com",
+      apiVersion: "2024-12-01-preview",
+      deployment: "gpt-5.4",
+      authScheme: "api-key"
+    });
+    expect(result.ok).toBe(true);
+    const cfgPath = join(s.stateRoot, "instances", config.instance, "config.json");
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(cfg.provider?.name).toBe("openai");
+    expect(cfg.provider?.baseUrl).toBe("https://lilac-labs-w.openai.azure.com");
+    expect(cfg.provider?.apiVersion).toBe("2024-12-01-preview");
+    expect(cfg.provider?.deployment).toBe("gpt-5.4");
+    expect(cfg.provider?.authScheme).toBe("api-key");
+  });
+
+  test("POST openrouter ignores azure routing fields (normalizeProvider drops them)", async () => {
+    const result = await setSetupProvider(config, {
+      provider: "openrouter",
+      apiKey: "sk-or",
+      apiVersion: "2024-12-01-preview",
+      deployment: "x",
+      authScheme: "api-key"
+    });
+    expect(result.ok).toBe(true);
+    const cfgPath = join(s.stateRoot, "instances", config.instance, "config.json");
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(cfg.provider?.name).toBe("openrouter");
+    expect(cfg.provider?.apiVersion).toBeUndefined();
+    expect(cfg.provider?.deployment).toBeUndefined();
+    expect(cfg.provider?.authScheme).toBeUndefined();
+  });
+
+  test("a model-only same-provider edit preserves previously-configured azure routing", async () => {
+    // Configure Azure first.
+    await setSetupProvider(config, {
+      provider: "openai",
+      apiKey: "sk-azure",
+      model: "gpt-5.4",
+      baseUrl: "https://lilac-labs-w.openai.azure.com",
+      apiVersion: "2024-12-01-preview",
+      deployment: "gpt-5.4",
+      authScheme: "api-key"
+    });
+    // Then a model-only edit — the exact shape the web Edit Provider dialog
+    // posts ({ provider, model }, no transport fields). The azure routing must
+    // survive rather than reset to a plain api.openai.com call.
+    const result = await setSetupProvider(config, { provider: "openai", model: "gpt-5.4-mini" });
+    expect(result.ok).toBe(true);
+    const cfgPath = join(s.stateRoot, "instances", config.instance, "config.json");
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(cfg.provider?.model).toBe("gpt-5.4-mini");
+    expect(cfg.provider?.baseUrl).toBe("https://lilac-labs-w.openai.azure.com");
+    expect(cfg.provider?.apiVersion).toBe("2024-12-01-preview");
+    expect(cfg.provider?.deployment).toBe("gpt-5.4");
+    expect(cfg.provider?.authScheme).toBe("api-key");
+  });
+
+  test("POST openai with apiVersion but no baseUrl is rejected", async () => {
+    const result = await setSetupProvider(config, {
+      provider: "openai",
+      apiKey: "sk-azure",
+      model: "gpt-5.4",
+      apiVersion: "2024-12-01-preview"
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("requires a baseUrl");
+  });
+
+  test("a same-provider edit preserves a custom apiKeyEnv", async () => {
+    // Seed an Azure config with a custom apiKeyEnv (as `gini provider set
+    // --api-key-env` would produce), and make the per-provider env var look
+    // "already set" so a keyless model-only edit is accepted.
+    config.provider = {
+      name: "openai",
+      model: "gpt-5.4",
+      apiKeyEnv: "AZURE_OPENAI_API_KEY",
+      baseUrl: "https://lilac-labs-w.openai.azure.com",
+      apiVersion: "2024-12-01-preview",
+      deployment: "gpt-5.4",
+      authScheme: "api-key"
+    };
+    process.env.OPENAI_API_KEY = "sk-existing";
+    const result = await setSetupProvider(config, { provider: "openai", model: "gpt-5.4-mini" });
+    expect(result.ok).toBe(true);
+    expect(config.provider.apiKeyEnv).toBe("AZURE_OPENAI_API_KEY");
+    expect(config.provider.baseUrl).toBe("https://lilac-labs-w.openai.azure.com");
   });
 
   test("POST openai without apiKey returns ok:false", async () => {

@@ -523,7 +523,7 @@ async function callToolCallingChatCompletions(
   const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
   const headers: Record<string, string> = {
     "content-type": "application/json",
-    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...chatCompletionsAuthHeader(provider, apiKey),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
@@ -547,7 +547,7 @@ async function callToolCallingChatCompletions(
     body.tools = tools;
     body.tool_choice = "auto";
   }
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(chatCompletionsUrl(provider, baseUrl), {
     method: "POST",
     headers: { ...headers, ...(wantStream ? { accept: "text/event-stream" } : {}) },
     body: JSON.stringify(body)
@@ -1467,7 +1467,15 @@ export async function generateTaskSummary(
   const systemContext = recalledBlock.length > 0
     ? `${stablePrefix}\n\n${recalledBlock}`
     : stablePrefix;
-  if (provider.name === "openrouter" || provider.name === "local" || provider.name === "deepseek") {
+  if (
+    provider.name === "openrouter" ||
+    provider.name === "local" ||
+    provider.name === "deepseek" ||
+    // Azure OpenAI exposes deployment-scoped chat/completions, not the flat
+    // /responses surface this path uses for standard OpenAI — route it through
+    // the chat-completions builder so the URL + api-key header come out right.
+    azureApiVersion(provider) !== undefined
+  ) {
     return callChatCompletions(provider, input, systemContext);
   }
   return callOpenAIResponses(provider, input, systemContext, onDelta);
@@ -1660,11 +1668,11 @@ async function callStructuredChatCompletions<T>(
   const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
   const headers: Record<string, string> = {
     "content-type": "application/json",
-    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...chatCompletionsAuthHeader(provider, apiKey),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(chatCompletionsUrl(provider, baseUrl), {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -1742,12 +1750,22 @@ function withDeepSeekThinkingDefaults(
 
 export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   if (provider.name === "openai") {
+    const apiVersion = provider.apiVersion?.trim();
+    const deployment = provider.deployment?.trim();
     return {
       name: "openai",
       model: provider.model || "gpt-5.4-mini",
       baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv ?? "OPENAI_API_KEY",
-      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {}),
+      // Azure routing fields — only carried for openai. authScheme is stored
+      // only when it names a real scheme so a stray value falls back to the
+      // bearer default at the call site.
+      ...(apiVersion && apiVersion.length > 0 ? { apiVersion } : {}),
+      ...(deployment && deployment.length > 0 ? { deployment } : {}),
+      ...(provider.authScheme === "api-key" || provider.authScheme === "bearer"
+        ? { authScheme: provider.authScheme }
+        : {})
     };
   }
   if (provider.name === "openrouter") {
@@ -1884,11 +1902,11 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
   const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
   const headers: Record<string, string> = {
     "content-type": "application/json",
-    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...chatCompletionsAuthHeader(provider, apiKey),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(chatCompletionsUrl(provider, baseUrl), {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -2496,6 +2514,70 @@ function defaultBaseUrl(provider: ProviderConfig): string {
   return DEFAULT_OPENAI_BASE_URL;
 }
 
+// Azure OpenAI mode marker. An openai-named provider carrying a non-empty
+// apiVersion routes to the deployment-scoped Azure surface; everything else
+// uses the flat OpenAI-compatible paths. Returns the trimmed api-version (the
+// query value) when in Azure mode, undefined otherwise. Centralized so the URL
+// builder and the generateTaskSummary routing agree on what "Azure mode" means.
+function azureApiVersion(provider: ProviderConfig): string | undefined {
+  if (provider.name !== "openai") return undefined;
+  const version = provider.apiVersion?.trim();
+  return version && version.length > 0 ? version : undefined;
+}
+
+// Build the chat-completions request URL for an OpenAI-compatible provider.
+// Standard providers hit `${baseUrl}/chat/completions`. Azure OpenAI has no
+// such flat path: it routes per deployment and requires the api-version query,
+// so the URL becomes
+// `${baseUrl}/openai/deployments/<deployment>/chat/completions?api-version=<v>`.
+// The deployment defaults to the model id when unset. Components are
+// percent-encoded so an unusual deployment/version value can't break the path.
+function chatCompletionsUrl(provider: ProviderConfig, baseUrl: string): string {
+  const apiVersion = azureApiVersion(provider);
+  if (!apiVersion) return `${baseUrl}/chat/completions`;
+  const deployment = (provider.deployment?.trim() || provider.model).trim();
+  return `${baseUrl}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`;
+}
+
+// Auth header for an OpenAI-compatible chat-completions request. Azure key auth
+// uses the `api-key` header; every other provider (and Azure Entra-token auth)
+// uses `Authorization: Bearer`. `apiKey` is optional so keyless local gateways
+// send no auth header at all.
+//
+// The `api-key` scheme is gated on Azure routing mode: it is only meaningful
+// when the request targets an Azure deployment URL (apiVersion set). Without
+// that gate, `authScheme: "api-key"` on a non-Azure openai config would post an
+// `api-key` header to a standard OpenAI endpoint that only accepts
+// `Authorization: Bearer`, producing a guaranteed 401 mislabeled as an auth
+// failure. Outside Azure mode we fall back to Bearer so the header is correct.
+function chatCompletionsAuthHeader(provider: ProviderConfig, apiKey: string | undefined): Record<string, string> {
+  if (!apiKey) return {};
+  if (provider.authScheme === "api-key" && azureApiVersion(provider) !== undefined) {
+    return { "api-key": apiKey };
+  }
+  return { authorization: `Bearer ${apiKey}` };
+}
+
+// True when an openai config selects Azure routing (apiVersion set) but lacks a
+// usable Azure resource baseUrl — it is missing, or still the standard OpenAI
+// default. In that state chatCompletionsUrl would build the deployment-scoped
+// path against api.openai.com/v1 (which has no /openai/deployments route) and
+// 404. The config-entry boundaries (CLI `provider set`, the setup API, and the
+// set_provider tool that funnels through it) call this to reject the impossible
+// combination before it persists. normalizeProvider itself stays a pure
+// transform — it must not throw, since it also hydrates persisted configs and
+// resolves per-agent overrides.
+export function azureRoutingNeedsBaseUrl(
+  name: string,
+  apiVersion: string | undefined,
+  baseUrl: string | undefined
+): boolean {
+  if (name !== "openai") return false;
+  if (!apiVersion || apiVersion.trim().length === 0) return false;
+  const trimmed = (baseUrl ?? "").trim().replace(/\/+$/, "");
+  return trimmed.length === 0 || trimmed === DEFAULT_OPENAI_BASE_URL;
+}
+
 // ---------------- Vision (image input) ----------------
 //
 // Single-shot vision call: caller provides a prompt + one inline base64 PNG/JPEG,
@@ -2629,7 +2711,7 @@ async function callVisionChatCompletions(
   const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
   const headers: Record<string, string> = {
     "content-type": "application/json",
-    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...chatCompletionsAuthHeader(provider, apiKey),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
@@ -2643,7 +2725,7 @@ async function callVisionChatCompletions(
   const tokenBudgetField = provider.name === "openai"
     ? { max_completion_tokens: maxTokens }
     : { max_tokens: maxTokens };
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(chatCompletionsUrl(provider, baseUrl), {
     method: "POST",
     headers,
     body: JSON.stringify({

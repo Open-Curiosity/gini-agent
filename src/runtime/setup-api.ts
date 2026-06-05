@@ -11,8 +11,10 @@
 //     provider name when configured; null otherwise. `providerConfigured`
 //     is true when the active provider has valid creds — same definition
 //     `providerHealth` uses.
-//   - POST /api/setup/provider accepts {provider: "openai", apiKey} or
-//     {provider: "codex"}. OpenAI flow writes to ~/.gini/secrets.env using
+//   - POST /api/setup/provider accepts {provider: "openai", apiKey, model?,
+//     baseUrl?} — plus apiVersion/deployment/authScheme to point the openai
+//     provider at an Azure OpenAI deployment — or {provider: "codex"}. The
+//     OpenAI flow writes to ~/.gini/secrets.env using
 //     the existing helper, then updates process.env so the running
 //     gateway picks up the new key on the very next provider call (no
 //     restart needed — readOpenAIBearer in src/provider.ts reads from
@@ -44,7 +46,7 @@
 
 import { writeFileSync } from "node:fs";
 import { configPath, writeRuntimeConfig } from "../paths";
-import { hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { azureRoutingNeedsBaseUrl, hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
@@ -135,6 +137,50 @@ export async function setSetupProvider(
         error: `apiKey is required for the ${providerName} provider.`
       };
     }
+    // On a same-provider edit, preserve transport config the caller didn't
+    // resend. The web Edit Provider dialog posts only { provider, apiKey?,
+    // model }, so without this fallback a model-only save would wipe a
+    // configured baseUrl, apiKeyEnv, and the Azure routing fields (apiVersion /
+    // deployment / authScheme), silently turning a configured Azure deployment
+    // into a plain api.openai.com call. A provider SWITCH (different name)
+    // starts clean — `existing` is undefined — matching the cross-provider
+    // non-inheritance rule resolveEffectiveContext enforces for agents.
+    const existing = config.provider?.name === providerName ? config.provider : undefined;
+    const model = typeof payload.model === "string" && payload.model.length > 0
+      ? payload.model
+      : (existing?.model || envKeySpec.defaultModel);
+    const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
+      ? payload.baseUrl.trim()
+      : existing?.baseUrl;
+    // Azure OpenAI routing fields. normalizeProvider carries them only for the
+    // openai provider, so passing them for openrouter/local/deepseek is inert.
+    const apiVersion = typeof payload.apiVersion === "string" && payload.apiVersion.trim().length > 0
+      ? payload.apiVersion.trim()
+      : existing?.apiVersion;
+    const deployment = typeof payload.deployment === "string" && payload.deployment.trim().length > 0
+      ? payload.deployment.trim()
+      : existing?.deployment;
+    const authScheme = payload.authScheme === "api-key" || payload.authScheme === "bearer"
+      ? payload.authScheme
+      : existing?.authScheme;
+    // Preserve a custom apiKeyEnv (set via `gini provider set --api-key-env`)
+    // across a same-provider edit; the web Edit dialog can't resend it.
+    const apiKeyEnv = existing?.apiKeyEnv;
+
+    // Azure routing needs a real resource endpoint. Reject apiVersion paired
+    // with a missing/default OpenAI baseUrl BEFORE persisting the key, so we
+    // never half-apply an impossible config whose deployment URL would resolve
+    // against api.openai.com and 404. Covers the set_provider tool too, which
+    // funnels through here.
+    if (azureRoutingNeedsBaseUrl(providerName, apiVersion, baseUrl)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: "apiVersion selects Azure OpenAI routing and requires a baseUrl of https://<resource>.openai.azure.com."
+      };
+    }
+
     if (apiKey) {
       // Persist to secrets.env so the wrapper-sourced env carries it on
       // future shell launches. The shared writer lives in src/state/ —
@@ -146,16 +192,14 @@ export async function setSetupProvider(
       process.env[envKeySpec.envVar] = apiKey;
     }
 
-    const model = typeof payload.model === "string" && payload.model.length > 0
-      ? payload.model
-      : (config.provider?.name === providerName && config.provider.model ? config.provider.model : envKeySpec.defaultModel);
-    const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
-      ? payload.baseUrl.trim()
-      : undefined;
     config.provider = normalizeProvider({
       name: providerName as ProviderConfig["name"],
       model,
-      ...(baseUrl ? { baseUrl } : {})
+      ...(baseUrl ? { baseUrl } : {}),
+      ...(apiKeyEnv ? { apiKeyEnv } : {}),
+      ...(apiVersion ? { apiVersion } : {}),
+      ...(deployment ? { deployment } : {}),
+      ...(authScheme ? { authScheme } : {})
     });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 
