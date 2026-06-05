@@ -12,6 +12,7 @@ import { loadConfig, parseInstance, runtimePortPath } from "./paths";
 import { appendLog, mutateState, readState } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
+import { reconcileAutostartPlistOnStartup } from "./runtime/autostart-reconcile";
 import { installCrashHandlers } from "./runtime/crash-handlers";
 import { maybeAskAboutCrashes } from "./runtime/crash-recovery";
 import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
@@ -90,6 +91,21 @@ setBrowserInstance(config.instance);
 // keeps the never-crash-boot guarantee. See ADR tunnel-connectivity.md.
 await reconcileTunnelOnStartup(config).catch((error) => {
   appendLog(config.instance, "tunnel.reconcile.error", {
+    error: error instanceof Error ? error.message : String(error)
+  });
+});
+
+// Reconcile the installed launchd plists against the current supervision
+// template. For a launchd-managed instance whose on-disk plist predates a
+// supervision-template change (e.g. a runtime version update that altered the
+// plist shape), this rewrites the plist files and dispatches a detached
+// `gini autostart enable` whose bootout relaunches us from the corrected
+// plist — so a version update propagates supervision changes to EXISTING
+// installs, not just fresh ones. No-op when up to date or when there's no
+// managed plist (foreground / `gini run` / conductor). The .catch preserves
+// the never-crash-boot guarantee. See ADR always-up-supervision.md.
+await reconcileAutostartPlistOnStartup(config).catch((error) => {
+  appendLog(config.instance, "autostart.reconcile.error", {
     error: error instanceof Error ? error.message : String(error)
   });
 });

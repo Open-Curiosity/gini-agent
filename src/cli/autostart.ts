@@ -794,6 +794,32 @@ export interface PlistOptions {
 // change to this value re-stamps existing installs on next startup.
 const PLIST_PROCESS_TYPE = "Interactive";
 
+// The single source of truth for a generated plist's stamp. Both
+// generatePlist (write side) and the startup reconcile (check side) call
+// this so they hash byte-identical input. Mirrors generatePlist's
+// throttle-default and periodic-vs-long-lived resolution exactly.
+export function stampForGeneratedPlist(args: {
+  instance: Instance;
+  kind?: PlistKind;
+  spec: LaunchSpec;
+  throttleIntervalSeconds?: number;
+  startIntervalSeconds?: number;
+}): string {
+  const throttle = args.throttleIntervalSeconds ?? THROTTLE_INTERVAL_SECONDS;
+  const periodic = args.startIntervalSeconds !== undefined;
+  const label = args.kind ? labelForKind(args.instance, args.kind) : labelFor(args.instance);
+  return computePlistStamp(
+    plistStampInput({
+      kind: args.kind ?? "legacy",
+      label,
+      spec: args.spec,
+      processType: PLIST_PROCESS_TYPE,
+      throttleIntervalSeconds: periodic ? null : throttle,
+      startIntervalSeconds: periodic ? args.startIntervalSeconds! : null
+    })
+  );
+}
+
 export function generatePlist(options: PlistOptions): string {
   const throttle = options.throttleIntervalSeconds ?? THROTTLE_INTERVAL_SECONDS;
   const periodic = options.startIntervalSeconds !== undefined;
@@ -803,16 +829,13 @@ export function generatePlist(options: PlistOptions): string {
   // (computed from the SAME extraction the startup reconcile uses). Inject it
   // into EnvironmentVariables so it persists in the on-disk plist; the stamp
   // value itself is never part of what we hash.
-  const stamp = computePlistStamp(
-    plistStampInput({
-      kind: options.kind ?? "legacy",
-      label,
-      spec: options.spec,
-      processType: PLIST_PROCESS_TYPE,
-      throttleIntervalSeconds: periodic ? null : throttle,
-      startIntervalSeconds: periodic ? options.startIntervalSeconds! : null
-    })
-  );
+  const stamp = stampForGeneratedPlist({
+    instance: options.instance,
+    kind: options.kind,
+    spec: options.spec,
+    throttleIntervalSeconds: options.throttleIntervalSeconds,
+    startIntervalSeconds: options.startIntervalSeconds
+  });
   const stampedEnvironment: Record<string, string> = {
     ...options.spec.environment,
     [GINI_PLIST_STAMP_KEY]: stamp
