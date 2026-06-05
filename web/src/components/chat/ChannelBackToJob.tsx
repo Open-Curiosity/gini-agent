@@ -36,7 +36,7 @@ export function ChannelBackToJob({
         toast.error(error instanceof Error ? error.message : "Failed to switch agent");
       }
     }
-    router.push(`/jobs?job=${jobId}`);
+    router.push(`/jobs?job=${encodeURIComponent(jobId)}`);
   };
 
   return (
