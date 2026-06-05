@@ -223,7 +223,7 @@ describe("lintWiki: frontmatter + taxonomy", () => {
       expect(text).toContain("'created' is not YYYY-MM-DD");
       expect(text).toContain("not in");
       expect(text).toMatch(/missing or empty 'sources'/);
-      expect(text).toMatch(/fewer than 2 outbound links/);
+      expect(text).toMatch(/fewer than 2 resolved outbound links/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -308,6 +308,9 @@ describe("lintWiki: size, staleness, naming, raw/", () => {
       const r = lintWiki(root, "wiki", { staleDays: 90, today: new Date("2026-06-01T00:00:00Z") });
       expect(r.stale.some((s) => s.page === join("pages", "old.md"))).toBe(true);
       expect(r.stale.some((s) => s.page === join("pages", "fresh.md"))).toBe(false);
+      // stale is advisory: it must NOT gate clean / count toward totalIssues.
+      expect(r.totalIssues).toBe(0);
+      expect(r.clean).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -327,6 +330,224 @@ describe("lintWiki: size, staleness, naming, raw/", () => {
       expect(r.counts.brokenLinks).toBe(0);
       // raw source is not counted as a page
       expect(r.counts.pages).toBe(3);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("lintWiki: review hardening", () => {
+  test("detects duplicate slugs and counts them as blocking", () => {
+    const root = tempWiki();
+    try {
+      write(root, "index.md", "# Index\n\n- [[alpha]]\n");
+      write(root, "pages/alpha.md", page({ title: "Alpha", links: ["beta", "index"] }));
+      write(root, "pages/beta.md", page({ title: "Beta", links: ["alpha", "index"] }));
+      // archive/alpha.md collides with pages/alpha.md on slug "alpha"
+      write(root, "archive/alpha.md", page({ title: "Alpha Archived", links: ["beta", "index"] }));
+      const r = lintWiki(root, "wiki");
+      const dup = r.duplicateSlugs.find((d) => d.slug === "alpha");
+      expect(dup).toBeTruthy();
+      expect(dup!.files).toEqual([join("archive", "alpha.md"), join("pages", "alpha.md")]);
+      expect(r.counts.duplicateSlugs).toBe(1);
+      expect(r.clean).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a nested index.md/schema.md does not hijack the root catalog/taxonomy", () => {
+    const root = tempWiki();
+    try {
+      write(root, "SCHEMA.md", SCHEMA);
+      write(root, "index.md", "# Index\n\n- [[alpha]]\n- [[beta]]\n");
+      write(root, "pages/alpha.md", page({ title: "Alpha", tags: ["models"], links: ["beta", "index"] }));
+      write(root, "pages/beta.md", page({ title: "Beta", tags: ["people"], links: ["alpha", "index"] }));
+      // A file literally named index.md but NESTED must NOT be read as the root
+      // index (its [[alpha]]-only list would otherwise make beta look unindexed).
+      write(root, "pages/sub/index.md", page({ title: "Sub Index", tags: ["models"], links: ["alpha"] }));
+      // A nested schema.md must NOT replace the root tag taxonomy.
+      write(root, "pages/sub/schema.md", page({ title: "Sub Schema", tags: ["people"], links: ["alpha", "beta"] }));
+      const r = lintWiki(root, "wiki");
+      // root taxonomy intact (nested schema.md did not overwrite it)
+      expect(r.structure.taxonomyTags).toEqual(["models", "people", "techniques"]);
+      // root index drives drift: beta stays indexed (nested index.md did not win)
+      expect(r.missingFromIndex).not.toContain(join("pages", "beta.md"));
+      // both nested files are linted as pages, not silently dropped → 4 pages
+      expect(r.counts.pages).toBe(4);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ignores [[links]] in inline code spans and ~~~ fences", () => {
+    const root = tempWiki();
+    try {
+      write(root, "index.md", "# Index\n\n- [[alpha]]\n- [[beta]]\n");
+      write(
+        root,
+        "pages/alpha.md",
+        [
+          "---",
+          "title: Alpha",
+          "created: 2026-01-01",
+          "updated: 2026-01-01",
+          "type: entity",
+          "tags: [models]",
+          "sources: [raw/x.md]",
+          "---",
+          "",
+          "# Alpha",
+          "",
+          "Real links: [[beta]] and [[index]].",
+          "Inline code `[[ghost-a]]` should not count.",
+          "",
+          "~~~",
+          "[[ghost-b]] inside a tilde fence",
+          "~~~",
+          ""
+        ].join("\n")
+      );
+      write(root, "pages/beta.md", page({ title: "Beta", links: ["alpha", "index"] }));
+      const r = lintWiki(root, "wiki");
+      expect(r.counts.brokenLinks).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("min-outbound counts only resolved targets (a broken link does not pad it)", () => {
+    const root = tempWiki();
+    try {
+      write(root, "index.md", "# Index\n\n- [[alpha]]\n- [[beta]]\n");
+      // alpha: one resolved page link + one broken link → only 1 resolved outbound
+      write(root, "pages/alpha.md", page({ title: "Alpha", links: ["beta", "ghost"] }));
+      write(root, "pages/beta.md", page({ title: "Beta", links: ["alpha", "index"] }));
+      const r = lintWiki(root, "wiki");
+      const alpha = r.frontmatter.find((f) => f.page === join("pages", "alpha.md"));
+      expect(alpha).toBeTruthy();
+      expect(alpha!.issues.join(" | ")).toMatch(/fewer than 2 resolved outbound links/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("indexEntriesWithoutPage gates clean", () => {
+    const root = tempWiki();
+    try {
+      write(root, "index.md", "# Index\n\n- [[alpha]]\n- [[beta]]\n- [[phantom]]\n");
+      write(root, "pages/alpha.md", page({ title: "Alpha", links: ["beta", "index"] }));
+      write(root, "pages/beta.md", page({ title: "Beta", links: ["alpha", "index"] }));
+      const r = lintWiki(root, "wiki");
+      expect(r.indexEntriesWithoutPage).toContain("phantom");
+      expect(r.clean).toBe(false);
+      expect(r.totalIssues).toBeGreaterThanOrEqual(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not flag tags when no SCHEMA taxonomy is present", () => {
+    const root = tempWiki();
+    try {
+      // no SCHEMA.md → tags are unchecked (can't validate against an absent taxonomy)
+      write(root, "index.md", "# Index\n\n- [[alpha]]\n- [[beta]]\n");
+      write(root, "pages/alpha.md", page({ title: "Alpha", tags: ["anything-goes"], links: ["beta", "index"] }));
+      write(root, "pages/beta.md", page({ title: "Beta", tags: ["whatever"], links: ["alpha", "index"] }));
+      const r = lintWiki(root, "wiki");
+      expect(r.structure.hasSchema).toBe(false);
+      expect(r.unknownTagsUsed.length).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("parses an inline array that has a trailing YAML comment", () => {
+    const root = tempWiki();
+    try {
+      write(root, "SCHEMA.md", SCHEMA);
+      write(root, "index.md", "# Index\n\n- [[alpha]]\n- [[beta]]\n");
+      write(
+        root,
+        "pages/alpha.md",
+        [
+          "---",
+          "title: Alpha",
+          "created: 2026-01-01",
+          "updated: 2026-01-01",
+          "type: entity",
+          "tags: [models, people]   # primary categories",
+          "sources: [raw/x.md]",
+          "---",
+          "",
+          "# Alpha",
+          "",
+          "Links: [[beta]] and [[index]].",
+          ""
+        ].join("\n")
+      );
+      write(root, "pages/beta.md", page({ title: "Beta", links: ["alpha", "index"] }));
+      const r = lintWiki(root, "wiki");
+      // tags parsed as an array despite the trailing comment → no missing-tags issue,
+      // and both are in the taxonomy → no unknown-tag false positive.
+      expect(r.frontmatter.find((f) => f.page === join("pages", "alpha.md"))).toBeUndefined();
+      expect(r.unknownTagsUsed.length).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("taxonomy parsing skips fenced code and spans sub-headings", () => {
+    const root = tempWiki();
+    try {
+      const schema = [
+        "# Schema",
+        "",
+        "## Tag taxonomy",
+        "",
+        "### Models",
+        "- models",
+        "",
+        "### People",
+        "- people",
+        "",
+        "```",
+        "- not-a-real-tag-in-code",
+        "```",
+        "",
+        "## Conventions",
+        "- this-is-not-a-tag",
+        ""
+      ].join("\n");
+      write(root, "SCHEMA.md", schema);
+      write(root, "index.md", "# Index\n\n- [[alpha]]\n- [[beta]]\n");
+      write(root, "pages/alpha.md", page({ title: "Alpha", tags: ["models"], links: ["beta", "index"] }));
+      write(root, "pages/beta.md", page({ title: "Beta", tags: ["people"], links: ["alpha", "index"] }));
+      const r = lintWiki(root, "wiki");
+      // sub-headings inside the tag section are still collected
+      expect(r.structure.taxonomyTags).toContain("models");
+      expect(r.structure.taxonomyTags).toContain("people");
+      // fenced-code bullet and the post-section "Conventions" bullet are excluded
+      expect(r.structure.taxonomyTags).not.toContain("not-a-real-tag-in-code");
+      expect(r.structure.taxonomyTags).not.toContain("this-is-not-a-tag");
+      expect(r.unknownTagsUsed.length).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("flags an underscore filename and resolves [[Display Name]] to its hyphen slug", () => {
+    const root = tempWiki();
+    try {
+      write(root, "index.md", "# Index\n\n- [[my-page]]\n- [[beta]]\n");
+      // file uses underscores; a link uses the display form with a space
+      write(root, "pages/my_page.md", page({ title: "My Page", links: ["beta", "index"] }));
+      write(root, "pages/beta.md", page({ title: "Beta", links: ["My Page", "index"] }));
+      const r = lintWiki(root, "wiki");
+      // underscore filename is flagged for rename...
+      expect(r.nonSlugFilenames).toContain(join("pages", "my_page.md"));
+      // ...but [[My Page]] still resolves to my_page.md via the shared slug "my-page"
+      expect(r.counts.brokenLinks).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
