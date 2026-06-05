@@ -27,11 +27,10 @@ import { submitTask } from "../agent";
 // `zsh -lc` profile, or a token-refresh network stall can't pin the tick.
 const SPAWN_TIMEOUT_MS = 15_000;
 
-// Cap the TURNS woken per watcher per tick. Gmail lists newest-first, so we
-// enumerate the whole window (paginated, oldest-first) but only wake up to this
-// many agent turns in a single tick; the rest drain over successive ticks as
-// the cursor advances. Caps the cold-start / catch-up burst so one watcher
-// can't wake hundreds of turns at once.
+// Cap the TURNS woken per watcher per tick. A fully-enumerated (non-truncated)
+// window is drained oldest-first, but only up to this many agent turns in a
+// single tick; the rest drain over successive ticks as the cursor advances.
+// Caps the catch-up burst so one watcher can't wake hundreds of turns at once.
 const MAX_MESSAGES_PER_TICK = 25;
 
 // Per-page result size for the paginated window list. Combined with
@@ -41,10 +40,12 @@ const MAX_MESSAGES_PER_TICK = 25;
 const WINDOW_PAGE_SIZE = 100;
 
 // Max pages `--page-all` walks per tick. gws stops after this many pages even
-// if more remain (the last page then still carries a nextPageToken), so a
-// window larger than WINDOW_PAGE_LIMIT * WINDOW_PAGE_SIZE only fully drains
-// over several ticks. We log when this cap is hit so truncation is observable.
-const WINDOW_PAGE_LIMIT = 10;
+// if more remain (the last page then still carries a nextPageToken). When this
+// cap is hit the window can't be enumerated oldest-first (the older tail isn't
+// listed), so the worker baselines past it with a single notice turn rather
+// than draining — see processWatcher. We log when the cap is hit. Exported so
+// the truncated-window test can build a page-cap-hit response in sync.
+export const WINDOW_PAGE_LIMIT = 10;
 
 // Metadata the worker reads for the safety floor + the woken-turn prompt.
 // Bodies are deliberately NOT read here — the agent reads them via the skill.
@@ -319,6 +320,21 @@ export function buildWatchPrompt(watcher: EmailWatcherRecord, meta: EmailMetadat
   ].join("\n");
 }
 
+// Notice prompt for a TRUNCATED steady-state window: too many genuinely-new
+// matches accumulated (only reachable after downtime + high volume) to draft
+// each one. The worker baselines the cursor past the backlog and wakes this one
+// turn so the situation is surfaced, not silently swallowed. Carries no
+// untrusted email content, so no fence is needed.
+export function buildBacklogNoticePrompt(watcher: EmailWatcherRecord): string {
+  return [
+    "[automated email-watch notice]",
+    `A large backlog of emails matching your watch (query: ${watcher.query}) accumulated, likely while I was offline.`,
+    "I'm not drafting replies to all of them. Ask me to triage this inbox if you'd like me to work through them.",
+    "",
+    "If nothing is actionable, respond with exactly [SILENT] and nothing else."
+  ].join("\n");
+}
+
 // Resolve the signed-in account address ("me") via gws getProfile, used for
 // the self-message drop. Best-effort: returns undefined on any failure so a
 // missing profile just disables the self-drop (the automated-sender drop and
@@ -334,24 +350,40 @@ async function resolveSelfEmail(gwsSpawn: GwsSpawn): Promise<string | undefined>
   }
 }
 
-// Process one watcher.
+// Fetch one message's internalDate (epoch ms) by id, 0 when unavailable. Used
+// to baseline the cursor from the newest listed message without enumerating the
+// rest of the window.
+async function fetchInternalDate(gwsSpawn: GwsSpawn, id: string): Promise<number> {
+  const meta = parseMessageMetadata(await gwsSpawn(buildGetArgs(id)), id);
+  const internalDate = meta.internalDate ? Number(meta.internalDate) : 0;
+  return Number.isFinite(internalDate) && internalDate > 0 ? internalDate : 0;
+}
+
+// Process one watcher. Three regimes, all governed by the fact that the `after:`
+// watermark only ever moves FORWARD (to newer mail): you can never reach an
+// older, un-listed tail by advancing it, so a path that needs the tail is wrong.
 //
-// Gmail lists newest-first, so a naive "advance the cursor to the newest item
-// on the page" silently drops every older match that didn't fit on the page.
-// Instead we ENUMERATE the whole window (paginated), drain it OLDEST-FIRST, cap
-// the TURNS woken this tick at MAX_MESSAGES_PER_TICK, and advance the cursor
-// ONCE at the end to the LAST CONSUMED item's internalDate — forward progress
-// that drains a backlog over successive ticks without ever stepping past an
-// un-consumed match.
+//  1. SEEDING (no lastSeenInternalDate): BASELINE only. Take the newest listed
+//     id (Gmail lists newest-first => window.ids[0]), fetch ITS internalDate,
+//     set the cursor there, markSeen just that boundary id, and wake NO turn.
+//     Pre-existing mail older than the baseline is excluded by `after:` forever
+//     — the correct behavior (never draft a backlog), regardless of inbox size.
+//     No enumeration, so inbox size / page truncation is irrelevant here.
 //
-// Crash safety is the email_seen store, not the cursor: markSeen is committed
-// per item, so a crash mid-batch re-lists the window next tick and the dedup
-// skips whatever was already handled. The cursor only bounds the `after:`
-// query and is advanced exactly once per tick.
+//  2. STEADY-STATE, window NOT truncated (fully enumerated, <= the page cap):
+//     drain OLDEST-FIRST, cap the TURNS woken at MAX_MESSAGES_PER_TICK, advance
+//     the cursor ONCE to the LAST CONSUMED item's internalDate. A >cap backlog
+//     drains over successive ticks without ever stepping past an un-consumed
+//     match. Crash safety is the email_seen store (markSeen committed per item),
+//     not the cursor — a crash mid-batch re-lists the window and dedup skips
+//     whatever was already handled.
 //
-// On the first run (no lastSeenInternalDate) it SEEDS: marks ALL current
-// matches seen across the whole window and sets the cursor to the newest match
-// without waking any turn (no replay storm). Returns how many turns it triggered.
+//  3. STEADY-STATE, window TRUNCATED (pageLimitHit: > the page cap of genuinely
+//     -new matches, only reachable after downtime + high volume): the older
+//     tail isn't listed, so oldest-first draining would silently skip it. Don't
+//     draft the backlog and don't skip it silently — jump the cursor to the
+//     NEWEST, markSeen that boundary id, and wake exactly ONE notice turn so the
+//     user is told a backlog accumulated.
 async function processWatcher(
   config: RuntimeConfig,
   watcher: EmailWatcherRecord,
@@ -372,23 +404,64 @@ async function processWatcher(
   }
 
   const window = parseMessageWindow(await gwsSpawn(buildListArgs(query)));
+
+  // Regime 1: SEEDING — baseline the cursor at the newest match, draft nothing.
+  if (isSeeding) {
+    const newest = window.ids[0];
+    let cursor: string;
+    if (newest) {
+      const internalDate = await fetchInternalDate(gwsSpawn, newest);
+      // Date.now() is allowed in worker runtime code (unlike workflow scripts);
+      // it only matters as a fallback if the newest message has no internalDate.
+      cursor = String(internalDate > 0 ? internalDate : Date.now());
+      markEmailSeen(config.instance, watcher.id, newest);
+    } else {
+      cursor = String(Date.now());
+    }
+    await updateEmailWatcher(config, watcher.id, {
+      lastSeenInternalDate: cursor,
+      lastPolledAt: now(),
+      status: "ok",
+      lastError: undefined
+    });
+    return { triggered: 0, seeded: true };
+  }
+
+  // Regime 3: TRUNCATED steady-state window — the older tail isn't listed, so a
+  // forward-only watermark can never reach it. Jump past the whole backlog to
+  // the newest and wake ONE notice turn instead of storming drafts or silently
+  // skipping. Bounded + non-silent.
   if (window.pageLimitHit) {
-    // The window is larger than WINDOW_PAGE_LIMIT pages; gws stopped early and
-    // older matches weren't listed this tick. They'll drain over later ticks as
-    // the cursor advances, but log it so the truncation is never silent.
+    const newest = window.ids[0];
+    let cursor: string | undefined;
+    if (newest) {
+      const internalDate = await fetchInternalDate(gwsSpawn, newest);
+      if (internalDate > 0) cursor = String(internalDate);
+      markEmailSeen(config.instance, watcher.id, newest);
+    }
     appendLog(config.instance, "email.watch.page_limit", {
       watcherId: watcher.id,
       listed: window.ids.length,
       pageLimit: WINDOW_PAGE_LIMIT
     });
+    await spawnTurn(watcher, buildBacklogNoticePrompt(watcher));
+    await updateEmailWatcher(config, watcher.id, {
+      ...(cursor ? { lastSeenInternalDate: cursor } : {}),
+      lastPolledAt: now(),
+      status: "ok",
+      lastError: undefined
+    });
+    return { triggered: 1, seeded: false };
   }
-  // Gmail returns newest-first; drain oldest-first so a turn-cap or crash never
-  // advances the cursor past an older, un-consumed match.
+
+  // Regime 2: fully-enumerated steady-state window. Gmail returns newest-first;
+  // drain oldest-first so a turn-cap or crash never advances the cursor past an
+  // older, un-consumed match.
   const ids = window.ids.slice().reverse();
 
-  // The internalDate of the LAST item we consumed (woke a turn for, dropped, or
-  // seeded). The cursor advances to exactly this at the end — never past an item
-  // we stopped before.
+  // The internalDate of the LAST item we consumed (woke a turn for, or dropped).
+  // The cursor advances to exactly this at the end — never past an item we
+  // stopped before.
   let lastConsumedInternalDate = 0;
   let triggered = 0;
 
@@ -396,18 +469,6 @@ async function processWatcher(
     // Already handled in a prior tick — skip without re-fetching metadata. It's
     // behind the current watermark, so it doesn't move lastConsumedInternalDate.
     if (isEmailSeen(config.instance, watcher.id, id)) continue;
-
-    if (isSeeding) {
-      // Seeding: record as seen, never wake a turn. Fetch metadata only to find
-      // the high-water internalDate so the cursor starts at the true newest.
-      const meta = parseMessageMetadata(await gwsSpawn(buildGetArgs(id)), id);
-      const internalDate = meta.internalDate ? Number(meta.internalDate) : 0;
-      markEmailSeen(config.instance, watcher.id, id);
-      if (Number.isFinite(internalDate) && internalDate > lastConsumedInternalDate) {
-        lastConsumedInternalDate = internalDate;
-      }
-      continue;
-    }
 
     // Turn cap reached: STOP consuming. Leave the remaining (older-than-rest,
     // but newer-than-cursor) matches for the next tick — the cursor will sit at
@@ -452,14 +513,8 @@ async function processWatcher(
 
   // Advance the watermark ONCE to the last-consumed item's internalDate
   // (forward progress; a backlog drains over successive ticks). When nothing
-  // was consumed this tick keep the prior cursor — or, on a seeding run with an
-  // empty inbox, baseline it at now so the next tick has an `after:` bound.
-  let cursor: string | undefined;
-  if (lastConsumedInternalDate > 0) {
-    cursor = String(lastConsumedInternalDate);
-  } else if (isSeeding) {
-    cursor = String(Date.now());
-  }
+  // was consumed this tick keep the prior cursor.
+  const cursor = lastConsumedInternalDate > 0 ? String(lastConsumedInternalDate) : undefined;
   await updateEmailWatcher(config, watcher.id, {
     ...(cursor ? { lastSeenInternalDate: cursor } : {}),
     lastPolledAt: now(),
@@ -467,7 +522,7 @@ async function processWatcher(
     lastError: undefined
   });
 
-  return { triggered, seeded: isSeeding };
+  return { triggered, seeded: false };
 }
 
 // One full poll tick across every enabled watcher. Self-contained and
