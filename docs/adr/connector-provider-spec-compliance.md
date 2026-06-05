@@ -91,6 +91,10 @@ The cost of fixing all three is small (mechanical renames + frontmatter migratio
 - A scheduled background job re-probes every connector whose provider declares a probe, with a configurable per-provider interval (default 30 minutes). Probes that time out (>10s) fail closed. Probes that succeed flip health to `healthy`; failures flip to `unhealthy` with the surfaced message.
 - The activation gate treats `health === "unknown"` as active if the provider has no probe (the connector exists, no failing signal). Treats `health === "unknown"` as inactive if the provider *does* have a probe but hasn't run yet — to avoid surfacing skills before their first probe.
 
+### Health vs. session liveness
+
+Connector `health` answers "are the credentials provisioned and usable," not "is the user's session currently live." The two diverge when a provider holds a long-lived credential *and* a separately-expiring session — e.g. `google-oauth-desktop` stores the OAuth *client* id/secret (presence-only, never expire) while `gws auth login` mints a *user* token that does expire. Such session liveness is a **derived, non-persisted** signal computed on read (see `gwsSessionStatus`, parsed from `gws auth status`), surfaced on the connector payload as a transient `session` field and to the model via `list_connectors`. It is deliberately **not** folded into `health` and **not** a probe: the connector.request `/complete` path drops any connector that isn't `healthy` at creation (see [Chat Credential Provisioning](chat-credential-provisioning.md)), and a session signal reads "signed out" before the first `gws auth login` runs — so gating `health` on it would delete the connector the instant its client creds are saved. Probes validate provisioning; liveness is queried lazily and cached.
+
 ### Skill installation flow
 
 - **Primary discovery**: filesystem watch on `skills/` (bundled) and `~/.gini/instances/<inst>/skills/` (user). Matches Claude Code, Anthropic spec, OpenClaw, Hermes conventions.
@@ -108,7 +112,7 @@ Both are bundled, enabled by default, and declare `metadata.gini.requires.connec
 
 ### Web UI
 
-- **Skills page** at `/skills`. Lists every loaded SkillRecord with status: `active`, `needs setup`, `unsupported`, `disabled`. Per-skill rows show `requires.connectors`, `prerequisites.commands`, `prerequisites.env`, `allowed-tools` with per-entry resolution status. Connector management happens inline:
+- **Skills page** at `/skills`. Lists every loaded SkillRecord with status: `active`, `needs setup`, `unsupported`, `disabled`. A connector backed by a setup skill (provider `setupSkill`) carries its sign-in liveness on that skill's row — `needs sign-in` when provisioned but the session expired — and skills that merely depend on the connector defer to it (`via <setup skill>`) rather than each showing their own connection state. Per-skill rows show `requires.connectors`, `prerequisites.commands`, `prerequisites.env`, `allowed-tools` with per-entry resolution status. Connector management happens inline:
   - Missing connectors render an inline `[Set up <Label>]` button that opens the Add Connector dialog scoped to that provider (no navigation).
   - Healthy connectors render a `[Disconnect]` affordance. Disconnect calls `DELETE /api/connectors/<id>`; the gateway tombstones `source: "auto"` records (status="disabled") and physically deletes `source: "user"` records.
   - A `Refresh detection` button at the top of the page calls `POST /api/connectors/detect` to re-run the auto-detection pass on demand.
