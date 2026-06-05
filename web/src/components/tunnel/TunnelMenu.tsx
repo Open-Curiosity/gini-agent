@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { useIsMobile } from "@/lib/use-is-mobile";
 import { TunnelTrigger } from "./TunnelTrigger";
 import { TunnelSelectionPanel } from "./TunnelSelectionPanel";
 import { TunnelConnectedPopover } from "./TunnelConnectedPopover";
@@ -19,6 +20,11 @@ export function TunnelMenu() {
   const { state, error, select, connect, cancel, disconnect, refresh } = useTunnel();
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(false);
+  // The trigger now lives in the sidebar footer. Open the popover to the right
+  // (into the content area) on desktop; on mobile the sidebar is a full-width
+  // Sheet, so a side placement would push the 24rem popover off-screen — open it
+  // upward over the drawer instead.
+  const isMobile = useIsMobile();
 
   const connected = state.status === "connected";
   // Drop the edit override once we're no longer connected so the natural
@@ -58,10 +64,11 @@ export function TunnelMenu() {
         <TunnelTrigger connected={connected} />
       </PopoverTrigger>
       <PopoverContent
-        side="right"
+        side={isMobile ? "top" : "right"}
         align="end"
         sideOffset={8}
-        className="w-96 overflow-hidden p-0"
+        collisionPadding={12}
+        className="w-[min(24rem,calc(100vw-2rem))] overflow-hidden p-0"
       >
         {/* Surface a request failure (connect/select/disconnect) so it isn't
             silently swallowed; state.message carries gateway-reported errors,
