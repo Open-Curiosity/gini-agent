@@ -149,20 +149,12 @@ export function providerCatalog(): ProviderCatalogItem[] {
       displayName: "Anthropic Compatible",
       baseUrl: DEFAULT_ANTHROPIC_BASE_URL,
       auth: "env",
-      // All current Claude models, in both their first-party ids (default
-      // baseUrl) and their Bedrock Mantle anthropic.-prefixed ids (Bedrock
-      // baseUrl). The model picker lists every entry; pick the form matching
-      // the configured endpoint.
-      models: [
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5",
-        "anthropic.claude-opus-4-8",
-        "anthropic.claude-opus-4-7",
-        "anthropic.claude-sonnet-4-6",
-        "anthropic.claude-haiku-4-5"
-      ],
+      // All current Claude models by their clean first-party ids. When the
+      // configured baseUrl is a Bedrock Mantle endpoint, callAnthropicMessages
+      // auto-maps these to the required anthropic.-prefixed Bedrock ids
+      // (resolveAnthropicModel) — so the picker stays clean and the same
+      // selection works against either endpoint.
+      models: ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
       capabilities: ["messages", "tool-calling", "streaming", "vision"],
       costHint: "external"
     },
@@ -1255,7 +1247,7 @@ async function callAnthropicMessages(
     maxTokensOverride ?? (typeof extras.max_tokens === "number" ? extras.max_tokens : DEFAULT_ANTHROPIC_MAX_TOKENS);
   const body: Record<string, unknown> = {
     ...extras,
-    model: provider.model,
+    model: resolveAnthropicModel(provider.model, baseUrl),
     messages: anthropicMessages,
     max_tokens: resolvedMaxTokens,
     stream: wantStream
@@ -1306,6 +1298,19 @@ function readAnthropicKey(provider: ProviderConfig): string {
     throw new Error(`Anthropic provider is configured but ${envName} is not set.`);
   }
   return apiKey;
+}
+
+// Bedrock Mantle requires the `anthropic.` provider prefix on model ids, while
+// the first-party API uses the bare id. The model picker lists clean first-
+// party ids; when the configured endpoint is a Bedrock URL we auto-map a bare
+// id to its anthropic.-prefixed form, so one selection works against either
+// endpoint. An already-prefixed id (e.g. set explicitly via the CLI) is left
+// untouched.
+function resolveAnthropicModel(model: string, baseUrl: string): string {
+  if (/bedrock/i.test(baseUrl) && !model.startsWith("anthropic.")) {
+    return `anthropic.${model}`;
+  }
+  return model;
 }
 
 interface AnthropicTranslation {

@@ -278,7 +278,7 @@ export default function AddProviderPage() {
                       <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">
                         https://bedrock-mantle.&lt;region&gt;.api.aws/anthropic
                       </code>{" "}
-                      and pick an <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">anthropic.</code>-prefixed model.
+                      — the selected model is mapped to its Bedrock id automatically.
                     </p>
                   ) : null}
                 </div>

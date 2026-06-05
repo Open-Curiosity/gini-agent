@@ -3775,6 +3775,39 @@ describe("anthropic provider", () => {
       restoreEnv();
     }
   });
+
+  test("auto-maps the model id to the Bedrock anthropic.-prefixed form when the baseUrl is Bedrock", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const okBody = () =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} });
+    const sentModel = async (provider: ReturnType<typeof normalizeProvider>): Promise<string> => {
+      const stub = installFetch(okBody);
+      try {
+        await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+        return JSON.parse(String(stub.calls[0]!.init.body)).model;
+      } finally {
+        stub.restore();
+      }
+    };
+    try {
+      // Bedrock baseUrl + clean id → prefixed in the request body.
+      expect(
+        await sentModel(
+          normalizeProvider({ name: "anthropic", model: "claude-opus-4-8", baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic" })
+        )
+      ).toBe("anthropic.claude-opus-4-8");
+      // First-party baseUrl → clean id unchanged.
+      expect(await sentModel(normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" }))).toBe("claude-opus-4-8");
+      // Already-prefixed id on Bedrock → not double-prefixed.
+      expect(
+        await sentModel(
+          normalizeProvider({ name: "anthropic", model: "anthropic.claude-haiku-4-5", baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic" })
+        )
+      ).toBe("anthropic.claude-haiku-4-5");
+    } finally {
+      restoreEnv();
+    }
+  });
 });
 
 describe("codex no-tools dispatch", () => {
