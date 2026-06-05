@@ -12,19 +12,26 @@ export function AgentChatHeader({
   seed,
   lastActiveAt,
   subtitle,
-  right
+  right,
+  showAvatar,
+  back
 }: {
   name: string;
   seed?: string;
   lastActiveAt?: string;
   subtitle?: string;
   right?: React.ReactNode;
+  showAvatar?: boolean;
+  back?: React.ReactNode;
 }) {
   const lastActive = lastActiveAt ? formatRelativeTime(lastActiveAt) : "";
   return (
     <header className="flex shrink-0 items-center justify-between gap-4 border-b border-[#1C1C1E] px-7 py-4">
       <div className="flex min-w-0 items-center gap-4">
-        <AgentAvatar name={name} seed={seed} size={52} className="border border-[#1C1C1E]" />
+        {back}
+        {showAvatar !== false ? (
+          <AgentAvatar name={name} seed={seed} size={52} className="border border-[#1C1C1E]" />
+        ) : null}
         <div className="flex min-w-0 flex-col gap-1">
           <h1 className="truncate text-[19px] font-bold leading-none text-foreground">{name}</h1>
           <div className="flex items-center gap-1.5 text-[12px] leading-none">

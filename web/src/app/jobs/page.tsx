@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -18,7 +19,10 @@ import { adaptJob, adaptRun } from "./_components/calendar/types";
 
 export default function JobsPage() {
   const jobs = useJobs();
-  const [selected, setSelected] = useState<string | null>(null);
+  const params = useSearchParams();
+  // Deep-link from a channel's "Back to job" link: ?job=<id> preselects that
+  // job in JobDetail. The initializer runs once on mount, which is sufficient.
+  const [selected, setSelected] = useState<string | null>(params?.get("job") ?? null);
   const runs = useJobRuns(selected ?? undefined);
   // For the calendar tab we need every run (across all jobs), not just the
   // selected job's runs. `useJobRuns(undefined)` resolves to `/job-runs`.
