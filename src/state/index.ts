@@ -192,7 +192,9 @@ export {
   listEmailWatchers,
   getEmailWatcher,
   updateEmailWatcher,
-  removeEmailWatcher
+  setEmailWatcherEnabled,
+  removeEmailWatcher,
+  backfillEmailWatcherJobs
 } from "./email-watchers";
 export type { AddEmailWatcherInput } from "./email-watchers";
 export {
