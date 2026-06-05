@@ -569,6 +569,29 @@ export async function waitForRuntimeStopped(config: RuntimeConfig, pid?: number,
   return false;
 }
 
+// Poll until a specific port is bindable (the prior holder has released it) or
+// the deadline passes. `launchctl bootout` returns as soon as the unload is
+// ACCEPTED, not after the process has died and freed its socket — so a
+// bootout→bootstrap reload can race the kernel's TIME_WAIT/teardown and hit
+// EADDRINUSE. Callers that bootout a port-binding service await this before the
+// re-bootstrap so the port is actually free first. Probes the single host
+// (127.0.0.1 by default) the gateway/web bind to; returns whether it became
+// free within the budget. Timeout/interval are parameters so tests don't poll
+// for real.
+export async function waitForPortFree(
+  port: number,
+  host = "127.0.0.1",
+  timeoutMs = 10_000,
+  intervalMs = 100
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await probe(port, host)) return true;
+    await Bun.sleep(intervalMs);
+  }
+  return false;
+}
+
 export async function isRunning(config: RuntimeConfig): Promise<boolean> {
   try {
     const response = await fetch(`${url(config)}/api/status`, { headers: auth(config) });
