@@ -12,13 +12,19 @@ import { join } from "node:path";
 import {
   GINI_SUPERVISOR_VALUE,
   LABEL_PREFIX,
+  computePlistStamp,
   generatePlist,
   guiDomain,
   labelFor,
+  plistStampInput,
   plistPathFor,
+  readPlistStamp,
   resolveLaunchSpec,
   serviceTarget,
-  supervisor
+  supervisor,
+  writePlist,
+  type LaunchSpec,
+  type PlistKind
 } from "./autostart";
 
 function makeTempHome(tag: string): string {
@@ -830,6 +836,144 @@ describe("generatePlist (watchdog kind: periodic StartInterval)", () => {
       });
       expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<true\/>/);
       expect(xml).not.toContain("<key>StartInterval</key>");
+    }
+  });
+});
+
+describe("computePlistStamp / readPlistStamp", () => {
+  // A gateway-shaped spec carrying the full env (PATH, secrets, HOME, the
+  // supervision keys). The stamp must depend ONLY on the supervision subset.
+  function gatewaySpec(overrides: Partial<LaunchSpec> = {}): LaunchSpec {
+    return {
+      programArguments: ["/opt/bun/bin/bun", "run", "src/server.ts", "--instance", "main"],
+      workingDirectory: "/Users/test/.gini/runtime",
+      environment: {
+        PATH: "/usr/bin:/opt/homebrew/bin",
+        HOME: "/Users/test",
+        LANG: "en_US.UTF-8",
+        SHELL: "/bin/zsh",
+        OPENAI_API_KEY: "sk-secret-value",
+        GINI_STATE_ROOT: "/tmp/scratch",
+        GINI_INSTANCE: "main",
+        GINI_SUPERVISOR: GINI_SUPERVISOR_VALUE
+      },
+      ...overrides
+    };
+  }
+
+  function gatewayStamp(spec: LaunchSpec): string {
+    return computePlistStamp(
+      plistStampInput({
+        kind: "gateway",
+        label: `${LABEL_PREFIX}.main.gateway`,
+        spec,
+        processType: "Interactive",
+        throttleIntervalSeconds: 10,
+        startIntervalSeconds: null
+      })
+    );
+  }
+
+  test("identical inputs hash to an identical short hex stamp", () => {
+    const a = gatewayStamp(gatewaySpec());
+    const b = gatewayStamp(gatewaySpec());
+    expect(a).toBe(b);
+    // Short hex fingerprint (12 chars).
+    expect(a).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  test("changing PATH / a secret value / HOME / log paths yields the SAME stamp (false-positive guard)", () => {
+    // This is the loop-safety test. PATH (shell-merged), secret VALUES, HOME,
+    // SHELL, and the state/log roots all vary legitimately between machines
+    // and between the merge/no-merge code paths. If any of them fed the stamp,
+    // a fresh boot would see drift, rewrite + relaunch, boot again, see drift
+    // again — an infinite reconcile loop. They must NOT affect the stamp.
+    const base = gatewayStamp(gatewaySpec());
+    expect(
+      gatewayStamp(gatewaySpec({ environment: { ...gatewaySpec().environment, PATH: "/totally/different/path" } }))
+    ).toBe(base);
+    expect(
+      gatewayStamp(gatewaySpec({ environment: { ...gatewaySpec().environment, OPENAI_API_KEY: "sk-rotated-key" } }))
+    ).toBe(base);
+    expect(
+      gatewayStamp(gatewaySpec({ environment: { ...gatewaySpec().environment, HOME: "/Users/other" } }))
+    ).toBe(base);
+    expect(
+      gatewayStamp(gatewaySpec({ environment: { ...gatewaySpec().environment, SHELL: "/bin/bash" } }))
+    ).toBe(base);
+    expect(
+      gatewayStamp(gatewaySpec({ environment: { ...gatewaySpec().environment, GINI_STATE_ROOT: "/tmp/other-scratch" } }))
+    ).toBe(base);
+  });
+
+  test("changing a supervision-critical field yields a DIFFERENT stamp", () => {
+    const base = gatewayStamp(gatewaySpec());
+    // A ProgramArgument move (e.g. bun path changes) re-stamps.
+    expect(
+      gatewayStamp(gatewaySpec({
+        programArguments: ["/different/bun", "run", "src/server.ts", "--instance", "main"]
+      }))
+    ).not.toBe(base);
+    // The supervisor marker disappearing (the exact stale case we heal) re-stamps.
+    const noMarker = { ...gatewaySpec().environment };
+    delete noMarker.GINI_SUPERVISOR;
+    expect(gatewayStamp(gatewaySpec({ environment: noMarker }))).not.toBe(base);
+    // WorkingDirectory change re-stamps.
+    expect(
+      gatewayStamp(gatewaySpec({ workingDirectory: "/somewhere/else" }))
+    ).not.toBe(base);
+    // The KeepAlive-vs-periodic scheduling shape re-stamps: same spec but
+    // computed as the periodic (watchdog) shape.
+    const periodic = computePlistStamp(
+      plistStampInput({
+        kind: "gateway",
+        label: `${LABEL_PREFIX}.main.gateway`,
+        spec: gatewaySpec(),
+        processType: "Interactive",
+        throttleIntervalSeconds: null,
+        startIntervalSeconds: 30
+      })
+    );
+    expect(periodic).not.toBe(base);
+  });
+
+  test("round-trip: writePlist → readPlistStamp returns the same value computePlistStamp produced", () => {
+    const home = makeTempHome("stamp-roundtrip");
+    try {
+      const prevHome = process.env.HOME;
+      process.env.HOME = home;
+      try {
+        const spec = gatewaySpec();
+        const expected = gatewayStamp(spec);
+        const path = writePlist({
+          instance: "main",
+          kind: "gateway" as PlistKind,
+          spec,
+          stdoutPath: "/tmp/out.log",
+          stderrPath: "/tmp/err.log"
+        });
+        expect(readPlistStamp(path)).toBe(expected);
+      } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("readPlistStamp returns null for a missing file or a stamp-less plist", () => {
+    expect(readPlistStamp("/tmp/does-not-exist-gini-stamp.plist")).toBeNull();
+    const home = makeTempHome("stamp-missing");
+    try {
+      const stampless = join(home, "no-stamp.plist");
+      writeFileSync(
+        stampless,
+        "<plist><dict><key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin</string></dict></dict></plist>"
+      );
+      expect(readPlistStamp(stampless)).toBeNull();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });
