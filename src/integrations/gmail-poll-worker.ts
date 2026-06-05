@@ -611,5 +611,5 @@ function sanitizeWatcherError(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error);
   return raw
     .replace(/\/[^\s'"]*\.(?:json|enc)\b/g, "<path>")
-    .replace(/(?:\/Users\/[^/\s'"]+|\/home\/[^/\s'"]+|\/root)(?:\/[^\s'"]*)?/g, "<path>");
+    .replace(/(?:\/Users\/[^/\s'"]+|\/home\/[^/\s'"]+|\/root(?=\/|$|[\s'"]))(?:\/[^\s'"]*)?/g, "<path>");
 }

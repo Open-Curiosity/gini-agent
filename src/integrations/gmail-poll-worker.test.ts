@@ -545,6 +545,24 @@ describe("runGmailPollTick", () => {
     expect(live?.lastError).not.toContain("keyring");
   });
 
+  test("scrubs a /root path but not a /rootcause-like token", async () => {
+    const config = buildConfig("worker-rootscrub");
+    await seedWatcher(config, "alice@x.com");
+    await runGmailPollTick(config, {
+      sessionStatus: async () => ({ installed: true, clientConfigured: true, signedIn: true, message: "ok" }),
+      resolveSelfEmail: async () => undefined,
+      gwsSpawn: async () => {
+        throw new Error("/rootcause analysis failed at /root/.config/gws/keyring during poll");
+      }
+    });
+    const live = readState(config.instance).emailWatchers[0];
+    // The real /root/... path is redacted...
+    expect(live?.lastError).toContain("<path>");
+    expect(live?.lastError).not.toContain("/root/.config");
+    // ...but the unrelated /rootcause token is NOT over-redacted.
+    expect(live?.lastError).toContain("/rootcause analysis failed");
+  });
+
   test("bounds the query with after:<epochSec> once a watermark exists, but not on seeding", async () => {
     const config = buildConfig("worker-after");
     const watcher = await seedWatcher(config, "alice@x.com");
