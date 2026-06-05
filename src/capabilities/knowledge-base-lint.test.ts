@@ -229,6 +229,45 @@ describe("lintWiki: frontmatter + taxonomy", () => {
     }
   });
 
+  test("parses block-list frontmatter (tags/sources as - items, not inline arrays)", () => {
+    const root = tempWiki();
+    try {
+      write(root, "SCHEMA.md", SCHEMA);
+      write(root, "index.md", "# Index\n\n- [[alpha]]\n- [[beta]]\n");
+      // alpha uses YAML block sequences for tags + sources instead of [a, b]
+      write(
+        root,
+        "pages/alpha.md",
+        [
+          "---",
+          "title: Alpha",
+          "created: 2026-01-01",
+          "updated: 2026-01-01",
+          "type: entity",
+          "tags:",
+          "  - models",
+          "  - people",
+          "sources:",
+          "  - raw/articles/x.md",
+          "---",
+          "",
+          "# Alpha",
+          "",
+          "Links: [[beta]] and [[index]].",
+          ""
+        ].join("\n")
+      );
+      write(root, "pages/beta.md", page({ title: "Beta", links: ["alpha", "index"] }));
+      const r = lintWiki(root, "wiki");
+      // No frontmatter complaints for alpha: tags + sources parsed from the block list.
+      expect(r.frontmatter.find((f) => f.page === join("pages", "alpha.md"))).toBeUndefined();
+      // And the block-list tags are taxonomy-checked (no unknown-tag false positives).
+      expect(r.unknownTagsUsed.length).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("flags a tag outside the SCHEMA taxonomy", () => {
     const root = tempWiki();
     try {
