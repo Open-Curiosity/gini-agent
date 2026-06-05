@@ -31,5 +31,5 @@ export default function Index() {
     if (pending) void clearPendingPair();
     return <Redirect href="/setup" />;
   }
-  return <Redirect href="/agents" />;
+  return <Redirect href="/channels" />;
 }

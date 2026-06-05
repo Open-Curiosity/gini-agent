@@ -17,12 +17,14 @@ import {
   appendTaskPartial,
   appendTrace,
   createChatMessage,
+  getLastMainChatAssistantTextBlock,
   isTerminalTaskStatus,
   mutateState,
   now,
   readState,
   readTrace
 } from "../state";
+import { id as makeId } from "../state/ids";
 import { ApprovedActionFailedError, findTask, scheduleAutoRetain } from "../agent";
 import { recall } from "../memory";
 import {
@@ -92,6 +94,7 @@ import {
   type ChatEmitContext
 } from "./chat-task-emit";
 import { dispatchToolCall, parseToolArgsLenient, ToolDisplayError } from "./tool-dispatch";
+import { parseLeadingRouteDirective } from "./route-directive";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn } from "./chat";
@@ -106,6 +109,12 @@ import { resolveEffectiveContext } from "./effective-context";
 // to be a meaningful budget for normal work. Power users can override this
 // per-instance via `config.agent.maxIterations` in `~/.gini/instances/<inst>/config.json`.
 const MAX_LOOP_ITERATIONS = 90;
+
+// Loop-breaker: how many consecutive iterations of the IDENTICAL tool call(s)
+// yielding the IDENTICAL result(s) we tolerate before deciding the model is
+// stuck (e.g. a guard that keeps refusing the same cold call) and routing to
+// the graceful tool-less summary exit instead of grinding to MAX_LOOP_ITERATIONS.
+const MAX_IDENTICAL_TOOL_REPEATS = 3;
 
 // Resolve the effective iteration cap from config, falling back to the
 // default when the user hasn't set one or set an invalid value. Validation
@@ -1139,7 +1148,7 @@ export function buildSkillScriptsBlock(state: RuntimeState, visibleSkillNames: S
 function buildDeferredToolsBlock(index: Array<{ name: string; summary: string }>): string {
   if (index.length === 0) return "";
   return [
-    "Tools available on demand (NOT yet loaded). These are real tools you can use, but their definitions aren't loaded yet. To use one, FIRST call load_tools with its exact name(s) (e.g. load_tools({\"names\":[\"browser_navigate\"]})); from the next turn on you call the tool directly by name. Don't guess a tool's arguments before loading it.",
+    "Tools available on demand (NOT yet loaded). These are real tools you can use, but their definitions aren't loaded yet. To use one, FIRST call load_tools with its exact name(s) (e.g. load_tools({\"names\":[\"browser_snapshot\"]})); from the next turn on you call the tool directly by name. Don't guess a tool's arguments before loading it.",
     ...index.map((t) => `- ${t.name} — ${t.summary}`)
   ].join("\n");
 }
@@ -1262,7 +1271,11 @@ async function runLoop(
   // `undefined`, in which case the emit* helpers are no-ops. Per ADR
   // chat-block-protocol.md, subagent inner work stays opaque to the
   // user — only the parent's `spawn_subagent` tool_call surfaces.
-  const emitCtx: ChatEmitContext | undefined = resolveEmitContext(config, taskId);
+  // `let`, not `const`: the route filter below may reassign emitCtx to a
+  // threaded copy mid-turn when the agent's `<route>thread</route>` directive
+  // fires, so the rest of the turn (continued text, tool calls, tool results,
+  // the terminal phase) all thread.
+  let emitCtx: ChatEmitContext | undefined = resolveEmitContext(config, taskId);
   // Tracks the in-flight assistant_text block id for delta upserts so a
   // streaming model response only emits a single block per loop
   // iteration. Reset between iterations so the next provider call gets
@@ -1270,8 +1283,90 @@ async function runLoop(
   let inFlightAssistantBlockId: string | undefined;
   let inFlightAssistantText = "";
 
+  // Per-turn chat-vs-thread routing state. Only the FIRST iteration of a
+  // turn can carry the leading `<route>` directive, and only when there's a
+  // prior main-chat assistant message to branch a thread from. Once routing
+  // is resolved (directive seen, or the leading text proves it isn't a
+  // directive) the working text is surfaced unchanged.
+  //
+  // `routeRawText` accretes the raw streamed text so the parser can inspect
+  // the leading bytes; `routeSurfacedLen` tracks how much CLEANED text has
+  // already reached the task partial so each flush appends only the new
+  // delta. The directive must never reach appendTaskPartial, task.summary,
+  // or any block.
+  let routeResolved = false;
+  let routeRawText = "";
+  let routeStrippedPrefix = 0;
+  let routeSurfacedLen = 0;
+  // The thread-switch is performed once per runLoop entry. A task already
+  // threaded (a thread-reply, or a mid-turn switch that persisted) skips
+  // detection entirely — its whole response threads with no directive.
+  const threadDetectionEnabled = (): boolean =>
+    Boolean(emitCtx) && !emitCtx?.threadId;
+
+  // Mint a thread for this turn and re-point emitCtx at it. Branches off the
+  // most recent main-chat assistant message; when there is none (the very
+  // first turn) we stay in the main chat — there's nothing to branch from —
+  // but the directive is still stripped. Persists the thread fields onto the
+  // Task so an approval-resume (which re-runs resolveEmitContext) keeps
+  // threading from the same parent.
+  const switchTurnToThread = async (): Promise<"switched" | "already-threaded" | "no-parent"> => {
+    if (!emitCtx) return "no-parent";
+    if (emitCtx.threadId) return "already-threaded";
+    const parent = getLastMainChatAssistantTextBlock(config.instance, emitCtx.sessionId);
+    if (!parent) return "no-parent"; // First-ever turn — stay in main chat.
+    const threadId = makeId("thread");
+    const parentBlockId = parent.id;
+    emitCtx = { ...emitCtx, threadId, parentBlockId };
+    await mutateState(config.instance, (state) => {
+      const item = state.tasks.find((t) => t.id === taskId);
+      if (item) {
+        item.threadId = threadId;
+        item.parentBlockId = parentBlockId;
+        item.updatedAt = now();
+      }
+    });
+    return "switched";
+  };
+
+  // Resolve the per-turn route from the model's final text and return the
+  // CLEANED text (directive stripped) for the final-answer / one-shot paths.
+  // The thread decision fires here ONLY when streaming never resolved it
+  // (`!routeResolved` — the provider returned the whole string at once, so no
+  // flush ran). When a streamed flush already decided the route, re-running
+  // the switch would (wrongly) branch a thread off this turn's OWN assistant
+  // block; we only re-strip the same directive prefix in that case.
+  const finalizeTurnRoute = async (text: string): Promise<string> => {
+    const detect = !routeResolved && isFirstModelCall && threadDetectionEnabled();
+    const alreadyStrippedThisTurn = routeResolved && routeStrippedPrefix > 0;
+    if (!detect && !alreadyStrippedThisTurn) return text;
+    const parsed = parseLeadingRouteDirective(text);
+    if (parsed.status === "directive") {
+      if (detect && parsed.route === "thread") await switchTurnToThread();
+      return parsed.rest ?? "";
+    }
+    // `none` / `incomplete` — never a directive; surface the text unchanged.
+    return text;
+  };
+  // True while the current loop iteration is the runLoop's first model call —
+  // the only iteration that can carry a leading `<route>` directive. Visible
+  // to finalizeTurnRoute, which runs after the per-iteration assignment.
+  let isFirstModelCall = false;
+
+  // Loop-breaker bookkeeping: detect the model repeating the identical tool
+  // call(s) and getting the identical result(s) several iterations in a row.
+  // `brokeOnRepeat` steers the post-loop summary exit toward the right wording.
+  let lastIterationSignature: string | undefined;
+  let identicalRunLength = 0;
+  let brokeOnRepeat = false;
+
   while (iterations < cap) {
     iterations += 1;
+    // The leading `<route>` directive can only appear on the very first model
+    // output of a fresh turn — never on an approval-resume continuation
+    // (iterationsSoFar > 0), where the turn's earlier text already streamed to
+    // the main chat and threading the tail would split the turn.
+    isFirstModelCall = iterationsSoFar === 0 && iterations === 1;
 
     // Terminal-state bail-out. If the task was already moved to any
     // terminal status — cancelled externally, failed by a concurrent
@@ -1312,21 +1407,57 @@ async function runLoop(
     // completion / iteration-cap / cancellation paths below.
     inFlightAssistantBlockId = undefined;
     inFlightAssistantText = "";
+    // Reset the per-turn route state for this model call. Detection only
+    // runs on the first iteration of a fresh turn AND only when the task
+    // isn't already threaded; otherwise routing is pre-resolved and the
+    // text surfaces unchanged (byte-for-byte identical to the legacy path).
+    routeRawText = "";
+    routeStrippedPrefix = 0;
+    routeSurfacedLen = 0;
+    routeResolved = !(isFirstModelCall && threadDetectionEnabled());
     const flush = async (): Promise<void> => {
       if (!pending) return;
       const delta = pending;
       pending = "";
       lastFlush = Date.now();
-      await mutateState(config.instance, (state) => {
-        appendTaskPartial(state, taskId, delta);
-      });
+
+      // Accrete the raw streamed text first so the route parser can inspect
+      // the leading bytes; nothing is surfaced until routing is resolved.
+      routeRawText += delta;
+      if (!routeResolved) {
+        const parsed = parseLeadingRouteDirective(routeRawText);
+        if (parsed.status === "incomplete") {
+          // The leading text could still become a directive — buffer until
+          // more tokens arrive. This only delays the first flush by a few
+          // tokens. No partial / block write happens yet.
+          return;
+        }
+        if (parsed.status === "directive") {
+          routeStrippedPrefix = routeRawText.length - (parsed.rest?.length ?? 0);
+          if (parsed.route === "thread") await switchTurnToThread();
+        }
+        // `none` (or a non-thread directive): keep routeStrippedPrefix at its
+        // resolved value (0 for `none`) so the cleaned text surfaces as-is.
+        routeResolved = true;
+      }
+
+      // Surface only the CLEANED text — the directive substring (when present)
+      // is removed from both the task partial and the assistant_text block.
+      const cleanedFull = routeRawText.slice(routeStrippedPrefix);
+      const cleanedDelta = cleanedFull.slice(routeSurfacedLen);
+      routeSurfacedLen = cleanedFull.length;
+      if (cleanedDelta) {
+        await mutateState(config.instance, (state) => {
+          appendTaskPartial(state, taskId, cleanedDelta);
+        });
+      }
       // Mirror the same flush boundary to the assistant_text block so
       // SSE subscribers see the same cadence the partialSummary path
-      // exposes today. The block carries the FULL accreted text (not
-      // the delta), so a reconnect always observes a monotonically
+      // exposes today. The block carries the FULL accreted (cleaned) text
+      // (not the delta), so a reconnect always observes a monotonically
       // growing string and never needs to splice deltas itself.
-      if (emitCtx) {
-        inFlightAssistantText += delta;
+      if (emitCtx && cleanedFull) {
+        inFlightAssistantText = cleanedFull;
         if (!inFlightAssistantBlockId) {
           const block = emitAssistantTextStart(emitCtx, inFlightAssistantText);
           inFlightAssistantBlockId = block?.id;
@@ -1335,10 +1466,20 @@ async function runLoop(
         }
       }
     };
+    // Serialize flushes so the route resolution (which awaits the thread
+    // switch + a mutateState) inside one flush completes before the next
+    // flush — or the post-model drain — reads the routing state. A
+    // fire-and-forget flush could otherwise still be mid-await when the loop
+    // proceeds to strip the directive from the final summary, leaking it.
+    let flushChain: Promise<void> = Promise.resolve();
+    const enqueueFlush = (): Promise<void> => {
+      flushChain = flushChain.then(() => flush());
+      return flushChain;
+    };
     const onDelta = (text: string): void => {
       pending += text;
       if (Date.now() - lastFlush >= 150) {
-        void flush();
+        void enqueueFlush();
       }
     };
 
@@ -1390,7 +1531,11 @@ async function runLoop(
       }
       throw error;
     }
-    await flush();
+    // Drain any in-flight streamed flush, then flush the remaining buffer so
+    // routing is fully resolved before we strip the directive from the final
+    // text below.
+    await flushChain;
+    await enqueueFlush();
     accumulatedCost = addCost(accumulatedCost, result.cost);
 
     // First successful provider call in this runLoop entry: commit the
@@ -1430,10 +1575,18 @@ async function runLoop(
       }
     });
 
+    // Resolve the turn's route from the model's text and strip the leading
+    // directive once for both the final-answer and tool-call paths. When the
+    // provider returned the whole string at once (no streaming deltas) this
+    // is where the thread switch fires; when streaming already resolved it,
+    // this just re-strips the same prefix. The directive must never reach
+    // task.summary, the assistant_text block, or the user.
+    const cleanedTurnText = await finalizeTurnRoute(result.text || "");
+
     // Final answer path: no tool calls, model said stop (or unknown but
     // produced text).
     if (result.toolCalls.length === 0) {
-      const finalText = result.text || "";
+      const finalText = cleanedTurnText;
       const finished = await mutateState(config.instance, (state) => {
         const item = findTask(state, taskId);
         // Respect a prior terminal status. `cancelTask` may have
@@ -1554,10 +1707,12 @@ async function runLoop(
     // fresh block for whatever text the model emits after the tool
     // results come back.
     if (inFlightAssistantBlockId) {
+      // Use the cleaned text — never the raw result.text — so a leading
+      // route directive doesn't leak into the settled pre-tool-call block.
       finalizeAssistantText(
         emitCtx,
         inFlightAssistantBlockId,
-        inFlightAssistantText || (result.text ?? "")
+        inFlightAssistantText || cleanedTurnText
       );
       inFlightAssistantBlockId = undefined;
       inFlightAssistantText = "";
@@ -1640,6 +1795,47 @@ async function runLoop(
         });
         const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
         return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
+      }
+      // start_thread is the agent-decided threading CONTROL tool, handled
+      // INLINE here (before any phase/tool_call/tool_result emission) so it
+      // produces NO visible chat block — it's a control action, not work.
+      // It reuses the same switchTurnToThread() helper the `<route>`
+      // directive path uses, so the minted threadId / persisted task fields
+      // are identical. Once the switch lands, emitCtx is threaded for the
+      // rest of this turn, so any sibling tool calls later in this batch and
+      // all continued text/tools/final answer in later iterations thread too.
+      // The only state mutation is updateRecentToolCall(done); a tool result
+      // is always pushed so the provider sees the call resolved (a dangling
+      // tool_call breaks the next provider turn).
+      if (call.function.name === "start_thread") {
+        // Detection only fires on the first model call of a fresh turn; a
+        // resume continuation or an already-threaded task can't re-route.
+        const canRoute = isFirstModelCall && threadDetectionEnabled();
+        let resultPayload: { ok: true; threaded: boolean; note: string };
+        if (!canRoute) {
+          resultPayload = emitCtx?.threadId
+            ? { ok: true, threaded: true, note: "Already in a thread." }
+            : { ok: true, threaded: false, note: "Already in the main chat — staying here." };
+        } else {
+          const outcome = await switchTurnToThread();
+          if (outcome === "switched") {
+            routeResolved = true; // The `<route>` text parser must not also re-route this turn.
+            resultPayload = { ok: true, threaded: true, note: "Replying in a thread now. Continue normally." };
+          } else if (outcome === "already-threaded") {
+            resultPayload = { ok: true, threaded: true, note: "Already in a thread." };
+          } else {
+            resultPayload = { ok: true, threaded: false, note: "No earlier message to branch from — replying in the main chat." };
+          }
+        }
+        const content = JSON.stringify(resultPayload);
+        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content });
+        await mutateState(config.instance, (state) => {
+          const item = findTask(state, taskId);
+          if (isTerminalTaskStatus(item.status)) return;
+          updateRecentToolCall(item, call.id, "done");
+          item.updatedAt = now();
+        });
+        continue;
       }
       // Per-tool phase + tool_call(running) emission. Args are parsed
       // leniently — emission must never abort dispatch on malformed
@@ -1879,19 +2075,50 @@ async function runLoop(
       return paused;
     }
 
+    // Loop-breaker: this iteration is all-sync and will loop again. Signature
+    // the tool call(s) by tool_call_id (don't assume index alignment) plus
+    // their results, and bail to the graceful summary exit if the model has
+    // repeated the IDENTICAL call(s) with the IDENTICAL result(s) too many
+    // times in a row — a guard or tool that keeps refusing the same input.
+    const resultById = new Map(toolResultMessages.map((m) => [m.tool_call_id, m.content]));
+    const iterationSignature = JSON.stringify(
+      result.toolCalls.map((c) => [c.function.name, c.function.arguments, resultById.get(c.id) ?? null])
+    );
+    if (iterationSignature === lastIterationSignature) {
+      identicalRunLength += 1;
+    } else {
+      identicalRunLength = 1;
+      lastIterationSignature = iterationSignature;
+    }
+    if (identicalRunLength >= MAX_IDENTICAL_TOOL_REPEATS) {
+      brokeOnRepeat = true;
+      appendTrace(config.instance, taskId, {
+        type: "warning",
+        message: `Stopped after ${identicalRunLength} identical consecutive tool iterations (loop-breaker).`,
+        data: { iterations, toolNames: result.toolCalls.map((c) => c.function.name) }
+      });
+      break;
+    }
+
     // All sync — keep looping.
   }
 
-  // Hit the iteration cap. Instead of failing outright, give the model one
-  // last turn with NO tools available and an explicit instruction to write
+  // Loop ended without a final answer — either the iteration cap or the
+  // identical-repeat loop-breaker. Instead of failing outright, give the model
+  // one last turn with NO tools available and an explicit instruction to write
   // a final answer summarizing what it learned and what it couldn't finish.
   // The summary call's cost is recorded on the task just like any other
   // model call. If the summary call itself fails (provider error, etc.),
   // fall back to the legacy failure path so we don't lose the user's work.
-  const summaryInstruction =
-    `You have reached the maximum number of tool-calling iterations (${cap}). ` +
-    `No further tools are available. Please write a final answer summarizing ` +
-    `what you have learned so far and what you were unable to complete.`;
+  const summaryInstruction = brokeOnRepeat
+    ? `You repeated the same tool call(s) with identical arguments and received ` +
+      `the identical result each time, which means that path is blocked. No ` +
+      `further tools are available now. Write a final answer for the user: ` +
+      `explain what you were able to determine, what is blocking you (e.g. a ` +
+      `sign-in or tool that keeps refusing), and what they could do next.`
+    : `You have reached the maximum number of tool-calling iterations (${cap}). ` +
+      `No further tools are available. Please write a final answer summarizing ` +
+      `what you have learned so far and what you were unable to complete.`;
   const summaryMessages: ToolCallingMessage[] = [
     ...workingMessages,
     { role: "user", content: summaryInstruction }
@@ -1923,7 +2150,9 @@ async function runLoop(
       // Respect a prior terminal status.
       if (isTerminalTaskStatus(item.status)) return item;
       item.status = "completed";
-      item.currentStep = `Completed (iteration cap reached: ${cap})`;
+      item.currentStep = brokeOnRepeat
+        ? "Completed (stopped: repeated identical tool calls)"
+        : `Completed (iteration cap reached: ${cap})`;
       item.summary = finalText;
       item.cost = accumulatedCost;
       item.partialSummary = undefined;
@@ -1939,13 +2168,20 @@ async function runLoop(
     if (exhausted.status === "completed") {
       const block = emitAssistantTextStart(emitCtx, finalText);
       if (block?.id) finalizeAssistantText(emitCtx, block.id, finalText);
-      emitSystemNote(emitCtx, `Iteration cap reached (${cap}). Returning best-effort summary.`);
+      emitSystemNote(
+        emitCtx,
+        brokeOnRepeat
+          ? "Stopped after repeated identical tool calls. Returning best-effort summary."
+          : `Iteration cap reached (${cap}). Returning best-effort summary.`
+      );
       emitPhase(emitCtx, "Completed");
     }
     appendTrace(config.instance, taskId, {
       type: "warning",
-      message: `Iteration cap (${cap}) reached; produced summary in tool-less final turn.`,
-      data: { iterations: cap }
+      message: brokeOnRepeat
+        ? "Loop-breaker stopped repeated identical tool calls; produced summary in tool-less final turn."
+        : `Iteration cap (${cap}) reached; produced summary in tool-less final turn.`,
+      data: { iterations }
     });
     appendTrace(config.instance, taskId, {
       type: "model",
@@ -1986,7 +2222,11 @@ async function runLoop(
       if (isTerminalTaskStatus(item.status)) return item;
       item.status = "failed";
       item.currentStep = "Failed";
-      item.error = authProvider ? message : `Chat task exceeded ${cap} model iterations.`;
+      item.error = authProvider
+        ? message
+        : brokeOnRepeat
+          ? "Chat task stopped after repeated identical tool calls."
+          : `Chat task exceeded ${cap} model iterations.`;
       if (authProvider) item.authErrorProvider = authProvider;
       // Preserve the accumulated cost from the loop so the audit row
       // reflects all model calls leading up to the failed summary turn.
@@ -1996,7 +2236,7 @@ async function runLoop(
       item.updatedAt = now();
       return item;
     });
-    // Cap-reached fail path: emit a system_note so the chat thread has
+    // Summary-call fail path: emit a system_note so the chat thread has
     // an explicit marker rather than just trailing off after the last
     // assistant_text. Phase blocks track currentStep; the system_note
     // captures the error condition.
@@ -2004,13 +2244,20 @@ async function runLoop(
       const note = providerAuthNote(authProvider, message);
       emitSystemNote(emitCtx, note.text, note.authError);
     } else {
-      emitSystemNote(emitCtx, `Iteration cap reached (${cap}) and summary call failed: ${message}`);
+      emitSystemNote(
+        emitCtx,
+        brokeOnRepeat
+          ? `Stopped after repeated identical tool calls and summary call failed: ${message}`
+          : `Iteration cap reached (${cap}) and summary call failed: ${message}`
+      );
     }
     emitPhase(emitCtx, "Failed");
     appendTrace(config.instance, taskId, {
       type: "error",
-      message: "Chat task hit iteration cap and tool-less summary call failed",
-      data: { iterations: cap, summaryError: message }
+      message: brokeOnRepeat
+        ? "Chat task stopped on repeated identical tool calls and tool-less summary call failed"
+        : "Chat task hit iteration cap and tool-less summary call failed",
+      data: { iterations, summaryError: message }
     });
     await updateRunFromTask(config, exhausted);
     await syncSubagentFromTask(config, exhausted);

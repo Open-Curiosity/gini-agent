@@ -363,7 +363,7 @@ export default function PairScreen() {
         await saveCredentials({ baseUrl: client.origin, token });
         if (genRef.current !== myGen) return;
         setPhase("paired");
-        router.replace("/agents");
+        router.replace("/channels");
       } catch (e) {
         if (genRef.current !== myGen) return;
         setError(e instanceof Error ? e.message : String(e));

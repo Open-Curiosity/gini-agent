@@ -145,6 +145,11 @@ export interface SubmitTaskOptions {
   // Threaded through to Task.images so the chat-task loop can dispatch
   // vision content without re-reading the chat message.
   images?: ImageAttachment[];
+  // Set when the task replies inside a thread. Stamped on the task so
+  // resolveEmitContext threads the whole response (every emit* block lands
+  // tagged with the same thread_id/parent_block_id), not just the user turn.
+  threadId?: string;
+  parentBlockId?: string;
 }
 
 export async function submitTask(
@@ -173,6 +178,8 @@ export async function submitTask(
   );
   if (options.mode) created.mode = options.mode;
   if (options.images && options.images.length > 0) created.images = options.images;
+  if (options.threadId) created.threadId = options.threadId;
+  if (options.parentBlockId) created.parentBlockId = options.parentBlockId;
   // When a parentTaskId is set, the upsert + the parent-status
   // check must serialize together. Without this, `spawnSubagent`'s
   // in-callback check inside `createSubagentRecord` can pass, then

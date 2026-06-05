@@ -294,7 +294,9 @@ export async function createScheduledJob(
     // explicitly ignore it.
     let resolvedChatSessionId = chatSessionId;
     if (createDedicatedSessionTitle !== undefined) {
-      const session = createChatSession(state, createDedicatedSessionTitle, undefined, owningAgentId, "job");
+      // Recurring-job-derived sessions are channels in the new chats IA;
+      // they always carry origin: "job" as well.
+      const session = createChatSession(state, createDedicatedSessionTitle, undefined, owningAgentId, "job", "channel");
       if (parentTaskId) {
         const parentSession = state.chatSessions.find((candidate) =>
           candidate.id !== session.id && candidate.taskIds.includes(parentTaskId)

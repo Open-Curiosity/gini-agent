@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-05-21
-- **See also:** [Agent Loop With Native Tool Calling](./agent-loop-tool-calling.md), [Per-Agent Memory Isolation](./agent-memory-isolation.md)
+- **See also:** [Agent Loop With Native Tool Calling](./agent-loop-tool-calling.md), [Per-Agent Memory Isolation](./agent-memory-isolation.md), [One Chat Per Agent, Threads, And Job Channels](./agent-chat-threads-and-channels.md)
 
 ## Decision
 
@@ -106,6 +106,23 @@ remote previews, screen readers) would need the same translation code.
   defense against interleaved writers. Inserts and upserts fire an
   in-process `EventEmitter` event after the SQLite commit so SSE
   subscribers only observe durable rows.
+
+- Thread membership is an additive tag on the same rows. `ChatBlockBase`
+  carries optional `threadId` / `parentBlockId` (`chat_blocks` columns
+  `thread_id` / `parent_block_id`, `memory.db` schema bumped 8 → 9 with
+  the `idx_chat_blocks_thread` index on `(session_id, thread_id,
+  ordinal)`). A thread is a span of blocks inside the agent's one
+  session, not a separate session — thread blocks draw from the same
+  per-session ordinal sequence, ride the same SSE stream and
+  `Last-Event-ID` resume, and the `UNIQUE (session_id, ordinal)`
+  invariant is preserved. `listThreadBlocks` / `listMainChatBlocks` /
+  `summarizeThreads` / `summarizeThreadsForInstance` query thread
+  membership; inserts and upserts carry the columns forward so streaming
+  preserves membership with no extra arguments. See ADR
+  agent-chat-threads-and-channels.md for the threading model, the
+  agent-decided routing (`start_thread` control tool +
+  `<route>thread</route>` fallback), and the one-chat-per-agent /
+  job-channel IA.
 
 - Emission in `src/execution/chat-task.ts` via helpers in
   `src/execution/chat-task-emit.ts`. The loop resolves an emission
