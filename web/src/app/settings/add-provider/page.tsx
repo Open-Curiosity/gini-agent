@@ -66,9 +66,10 @@ export default function AddProviderPage() {
   const [deployment, setDeployment] = useState("");
   const [authScheme, setAuthScheme] = useState("bearer");
 
-  // The Azure deployment fields only make sense when the base URL points at an
-  // Azure endpoint, so they stay hidden until the user enters one.
-  const isAzure = /azure/i.test(baseUrl);
+  // Show the Azure fields when the base URL looks like an Azure endpoint OR an
+  // api-version is already set (the runtime's actual Azure-mode signal), so a
+  // custom Azure domain isn't hidden. A standard OpenAI setup has neither.
+  const isAzure = /azure/i.test(baseUrl) || apiVersion.trim().length > 0;
 
   // Seed once the catalog arrives: honor a ?provider= preselection from the
   // settings list (Edit button on a row), else fall back to the first tile.

@@ -46,7 +46,7 @@
 
 import { writeFileSync } from "node:fs";
 import { configPath, writeRuntimeConfig } from "../paths";
-import { azureApiKeyNeedsHttps, azureBaseUrlNeedsApiVersion, azureRoutingNeedsBaseUrl, hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { azureBaseUrlNeedsApiVersion, azureModeNeedsHttps, azureRoutingNeedsBaseUrl, hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { isValidEnvVarName, removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
@@ -214,12 +214,12 @@ export async function setSetupProvider(
         error: "An Azure OpenAI endpoint requires an api-version (e.g. 2024-12-01-preview)."
       };
     }
-    if (azureApiKeyNeedsHttps(providerName, authScheme, baseUrl)) {
+    if (azureModeNeedsHttps(providerName, apiVersion, baseUrl)) {
       return {
         ok: false,
         provider: providerHealth(config),
         plistRefreshNeeded: false,
-        error: "Azure api-key auth requires an https:// endpoint (the key is sent in a plaintext header)."
+        error: "Azure OpenAI requires an https:// endpoint (the credential is sent on every request)."
       };
     }
 

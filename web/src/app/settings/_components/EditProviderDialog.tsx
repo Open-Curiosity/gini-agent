@@ -57,10 +57,12 @@ export function EditProviderDialog({
   const [deployment, setDeployment] = useState(currentDeployment ?? "");
   const [authScheme, setAuthScheme] = useState(currentAuthScheme ?? "bearer");
 
-  // The Azure deployment fields only make sense when the base URL points at an
-  // Azure endpoint. Gate them on that so a standard OpenAI setup never shows
-  // Azure-only inputs.
-  const isAzure = /azure/i.test(baseUrl);
+  // Show the Azure fields when the base URL looks like an Azure endpoint OR an
+  // api-version is already set — the latter is the runtime's actual Azure-mode
+  // signal, so a config on a custom Azure domain still shows (and doesn't get
+  // its routing cleared on an unrelated edit). A standard OpenAI setup has
+  // neither, so it never shows Azure-only inputs.
+  const isAzure = /azure/i.test(baseUrl) || apiVersion.trim().length > 0;
 
   // Reset transient inputs whenever the dialog opens for a new row.
   // currentModel can shift if the active provider changes elsewhere; we

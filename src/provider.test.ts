@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import {
-  azureApiKeyNeedsHttps,
   azureBaseUrlNeedsApiVersion,
+  azureModeNeedsHttps,
   azureRoutingNeedsBaseUrl,
   clearEchoToolCallingResponses,
   clearEchoVisionResponses,
@@ -3168,6 +3168,9 @@ describe("azure openai routing", () => {
     // openai, canonical azure host, blank/missing apiVersion → flagged.
     expect(azureBaseUrlNeedsApiVersion("openai", undefined, "https://x.openai.azure.com")).toBe(true);
     expect(azureBaseUrlNeedsApiVersion("openai", "  ", "https://lilac-labs-w.openai.azure.com/")).toBe(true);
+    // Azure Government (.us) and China (.cn) clouds count too.
+    expect(azureBaseUrlNeedsApiVersion("openai", undefined, "https://x.openai.azure.us")).toBe(true);
+    expect(azureBaseUrlNeedsApiVersion("openai", undefined, "https://x.openai.azure.cn")).toBe(true);
     // openai, non-azure host without apiVersion → not flagged (standard or a
     // compatible endpoint that serves flat paths).
     expect(azureBaseUrlNeedsApiVersion("openai", undefined, "https://api.openai.com/v1")).toBe(false);
@@ -3180,19 +3183,20 @@ describe("azure openai routing", () => {
     expect(azureBaseUrlNeedsApiVersion("openai", undefined, "https://evil.example.com/path/.openai.azure.com")).toBe(false);
   });
 
-  test("azureApiKeyNeedsHttps flags api-key auth against a non-https endpoint", () => {
-    // Not api-key → never flagged (bearer keeps http local-gateway reach).
-    expect(azureApiKeyNeedsHttps("openai", "bearer", "http://x.openai.azure.com")).toBe(false);
-    expect(azureApiKeyNeedsHttps("openai", undefined, "http://x")).toBe(false);
-    // api-key + http → flagged (the key would go over the wire in plaintext).
-    expect(azureApiKeyNeedsHttps("openai", "api-key", "http://x.openai.azure.com")).toBe(true);
-    // api-key + https → fine, for any Azure cloud suffix.
-    expect(azureApiKeyNeedsHttps("openai", "api-key", "https://x.openai.azure.com")).toBe(false);
-    expect(azureApiKeyNeedsHttps("openai", "api-key", "https://x.openai.azure.us")).toBe(false);
-    // api-key + no baseUrl → not flagged here (the default host is https).
-    expect(azureApiKeyNeedsHttps("openai", "api-key", undefined)).toBe(false);
-    // Non-openai providers are never gated (authScheme is openai-only).
-    expect(azureApiKeyNeedsHttps("openrouter", "api-key", "http://x")).toBe(false);
+  test("azureModeNeedsHttps flags any Azure-mode config on a non-https endpoint", () => {
+    // Not Azure mode (no apiVersion) → never flagged, whatever the URL.
+    expect(azureModeNeedsHttps("openai", undefined, "http://x.openai.azure.com")).toBe(false);
+    expect(azureModeNeedsHttps("openai", "  ", "http://x")).toBe(false);
+    // Azure mode + http → flagged, regardless of auth scheme (the api-key OR
+    // the Bearer Entra token would otherwise travel in plaintext).
+    expect(azureModeNeedsHttps("openai", "2024-12-01-preview", "http://x.openai.azure.com")).toBe(true);
+    // Azure mode + https → fine, for any Azure cloud suffix.
+    expect(azureModeNeedsHttps("openai", "2024-12-01-preview", "https://x.openai.azure.com")).toBe(false);
+    expect(azureModeNeedsHttps("openai", "2024-12-01-preview", "https://x.openai.azure.us")).toBe(false);
+    // No baseUrl → not flagged here (the default host is https).
+    expect(azureModeNeedsHttps("openai", "2024-12-01-preview", undefined)).toBe(false);
+    // Non-openai providers are never gated.
+    expect(azureModeNeedsHttps("openrouter", "2024-12-01-preview", "http://x")).toBe(false);
   });
 
   test("isProviderConfigured honors a custom apiKeyEnv for the active provider", () => {

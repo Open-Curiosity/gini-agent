@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 import type { CliContext } from "../context";
 import { parseSubArgs, restAfter } from "../args";
 import { configPath, writeRuntimeConfig } from "../../paths";
-import { azureApiKeyNeedsHttps, azureBaseUrlNeedsApiVersion, azureRoutingNeedsBaseUrl, normalizeProvider, providerHealth } from "../../provider";
+import { azureBaseUrlNeedsApiVersion, azureModeNeedsHttps, azureRoutingNeedsBaseUrl, normalizeProvider, providerHealth } from "../../provider";
 import { isValidEnvVarName } from "../../state/secrets-env";
 import { api } from "../api";
 import { print } from "../output";
@@ -133,9 +133,9 @@ export async function provider(ctx: CliContext): Promise<void> {
     if (azureBaseUrlNeedsApiVersion(name, apiVersion, baseUrl)) {
       throw new Error("An Azure OpenAI base URL requires --api-version (e.g. 2024-12-01-preview).");
     }
-    // api-key auth puts the key in a plaintext header; never send it over http.
-    if (azureApiKeyNeedsHttps(name, authScheme, baseUrl)) {
-      throw new Error("--auth-scheme api-key requires an https:// --base-url.");
+    // Azure mode sends a credential on every call; never over plaintext http.
+    if (azureModeNeedsHttps(name, apiVersion, baseUrl)) {
+      throw new Error("Azure OpenAI (--api-version) requires an https:// --base-url.");
     }
 
     config.provider = normalizeProvider({

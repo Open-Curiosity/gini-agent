@@ -2612,37 +2612,41 @@ export function azureBaseUrlNeedsApiVersion(
   return isAzureResourceHost(baseUrl);
 }
 
-// Azure api-key auth sends the resource key in a plaintext `api-key` header, so
-// refuse to configure it against a non-https endpoint — that would leak the key
-// over the wire. A host allowlist would wrongly reject Azure Government / China
-// clouds (whose suffixes differ), so requiring https is the safe, cloud-agnostic
-// guard. Only the api-key scheme is gated; Bearer is generic and keeps its
-// existing reach (e.g. local http gateways).
-export function azureApiKeyNeedsHttps(
+// Azure mode sends a credential on every call — the resource key in a plaintext
+// `api-key` header, or an Entra access token as `Authorization: Bearer`. Either
+// leaks over plaintext http, so refuse to configure ANY Azure-mode endpoint
+// (apiVersion set) that isn't https, regardless of auth scheme. Azure is https
+// across all clouds, so this never blocks a legitimate setup; requiring https
+// (rather than a host allowlist) keeps it cloud-agnostic. Non-Azure openai and
+// other providers are untouched — local http gateways still work on Bearer.
+export function azureModeNeedsHttps(
   name: string,
-  authScheme: string | undefined,
+  apiVersion: string | undefined,
   baseUrl: string | undefined
 ): boolean {
   if (name !== "openai") return false;
-  if (authScheme !== "api-key") return false;
+  if (!apiVersion || apiVersion.trim().length === 0) return false;
   const value = (baseUrl ?? "").trim().toLowerCase();
   if (value.length === 0) return false;
   return !value.startsWith("https://");
 }
 
-// True when baseUrl's HOST is an Azure OpenAI resource endpoint
-// (<resource>.openai.azure.com). Parses the host so ".openai.azure.com"
-// appearing in a path or query can't trip the check; falls back to a substring
-// match only for strings that don't parse as a URL (a value the user may still
-// be mid-editing).
+// True when baseUrl's HOST is an Azure OpenAI resource endpoint, across all
+// Azure clouds: <resource>.openai.azure.com (public), .openai.azure.us (US
+// Government), and .openai.azure.cn (China / 21Vianet). Parses the host so a
+// suffix appearing in a path or query can't trip the check; falls back to a
+// substring match only for strings that don't parse as a URL (a value the user
+// may still be mid-editing).
 function isAzureResourceHost(baseUrl: string | undefined): boolean {
   const value = (baseUrl ?? "").trim();
   if (value.length === 0) return false;
   try {
     const host = new URL(value).hostname.toLowerCase();
-    return host === "openai.azure.com" || host.endsWith(".openai.azure.com");
+    return host.endsWith(".openai.azure.com")
+      || host.endsWith(".openai.azure.us")
+      || host.endsWith(".openai.azure.cn");
   } catch {
-    return /\.openai\.azure\.com/i.test(value);
+    return /\.openai\.azure\.(?:com|us|cn)/i.test(value);
   }
 }
 
