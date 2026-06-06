@@ -1422,7 +1422,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         properties: {
           provider: {
             type: "string",
-            description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` are updated."
+            description: "Provider id (e.g. 'codex', 'openai', 'anthropic', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` are updated."
           },
           model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5'). Defaults to the provider's first catalog model when omitted." },
           baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo." },
