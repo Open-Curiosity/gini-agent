@@ -187,6 +187,47 @@ describe("direct self tools — query", () => {
       expect(Array.isArray(parsed.skills)).toBe(true);
     }
   });
+
+  test("list_providers credits a custom apiKeyEnv for the active provider", async () => {
+    const instance = `self-providers-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    // Active anthropic provider keyed on a custom env var (a Bedrock bearer),
+    // exactly as the Settings catalog surface sees it. The agent-facing
+    // list_providers op must thread apiKeyEnv so it agrees with Settings.
+    config.provider = {
+      name: "anthropic",
+      model: "anthropic.claude-opus-4-8",
+      baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      apiKeyEnv: "BEDROCK_BEARER_TOKEN_SELFREG"
+    };
+    const prevCustom = process.env.BEDROCK_BEARER_TOKEN_SELFREG;
+    const prevCanonical = process.env.ANTHROPIC_API_KEY;
+    process.env.BEDROCK_BEARER_TOKEN_SELFREG = "bedrock-live";
+    // Canonical unset so the custom-env credit is the only path to configured.
+    delete process.env.ANTHROPIC_API_KEY;
+    const taskId = await newTask(config);
+    try {
+      const result = await dispatchToolCall(config, taskId, "list_providers", "call_1", "{}");
+      expect(result.kind).toBe("sync");
+      if (result.kind === "sync") {
+        const parsed = JSON.parse(result.result) as {
+          ok: boolean;
+          activeProvider: string;
+          providers: Array<{ name: string; configured: boolean; isActive: boolean }>;
+        };
+        expect(parsed.ok).toBe(true);
+        expect(parsed.activeProvider).toBe("anthropic");
+        const anthropic = parsed.providers.find((p) => p.name === "anthropic");
+        expect(anthropic?.configured).toBe(true);
+        expect(anthropic?.isActive).toBe(true);
+      }
+    } finally {
+      if (prevCustom === undefined) delete process.env.BEDROCK_BEARER_TOKEN_SELFREG;
+      else process.env.BEDROCK_BEARER_TOKEN_SELFREG = prevCustom;
+      if (prevCanonical === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevCanonical;
+    }
+  });
 });
 
 describe("direct self tools — mutate", () => {

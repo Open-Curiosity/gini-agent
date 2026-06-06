@@ -3815,6 +3815,9 @@ describe("anthropic provider", () => {
   test("catalog 'configured' honors a custom apiKeyEnv for the active provider", () => {
     const restoreCanonical = setEnv("ANTHROPIC_API_KEY", undefined);
     const restoreCustom = setEnv("BEDROCK_BEARER_TOKEN", "bedrock-token");
+    // Force-clear the "missing" probe name so the negative assertion never
+    // depends on a stray value in the ambient/CI environment.
+    const restoreMissing = setEnv("GINI_TEST_UNSET_BEARER", undefined);
     try {
       // Canonical var unset + not the active provider → not configured.
       expect(isProviderConfigured("anthropic")).toBe(false);
@@ -3824,7 +3827,26 @@ describe("anthropic provider", () => {
         providerCatalogWithStatus("anthropic", "BEDROCK_BEARER_TOKEN").find((p) => p.name === "anthropic")?.configured
       ).toBe(true);
       // Active anthropic but the named custom env var is unset → not configured.
-      expect(isProviderConfigured("anthropic", "anthropic", "MISSING_ENV_VAR")).toBe(false);
+      expect(isProviderConfigured("anthropic", "anthropic", "GINI_TEST_UNSET_BEARER")).toBe(false);
+    } finally {
+      restoreMissing();
+      restoreCustom();
+      restoreCanonical();
+    }
+  });
+
+  test("active custom apiKeyEnv: a stray canonical key does not mask a missing custom key", () => {
+    // The active provider reads its bearer from BEDROCK_BEARER_TOKEN (unset);
+    // a present-but-irrelevant ANTHROPIC_API_KEY must NOT make the badge lie —
+    // providerHealth/readAnthropicKey both gate on the custom var, so the
+    // catalog badge has to agree (not fall through to the canonical var).
+    const restoreCanonical = setEnv("ANTHROPIC_API_KEY", "sk-ant-stray");
+    const restoreCustom = setEnv("BEDROCK_BEARER_TOKEN", undefined);
+    try {
+      expect(isProviderConfigured("anthropic", "anthropic", "BEDROCK_BEARER_TOKEN")).toBe(false);
+      expect(
+        providerCatalogWithStatus("anthropic", "BEDROCK_BEARER_TOKEN").find((p) => p.name === "anthropic")?.configured
+      ).toBe(false);
     } finally {
       restoreCustom();
       restoreCanonical();

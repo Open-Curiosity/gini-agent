@@ -91,14 +91,19 @@ export function isProviderConfigured(
 ): boolean {
   if (name === "echo") return false;
   if (name === "codex") return hasUsableCodexCredentials();
-  // For the active provider, honor a custom apiKeyEnv (e.g. a CLI-set
-  // `--api-key-env`) so a provider whose key lives in a non-canonical env var
-  // isn't reported unconfigured here while providerHealth — which reads
-  // provider.apiKeyEnv — reports it configured.
-  if (name === activeProviderName && activeApiKeyEnv && process.env[activeApiKeyEnv]) return true;
+  // local is a no-auth opt-in: as the active provider it counts as
+  // configured even without a key (most local gateways accept no-auth).
+  // Kept ahead of the custom-apiKeyEnv branch so local never gates on a key.
+  if (name === "local" && activeProviderName === "local") return true;
+  // For the active provider with a custom apiKeyEnv (e.g. a CLI-set
+  // `--api-key-env` pointing a Bedrock bearer at BEDROCK_BEARER_TOKEN), the
+  // configured status reflects THAT env var alone. Falling through to the
+  // canonical var would mask a missing custom key — reporting "configured"
+  // off a stray ANTHROPIC_API_KEY while the active provider actually reads
+  // (and providerHealth / readAnthropicKey gate on) the custom var.
+  if (name === activeProviderName && activeApiKeyEnv) return Boolean(process.env[activeApiKeyEnv]);
   const envVar = PROVIDER_API_KEY_ENV[name];
   if (envVar && process.env[envVar]) return true;
-  if (name === "local" && activeProviderName === "local") return true;
   return false;
 }
 
