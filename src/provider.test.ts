@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import {
+  azureApiKeyNeedsHttps,
   azureBaseUrlNeedsApiVersion,
   azureRoutingNeedsBaseUrl,
   clearEchoToolCallingResponses,
@@ -3177,6 +3178,19 @@ describe("azure openai routing", () => {
     // ".openai.azure.com" in the PATH (not the host) must not trip — the check
     // parses the hostname, not a substring of the whole URL.
     expect(azureBaseUrlNeedsApiVersion("openai", undefined, "https://evil.example.com/path/.openai.azure.com")).toBe(false);
+  });
+
+  test("azureApiKeyNeedsHttps flags api-key auth against a non-https endpoint", () => {
+    // Not api-key → never flagged (bearer keeps http local-gateway reach).
+    expect(azureApiKeyNeedsHttps("bearer", "http://x.openai.azure.com")).toBe(false);
+    expect(azureApiKeyNeedsHttps(undefined, "http://x")).toBe(false);
+    // api-key + http → flagged (the key would go over the wire in plaintext).
+    expect(azureApiKeyNeedsHttps("api-key", "http://x.openai.azure.com")).toBe(true);
+    // api-key + https → fine, for any Azure cloud suffix.
+    expect(azureApiKeyNeedsHttps("api-key", "https://x.openai.azure.com")).toBe(false);
+    expect(azureApiKeyNeedsHttps("api-key", "https://x.openai.azure.us")).toBe(false);
+    // api-key + no baseUrl → not flagged here (the default host is https).
+    expect(azureApiKeyNeedsHttps("api-key", undefined)).toBe(false);
   });
 
   test("isProviderConfigured honors a custom apiKeyEnv for the active provider", () => {

@@ -134,12 +134,16 @@ export default function AddProviderPage() {
           ? "Codex OAuth verified."
           : `Provider set to ${providerName} (${selectedModel}).`
       );
-      // Refetch providers BEFORE navigating so the settings list mounts
-      // with the row already present. We can't use useInvalidate here —
-      // it debounces 80ms and its unmount cleanup clears the pending set
-      // when this page unmounts, so the invalidation never fires.
-      queryClient.invalidateQueries({ queryKey: ["status"] });
-      await queryClient.refetchQueries({ queryKey: ["providers"] });
+      // Refetch BOTH providers and status BEFORE navigating, so the settings
+      // list mounts with the row present AND the Edit dialog's /status-sourced
+      // prefill is fresh (a fast edit otherwise reopens with stale transport
+      // fields). We can't use useInvalidate here — it debounces 80ms and its
+      // unmount cleanup clears the pending set when this page unmounts, so the
+      // invalidation never fires.
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["providers"] }),
+        queryClient.refetchQueries({ queryKey: ["status"] })
+      ]);
       router.push("/settings");
     },
     onError: (error: Error) => toast.error(error.message)

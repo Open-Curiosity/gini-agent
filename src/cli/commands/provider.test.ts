@@ -312,6 +312,16 @@ describe("provider CLI", () => {
     await expect(provider(ctx)).rejects.toThrow(/requires --api-version/);
   });
 
+  test("--auth-scheme api-key with an http --base-url is rejected", async () => {
+    const ctx = makeCtx([
+      "provider", "set", "openai", "gpt-5.4",
+      "--base-url", "http://x.openai.azure.com",
+      "--api-version", "2024-12-01-preview",
+      "--auth-scheme", "api-key"
+    ]);
+    await expect(provider(ctx)).rejects.toThrow(/https/);
+  });
+
   test("azure flags on a non-openai provider warn that they are ignored", async () => {
     const captured: string[] = [];
     const original = process.stderr.write.bind(process.stderr);

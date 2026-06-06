@@ -338,6 +338,20 @@ describe("setup-api", () => {
     expect(body).not.toContain("AZURE_OPENAI_API_KEY");
   });
 
+  test("POST openai with api-key auth and an http baseUrl is rejected", async () => {
+    const result = await setSetupProvider(config, {
+      provider: "openai",
+      apiKey: "sk-azure",
+      model: "gpt-5.4",
+      baseUrl: "http://x.openai.azure.com",
+      apiVersion: "2024-12-01-preview",
+      deployment: "gpt-5.4",
+      authScheme: "api-key"
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("https");
+  });
+
   test("POST openai without apiKey returns ok:false", async () => {
     const result = await setSetupProvider(config, { provider: "openai", apiKey: "" });
     expect(result.ok).toBe(false);
