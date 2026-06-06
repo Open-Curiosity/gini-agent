@@ -41,6 +41,10 @@ export function EditProviderDialog({
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
   const [model, setModel] = useState<string>(currentModel ?? row.models[0] ?? "");
+  // Optional endpoint override, surfaced only for anthropic. Empty keeps the
+  // current endpoint (setSetupProvider preserves an omitted baseUrl on the
+  // active provider); a value re-points the transport (e.g. to Bedrock).
+  const [baseUrl, setBaseUrl] = useState("");
 
   // Reset transient inputs whenever the dialog opens for a new row.
   // currentModel can shift if the active provider changes elsewhere; we
@@ -50,6 +54,7 @@ export function EditProviderDialog({
     setApiKey("");
     setShowKey(false);
     setModel(currentModel ?? row.models[0] ?? "");
+    setBaseUrl("");
   }, [open, row.id, currentModel, row.models]);
 
   const save = useMutation({
@@ -61,7 +66,8 @@ export function EditProviderDialog({
           // The backend treats apiKey as optional when the env var is
           // already set, so model-only edits work without a re-type.
           ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-          ...(model ? { model } : {})
+          ...(model ? { model } : {}),
+          ...(baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {})
         })
       }),
     onSuccess: async (result) => {
@@ -83,8 +89,10 @@ export function EditProviderDialog({
   // the user dismiss via Cancel without nagging.
   const dirty =
     apiKey.trim().length > 0 ||
+    baseUrl.trim().length > 0 ||
     (model !== "" && model !== (currentModel ?? row.models[0] ?? ""));
   const canSubmit = dirty && !save.isPending;
+  const isAnthropic = row.name === "anthropic";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -134,6 +142,25 @@ export function EditProviderDialog({
               </button>
             </div>
           </div>
+
+          {isAnthropic ? (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="edit-base-url" className="text-[13px] font-semibold text-[#C2C2C8]">Base URL</Label>
+                <span className="text-xs text-[#6A6A70]">optional</span>
+              </div>
+              <Input
+                id="edit-base-url"
+                type="text"
+                autoComplete="off"
+                placeholder="Leave blank to keep the current endpoint"
+                value={baseUrl}
+                onChange={(e) => setBaseUrl(e.target.value)}
+                disabled={save.isPending}
+                className="h-11 border-[#2A2A2E] bg-[#0E0E11] font-mono text-[13px]"
+              />
+            </div>
+          ) : null}
 
           <div className="space-y-2">
             <div className="flex items-center justify-between">

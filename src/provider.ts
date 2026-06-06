@@ -84,9 +84,18 @@ const PROVIDER_API_KEY_ENV: Record<string, string> = {
 // accept no-auth requests so the env var is optional — we still gate
 // the row on the user having explicitly opted in by either setting the
 // env var or making local the active provider.
-export function isProviderConfigured(name: string, activeProviderName?: string): boolean {
+export function isProviderConfigured(
+  name: string,
+  activeProviderName?: string,
+  activeApiKeyEnv?: string
+): boolean {
   if (name === "echo") return false;
   if (name === "codex") return hasUsableCodexCredentials();
+  // For the active provider, honor a custom apiKeyEnv (e.g. a CLI-set
+  // `--api-key-env`) so a provider whose key lives in a non-canonical env var
+  // isn't reported unconfigured here while providerHealth — which reads
+  // provider.apiKeyEnv — reports it configured.
+  if (name === activeProviderName && activeApiKeyEnv && process.env[activeApiKeyEnv]) return true;
   const envVar = PROVIDER_API_KEY_ENV[name];
   if (envVar && process.env[envVar]) return true;
   if (name === "local" && activeProviderName === "local") return true;
@@ -98,11 +107,12 @@ export function isProviderConfigured(name: string, activeProviderName?: string):
 // providerCatalog() stays in place for callers that just need the list of
 // known provider shapes (e.g. setup-api default-model resolution).
 export function providerCatalogWithStatus(
-  activeProviderName?: string
+  activeProviderName?: string,
+  activeApiKeyEnv?: string
 ): Array<ProviderCatalogItem & { configured: boolean }> {
   return providerCatalog().map((item) => ({
     ...item,
-    configured: isProviderConfigured(item.name, activeProviderName)
+    configured: isProviderConfigured(item.name, activeProviderName, activeApiKeyEnv)
   }));
 }
 
@@ -1239,6 +1249,11 @@ async function callAnthropicMessages(
 ): Promise<ToolCallingResult> {
   const apiKey = readAnthropicKey(provider);
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
+  // The builder owns the /v1/messages path. Tolerate a baseUrl that already
+  // carries it (a common habit from OpenAI-style baseUrls that include /v1) by
+  // stripping a trailing /v1 or /v1/messages first, so it never doubles into
+  // /v1/v1/messages. Bedrock detection below still runs on the raw baseUrl.
+  const messagesUrl = `${baseUrl.replace(/\/v1(\/messages)?$/, "")}/v1/messages`;
   const wantStream = Boolean(onDelta);
   const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
   const { system, messages: anthropicMessages } = translateMessagesToAnthropic(safeMessages);
@@ -1263,7 +1278,7 @@ async function callAnthropicMessages(
     body.tool_choice = { type: "auto" };
   }
 
-  const response = await fetch(`${baseUrl}/v1/messages`, {
+  const response = await fetch(messagesUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json",

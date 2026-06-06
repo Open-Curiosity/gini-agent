@@ -3808,6 +3808,51 @@ describe("anthropic provider", () => {
       restoreEnv();
     }
   });
+
+  test("catalog 'configured' honors a custom apiKeyEnv for the active provider", () => {
+    const restoreCanonical = setEnv("ANTHROPIC_API_KEY", undefined);
+    const restoreCustom = setEnv("BEDROCK_BEARER_TOKEN", "bedrock-token");
+    try {
+      // Canonical var unset + not the active provider → not configured.
+      expect(isProviderConfigured("anthropic")).toBe(false);
+      // Active anthropic whose custom apiKeyEnv env var IS set → configured.
+      expect(isProviderConfigured("anthropic", "anthropic", "BEDROCK_BEARER_TOKEN")).toBe(true);
+      expect(
+        providerCatalogWithStatus("anthropic", "BEDROCK_BEARER_TOKEN").find((p) => p.name === "anthropic")?.configured
+      ).toBe(true);
+      // Active anthropic but the named custom env var is unset → not configured.
+      expect(isProviderConfigured("anthropic", "anthropic", "MISSING_ENV_VAR")).toBe(false);
+    } finally {
+      restoreCustom();
+      restoreCanonical();
+    }
+  });
+
+  test("strips a trailing /v1 from the baseUrl so the request path doesn't double", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const cases: Array<[string | undefined, string]> = [
+      [undefined, "https://api.anthropic.com/v1/messages"],
+      ["https://api.anthropic.com/v1", "https://api.anthropic.com/v1/messages"],
+      ["https://api.anthropic.com/v1/messages", "https://api.anthropic.com/v1/messages"],
+      ["https://bedrock-mantle.us-east-1.api.aws/anthropic", "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages"]
+    ];
+    try {
+      for (const [base, expected] of cases) {
+        const stub = installFetch(() =>
+          anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })
+        );
+        try {
+          const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8", ...(base ? { baseUrl: base } : {}) });
+          await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+          expect(stub.calls[0]!.url).toBe(expected);
+        } finally {
+          stub.restore();
+        }
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
 });
 
 describe("codex no-tools dispatch", () => {
