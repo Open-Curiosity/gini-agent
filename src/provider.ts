@@ -2578,6 +2578,26 @@ export function azureRoutingNeedsBaseUrl(
   return trimmed.length === 0 || trimmed === DEFAULT_OPENAI_BASE_URL;
 }
 
+// The complement of azureRoutingNeedsBaseUrl: an openai config pointed at an
+// Azure resource host but missing apiVersion. Azure routing is keyed on
+// apiVersion, so without it `chatCompletionsUrl` would build the flat
+// `${baseUrl}/chat/completions` (and the summary path the flat `/responses`)
+// against the Azure host — which Azure does not serve, a guaranteed 404. The
+// config-entry boundaries reject this so the broken combination never
+// persists. Match the canonical Azure host suffix (`.openai.azure.com`) rather
+// than the loose `/azure/i` the UI uses to reveal the optional fields, so an
+// OpenAI-compatible proxy whose URL merely contains "azure" isn't forced into
+// deployment routing it may not want.
+export function azureBaseUrlNeedsApiVersion(
+  name: string,
+  apiVersion: string | undefined,
+  baseUrl: string | undefined
+): boolean {
+  if (name !== "openai") return false;
+  if (apiVersion && apiVersion.trim().length > 0) return false;
+  return /\.openai\.azure\.com/i.test(baseUrl ?? "");
+}
+
 // ---------------- Vision (image input) ----------------
 //
 // Single-shot vision call: caller provides a prompt + one inline base64 PNG/JPEG,

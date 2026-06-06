@@ -40,6 +40,7 @@ describe("setup-api", () => {
     GINI_STATE_ROOT?: string;
     OPENAI_API_KEY?: string;
     OPENROUTER_API_KEY?: string;
+    AZURE_OPENAI_API_KEY?: string;
     CODEX_AUTH_JSON?: string;
     GINI_PROVIDER?: string;
     GINI_MODEL?: string;
@@ -55,6 +56,7 @@ describe("setup-api", () => {
       GINI_STATE_ROOT: process.env.GINI_STATE_ROOT,
       OPENAI_API_KEY: process.env.OPENAI_API_KEY,
       OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
+      AZURE_OPENAI_API_KEY: process.env.AZURE_OPENAI_API_KEY,
       CODEX_AUTH_JSON: process.env.CODEX_AUTH_JSON,
       GINI_PROVIDER: process.env.GINI_PROVIDER,
       GINI_MODEL: process.env.GINI_MODEL
@@ -65,8 +67,10 @@ describe("setup-api", () => {
     delete process.env.OPENAI_API_KEY;
     // The openrouter test POSTs a key through production code, which writes
     // OPENROUTER_API_KEY into process.env; scrub it for a clean baseline and
-    // restore it in afterEach so it never leaks into later tests/files.
+    // restore it in afterEach so it never leaks into later tests/files. The
+    // custom-apiKeyEnv tests do the same with AZURE_OPENAI_API_KEY.
     delete process.env.OPENROUTER_API_KEY;
+    delete process.env.AZURE_OPENAI_API_KEY;
     // Scrub provider/model env so the test's assertions about the
     // platform default ("codex"/gpt-5.5) are not skewed by an ambient
     // GINI_PROVIDER=echo or similar in the caller's shell.
@@ -98,6 +102,8 @@ describe("setup-api", () => {
     else process.env.OPENAI_API_KEY = env.OPENAI_API_KEY;
     if (env.OPENROUTER_API_KEY === undefined) delete process.env.OPENROUTER_API_KEY;
     else process.env.OPENROUTER_API_KEY = env.OPENROUTER_API_KEY;
+    if (env.AZURE_OPENAI_API_KEY === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+    else process.env.AZURE_OPENAI_API_KEY = env.AZURE_OPENAI_API_KEY;
     if (env.CODEX_AUTH_JSON === undefined) delete process.env.CODEX_AUTH_JSON;
     else process.env.CODEX_AUTH_JSON = env.CODEX_AUTH_JSON;
     if (env.GINI_PROVIDER === undefined) delete process.env.GINI_PROVIDER;
@@ -221,10 +227,10 @@ describe("setup-api", () => {
     expect(result.error).toContain("requires a baseUrl");
   });
 
-  test("a same-provider edit preserves a custom apiKeyEnv", async () => {
+  test("a same-provider edit preserves a custom apiKeyEnv and gates on it", async () => {
     // Seed an Azure config with a custom apiKeyEnv (as `gini provider set
-    // --api-key-env` would produce), and make the per-provider env var look
-    // "already set" so a keyless model-only edit is accepted.
+    // --api-key-env` would produce). The keyless model-only edit must gate on
+    // the CUSTOM env var, not the default OPENAI_API_KEY.
     config.provider = {
       name: "openai",
       model: "gpt-5.4",
@@ -234,11 +240,41 @@ describe("setup-api", () => {
       deployment: "gpt-5.4",
       authScheme: "api-key"
     };
-    process.env.OPENAI_API_KEY = "sk-existing";
+    process.env.AZURE_OPENAI_API_KEY = "sk-existing";
     const result = await setSetupProvider(config, { provider: "openai", model: "gpt-5.4-mini" });
     expect(result.ok).toBe(true);
     expect(config.provider.apiKeyEnv).toBe("AZURE_OPENAI_API_KEY");
     expect(config.provider.baseUrl).toBe("https://lilac-labs-w.openai.azure.com");
+  });
+
+  test("a same-provider edit with a key writes to the custom apiKeyEnv, not the default", async () => {
+    config.provider = {
+      name: "openai",
+      model: "gpt-5.4",
+      apiKeyEnv: "AZURE_OPENAI_API_KEY",
+      baseUrl: "https://lilac-labs-w.openai.azure.com",
+      apiVersion: "2024-12-01-preview",
+      deployment: "gpt-5.4",
+      authScheme: "api-key"
+    };
+    const result = await setSetupProvider(config, { provider: "openai", apiKey: "sk-azure-rotated", model: "gpt-5.4" });
+    expect(result.ok).toBe(true);
+    // The key lands in the configured env var — the same one the gateway reads.
+    expect(process.env.AZURE_OPENAI_API_KEY).toBe("sk-azure-rotated");
+    expect(process.env.OPENAI_API_KEY).toBeUndefined();
+    const secretsPath = join(s.home, ".gini", "secrets.env");
+    expect(readFileSync(secretsPath, "utf8")).toContain("AZURE_OPENAI_API_KEY=");
+  });
+
+  test("POST openai with an azure baseUrl but no apiVersion is rejected", async () => {
+    const result = await setSetupProvider(config, {
+      provider: "openai",
+      apiKey: "sk-azure",
+      model: "gpt-5.4",
+      baseUrl: "https://lilac-labs-w.openai.azure.com"
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("api-version");
   });
 
   test("a full edit with blanked azure fields clears routing (swap back to standard OpenAI)", async () => {

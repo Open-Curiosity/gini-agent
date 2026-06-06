@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 import type { CliContext } from "../context";
 import { parseSubArgs, restAfter } from "../args";
 import { configPath, writeRuntimeConfig } from "../../paths";
-import { azureRoutingNeedsBaseUrl, normalizeProvider, providerHealth } from "../../provider";
+import { azureBaseUrlNeedsApiVersion, azureRoutingNeedsBaseUrl, normalizeProvider, providerHealth } from "../../provider";
 import { api } from "../api";
 import { print } from "../output";
 import { maybeRefreshAutostart } from "./autostart";
@@ -121,6 +121,11 @@ export async function provider(ctx: CliContext): Promise<void> {
     // default api.openai.com base would build a 404-ing deployment URL.
     if (azureRoutingNeedsBaseUrl(name, apiVersion, baseUrl)) {
       throw new Error("--api-version selects Azure OpenAI routing and requires --base-url <https://<resource>.openai.azure.com>.");
+    }
+    // The inverse: an Azure resource base URL without --api-version would build
+    // a flat path against the Azure host, which 404s.
+    if (azureBaseUrlNeedsApiVersion(name, apiVersion, baseUrl)) {
+      throw new Error("An Azure OpenAI base URL requires --api-version (e.g. 2024-12-01-preview).");
     }
 
     config.provider = normalizeProvider({

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import {
+  azureBaseUrlNeedsApiVersion,
   azureRoutingNeedsBaseUrl,
   clearEchoToolCallingResponses,
   clearEchoVisionResponses,
@@ -3155,6 +3156,23 @@ describe("azure openai routing", () => {
     expect(azureRoutingNeedsBaseUrl("openai", "2024-12-01-preview", "https://api.openai.com/v1/")).toBe(true);
     // azure mode with a real resource endpoint → OK.
     expect(azureRoutingNeedsBaseUrl("openai", "2024-12-01-preview", "https://x.openai.azure.com")).toBe(false);
+  });
+
+  test("azureBaseUrlNeedsApiVersion flags an azure-host openai config missing apiVersion", () => {
+    // Not openai → never flagged.
+    expect(azureBaseUrlNeedsApiVersion("local", undefined, "https://x.openai.azure.com")).toBe(false);
+    // openai with apiVersion set → fine (real Azure mode).
+    expect(azureBaseUrlNeedsApiVersion("openai", "2024-12-01-preview", "https://x.openai.azure.com")).toBe(false);
+    // openai, canonical azure host, blank/missing apiVersion → flagged.
+    expect(azureBaseUrlNeedsApiVersion("openai", undefined, "https://x.openai.azure.com")).toBe(true);
+    expect(azureBaseUrlNeedsApiVersion("openai", "  ", "https://lilac-labs-w.openai.azure.com/")).toBe(true);
+    // openai, non-azure host without apiVersion → not flagged (standard or a
+    // compatible endpoint that serves flat paths).
+    expect(azureBaseUrlNeedsApiVersion("openai", undefined, "https://api.openai.com/v1")).toBe(false);
+    expect(azureBaseUrlNeedsApiVersion("openai", undefined, undefined)).toBe(false);
+    // A URL that merely contains "azure" but isn't the canonical Azure host →
+    // not forced into deployment routing.
+    expect(azureBaseUrlNeedsApiVersion("openai", undefined, "https://my-azure-proxy.example.com/v1")).toBe(false);
   });
 
   test("azure tool-calling posts to the deployment-scoped url with the api-key header", async () => {

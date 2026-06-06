@@ -46,7 +46,7 @@
 
 import { writeFileSync } from "node:fs";
 import { configPath, writeRuntimeConfig } from "../paths";
-import { azureRoutingNeedsBaseUrl, hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { azureBaseUrlNeedsApiVersion, azureRoutingNeedsBaseUrl, hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
@@ -124,19 +124,6 @@ export async function setSetupProvider(
   const envKeySpec = ENV_KEY_PROVIDERS[providerName];
   if (envKeySpec) {
     const apiKey = typeof payload.apiKey === "string" ? payload.apiKey.trim() : "";
-    // Accept a no-key payload when the env var is already set — the Edit
-    // Provider dialog uses this to update just the default model without
-    // making the user re-type their key. Initial Add Provider still
-    // requires a key because the env var is empty there.
-    const envAlreadySet = Boolean(process.env[envKeySpec.envVar]);
-    if (!apiKey && !envKeySpec.allowEmptyKey && !envAlreadySet) {
-      return {
-        ok: false,
-        provider: providerHealth(config),
-        plistRefreshNeeded: false,
-        error: `apiKey is required for the ${providerName} provider.`
-      };
-    }
     // On a same-provider edit, preserve transport config the caller didn't
     // resend. The web Edit Provider dialog posts only { provider, apiKey?,
     // model }, so without this fallback a model-only save would wipe a
@@ -146,6 +133,26 @@ export async function setSetupProvider(
     // starts clean — `existing` is undefined — matching the cross-provider
     // non-inheritance rule resolveEffectiveContext enforces for agents.
     const existing = config.provider?.name === providerName ? config.provider : undefined;
+    // The env var that actually holds this provider's key. A same-provider edit
+    // honors a custom apiKeyEnv (set via `gini provider set --api-key-env`) so
+    // the "already set?" check and the secret write target the SAME var the
+    // gateway reads at call time (readOpenAIBearer / providerHealth read
+    // provider.apiKeyEnv). Otherwise a config naming AZURE_OPENAI_API_KEY would
+    // get its key written to OPENAI_API_KEY and read back as unconfigured.
+    const targetEnvVar = existing?.apiKeyEnv ?? envKeySpec.envVar;
+    // Accept a no-key payload when the env var is already set — the Edit
+    // Provider dialog uses this to update just the default model without
+    // making the user re-type their key. Initial Add Provider still
+    // requires a key because the env var is empty there.
+    const envAlreadySet = Boolean(process.env[targetEnvVar]);
+    if (!apiKey && !envKeySpec.allowEmptyKey && !envAlreadySet) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: `apiKey is required for the ${providerName} provider.`
+      };
+    }
     // Field resolution rule: a key PRESENT in the payload (even blank) is
     // applied, with blank/invalid clearing the field; a key ABSENT preserves
     // the existing value. This lets the full web Edit Provider form clear a
@@ -183,16 +190,24 @@ export async function setSetupProvider(
         error: "apiVersion selects Azure OpenAI routing and requires a baseUrl of https://<resource>.openai.azure.com."
       };
     }
+    if (azureBaseUrlNeedsApiVersion(providerName, apiVersion, baseUrl)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: "An Azure OpenAI endpoint requires an api-version (e.g. 2024-12-01-preview)."
+      };
+    }
 
     if (apiKey) {
       // Persist to secrets.env so the wrapper-sourced env carries it on
       // future shell launches. The shared writer lives in src/state/ —
       // both CLI and runtime are allowed to depend on src/state/.
-      writeKeyToSecretsEnv(envKeySpec.envVar, apiKey);
+      writeKeyToSecretsEnv(targetEnvVar, apiKey);
       // Make the running gateway use the new key on its very next
       // provider call. readOpenAIBearer reads process.env on each call,
       // so this assignment is enough — no restart needed.
-      process.env[envKeySpec.envVar] = apiKey;
+      process.env[targetEnvVar] = apiKey;
     }
 
     config.provider = normalizeProvider({

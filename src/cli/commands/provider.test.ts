@@ -304,6 +304,14 @@ describe("provider CLI", () => {
     await expect(provider(ctx)).rejects.toThrow(/requires --base-url/);
   });
 
+  test("--base-url azure endpoint without --api-version is rejected", async () => {
+    const ctx = makeCtx([
+      "provider", "set", "openai", "gpt-5.4",
+      "--base-url", "https://lilac-labs-w.openai.azure.com"
+    ]);
+    await expect(provider(ctx)).rejects.toThrow(/requires --api-version/);
+  });
+
   test("azure flags on a non-openai provider warn that they are ignored", async () => {
     const captured: string[] = [];
     const original = process.stderr.write.bind(process.stderr);
