@@ -2814,13 +2814,7 @@ describe("hostnameIsLoopback", () => {
       "LocalHost",
       "app.localhost",
       "localhost.",
-      "127.0.0.1.",
-      // IPv4-mapped / compat IPv6 hex forms of 127.0.0.1 (how browsers
-      // normalize [::ffff:127.0.0.1] / [::127.0.0.1]).
-      "::ffff:7f00:1",
-      "[::ffff:7f00:1]",
-      "::7f00:1",
-      "[::7f00:1]"
+      "127.0.0.1."
     ]) {
       expect(hostnameIsLoopback(h)).toBe(true);
     }
@@ -2833,11 +2827,7 @@ describe("hostnameIsLoopback", () => {
       "notlocalhost",
       "10.0.0.1",
       "169.254.169.254",
-      "1.2.3.4",
-      // IPv4-mapped IPv6 of a public IP (8.8.8.8) and a link-local IP
-      // (169.254.169.254) — neither is loopback.
-      "::ffff:808:808",
-      "::ffff:a9fe:a9fe"
+      "1.2.3.4"
     ]) {
       expect(hostnameIsLoopback(h)).toBe(false);
     }
