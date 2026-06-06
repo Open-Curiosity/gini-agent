@@ -3,7 +3,7 @@ import { AgentAvatar } from "./AgentAvatar";
 import { formatRelativeTime } from "./relative-time";
 
 // Per-agent (or channel) chat header — design `zFqWM`. 52px colored-initial
-// avatar, name, a green "Ready · last active …" status row, and a right-side
+// avatar, name, a muted "last active …" status row, and a right-side
 // affordance. When `right` is provided (the chat surface passes a wired
 // in-chat search control) it renders there; otherwise the static "Search in
 // chat" pill stands in for design parity on surfaces with no transcript.
@@ -35,18 +35,10 @@ export function AgentChatHeader({
         <div className="flex min-w-0 flex-col gap-1">
           <h1 className="truncate text-[19px] font-bold leading-none text-foreground">{name}</h1>
           <div className="flex items-center gap-1.5 text-[12px] leading-none">
-            <span aria-hidden className="size-[7px] rounded-full bg-[#4ADE80]" />
-            <span className="font-semibold text-[#C2C2C8]">Ready</span>
             {subtitle ? (
-              <>
-                <span className="text-[#5A5A60]">·</span>
-                <span className="font-medium text-[#7A7A80]">{subtitle}</span>
-              </>
+              <span className="font-medium text-[#7A7A80]">{subtitle}</span>
             ) : lastActive ? (
-              <>
-                <span className="text-[#5A5A60]">·</span>
-                <span className="font-medium text-[#7A7A80]">last active {lastActive}</span>
-              </>
+              <span className="font-medium text-[#7A7A80]">last active {lastActive}</span>
             ) : null}
           </div>
         </div>
