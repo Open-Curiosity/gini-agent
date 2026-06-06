@@ -24,10 +24,23 @@ import {
 // Per-paragraph TextInputs means selection can't span across paragraphs
 // — that is a deliberate trade-off vs. losing markdown rendering or
 // shipping a native module.
+//
+// `containsLink` opts a block out of BOTH selectable paths. A markdown link
+// is interactive (tap opens an in-app browser, long-press shows a menu): the
+// iOS TextInput wrapper would swallow the link's touches entirely, and a
+// `<Text selectable>` wrapper makes iOS raise its own text-selection "Copy"
+// callout on top of the link menu on long-press. So a link-bearing block
+// renders as a plain (non-selectable) `<Text>` — the link's gestures win, at
+// the cost of text selection for that one block (its links can still be
+// copied via the link menu's "Copy Link").
 export const SelectableBlockText = forwardRef<unknown, {
   style?: StyleProp<TextStyle>;
   children?: ReactNode;
-}>(function SelectableBlockText({ style, children }, _ref) {
+  containsLink?: boolean;
+}>(function SelectableBlockText({ style, children, containsLink = false }, _ref) {
+  if (containsLink) {
+    return <Text style={style}>{children}</Text>;
+  }
   if (Platform.OS === "ios") {
     return (
       <TextInput
