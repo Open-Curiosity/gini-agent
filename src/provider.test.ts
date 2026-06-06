@@ -3182,15 +3182,17 @@ describe("azure openai routing", () => {
 
   test("azureApiKeyNeedsHttps flags api-key auth against a non-https endpoint", () => {
     // Not api-key → never flagged (bearer keeps http local-gateway reach).
-    expect(azureApiKeyNeedsHttps("bearer", "http://x.openai.azure.com")).toBe(false);
-    expect(azureApiKeyNeedsHttps(undefined, "http://x")).toBe(false);
+    expect(azureApiKeyNeedsHttps("openai", "bearer", "http://x.openai.azure.com")).toBe(false);
+    expect(azureApiKeyNeedsHttps("openai", undefined, "http://x")).toBe(false);
     // api-key + http → flagged (the key would go over the wire in plaintext).
-    expect(azureApiKeyNeedsHttps("api-key", "http://x.openai.azure.com")).toBe(true);
+    expect(azureApiKeyNeedsHttps("openai", "api-key", "http://x.openai.azure.com")).toBe(true);
     // api-key + https → fine, for any Azure cloud suffix.
-    expect(azureApiKeyNeedsHttps("api-key", "https://x.openai.azure.com")).toBe(false);
-    expect(azureApiKeyNeedsHttps("api-key", "https://x.openai.azure.us")).toBe(false);
+    expect(azureApiKeyNeedsHttps("openai", "api-key", "https://x.openai.azure.com")).toBe(false);
+    expect(azureApiKeyNeedsHttps("openai", "api-key", "https://x.openai.azure.us")).toBe(false);
     // api-key + no baseUrl → not flagged here (the default host is https).
-    expect(azureApiKeyNeedsHttps("api-key", undefined)).toBe(false);
+    expect(azureApiKeyNeedsHttps("openai", "api-key", undefined)).toBe(false);
+    // Non-openai providers are never gated (authScheme is openai-only).
+    expect(azureApiKeyNeedsHttps("openrouter", "api-key", "http://x")).toBe(false);
   });
 
   test("isProviderConfigured honors a custom apiKeyEnv for the active provider", () => {

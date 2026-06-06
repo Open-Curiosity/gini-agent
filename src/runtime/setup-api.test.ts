@@ -352,6 +352,13 @@ describe("setup-api", () => {
     expect(result.error).toContain("https");
   });
 
+  test("a same-provider edit with a malformed persisted apiKeyEnv is rejected", async () => {
+    config.provider = { name: "openai", model: "gpt-5.4", apiKeyEnv: "FOO=evil" };
+    const result = await setSetupProvider(config, { provider: "openai", model: "gpt-5.4-mini" });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("valid environment variable name");
+  });
+
   test("POST openai without apiKey returns ok:false", async () => {
     const result = await setSetupProvider(config, { provider: "openai", apiKey: "" });
     expect(result.ok).toBe(false);

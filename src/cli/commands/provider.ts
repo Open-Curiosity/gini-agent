@@ -3,6 +3,7 @@ import type { CliContext } from "../context";
 import { parseSubArgs, restAfter } from "../args";
 import { configPath, writeRuntimeConfig } from "../../paths";
 import { azureApiKeyNeedsHttps, azureBaseUrlNeedsApiVersion, azureRoutingNeedsBaseUrl, normalizeProvider, providerHealth } from "../../provider";
+import { isValidEnvVarName } from "../../state/secrets-env";
 import { api } from "../api";
 import { print } from "../output";
 import { maybeRefreshAutostart } from "./autostart";
@@ -66,6 +67,11 @@ export async function provider(ctx: CliContext): Promise<void> {
       }
       authScheme = authSchemeRaw;
     }
+    // The apiKeyEnv name is interpolated into ~/.gini/secrets.env (a
+    // shell-sourced file); reject anything that isn't a plain env-var name.
+    if (apiKeyEnv !== undefined && !isValidEnvVarName(apiKeyEnv)) {
+      throw new Error("--api-key-env must be a valid environment variable name (letters, digits, underscore; not starting with a digit).");
+    }
     const extraBodyRaw = flags["--extra-body"];
     let extraBody: Record<string, unknown> | undefined;
     if (extraBodyRaw !== undefined) {
@@ -128,7 +134,7 @@ export async function provider(ctx: CliContext): Promise<void> {
       throw new Error("An Azure OpenAI base URL requires --api-version (e.g. 2024-12-01-preview).");
     }
     // api-key auth puts the key in a plaintext header; never send it over http.
-    if (azureApiKeyNeedsHttps(authScheme, baseUrl)) {
+    if (azureApiKeyNeedsHttps(name, authScheme, baseUrl)) {
       throw new Error("--auth-scheme api-key requires an https:// --base-url.");
     }
 

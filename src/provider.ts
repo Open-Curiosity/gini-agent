@@ -2619,9 +2619,11 @@ export function azureBaseUrlNeedsApiVersion(
 // guard. Only the api-key scheme is gated; Bearer is generic and keeps its
 // existing reach (e.g. local http gateways).
 export function azureApiKeyNeedsHttps(
+  name: string,
   authScheme: string | undefined,
   baseUrl: string | undefined
 ): boolean {
+  if (name !== "openai") return false;
   if (authScheme !== "api-key") return false;
   const value = (baseUrl ?? "").trim().toLowerCase();
   if (value.length === 0) return false;

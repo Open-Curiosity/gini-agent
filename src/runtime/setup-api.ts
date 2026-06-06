@@ -47,7 +47,7 @@
 import { writeFileSync } from "node:fs";
 import { configPath, writeRuntimeConfig } from "../paths";
 import { azureApiKeyNeedsHttps, azureBaseUrlNeedsApiVersion, azureRoutingNeedsBaseUrl, hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
-import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
+import { isValidEnvVarName, removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
@@ -142,6 +142,17 @@ export async function setSetupProvider(
     // provider.apiKeyEnv). Otherwise a config naming AZURE_OPENAI_API_KEY would
     // get its key written to OPENAI_API_KEY and read back as unconfigured.
     const targetEnvVar = existing?.apiKeyEnv ?? envKeySpec.envVar;
+    // A persisted apiKeyEnv flows into the secrets.env writer; reject a
+    // malformed name (it would otherwise be caught by the writer's guard and
+    // surface as an unhandled 500) rather than try to write it.
+    if (!isValidEnvVarName(targetEnvVar)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: `The configured apiKeyEnv (${targetEnvVar}) is not a valid environment variable name.`
+      };
+    }
     // Accept a no-key payload when the env var is already set — the Edit
     // Provider dialog uses this to update the model or transport config
     // (base URL, Azure routing) without making the user re-type their key.
@@ -203,7 +214,7 @@ export async function setSetupProvider(
         error: "An Azure OpenAI endpoint requires an api-version (e.g. 2024-12-01-preview)."
       };
     }
-    if (azureApiKeyNeedsHttps(authScheme, baseUrl)) {
+    if (azureApiKeyNeedsHttps(providerName, authScheme, baseUrl)) {
       return {
         ok: false,
         provider: providerHealth(config),
@@ -326,7 +337,7 @@ export function removeSetupProvider(
   // so disconnect must clear the same target or the secret survives.
   // removeKeyFromSecretsEnv / delete are no-ops when the var is already absent.
   const scrubVars = new Set<string>([envKeySpec.envVar]);
-  if (config.provider?.name === providerName && config.provider.apiKeyEnv) {
+  if (config.provider?.name === providerName && config.provider.apiKeyEnv && isValidEnvVarName(config.provider.apiKeyEnv)) {
     scrubVars.add(config.provider.apiKeyEnv);
   }
   for (const envVar of scrubVars) {
