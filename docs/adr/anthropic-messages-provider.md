@@ -57,7 +57,6 @@ SigV4 / IAM-role auth (the AWS-recommended Bedrock path) is intentionally **not*
 
 - SigV4 / IAM-role auth for Bedrock (requires the dedicated SDK client).
 - `anthropic-beta` header passthrough for beta-gated features (`extraBody` goes in the request body, not headers).
-- Auto-prefixing `anthropic.` model ids when `baseUrl` points at Bedrock (current design is explicit-per-target to avoid surprising rewrites).
 - Re-mint automation for expiring Bedrock bearer tokens.
 
 ## Consequences
