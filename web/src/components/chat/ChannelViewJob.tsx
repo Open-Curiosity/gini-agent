@@ -3,15 +3,15 @@
 import { useRouter } from "next/navigation";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { ArrowLeft } from "lucide-react";
+import { ArrowUpRight } from "lucide-react";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
 
-// Header pill on a recurring-job channel that returns to the originating job.
+// Header pill on a recurring-job channel that opens the originating job.
 // Switches the active agent to the job's owning agent when it differs (mirrors
 // the sidebar's agent-switch mutation), then deep-links into /jobs with that
 // job preselected.
-export function ChannelBackToJob({
+export function ChannelViewJob({
   jobId,
   agentId,
   activeAgentId
@@ -45,8 +45,8 @@ export function ChannelBackToJob({
       onClick={onClick}
       className="flex items-center gap-2 rounded-md border border-[#2A2A2E] bg-[#15161C] px-2.5 py-1.5 text-[12px] font-medium text-[#C2C2C8] transition-colors hover:bg-[#1C1C22] hover:text-white"
     >
-      <ArrowLeft className="size-3.5" />
-      Back to job
+      View job
+      <ArrowUpRight className="size-3.5" />
     </button>
   );
 }

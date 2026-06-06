@@ -10,7 +10,7 @@ import { BlockToolCallsCollapsed } from "@/components/chat/BlockToolCallsCollaps
 import { GeneratedFilesCard } from "@/components/chat/GeneratedFilesCard";
 import { Composer } from "@/components/chat/Composer";
 import { AgentChatHeader } from "@/components/chat/AgentChatHeader";
-import { ChannelBackToJob } from "@/components/chat/ChannelBackToJob";
+import { ChannelViewJob } from "@/components/chat/ChannelViewJob";
 import { ChatSearchBox } from "@/components/chat/ChatSearchBox";
 import { ChatTabBar, type ChatTab } from "@/components/chat/ChatTabBar";
 import { ThreadChip } from "@/components/chat/ThreadChip";
@@ -294,9 +294,9 @@ function ChatSurface({
           lastActiveAt={session.updatedAt}
           subtitle={isChannel ? "recurring job channel" : undefined}
           showAvatar={!isChannel}
-          back={
+          titleAction={
             isChannel && job ? (
-              <ChannelBackToJob jobId={job.id} agentId={job.agentId} activeAgentId={activeAgentId} />
+              <ChannelViewJob jobId={job.id} agentId={job.agentId} activeAgentId={activeAgentId} />
             ) : undefined
           }
           right={

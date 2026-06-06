@@ -14,7 +14,7 @@ export function AgentChatHeader({
   subtitle,
   right,
   showAvatar,
-  back
+  titleAction
 }: {
   name: string;
   seed?: string;
@@ -22,13 +22,12 @@ export function AgentChatHeader({
   subtitle?: string;
   right?: React.ReactNode;
   showAvatar?: boolean;
-  back?: React.ReactNode;
+  titleAction?: React.ReactNode;
 }) {
   const lastActive = lastActiveAt ? formatRelativeTime(lastActiveAt) : "";
   return (
     <header className="flex shrink-0 items-center justify-between gap-4 border-b border-[#1C1C1E] px-7 py-4">
       <div className="flex min-w-0 items-center gap-4">
-        {back}
         {showAvatar !== false ? (
           <AgentAvatar name={name} seed={seed} size={52} className="border border-[#1C1C1E]" />
         ) : null}
@@ -42,6 +41,7 @@ export function AgentChatHeader({
             ) : null}
           </div>
         </div>
+        {titleAction}
       </div>
       {right ?? (
         <div className="hidden items-center gap-2 rounded-md border border-[#2A2A2E] bg-[#15161C] px-2.5 py-1.5 text-[12px] font-medium text-[#7A7A80] sm:flex">
