@@ -2,6 +2,7 @@ import { writeFileSync } from "node:fs";
 import { createHandler, isWebProxyPath, proxyWebSocketUpgrade, relaySessionGateRequired, sessionCookieValue, webSocketProxyHandler, writePid } from "./http";
 import { webBoundRequestAllowed } from "./lib/origin-trust";
 import { resolveSessionFromCookie } from "./governance/pairing";
+import "./hooks/builtins"; // registers trusted hook handlers (gmail-delta) before the scheduler/backfill run
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";

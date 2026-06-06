@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RuntimeConfig } from "../types";
+import "../hooks/builtins"; // populates the registry so createScheduledJob resolves isKnownHook("gmail-delta")
 import {
   addEmailWatcher,
   backfillEmailWatcherJobs,
