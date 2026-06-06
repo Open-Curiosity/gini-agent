@@ -3470,6 +3470,7 @@ describe("anthropic provider", () => {
       const sentWithSys = JSON.parse(String(fetchStub.calls[1]!.init.body));
       expect(sentWithSys.system).toBe("real system");
     } finally {
+      fetchStub.restore();
       restoreEnv();
     }
   });
