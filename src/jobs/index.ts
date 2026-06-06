@@ -467,11 +467,29 @@ function renderHookContext(items: PreRunHookContextItem[]): string[] {
   });
 }
 
+// Sentinel the Promise.race resolves to when the timeout wins. Kept distinct
+// from a handler-returned result so the caller can tell a TIMEOUT (transient —
+// the job must keep scheduling) apart from a handler's own error result (a
+// config error — fatal).
+const HOOK_TIMEOUT = Symbol("preRunHookTimeout");
+
 // Runs the job's preRun hook (if any) and returns what the dispatch loop should
 // do next. No hook => { action: "proceed", context: [] }, byte-identical to the
 // pre-hook behavior. The hook gets the tight pre-LLM timeout (Claude Code's
-// UserPromptSubmit budget), NOT the job's 600s budget. A handler throw or a
-// timeout collapses to the error action (finalize failed, no draft).
+// UserPromptSubmit budget), NOT the job's 600s budget.
+//
+// Error taxonomy (the `fatal` flag on the error action drives whether a
+// scheduled job's status flips to "failed", which stops scheduling forever):
+//   - CONFIG errors (fatal): an unknown handlerId, a handler-returned
+//     { kind: "error" } (gmail-delta uses this only for missing/unknown
+//     watcher), or a malformed result whose kind isn't in the union. A draft is
+//     meaningless and retrying won't fix it, so the job is deactivated.
+//   - TRANSIENT errors (non-fatal): a timeout or an unexpected handler throw.
+//     The run is failed but the JOB stays active so it self-recovers next tick.
+//     Handlers MUST be cancellation-safe + idempotent — Promise.race does NOT
+//     cancel the loser, so a timed-out handler keeps running to completion; a
+//     well-behaved handler (gmail-delta) only writes replay-safe cursor/dedup
+//     state, so the orphaned promise can't corrupt anything.
 async function runPreRunHook(
   config: RuntimeConfig,
   job: JobRecord,
@@ -479,31 +497,51 @@ async function runPreRunHook(
 ): Promise<
   | { action: "proceed"; context: string[] }
   | { action: "shortCircuit"; summary?: string }
-  | { action: "error"; message: string }
+  | { action: "error"; message: string; fatal: boolean }
 > {
   const hook = job.preRunHook;
   if (!hook) return { action: "proceed", context: [] };
 
   const handler = resolvePreRunHook(hook.handlerId);
-  if (!handler) return { action: "error", message: `Unknown preRun hook handler: ${hook.handlerId}` };
+  // Unknown handlerId is a config error (fatal) — the registry is the security
+  // boundary, and createScheduledJob already rejects unknown ids at create time.
+  if (!handler) return { action: "error", message: `Unknown preRun hook handler: ${hook.handlerId}`, fatal: true };
 
   const timeoutMs = hook.timeoutMs ?? PRE_RUN_HOOK_DEFAULT_TIMEOUT_MS;
-  let result: JobPreRunHookResult;
+  let raced: JobPreRunHookResult | typeof HOOK_TIMEOUT;
   try {
-    result = await Promise.race([
+    raced = await Promise.race([
       handler({ config, job, run, hookConfig: hook.config }),
-      Bun.sleep(timeoutMs).then<JobPreRunHookResult>(() => ({
-        kind: "error",
-        message: `preRun hook ${hook.handlerId} timed out after ${timeoutMs}ms`
-      }))
+      Bun.sleep(timeoutMs).then<typeof HOOK_TIMEOUT>(() => HOOK_TIMEOUT)
     ]);
   } catch (error) {
-    result = { kind: "error", message: error instanceof Error ? error.message : String(error) };
+    // An unexpected handler throw is transient — gmail-delta never throws (it
+    // catches and short-circuits), so a throw here is a handler bug or a
+    // transient runtime fault. Keep the job scheduling.
+    return {
+      action: "error",
+      message: error instanceof Error ? error.message : String(error),
+      fatal: false
+    };
   }
 
-  if (result.kind === "shortCircuit") return { action: "shortCircuit", summary: result.summary };
-  if (result.kind === "error") return { action: "error", message: result.message };
-  return { action: "proceed", context: renderHookContext(result.items) };
+  // Timeout: transient. Fail the run, keep the job active.
+  if (raced === HOOK_TIMEOUT) {
+    return { action: "error", message: `preRun hook ${hook.handlerId} timed out after ${timeoutMs}ms`, fatal: false };
+  }
+
+  // Validate the result kind against the known union INSIDE this guard so a
+  // malformed result takes the typed (fatal config) error path instead of
+  // throwing past the catch — a throw there would strand the run "running"
+  // forever and brick the job under overlap protection.
+  if (raced.kind === "shortCircuit") return { action: "shortCircuit", summary: raced.summary };
+  if (raced.kind === "error") return { action: "error", message: raced.message, fatal: true };
+  if (raced.kind === "context") return { action: "proceed", context: renderHookContext(raced.items) };
+  return {
+    action: "error",
+    message: `preRun hook ${hook.handlerId} returned an unknown result kind: ${String((raced as { kind?: unknown }).kind)}`,
+    fatal: true
+  };
 }
 
 // Finalize a short-circuited run with NO model turn. The run never spawned a
@@ -620,19 +658,24 @@ async function finalizeShortCircuit(
   }
 }
 
-// Finalize a run that the hook failed (error kind or timeout). No model turn,
-// no draft. Mirrors dispatchPromptRun's catch shape: guard run.status ===
-// "running" (cancel race), stamp the run failed, stamp lastFailureAt + lastError
-// on the job, and flip job.status="failed" only for scheduled triggers (matching
-// dispatch's catch). The hook's error kind is reserved for broken config — a
-// transient transport failure must NOT reach here (the handler returns
-// shortCircuit for those so the job keeps scheduling).
+// Finalize a run that the hook failed. No model turn, no draft. Mirrors
+// dispatchPromptRun's catch shape: guard run.status === "running" (cancel race),
+// stamp the run failed, stamp lastFailureAt + lastError on the job.
+//
+// `fatal` decides whether a scheduled job is DEACTIVATED. A CONFIG error
+// (fatal: unknown handler, missing watcher, malformed result) flips
+// job.status="failed" so a job that can never succeed stops claiming the
+// scheduler. A TRANSIENT error (non-fatal: timeout or handler throw) leaves
+// job.status="active" so the job self-recovers on its next tick — flipping it to
+// "failed" on a transient stall would silently kill a watcher (and the orphaned
+// handler promise could later write a healthy-looking status, masking the death).
 async function finalizeHookError(
   config: RuntimeConfig,
   job: JobRecord,
   run: JobRunRecord,
   message: string,
-  trigger: "schedule" | "manual" | "replay"
+  trigger: "schedule" | "manual" | "replay",
+  fatal: boolean
 ): Promise<void> {
   await mutateState(config.instance, (state) => {
     const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);
@@ -646,7 +689,7 @@ async function finalizeHookError(
     if (jobItem) {
       jobItem.lastFailureAt = runItem.completedAt;
       jobItem.lastError = message;
-      if (trigger === "schedule") jobItem.status = "failed";
+      if (fatal && trigger === "schedule") jobItem.status = "failed";
     }
     appendEvent(
       state,
@@ -730,7 +773,7 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
         continue;
       }
       if (hook.action === "error") {
-        await finalizeHookError(config, job, run, hook.message, "schedule");
+        await finalizeHookError(config, job, run, hook.message, "schedule", hook.fatal);
         continue;
       }
       await dispatchPromptRun(config, job, run, "schedule", hook.context);
@@ -1017,7 +1060,7 @@ export async function runJobNow(
     return { jobId: job.id, runId: run.id, shortCircuited: true };
   }
   if (hook.action === "error") {
-    await finalizeHookError(config, job, run, hook.message, trigger);
+    await finalizeHookError(config, job, run, hook.message, trigger, hook.fatal);
     return { jobId: job.id, runId: run.id, error: hook.message };
   }
   return dispatchPromptRun(config, job, run, trigger, hook.context);

@@ -306,6 +306,78 @@ describe("pre-run hook primitive", () => {
     expect(run?.error).toContain("timed out");
   });
 
+  test("a scheduled-trigger timeout fails the run but keeps the job active (self-recovers)", async () => {
+    // A timeout is TRANSIENT: a never-resolving handler under a small timeout
+    // must NOT flip job.status="failed" (that would stop the scheduler forever
+    // and silently kill an email watcher). The run is failed; the job stays
+    // active so the next tick re-claims it.
+    const config = buildConfig(workspaceRoot, "hook-timeout-sched");
+    const sessionId = "session_to_sched";
+    await createSession(config, sessionId);
+    const job = await createScheduledJob(config, {
+      name: "to-sched",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-timeout", config: {}, timeoutMs: 10 }
+    });
+
+    await mutateState(config.instance, (state) => {
+      const j = state.jobs.find((x) => x.id === job.id)!;
+      j.nextRunAt = new Date(Date.now() - 1000).toISOString();
+    });
+    const { runDueJobs } = await import("../index");
+    await runDueJobs(config);
+
+    const state = readState(config.instance);
+    // 0 turns spawned.
+    expect(state.tasks.filter((t) => t.jobId === job.id)).toHaveLength(0);
+    // Run failed.
+    const run = state.jobRuns.find((r) => r.jobId === job.id);
+    expect(run?.status).toBe("failed");
+    expect(run?.error).toContain("timed out");
+    // Job stays ACTIVE — transient timeout does not deactivate the schedule.
+    const j = state.jobs.find((x) => x.id === job.id);
+    expect(j?.status).toBe("active");
+  });
+
+  test("a malformed handler result takes the fatal config-error path, not a throw past the catch", async () => {
+    // A result whose kind isn't in the union (e.g. a prototype-resolved JS
+    // built-in or a buggy handler) must be validated INSIDE runPreRunHook so the
+    // run finalizes failed (fatal, scheduled => job.status="failed") instead of
+    // throwing past the catch and stranding the run "running" forever.
+    const config = buildConfig(workspaceRoot, "hook-malformed");
+    const sessionId = "session_malformed";
+    await createSession(config, sessionId);
+    __registerPreRunHookForTest(
+      "test-malformed",
+      // deliberately returns an off-union shape
+      (async () => ({ kind: "bogus" })) as unknown as Parameters<typeof __registerPreRunHookForTest>[1]
+    );
+    const job = await createScheduledJob(config, {
+      name: "malformed",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-malformed", config: {} }
+    });
+
+    await mutateState(config.instance, (state) => {
+      const j = state.jobs.find((x) => x.id === job.id)!;
+      j.nextRunAt = new Date(Date.now() - 1000).toISOString();
+    });
+    const { runDueJobs } = await import("../index");
+    await runDueJobs(config);
+
+    const state = readState(config.instance);
+    const run = state.jobRuns.find((r) => r.jobId === job.id);
+    expect(run?.status).toBe("failed");
+    expect(run?.error).toContain("unknown result kind");
+    expect(state.tasks.filter((t) => t.jobId === job.id)).toHaveLength(0);
+    // Malformed result is a config error => fatal => scheduled job deactivated.
+    expect(state.jobs.find((x) => x.id === job.id)?.status).toBe("failed");
+  });
+
   test("createScheduledJob rejects an unknown handlerId at create time", async () => {
     const config = buildConfig(workspaceRoot, "hook-unknown-create");
     await expect(

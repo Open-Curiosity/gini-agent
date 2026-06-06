@@ -20,6 +20,12 @@ import type { JobRecord, JobRunRecord, RuntimeConfig } from "../../types";
 // spawned task's approval/audit/trace envelope, so it must only do read-only /
 // idempotent side effects (cursor + dedup), never the kind that requires the
 // approval gate. See CLAUDE.md boundaries + ADR job-pre-run-hooks.md.
+//
+// CANCELLATION SAFETY: the scheduler enforces the per-hook timeout with
+// Promise.race, which does NOT cancel the losing promise — a handler that
+// exceeds its timeout keeps running to completion. Handlers MUST therefore be
+// cancellation-safe and idempotent: only replay-safe side effects, so an
+// orphaned post-timeout handler can't corrupt state or double-deliver.
 export interface PreRunHookContext {
   config: RuntimeConfig; // per-instance runtime config (instance-isolated)
   job: JobRecord; // the claimed job
