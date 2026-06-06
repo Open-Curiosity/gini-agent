@@ -3174,6 +3174,9 @@ describe("azure openai routing", () => {
     // A URL that merely contains "azure" but isn't the canonical Azure host →
     // not forced into deployment routing.
     expect(azureBaseUrlNeedsApiVersion("openai", undefined, "https://my-azure-proxy.example.com/v1")).toBe(false);
+    // ".openai.azure.com" in the PATH (not the host) must not trip — the check
+    // parses the hostname, not a substring of the whole URL.
+    expect(azureBaseUrlNeedsApiVersion("openai", undefined, "https://evil.example.com/path/.openai.azure.com")).toBe(false);
   });
 
   test("isProviderConfigured honors a custom apiKeyEnv for the active provider", () => {

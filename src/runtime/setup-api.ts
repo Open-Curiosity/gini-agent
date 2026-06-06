@@ -125,11 +125,13 @@ export async function setSetupProvider(
   if (envKeySpec) {
     const apiKey = typeof payload.apiKey === "string" ? payload.apiKey.trim() : "";
     // On a same-provider edit, preserve transport config the caller didn't
-    // resend. The web Edit Provider dialog posts only { provider, apiKey?,
-    // model }, so without this fallback a model-only save would wipe a
-    // configured baseUrl, apiKeyEnv, and the Azure routing fields (apiVersion /
-    // deployment / authScheme), silently turning a configured Azure deployment
-    // into a plain api.openai.com call. A provider SWITCH (different name)
+    // resend. A partial caller — the Settings model picker or the set_provider
+    // tool — posts only { provider, model? }, so without this fallback a
+    // model-only save would wipe a configured baseUrl, apiKeyEnv, and the Azure
+    // routing fields (apiVersion / deployment / authScheme), silently turning a
+    // configured Azure deployment into a plain api.openai.com call. (The full
+    // Edit Provider dialog posts every transport field, so it clears via blanks
+    // rather than relying on this fallback.) A provider SWITCH (different name)
     // starts clean — `existing` is undefined — matching the cross-provider
     // non-inheritance rule resolveEffectiveContext enforces for agents.
     const existing = config.provider?.name === providerName ? config.provider : undefined;

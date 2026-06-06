@@ -2609,7 +2609,23 @@ export function azureBaseUrlNeedsApiVersion(
 ): boolean {
   if (name !== "openai") return false;
   if (apiVersion && apiVersion.trim().length > 0) return false;
-  return /\.openai\.azure\.com/i.test(baseUrl ?? "");
+  return isAzureResourceHost(baseUrl);
+}
+
+// True when baseUrl's HOST is an Azure OpenAI resource endpoint
+// (<resource>.openai.azure.com). Parses the host so ".openai.azure.com"
+// appearing in a path or query can't trip the check; falls back to a substring
+// match only for strings that don't parse as a URL (a value the user may still
+// be mid-editing).
+function isAzureResourceHost(baseUrl: string | undefined): boolean {
+  const value = (baseUrl ?? "").trim();
+  if (value.length === 0) return false;
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return host === "openai.azure.com" || host.endsWith(".openai.azure.com");
+  } catch {
+    return /\.openai\.azure\.com/i.test(value);
+  }
 }
 
 // ---------------- Vision (image input) ----------------

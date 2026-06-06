@@ -106,8 +106,14 @@ export function EditProviderDialog({
         return;
       }
       toast.success(`${displayProviderName(row)} updated.`);
-      queryClient.invalidateQueries({ queryKey: ["status"] });
-      await queryClient.refetchQueries({ queryKey: ["providers"] });
+      // Await BOTH refetches before the dialog can reopen — the prefill reads
+      // the active provider's transport config from /status, so closing before
+      // status refreshes could reopen with stale fields and revert this save on
+      // the next one.
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["status"] }),
+        queryClient.refetchQueries({ queryKey: ["providers"] })
+      ]);
       onOpenChange(false);
     },
     onError: (error: Error) => toast.error(error.message)
