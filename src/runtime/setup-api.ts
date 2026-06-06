@@ -176,6 +176,9 @@ export async function setSetupProvider(
     // Preserve a custom apiKeyEnv (set via `gini provider set --api-key-env`)
     // across a same-provider edit; the web Edit dialog can't resend it.
     const apiKeyEnv = existing?.apiKeyEnv;
+    // Likewise preserve a CLI-set extraBody (e.g. chat_template_kwargs) — no web
+    // surface sends it, so a same-provider edit must not silently drop it.
+    const extraBody = existing?.extraBody;
 
     // Azure routing needs a real resource endpoint. Reject apiVersion paired
     // with a missing/default OpenAI baseUrl BEFORE persisting the key, so we
@@ -215,6 +218,7 @@ export async function setSetupProvider(
       model,
       ...(baseUrl ? { baseUrl } : {}),
       ...(apiKeyEnv ? { apiKeyEnv } : {}),
+      ...(extraBody ? { extraBody } : {}),
       ...(apiVersion ? { apiVersion } : {}),
       ...(deployment ? { deployment } : {}),
       ...(authScheme ? { authScheme } : {})
@@ -305,11 +309,20 @@ export function removeSetupProvider(
     };
   }
 
-  // Wipe the bearer from both stores so the running process and future
-  // shell launches stop seeing it. removeKeyFromSecretsEnv is a no-op if
-  // the file or the line is already absent — safe to call unconditionally.
-  removeKeyFromSecretsEnv(envKeySpec.envVar);
-  delete process.env[envKeySpec.envVar];
+  // Wipe the bearer from both stores so the running process and future shell
+  // launches stop seeing it. Scrub the env var the active config actually used
+  // (a custom apiKeyEnv like AZURE_OPENAI_API_KEY) as well as the provider
+  // default — the write path stores the key under `apiKeyEnv ?? envKeySpec.envVar`,
+  // so disconnect must clear the same target or the secret survives.
+  // removeKeyFromSecretsEnv / delete are no-ops when the var is already absent.
+  const scrubVars = new Set<string>([envKeySpec.envVar]);
+  if (config.provider?.name === providerName && config.provider.apiKeyEnv) {
+    scrubVars.add(config.provider.apiKeyEnv);
+  }
+  for (const envVar of scrubVars) {
+    removeKeyFromSecretsEnv(envVar);
+    delete process.env[envVar];
+  }
 
   let switched = false;
   if (config.provider?.name === providerName) {

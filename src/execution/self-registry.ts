@@ -288,10 +288,14 @@ async function setProvider(
   }
   const payload: Record<string, unknown> = { provider: targetProvider };
   if (typeof args.model === "string" && args.model.trim().length > 0) payload.model = args.model.trim();
-  if (typeof args.baseUrl === "string" && args.baseUrl.trim().length > 0) payload.baseUrl = args.baseUrl.trim();
   if (typeof args.apiKey === "string" && args.apiKey.trim().length > 0) payload.apiKey = args.apiKey.trim();
-  if (typeof args.apiVersion === "string" && args.apiVersion.trim().length > 0) payload.apiVersion = args.apiVersion.trim();
-  if (typeof args.deployment === "string" && args.deployment.trim().length > 0) payload.deployment = args.deployment.trim();
+  // Transport fields pass through when PRESENT (even blank), so the agent can
+  // CLEAR them — a blank baseUrl/apiVersion swaps an Azure config back to
+  // standard OpenAI — matching the setup API's present-clears / absent-preserves
+  // rule. Omitting an arg entirely preserves the persisted value.
+  if (typeof args.baseUrl === "string") payload.baseUrl = args.baseUrl.trim();
+  if (typeof args.apiVersion === "string") payload.apiVersion = args.apiVersion.trim();
+  if (typeof args.deployment === "string") payload.deployment = args.deployment.trim();
   if (args.authScheme === "api-key" || args.authScheme === "bearer") payload.authScheme = args.authScheme;
   const result = await setSetupProvider(config, payload);
   appendTrace(config.instance, taskId, {

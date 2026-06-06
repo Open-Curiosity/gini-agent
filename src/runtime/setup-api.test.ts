@@ -10,7 +10,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { getSetupStatus, setSetupProvider } from "./setup-api";
+import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./setup-api";
+import { writeKeyToSecretsEnv } from "../state/secrets-env";
 import { loadConfig } from "../paths";
 import type { RuntimeConfig } from "../types";
 
@@ -306,6 +307,35 @@ describe("setup-api", () => {
     expect(cfg.provider?.apiVersion).toBeUndefined();
     expect(cfg.provider?.deployment).toBeUndefined();
     expect(cfg.provider?.authScheme).toBeUndefined();
+  });
+
+  test("a model-only same-provider edit preserves a configured extraBody", async () => {
+    config.provider = { name: "openai", model: "gpt-5.4", extraBody: { reasoning_effort: "max" } };
+    process.env.OPENAI_API_KEY = "sk-existing";
+    const result = await setSetupProvider(config, { provider: "openai", model: "gpt-5.4-mini" });
+    expect(result.ok).toBe(true);
+    expect(config.provider.extraBody).toEqual({ reasoning_effort: "max" });
+  });
+
+  test("removing a provider with a custom apiKeyEnv scrubs that env var, not just the default", async () => {
+    config.provider = {
+      name: "openai",
+      model: "gpt-5.4",
+      apiKeyEnv: "AZURE_OPENAI_API_KEY",
+      baseUrl: "https://lilac-labs-w.openai.azure.com",
+      apiVersion: "2024-12-01-preview",
+      deployment: "gpt-5.4",
+      authScheme: "api-key"
+    };
+    writeKeyToSecretsEnv("AZURE_OPENAI_API_KEY", "sk-azure-secret");
+    process.env.AZURE_OPENAI_API_KEY = "sk-azure-secret";
+    const result = removeSetupProvider(config, "openai");
+    expect(result.ok).toBe(true);
+    // The secret must be gone from BOTH stores, under the custom env var.
+    expect(process.env.AZURE_OPENAI_API_KEY).toBeUndefined();
+    const secretsPath = join(s.home, ".gini", "secrets.env");
+    const body = existsSync(secretsPath) ? readFileSync(secretsPath, "utf8") : "";
+    expect(body).not.toContain("AZURE_OPENAI_API_KEY");
   });
 
   test("POST openai without apiKey returns ok:false", async () => {

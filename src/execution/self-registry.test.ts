@@ -306,6 +306,52 @@ describe("direct self tools — mutate", () => {
     }
   });
 
+  test("set_provider clears azure routing when blank transport fields are passed", async () => {
+    const instance = `self-setprov-clear-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    config.provider = {
+      name: "openai",
+      model: "gpt-5.4",
+      apiKeyEnv: "OPENAI_API_KEY",
+      baseUrl: "https://lilac-labs-w.openai.azure.com",
+      apiVersion: "2024-12-01-preview",
+      deployment: "gpt-5.4",
+      authScheme: "api-key"
+    };
+    const taskId = await newTask(config);
+    const originalHome = process.env.HOME;
+    const originalKey = process.env.OPENAI_API_KEY;
+    const originalSkip = process.env.GINI_SKIP_PLIST_REFRESH;
+    const sandboxHome = mkdtempSync(join(tmpdir(), "gini-self-azclear-home-"));
+    process.env.HOME = sandboxHome;
+    process.env.OPENAI_API_KEY = "sk-existing";
+    process.env.GINI_SKIP_PLIST_REFRESH = "1";
+    try {
+      // The agent passes blank transport fields to clear Azure routing — the
+      // present-blank values clear, swapping back to standard OpenAI.
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "set_provider",
+        "call_1",
+        JSON.stringify({ provider: "openai", baseUrl: "", apiVersion: "", deployment: "" })
+      );
+      expect(result.kind).toBe("sync");
+      expect(config.provider.name).toBe("openai");
+      expect(config.provider.baseUrl).toBe("https://api.openai.com/v1");
+      expect(config.provider.apiVersion).toBeUndefined();
+      expect(config.provider.deployment).toBeUndefined();
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = originalKey;
+      if (originalSkip === undefined) delete process.env.GINI_SKIP_PLIST_REFRESH;
+      else process.env.GINI_SKIP_PLIST_REFRESH = originalSkip;
+      rmSync(sandboxHome, { recursive: true, force: true });
+    }
+  });
+
   test("auto-resolving a self.config op scrubs secret args from the resolved approval payload", async () => {
     const instance = `self-scrub-payload-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance, "auto");
