@@ -1037,19 +1037,21 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
   return undefined;
 }
 
-// Shared loopback boundary check for any tool that reads or executes
-// against the live page. browser_navigate blocks loopback targets up
-// front via safetyCheck, but a page can still settle on a loopback origin
-// afterward — JS navigation, meta-refresh, a link click, or a CDP-attached
-// tab already parked on the control plane. snapshot() calls this before
-// reading page state; browser_console calls it before evaluating agent JS.
-// Returns the block reason (and bounces the page to about:blank,
-// best-effort) when the current origin is disallowed, otherwise undefined.
+// Shared origin boundary check for any tool that reads or executes against
+// the live page. Returns the safetyCheck reason — covering EVERY origin
+// safetyCheck refuses (loopback control-plane, cloud metadata, link-local)
+// — when the page's current URL is disallowed, otherwise undefined; bounces
+// the page to about:blank (best-effort) on a block. browser_navigate blocks
+// these targets up front, but a page can still settle on one afterward via
+// JS navigation, meta-refresh, a link click, or a CDP-attached tab already
+// parked there. snapshot() calls this before reading page state;
+// browser_console before evaluating agent JS; browser_vision before/after
+// the screenshot.
 //
 // Test mocks pass minimal page stubs (often only `evaluate`). Guarding
 // url()/goto() behind typeof keeps those mocks from having to grow a
 // surface just to clear this check.
-async function assertNotLoopbackPage(page: Page): Promise<string | undefined> {
+async function disallowedOriginReason(page: Page): Promise<string | undefined> {
   if (typeof page.url !== "function") return undefined;
   const currentUrl = page.url();
   if (!currentUrl || currentUrl === "about:blank") return undefined;
@@ -1116,7 +1118,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   // (only evaluate is mocked, since the walker only needs DOM
   // access). Guard the url()/goto() calls behind typeof checks so
   // existing unit tests don't have to grow the mock surface.
-  const loopbackBlock = await assertNotLoopbackPage(page);
+  const loopbackBlock = await disallowedOriginReason(page);
   if (loopbackBlock) {
     throw new Error(`${loopbackBlock} (page settled on disallowed URL after a navigation; agent must not inspect this surface)`);
   }
@@ -2088,7 +2090,7 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       // messages (console output the page emitted): the write is already
       // blocked, but returning — or later resurfacing — that state would still
       // leak it, so drop the captured logs too.
-      const postEvalBlock = await assertNotLoopbackPage(session.page);
+      const postEvalBlock = await disallowedOriginReason(session.page);
       if (postEvalBlock) {
         consoleLogs.delete(taskId);
         return fail(`${postEvalBlock} (refusing to return console state from a disallowed origin)`);
@@ -2505,7 +2507,7 @@ export async function browserVision(
       // rendered pixels to the vision provider, so an unguarded screenshot of
       // a loopback page would exfiltrate control-plane state as an image —
       // the same surface browser_console and snapshot() already gate.
-      const visionBlock = await assertNotLoopbackPage(session.page);
+      const visionBlock = await disallowedOriginReason(session.page);
       if (visionBlock) {
         return fail(`${visionBlock} (refusing to screenshot a disallowed origin)`);
       }
@@ -2571,7 +2573,7 @@ export async function browserVision(
       // Re-check after the capture: if the page navigated to a refused origin
       // while the screenshot was in flight, discard the buffer rather than
       // sending its pixels to the vision provider.
-      const postShotBlock = await assertNotLoopbackPage(session.page);
+      const postShotBlock = await disallowedOriginReason(session.page);
       if (postShotBlock) {
         return fail(`${postShotBlock} (page navigated to a disallowed origin during capture; discarding screenshot)`);
       }
@@ -2914,8 +2916,8 @@ export const __test = {
   },
   // Expose the server-side loopback boundary check for direct unit
   // testing — snapshot() and browser_console both gate on it.
-  assertNotLoopbackPageForTest(page: Page): Promise<string | undefined> {
-    return assertNotLoopbackPage(page);
+  disallowedOriginReasonForTest(page: Page): Promise<string | undefined> {
+    return disallowedOriginReason(page);
   },
   // Seed / read the per-task console-log buffer so tests can assert that a
   // blocked browser_console call drops captured control-plane output.

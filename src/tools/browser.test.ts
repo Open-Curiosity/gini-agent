@@ -2799,7 +2799,7 @@ describe("currentDisconnectGeneration", () => {
 // The agent's browser tool is barred from loopback origins so it cannot
 // pivot through the local web control plane to forge bearer-injected BFF
 // writes (issue #193). hostnameIsLoopback is the shared predicate;
-// assertNotLoopbackPage is the server-side page gate reused by snapshot()
+// disallowedOriginReason is the server-side page gate reused by snapshot()
 // and browser_console; browser_console adds an in-page assertion that
 // closes the check-to-use race the server-side gate alone can't.
 describe("hostnameIsLoopback", () => {
@@ -2834,7 +2834,7 @@ describe("hostnameIsLoopback", () => {
   });
 });
 
-describe("assertNotLoopbackPage", () => {
+describe("disallowedOriginReason", () => {
   test("loopback url returns the block reason and bounces to about:blank", async () => {
     let gotoTarget: string | undefined;
     const page = {
@@ -2844,7 +2844,7 @@ describe("assertNotLoopbackPage", () => {
         return null;
       }) as unknown as import("playwright-core").Page["goto"]
     } as unknown as import("playwright-core").Page;
-    const reason = await browserTest.assertNotLoopbackPageForTest(page);
+    const reason = await browserTest.disallowedOriginReasonForTest(page);
     expect(reason).toBeDefined();
     expect(reason!).toContain("loopback");
     expect(gotoTarget).toBe("about:blank");
@@ -2859,24 +2859,24 @@ describe("assertNotLoopbackPage", () => {
         return null;
       }) as unknown as import("playwright-core").Page["goto"]
     } as unknown as import("playwright-core").Page;
-    expect(await browserTest.assertNotLoopbackPageForTest(page)).toBeUndefined();
+    expect(await browserTest.disallowedOriginReasonForTest(page)).toBeUndefined();
     expect(bounced).toBe(false);
   });
 
   test("about:blank, empty url, and missing url() are all treated as safe", async () => {
     const blank = { url: () => "about:blank" } as unknown as import("playwright-core").Page;
-    expect(await browserTest.assertNotLoopbackPageForTest(blank)).toBeUndefined();
+    expect(await browserTest.disallowedOriginReasonForTest(blank)).toBeUndefined();
     const empty = { url: () => "" } as unknown as import("playwright-core").Page;
-    expect(await browserTest.assertNotLoopbackPageForTest(empty)).toBeUndefined();
+    expect(await browserTest.disallowedOriginReasonForTest(empty)).toBeUndefined();
     const noUrl = {} as unknown as import("playwright-core").Page;
-    expect(await browserTest.assertNotLoopbackPageForTest(noUrl)).toBeUndefined();
+    expect(await browserTest.disallowedOriginReasonForTest(noUrl)).toBeUndefined();
   });
 
   test("loopback url with no goto() still returns the reason without throwing", async () => {
     const page = {
       url: () => "http://localhost:7351/"
     } as unknown as import("playwright-core").Page;
-    const reason = await browserTest.assertNotLoopbackPageForTest(page);
+    const reason = await browserTest.disallowedOriginReasonForTest(page);
     expect(reason).toBeDefined();
     expect(reason!).toContain("loopback");
   });
@@ -2888,7 +2888,7 @@ describe("assertNotLoopbackPage", () => {
         throw new Error("navigation crashed");
       }) as unknown as import("playwright-core").Page["goto"]
     } as unknown as import("playwright-core").Page;
-    const reason = await browserTest.assertNotLoopbackPageForTest(page);
+    const reason = await browserTest.disallowedOriginReasonForTest(page);
     expect(reason).toBeDefined();
     expect(reason!).toContain("loopback");
   });
