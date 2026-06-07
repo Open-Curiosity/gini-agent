@@ -49,3 +49,4 @@ Each file in this directory captures one architecture decision: the context, the
 - [Connector-Backed Web Search](web-search-connectors.md)
 - [In-App Doc References Render Inline](in-app-doc-references.md)
 - [Per-Agent Structured Database Primitive](agent-database.md)
+- [In-App Log Viewing](logs-viewing.md)
