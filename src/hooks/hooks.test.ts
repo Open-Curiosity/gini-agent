@@ -96,6 +96,10 @@ describe("pre-run hook primitive", () => {
     clearEchoToolCallingResponses();
     // Register the stub handlers the tests resolve by id.
     __registerHookForTest("test-shortcircuit", async () => ({ kind: "shortCircuit", summary: "[SILENT]" }));
+    __registerHookForTest("test-shortcircuit-notice", async () => ({
+      kind: "shortCircuit",
+      summary: "A large backlog accumulated; not drafting replies to all of them."
+    }));
     __registerHookForTest("test-context", async () => ({
       kind: "context",
       items: [{ text: "<<<INJECTED-FENCE>>>\nmatched data\n<<<END>>>", untrusted: false }]
@@ -208,6 +212,61 @@ describe("pre-run hook primitive", () => {
       (a) => a.action === "job.oneshot.completed" && a.target === job.id
     );
     expect(audit).toBeDefined();
+  });
+
+  test("a non-silent short-circuit summary posts exactly one assistant message (no model turn)", async () => {
+    // A short-circuiting hook can surface a one-off notice WITHOUT a model turn:
+    // a non-silent summary is delivered as a runtime-authored assistant message
+    // into the job's chat session. Pin that exactly one assistant message lands
+    // and no task was spawned.
+    const config = buildConfig(workspaceRoot, "hook-sc-notice");
+    const sessionId = "session_sc_notice";
+    await createSession(config, sessionId);
+    const job = await createScheduledJob(config, {
+      name: "sc-notice",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-shortcircuit-notice", config: {} }
+    });
+
+    const result = await runJobNow(config, job.id, "manual");
+    expect((result as { shortCircuited?: boolean }).shortCircuited).toBe(true);
+
+    const state = readState(config.instance);
+    // No model turn / task spawned.
+    expect(state.tasks.filter((t) => t.jobId === job.id)).toHaveLength(0);
+    // Exactly one assistant message materialized into the job's session, carrying
+    // the notice text.
+    const assistantMsgs = state.chatMessages.filter((m) => m.sessionId === sessionId && m.role === "assistant");
+    expect(assistantMsgs).toHaveLength(1);
+    expect(assistantMsgs[0]!.content).toContain("large backlog accumulated");
+    // No suppression audit for a delivered notice.
+    const suppressed = state.audit.find(
+      (a) => a.action === "chat.message.suppressed_silent" && a.target === sessionId
+    );
+    expect(suppressed).toBeUndefined();
+    // The run still finalized completed.
+    expect(state.jobRuns.find((r) => r.jobId === job.id)?.status).toBe("completed");
+  });
+
+  test("a [SILENT] short-circuit posts no assistant message", async () => {
+    const config = buildConfig(workspaceRoot, "hook-sc-silent");
+    const sessionId = "session_sc_silent";
+    await createSession(config, sessionId);
+    const job = await createScheduledJob(config, {
+      name: "sc-silent",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-shortcircuit", config: {} }
+    });
+
+    await runJobNow(config, job.id, "manual");
+    const assistantMsgs = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === sessionId && m.role === "assistant"
+    );
+    expect(assistantMsgs).toHaveLength(0);
   });
 
   test("context injects the fenced item into exactly one spawned turn", async () => {

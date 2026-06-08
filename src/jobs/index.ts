@@ -1,9 +1,8 @@
 import { submitTask } from "../agent";
 import type { JobRecord, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
-import { addAudit, appendEvent, appendLog, appendTrace, createChatSession, createJob, createJobRun, createRun, isTerminalTaskStatus, mutateState, now, readState } from "../state";
+import { addAudit, appendEvent, appendLog, appendTrace, createChatMessage, createChatSession, createJob, createJobRun, createRun, insertChatBlock, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { isKnownHook, runHook, type HookConfig } from "../hooks";
-import { syncChatTaskResult } from "../execution/chat";
 import { spawn } from "bun";
 import { Cron } from "croner";
 
@@ -498,6 +497,52 @@ async function persistHookState(
   });
 }
 
+// Post a hook's short-circuit summary into the job's chat session as a
+// runtime-authored assistant message — NO model turn, no spawned task. This is
+// the generic "a hook can notify without a model turn" capability: a hook that
+// short-circuits (skipping the drafting turn) can still deliver a one-off notice
+// (e.g. the gmail-watch backlog notice). It mirrors the assistant-message
+// materialization syncChatTaskResult uses (a legacy ChatMessageRecord via
+// createChatMessage) AND emits the assistant_text chat block so the same
+// SSE/APNs notify path the chat UI listens on fires. The caller has already
+// filtered out the empty/"[SILENT]" case, so this always has real content to
+// deliver.
+async function deliverHookSummary(
+  config: RuntimeConfig,
+  sessionId: string,
+  summary: string
+): Promise<void> {
+  const message = await mutateState(config.instance, (state) => {
+    // A session deleted between the claim and here drops the delivery — match
+    // syncChatTaskResult's "missing session" handling (skip, don't orphan).
+    if (!state.chatSessions.some((s) => s.id === sessionId)) return undefined;
+    return createChatMessage(state, { sessionId, role: "assistant", content: summary });
+  });
+  if (!message) return;
+  // Dual-publish the assistant_text ChatBlock so the per-session SSE stream (and
+  // the block-protocol web/mobile UI) sees the message. Best-effort: a SQLite
+  // failure here must not roll back the legacy ChatMessageRecord above (mirrors
+  // submitChatMessage's user_text dual-publish tolerance).
+  try {
+    const block = insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId,
+      text: summary,
+      streaming: false
+    });
+    if (block.kind === "assistant_text") {
+      // The APNs dispatcher fires its completion alert on a terminal `phase`
+      // block, so emit one so a backgrounded device is woken for the notice.
+      insertChatBlock(config.instance, { kind: "phase", sessionId, label: "Completed" });
+    }
+  } catch (error) {
+    appendLog(config.instance, "job.hook.notify.error", {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
 // Finalize a short-circuited run with NO model turn. The run never spawned a
 // task (no taskId), so we finalize it INLINE by run.id rather than routing a
 // synthetic Task through finalizeJobRunFromTask — that path's chat sync calls
@@ -510,11 +555,13 @@ async function persistHookState(
 // lastSuccessAt + cleared lastError, oneShot auto-pause + its audit, and the
 // job.run.completed event.
 //
-// Delivery: a short-circuited run has nothing to materialize into chat, so we
-// emit the chat.message.suppressed_silent audit explicitly for the silent/empty
-// case (preserving the suppression audit the dead path used to produce only by a
-// swallowed throw). syncChatTaskResult is reached only in the theoretical edge
-// of a genuinely non-silent summary attached to a real spawned task.
+// Delivery: a silent/empty summary delivers nothing and emits the
+// chat.message.suppressed_silent audit explicitly (preserving the suppression
+// audit the dead path used to produce only by a swallowed throw). A genuinely
+// NON-silent summary IS delivered — posted directly into the job's chat session
+// as a runtime-authored assistant message via deliverHookSummary (no model turn,
+// no spawned task), which is how a short-circuiting hook surfaces a one-off
+// notice (the gmail-watch backlog notice).
 //
 // A cancelTask that landed between the claim and here already flipped the run
 // terminal, so the `status === "running"` guard makes this a no-op (no double
@@ -596,19 +643,12 @@ async function finalizeShortCircuit(
     return { taskId: runItem.taskId };
   });
 
-  // Only deliver when there's a genuinely non-silent summary AND a real spawned
-  // task to materialize — a short-circuited run normally has neither.
-  if (outcome && !isSilent && outcome.taskId && job.chatSessionId) {
-    try {
-      await syncChatTaskResult(config, job.chatSessionId, outcome.taskId);
-    } catch (error) {
-      appendLog(config.instance, "job.chat.sync.error", {
-        jobId: job.id,
-        taskId: outcome.taskId,
-        sessionId: job.chatSessionId,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    }
+  // Deliver a genuinely non-silent summary as a runtime-authored assistant
+  // message (no model turn) so a short-circuiting hook can still surface a
+  // one-off notice. Only runs when the run actually finalized here (outcome
+  // defined) and the job is bound to a chat session.
+  if (outcome && !isSilent && job.chatSessionId) {
+    await deliverHookSummary(config, job.chatSessionId, trimmed);
   }
 }
 
