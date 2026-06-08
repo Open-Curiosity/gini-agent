@@ -3206,6 +3206,15 @@ describe("auth-error classification", () => {
     expect(redactSecrets("denied key ABSKQmVkcm9ja0FQSUtleS1hYmNkZWZnaGlqaz0099 is invalid")).toBe(
       "denied key ABSK*** is invalid"
     );
+    // AWS SigV4 (aws-sigv4 Bedrock path): the access key id and the request
+    // signature are masked. The secret access key never appears on the wire.
+    expect(
+      redactSecrets(
+        `Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260608/us-east-1/bedrock-mantle/aws4_request, SignedHeaders=host, Signature=${"a".repeat(64)}`
+      )
+    ).toBe(
+      "Authorization: AWS4-HMAC-SHA256 Credential=AWS-ACCESS-KEY-***/20260608/us-east-1/bedrock-mantle/aws4_request, SignedHeaders=host, Signature=***"
+    );
   });
 
   test("providerAuthNote builds the note text + routing metadata", () => {
@@ -3881,6 +3890,143 @@ describe("anthropic provider", () => {
     } finally {
       restoreCustom();
       restoreCanonical();
+    }
+  });
+
+  test("aws-sigv4: SigV4-signs the Bedrock Mantle request instead of x-api-key", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({
+        name: "anthropic",
+        model: "claude-opus-4-8",
+        baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+        authMode: "aws-sigv4"
+      });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      const call = fetchStub.calls[0]!;
+      // Same endpoint + body as the bearer path — only the auth headers differ.
+      expect(call.url).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages");
+      const headers = call.init.headers as Record<string, string>;
+      expect(headers["x-api-key"]).toBeUndefined();
+      expect(headers["authorization"]).toMatch(
+        /^AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE\/\d{8}\/us-east-1\/bedrock-mantle\/aws4_request, SignedHeaders=anthropic-version;content-type;host;x-amz-content-sha256;x-amz-date, Signature=[0-9a-f]{64}$/
+      );
+      expect(headers["x-amz-date"]).toMatch(/^\d{8}T\d{6}Z$/);
+      expect(headers["x-amz-content-sha256"]).toMatch(/^[0-9a-f]{64}$/);
+      // Bedrock baseUrl still auto-maps the clean id to the anthropic. form.
+      expect(JSON.parse(String(call.init.body)).model).toBe("anthropic.claude-opus-4-8");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("aws-sigv4: providerHealth is configured when AWS credentials resolve", () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    try {
+      const health = providerHealth(
+        config(
+          normalizeProvider({
+            name: "anthropic",
+            model: "claude-opus-4-8",
+            baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+            authMode: "aws-sigv4"
+          })
+        )
+      );
+      expect(health.configured).toBe(true);
+      expect(health.message).toContain("AWS SigV4");
+    } finally {
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("aws-sigv4: providerHealth is not-configured when no AWS credentials resolve", () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", undefined);
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", undefined);
+    const restoreFile = setEnv("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/gini-test/credentials");
+    const restoreProfile = setEnv("AWS_PROFILE", undefined);
+    try {
+      const health = providerHealth(
+        config(
+          normalizeProvider({
+            name: "anthropic",
+            model: "claude-opus-4-8",
+            baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+            authMode: "aws-sigv4"
+          })
+        )
+      );
+      expect(health.configured).toBe(false);
+      expect(health.message).toMatch(/Set AWS credentials/);
+    } finally {
+      restoreProfile();
+      restoreFile();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("aws-sigv4: errors when no AWS credentials resolve", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", undefined);
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", undefined);
+    const restoreFile = setEnv("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/gini-test/credentials");
+    const restoreProfile = setEnv("AWS_PROFILE", undefined);
+    const fetchStub = installFetch(() =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [], stop_reason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({
+        name: "anthropic",
+        model: "claude-opus-4-8",
+        baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+        authMode: "aws-sigv4"
+      });
+      await expect(
+        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
+      ).rejects.toThrow(/no AWS credentials resolved/);
+    } finally {
+      fetchStub.restore();
+      restoreProfile();
+      restoreFile();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("aws-sigv4: errors when no AWS region resolves", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const restoreRegion = setEnv("AWS_REGION", undefined);
+    const restoreDefRegion = setEnv("AWS_DEFAULT_REGION", undefined);
+    const fetchStub = installFetch(() =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [], stop_reason: "end_turn", usage: {} })
+    );
+    try {
+      // A non-Bedrock host has no region to parse; with no awsRegion/AWS_REGION,
+      // region resolution fails before any request is signed.
+      const provider = normalizeProvider({
+        name: "anthropic",
+        model: "claude-opus-4-8",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "aws-sigv4"
+      });
+      await expect(
+        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
+      ).rejects.toThrow(/no AWS region resolved/);
+    } finally {
+      fetchStub.restore();
+      restoreDefRegion();
+      restoreRegion();
+      restoreSk();
+      restoreAk();
     }
   });
 

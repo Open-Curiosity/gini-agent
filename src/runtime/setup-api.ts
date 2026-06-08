@@ -137,12 +137,18 @@ export async function setSetupProvider(
     const existing = config.provider?.name === providerName ? config.provider : undefined;
     const targetEnvVar = existing?.apiKeyEnv ?? envKeySpec.envVar;
     const apiKey = typeof payload.apiKey === "string" ? payload.apiKey.trim() : "";
+    // anthropic supports an AWS SigV4 auth mode that signs each request with IAM
+    // credentials (AWS env vars / ~/.aws) instead of a bearer key — so it needs
+    // no apiKey. Honor an explicit payload.authMode, else preserve the active
+    // provider's mode so a model/region edit doesn't flip it back to bearer.
+    const authMode = typeof payload.authMode === "string" ? payload.authMode : existing?.authMode;
+    const sigv4 = providerName === "anthropic" && authMode === "aws-sigv4";
     // Accept a no-key payload when the env var is already set — the Edit
-    // Provider dialog uses this to update just the model/baseUrl without
-    // making the user re-type their key. Initial Add Provider still requires a
-    // key because the env var is empty there.
+    // Provider dialog uses this to update just the model/baseUrl without making
+    // the user re-type their key. Initial Add Provider still requires a key
+    // because the env var is empty there. SigV4 mode never needs a key.
     const envAlreadySet = Boolean(process.env[targetEnvVar]);
-    if (!apiKey && !envKeySpec.allowEmptyKey && !envAlreadySet) {
+    if (!sigv4 && !apiKey && !envKeySpec.allowEmptyKey && !envAlreadySet) {
       return {
         ok: false,
         provider: providerHealth(config),
@@ -171,11 +177,19 @@ export async function setSetupProvider(
     const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
       ? payload.baseUrl.trim()
       : existing?.baseUrl;
+    const awsRegion = typeof payload.awsRegion === "string" && payload.awsRegion.trim().length > 0
+      ? payload.awsRegion.trim()
+      : existing?.awsRegion;
     config.provider = normalizeProvider({
       name: providerName as ProviderConfig["name"],
       model,
       ...(baseUrl ? { baseUrl } : {}),
-      ...(existing?.apiKeyEnv ? { apiKeyEnv: existing.apiKeyEnv } : {})
+      ...(existing?.apiKeyEnv ? { apiKeyEnv: existing.apiKeyEnv } : {}),
+      ...(sigv4 ? { authMode: "aws-sigv4" as const } : {}),
+      ...(sigv4 && awsRegion ? { awsRegion } : {}),
+      ...(sigv4 && existing?.awsAccessKeyIdEnv ? { awsAccessKeyIdEnv: existing.awsAccessKeyIdEnv } : {}),
+      ...(sigv4 && existing?.awsSecretAccessKeyEnv ? { awsSecretAccessKeyEnv: existing.awsSecretAccessKeyEnv } : {}),
+      ...(sigv4 && existing?.awsSessionTokenEnv ? { awsSessionTokenEnv: existing.awsSessionTokenEnv } : {})
     });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 

@@ -119,6 +119,26 @@ describe("provider CLI", () => {
     expect(persisted.provider.apiKeyEnv).toBe("BEDROCK_BEARER_TOKEN");
   });
 
+  test("set anthropic --auth-mode aws-sigv4 persists the SigV4 auth mode + region", async () => {
+    const ctx = makeCtx([
+      "provider", "set", "anthropic",
+      "--base-url", "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      "--auth-mode", "aws-sigv4",
+      "--aws-region", "us-east-1"
+    ]);
+    await provider(ctx);
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.authMode).toBe("aws-sigv4");
+    expect(persisted.provider.awsRegion).toBe("us-east-1");
+    expect(persisted.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+  });
+
+  test("set rejects an invalid --auth-mode value", async () => {
+    const ctx = makeCtx(["provider", "set", "anthropic", "--auth-mode", "sigv5"]);
+    await expect(provider(ctx)).rejects.toThrow(/--auth-mode must be/);
+  });
+
   test("set anthropic with no model falls back to the catalog default", async () => {
     await provider(makeCtx(["provider", "set", "anthropic"]));
     const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");

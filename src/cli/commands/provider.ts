@@ -7,7 +7,7 @@ import { api } from "../api";
 import { print } from "../output";
 import { maybeRefreshAutostart } from "./autostart";
 
-const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deepseek|anthropic [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]";
+const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deepseek|anthropic [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>] [--auth-mode bearer|aws-sigv4] [--aws-region <region>]";
 
 // Single source of truth for value-bearing flags on `gini provider set`.
 // `parseSubArgs` uses this to both partition positionals and extract flag
@@ -16,7 +16,9 @@ const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deeps
 const PROVIDER_SET_FLAGS: ReadonlySet<string> = new Set([
   "--base-url",
   "--api-key-env",
-  "--extra-body"
+  "--extra-body",
+  "--auth-mode",
+  "--aws-region"
 ]);
 
 export async function provider(ctx: CliContext): Promise<void> {
@@ -69,6 +71,14 @@ export async function provider(ctx: CliContext): Promise<void> {
       extraBody = parsed as Record<string, unknown>;
     }
 
+    // anthropic AWS SigV4 mode: sign each request with IAM credentials instead
+    // of a bearer key (region is parsed from the Bedrock host when omitted).
+    const authMode = flags["--auth-mode"];
+    const awsRegion = flags["--aws-region"];
+    if (authMode !== undefined && authMode !== "bearer" && authMode !== "aws-sigv4") {
+      throw new Error(`--auth-mode must be "bearer" or "aws-sigv4"\n${USAGE}`);
+    }
+
     // Echo bypasses HTTP entirely and ignores every flag.
     // Codex uses /responses with its own request shape, so it ignores
     // --extra-body — but it DOES honor --base-url (the codex backend URL)
@@ -91,7 +101,9 @@ export async function provider(ctx: CliContext): Promise<void> {
       model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.5" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : name === "deepseek" ? "deepseek-v4-flash" : name === "anthropic" ? "claude-opus-4-8" : "gpt-5.4-mini"),
       ...(baseUrl ? { baseUrl } : {}),
       ...(apiKeyEnv ? { apiKeyEnv } : {}),
-      ...(extraBody ? { extraBody } : {})
+      ...(extraBody ? { extraBody } : {}),
+      ...(name === "anthropic" && authMode === "aws-sigv4" ? { authMode: "aws-sigv4" as const } : {}),
+      ...(name === "anthropic" && authMode === "aws-sigv4" && awsRegion ? { awsRegion } : {})
     });
     writeRuntimeConfig(config);
     // If an autostart plist already exists for this instance, refresh it

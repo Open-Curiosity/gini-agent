@@ -6,6 +6,7 @@ import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
 import { resolveProviderModality } from "./provider-capabilities";
+import { resolveAwsCredentials, resolveAwsRegion, signAwsRequest } from "./aws-sigv4";
 import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -52,6 +53,24 @@ export function providerHealth(config: RuntimeConfig) {
       message: credentials.ok
         ? `Codex credentials are available from ${credentials.authPath}.`
         : credentials.message
+    };
+  }
+
+  if (provider.name === "anthropic" && provider.authMode === "aws-sigv4") {
+    const configured = Boolean(
+      resolveAwsCredentials({
+        accessKeyIdEnv: provider.awsAccessKeyIdEnv,
+        secretAccessKeyEnv: provider.awsSecretAccessKeyEnv,
+        sessionTokenEnv: provider.awsSessionTokenEnv
+      })
+    );
+    return {
+      ok: configured,
+      provider,
+      configured,
+      message: configured
+        ? "anthropic provider is configured (AWS SigV4)."
+        : "Set AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials) to use the anthropic provider in aws-sigv4 mode."
     };
   }
 
@@ -288,6 +307,12 @@ export function redactSecrets(text: string): string {
     // shape from the short-term token above, so match the prefix and mask the
     // base64 body. See AWS "Securing Amazon Bedrock API keys".
     .replace(/\bABSK[A-Za-z0-9+\/]{16,}={0,2}/g, "ABSK***")
+    // AWS SigV4 wire exposure (aws-sigv4 Bedrock path): the access key id
+    // (AKIA…/ASIA…) rides in the Authorization `Credential=`, and the per-request
+    // signature in `Signature=`. Mask both. The secret access key never goes on
+    // the wire — it only derives the signature locally — so it can't leak here.
+    .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "AWS-ACCESS-KEY-***")
+    .replace(/Signature=[0-9a-f]{64}/gi, "Signature=***")
     .replace(/\bBearer\s+[A-Za-z0-9._-]{6,}/gi, "Bearer ***")
     .replace(/\b(api[_-]?key|token|secret|password)(["'\s:=]+)[A-Za-z0-9._-]{6,}/gi, "$1$2***");
 }
@@ -1258,7 +1283,6 @@ async function callAnthropicMessages(
   // loop omits it and the default (or extraBody.max_tokens) applies.
   maxTokensOverride?: number
 ): Promise<ToolCallingResult> {
-  const apiKey = readAnthropicKey(provider);
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
   // The builder owns the /v1/messages path. Tolerate a baseUrl that already
   // carries it (a common habit from OpenAI-style baseUrls that include /v1) by
@@ -1289,15 +1313,16 @@ async function callAnthropicMessages(
     body.tool_choice = { type: "auto" };
   }
 
+  const bodyJson = JSON.stringify(body);
   const response = await fetch(messagesUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-api-key": apiKey,
       "anthropic-version": ANTHROPIC_VERSION,
-      ...(wantStream ? { accept: "text/event-stream" } : {})
+      ...(wantStream ? { accept: "text/event-stream" } : {}),
+      ...anthropicAuthHeaders(provider, messagesUrl, bodyJson)
     },
-    body: JSON.stringify(body)
+    body: bodyJson
   });
 
   if (wantStream) {
@@ -1311,6 +1336,41 @@ async function callAnthropicMessages(
     throw new Error(readOpenAIError(payload) ?? fallback);
   }
   return parseAnthropicMessage(payload, provider);
+}
+
+// Build the auth headers for a Messages request. Default ("bearer") carries the
+// configured credential in `x-api-key`. "aws-sigv4" instead SigV4-signs the
+// request with IAM credentials (service "bedrock-mantle") — the body and URL are
+// unchanged, so only the returned headers differ. The content-type and
+// anthropic-version headers are folded into the signature because the fetch
+// sends them too; `accept` (streaming) is sent unsigned, which SigV4 permits.
+function anthropicAuthHeaders(provider: ProviderConfig, url: string, body: string): Record<string, string> {
+  if (provider.authMode === "aws-sigv4") {
+    const credentials = resolveAwsCredentials({
+      accessKeyIdEnv: provider.awsAccessKeyIdEnv,
+      secretAccessKeyEnv: provider.awsSecretAccessKeyEnv,
+      sessionTokenEnv: provider.awsSessionTokenEnv
+    });
+    if (!credentials) {
+      throw new Error(
+        "anthropic provider is set to aws-sigv4 but no AWS credentials resolved (set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials)."
+      );
+    }
+    const region = resolveAwsRegion({ awsRegion: provider.awsRegion, url });
+    if (!region) {
+      throw new Error("anthropic provider is set to aws-sigv4 but no AWS region resolved (set awsRegion or AWS_REGION).");
+    }
+    return signAwsRequest({
+      method: "POST",
+      url,
+      body,
+      region,
+      service: "bedrock-mantle",
+      credentials,
+      extraSignedHeaders: { "content-type": "application/json", "anthropic-version": ANTHROPIC_VERSION }
+    });
+  }
+  return { "x-api-key": readAnthropicKey(provider) };
 }
 
 // Read the token for the x-api-key header from the configured env var
@@ -2338,6 +2398,11 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || DEFAULT_ANTHROPIC_MODEL,
       baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_ANTHROPIC_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv ?? "ANTHROPIC_API_KEY",
+      ...(provider.authMode === "aws-sigv4" ? { authMode: "aws-sigv4" as const } : {}),
+      ...(provider.awsRegion ? { awsRegion: provider.awsRegion } : {}),
+      ...(provider.awsAccessKeyIdEnv ? { awsAccessKeyIdEnv: provider.awsAccessKeyIdEnv } : {}),
+      ...(provider.awsSecretAccessKeyEnv ? { awsSecretAccessKeyEnv: provider.awsSecretAccessKeyEnv } : {}),
+      ...(provider.awsSessionTokenEnv ? { awsSessionTokenEnv: provider.awsSessionTokenEnv } : {}),
       ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }

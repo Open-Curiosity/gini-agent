@@ -23,6 +23,7 @@ import {
 import { AnthropicLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
+import { providerAuthLabel } from "./providerAuth";
 import { EditProviderDialog } from "./EditProviderDialog";
 
 // Providers whose credentials are env-keyed and therefore safe to remove
@@ -81,11 +82,15 @@ interface SetProviderResult {
 export function ProviderCard({
   catalog,
   activeProviderName,
-  activeProviderModel
+  activeProviderModel,
+  activeProviderAuthMode,
+  activeProviderAwsRegion
 }: {
   catalog: ProviderCatalogItem[];
   activeProviderName?: string;
   activeProviderModel?: string;
+  activeProviderAuthMode?: string;
+  activeProviderAwsRegion?: string;
 }) {
   const invalidate = useInvalidate();
   const rows = SELECTABLE_PROVIDERS
@@ -188,6 +193,9 @@ export function ProviderCard({
             : "border-[#3A3A40]";
           const visual = PROVIDER_VISUAL[row.name] ?? { icon: TerminalIcon, authLabel: row.auth };
           const Icon = visual.icon;
+          // Only the active provider has a persisted authMode, so other rows
+          // keep their static label. SigV4 retitles the chip to "AWS SigV4".
+          const authLabel = providerAuthLabel(isActive ? activeProviderAuthMode : undefined, visual.authLabel);
           const model = isActive
             ? (activeProviderModel ?? row.models[0] ?? "")
             : (row.models[0] ?? "");
@@ -236,7 +244,7 @@ export function ProviderCard({
                 <div className="flex items-center gap-2.5">
                   <span className="text-[15px] font-semibold text-foreground">{displayProviderName(row)}</span>
                   <span className="rounded-md bg-[#1C1C22] px-2 py-0.5 text-[11px] font-semibold text-[#9A9AA0]">
-                    {visual.authLabel}
+                    {authLabel}
                   </span>
                   {isActive ? (
                     <span className="rounded-md bg-[#14321F] px-2 py-0.5 text-[11px] font-semibold text-[#4ADE80]">
@@ -340,9 +348,14 @@ export function ProviderCard({
       {editingRow ? (
         <EditProviderDialog
           row={editingRow}
-          authLabel={PROVIDER_VISUAL[editingRow.name]?.authLabel ?? editingRow.auth}
+          authLabel={providerAuthLabel(
+            editingRow.name === activeProviderName ? activeProviderAuthMode : undefined,
+            PROVIDER_VISUAL[editingRow.name]?.authLabel ?? editingRow.auth
+          )}
           icon={PROVIDER_VISUAL[editingRow.name]?.icon ?? TerminalIcon}
           currentModel={editingRow.name === activeProviderName ? activeProviderModel : undefined}
+          currentAuthMode={editingRow.name === activeProviderName ? activeProviderAuthMode : undefined}
+          currentAwsRegion={editingRow.name === activeProviderName ? activeProviderAwsRegion : undefined}
           open={Boolean(editingRow)}
           onOpenChange={(open) => {
             if (!open) setEditingRow(null);

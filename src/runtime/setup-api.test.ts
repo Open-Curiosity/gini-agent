@@ -296,6 +296,49 @@ describe("setup-api", () => {
     }
   });
 
+  test("anthropic aws-sigv4: configures with no apiKey and persists authMode + region", async () => {
+    const result = await setSetupProvider(config, {
+      provider: "anthropic",
+      model: "claude-opus-4-8",
+      baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      authMode: "aws-sigv4",
+      awsRegion: "us-east-1"
+    });
+    // No apiKey supplied, yet it succeeds — SigV4 signs with IAM creds, not a key.
+    expect(result.ok).toBe(true);
+    expect(config.provider.name).toBe("anthropic");
+    expect(config.provider.authMode).toBe("aws-sigv4");
+    expect(config.provider.awsRegion).toBe("us-east-1");
+    expect(config.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+  });
+
+  test("anthropic: switching from SigV4 to bearer clears authMode/region and writes the key", async () => {
+    // The Edit dialog opens reflecting a SigV4 provider and sends an explicit
+    // authMode: "bearer" to downgrade, so the persisted sigv4 fields must drop
+    // and the new key must land (a model-only edit would omit authMode instead,
+    // which preserves the mode).
+    config.provider = {
+      name: "anthropic",
+      model: "claude-opus-4-8",
+      baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      apiKeyEnv: "ANTHROPIC_API_KEY",
+      authMode: "aws-sigv4",
+      awsRegion: "us-east-1"
+    };
+    const result = await setSetupProvider(config, {
+      provider: "anthropic",
+      model: "claude-opus-4-8",
+      authMode: "bearer",
+      apiKey: "sk-ant-downgrade"
+    });
+    expect(result.ok).toBe(true);
+    expect(config.provider.authMode).toBeUndefined();
+    expect(config.provider.awsRegion).toBeUndefined();
+    // baseUrl is preserved (omitted in the payload on the still-active provider).
+    expect(config.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+    expect(process.env.ANTHROPIC_API_KEY).toBe("sk-ant-downgrade");
+  });
+
   test("remove rejects codex, local, and unknown providers", () => {
     expect(removeSetupProvider(config, "codex")).toMatchObject({ ok: false, error: expect.stringContaining("codex CLI") });
     expect(removeSetupProvider(config, "local")).toMatchObject({ ok: false });

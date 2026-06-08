@@ -17,6 +17,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { AnthropicLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
+import { authPayloadFields } from "../_components/providerAuth";
 import { displayProviderName, type ProviderCatalogItem } from "../_components/ProviderCard";
 
 // Codex stays first so it lines up with where the Settings list shows
@@ -63,6 +64,10 @@ export default function AddProviderPage() {
   // the base URL at "https://bedrock-mantle.<region>.api.aws/anthropic" (with
   // a minted bearer token in the key field) targets Claude in Amazon Bedrock.
   const [baseUrl, setBaseUrl] = useState("");
+  // anthropic auth mode (see EditProviderDialog). "aws-sigv4" signs each request
+  // with AWS IAM credentials and needs no API key; awsRegion is optional.
+  const [authMode, setAuthMode] = useState<"bearer" | "aws-sigv4">("bearer");
+  const [awsRegion, setAwsRegion] = useState("");
 
   // Seed once the catalog arrives: honor a ?provider= preselection from the
   // settings list (Edit button on a row), else fall back to the first tile.
@@ -79,13 +84,17 @@ export default function AddProviderPage() {
     setSelectedModel(entry?.models[0] ?? "");
     setApiKey("");
     setBaseUrl("");
+    setAuthMode("bearer");
+    setAwsRegion("");
   };
 
   const entry = tiles.find((t) => t.name === providerName);
   const isCodex = providerName === "codex";
   const isLocal = providerName === "local";
   const isAnthropic = providerName === "anthropic";
-  const requiresApiKey = providerName !== "" && !isCodex && !isLocal;
+  const sigv4 = isAnthropic && authMode === "aws-sigv4";
+  // SigV4 signs with IAM credentials, so no API key is required in that mode.
+  const requiresApiKey = providerName !== "" && !isCodex && !isLocal && !sigv4;
 
   const save = useMutation({
     mutationFn: async (): Promise<SetProviderResult> => {
@@ -104,7 +113,8 @@ export default function AddProviderPage() {
           provider: providerName,
           ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
           ...(selectedModel ? { model: selectedModel } : {}),
-          ...(baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {})
+          ...(baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
+          ...authPayloadFields(isAnthropic, authMode, awsRegion)
         })
       });
     },
@@ -225,6 +235,19 @@ export default function AddProviderPage() {
               </div>
             ) : (
               <>
+                {isAnthropic ? (
+                  <div className="grid gap-2">
+                    <Label htmlFor="provider-auth-mode">Authentication</Label>
+                    <Select value={authMode} onValueChange={(v) => setAuthMode(v as "bearer" | "aws-sigv4")} disabled={save.isPending}>
+                      <SelectTrigger id="provider-auth-mode"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="bearer">API key (x-api-key)</SelectItem>
+                        <SelectItem value="aws-sigv4">AWS SigV4 (IAM credentials)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                ) : null}
+
                 {requiresApiKey ? (
                   <div className="grid gap-2">
                     <Label htmlFor="provider-api-key">API key</Label>
@@ -237,6 +260,24 @@ export default function AddProviderPage() {
                       onChange={(e) => setApiKey(e.target.value)}
                       disabled={save.isPending}
                     />
+                  </div>
+                ) : null}
+
+                {sigv4 ? (
+                  <div className="grid gap-2">
+                    <Label htmlFor="provider-aws-region">
+                      AWS region <span className="text-muted-foreground">(optional)</span>
+                    </Label>
+                    <Input
+                      id="provider-aws-region"
+                      type="text"
+                      autoComplete="off"
+                      placeholder="e.g. us-east-1 — blank infers from the Base URL"
+                      value={awsRegion}
+                      onChange={(e) => setAwsRegion(e.target.value)}
+                      disabled={save.isPending}
+                    />
+                    <p className="text-xs text-muted-foreground">Signs with your AWS credentials (AWS_ACCESS_KEY_ID/SECRET or ~/.aws). No API key needed.</p>
                   </div>
                 ) : null}
 

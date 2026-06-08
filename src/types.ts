@@ -168,6 +168,26 @@ export interface ProviderConfig {
   model: string;
   baseUrl?: string;
   apiKeyEnv?: string;
+  // Auth shape for the anthropic provider. Default ("bearer", or omitted) sends
+  // the credential from `apiKeyEnv` in the `x-api-key` header — a first-party
+  // sk-ant key or a Bedrock API key. "aws-sigv4" instead SigV4-signs each
+  // Bedrock Mantle request with AWS IAM credentials (service "bedrock-mantle"),
+  // the durable path: long-lived IAM access keys never expire and need no token
+  // minting or refresh. The request URL, body, and SSE streaming are identical
+  // between the two modes; only the auth headers differ. Ignored by non-anthropic
+  // providers.
+  authMode?: "bearer" | "aws-sigv4";
+  // SigV4 signing region (aws-sigv4 mode). When omitted, parsed from the Bedrock
+  // host, then AWS_REGION / AWS_DEFAULT_REGION.
+  awsRegion?: string;
+  // Env vars holding the AWS credentials for aws-sigv4 mode. When omitted, the
+  // standard AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN are
+  // read, falling back to ~/.aws/credentials for the AWS_PROFILE (or "default")
+  // profile. Only env-var NAMES live in config; the secret values stay in the
+  // environment / ~/.aws and never touch config.json — same boundary as apiKeyEnv.
+  awsAccessKeyIdEnv?: string;
+  awsSecretAccessKeyEnv?: string;
+  awsSessionTokenEnv?: string;
   // Provider-specific request fields merged into chat-completions request
   // bodies (tool-calling, structured JSON, vision, and the chat-completions
   // branch of generateTaskSummary). The local and openrouter providers route

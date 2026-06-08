@@ -1,0 +1,174 @@
+// Minimal AWS Signature Version 4 signer for the Bedrock Mantle path.
+//
+// gini's anthropic provider reaches Claude on Amazon Bedrock by POSTing the
+// native Messages API to `https://bedrock-mantle.{region}.api.aws/anthropic`.
+// That endpoint accepts two auth shapes for the SAME request: a bearer token in
+// `x-api-key` (a short-term or long-term Bedrock API key), or a SigV4 signature
+// over the request using long-lived IAM credentials. The bearer is simple but
+// short-term tokens expire; SigV4 with IAM access keys never expires and needs
+// no minting — so it is the durable option (`authMode: "aws-sigv4"`).
+//
+// This module implements exactly what that path needs with `node:crypto` (no
+// AWS SDK dependency): the SigV4 canonical-request → string-to-sign → signing-
+// key HMAC chain → signature, plus credential/region resolution from the
+// standard env vars and `~/.aws/credentials`. The SigV4 service name for the
+// Mantle endpoint is `bedrock-mantle` (NOT `bedrock`, which is the legacy
+// bedrock-runtime InvokeModel surface).
+import { createHash, createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+export interface AwsCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  // Present only for temporary (STS) credentials; long-lived IAM access keys
+  // omit it. When present it is sent as x-amz-security-token.
+  sessionToken?: string;
+}
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function hmac(key: string | Buffer, value: string): Buffer {
+  return createHmac("sha256", key).update(value, "utf8").digest();
+}
+
+// `2026-06-08T18:00:00.000Z` -> `20260608T180000Z` (SigV4 x-amz-date).
+function amzDate(now: Date): string {
+  return now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+}
+
+// Sign a request and return the auth headers to merge into the outgoing fetch.
+// `extraSignedHeaders` are non-SigV4 headers (e.g. content-type,
+// anthropic-version) that are also sent on the request and must therefore be
+// folded into the signature — their names/values have to match the fetch
+// exactly. `host`, `x-amz-date`, and `x-amz-content-sha256` are always signed.
+export function signAwsRequest(opts: {
+  method: string;
+  url: string;
+  body: string;
+  region: string;
+  service: string;
+  credentials: AwsCredentials;
+  extraSignedHeaders?: Record<string, string>;
+  now?: Date;
+}): Record<string, string> {
+  const now = opts.now ?? new Date();
+  const url = new URL(opts.url);
+  const stamp = amzDate(now);
+  const dateStamp = stamp.slice(0, 8);
+  const payloadHash = sha256Hex(opts.body);
+
+  const signed: Record<string, string> = {
+    host: url.host,
+    "x-amz-content-sha256": payloadHash,
+    "x-amz-date": stamp
+  };
+  for (const [name, value] of Object.entries(opts.extraSignedHeaders ?? {})) {
+    signed[name.toLowerCase()] = value;
+  }
+
+  const names = Object.keys(signed).sort();
+  const canonicalHeaders = names.map((n) => `${n}:${signed[n]!.trim()}\n`).join("");
+  const signedHeaders = names.join(";");
+
+  const canonicalRequest = [
+    opts.method,
+    url.pathname,
+    "",
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash
+  ].join("\n");
+
+  const scope = `${dateStamp}/${opts.region}/${opts.service}/aws4_request`;
+  const stringToSign = [
+    "AWS4-HMAC-SHA256",
+    stamp,
+    scope,
+    sha256Hex(canonicalRequest)
+  ].join("\n");
+
+  const kDate = hmac(`AWS4${opts.credentials.secretAccessKey}`, dateStamp);
+  const kRegion = hmac(kDate, opts.region);
+  const kService = hmac(kRegion, opts.service);
+  const kSigning = hmac(kService, "aws4_request");
+  const signature = createHmac("sha256", kSigning).update(stringToSign, "utf8").digest("hex");
+
+  const headers: Record<string, string> = {
+    authorization: `AWS4-HMAC-SHA256 Credential=${opts.credentials.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+    "x-amz-date": stamp,
+    "x-amz-content-sha256": payloadHash
+  };
+  if (opts.credentials.sessionToken) headers["x-amz-security-token"] = opts.credentials.sessionToken;
+  return headers;
+}
+
+// Resolve AWS credentials for signing. Precedence: the env vars named in config
+// (default AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN), then
+// the `~/.aws/credentials` profile (AWS_PROFILE, else "default"). Returns null
+// when no usable credentials are found. Secret values never enter config — only
+// env-var names do — so this reads them from the environment / ~/.aws at call
+// time, matching the AWS CLI's own resolution.
+export function resolveAwsCredentials(opts: {
+  accessKeyIdEnv?: string;
+  secretAccessKeyEnv?: string;
+  sessionTokenEnv?: string;
+}): AwsCredentials | null {
+  const accessKeyId = process.env[opts.accessKeyIdEnv ?? "AWS_ACCESS_KEY_ID"];
+  const secretAccessKey = process.env[opts.secretAccessKeyEnv ?? "AWS_SECRET_ACCESS_KEY"];
+  if (accessKeyId && secretAccessKey) {
+    const sessionToken = process.env[opts.sessionTokenEnv ?? "AWS_SESSION_TOKEN"];
+    return { accessKeyId, secretAccessKey, sessionToken: sessionToken || undefined };
+  }
+  return readAwsProfileCredentials(process.env.AWS_PROFILE ?? "default");
+}
+
+// Parse ~/.aws/credentials (INI) for one profile. No `ini` dependency: the
+// credentials file is a flat list of `[profile]` sections with `key = value`
+// lines. Honors AWS_SHARED_CREDENTIALS_FILE.
+export function readAwsProfileCredentials(profile: string): AwsCredentials | null {
+  const path = process.env.AWS_SHARED_CREDENTIALS_FILE ?? join(homedir(), ".aws", "credentials");
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+  let inProfile = false;
+  let accessKeyId: string | undefined;
+  let secretAccessKey: string | undefined;
+  let sessionToken: string | undefined;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+    const section = line.match(/^\[(.+)\]$/);
+    if (section) {
+      inProfile = section[1]!.trim() === profile;
+      continue;
+    }
+    if (!inProfile) continue;
+    const eq = line.indexOf("=");
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim().toLowerCase();
+    const value = line.slice(eq + 1).trim();
+    if (key === "aws_access_key_id") accessKeyId = value;
+    else if (key === "aws_secret_access_key") secretAccessKey = value;
+    else if (key === "aws_session_token") sessionToken = value;
+  }
+  if (accessKeyId && secretAccessKey) return { accessKeyId, secretAccessKey, sessionToken };
+  return null;
+}
+
+// Resolve the signing region: explicit config, else parsed from the Bedrock
+// host (bedrock-mantle.{region}.api.aws / bedrock-runtime.{region}.amazonaws.com),
+// else AWS_REGION / AWS_DEFAULT_REGION. Returns null when none resolve.
+export function resolveAwsRegion(opts: { awsRegion?: string; url: string }): string | null {
+  if (opts.awsRegion) return opts.awsRegion;
+  const host = new URL(opts.url).host;
+  const fromHost = host.match(/\.([a-z]{2}-[a-z]+-\d+)\./);
+  if (fromHost) return fromHost[1]!;
+  return process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? null;
+}
