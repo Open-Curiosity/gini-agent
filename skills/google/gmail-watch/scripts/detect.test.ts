@@ -13,6 +13,8 @@ import {
   detect,
   parseFromAddress,
   parseGwsAuthStatus,
+  run,
+  scrubError,
   shouldDropMessage,
   type GwsSpawn
 } from "./detect";
@@ -159,6 +161,16 @@ describe("parse + safety helpers", () => {
     const data = JSON.parse(item.text);
     expect(data.id).toBe("m1");
     expect(data.subject).toBe("hi");
+  });
+
+  test("scrubError redacts secret-file paths, home-rooted paths, and /root", () => {
+    expect(scrubError("failed to read /Users/alice/.config/gws/token.json")).toBe("failed to read <path>");
+    // Extension-less home path is redacted too.
+    expect(scrubError("keyring at /Users/x/.config/gws/keyring missing")).toBe("keyring at <path> missing");
+    expect(scrubError("open /home/bob/.gini/secrets.enc: denied")).toBe("open <path>: denied");
+    expect(scrubError("config /root/.config/gws failed")).toBe("config <path> failed");
+    // /root anchored so it doesn't eat /rootcause.
+    expect(scrubError("the rootcause was unclear")).toBe("the rootcause was unclear");
   });
 });
 
@@ -339,6 +351,24 @@ describe("detect — regimes", () => {
     expect(Number(r.state.cursor)).toBeGreaterThan(1000);
   });
 
+  test("a healthy tick stamps status:ok into the returned state", async () => {
+    const spawn = stubSpawn(["m2", "m1"], {
+      m1: { id: "m1", internalDate: "1000", from: "alice@x.com", subject: "a" },
+      m2: { id: "m2", internalDate: "2000", from: "alice@x.com", subject: "b" }
+    });
+    // Seeding tick.
+    const seed = await detect({ query: "is:unread", state: null }, spawn, "me@example.com");
+    expect(seed.state.status).toBe("ok");
+    // Steady tick with a new match.
+    const steady = await detect(
+      { query: "is:unread", state: { cursor: "1000", seen: [] } },
+      stubSpawn(["m3"], { m3: { id: "m3", internalDate: "3000", from: "Bob <bob@x.com>", subject: "hi" } }),
+      "me@example.com"
+    );
+    expect(steady.kind).toBe("context");
+    expect(steady.state.status).toBe("ok");
+  });
+
   test("dedup: an already-seen boundary id does not re-trigger", async () => {
     // m9 sits at the cursor's boundary second and is already in `seen`.
     const spawn = stubSpawn(["m9"], {
@@ -350,6 +380,52 @@ describe("detect — regimes", () => {
       "me@example.com"
     );
     expect(r.kind).toBe("shortCircuit");
+  });
+});
+
+describe("run — health in state", () => {
+  test("signed-out tick emits status:needs_auth with cursor/seen unchanged", async () => {
+    const signedOut: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":false}';
+      throw new Error("should not poll while signed out");
+    };
+    const r = await run({ query: "is:unread", state: { cursor: "5000", seen: ["m1"] } }, signedOut);
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.summary).toBe("[SILENT]");
+    expect(r.state.status).toBe("needs_auth");
+    // Cursor/seen carried through unchanged (don't advance past unread mail).
+    expect(r.state.cursor).toBe("5000");
+    expect(r.state.seen).toEqual(["m1"]);
+    expect(r.state.lastError).toBeUndefined();
+  });
+
+  test("gws-error tick emits status:error + a scrubbed lastError, cursor/seen unchanged", async () => {
+    const erroring: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      throw new Error("transport blew up reading /Users/alice/.config/gws/token.json");
+    };
+    const r = await run({ query: "is:unread", state: { cursor: "7000", seen: ["m2"] } }, erroring);
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.status).toBe("error");
+    expect(r.state.lastError).toBe("transport blew up reading <path>");
+    expect(r.state.cursor).toBe("7000");
+    expect(r.state.seen).toEqual(["m2"]);
+  });
+
+  test("a healthy signed-in tick returns detect's status:ok result", async () => {
+    const healthy: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) return listResponse(["m2", "m1"]);
+      return PREAMBLE + "{}";
+    };
+    const r = await run({ query: "is:unread", state: null }, healthy);
+    expect(r.kind).toBe("shortCircuit"); // seeding
+    expect(r.state.status).toBe("ok");
+    expect(r.state.lastError).toBeUndefined();
   });
 });
 

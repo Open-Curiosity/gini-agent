@@ -7,10 +7,12 @@
 // BODY for an email watcher's backing scheduled job.
 //
 // Contract:
-//   stdin:  JSON { query, account?, state: { cursor?, seen? } | null }
-//   stdout: JSON { kind, items?, summary?, note?, state }
-//   exit:   0 always (a gws/transport error is reported as a shortCircuit with a
-//           note, never a non-zero exit, so the backing job stays alive)
+//   stdin:  JSON { query, account?, state: { cursor?, seen?, status?, lastError? } | null }
+//   stdout: JSON { kind, items?, summary?, state: { cursor?, seen?, status?, lastError? } }
+//   exit:   0 always (a gws/transport / signed-out condition is reported as a
+//           shortCircuit carrying status in `state`, never a non-zero exit, so the
+//           backing job stays alive and the email read path can derive the
+//           watcher's displayed status)
 //
 // It polls `gws` for new matching message ids for ONE watch, dedups against the
 // caller-supplied state (cursor + a tiny boundary `seen` set), applies a
@@ -55,6 +57,14 @@ interface DetectState {
   // re-listed every tick; this set drops them. The `after:` watermark keeps it
   // bounded to one second's worth of mail.
   seen?: string[];
+  // Watcher health, carried IN the opaque state blob so the job persists it onto
+  // hookState and the email read path can derive the watcher's displayed status
+  // from it (the generic skill-script handler can't write watcher state). "ok" =
+  // last tick polled cleanly; "needs_auth" = the gws session is signed out;
+  // "error" = a gws/transport fault on the last tick.
+  status?: "ok" | "needs_auth" | "error";
+  // Scrubbed last-error message when status === "error" (cleared on "ok").
+  lastError?: string;
 }
 
 interface DetectArgs {
@@ -82,10 +92,10 @@ interface DetectResult {
   kind: "shortCircuit" | "context";
   items?: ResultItem[];
   summary?: string;
-  // Status note the handler/runtime can map to the watcher status (e.g.
-  // "needs_auth", "error"). Never fails the job — a transport problem is a
-  // shortCircuit with a note, not a non-zero exit.
-  note?: "needs_auth" | "error";
+  // Health rides in `state.status`/`state.lastError` (the opaque blob the job
+  // persists), so the email read path can derive the watcher's displayed status.
+  // A transport problem is a shortCircuit with status:"error", never a non-zero
+  // exit, so the backing job keeps polling and recovers on the next clean tick.
   state: DetectState;
 }
 
@@ -240,6 +250,21 @@ function parseMessageMetadata(stdout: string, id: string): EmailMetadata {
   return meta;
 }
 
+// ── Error scrub (ported verbatim) ────────────────────────────────────────────
+
+// Scrub a gws/transport error message before it rides back in state.lastError
+// and surfaces in the watcher status. Redact credential-bearing file paths
+// (config/keyring/token files) and any home-rooted path so a leaked stack frame
+// or CLI diagnostic can't expose the operator's filesystem layout. Two passes:
+//   - explicit .json/.enc secret files;
+//   - any /Users/<u>, /home/<u>, or /root path (anchored so /root doesn't eat
+//     /rootcause). Over-redaction is the safe direction for an error string.
+export function scrubError(message: string): string {
+  return message
+    .replace(/[^\s'"]*\.(?:json|enc)/g, "<path>")
+    .replace(/(?:\/Users\/[^/\s'"]+|\/home\/[^/\s'"]+|\/root(?=\/|$|[\s'"]))(?:\/[^\s'"]*)?/g, "<path>");
+}
+
 // ── Safety floor (ported verbatim) ───────────────────────────────────────────
 
 // Drop automated senders or the user's own address. Bodies aren't available, so
@@ -386,7 +411,7 @@ export async function detect(
     } else {
       cursor = String(Date.now());
     }
-    return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor, seen } };
+    return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor, seen, status: "ok" } };
   }
 
   // Regime 3: TRUNCATED steady-state window — the older tail isn't listed, so a
@@ -408,7 +433,7 @@ export async function detect(
     return {
       kind: "shortCircuit",
       summary,
-      state: { cursor, seen: newest ? [newest] : [] }
+      state: { cursor, seen: newest ? [newest] : [], status: "ok" }
     };
   }
 
@@ -462,13 +487,13 @@ export async function detect(
   if (items.length === 0) {
     // No delivery this tick (only dropped items, or nothing new): persist the
     // advanced cursor immediately (the caller treats shortCircuit as immediate).
-    return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor: newCursor, seen: seenOut } };
+    return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor: newCursor, seen: seenOut, status: "ok" } };
   }
 
   // Surviving matches: the caller persists this state ONLY after the drafting
   // turn dispatches (the context => deferred timing), so a dispatch failure
   // leaves the old cursor and the matches re-trigger next tick (at-least-once).
-  return { kind: "context", items, state: { cursor: newCursor, seen: seenOut } };
+  return { kind: "context", items, state: { cursor: newCursor, seen: seenOut, status: "ok" } };
 }
 
 // Compute the small boundary dedup set: the listed ids whose internalDate floors
@@ -512,55 +537,46 @@ async function readStdinJson<T>(): Promise<T> {
   return (text ? JSON.parse(text) : {}) as T;
 }
 
+// Run one detection tick given the parsed args + an injected gws spawn (the test
+// seam — main() passes defaultGwsSpawn). Maps auth state + transport faults onto
+// the health-in-state contract: signed-out => status:"needs_auth" with the prior
+// cursor/seen UNCHANGED; gws/transport throw => status:"error" + a SCRUBBED
+// lastError, cursor/seen UNCHANGED (the next healthy tick re-detects); a clean
+// poll returns detect()'s status:"ok" result. Never throws — the backing job must
+// stay alive and recover the moment gws is healthy/re-authed.
+export async function run(args: DetectArgs, gwsSpawn: GwsSpawn): Promise<DetectResult> {
+  const stateIn: DetectState = args.state ?? {};
+  try {
+    const status = parseGwsAuthStatus(await gwsSpawn(buildAuthStatusArgs()));
+    if (!status.signedIn) {
+      return { kind: "shortCircuit", summary: "[SILENT]", state: { ...stateIn, status: "needs_auth", lastError: undefined } };
+    }
+    const selfEmail = await resolveSelfEmail(gwsSpawn);
+    return await detect(args, gwsSpawn, selfEmail);
+  } catch (error) {
+    return {
+      kind: "shortCircuit",
+      summary: "[SILENT]",
+      state: { ...stateIn, status: "error", lastError: scrubError(error instanceof Error ? error.message : String(error)) }
+    };
+  }
+}
+
 async function main(): Promise<void> {
   let args: DetectArgs;
   try {
     args = await readStdinJson<DetectArgs>();
   } catch (error) {
-    // Bad stdin is reported as a shortCircuit error note, not a non-zero exit, so
-    // the backing job stays alive.
+    // Bad stdin is reported as a shortCircuit with status:"error", not a non-zero
+    // exit, so the backing job stays alive. No prior cursor/seen to preserve.
     process.stdout.write(JSON.stringify({
       kind: "shortCircuit",
       summary: "[SILENT]",
-      note: "error",
-      state: {}
-    }));
+      state: { status: "error", lastError: scrubError(error instanceof Error ? error.message : String(error)) }
+    } satisfies DetectResult));
     return;
   }
-
-  const stateIn: DetectState = args.state ?? {};
-  const gwsSpawn = defaultGwsSpawn;
-
-  // Signed-out handling: a missing/expired gws session is reported as a
-  // shortCircuit with a needs_auth note (the handler/runtime maps it onto the
-  // watcher status), NEVER a non-zero exit — the backing job must keep polling so
-  // it recovers the moment the user re-auths.
-  try {
-    const status = parseGwsAuthStatus(await gwsSpawn(buildAuthStatusArgs()));
-    if (!status.signedIn) {
-      process.stdout.write(JSON.stringify({
-        kind: "shortCircuit",
-        summary: "[SILENT]",
-        note: "needs_auth",
-        state: stateIn
-      }));
-      return;
-    }
-
-    const selfEmail = await resolveSelfEmail(gwsSpawn);
-    const result = await detect(args, gwsSpawn, selfEmail);
-    process.stdout.write(JSON.stringify(result));
-  } catch (error) {
-    // Any gws/transport error: report a shortCircuit with an error note + the
-    // UNCHANGED state (so the next healthy tick re-detects), never a non-zero
-    // exit. A scrubbed message rides in `summary` for observability.
-    process.stdout.write(JSON.stringify({
-      kind: "shortCircuit",
-      summary: "[SILENT]",
-      note: "error",
-      state: stateIn
-    }));
-  }
+  process.stdout.write(JSON.stringify(await run(args, defaultGwsSpawn)));
 }
 
 // Parse the JSON `gws auth status` emits. signedIn := token_valid === true.

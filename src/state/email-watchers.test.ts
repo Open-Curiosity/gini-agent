@@ -229,3 +229,61 @@ describe("backing job lifecycle", () => {
     expect(jobStatus()).toBe("active");
   });
 });
+
+describe("derived watcher health", () => {
+  // Write the detection script's health blob onto the backing job's hookState the
+  // way a tick would, then assert the email read path surfaces it as the
+  // watcher's status/lastError.
+  async function setHookState(
+    config: ReturnType<typeof buildConfig>,
+    jobId: string,
+    hookState: Record<string, unknown>
+  ): Promise<void> {
+    await mutateState(config.instance, (state) => {
+      const job = state.jobs.find((j) => j.id === jobId);
+      if (job) job.hookState = hookState;
+    });
+  }
+
+  test("a signed-out tick surfaces needs_auth on list + get", async () => {
+    const config = buildConfig("ew-health-needsauth");
+    const watcher = await addEmailWatcher(config, { sender: "ken@x.com" });
+    await setHookState(config, watcher.jobId!, { cursor: "1000", seen: [], status: "needs_auth" });
+    expect(listEmailWatchers(config).find((w) => w.id === watcher.id)?.status).toBe("needs_auth");
+    expect(getEmailWatcher(config, watcher.id)?.status).toBe("needs_auth");
+  });
+
+  test("a gws-error tick surfaces error + the scrubbed lastError", async () => {
+    const config = buildConfig("ew-health-error");
+    const watcher = await addEmailWatcher(config, { sender: "lara@x.com" });
+    await setHookState(config, watcher.jobId!, {
+      cursor: "1000",
+      seen: [],
+      status: "error",
+      lastError: "gws failed reading <path>"
+    });
+    const derived = getEmailWatcher(config, watcher.id);
+    expect(derived?.status).toBe("error");
+    expect(derived?.lastError).toBe("gws failed reading <path>");
+  });
+
+  test("a healthy tick surfaces ok and clears a prior lastError", async () => {
+    const config = buildConfig("ew-health-ok");
+    const watcher = await addEmailWatcher(config, { sender: "mona@x.com" });
+    // First an error tick, then a healthy one: the derived view must clear the
+    // error (detect emits status:"ok" with no lastError).
+    await setHookState(config, watcher.jobId!, { status: "error", lastError: "boom" });
+    expect(getEmailWatcher(config, watcher.id)?.status).toBe("error");
+    await setHookState(config, watcher.jobId!, { cursor: "2000", seen: ["m"], status: "ok" });
+    const derived = getEmailWatcher(config, watcher.id);
+    expect(derived?.status).toBe("ok");
+    expect(derived?.lastError).toBeUndefined();
+  });
+
+  test("a watcher with no backing-job hookState keeps its stored status", async () => {
+    const config = buildConfig("ew-health-none");
+    const watcher = await addEmailWatcher(config, { sender: "nina@x.com" });
+    // No hookState written yet (pre-first-tick) => stored status is surfaced.
+    expect(getEmailWatcher(config, watcher.id)?.status).toBe("ok");
+  });
+});

@@ -11,7 +11,7 @@
 // helpers are imported lazily (dynamic import) so this state module doesn't close
 // a static cycle with src/jobs (which imports src/state).
 
-import type { EmailWatcherRecord, RuntimeConfig, RuntimeState } from "../types";
+import type { EmailWatcherRecord, EmailWatcherStatus, RuntimeConfig, RuntimeState } from "../types";
 import { id, now } from "./ids";
 import { addAudit } from "./audit";
 import { createChatSession, deleteChatSession } from "./records";
@@ -166,12 +166,38 @@ export function createEmailWatcher(
   return item;
 }
 
+// Overlay the watcher's displayed health from its backing job's hookState. The
+// detection script (run by the generic skill-script handler, which can't write
+// watcher state) records the last tick's health in its opaque state blob —
+// hookState.status ("ok"|"needs_auth"|"error") and hookState.lastError (scrubbed)
+// — which the job persists each tick. status/lastError on the record are thus
+// DERIVED-on-read from the backing job; `enabled` stays the separate lifecycle
+// flag. A watcher with no backing job (legacy, pre-first-tick) keeps its stored
+// status.
+function withDerivedHealth(watcher: EmailWatcherRecord, state: RuntimeState): EmailWatcherRecord {
+  if (!watcher.jobId) return watcher;
+  const job = state.jobs.find((j) => j.id === watcher.jobId);
+  const hookState = job?.hookState;
+  if (!hookState) return watcher;
+  const status = hookState.status;
+  if (status !== "ok" && status !== "needs_auth" && status !== "error") return watcher;
+  const lastError = typeof hookState.lastError === "string" ? hookState.lastError : undefined;
+  return {
+    ...watcher,
+    status: status as EmailWatcherStatus,
+    ...(lastError !== undefined ? { lastError } : { lastError: undefined })
+  };
+}
+
 export function listEmailWatchers(config: RuntimeConfig): EmailWatcherRecord[] {
-  return readState(config.instance).emailWatchers;
+  const state = readState(config.instance);
+  return state.emailWatchers.map((watcher) => withDerivedHealth(watcher, state));
 }
 
 export function getEmailWatcher(config: RuntimeConfig, watcherId: string): EmailWatcherRecord | undefined {
-  return readState(config.instance).emailWatchers.find((item) => item.id === watcherId);
+  const state = readState(config.instance);
+  const watcher = state.emailWatchers.find((item) => item.id === watcherId);
+  return watcher ? withDerivedHealth(watcher, state) : undefined;
 }
 
 // Apply a field patch to a watcher inside the per-instance lock. Used by the
