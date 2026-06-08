@@ -238,7 +238,7 @@ export function ProviderCard({
                     {visual.authLabel}
                   </span>
                   {isActive ? (
-                    <span className="rounded-md bg-[#14321F] px-2 py-0.5 text-[11px] font-semibold text-[#4ADE80]">
+                    <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-[11px] font-semibold text-emerald-600 dark:bg-[#14321F] dark:text-[#4ADE80]">
                       Active
                     </span>
                   ) : null}
