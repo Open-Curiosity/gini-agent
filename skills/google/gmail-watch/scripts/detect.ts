@@ -311,7 +311,8 @@ async function fetchInternalDate(gwsSpawn: GwsSpawn, id: string): Promise<number
 // Run detection for ONE watch given its query + opaque state. Returns the typed
 // result + the NEW state — pure: it makes the gws calls (the only side effect is
 // the read-only subprocess) but never persists anything. The caller persists the
-// returned state at the J4-correct moment.
+// returned state at the at-least-once commit boundary (a shortCircuit
+// immediately; a context result only after the drafting turn dispatches).
 //
 // Three regimes, all governed by the fact that the `after:` watermark only ever
 // moves FORWARD (to newer mail): you can never reach an older, un-listed tail by

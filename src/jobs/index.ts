@@ -461,7 +461,7 @@ async function runPreRunHook(
   // The JOB owns the hook's state: thread the current blob in as the run's input
   // (the runner merges `payload` into the handler's hookConfig, so a pure handler
   // reads hookConfig.state) and carry the handler's newState back out. The
-  // persistence TIMING below preserves J4 at-least-once.
+  // persistence TIMING below preserves at-least-once across the delivery boundary.
   const outcome = await runHook(config, hook, { state: job.hookState });
   if (outcome.kind === "shortCircuit") {
     return {
@@ -482,11 +482,10 @@ async function runPreRunHook(
 }
 
 // Persist a pure handler's new state onto the backing job inside the per-instance
-// lock. Used at the J4-correct commit moment: immediately for a shortCircuit
+// lock. Used at the at-least-once commit boundary: immediately for a shortCircuit
 // (nothing was delivered), and only after the drafting turn dispatches for a
 // context result (so a dispatch failure leaves the OLD state and the matches
-// re-detect next tick — at-least-once across the delivery boundary). No state =
-// no-op.
+// re-detect next tick). No state = no-op.
 async function persistHookState(
   config: RuntimeConfig,
   jobId: string,

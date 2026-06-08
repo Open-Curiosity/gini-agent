@@ -13,20 +13,19 @@
 // NOT touch files/DB. This handler is the conduit: the current state arrives in
 // hookConfig.state (the jobs consumer passes job.hookState as the runHook
 // payload), is forwarded to the script, and the script's new state rides back on
-// the HookResult. The CONSUMER persists newState at the J4-correct moment
-// (shortCircuit immediately; context only after the turn dispatches).
+// the HookResult. The CONSUMER persists newState at the at-least-once commit
+// boundary (a shortCircuit immediately; a context result only after the turn
+// dispatches).
 //
 // Error taxonomy follows the hook contract so a scheduled job survives a
 // transient stall:
 //   - missing/unknown skill | script, missing skill/script config key, or a
 //     malformed script result => { kind: "error" } (CONFIG, fatal to a schedule).
-//   - non-zero exit / unparseable stdout / a script throw => mapped to a hook
-//     `error` whose message marks it transient... but the hook `error` kind has
-//     no transient flag, and the runner classes a handler-returned error as
-//     non-transient (config). To keep a scheduled job ALIVE across a transient
-//     script failure (per J2), this handler THROWS on a transient failure so the
-//     runner's catch classes it transient — the same shape gmail's old transport
-//     errors used to stay alive.
+//   - non-zero exit / unparseable stdout / a script throw => a transient failure
+//     a scheduled job must SURVIVE. The hook `error` kind has no transient flag
+//     and the runner classes a handler-returned error as non-transient (config),
+//     so this handler THROWS on a transient failure instead — the runner's catch
+//     then classes it transient and the backing job stays active to retry.
 
 import type { HookContext, HookContextItem, HookResult } from "../hooks/types";
 import { registerHook } from "../hooks/registry";
@@ -127,7 +126,7 @@ export async function skillScriptHandler(ctx: HookContext): Promise<HookResult> 
   if (!result.ok) {
     // Non-zero exit / unparseable stdout / timeout / script throw. Throw so the
     // runner classes it TRANSIENT — a scheduled job must stay active and retry
-    // next tick rather than be deactivated by a transient script fault (J2).
+    // next tick rather than be deactivated by a transient script fault.
     throw new Error(result.error ?? "skill-script: script failed");
   }
 

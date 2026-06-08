@@ -5,7 +5,7 @@
 // dedup, truncation, oldest-first backlog drain, same-second siblings, the
 // after: watermark bound) by calling `detect` directly with an injected gws
 // spawn — no child process, no state store (the engine is pure: state in, state
-// out). The R1–R3 hardening pins are preserved here at the engine's new home.
+// out). Every detection-hardening invariant is pinned here.
 
 import { describe, expect, test } from "bun:test";
 import {
