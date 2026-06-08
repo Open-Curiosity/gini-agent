@@ -12,6 +12,7 @@ import {
   Moon,
   Plus,
   RefreshCw,
+  ScrollText,
   Settings,
   Sun,
   WandSparkles
@@ -31,14 +32,6 @@ import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
 import type { AgentRow, ChatSession } from "@/lib/view-types";
 import type { GiniUpdateResult, GiniVersionInfo, JobRecord } from "@runtime/types";
-
-// "Online" is a coarse status hint on the sidebar agent rows. The runtime
-// reports a richer AgentStatus; anything that isn't an explicit error/paused
-// state reads as ready, matching the green dot in the design.
-function isAgentOnline(status: string | undefined): boolean {
-  if (!status) return true;
-  return !["error", "paused", "disabled", "stopped"].includes(status);
-}
 
 function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
@@ -198,8 +191,6 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                         </span>
                         {unread ? (
                           <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-[#4277FB]" />
-                        ) : isAgentOnline(agent.status) ? (
-                          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-[#39C36E]" />
                         ) : null}
                       </button>
                     </li>
@@ -288,6 +279,12 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
               </Link>
             </li>
             <li>
+              <Link href="/logs" onClick={onNavigate} className={navItem(pathname === "/logs")}>
+                <ScrollText className="size-3.5 text-[#8A8A90]" />
+                Logs
+              </Link>
+            </li>
+            <li>
               <Link href="/settings" onClick={onNavigate} className={navItem(pathname === "/settings")}>
                 <Settings className="size-3.5 text-[#8A8A90]" />
                 Settings
@@ -297,9 +294,10 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
         </div>
       </ScrollArea>
 
-      <div className="border-t border-[#1C1C1E] px-3 pb-2 pt-3">
+      <div className="px-3 pb-2 pt-3">
         <TunnelMenu />
       </div>
+      <div className="h-px bg-[#1C1C1E]" />
       <UpdateReminder />
       <CreateAgentDialog open={createOpen} onOpenChange={setCreateOpen} />
     </div>

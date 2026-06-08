@@ -295,20 +295,19 @@ export interface RuntimeConfig {
   // Power-user agent budget knobs. Lives under a nested `agent` namespace so
   // future budgets (token cap, wall-clock cap, etc.) can hang off the same
   // object without further config-shape churn. Validated leniently at the
-  // call site — an invalid value falls back to the built-in default.
+  // call site — an invalid value falls back to that knob's default.
   agent?: {
     // Hard cap on chat-task loop iterations (model -> tool -> model cycles).
     // When the cap is hit the loop gracefully produces a tool-less final
     // summary instead of failing outright. Must be a positive integer; any
     // non-conforming value falls back to the built-in default.
     maxIterations?: number;
+    // Soft cap for prior chat history replayed into a new chat-task prompt.
+    // The full chat remains stored; this bounds only the provider-bound
+    // transcript tail. Must be a positive integer; any non-conforming value
+    // falls back to the provider-derived default.
+    priorContextTokens?: number;
   };
-  // Cache warmer interval in minutes. 0 / undefined disables the warmer.
-  // When > 0 the runtime fires a minimal probe against the active
-  // provider every `cacheWarmerMinutes * 0.9` minutes so the prompt
-  // cache stays warm. Bounded to 0..1440 by the setter. See
-  // src/runtime/cache-warmer.ts.
-  cacheWarmerMinutes?: number;
 }
 
 // ChatBlock — semantic, typed conversation block emitted by the runtime so
@@ -952,6 +951,12 @@ export interface ChatMessageRecord {
   // replay can reconstruct exact assistant→tool ordering. Older rows lack it
   // and fall back to 0.
   seq?: number;
+  // Thread membership for provider-replay rows. ChatBlock remains the UI
+  // source of truth; these fields let prompt packing prefer the active thread
+  // without losing the single-session durable history model. Legacy rows omit
+  // them and are treated as main-chat context.
+  threadId?: string;
+  parentBlockId?: string;
 }
 
 export interface TraceRecord {

@@ -132,6 +132,21 @@ export function unquoteSecretsValue(raw: string): string {
   return trimmed;
 }
 
+// Best-effort read of the raw ~/.gini/secrets.env body for literal-redaction
+// inputs (the same `secretsEnvBody` redactReportText consumes). Returns
+// undefined when the file is absent or unreadable — pattern-based redaction
+// still runs regardless, so a read failure must never throw on the redaction
+// path.
+export function readSecretsEnvBody(): string | undefined {
+  const path = secretsEnvPath();
+  try {
+    if (!existsSync(path)) return undefined;
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
 // Predicate: does ~/.gini/secrets.env already carry a NON-EMPTY value
 // for this env-var name? Used by callers that want to avoid silently
 // clobbering an existing key — `gini import apply openclaw` notably

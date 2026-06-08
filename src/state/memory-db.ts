@@ -57,6 +57,10 @@ import { id, now } from "./ids";
 // columns through CREATE TABLE; existing installs add them via additive
 // ensureColumn calls. The (session_id, thread_id, ordinal) index covers
 // thread playback; the existing UNIQUE(session_id, ordinal) is untouched.
+//
+// The agent-database primitive (ADR agent-database.md) intentionally lives in a
+// SEPARATE per-agent SQLite file (src/state/agent-data-db.ts), NOT here — so the
+// agent's own SQL can never reach memory.db. This DB stays Gini-system-only.
 export const MEMORY_SCHEMA_VERSION = 9;
 export const DEFAULT_BANK_ID = "bank_default";
 

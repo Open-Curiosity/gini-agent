@@ -1,0 +1,291 @@
+import { beforeEach, describe, expect, test } from "bun:test";
+import { createElement } from "react";
+// Importing the shared setup installs the (process-global) module mocks before
+// the components under test are imported. The same mocks are used by
+// linkContextMenu.test so the two files can run in one process.
+import {
+  effectCleanups,
+  loopStart,
+  loopStop,
+  openBrowserAsync,
+  Platform,
+  Text,
+  TextInput,
+  View
+} from "./chatMockSetup";
+
+const { markdownRules, BlockAssistantText } = await import(
+  "@/src/components/chat/BlockAssistantText"
+);
+const { SelectableBlockText } = await import(
+  "@/src/components/chat/SelectableBlockText"
+);
+// The real link module (its native deps are mocked by chatMockSetup), so the
+// link rule's wiring is verified through observable behavior.
+const { subscribeLinkMenu } = await import(
+  "@/src/components/chat/linkContextMenu"
+);
+
+type Node = {
+  key: string;
+  content?: string;
+  type?: string;
+  attributes?: { href?: string };
+  children?: Node[];
+};
+
+// markdownRules is strongly typed against the library's ASTNode and forwardRef
+// hides `.render` from its public type. The tests poke both with hand-built
+// partial nodes, so reach them through loose accessors.
+const rule = (name: string): ((...a: unknown[]) => any) =>
+  (markdownRules as Record<string, (...a: unknown[]) => any>)[name];
+const renderSel = (props: unknown): any =>
+  (
+    SelectableBlockText as unknown as {
+      render: (p: unknown, r: unknown) => any;
+    }
+  ).render(props, null);
+
+// Minimal style map covering every key the inline rules read.
+const styles = {
+  text: {},
+  textgroup: {},
+  strong: {},
+  em: {},
+  s: {},
+  inline: {},
+  link: { color: "#007AFF" },
+  code_block: {},
+  fence: {}
+} as Record<string, object>;
+
+function linkNode(href?: string, label = "docs"): Node {
+  return {
+    key: "lnk",
+    type: "link",
+    content: "",
+    attributes: href ? { href } : {},
+    children: [{ key: "lt", type: "text", content: label, children: [] }]
+  };
+}
+
+// Render a block-level rule (paragraph/heading) and resolve the iOS-vs-Text
+// wrapper choice by invoking the SelectableBlockText forwardRef body.
+function renderBlock(ruleName: string, node: Node, children: unknown[]) {
+  const el = rule(ruleName)(node, children, [], styles);
+  return renderSel(el.props);
+}
+
+beforeEach(() => {
+  Platform.OS = "ios";
+  openBrowserAsync.mockClear();
+});
+
+describe("bug: markdown links inside iOS block text are not clickable", () => {
+  // The defect: on iOS, paragraphs/headings wrap their inline children in a
+  // <TextInput editable={false}> for the selection loupe. A nested
+  // <Text onPress> link never receives taps inside a TextInput, so links
+  // render styled but inert. A link-containing block must fall back to the
+  // selectable <Text> path so the link's onPress is reachable.
+  test("iOS paragraph containing a link renders as Text, not TextInput", () => {
+    const para: Node = { key: "p", type: "paragraph", children: [linkNode("https://example.com")] };
+    const inner = renderBlock("paragraph", para, [rule("link")(linkNode("https://example.com"), "docs", [], styles)]);
+    expect(inner.type).toBe(Text);
+    // Link blocks render as a plain (non-selectable) Text so the link's
+    // gestures win over iOS text selection.
+    expect(inner.props.selectable).toBeFalsy();
+  });
+
+  test("iOS heading containing a link renders as Text, not TextInput", () => {
+    const h: Node = { key: "h", type: "heading1", children: [linkNode("https://example.com")] };
+    const inner = renderBlock("heading1", h, [rule("link")(linkNode("https://example.com"), "docs", [], styles)]);
+    expect(inner.type).toBe(Text);
+  });
+
+  test("link nested deeper (inside emphasis) is still detected on iOS", () => {
+    const nested: Node = {
+      key: "p",
+      type: "paragraph",
+      children: [{ key: "em", type: "em", children: [linkNode("https://deep.example")] }]
+    };
+    const inner = renderBlock("paragraph", nested, ["x"]);
+    expect(inner.type).toBe(Text);
+  });
+});
+
+describe("link tap and long-press wiring", () => {
+  test("a web link taps to the in-app browser and long-presses to the menu", () => {
+    const el = rule("link")(linkNode("https://example.com"), "docs", [], styles);
+    expect(typeof el.props.onPress).toBe("function");
+    el.props.onPress();
+    expect(openBrowserAsync).toHaveBeenCalledWith("https://example.com");
+
+    const seen: Array<{ href: string; x: number; y: number }> = [];
+    const unsub = subscribeLinkMenu((r) => seen.push(r));
+    expect(typeof el.props.onLongPress).toBe("function");
+    el.props.onLongPress({ nativeEvent: { pageX: 12, pageY: 34 } });
+    unsub();
+    expect(seen).toEqual([{ href: "https://example.com", x: 12, y: 34 }]);
+  });
+
+  test("the link is not selectable so long-press shows the menu, not selection", () => {
+    const el = rule("link")(linkNode("https://example.com"), "docs", [], styles);
+    expect(el.props.selectable).toBeFalsy();
+  });
+
+  test("the link's label children are forced non-selectable (no native Copy callout)", () => {
+    // A selectable child Text would trigger iOS's own selection menu on
+    // long-press; the link renderer clones its children with selectable off.
+    const child = createElement(Text as never, { selectable: true }, "docs");
+    const el = rule("link")(linkNode("https://example.com"), [child], [], styles);
+    const kids = (Array.isArray(el.props.children) ? el.props.children : [el.props.children]) as any[];
+    expect(kids[0].props.selectable).toBe(false);
+    // The label text is preserved (Children.map normalizes it into an array).
+    expect([kids[0].props.children].flat()).toEqual(["docs"]);
+  });
+
+  test("non-web and missing-href links are inert (no onPress / onLongPress)", () => {
+    for (const bad of [
+      "tel:18005551234",
+      "mailto:a@b.com",
+      "file:///etc/passwd",
+      "javascript:alert(1)",
+      "gini://deep/link",
+      "/relative/path",
+      "//proto.relative",
+      " https://leading.space",
+      undefined
+    ]) {
+      const el = rule("link")(linkNode(bad), "x", [], styles);
+      expect(el.props.onPress).toBeUndefined();
+      expect(el.props.onLongPress).toBeUndefined();
+    }
+  });
+});
+
+describe("non-regression: link-free blocks keep the iOS selection wrapper", () => {
+  test("iOS paragraph without a link still renders as TextInput", () => {
+    const para: Node = { key: "p", type: "paragraph", children: [{ key: "t", type: "text", content: "hello", children: [] }] };
+    const inner = renderBlock("paragraph", para, ["hello"]);
+    expect(inner.type).toBe(TextInput);
+  });
+
+  test("iOS paragraph with empty children still renders as TextInput", () => {
+    const para: Node = { key: "p", type: "paragraph", children: [] };
+    expect(renderBlock("paragraph", para, []).type).toBe(TextInput);
+  });
+
+  test("iOS paragraph with no children field still renders as TextInput", () => {
+    const para: Node = { key: "p", type: "paragraph" };
+    expect(renderBlock("paragraph", para, []).type).toBe(TextInput);
+  });
+
+  test("non-iOS always uses Text regardless of links", () => {
+    Platform.OS = "android";
+    const para: Node = { key: "p", type: "paragraph", children: [linkNode("https://x.example")] };
+    expect(renderBlock("paragraph", para, ["x"]).type).toBe(Text);
+  });
+
+  test("iOS paragraph whose only link is non-web keeps TextInput", () => {
+    // A non-web link is inert (no handlers), so it must not strip the block's
+    // selection by flipping it onto the link path.
+    const para: Node = { key: "p", type: "paragraph", children: [linkNode("tel:18005551234")] };
+    expect(renderBlock("paragraph", para, ["x"]).type).toBe(TextInput);
+  });
+
+  test("iOS paragraph whose only link is a blocklink keeps TextInput", () => {
+    // A blocklink (e.g. a linked image) is handled by the library's own
+    // block-safe touchable plus the <Markdown onLinkPress> guard, not the
+    // Text fallback — rendering block content under Text would break — so it
+    // must NOT flip the block off the TextInput selection path.
+    const blockLink: Node = {
+      key: "bl",
+      type: "blocklink",
+      content: "",
+      attributes: { href: "https://example.com" },
+      children: [{ key: "img", type: "image", content: "", children: [] }]
+    };
+    const para: Node = { key: "p", type: "paragraph", children: [blockLink] };
+    expect(renderBlock("paragraph", para, ["x"]).type).toBe(TextInput);
+  });
+});
+
+describe("SelectableBlockText branches", () => {
+  test("containsLink -> plain non-selectable Text (link gestures win)", () => {
+    const out = renderSel({ style: {}, children: "x", containsLink: true });
+    expect(out.type).toBe(Text);
+    expect(out.props.selectable).toBeFalsy();
+  });
+
+  test("iOS + no link -> TextInput", () => {
+    const out = renderSel({ style: {}, children: "x", containsLink: false });
+    expect(out.type).toBe(TextInput);
+    expect(out.props.editable).toBe(false);
+  });
+
+  test("web -> Text", () => {
+    Platform.OS = "web";
+    const out = renderSel({ style: {}, children: "x" });
+    expect(out.type).toBe(Text);
+  });
+});
+
+describe("markdown rules coverage", () => {
+  test("inline + emphasis rules return Text-based nodes", () => {
+    for (const name of ["text", "textgroup", "strong", "em", "s", "inline"]) {
+      const el = rule(name)({ key: name, content: name, children: [] }, ["c"], [], styles);
+      expect(el.type).toBe(Text);
+      expect(el.props.selectable).toBe(true);
+    }
+  });
+
+  test("all heading levels render", () => {
+    for (const h of ["heading2", "heading3", "heading4", "heading5", "heading6"]) {
+      const node: Node = { key: h, type: h, children: [{ key: "t", type: "text", content: "x", children: [] }] };
+      expect(renderBlock(h, node, ["x"]).type).toBe(TextInput);
+    }
+  });
+
+  test("code_block trims a single trailing newline; fence handles missing content", () => {
+    const cb = rule("code_block")({ key: "c", content: "a\n", children: [] }, [], [], styles);
+    expect(renderSel(cb.props).props.children).toBe("a");
+    const cb2 = rule("code_block")({ key: "c2", content: "b", children: [] }, [], [], styles);
+    expect(renderSel(cb2.props).props.children).toBe("b");
+    const f = rule("fence")({ key: "f", children: [] }, [], [], styles);
+    expect(renderSel(f.props).props.children).toBe("");
+    const f2 = rule("fence")({ key: "f2", content: "c\n", children: [] }, [], [], styles);
+    expect(renderSel(f2.props).props.children).toBe("c");
+  });
+});
+
+describe("BlockAssistantText component + StreamingCursor", () => {
+  test("renders without a cursor when not streaming", () => {
+    const el = BlockAssistantText({ block: { text: "hi", streaming: false } as never }) as any;
+    expect(el.type).toBe(View);
+  });
+
+  test("routes Markdown's default openers through the in-app browser", () => {
+    // The library's default link/blocklink openers go through onLinkPress;
+    // it forwards to the in-app browser and returns false so the library
+    // doesn't also hand the URL to the system browser.
+    const el = BlockAssistantText({ block: { text: "hi", streaming: false } as never }) as any;
+    const markdownEl = el.props.children.props.children[0];
+    const onLinkPress = markdownEl.props.onLinkPress;
+    expect(onLinkPress("https://ok.example")).toBe(false);
+    expect(openBrowserAsync).toHaveBeenCalledWith("https://ok.example");
+  });
+
+  test("renders a cursor when streaming and the cursor effect loops", () => {
+    const el = BlockAssistantText({ block: { text: "hi", streaming: true } as never }) as any;
+    expect(el.type).toBe(View);
+    // Outer row View wraps the bubble View, whose children are [Markdown,
+    // cursor]. The streaming branch mounts <StreamingCursor/>; invoke it to
+    // run its animation effect (and the captured cleanup) under the hook stubs.
+    const cursorEl = el.props.children.props.children[1];
+    const Cursor = cursorEl.type as () => unknown;
+    Cursor();
+    expect(loopStart).toHaveBeenCalled();
+    for (const c of effectCleanups.splice(0)) c();
+    expect(loopStop).toHaveBeenCalled();
+  });
+});

@@ -11,7 +11,6 @@ import { McpCard, type McpRow } from "./_components/McpCard";
 import { MessagingCard, type MessagingRow } from "./_components/MessagingCard";
 import { DevicesCard, type DeviceRow } from "./_components/DevicesCard";
 import { BrowserSettingsCard } from "./_components/BrowserSettingsCard";
-import { CacheWarmerCard } from "./_components/CacheWarmerCard";
 
 export default function SettingsPage() {
   const invalidate = useInvalidate();
@@ -100,8 +99,6 @@ export default function SettingsPage() {
           activeProviderModel={activeProviderModel}
           activeProvider={activeProvider}
         />
-
-        <CacheWarmerCard />
 
         <BrowserSettingsCard />
 
