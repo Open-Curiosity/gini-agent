@@ -221,6 +221,7 @@ describe("browser disconnect lifecycle", () => {
     browserTest.clearFakeSessionsForTest();
     browserTest.setInFlightDisconnectsForTest(0);
     browserTest.clearPendingSharedForTest();
+    browserTest.resetTeardownCloseTimeoutForTest();
   });
 
   test("in-flight disconnect rejects new browser_navigate admissions", async () => {
@@ -325,6 +326,52 @@ describe("browser disconnect lifecycle", () => {
     // at least ~100ms but well under the 5s deadline.
     expect(elapsed).toBeGreaterThanOrEqual(100);
     expect(elapsed).toBeLessThan(2_000);
+  });
+
+  test("disconnectSharedBrowser bounds a wedged context.close() and force-kills the child", async () => {
+    // Reproduces the connect/disconnect hang: a Chromium wedged on a heavy
+    // navigation never resolves context.close(). Teardown must give up at
+    // the bounded budget and SIGKILL the child so the profile-dir lock
+    // frees for the relaunch — instead of hanging for minutes.
+    browserTest.setTeardownCloseTimeoutForTest(50);
+    let killed = false;
+    browserTest.installFakeManagedContextForTest({
+      close: () => new Promise(() => {}),
+      browser: () => ({
+        process: () => ({
+          kill: () => {
+            killed = true;
+          }
+        })
+      })
+    });
+    const started = Date.now();
+    await disconnectSharedBrowser();
+    const elapsed = Date.now() - started;
+    expect(killed).toBe(true);
+    expect(elapsed).toBeLessThan(7_000);
+  });
+
+  test("disconnectSharedBrowser is not wedged by a per-page close() that never resolves", async () => {
+    // A wedged owned-page close() runs BEFORE teardownHandle; bounding it
+    // is what lets disconnect reach the context teardown at all.
+    browserTest.setTeardownCloseTimeoutForTest(50);
+    let contextCloseCalled = false;
+    browserTest.installFakeManagedContextForTest({
+      close: async () => {
+        contextCloseCalled = true;
+      }
+    });
+    browserTest.installFakeSessionForTest("wedged-page-task", 0);
+    const session = browserTest.getFakeSessionForTest("wedged-page-task");
+    expect(session).toBeDefined();
+    session!.ownedPageIds.clear();
+    session!.ownedPageIds.add({ close: () => new Promise(() => {}) } as never);
+    const started = Date.now();
+    await disconnectSharedBrowser();
+    const elapsed = Date.now() - started;
+    expect(contextCloseCalled).toBe(true);
+    expect(elapsed).toBeLessThan(7_000);
   });
 
   // Round-3 review fix: epoch counter. withSession captures the current
