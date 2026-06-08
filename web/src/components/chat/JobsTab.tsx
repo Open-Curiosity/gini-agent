@@ -333,10 +333,10 @@ function RunCard({
 function JobStatusBadge({ status }: { status: JobStatus }) {
   const tone =
     status === "active"
-      ? "bg-[#14331E] text-[#4ADE80]"
+      ? "bg-emerald-500/10 text-emerald-600 dark:bg-[#14331E] dark:text-[#4ADE80]"
       : status === "failed"
-        ? "bg-[#3A1A1A] text-[#F87171]"
-        : "bg-[#2A2A2E] text-[#C2C2C8]";
+        ? "bg-red-500/10 text-red-600 dark:bg-[#3A1A1A] dark:text-[#F87171]"
+        : "bg-muted text-muted-foreground";
   return (
     <span className={cn("shrink-0 rounded-md px-[9px] py-1 text-[10px] font-bold uppercase tracking-[0.6px]", tone)}>
       {status}
@@ -349,10 +349,10 @@ function JobStatusBadge({ status }: { status: JobStatus }) {
 function RunStatusBadge({ status }: { status: JobRunRecord["status"] }) {
   const tone =
     status === "completed"
-      ? "bg-[#14331E] text-[#4ADE80]"
+      ? "bg-emerald-500/10 text-emerald-600 dark:bg-[#14331E] dark:text-[#4ADE80]"
       : status === "failed"
-        ? "bg-[#3A1A1A] text-[#F87171]"
-        : "bg-[#16243B] text-[#60A5FA]";
+        ? "bg-red-500/10 text-red-600 dark:bg-[#3A1A1A] dark:text-[#F87171]"
+        : "bg-blue-500/10 text-blue-600 dark:bg-[#16243B] dark:text-[#60A5FA]";
   return (
     <span className={cn("rounded-md px-[9px] py-1 text-[10px] font-bold uppercase tracking-[0.6px]", tone)}>
       {status}
