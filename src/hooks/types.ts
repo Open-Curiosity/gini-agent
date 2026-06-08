@@ -20,12 +20,13 @@ import type { RuntimeConfig } from "../types";
 // JobRecord) and hands it to the runner; the runner resolves the trusted
 // handler by `handlerId` and feeds it the `config` DATA.
 export interface HookConfig {
-  // Registry id of a trusted in-tree handler. v1: "gmail-delta". Rejected by a
-  // consumer at config-create time (isKnownHook) and treated as an error at run
-  // time (the runner) when not in the registry.
+  // Registry id of a trusted in-tree handler. v1: "skill-script" (runs a named
+  // skill script headless). Rejected by a consumer at config-create time
+  // (isKnownHook) and treated as an error at run time (the runner) when not in
+  // the registry.
   handlerId: string;
   // Declarative, handler-specific configuration validated by the handler.
-  // For gmail-delta: { watcherId: string }.
+  // For skill-script: { skill, script, ...declarative data }.
   config: Record<string, unknown>;
   // Per-hook wall-clock budget. Defaults to the runner's PRE_RUN_HOOK_DEFAULT_
   // TIMEOUT_MS (30s) — the pre-LLM path is on the critical path to the model, so
@@ -33,12 +34,13 @@ export interface HookConfig {
   timeoutMs?: number;
 }
 
-// What every hook handler receives. Deterministic + read-only-by-contract.
-// A handler may persist its OWN cursor/dedup state (the gmail-delta handler
-// writes the EmailWatcherRecord cursor + email_seen) but it runs OUTSIDE the
-// spawned task's approval/audit/trace envelope, so it must only do read-only /
-// idempotent side effects (cursor + dedup), never the kind that requires the
-// approval gate. See CLAUDE.md boundaries + ADR job-pre-run-hooks.md.
+// What every hook handler receives. Deterministic + read-only-by-contract. A
+// handler runs OUTSIDE the spawned task's approval/audit/trace envelope, so it
+// must only do read-only / idempotent side effects, never the kind that requires
+// the approval gate. State that the handler computes should ride back on the
+// HookResult (the consumer persists it) rather than being written by the handler
+// — the skill-script handler runs a PURE script (state in, state out) and writes
+// nothing itself. See CLAUDE.md boundaries + ADR job-pre-run-hooks.md.
 //
 // CANCELLATION SAFETY: the runner enforces the per-hook timeout with
 // Promise.race, which does NOT cancel the losing promise — a handler that

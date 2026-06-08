@@ -10,4 +10,3 @@
 // handler into its load path.
 
 import "../capabilities/skill-script-hook"; // self-registers "skill-script"
-import "../integrations/gmail-delta-hook"; // self-registers "gmail-delta" (removed once email-watch is on skill-script)

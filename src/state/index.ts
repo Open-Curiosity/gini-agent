@@ -197,8 +197,3 @@ export {
   backfillEmailWatcherJobs
 } from "./email-watchers";
 export type { AddEmailWatcherInput } from "./email-watchers";
-export {
-  markEmailSeen,
-  isEmailSeen,
-  deleteEmailSeenForWatcher
-} from "./memory-db";

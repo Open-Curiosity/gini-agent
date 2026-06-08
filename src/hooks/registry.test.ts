@@ -83,12 +83,13 @@ describe("hook primitive — registry prototype safety", () => {
 });
 
 describe("hook primitive — module boundary", () => {
-  test("the generic core imports no jobs/state/integrations module", () => {
+  test("the generic core imports no jobs/state/integrations/capabilities module", () => {
     // Pins the module boundary so a future edit can't recouple the primitive to a
-    // domain. The composition root (builtins.ts) is excluded — it is the ONE file
-    // allowed to import a domain handler.
+    // domain or to the (core but non-primitive) capabilities layer. The
+    // composition root (builtins.ts) is excluded — it is the ONE file allowed to
+    // import a handler module.
     const here = import.meta.dir;
-    const forbidden = /from\s+["']\.\.\/(jobs|state|integrations)/;
+    const forbidden = /from\s+["']\.\.\/(jobs|state|integrations|capabilities)/;
     for (const file of ["types.ts", "registry.ts", "runner.ts", "index.ts"]) {
       const src = readFileSync(join(here, file), "utf8");
       expect(forbidden.test(src)).toBe(false);
@@ -97,9 +98,9 @@ describe("hook primitive — module boundary", () => {
 });
 
 describe("hook primitive — registration reachability", () => {
-  test("importing builtins registers the gmail-delta built-in", async () => {
+  test("importing builtins registers the skill-script built-in", async () => {
     await import("./builtins");
-    expect(isKnownHook("gmail-delta")).toBe(true);
-    expect(resolveHook("gmail-delta")).toBeDefined();
+    expect(isKnownHook("skill-script")).toBe(true);
+    expect(resolveHook("skill-script")).toBeDefined();
   });
 });

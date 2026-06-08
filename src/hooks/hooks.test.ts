@@ -429,8 +429,8 @@ describe("pre-run hook primitive", () => {
       expect(resolveHook(key)).toBeUndefined();
     }
     // The genuine built-in still resolves.
-    expect(isKnownHook("gmail-delta")).toBe(true);
-    expect(resolveHook("gmail-delta")).toBeDefined();
+    expect(isKnownHook("skill-script")).toBe(true);
+    expect(resolveHook("skill-script")).toBeDefined();
   });
 
   test("createScheduledJob rejects a prototype-key handlerId at create time", async () => {

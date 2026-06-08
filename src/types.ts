@@ -1203,10 +1203,12 @@ export interface NotificationRecord {
 // `gws` session is signed out, so we skip polling until the user re-auths.
 export type EmailWatcherStatus = "ok" | "error" | "needs_auth";
 
-// A durable per-(account, sender-query) email watcher. The gmail poll
-// worker reads each enabled watcher, polls `gws` for new matching message
-// ids, and wakes an agent turn in the watcher's dedicated chat session on
-// each new match. The data model is multi-account-SHAPED (provider +
+// A durable per-(account, sender-query) email watcher. Each watcher is driven by
+// a backing scheduled job whose `skill-script` pre-run hook runs the gmail-watch
+// detection script — it polls `gws` for new matching mail and, on a match, wakes
+// an agent turn in the watcher's dedicated chat session. The detection cursor +
+// dedup state live on the backing JobRecord.hookState (not here); this record is
+// the durable config. The data model is multi-account-SHAPED (provider +
 // accountEmail + credentialName) but v1 watches the single signed-in `gws`
 // identity. See ADR email-watch.md.
 export interface EmailWatcherRecord {
@@ -1227,13 +1229,10 @@ export interface EmailWatcherRecord {
   query: string;
   // Optional Gmail label ids to scope the query. Unused in v1.
   labelIds?: string[];
-  // Watermark: the internalDate (epoch ms, as a string) of the newest
-  // message we've processed. Undefined until the first seeding poll runs.
-  lastSeenInternalDate?: string;
   // Dedicated chat session the woken turn posts its proposed reply into.
   chatSessionId?: string;
   // Backing scheduled job that drives this watcher (interval-driven cron job
-  // with a `gmail-delta` preRunHook bound to `chatSessionId`). The job is the
+  // with a `skill-script` preRunHook bound to `chatSessionId`). The job is the
   // scheduler; the watcher is the durable detection identity. Optional only for
   // legacy/hand-edited rows; the startup backfill provisions a job for any
   // enabled watcher missing a resolvable jobId. See ADR job-pre-run-hooks.md.

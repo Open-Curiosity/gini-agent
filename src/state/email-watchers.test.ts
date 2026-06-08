@@ -5,16 +5,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RuntimeConfig } from "../types";
-import "../hooks/builtins"; // populates the registry so createScheduledJob resolves isKnownHook("gmail-delta")
+import "../hooks/builtins"; // populates the registry so createScheduledJob resolves isKnownHook("skill-script")
 import {
   addEmailWatcher,
   backfillEmailWatcherJobs,
   buildWatcherQuery,
   closeAllMemoryDbs,
   getEmailWatcher,
-  isEmailSeen,
   listEmailWatchers,
-  markEmailSeen,
   mutateState,
   readState,
   removeEmailWatcher,
@@ -84,10 +82,10 @@ describe("watcher CRUD", () => {
     const config = buildConfig("ew-update");
     const watcher = await addEmailWatcher(config, { sender: "bob@x.com" });
     const updated = await updateEmailWatcher(config, watcher.id, {
-      lastSeenInternalDate: "12345",
+      query: "from:bob@x.com newer_than:1d",
       status: "needs_auth"
     });
-    expect(updated?.lastSeenInternalDate).toBe("12345");
+    expect(updated?.query).toBe("from:bob@x.com newer_than:1d");
     expect(updated?.status).toBe("needs_auth");
   });
 
@@ -113,7 +111,7 @@ describe("watcher CRUD", () => {
 describe("backing job lifecycle", () => {
   function backingJob(config: ReturnType<typeof buildConfig>, watcherId: string) {
     return readState(config.instance).jobs.find(
-      (j) => j.preRunHook?.handlerId === "gmail-delta" &&
+      (j) => j.preRunHook?.handlerId === "skill-script" &&
         (j.preRunHook.config as { watcherId?: string }).watcherId === watcherId
     );
   }
@@ -125,26 +123,27 @@ describe("backing job lifecycle", () => {
     const job = backingJob(config, watcher.id);
     expect(job).toBeDefined();
     expect(job?.id).toBe(watcher.jobId!);
-    expect(job?.preRunHook?.handlerId).toBe("gmail-delta");
-    expect((job?.preRunHook?.config as { watcherId?: string }).watcherId).toBe(watcher.id);
+    expect(job?.preRunHook?.handlerId).toBe("skill-script");
+    const hookConfig = job?.preRunHook?.config as { skill?: string; script?: string; watcherId?: string; query?: string };
+    expect(hookConfig.skill).toBe("gmail-watch");
+    expect(hookConfig.script).toBe("detect");
+    expect(hookConfig.watcherId).toBe(watcher.id);
+    expect(hookConfig.query).toBe(watcher.query);
     expect(job?.chatSessionId).toBe(watcher.chatSessionId);
     expect(job?.intervalSeconds).toBe(60);
   });
 
-  test("remove deletes the backing job, the dedup rows, and the dedicated session", async () => {
+  test("remove deletes the backing job and the dedicated session", async () => {
     const config = buildConfig("ew-job-remove");
     const watcher = await addEmailWatcher(config, { sender: "erin@x.com" });
-    markEmailSeen(config.instance, watcher.id, "msg-1");
     const jobId = watcher.jobId!;
     const sessionId = watcher.chatSessionId!;
     await removeEmailWatcher(config, watcher.id);
     const state = readState(config.instance);
-    // Watcher, job, and dedicated session all gone.
+    // Watcher, job (carrying the detection state), and dedicated session all gone.
     expect(state.emailWatchers.find((w) => w.id === watcher.id)).toBeUndefined();
     expect(state.jobs.find((j) => j.id === jobId)).toBeUndefined();
     expect(state.chatSessions.find((s) => s.id === sessionId)).toBeUndefined();
-    // Dedup rows dropped.
-    expect(isEmailSeen(config.instance, watcher.id, "msg-1")).toBe(false);
   });
 
   test("removeEmailWatcher cleans the session even when the backing job is already gone (rollback shape)", async () => {
@@ -228,17 +227,5 @@ describe("backing job lifecycle", () => {
     await setEmailWatcherEnabled(config, watcher.id, true);
     expect(getEmailWatcher(config, watcher.id)?.enabled).toBe(true);
     expect(jobStatus()).toBe("active");
-  });
-});
-
-describe("email_seen dedup store", () => {
-  test("markEmailSeen is idempotent and isEmailSeen reflects it", () => {
-    const config = buildConfig("ew-seen");
-    expect(isEmailSeen(config.instance, "w1", "m1")).toBe(false);
-    markEmailSeen(config.instance, "w1", "m1");
-    markEmailSeen(config.instance, "w1", "m1"); // idempotent
-    expect(isEmailSeen(config.instance, "w1", "m1")).toBe(true);
-    // Scoped per watcher.
-    expect(isEmailSeen(config.instance, "w2", "m1")).toBe(false);
   });
 });

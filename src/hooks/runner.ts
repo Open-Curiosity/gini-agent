@@ -125,14 +125,14 @@ export type HookOutcome =
 //
 // Error taxonomy (the `transient` flag lets the consumer decide durability):
 //   - CONFIG errors (transient:false): an unknown handlerId, a handler-returned
-//     { kind: "error" } (gmail-delta uses this only for missing/unknown watcher),
-//     or a malformed result whose kind isn't in the union. A turn is meaningless
-//     and retrying won't fix it.
+//     { kind: "error" } (the skill-script handler uses this for a missing/unknown
+//     skill|script or malformed script output), or a result whose kind isn't in
+//     the union. A turn is meaningless and retrying won't fix it.
 //   - TRANSIENT errors (transient:true): a timeout or an unexpected handler throw.
 //     Handlers MUST be cancellation-safe + idempotent — Promise.race does NOT
 //     cancel the loser, so a timed-out handler keeps running to completion; a
-//     well-behaved handler (gmail-delta) only writes replay-safe cursor/dedup
-//     state, so the orphaned promise can't corrupt anything.
+//     well-behaved handler (the skill-script handler runs a PURE script) writes
+//     no state itself, so the orphaned promise can't corrupt anything.
 export async function runHook(
   config: RuntimeConfig,
   hookConfig: HookConfig,
@@ -154,9 +154,9 @@ export async function runHook(
       Bun.sleep(timeoutMs).then<typeof HOOK_TIMEOUT>(() => HOOK_TIMEOUT)
     ]);
   } catch (error) {
-    // An unexpected handler throw is transient — gmail-delta never throws (it
-    // catches and short-circuits), so a throw here is a handler bug or a
-    // transient runtime fault.
+    // An unexpected handler throw is transient — the skill-script handler throws
+    // deliberately on a transient script failure (non-zero exit / unparseable
+    // stdout) precisely to land here and keep a scheduled job alive.
     return {
       kind: "error",
       message: error instanceof Error ? error.message : String(error),

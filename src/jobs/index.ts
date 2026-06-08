@@ -442,9 +442,9 @@ export function advanceCronNextRunAt(
 //     the scheduled job stays active so it self-recovers on its next tick.
 //     Deactivating a watcher on a transient stall would silently kill it.
 //   - NON-transient error (unknown handlerId, a handler-returned { kind:"error" }
-//     — gmail-delta uses this only for missing/unknown watcher — or a malformed
-//     result): fatal:true — a draft is meaningless and retrying won't fix it, so
-//     the scheduled job is deactivated.
+//     — the skill-script handler uses this for a missing/unknown skill|script or
+//     malformed script output — or a malformed result): fatal:true — a draft is
+//     meaningless and retrying won't fix it, so the scheduled job is deactivated.
 // The runner decided transience; jobs decides what that means for a SCHEDULE.
 async function runPreRunHook(
   config: RuntimeConfig,

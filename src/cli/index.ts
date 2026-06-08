@@ -1,7 +1,7 @@
 // CLI entry point. Parses global flags, resolves the instance and runtime
 // config, builds a CliContext, and dispatches to the right command module.
 
-import "../hooks/builtins"; // registers trusted hook handlers (gmail-delta) so any in-process createScheduledJob path resolves isKnownHook
+import "../hooks/builtins"; // registers trusted hook handlers (skill-script) so any in-process createScheduledJob path resolves isKnownHook
 import { defaultWebPort, loadConfig, parseInstance } from "../paths";
 import type { RuntimeConfig } from "../types";
 import { applyGlobalEnvOverrides, flagValue, hasFlag, stripGlobalArgs } from "./args";

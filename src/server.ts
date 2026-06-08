@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 import { createHandler, isWebProxyPath, proxyWebSocketUpgrade, relaySessionGateRequired, sessionCookieValue, webSocketProxyHandler, writePid } from "./http";
 import { webBoundRequestAllowed } from "./lib/origin-trust";
 import { resolveSessionFromCookie } from "./governance/pairing";
-import "./hooks/builtins"; // registers trusted hook handlers (gmail-delta) before the scheduler/backfill run
+import "./hooks/builtins"; // registers trusted hook handlers (skill-script) before the scheduler/backfill run
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
@@ -160,13 +160,13 @@ syncProviderMcpServers(config)
   });
 
 // Email-watch migration backfill (ADR job-pre-run-hooks.md). Provisions a
-// backing scheduled job (with a gmail-delta preRunHook) for any enabled watcher
-// that lacks a resolvable jobId — legacy watchers created before the hooks
-// cutover, or a watcher whose job was removed out-of-band. Idempotent: it finds
-// existing jobs and does nothing, so it's safe to run on every startup. The
-// watcher's cursor is preserved, so a migrated watcher's first hook-fire is a
-// normal steady-state tick, not a re-seed. Best-effort: a failure logs and lets
-// startup continue.
+// backing scheduled job (with a skill-script preRunHook running gmail-watch's
+// detect script) for any enabled watcher that lacks a resolvable jobId — legacy
+// watchers created before the hooks cutover, or a watcher whose job was removed
+// out-of-band. Idempotent: it finds existing jobs and does nothing, so it's safe
+// to run on every startup. The detection cursor lives on the backing job's
+// hookState, so a migrated watcher re-seeds on its first fire. Best-effort: a
+// failure logs and lets startup continue.
 backfillEmailWatcherJobs(config)
   .then((provisioned) => {
     if (provisioned > 0) {
