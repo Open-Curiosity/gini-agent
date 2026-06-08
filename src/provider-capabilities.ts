@@ -69,6 +69,17 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
       // no per-model gate. translateMessagesToAnthropic maps image_url and
       // document parts into the corresponding base64 source blocks.
       return { vision: true, nativeDocs: true };
+    case "bedrock": {
+      // Bedrock Converse exposes image/document content blocks, but support is
+      // per-model. Enable for the families that accept them (Claude 3+, the
+      // multimodal Nova tiers, Mistral Pixtral, Llama 4, and the Llama 3.2
+      // vision variants); text-only ids (DeepSeek R1, Llama 3.3, Nova Micro)
+      // stay conservatively false so the vision path never sends a block the
+      // model rejects. Conservative default for unrecognized ids.
+      const multimodal =
+        /anthropic\.claude|amazon\.nova-(?:pro|lite|premier)|pixtral|llama4|llama3-2-(?:11b|90b)/i.test(model);
+      return multimodal ? { vision: true, nativeDocs: true } : { vision: false, nativeDocs: false };
+    }
     case "codex":
       // Verified empirically against the live ChatGPT-backend /responses
       // surface (gpt-5.x): it accepts a native `input_file` document part

@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import {
   ArrowLeftRightIcon,
   CheckIcon,
+  Cloud as CloudIcon,
   PencilIcon,
   PlusIcon,
   Terminal as TerminalIcon,
@@ -23,13 +24,13 @@ import {
 import { AnthropicLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
-import { providerAuthLabel } from "./providerAuth";
 import { EditProviderDialog } from "./EditProviderDialog";
 
 // Providers whose credentials are env-keyed and therefore safe to remove
 // from this UI: scrubbing the env var + secrets.env line is reversible
 // (the user can add it back). Codex is owned by the codex CLI and local
-// has no key to clear, so neither row exposes the trash button.
+// has no key to clear; bedrock signs with ~/.aws credentials gini doesn't
+// manage — so none of those three expose the trash button.
 const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek", "anthropic"]);
 
 export interface ProviderCatalogItem {
@@ -59,7 +60,7 @@ export function displayProviderName(item: { displayName: string; name: string })
 // Providers selectable on the Settings page. Echo is dev-only; the four
 // real providers map onto the Pencil mock (Codex, OpenAI, DeepSeek, Ollama
 // stand in for `local`).
-const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "deepseek", "openrouter", "local"] as const;
+const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "bedrock", "deepseek", "openrouter", "local"] as const;
 
 // Per-provider visual identity. Brand logos for OpenAI/DeepSeek/Ollama
 // come from the authoritative Pencil design file; codex (Terminal) and
@@ -69,6 +70,7 @@ const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: 
   codex: { icon: TerminalIcon, authLabel: "OAuth" },
   openai: { icon: OpenAILogo, authLabel: "API key" },
   anthropic: { icon: AnthropicLogo, authLabel: "API key" },
+  bedrock: { icon: CloudIcon, authLabel: "AWS" },
   deepseek: { icon: DeepSeekLogo, authLabel: "API key" },
   openrouter: { icon: ZapIcon, authLabel: "API key" },
   local: { icon: OllamaLogo, authLabel: "Local" }
@@ -83,13 +85,13 @@ export function ProviderCard({
   catalog,
   activeProviderName,
   activeProviderModel,
-  activeProviderAuthMode,
   activeProviderAwsRegion
 }: {
   catalog: ProviderCatalogItem[];
   activeProviderName?: string;
   activeProviderModel?: string;
-  activeProviderAuthMode?: string;
+  // Active bedrock provider's region — threaded into the Edit dialog so it
+  // opens pre-filled.
   activeProviderAwsRegion?: string;
 }) {
   const invalidate = useInvalidate();
@@ -193,9 +195,7 @@ export function ProviderCard({
             : "border-[#3A3A40]";
           const visual = PROVIDER_VISUAL[row.name] ?? { icon: TerminalIcon, authLabel: row.auth };
           const Icon = visual.icon;
-          // Only the active provider has a persisted authMode, so other rows
-          // keep their static label. SigV4 retitles the chip to "AWS SigV4".
-          const authLabel = providerAuthLabel(isActive ? activeProviderAuthMode : undefined, visual.authLabel);
+          const authLabel = visual.authLabel;
           const model = isActive
             ? (activeProviderModel ?? row.models[0] ?? "")
             : (row.models[0] ?? "");
@@ -348,13 +348,9 @@ export function ProviderCard({
       {editingRow ? (
         <EditProviderDialog
           row={editingRow}
-          authLabel={providerAuthLabel(
-            editingRow.name === activeProviderName ? activeProviderAuthMode : undefined,
-            PROVIDER_VISUAL[editingRow.name]?.authLabel ?? editingRow.auth
-          )}
+          authLabel={PROVIDER_VISUAL[editingRow.name]?.authLabel ?? editingRow.auth}
           icon={PROVIDER_VISUAL[editingRow.name]?.icon ?? TerminalIcon}
           currentModel={editingRow.name === activeProviderName ? activeProviderModel : undefined}
-          currentAuthMode={editingRow.name === activeProviderName ? activeProviderAuthMode : undefined}
           currentAwsRegion={editingRow.name === activeProviderName ? activeProviderAwsRegion : undefined}
           open={Boolean(editingRow)}
           onOpenChange={(open) => {

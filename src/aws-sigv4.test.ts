@@ -58,6 +58,22 @@ describe("signAwsRequest", () => {
     expect(headers["x-amz-security-token"]).toBeUndefined();
   });
 
+  test("SigV4-encodes reserved path characters in the canonical URI", () => {
+    // encodeURIComponent leaves !*'() unencoded, but SigV4's canonical URI
+    // requires them encoded; canonicalUri fixes that. A Bedrock model id never
+    // contains them, so exercise a path that does to guard the general case.
+    const headers = signAwsRequest({
+      method: "POST",
+      url: "https://bedrock-runtime.us-east-1.amazonaws.com/model/a(b)!'*/converse",
+      body: BODY,
+      region: "us-east-1",
+      service: "bedrock",
+      credentials: CREDS,
+      now: new Date("2026-06-08T18:00:00.000Z")
+    });
+    expect(headers.authorization).toMatch(/Signature=[0-9a-f]{64}$/);
+  });
+
   test("adds x-amz-security-token only for temporary credentials; signs the SigV4 trio without extras", () => {
     const headers = signAwsRequest({
       method: "POST",

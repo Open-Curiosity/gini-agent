@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import {
   ArrowLeftIcon,
   CheckIcon,
+  Cloud as CloudIcon,
   Terminal as TerminalIcon,
   ZapIcon
 } from "lucide-react";
@@ -17,17 +18,17 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { AnthropicLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
-import { authPayloadFields } from "../_components/providerAuth";
 import { displayProviderName, type ProviderCatalogItem } from "../_components/ProviderCard";
 
 // Codex stays first so it lines up with where the Settings list shows
 // its row. Echo is dev-only and never appears here.
-const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "openrouter", "deepseek", "local"] as const;
+const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "bedrock", "openrouter", "deepseek", "local"] as const;
 
 const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: string }>; description: string }> = {
   codex: { icon: TerminalIcon, description: "OAuth via codex --login" },
   openai: { icon: OpenAILogo, description: "GPT-5.4, GPT-5.4 mini, …" },
-  anthropic: { icon: AnthropicLogo, description: "Claude Opus/Sonnet/Haiku (incl. Bedrock)" },
+  anthropic: { icon: AnthropicLogo, description: "Claude (first-party API key)" },
+  bedrock: { icon: CloudIcon, description: "Claude, Nova, Llama… on AWS" },
   openrouter: { icon: ZapIcon, description: "Multi-model router" },
   deepseek: { icon: DeepSeekLogo, description: "DeepSeek V4 family" },
   local: { icon: OllamaLogo, description: "Ollama, LM Studio, vLLM" }
@@ -60,13 +61,9 @@ export default function AddProviderPage() {
   const [providerName, setProviderName] = useState<string>("");
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [apiKey, setApiKey] = useState("");
-  // Optional endpoint override. Only surfaced for anthropic, where pointing
-  // the base URL at "https://bedrock-mantle.<region>.api.aws/anthropic" (with
-  // a minted bearer token in the key field) targets Claude in Amazon Bedrock.
+  // Optional first-party endpoint override (anthropic/openai-compatible proxies).
   const [baseUrl, setBaseUrl] = useState("");
-  // anthropic auth mode (see EditProviderDialog). "aws-sigv4" signs each request
-  // with AWS IAM credentials and needs no API key; awsRegion is optional.
-  const [authMode, setAuthMode] = useState<"bearer" | "aws-sigv4">("bearer");
+  // Optional AWS region for the bedrock provider (defaults to us-east-1).
   const [awsRegion, setAwsRegion] = useState("");
 
   // Seed once the catalog arrives: honor a ?provider= preselection from the
@@ -84,7 +81,6 @@ export default function AddProviderPage() {
     setSelectedModel(entry?.models[0] ?? "");
     setApiKey("");
     setBaseUrl("");
-    setAuthMode("bearer");
     setAwsRegion("");
   };
 
@@ -92,9 +88,9 @@ export default function AddProviderPage() {
   const isCodex = providerName === "codex";
   const isLocal = providerName === "local";
   const isAnthropic = providerName === "anthropic";
-  const sigv4 = isAnthropic && authMode === "aws-sigv4";
-  // SigV4 signs with IAM credentials, so no API key is required in that mode.
-  const requiresApiKey = providerName !== "" && !isCodex && !isLocal && !sigv4;
+  const isBedrock = providerName === "bedrock";
+  // Codex (OAuth), bedrock (AWS SigV4), and local (no-auth) hold no gini key.
+  const requiresApiKey = providerName !== "" && !isCodex && !isLocal && !isBedrock;
 
   const save = useMutation({
     mutationFn: async (): Promise<SetProviderResult> => {
@@ -112,9 +108,9 @@ export default function AddProviderPage() {
         body: JSON.stringify({
           provider: providerName,
           ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-          ...(selectedModel ? { model: selectedModel } : {}),
+          ...(selectedModel.trim() ? { model: selectedModel.trim() } : {}),
           ...(baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
-          ...authPayloadFields(isAnthropic, authMode, awsRegion)
+          ...(isBedrock && awsRegion.trim() ? { awsRegion: awsRegion.trim() } : {})
         })
       });
     },
@@ -142,7 +138,7 @@ export default function AddProviderPage() {
   const canSubmit =
     providerName !== "" &&
     !save.isPending &&
-    (isCodex ? true : selectedModel !== "" && (!requiresApiKey || apiKey.trim().length > 0));
+    (isCodex ? true : selectedModel.trim() !== "" && (!requiresApiKey || apiKey.trim().length > 0));
 
   return (
     <>
@@ -171,7 +167,7 @@ export default function AddProviderPage() {
             <h2 className="text-sm font-semibold">Provider type</h2>
             <p className="text-xs text-muted-foreground">Choose the model API surface to configure.</p>
           </div>
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
             {tiles.map((tile) => {
               const visual = PROVIDER_VISUAL[tile.name] ?? { icon: TerminalIcon, description: "" };
               const Icon = visual.icon;
@@ -209,9 +205,11 @@ export default function AddProviderPage() {
             <p className="text-xs text-muted-foreground">
               {isCodex
                 ? "Codex authenticates through your existing ChatGPT account — no API key needed."
-                : isLocal
-                  ? "Local providers accept no-auth requests; leave the key blank if your gateway is open."
-                  : "Saved to ~/.gini/secrets.env (mode 0600). Not sent anywhere except the provider."}
+                : isBedrock
+                  ? "Bedrock signs each request with your AWS credentials — no API key needed."
+                  : isLocal
+                    ? "Local providers accept no-auth requests; leave the key blank if your gateway is open."
+                    : "Saved to ~/.gini/secrets.env (mode 0600). Not sent anywhere except the provider."}
             </p>
           </div>
 
@@ -233,21 +231,48 @@ export default function AddProviderPage() {
                   every request, so a future <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">codex --login</code> refresh is picked up automatically.
                 </p>
               </div>
+            ) : isBedrock ? (
+              <>
+                <p className="text-xs text-muted-foreground">
+                  Gini signs each Converse request with the AWS credentials it finds in
+                  <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">AWS_ACCESS_KEY_ID</code>/<code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">AWS_SECRET_ACCESS_KEY</code>
+                  or your <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">~/.aws/credentials</code> profile — the same ones your <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">aws</code> CLI uses. No API key.
+                </p>
+                <div className="grid gap-2">
+                  <Label htmlFor="bedrock-model">Model (cross-region inference profile id)</Label>
+                  <Input
+                    id="bedrock-model"
+                    type="text"
+                    autoComplete="off"
+                    placeholder="us.anthropic.claude-opus-4-8"
+                    value={selectedModel}
+                    onChange={(e) => setSelectedModel(e.target.value)}
+                    disabled={save.isPending}
+                    className="font-mono"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Any Bedrock model — e.g. <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">us.amazon.nova-pro-v1:0</code>,{" "}
+                    <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">us.meta.llama3-3-70b-instruct-v1:0</code>,{" "}
+                    <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">us.deepseek.r1-v1:0</code>.
+                  </p>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="bedrock-region">
+                    AWS region <span className="text-muted-foreground">(optional)</span>
+                  </Label>
+                  <Input
+                    id="bedrock-region"
+                    type="text"
+                    autoComplete="off"
+                    placeholder="us-east-1"
+                    value={awsRegion}
+                    onChange={(e) => setAwsRegion(e.target.value)}
+                    disabled={save.isPending}
+                  />
+                </div>
+              </>
             ) : (
               <>
-                {isAnthropic ? (
-                  <div className="grid gap-2">
-                    <Label htmlFor="provider-auth-mode">Authentication</Label>
-                    <Select value={authMode} onValueChange={(v) => setAuthMode(v as "bearer" | "aws-sigv4")} disabled={save.isPending}>
-                      <SelectTrigger id="provider-auth-mode"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="bearer">API key (x-api-key)</SelectItem>
-                        <SelectItem value="aws-sigv4">AWS SigV4 (IAM credentials)</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                ) : null}
-
                 {requiresApiKey ? (
                   <div className="grid gap-2">
                     <Label htmlFor="provider-api-key">API key</Label>
@@ -260,24 +285,6 @@ export default function AddProviderPage() {
                       onChange={(e) => setApiKey(e.target.value)}
                       disabled={save.isPending}
                     />
-                  </div>
-                ) : null}
-
-                {sigv4 ? (
-                  <div className="grid gap-2">
-                    <Label htmlFor="provider-aws-region">
-                      AWS region <span className="text-muted-foreground">(optional)</span>
-                    </Label>
-                    <Input
-                      id="provider-aws-region"
-                      type="text"
-                      autoComplete="off"
-                      placeholder="e.g. us-east-1 — blank infers from the Base URL"
-                      value={awsRegion}
-                      onChange={(e) => setAwsRegion(e.target.value)}
-                      disabled={save.isPending}
-                    />
-                    <p className="text-xs text-muted-foreground">Signs with your AWS credentials (AWS_ACCESS_KEY_ID/SECRET or ~/.aws). No API key needed.</p>
                   </div>
                 ) : null}
 
@@ -313,15 +320,6 @@ export default function AddProviderPage() {
                       ))}
                     </SelectContent>
                   </Select>
-                  {isAnthropic ? (
-                    <p className="text-xs text-muted-foreground">
-                      Leave Base URL blank for the first-party Claude API. For Amazon Bedrock, set it to{" "}
-                      <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">
-                        https://bedrock-mantle.&lt;region&gt;.api.aws/anthropic
-                      </code>{" "}
-                      — the selected model is mapped to its Bedrock id automatically.
-                    </p>
-                  ) : null}
                 </div>
               </>
             )}

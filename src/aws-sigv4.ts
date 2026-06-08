@@ -40,6 +40,22 @@ function amzDate(now: Date): string {
   return now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
 }
 
+// SigV4 canonical-URI encoding for non-S3 services: the request path is
+// URI-encoded a SECOND time (each segment encoded; '/' preserved; unreserved
+// chars A-Za-z0-9-_.~ left as-is). The caller already encodeURIComponent's a
+// path segment that carries reserved chars (e.g. a Bedrock model id's ':' ->
+// '%3A'), and AWS re-encodes the received path when recomputing the signature
+// ('%3A' -> '%253A'); encoding pathname here matches that so the signature
+// agrees. encodeURIComponent leaves !*'() unencoded, so encode those too.
+function canonicalUri(pathname: string): string {
+  return pathname
+    .split("/")
+    .map((segment) =>
+      encodeURIComponent(segment).replace(/[!*'()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+    )
+    .join("/");
+}
+
 // Sign a request and return the auth headers to merge into the outgoing fetch.
 // `extraSignedHeaders` are non-SigV4 headers (e.g. content-type,
 // anthropic-version) that are also sent on the request and must therefore be
@@ -76,7 +92,7 @@ export function signAwsRequest(opts: {
 
   const canonicalRequest = [
     opts.method,
-    url.pathname,
+    canonicalUri(url.pathname),
     "",
     canonicalHeaders,
     signedHeaders,

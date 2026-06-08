@@ -3287,6 +3287,60 @@ function anthropicSse(
   return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
+// Encode Converse events as an AWS event-stream (vnd.amazon.eventstream) body —
+// the binary framing readConverseStream parses. Each frame is
+// [4B totalLen][4B headersLen][4B preludeCRC=0][headers][payload][4B msgCRC=0];
+// readConverseStream doesn't validate CRCs, so zeros are fine. Headers carry the
+// string-typed (:event-type, :message-type) values the parser routes on.
+function converseEventStream(events: Array<{ type: string; payload: unknown; messageType?: string }>): Response {
+  const enc = new TextEncoder();
+  const u8concat = (parts: Uint8Array[]): Uint8Array => {
+    const total = parts.reduce((n, p) => n + p.length, 0);
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const p of parts) { out.set(p, o); o += p.length; }
+    return out;
+  };
+  const strHeader = (name: string, value: string): Uint8Array => {
+    const n = enc.encode(name);
+    const v = enc.encode(value);
+    const h = new Uint8Array(1 + n.length + 1 + 2 + v.length);
+    let o = 0;
+    h[o++] = n.length;
+    h.set(n, o); o += n.length;
+    h[o++] = 7; // value type 7 = string
+    h[o++] = (v.length >> 8) & 0xff;
+    h[o++] = v.length & 0xff;
+    h.set(v, o);
+    return h;
+  };
+  const frames = events.map((ev) => {
+    const payload = enc.encode(JSON.stringify(ev.payload));
+    const headers = u8concat([
+      strHeader(":event-type", ev.type),
+      strHeader(":message-type", ev.messageType ?? "event"),
+      strHeader(":content-type", "application/json")
+    ]);
+    const totalLen = 12 + headers.length + payload.length + 4;
+    const msg = new Uint8Array(totalLen);
+    const dv = new DataView(msg.buffer);
+    dv.setUint32(0, totalLen);
+    dv.setUint32(4, headers.length);
+    dv.setUint32(8, 0);
+    msg.set(headers, 12);
+    msg.set(payload, 12 + headers.length);
+    return msg;
+  });
+  const all = u8concat(frames);
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(all);
+      controller.close();
+    }
+  });
+  return new Response(stream, { status: 200, headers: { "content-type": "application/vnd.amazon.eventstream" } });
+}
+
 describe("anthropic provider", () => {
   test("normalizeProvider applies defaults and preserves overrides", () => {
     expect(normalizeProvider({ name: "anthropic", model: "" })).toEqual({
@@ -3819,35 +3873,20 @@ describe("anthropic provider", () => {
     }
   });
 
-  test("auto-maps the model id to the Bedrock anthropic.-prefixed form when the baseUrl is Bedrock", async () => {
+  test("anthropic sends the model id verbatim (first-party; no Bedrock prefix mapping)", async () => {
     const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
-    const okBody = () =>
-      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} });
-    const sentModel = async (provider: ReturnType<typeof normalizeProvider>): Promise<string> => {
-      const stub = installFetch(okBody);
-      try {
-        await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
-        return JSON.parse(String(stub.calls[0]!.init.body)).model;
-      } finally {
-        stub.restore();
-      }
-    };
+    const stub = installFetch(() =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })
+    );
     try {
-      // Bedrock baseUrl + clean id → prefixed in the request body.
-      expect(
-        await sentModel(
-          normalizeProvider({ name: "anthropic", model: "claude-opus-4-8", baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic" })
-        )
-      ).toBe("anthropic.claude-opus-4-8");
-      // First-party baseUrl → clean id unchanged.
-      expect(await sentModel(normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" }))).toBe("claude-opus-4-8");
-      // Already-prefixed id on Bedrock → not double-prefixed.
-      expect(
-        await sentModel(
-          normalizeProvider({ name: "anthropic", model: "anthropic.claude-haiku-4-5", baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic" })
-        )
-      ).toBe("anthropic.claude-haiku-4-5");
+      await generateToolCallingResponse(
+        config(normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" })),
+        [{ role: "user", content: "hi" }],
+        []
+      );
+      expect(JSON.parse(String(stub.calls[0]!.init.body)).model).toBe("claude-opus-4-8");
     } finally {
+      stub.restore();
       restoreEnv();
     }
   });
@@ -3893,32 +3932,70 @@ describe("anthropic provider", () => {
     }
   });
 
-  test("aws-sigv4: SigV4-signs the Bedrock Mantle request instead of x-api-key", async () => {
+  test("bedrock: SigV4-signs the Converse request (no x-api-key) and sends the converse body", async () => {
     const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
     const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+    const restoreRegion = setEnv("AWS_REGION", undefined);
+    const restoreDef = setEnv("AWS_DEFAULT_REGION", undefined);
     const fetchStub = installFetch(() =>
-      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })
+      anthropicJson({
+        output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+        stopReason: "end_turn",
+        usage: { inputTokens: 3, outputTokens: 1, totalTokens: 4 }
+      })
     );
     try {
-      const provider = normalizeProvider({
-        name: "anthropic",
-        model: "claude-opus-4-8",
-        baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
-        authMode: "aws-sigv4"
-      });
-      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
       const call = fetchStub.calls[0]!;
-      // Same endpoint + body as the bearer path — only the auth headers differ.
-      expect(call.url).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages");
+      // modelId path segment is encodeURIComponent'd (':' -> %3A); non-stream op.
+      expect(call.url).toBe("https://bedrock-runtime.us-east-1.amazonaws.com/model/us.amazon.nova-pro-v1%3A0/converse");
       const headers = call.init.headers as Record<string, string>;
       expect(headers["x-api-key"]).toBeUndefined();
       expect(headers["authorization"]).toMatch(
-        /^AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE\/\d{8}\/us-east-1\/bedrock-mantle\/aws4_request, SignedHeaders=anthropic-version;content-type;host;x-amz-content-sha256;x-amz-date, Signature=[0-9a-f]{64}$/
+        /^AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE\/\d{8}\/us-east-1\/bedrock\/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=[0-9a-f]{64}$/
       );
       expect(headers["x-amz-date"]).toMatch(/^\d{8}T\d{6}Z$/);
-      expect(headers["x-amz-content-sha256"]).toMatch(/^[0-9a-f]{64}$/);
-      // Bedrock baseUrl still auto-maps the clean id to the anthropic. form.
-      expect(JSON.parse(String(call.init.body)).model).toBe("anthropic.claude-opus-4-8");
+      const body = JSON.parse(String(call.init.body));
+      expect(body.messages).toEqual([{ role: "user", content: [{ text: "hi" }] }]);
+      expect(body.inferenceConfig.maxTokens).toBeGreaterThan(0);
+      expect(result.text).toBe("ok");
+      expect(result.usage).toMatchObject({ input_tokens: 3, output_tokens: 1, total_tokens: 4 });
+    } finally {
+      fetchStub.restore();
+      restoreDef();
+      restoreRegion();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: hoists system, maps tools to toolConfig, and parses a toolUse response", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        output: { message: { role: "assistant", content: [{ toolUse: { toolUseId: "tu_1", name: "lookup", input: { q: "x" } } }] } },
+        stopReason: "tool_use",
+        usage: {}
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "lookup", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "system", content: "sys" }, { role: "user", content: "go" }],
+        tools
+      );
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(body.system).toEqual([{ text: "sys" }]);
+      expect(body.toolConfig.tools[0].toolSpec).toMatchObject({ name: "lookup", inputSchema: { json: { type: "object" } } });
+      expect(body.toolConfig.toolChoice).toEqual({ auto: {} });
+      expect(result.finishReason).toBe("tool_calls");
+      expect(result.toolCalls[0]).toMatchObject({ id: "tu_1", function: { name: "lookup", arguments: JSON.stringify({ q: "x" }) } });
     } finally {
       fetchStub.restore();
       restoreSk();
@@ -3926,20 +4003,78 @@ describe("anthropic provider", () => {
     }
   });
 
-  test("aws-sigv4: providerHealth is configured when AWS credentials resolve", () => {
+  test("bedrock: streams converse-stream text deltas and tool-use, mapping stop + usage", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const seen: string[] = [];
+    const fetchStub = installFetch(() =>
+      converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "Hel" } } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "lo" } } },
+        { type: "contentBlockStop", payload: { contentBlockIndex: 0 } },
+        { type: "contentBlockStart", payload: { contentBlockIndex: 1, start: { toolUse: { toolUseId: "tu_9", name: "fetch" } } } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 1, delta: { toolUse: { input: "{\"u\":1}" } } } },
+        { type: "contentBlockStop", payload: { contentBlockIndex: 1 } },
+        { type: "messageStop", payload: { stopReason: "tool_use" } },
+        { type: "metadata", payload: { usage: { inputTokens: 7, outputTokens: 2, totalTokens: 9 } } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-lite-v1:0", awsRegion: "us-east-1" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], (d) => seen.push(d));
+      expect(fetchStub.calls[0]!.url).toContain("/converse-stream");
+      expect(seen.join("")).toBe("Hello");
+      expect(result.text).toBe("Hello");
+      expect(result.finishReason).toBe("tool_calls");
+      expect(result.toolCalls[0]).toMatchObject({ id: "tu_9", function: { name: "fetch", arguments: "{\"u\":1}" } });
+      expect(result.usage).toMatchObject({ input_tokens: 7, output_tokens: 2 });
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: a converse-stream exception frame throws", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      converseEventStream([{ type: "throttlingException", messageType: "exception", payload: { message: "slow down" } }])
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-lite-v1:0", awsRegion: "us-east-1" });
+      await expect(
+        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {})
+      ).rejects.toThrow(/slow down/);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: a non-OK converse response surfaces the error message", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() => anthropicJson({ message: "ValidationException: bad model id" }, 400));
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-lite-v1:0", awsRegion: "us-east-1" });
+      await expect(
+        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
+      ).rejects.toThrow(/bad model id/);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: providerHealth is configured when AWS credentials resolve", () => {
     const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
     const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
     try {
-      const health = providerHealth(
-        config(
-          normalizeProvider({
-            name: "anthropic",
-            model: "claude-opus-4-8",
-            baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
-            authMode: "aws-sigv4"
-          })
-        )
-      );
+      const health = providerHealth(config(normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" })));
       expect(health.configured).toBe(true);
       expect(health.message).toContain("AWS SigV4");
     } finally {
@@ -3948,50 +4083,20 @@ describe("anthropic provider", () => {
     }
   });
 
-  test("aws-sigv4: providerHealth is not-configured when no AWS credentials resolve", () => {
+  test("bedrock: providerHealth not-configured and errors when no AWS credentials resolve", async () => {
     const restoreAk = setEnv("AWS_ACCESS_KEY_ID", undefined);
     const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", undefined);
     const restoreFile = setEnv("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/gini-test/credentials");
     const restoreProfile = setEnv("AWS_PROFILE", undefined);
+    const fetchStub = installFetch(() => anthropicJson({}));
     try {
-      const health = providerHealth(
-        config(
-          normalizeProvider({
-            name: "anthropic",
-            model: "claude-opus-4-8",
-            baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
-            authMode: "aws-sigv4"
-          })
-        )
-      );
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1" });
+      const health = providerHealth(config(provider));
       expect(health.configured).toBe(false);
       expect(health.message).toMatch(/Set AWS credentials/);
-    } finally {
-      restoreProfile();
-      restoreFile();
-      restoreSk();
-      restoreAk();
-    }
-  });
-
-  test("aws-sigv4: errors when no AWS credentials resolve", async () => {
-    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", undefined);
-    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", undefined);
-    const restoreFile = setEnv("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/gini-test/credentials");
-    const restoreProfile = setEnv("AWS_PROFILE", undefined);
-    const fetchStub = installFetch(() =>
-      anthropicJson({ id: "m", type: "message", role: "assistant", content: [], stop_reason: "end_turn", usage: {} })
-    );
-    try {
-      const provider = normalizeProvider({
-        name: "anthropic",
-        model: "claude-opus-4-8",
-        baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
-        authMode: "aws-sigv4"
-      });
       await expect(
         generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
-      ).rejects.toThrow(/no AWS credentials resolved/);
+      ).rejects.toThrow(/needs AWS credentials/);
     } finally {
       fetchStub.restore();
       restoreProfile();
@@ -4001,30 +4106,61 @@ describe("anthropic provider", () => {
     }
   });
 
-  test("aws-sigv4: errors when no AWS region resolves", async () => {
+  test("bedrock: defaults region to us-east-1 and signs vision (image) content", async () => {
     const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
     const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
     const restoreRegion = setEnv("AWS_REGION", undefined);
-    const restoreDefRegion = setEnv("AWS_DEFAULT_REGION", undefined);
+    const restoreDef = setEnv("AWS_DEFAULT_REGION", undefined);
     const fetchStub = installFetch(() =>
-      anthropicJson({ id: "m", type: "message", role: "assistant", content: [], stop_reason: "end_turn", usage: {} })
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "a cat" }] } }, stopReason: "end_turn", usage: {} })
     );
     try {
-      // A non-Bedrock host has no region to parse; with no awsRegion/AWS_REGION,
-      // region resolution fails before any request is signed.
-      const provider = normalizeProvider({
-        name: "anthropic",
-        model: "claude-opus-4-8",
-        baseUrl: "https://api.anthropic.com",
-        authMode: "aws-sigv4"
+      // No awsRegion set → normalizeProvider defaults to us-east-1.
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" });
+      const result = await generateVisionAnalysis(config(provider), {
+        prompt: "what is this",
+        imageBase64: "aGVsbG8=",
+        mimeType: "image/png"
       });
-      await expect(
-        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
-      ).rejects.toThrow(/no AWS region resolved/);
+      const call = fetchStub.calls[0]!;
+      expect(call.url).toBe("https://bedrock-runtime.us-east-1.amazonaws.com/model/us.amazon.nova-pro-v1%3A0/converse");
+      const body = JSON.parse(String(call.init.body));
+      expect(body.messages[0].content).toEqual([
+        { text: "what is this" },
+        { image: { format: "png", source: { bytes: "aGVsbG8=" } } }
+      ]);
+      expect(result.text).toBe("a cat");
     } finally {
       fetchStub.restore();
-      restoreDefRegion();
+      restoreDef();
       restoreRegion();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: structured output parses JSON returned via Converse", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        output: { message: { role: "assistant", content: [{ text: "```json\n{\"ok\":true}\n```" }] } },
+        stopReason: "end_turn",
+        usage: {}
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1" });
+      const result = await generateStructured(config(provider), {
+        system: "s",
+        user: "u",
+        schemaName: "T",
+        validator: { parse: (v: unknown) => v as { ok: boolean } }
+      });
+      expect(result.data).toEqual({ ok: true });
+      expect(fetchStub.calls[0]!.url).toContain("/converse");
+    } finally {
+      fetchStub.restore();
       restoreSk();
       restoreAk();
     }

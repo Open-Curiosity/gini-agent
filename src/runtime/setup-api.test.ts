@@ -109,7 +109,7 @@ describe("setup-api", () => {
   test("status: providerConfigured reflects the codex platform default on a fresh instance", () => {
     const status = getSetupStatus(config);
     expect(status.ok).toBe(true);
-    expect(status.providers).toEqual(["openai", "codex", "openrouter", "deepseek", "local", "anthropic"]);
+    expect(status.providers).toEqual(["openai", "codex", "openrouter", "deepseek", "local", "anthropic", "bedrock"]);
     // Platform default is "codex". providerHealth treats codex as
     // configured when the runtime can find an auth.json; in this
     // scratch env there is none (CODEX_AUTH_JSON is scrubbed in
@@ -296,47 +296,46 @@ describe("setup-api", () => {
     }
   });
 
-  test("anthropic aws-sigv4: configures with no apiKey and persists authMode + region", async () => {
-    const result = await setSetupProvider(config, {
-      provider: "anthropic",
-      model: "claude-opus-4-8",
-      baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
-      authMode: "aws-sigv4",
-      awsRegion: "us-east-1"
-    });
-    // No apiKey supplied, yet it succeeds — SigV4 signs with IAM creds, not a key.
-    expect(result.ok).toBe(true);
-    expect(config.provider.name).toBe("anthropic");
-    expect(config.provider.authMode).toBe("aws-sigv4");
-    expect(config.provider.awsRegion).toBe("us-east-1");
-    expect(config.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+  test("bedrock: configures with no apiKey when AWS creds resolve, persisting model + region", async () => {
+    // Like codex, bedrock needs no gini-held key — it signs with AWS creds. When
+    // they resolve, set succeeds and persists the (model-agnostic) model + region.
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    try {
+      const result = await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-west-2" });
+      expect(result.ok).toBe(true);
+      expect(config.provider.name).toBe("bedrock");
+      expect(config.provider.model).toBe("us.amazon.nova-pro-v1:0");
+      expect(config.provider.awsRegion).toBe("us-west-2");
+      expect(config.provider.baseUrl).toBe("https://bedrock-runtime.us-west-2.amazonaws.com");
+      expect(result.provider.message).toContain("AWS SigV4");
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+    }
   });
 
-  test("anthropic: switching from SigV4 to bearer clears authMode/region and writes the key", async () => {
-    // The Edit dialog opens reflecting a SigV4 provider and sends an explicit
-    // authMode: "bearer" to downgrade, so the persisted sigv4 fields must drop
-    // and the new key must land (a model-only edit would omit authMode instead,
-    // which preserves the mode).
-    config.provider = {
-      name: "anthropic",
-      model: "claude-opus-4-8",
-      baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
-      apiKeyEnv: "ANTHROPIC_API_KEY",
-      authMode: "aws-sigv4",
-      awsRegion: "us-east-1"
-    };
-    const result = await setSetupProvider(config, {
-      provider: "anthropic",
-      model: "claude-opus-4-8",
-      authMode: "bearer",
-      apiKey: "sk-ant-downgrade"
-    });
-    expect(result.ok).toBe(true);
-    expect(config.provider.authMode).toBeUndefined();
-    expect(config.provider.awsRegion).toBeUndefined();
-    // baseUrl is preserved (omitted in the payload on the still-active provider).
-    expect(config.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
-    expect(process.env.ANTHROPIC_API_KEY).toBe("sk-ant-downgrade");
+  test("bedrock: rejects when no AWS credentials resolve", async () => {
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    const prevFile = process.env.AWS_SHARED_CREDENTIALS_FILE;
+    const prevProfile = process.env.AWS_PROFILE;
+    delete process.env.AWS_ACCESS_KEY_ID;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/gini-test/credentials";
+    delete process.env.AWS_PROFILE;
+    try {
+      const result = await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0" });
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/No AWS credentials/);
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+      if (prevFile === undefined) delete process.env.AWS_SHARED_CREDENTIALS_FILE; else process.env.AWS_SHARED_CREDENTIALS_FILE = prevFile;
+      if (prevProfile === undefined) delete process.env.AWS_PROFILE; else process.env.AWS_PROFILE = prevProfile;
+    }
   });
 
   test("remove rejects codex, local, and unknown providers", () => {

@@ -44,12 +44,12 @@
 
 import { writeFileSync } from "node:fs";
 import { configPath, writeRuntimeConfig } from "../paths";
-import { hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { hasUsableAwsCredentials, hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
-const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local", "anthropic"] as const;
+const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local", "anthropic", "bedrock"] as const;
 type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
 
 // Env-keyed providers that authenticate via an env var written to
@@ -87,7 +87,7 @@ export function getSetupStatus(config: RuntimeConfig): SetupStatus {
   // for browser onboarding. Anyone on echo needs to pick a real
   // provider in /setup. Other configured providers (openai with key,
   // codex with auth.json) pass through.
-  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local" || current === "deepseek" || current === "anthropic";
+  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local" || current === "deepseek" || current === "anthropic" || current === "bedrock";
   const providerConfigured = isRealProvider && Boolean(health.configured);
   return {
     ok: true,
@@ -137,18 +137,12 @@ export async function setSetupProvider(
     const existing = config.provider?.name === providerName ? config.provider : undefined;
     const targetEnvVar = existing?.apiKeyEnv ?? envKeySpec.envVar;
     const apiKey = typeof payload.apiKey === "string" ? payload.apiKey.trim() : "";
-    // anthropic supports an AWS SigV4 auth mode that signs each request with IAM
-    // credentials (AWS env vars / ~/.aws) instead of a bearer key — so it needs
-    // no apiKey. Honor an explicit payload.authMode, else preserve the active
-    // provider's mode so a model/region edit doesn't flip it back to bearer.
-    const authMode = typeof payload.authMode === "string" ? payload.authMode : existing?.authMode;
-    const sigv4 = providerName === "anthropic" && authMode === "aws-sigv4";
     // Accept a no-key payload when the env var is already set — the Edit
     // Provider dialog uses this to update just the model/baseUrl without making
     // the user re-type their key. Initial Add Provider still requires a key
-    // because the env var is empty there. SigV4 mode never needs a key.
+    // because the env var is empty there.
     const envAlreadySet = Boolean(process.env[targetEnvVar]);
-    if (!sigv4 && !apiKey && !envKeySpec.allowEmptyKey && !envAlreadySet) {
+    if (!apiKey && !envKeySpec.allowEmptyKey && !envAlreadySet) {
       return {
         ok: false,
         provider: providerHealth(config),
@@ -166,30 +160,22 @@ export async function setSetupProvider(
 
     // Default omitted model/baseUrl from the already-active provider so the
     // set-active and edit-model flows (which POST {provider, model} with no
-    // baseUrl) don't silently reset a configured endpoint (e.g. a Bedrock
-    // Mantle URL) back to the per-provider default. Add Provider targets a
-    // not-yet-active provider, so `existing` is undefined there and behavior is
-    // unchanged. apiKeyEnv is preserved so it stays in lockstep with the
-    // targetEnvVar the key was written to.
+    // baseUrl) don't silently reset a configured endpoint back to the
+    // per-provider default. Add Provider targets a not-yet-active provider, so
+    // `existing` is undefined there and behavior is unchanged. apiKeyEnv is
+    // preserved so it stays in lockstep with the targetEnvVar the key was
+    // written to.
     const model = typeof payload.model === "string" && payload.model.length > 0
       ? payload.model
       : (existing?.model ?? envKeySpec.defaultModel);
     const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
       ? payload.baseUrl.trim()
       : existing?.baseUrl;
-    const awsRegion = typeof payload.awsRegion === "string" && payload.awsRegion.trim().length > 0
-      ? payload.awsRegion.trim()
-      : existing?.awsRegion;
     config.provider = normalizeProvider({
       name: providerName as ProviderConfig["name"],
       model,
       ...(baseUrl ? { baseUrl } : {}),
-      ...(existing?.apiKeyEnv ? { apiKeyEnv: existing.apiKeyEnv } : {}),
-      ...(sigv4 ? { authMode: "aws-sigv4" as const } : {}),
-      ...(sigv4 && awsRegion ? { awsRegion } : {}),
-      ...(sigv4 && existing?.awsAccessKeyIdEnv ? { awsAccessKeyIdEnv: existing.awsAccessKeyIdEnv } : {}),
-      ...(sigv4 && existing?.awsSecretAccessKeyEnv ? { awsSecretAccessKeyEnv: existing.awsSecretAccessKeyEnv } : {}),
-      ...(sigv4 && existing?.awsSessionTokenEnv ? { awsSessionTokenEnv: existing.awsSessionTokenEnv } : {})
+      ...(existing?.apiKeyEnv ? { apiKeyEnv: existing.apiKeyEnv } : {})
     });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 
@@ -210,6 +196,36 @@ export async function setSetupProvider(
       provider: providerHealth(config),
       plistRefreshNeeded: refreshed
     };
+  }
+  if (providerName === "bedrock") {
+    // Like codex, bedrock holds no gini-managed key: it signs each Converse
+    // request with the caller's AWS credentials (~/.aws or AWS_*). "Configured"
+    // therefore means those credentials resolve — reject up front with a clear
+    // hint when they don't, mirroring codex's "run codex --login" gate. Only
+    // model + region are persisted (env-var NAMES, never secret values).
+    if (!hasUsableAwsCredentials()) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error:
+          "No AWS credentials found. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure ~/.aws/credentials, then retry."
+      };
+    }
+    const existing = config.provider?.name === "bedrock" ? config.provider : undefined;
+    const model = typeof payload.model === "string" && payload.model.length > 0
+      ? payload.model
+      : existing?.model;
+    const awsRegion = typeof payload.awsRegion === "string" && payload.awsRegion.trim().length > 0
+      ? payload.awsRegion.trim()
+      : existing?.awsRegion;
+    config.provider = normalizeProvider({
+      name: "bedrock",
+      model: model ?? "",
+      ...(awsRegion ? { awsRegion } : {})
+    });
+    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    return { ok: true, provider: providerHealth(config), plistRefreshNeeded: false };
   }
   // providerName === "codex"
   if (!hasUsableCodexCredentials(config.provider)) {
