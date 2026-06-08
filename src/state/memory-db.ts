@@ -60,9 +60,10 @@ import { id, now } from "./ids";
 //
 // Version 10 was the email-watch `email_seen` dedup store. Email-watch now
 // holds its detection cursor + dedup on the backing JobRecord.hookState
-// (see ADR email-watch.md), so the table is no longer created or used; the
-// version stays 10 so existing DBs don't re-run migrations.
-export const MEMORY_SCHEMA_VERSION = 10;
+// (see ADR email-watch.md), so the table is no longer created or used.
+// Version 11: bumped because the v10 schema SHAPE changed when the email_seen
+// table creation was removed (a cleaner signal than silently leaving it at 10).
+export const MEMORY_SCHEMA_VERSION = 11;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
