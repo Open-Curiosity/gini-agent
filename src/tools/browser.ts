@@ -124,6 +124,13 @@ let pendingAdmissions = 0;
 // before forcing teardown. Better to risk tearing down a slow in-flight
 // call than to wedge disconnect forever waiting on a hung page.goto.
 const DISCONNECT_DRAIN_DEADLINE_MS = 5_000;
+// How long a single Playwright close()/disconnect() in the teardown path
+// may run before we give up on it. context.close() / page.close() never
+// resolve when Chromium is wedged (a page stuck on a heavy/bot-protected
+// navigation), which would otherwise hang the whole connect/disconnect
+// flow for minutes. Overridable via __test.setTeardownCloseTimeoutForTest
+// so close-path tests don't have to wait the full budget.
+let teardownCloseTimeoutMs = 5_000;
 const sessions = new Map<string, Session>();
 // Per-task registry of literal secret values that browserFillByLocator
 // has typed into the page. Populated BEFORE the .fill() call so a
@@ -469,6 +476,25 @@ export async function materializeManagedForConnect(context: BrowserContext): Pro
   startSweeper();
 }
 
+// Bound a Playwright close()/disconnect() that can hang when Chromium is
+// wedged (a page stuck on a heavy/bot-protected navigation). Swallows
+// rejection like the old `.catch(() => undefined)`. Returns true if the op
+// settled within the budget, false if it timed out (caller then force-kills
+// the child so the profile-dir lock frees for the next launch).
+async function settledWithin(op: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const TIMED_OUT = Symbol("timed-out");
+  const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms);
+  });
+  try {
+    const outcome = await Promise.race([op.then(() => undefined, () => undefined), timeout]);
+    return outcome !== TIMED_OUT;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // Mode-aware teardown of a SharedHandle. Persistent: close the
 // BrowserContext, which also terminates the Chromium child Playwright
 // launched. The profile dir on disk stays put (sign-ins persist).
@@ -479,13 +505,33 @@ export async function materializeManagedForConnect(context: BrowserContext): Pro
 // in-process handle instead).
 async function teardownHandle(handle: SharedHandle): Promise<void> {
   switch (handle.kind) {
-    case "persistent":
-      await handle.context.close().catch(() => undefined);
+    case "persistent": {
+      // Bound the close so a wedged Chromium can't hang teardown forever.
+      // On timeout, force-kill the underlying child to release the
+      // profile-dir lock that the next launchPersistentContext needs.
+      const settled = await settledWithin(handle.context.close(), teardownCloseTimeoutMs);
+      if (!settled) {
+        // Duck-typed Browser.process() — the Node-side handle exposes it
+        // but the public typing doesn't (mirrors browser-connect.ts). The
+        // browser()/process() lookups can throw or be absent (tests), so
+        // guard the whole chain and treat any failure as best-effort.
+        try {
+          const browserAny = handle.context.browser() as unknown as
+            | { process?: () => { kill?: (signal?: NodeJS.Signals | number) => void } | undefined }
+            | null;
+          browserAny?.process?.()?.kill?.("SIGKILL");
+        } catch {
+          // best effort
+        }
+      }
       return;
+    }
     case "cdp": {
       const candidate = handle.browser as unknown as { disconnect?: () => Promise<void> };
       if (typeof candidate.disconnect === "function") {
-        await candidate.disconnect().catch(() => undefined);
+        // Bound the disconnect like the persistent close, but NEVER kill —
+        // the remote Chrome is the user's own process.
+        await settledWithin(candidate.disconnect(), teardownCloseTimeoutMs);
       }
       // If disconnect() isn't available on this CDP-attached Browser, do
       // NOT fall back to close() — close() over CDP terminates the user's
@@ -718,9 +764,10 @@ export async function disconnectSharedBrowser(): Promise<void> {
         // persistent mode (so agent-opened pages would go away anyway), but
         // in CDP mode the user's browser process stays alive, so any
         // agent-opened tabs we don't close here would survive disconnect
-        // as orphan tabs in the user's window.
+        // as orphan tabs in the user's window. Bound each close so a wedged
+        // page can't block reaching teardownHandle.
         for (const page of session.ownedPageIds) {
-          await page.close().catch(() => undefined);
+          await settledWithin(page.close(), teardownCloseTimeoutMs);
         }
         session.ownedPageIds.clear();
       } catch {
@@ -787,9 +834,10 @@ export async function closeAll(): Promise<void> {
       // Close every agent-owned page. In CDP mode this is the only thing
       // that reaps agent-opened tabs (the user's browser stays alive).
       // In persistent mode teardownHandle closes the whole context next,
-      // so this is harmless redundancy.
+      // so this is harmless redundancy. Bound each close so a wedged page
+      // can't block teardown.
       for (const page of session.ownedPageIds) {
-        await page.close().catch(() => undefined);
+        await settledWithin(page.close(), teardownCloseTimeoutMs);
       }
       session.ownedPageIds.clear();
     } catch {
@@ -2682,13 +2730,21 @@ export const __test = {
   resetChromiumImportForTest(): void {
     chromiumImport = undefined;
   },
+  // Shrink the teardown close/disconnect budget so the wedged-Chromium
+  // tests fire the timeout in milliseconds instead of waiting the full 5s.
+  setTeardownCloseTimeoutForTest(ms: number): void {
+    teardownCloseTimeoutMs = ms;
+  },
+  resetTeardownCloseTimeoutForTest(): void {
+    teardownCloseTimeoutMs = 5_000;
+  },
   // Install a fake shared handle so the close-path tests can assert
   // teardown behavior without launching Chromium. The `headed` flag
   // signals whether the test simulates the visible-window (managed) or
   // the headless-default state — both go through the same persistent
   // arm of teardownHandle, so the test impact is purely informational.
   installFakeManagedContextForTest(
-    context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[] }>
+    context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[]; browser: () => unknown }>
   ): void {
     shared = { kind: "persistent", context: context as BrowserContext, headed: true };
   },
