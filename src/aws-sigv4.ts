@@ -82,6 +82,10 @@ export function signAwsRequest(opts: {
     "x-amz-content-sha256": payloadHash,
     "x-amz-date": stamp
   };
+  // Temporary (STS/SSO/assumed-role) credentials MUST sign x-amz-security-token,
+  // not just send it: Bedrock recomputes the signature over a canonical request
+  // that includes the header, so an unsigned token yields 403 SignatureDoesNotMatch.
+  if (opts.credentials.sessionToken) signed["x-amz-security-token"] = opts.credentials.sessionToken;
   for (const [name, value] of Object.entries(opts.extraSignedHeaders ?? {})) {
     signed[name.toLowerCase()] = value;
   }

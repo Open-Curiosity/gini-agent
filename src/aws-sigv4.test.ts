@@ -74,7 +74,7 @@ describe("signAwsRequest", () => {
     expect(headers.authorization).toMatch(/Signature=[0-9a-f]{64}$/);
   });
 
-  test("adds x-amz-security-token only for temporary credentials; signs the SigV4 trio without extras", () => {
+  test("temporary credentials sign AND send x-amz-security-token (AWS requires it in SignedHeaders)", () => {
     const headers = signAwsRequest({
       method: "POST",
       url: URL_,
@@ -84,8 +84,14 @@ describe("signAwsRequest", () => {
       credentials: { ...CREDS, sessionToken: "FwoGsessiontoken" },
       now: new Date("2026-06-08T18:00:00.000Z")
     });
+    // Sent on the wire …
     expect(headers["x-amz-security-token"]).toBe("FwoGsessiontoken");
-    expect(headers.authorization).toContain("SignedHeaders=host;x-amz-content-sha256;x-amz-date,");
+    // … AND folded into the canonical SignedHeaders (alphabetical), else Bedrock
+    // returns 403 SignatureDoesNotMatch for STS/SSO/assumed-role sessions.
+    expect(headers.authorization).toContain(
+      "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token,"
+    );
+    expect(headers.authorization).toMatch(/Signature=[0-9a-f]{64}$/);
   });
 
   test("defaults the timestamp to the current time when not injected", () => {

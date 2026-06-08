@@ -24,6 +24,23 @@ function tag(): string {
 }
 
 describe("env var name guard", () => {
+  // Point HOME at a scratch dir so that even if the guard ever regressed, a
+  // write could not touch the developer's real ~/.gini/secrets.env.
+  let scratchHome: string;
+  let prevHome: string | undefined;
+  beforeEach(() => {
+    scratchHome = `/tmp/gini-secrets-env-guard/${tag()}`;
+    rmSync(scratchHome, { recursive: true, force: true });
+    mkdirSync(scratchHome, { recursive: true });
+    prevHome = process.env.HOME;
+    process.env.HOME = scratchHome;
+  });
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    rmSync(scratchHome, { recursive: true, force: true });
+  });
+
   test("accepts plain identifiers, rejects shell/regex-injection names", () => {
     expect(isSafeEnvVarName("ANTHROPIC_API_KEY")).toBe(true);
     expect(isSafeEnvVarName("_X1")).toBe(true);
@@ -35,7 +52,6 @@ describe("env var name guard", () => {
   });
 
   test("write throws on an unsafe name (never reaches the shell-sourced file); remove/has no-op", () => {
-    // Throws before touching the filesystem, so no scratch HOME is needed.
     expect(() => writeKeyToSecretsEnv("FOO=x; rm -rf /", "v")).toThrow(/unsafe env var name/);
     expect(removeKeyFromSecretsEnv("BAD NAME")).toBe(false);
     expect(secretsEnvHasKey("BAD NAME")).toBe(false);

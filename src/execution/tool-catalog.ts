@@ -1422,11 +1422,11 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         properties: {
           provider: {
             type: "string",
-            description: "Provider id (e.g. 'codex', 'openai', 'anthropic', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` are updated."
+            description: "Provider id (e.g. 'codex', 'openai', 'anthropic', 'bedrock', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`awsRegion` are updated."
           },
-          model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5'). Defaults to the provider's first catalog model when omitted." },
-          baseUrl: { type: "string", description: "Override base URL. For OpenAI-compatible providers (openai, openrouter, deepseek, local) this is the chat-completions endpoint; for anthropic it is the Messages API endpoint (e.g. a Bedrock Mantle URL). Ignored for codex/echo." },
-          apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env." }
+          model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5', or a Bedrock inference-profile id like 'us.amazon.nova-pro-v1:0'). Defaults to the provider's first catalog model when omitted." },
+          awsRegion: { type: "string", description: "AWS region for the 'bedrock' provider's Converse endpoint/signing (e.g. 'us-east-1'). Ignored by other providers." },
+          apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env. Not used by bedrock (AWS SigV4) or codex (OAuth)." }
         },
         required: []
       }
