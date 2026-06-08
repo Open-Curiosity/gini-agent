@@ -24,14 +24,14 @@ function ReplyRow({ block, agentName }: { block: ChatBlock; agentName: string })
     <div className="flex flex-col gap-1.5">
       <div className="flex items-center gap-2">
         <span className="text-[13px] font-bold text-foreground">{isUser ? "You" : agentName}</span>
-        <span className="text-[12px] font-medium text-[#6A6A70]">
+        <span className="text-[12px] font-medium text-muted-foreground">
           {formatMessageTimestamp(block.createdAt)}
         </span>
       </div>
       {isUser ? (
-        <p className="whitespace-pre-wrap text-[13px] font-medium leading-relaxed text-[#C2C2C8]">{text}</p>
+        <p className="whitespace-pre-wrap text-[13px] font-medium leading-relaxed text-foreground">{text}</p>
       ) : (
-        <div className="text-[#C2C2C8]">
+        <div className="text-foreground">
           <MarkdownContent text={text} />
         </div>
       )}
@@ -71,18 +71,18 @@ export function ThreadCard({
   const lastReply = thread.lastReplyAt ? formatRelativeTime(thread.lastReplyAt) : "";
 
   return (
-    <div className="flex flex-col gap-3.5 border-b border-[#1C1C1E] bg-[#0D0E14] px-10 py-5">
+    <div className="flex flex-col gap-3.5 border-b border-border bg-background px-10 py-5">
       {/* Meta */}
       <div className="flex flex-wrap items-center gap-2 text-[12px]">
-        <span className="font-medium text-[#6A6A70]">in</span>
-        <span className="flex items-center gap-1.5 rounded-md border border-[#1F1F24] bg-[#141418] px-2 py-0.5">
+        <span className="font-medium text-muted-foreground">in</span>
+        <span className="flex items-center gap-1.5 rounded-md border border-border bg-card px-2 py-0.5">
           <span aria-hidden className="size-[7px] rounded-full" style={{ backgroundColor: dotColor }} />
-          <span className="font-semibold text-[#C2C2C8]">{agentName}</span>
+          <span className="font-semibold text-foreground">{agentName}</span>
         </span>
         {thread.lastReplyAt ? (
           <>
-            <span className="text-[#3A3A40]">·</span>
-            <span className="font-medium text-[#6A6A70]">{formatMessageTimestamp(thread.lastReplyAt)}</span>
+            <span className="text-muted-foreground">·</span>
+            <span className="font-medium text-muted-foreground">{formatMessageTimestamp(thread.lastReplyAt)}</span>
           </>
         ) : null}
         {isUnread ? (
@@ -97,7 +97,7 @@ export function ThreadCard({
         <div className="flex items-center gap-2">
           <span className="text-[13px] font-bold text-foreground">{agentName}</span>
         </div>
-        <p className="text-[13px] font-medium leading-relaxed text-[#B6B6BC]">
+        <p className="text-[13px] font-medium leading-relaxed text-foreground">
           {thread.rootPreview || thread.lastReplyPreview || "Thread"}
         </p>
       </button>
@@ -131,12 +131,12 @@ export function ThreadCard({
         <button
           type="button"
           onClick={onOpen}
-          className="text-[12px] font-semibold text-[#C2C2C8] hover:underline"
+          className="text-[12px] font-semibold text-foreground hover:underline"
         >
           {thread.replyCount} {thread.replyCount === 1 ? "reply" : "replies"}
         </button>
         {lastReply ? (
-          <span className="text-[12px] font-medium text-[#6A6A70]">Last reply {lastReply}</span>
+          <span className="text-[12px] font-medium text-muted-foreground">Last reply {lastReply}</span>
         ) : null}
       </div>
     </div>
