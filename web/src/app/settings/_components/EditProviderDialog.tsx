@@ -61,8 +61,22 @@ export function EditProviderDialog({
   // api-version is already set — the latter is the runtime's actual Azure-mode
   // signal, so a config on a custom Azure domain still shows (and doesn't get
   // its routing cleared on an unrelated edit). A standard OpenAI setup has
-  // neither, so it never shows Azure-only inputs.
+  // neither, so it never shows Azure-only inputs. Blanking the base URL clears
+  // apiVersion/deployment (see onBaseUrlChange), which drives this false.
   const isAzure = /azure/i.test(baseUrl) || apiVersion.trim().length > 0;
+
+  // Blanking the Base URL is an explicit "leave this endpoint" action: clear the
+  // Azure routing fields too so the section collapses and a save reverts to the
+  // standard OpenAI endpoint, rather than leaving a stranded apiVersion that the
+  // backend rejects (apiVersion without an Azure base URL would 404).
+  const onBaseUrlChange = (next: string) => {
+    setBaseUrl(next);
+    if (next.trim().length === 0) {
+      setApiVersion("");
+      setDeployment("");
+      setAuthScheme("bearer");
+    }
+  };
 
   // Reset transient inputs whenever the dialog opens for a new row.
   // currentModel can shift if the active provider changes elsewhere; we
@@ -214,7 +228,7 @@ export function EditProviderDialog({
               autoComplete="off"
               placeholder={row.name === "openai" ? "https://<resource>.openai.azure.com for Azure" : "Override the default endpoint"}
               value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
+              onChange={(e) => onBaseUrlChange(e.target.value)}
               disabled={save.isPending}
               className="h-11 border-[#2A2A2E] bg-[#0E0E11] font-mono text-[13px]"
             />

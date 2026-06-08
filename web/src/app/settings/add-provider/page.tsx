@@ -69,7 +69,22 @@ export default function AddProviderPage() {
   // Show the Azure fields when the base URL looks like an Azure endpoint OR an
   // api-version is already set (the runtime's actual Azure-mode signal), so a
   // custom Azure domain isn't hidden. A standard OpenAI setup has neither.
+  // Blanking the base URL clears apiVersion/deployment (see onBaseUrlChange),
+  // which drives this false so the section collapses.
   const isAzure = /azure/i.test(baseUrl) || apiVersion.trim().length > 0;
+
+  // Blanking the Base URL is an explicit "leave this endpoint" action: clear the
+  // Azure routing fields too so the section collapses and a later save reverts to
+  // the standard OpenAI endpoint, rather than leaving a stranded apiVersion that
+  // the backend rejects (apiVersion without an Azure base URL would 404).
+  const onBaseUrlChange = (next: string) => {
+    setBaseUrl(next);
+    if (next.trim().length === 0) {
+      setApiVersion("");
+      setDeployment("");
+      setAuthScheme("bearer");
+    }
+  };
 
   // Seed once the catalog arrives: honor a ?provider= preselection from the
   // settings list (Edit button on a row), else fall back to the first tile.
@@ -291,7 +306,7 @@ export default function AddProviderPage() {
                         : "Override the default endpoint"
                     }
                     value={baseUrl}
-                    onChange={(e) => setBaseUrl(e.target.value)}
+                    onChange={(e) => onBaseUrlChange(e.target.value)}
                     disabled={save.isPending}
                   />
                 </div>
