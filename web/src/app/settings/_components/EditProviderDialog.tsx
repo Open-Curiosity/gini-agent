@@ -171,7 +171,7 @@ export function EditProviderDialog({
                 disabled={save.isPending}
                 className="h-11 border-[#2A2A2E] bg-[#0E0E11] font-mono text-[13px]"
               />
-              <p className="text-xs text-[#6A6A70]">Signs with your AWS credentials (AWS_ACCESS_KEY_ID/SECRET or ~/.aws). No API key needed.</p>
+              <p className="text-xs text-[#6A6A70]">Signs with your AWS credentials (AWS_ACCESS_KEY_ID/SECRET env vars or ~/.aws/credentials). No API key needed.</p>
             </div>
           ) : null}
 

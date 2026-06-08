@@ -2,7 +2,7 @@
 
 ## Decision
 
-Gini ships a `bedrock` provider distinct from `anthropic`. It speaks AWS's **Converse API** (`POST https://bedrock-runtime.{region}.amazonaws.com/model/{modelId}/converse[-stream]`), the model-agnostic message API that works across every Bedrock model family — Claude, Amazon Nova, Meta Llama, Mistral, DeepSeek, and more — with one request/response shape and unified tool use. Auth is **AWS SigV4** (service `bedrock`) computed from the caller's standard credential chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`[/`AWS_SESSION_TOKEN`], else the `~/.aws/credentials` profile) — the same credentials the `aws` CLI uses. No API key.
+Gini ships a `bedrock` provider distinct from `anthropic`. It speaks AWS's **Converse API** (`POST https://bedrock-runtime.{region}.amazonaws.com/model/{modelId}/converse[-stream]`), the model-agnostic message API that works across every Bedrock model family — Claude, Amazon Nova, Meta Llama, Mistral, DeepSeek, and more — with one request/response shape and unified tool use. Auth is **AWS SigV4** (service `bedrock`) computed from static credentials: the `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars (plus `AWS_SESSION_TOKEN` for temporary sessions), else the `~/.aws/credentials` profile. No API key. (SSO/`~/.aws/config` role chains aren't auto-resolved — see Out of scope; those users export the session into the env first.)
 
 The `modelId` is a Bedrock model id sent verbatim in the request path — typically a cross-region inference-profile id (e.g. `us.amazon.nova-pro-v1:0`, `us.anthropic.claude-opus-4-8`, `us.meta.llama3-3-70b-instruct-v1:0`). There is no Anthropic-style id remapping.
 

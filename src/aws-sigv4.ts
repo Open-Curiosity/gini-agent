@@ -1,19 +1,18 @@
-// Minimal AWS Signature Version 4 signer for the Bedrock Mantle path.
+// Minimal AWS Signature Version 4 signer for the Bedrock provider.
 //
-// gini's anthropic provider reaches Claude on Amazon Bedrock by POSTing the
-// native Messages API to `https://bedrock-mantle.{region}.api.aws/anthropic`.
-// That endpoint accepts two auth shapes for the SAME request: a bearer token in
-// `x-api-key` (a short-term or long-term Bedrock API key), or a SigV4 signature
-// over the request using long-lived IAM credentials. The bearer is simple but
-// short-term tokens expire; SigV4 with IAM access keys never expires and needs
-// no minting — so it is the durable option (`authMode: "aws-sigv4"`).
+// gini's bedrock provider calls the model-agnostic Converse API by POSTing to
+// `https://bedrock-runtime.{region}.amazonaws.com/model/{modelId}/converse`
+// (and `/converse-stream`). Those requests are authenticated with a SigV4
+// signature over standard AWS credentials — no bearer token, no key minting,
+// so a long-lived IAM key or a refreshed SSO/role session both work.
 //
 // This module implements exactly what that path needs with `node:crypto` (no
 // AWS SDK dependency): the SigV4 canonical-request → string-to-sign → signing-
 // key HMAC chain → signature, plus credential/region resolution from the
 // standard env vars and `~/.aws/credentials`. The SigV4 service name for the
-// Mantle endpoint is `bedrock-mantle` (NOT `bedrock`, which is the legacy
-// bedrock-runtime InvokeModel surface).
+// Converse endpoint is `bedrock`. The model id carries a ':' (e.g.
+// `us.amazon.nova-pro-v1:0`) that lands in the request path, so canonicalUri
+// double-encodes it to match how AWS recomputes the signed path.
 import { createHash, createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -183,8 +182,8 @@ export function readAwsProfileCredentials(profile: string): AwsCredentials | nul
 }
 
 // Resolve the signing region: explicit config, else parsed from the Bedrock
-// host (bedrock-mantle.{region}.api.aws / bedrock-runtime.{region}.amazonaws.com),
-// else AWS_REGION / AWS_DEFAULT_REGION. Returns null when none resolve.
+// runtime host (bedrock-runtime.{region}.amazonaws.com), else AWS_REGION /
+// AWS_DEFAULT_REGION. Returns null when none resolve.
 export function resolveAwsRegion(opts: { awsRegion?: string; url: string }): string | null {
   if (opts.awsRegion) return opts.awsRegion;
   const host = new URL(opts.url).host;

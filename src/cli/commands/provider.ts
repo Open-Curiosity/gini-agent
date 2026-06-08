@@ -1,8 +1,7 @@
-import { writeFileSync } from "node:fs";
 import type { CliContext } from "../context";
 import { parseSubArgs, restAfter } from "../args";
 import { configPath, writeRuntimeConfig } from "../../paths";
-import { normalizeProvider, providerHealth } from "../../provider";
+import { isValidAwsRegion, normalizeProvider, providerHealth } from "../../provider";
 import { isSafeEnvVarName } from "../../state/secrets-env";
 import { api } from "../api";
 import { print } from "../output";
@@ -80,12 +79,19 @@ export async function provider(ctx: CliContext): Promise<void> {
     // bedrock signs each Converse request with AWS credentials; --aws-region
     // pins the signing region/endpoint (defaults to us-east-1 when omitted).
     const awsRegion = flags["--aws-region"];
+    // The region lands in the Converse request host, so reject a malformed one
+    // here (matching the setup-API guard) instead of persisting it.
+    if (awsRegion !== undefined && !isValidAwsRegion(awsRegion)) {
+      throw new Error(`--aws-region must match /^[a-z0-9-]+$/ (e.g. us-east-1). Got: ${awsRegion}`);
+    }
 
     // Echo bypasses HTTP entirely and ignores every flag.
     // Codex uses /responses with its own request shape, so it ignores
     // --extra-body — but it DOES honor --base-url (the codex backend URL)
     // and --api-key-env (codexAuthPath reads process.env[apiKeyEnv] to
-    // locate the auth.json file). Warn precisely.
+    // locate the auth.json file). bedrock derives its endpoint from --aws-region
+    // and signs with AWS creds, so --base-url / --api-key-env / --extra-body
+    // don't apply. Warn precisely.
     if (name === "echo") {
       const ignored: string[] = [];
       if (baseUrl !== undefined) ignored.push("--base-url");
@@ -93,6 +99,14 @@ export async function provider(ctx: CliContext): Promise<void> {
       if (extraBody !== undefined) ignored.push("--extra-body");
       if (ignored.length > 0) {
         process.stderr.write(`gini: warning — ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored for the echo provider; echo bypasses HTTP entirely.\n`);
+      }
+    } else if (name === "bedrock") {
+      const ignored: string[] = [];
+      if (baseUrl !== undefined) ignored.push("--base-url");
+      if (apiKeyEnv !== undefined) ignored.push("--api-key-env");
+      if (extraBody !== undefined) ignored.push("--extra-body");
+      if (ignored.length > 0) {
+        process.stderr.write(`gini: warning — ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored for the bedrock provider; bedrock derives its endpoint from --aws-region and signs with AWS credentials. Use --aws-region.\n`);
       }
     } else if (name === "codex" && extraBody !== undefined) {
       process.stderr.write("gini: warning — --extra-body is ignored for the codex provider; codex uses the /responses API with its own request shape.\n");

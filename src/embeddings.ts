@@ -330,7 +330,7 @@ async function embedOpenAIBatch(config: RuntimeConfig, texts: string[]): Promise
   if (!bearer) {
     throw new Error("OpenAI embedding provider requires OPENAI_API_KEY or Codex OAuth credentials.");
   }
-  const baseUrl = (config.provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL).replace(/\/$/, "");
+  const baseUrl = openAIEmbeddingBaseUrl(config);
   const response = await fetch(`${baseUrl}/embeddings`, {
     method: "POST",
     headers: {
@@ -368,13 +368,34 @@ async function embedOpenAIBatch(config: RuntimeConfig, texts: string[]): Promise
   return out;
 }
 
+// Chat providers whose configured baseUrl/apiKeyEnv also speak the OpenAI
+// /embeddings wire shape, so the embedding path may reuse them. Every other
+// active chat provider (anthropic, bedrock, codex, echo) routes to a host with
+// no OpenAI /embeddings endpoint, so reusing its baseUrl/key would mis-route
+// the request and leak the chat key to that host (e.g. the Anthropic key to
+// api.anthropic.com/embeddings). Those fall back to the canonical OpenAI
+// endpoint + OPENAI_API_KEY instead.
+const OPENAI_EMBEDDING_COMPATIBLE = new Set(["openai", "openrouter", "deepseek", "local"]);
+
+function openAIEmbeddingBaseUrl(config: RuntimeConfig): string {
+  const reuse = OPENAI_EMBEDDING_COMPATIBLE.has(config.provider.name) && config.provider.baseUrl;
+  return (reuse ? config.provider.baseUrl! : DEFAULT_OPENAI_BASE_URL).replace(/\/$/, "");
+}
+
 // --------------------------------------------------------------------------
 // Bearer-token resolution (mirrors src/provider.ts but tolerant of missing
 // creds — getEmbeddingProvider auto-selects only when one of these resolves).
 // --------------------------------------------------------------------------
 
 function resolveOpenAIBearer(config: RuntimeConfig): string | null {
-  const envName = config.provider.apiKeyEnv ?? "OPENAI_API_KEY";
+  // Borrow the chat provider's key only for OpenAI-compatible providers; for
+  // anthropic/bedrock/codex/echo use OPENAI_API_KEY so the embedding call never
+  // sends a non-OpenAI key to api.openai.com (or the chat key to a non-OpenAI
+  // host via openAIEmbeddingBaseUrl).
+  const envName =
+    OPENAI_EMBEDDING_COMPATIBLE.has(config.provider.name) && config.provider.apiKeyEnv
+      ? config.provider.apiKeyEnv
+      : "OPENAI_API_KEY";
   const value = process.env[envName];
   return value && value.length > 0 ? value : null;
 }

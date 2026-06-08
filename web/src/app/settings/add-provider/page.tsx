@@ -236,7 +236,8 @@ export default function AddProviderPage() {
                 <p className="text-xs text-muted-foreground">
                   Gini signs each Converse request with the AWS credentials it finds in
                   <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">AWS_ACCESS_KEY_ID</code>/<code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">AWS_SECRET_ACCESS_KEY</code>
-                  or your <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">~/.aws/credentials</code> profile — the same ones your <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">aws</code> CLI uses. No API key.
+                  (plus <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">AWS_SESSION_TOKEN</code> for temporary sessions)
+                  or your <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">~/.aws/credentials</code> profile. No API key. SSO or assumed-role users: export the session first with <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">aws configure export-credentials</code>.
                 </p>
                 <div className="grid gap-2">
                   <Label htmlFor="bedrock-model">Model (cross-region inference profile id)</Label>

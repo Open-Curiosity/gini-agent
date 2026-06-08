@@ -285,7 +285,8 @@ describe("buildToolCatalog", () => {
   test("set_provider's model-facing schema offers bedrock + awsRegion and never a model-set baseUrl", () => {
     // This is the schema the MODEL actually sees (the SELF_OPERATIONS schema is
     // documentation-only). It must offer bedrock + awsRegion and must NOT expose
-    // a baseUrl the model could set (the round-1 key-exfil guard).
+    // a model-settable baseUrl — an env-keyed provider's key is sent to whatever
+    // baseUrl is configured, so a model-set endpoint would be a key-exfil vector.
     const state = stateWithToolsets([]);
     const catalog = buildToolCatalog(state);
     const tool = catalog.find((t) => t.function.name === "set_provider");

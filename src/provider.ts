@@ -2926,8 +2926,10 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || DEFAULT_BEDROCK_MODEL,
       // Informational: the regional Converse runtime host. callBedrockConverse
       // builds the full /model/{id}/converse[-stream] URL itself from awsRegion,
-      // so this baseUrl is for inspection/trace, not the request path.
-      baseUrl: pickBaseUrl(provider.baseUrl, bedrockRuntimeBaseUrl(awsRegion)),
+      // so this baseUrl is for inspection/trace, not the request path. Derive it
+      // straight from awsRegion (ignoring any stored baseUrl) so the displayed
+      // host can never drift from the host requests actually sign and hit.
+      baseUrl: bedrockRuntimeBaseUrl(awsRegion),
       awsRegion,
       ...(provider.awsAccessKeyIdEnv ? { awsAccessKeyIdEnv: provider.awsAccessKeyIdEnv } : {}),
       ...(provider.awsSecretAccessKeyEnv ? { awsSecretAccessKeyEnv: provider.awsSecretAccessKeyEnv } : {}),
