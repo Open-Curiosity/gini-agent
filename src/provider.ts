@@ -283,6 +283,11 @@ export function redactSecrets(text: string): string {
     // `&`/`=` fall outside the value class below, so match the whole token by
     // its prefix to mask the base64 body and the &Version tail in one shot.
     .replace(/\bbedrock-api-key-[^\s"']+/gi, "bedrock-api-key-***")
+    // Long-term Bedrock API keys (IAM service-specific credentials, also carried
+    // in x-api-key) are a single base64 blob beginning `ABSK…` — a different
+    // shape from the short-term token above, so match the prefix and mask the
+    // base64 body. See AWS "Securing Amazon Bedrock API keys".
+    .replace(/\bABSK[A-Za-z0-9+\/]{16,}={0,2}/g, "ABSK***")
     .replace(/\bBearer\s+[A-Za-z0-9._-]{6,}/gi, "Bearer ***")
     .replace(/\b(api[_-]?key|token|secret|password)(["'\s:=]+)[A-Za-z0-9._-]{6,}/gi, "$1$2***");
 }

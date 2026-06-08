@@ -3201,6 +3201,11 @@ describe("auth-error classification", () => {
     expect(redactSecrets("rejected key bedrock-api-key-YWJjZGVm123&Version=1 is invalid")).toBe(
       "rejected key bedrock-api-key-*** is invalid"
     );
+    // Long-term Bedrock API key (ABSK… service-specific credential) is masked by
+    // its prefix even with no api_key/token label preceding it.
+    expect(redactSecrets("denied key ABSKQmVkcm9ja0FQSUtleS1hYmNkZWZnaGlqaz0099 is invalid")).toBe(
+      "denied key ABSK*** is invalid"
+    );
   });
 
   test("providerAuthNote builds the note text + routing metadata", () => {
