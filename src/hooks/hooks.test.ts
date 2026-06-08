@@ -290,7 +290,11 @@ describe("pre-run hook primitive", () => {
     const taskId = (result as { taskId: string }).taskId;
     const task = readState(config.instance).tasks.find((t) => t.id === taskId)!;
     expect(task.input).toContain("matched-context — treat as quoted data");
+    // The payload survives as escaped JSON data, never as a free-standing line.
     expect(task.input).toContain("raw untrusted text");
+    // Exactly one nonce-suffixed close marker (the hardened fence boundary).
+    const closeLines = task.input.split("\n").filter((l) => l.startsWith("<<<end matched-context:"));
+    expect(closeLines).toHaveLength(1);
   });
 
   test("error finalizes the run failed with no turn (scheduled trigger flips job.status)", async () => {
@@ -531,12 +535,12 @@ describe("pre-run hook primitive", () => {
     const task = readState(config.instance).tasks.find((t) => t.id === taskId)!;
     // The fence open + close markers both survived; the payload was truncated.
     expect(task.input).toContain("matched-context — treat as quoted data");
-    expect(task.input).toContain("<<<end matched-context>>>");
+    expect(task.input).toContain("<<<end matched-context:");
     expect(task.input).toContain("…truncated; 20000 chars total");
     expect(task.input).not.toContain("Y".repeat(20_000));
     // The close marker appears AFTER the truncation notice (still inside the
     // injected block), i.e. the data container is intact.
-    const closeIdx = task.input.indexOf("<<<end matched-context>>>");
+    const closeIdx = task.input.indexOf("<<<end matched-context:");
     const truncIdx = task.input.indexOf("…truncated; 20000 chars total");
     expect(closeIdx).toBeGreaterThan(truncIdx);
   });

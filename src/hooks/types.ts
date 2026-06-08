@@ -51,10 +51,14 @@ export interface HookContext {
 }
 
 // A single piece of injectable context. `untrusted: true` means the runner
-// renders it inside a fence labeled as data, not instructions (Claude Code's
-// "phrase additionalContext as factual data" rule). A handler that owns its own
-// fence (gmail-delta returns already-fenced JSON+nonce strings) sets
-// untrusted:false so the runner doesn't double-fence.
+// renders it inside the hardened untrusted fence (JSON-encoded so quotes /
+// newlines / marker-like bytes are escaped onto one physical line, a per-item
+// nonce on the close delimiter so it can't be forged from inside the data, a
+// fixpoint sentinel strip + CR/LF collapse, and a char cap that keeps the close
+// marker intact) — Claude Code's "phrase additionalContext as factual data, not
+// instructions" rule, with the prompt-injection boundary owned by the trusted
+// runner. A handler that vouches for its own framing (a notice with no untrusted
+// bytes) sets untrusted:false and is passed through verbatim (still char-capped).
 export interface HookContextItem {
   text: string;
   untrusted: boolean;
@@ -67,19 +71,34 @@ export type HookResult =
   // exit-2 analog: cancel before the model. The consumer finalizes with no turn.
   // `summary` becomes the run summary; an empty / "[SILENT]" summary suppresses
   // chat + bridge delivery, exactly like a completed-with-nothing turn.
-  | { kind: "shortCircuit"; summary?: string }
+  //
+  // `state` is the handler's OPAQUE next state (a pure function returns its new
+  // state alongside its result). A consumer that owns the handler's state (the
+  // jobs scheduler persists it onto JobRecord.hookState) writes it. A
+  // shortCircuit delivers nothing, so the consumer persists `state` IMMEDIATELY.
+  | { kind: "shortCircuit"; summary?: string; state?: Record<string, unknown> }
   // additionalContext analog: run the turn with these items injected.
   //
   // `onDispatched` is an OPTIONAL post-delivery commit thunk: the consumer
   // awaits it ONLY after the turn has successfully dispatched — never if dispatch
-  // throws. A handler whose items represent about-to-be-DELIVERED work
-  // (gmail-delta defers markSeen + cursor-advance for the surviving matches)
-  // puts that commit here so a dispatch failure leaves the items un-committed and
-  // they re-trigger on the next fire (at-least-once across the delivery
-  // boundary). Intentional skips with no delivery
-  // (drop/seeding-baseline/truncated-notice) still commit inline in the handler.
-  | { kind: "context"; items: HookContextItem[]; onDispatched?: () => void | Promise<void> }
-  // non-blocking-error analog: the consumer finalizes failed; no turn.
+  // throws. A handler whose items represent about-to-be-DELIVERED work puts that
+  // commit here so a dispatch failure leaves the work un-committed.
+  //
+  // `state` is the handler's OPAQUE next state (see shortCircuit). Because a
+  // context result represents about-to-be-DELIVERED work, the consumer persists
+  // `state` ONLY after the turn dispatches (the same at-least-once boundary as
+  // `onDispatched`): a dispatch failure leaves the OLD state so the next fire
+  // re-detects and re-delivers. A pure handler (the skill-script handler) carries
+  // ALL of its commit semantics in `state` + this timing and needs no
+  // `onDispatched` thunk; the thunk remains for handlers with side effects.
+  | {
+      kind: "context";
+      items: HookContextItem[];
+      onDispatched?: () => void | Promise<void>;
+      state?: Record<string, unknown>;
+    }
+  // non-blocking-error analog: the consumer finalizes failed; no turn. No state
+  // is committed (the next fire re-reads the last persisted state).
   | { kind: "error"; message: string };
 
 export type HookHandler = (ctx: HookContext) => Promise<HookResult>;
