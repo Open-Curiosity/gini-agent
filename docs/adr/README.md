@@ -25,6 +25,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Crash Reporting And Issue Filing](crash-reporting-and-issue-filing.md)
 - [Connector + Provider Vocabulary, Spec Compliance, And Meta-Skills](connector-provider-spec-compliance.md)
 - [Provider extraBody Escape Hatch And Reserved-Key Denylist](provider-extra-body.md)
+- [Azure OpenAI As A First-Class Provider](azure-provider.md)
 - [Pinned in_memory Prompt-Cache Tier, No Active Warming](prompt-cache-in-memory-tier.md)
 - [Telegram Messaging Bridge](telegram-bridge.md)
 - [Discord Messaging Bridge](discord-bridge.md)

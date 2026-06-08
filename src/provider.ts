@@ -14,6 +14,19 @@ const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_CODEX_AUTH_PATH = "~/.codex/auth.json";
 const DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
+// Azure OpenAI has no universal base URL — it is per-resource
+// (https://<resource>.openai.azure.com), so there is no default and a config
+// without one is rejected at the entry boundaries (CLI / setup API /
+// set_provider tool). The default model matches the azure catalog's first
+// model so the no-model default agrees with the UI's pre-selected model (the
+// same `default == models[0]` invariant every other provider keeps); deployment
+// names on most resources match the model id.
+const DEFAULT_AZURE_MODEL = "gpt-5.5";
+// Default Azure data-plane api-version. 2024-10-21 is the latest dated GA for
+// deployment-scoped chat completions and is universally supported across
+// regions and SDKs (per learn.microsoft.com Azure OpenAI reference). Defaulted
+// so an azure config needs only a base URL + key to route correctly.
+const DEFAULT_AZURE_API_VERSION = "2024-10-21";
 
 export function providerHealth(config: RuntimeConfig) {
   const provider = normalizeProvider(config.provider);
@@ -41,6 +54,25 @@ export function providerHealth(config: RuntimeConfig) {
   }
 
   const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
+  if (provider.name === "azure") {
+    // Azure needs a valid https resource endpoint in addition to the key — match
+    // the isProviderConfigured azure gate so /api/setup/status agrees with the
+    // catalog and never advertises an azure config with no/invalid baseUrl as
+    // ready (the deployment URL would otherwise fail to build).
+    const hasKey = Boolean(process.env[envName]);
+    const endpointOk = !azureNeedsBaseUrl("azure", provider.baseUrl) && !azureNeedsHttps("azure", provider.baseUrl);
+    const azureReady = hasKey && endpointOk;
+    return {
+      ok: azureReady,
+      provider,
+      configured: azureReady,
+      message: azureReady
+        ? "azure provider is configured."
+        : hasKey
+          ? "Set a valid https Azure resource baseUrl (https://<resource>.openai.azure.com) to use the azure provider."
+          : `Set ${envName} to use the azure provider.`
+    };
+  }
   const configured = provider.name === "local" || Boolean(process.env[envName]);
   return {
     ok: configured,
@@ -58,7 +90,8 @@ const PROVIDER_API_KEY_ENV: Record<string, string> = {
   openai: "OPENAI_API_KEY",
   openrouter: "OPENROUTER_API_KEY",
   deepseek: "DEEPSEEK_API_KEY",
-  local: "GINI_LOCAL_API_KEY"
+  local: "GINI_LOCAL_API_KEY",
+  azure: "AZURE_OPENAI_API_KEY"
 };
 
 // Whether a provider has usable credentials in the current process env.
@@ -68,10 +101,35 @@ const PROVIDER_API_KEY_ENV: Record<string, string> = {
 // accept no-auth requests so the env var is optional — we still gate
 // the row on the user having explicitly opted in by either setting the
 // env var or making local the active provider.
-export function isProviderConfigured(name: string, activeProviderName?: string): boolean {
+export function isProviderConfigured(
+  name: string,
+  activeProviderName?: string,
+  activeApiKeyEnv?: string,
+  activeBaseUrl?: string
+): boolean {
   if (name === "echo") return false;
   if (name === "codex") return hasUsableCodexCredentials();
-  const envVar = PROVIDER_API_KEY_ENV[name];
+  // Azure has no default endpoint, so an env key alone is NOT a usable config —
+  // it counts as configured only when azure is the ACTIVE provider AND carries a
+  // valid persisted https resource baseUrl. RuntimeConfig persists a single
+  // provider, so a non-active azure row's baseUrl is unknown; surfacing it as
+  // "configured" would render a Settings row whose radio-switch can only ever
+  // fail (the switch payload carries no baseUrl). Gating on active + valid
+  // endpoint keeps the row truthful and removes that dead-end affordance.
+  if (name === "azure") {
+    if (name !== activeProviderName) return false;
+    if (azureNeedsBaseUrl(name, activeBaseUrl) || azureNeedsHttps(name, activeBaseUrl)) return false;
+    const azureEnv = activeApiKeyEnv || PROVIDER_API_KEY_ENV[name];
+    return Boolean(azureEnv && process.env[azureEnv]);
+  }
+  // For the active provider, honor a custom apiKeyEnv (e.g. a custom env var set
+  // via `gini provider set --api-key-env`) — the same var readOpenAIBearer /
+  // providerHealth read at call time — so a custom-env config isn't reported
+  // unconfigured and silently hidden by the settings UI. Non-active rows carry
+  // no stored config, so they fall back to the per-provider default env var.
+  const envVar = name === activeProviderName && activeApiKeyEnv
+    ? activeApiKeyEnv
+    : PROVIDER_API_KEY_ENV[name];
   if (envVar && process.env[envVar]) return true;
   if (name === "local" && activeProviderName === "local") return true;
   return false;
@@ -80,13 +138,17 @@ export function isProviderConfigured(name: string, activeProviderName?: string):
 // Catalog enriched with the per-provider configured flag. Used by the
 // settings UI to hide rows the user hasn't connected; the static
 // providerCatalog() stays in place for callers that just need the list of
-// known provider shapes (e.g. setup-api default-model resolution).
+// known provider shapes (e.g. setup-api default-model resolution). Pass the
+// active provider's apiKeyEnv so a custom-env active provider reads as
+// configured rather than being hidden.
 export function providerCatalogWithStatus(
-  activeProviderName?: string
+  activeProviderName?: string,
+  activeApiKeyEnv?: string,
+  activeBaseUrl?: string
 ): Array<ProviderCatalogItem & { configured: boolean }> {
   return providerCatalog().map((item) => ({
     ...item,
-    configured: isProviderConfigured(item.name, activeProviderName)
+    configured: isProviderConfigured(item.name, activeProviderName, activeApiKeyEnv, activeBaseUrl)
   }));
 }
 
@@ -142,6 +204,18 @@ export function providerCatalog(): ProviderCatalogItem[] {
       costHint: "external"
     },
     {
+      id: "azure",
+      name: "azure",
+      displayName: "Azure OpenAI",
+      // No catalog baseUrl: Azure is per-resource, supplied by the user as
+      // https://<resource>.openai.azure.com. The models below are the common
+      // chat-capable deployments; any Azure deployment name works at config time.
+      auth: "env",
+      models: ["gpt-5.5", "gpt-5.4", "gpt-4o", "gpt-4o-mini", "o3-mini"],
+      capabilities: ["chat-completions", "tool-calling", "deployment-scoped"],
+      costHint: "external"
+    },
+    {
       id: "local",
       name: "local",
       displayName: "Local OpenAI-Compatible",
@@ -168,6 +242,8 @@ export function providerDisplayLabel(name: ProviderName): string {
       return "OpenRouter";
     case "deepseek":
       return "DeepSeek";
+    case "azure":
+      return "Azure OpenAI";
     case "local":
       return "Local";
     case "echo":
@@ -523,7 +599,7 @@ async function callToolCallingChatCompletions(
   const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
   const headers: Record<string, string> = {
     "content-type": "application/json",
-    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...chatCompletionsAuthHeader(provider, apiKey),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
@@ -541,13 +617,13 @@ async function callToolCallingChatCompletions(
     // Zero Data Retention eligible. openrouter / deepseek / local
     // accept-but-ignore unknown fields, so the value is a no-op there.
     // Codex never hits this builder.
-    prompt_cache_retention: "in_memory"
+    ...promptCacheRetentionBody(provider)
   };
   if (tools.length > 0) {
     body.tools = tools;
     body.tool_choice = "auto";
   }
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(chatCompletionsUrl(provider, baseUrl), {
     method: "POST",
     headers: { ...headers, ...(wantStream ? { accept: "text/event-stream" } : {}) },
     body: JSON.stringify(body)
@@ -1467,7 +1543,15 @@ export async function generateTaskSummary(
   const systemContext = recalledBlock.length > 0
     ? `${stablePrefix}\n\n${recalledBlock}`
     : stablePrefix;
-  if (provider.name === "openrouter" || provider.name === "local" || provider.name === "deepseek") {
+  if (
+    provider.name === "openrouter" ||
+    provider.name === "local" ||
+    provider.name === "deepseek" ||
+    // Azure OpenAI exposes deployment-scoped chat/completions, not the flat
+    // /responses surface this path uses for standard OpenAI — route it through
+    // the chat-completions builder so the URL + api-key header come out right.
+    provider.name === "azure"
+  ) {
     return callChatCompletions(provider, input, systemContext);
   }
   return callOpenAIResponses(provider, input, systemContext, onDelta);
@@ -1577,7 +1661,8 @@ export async function generateStructured<T>(
     provider.name === "openrouter" ||
     provider.name === "local" ||
     provider.name === "openai" ||
-    provider.name === "deepseek"
+    provider.name === "deepseek" ||
+    provider.name === "azure"
   ) {
     return callStructuredChatCompletions(provider, request);
   }
@@ -1660,11 +1745,11 @@ async function callStructuredChatCompletions<T>(
   const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
   const headers: Record<string, string> = {
     "content-type": "application/json",
-    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...chatCompletionsAuthHeader(provider, apiKey),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(chatCompletionsUrl(provider, baseUrl), {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -1676,7 +1761,7 @@ async function callStructuredChatCompletions<T>(
         { role: "user", content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema.` }
       ],
       stream: false,
-      prompt_cache_retention: "in_memory"
+      ...promptCacheRetentionBody(provider)
     })
   });
   const rawPayload = await response.text();
@@ -1747,6 +1832,30 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || "gpt-5.4-mini",
       baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv ?? "OPENAI_API_KEY",
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
+    };
+  }
+  if (provider.name === "azure") {
+    const apiVersion = provider.apiVersion?.trim();
+    const deployment = provider.deployment?.trim();
+    return {
+      name: "azure",
+      model: provider.model || DEFAULT_AZURE_MODEL,
+      // No universal default — Azure is per-resource. A blank/missing baseUrl is
+      // carried through as-is (the config-entry boundaries reject it); the empty
+      // fallback keeps normalizeProvider a pure, non-throwing transform that also
+      // hydrates persisted configs and resolves per-agent overrides.
+      baseUrl: pickBaseUrl(provider.baseUrl, ""),
+      apiKeyEnv: provider.apiKeyEnv ?? "AZURE_OPENAI_API_KEY",
+      // api-version is required on every Azure data-plane call; default it so a
+      // config carrying only a base URL + key still routes.
+      apiVersion: apiVersion && apiVersion.length > 0 ? apiVersion : DEFAULT_AZURE_API_VERSION,
+      // deployment defaults to the model id at the call site (chatCompletionsUrl),
+      // so only carry an explicit override here.
+      ...(deployment && deployment.length > 0 ? { deployment } : {}),
+      // Default to Azure's resource-key `api-key` header; "bearer" opts into an
+      // Entra access token instead.
+      authScheme: provider.authScheme === "bearer" ? "bearer" : "api-key",
       ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
@@ -1858,7 +1967,7 @@ async function callOpenAIResponses(
           ]
         }
       ],
-      prompt_cache_retention: "in_memory"
+      ...promptCacheRetentionBody(provider)
     })
   });
 
@@ -1884,11 +1993,11 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
   const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
   const headers: Record<string, string> = {
     "content-type": "application/json",
-    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...chatCompletionsAuthHeader(provider, apiKey),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(chatCompletionsUrl(provider, baseUrl), {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -1899,7 +2008,7 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
         { role: "user", content: input }
       ],
       stream: false,
-      prompt_cache_retention: "in_memory"
+      ...promptCacheRetentionBody(provider)
     })
   });
   const rawPayload = await response.text();
@@ -2101,7 +2210,7 @@ function readOpenAIBearer(provider: ProviderConfig): string {
   const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
   const apiKey = process.env[envName];
   if (!apiKey) {
-    throw new Error(`OpenAI provider is configured but ${envName} is not set.`);
+    throw new Error(`${providerDisplayLabel(provider.name)} provider is configured but ${envName} is not set.`);
   }
   return apiKey;
 }
@@ -2493,7 +2602,94 @@ function defaultBaseUrl(provider: ProviderConfig): string {
   if (provider.name === "openrouter") return "https://openrouter.ai/api/v1";
   if (provider.name === "local") return "http://127.0.0.1:11434/v1";
   if (provider.name === "deepseek") return DEFAULT_DEEPSEEK_BASE_URL;
+  // Azure has no universal default — it is per-resource. Return empty so a
+  // config that slipped through without a baseUrl fails loudly at fetch time
+  // instead of silently sending Azure traffic to api.openai.com (a 404).
+  if (provider.name === "azure") return "";
   return DEFAULT_OPENAI_BASE_URL;
+}
+
+// ---------------- Azure OpenAI routing ----------------
+//
+// Azure is a first-class provider, so `provider.name === "azure"` is the single
+// routing signal — no host-sniffing or field-presence detection. These helpers
+// centralize the per-call URL + auth differences so the four chat-completions
+// builders stay consistent.
+
+// Build the chat-completions request URL. Standard OpenAI-compatible providers
+// hit `${baseUrl}/chat/completions`. Azure has no such flat path: it routes per
+// deployment and requires the api-version query, so the URL becomes
+// `${baseUrl}/openai/deployments/<deployment>/chat/completions?api-version=<v>`.
+// The deployment defaults to the model id; api-version defaults to the GA value
+// (normalizeProvider already fills it for a persisted config — default here too
+// so a hand-built azure ProviderConfig still routes). Components are
+// percent-encoded so an unusual deployment/version value can't break the path.
+function chatCompletionsUrl(provider: ProviderConfig, baseUrl: string): string {
+  if (provider.name !== "azure") return `${baseUrl}/chat/completions`;
+  const apiVersion = provider.apiVersion?.trim() || DEFAULT_AZURE_API_VERSION;
+  const deployment = (provider.deployment?.trim() || provider.model).trim();
+  return `${baseUrl}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`;
+}
+
+// Auth header for a chat-completions request. Azure resource-key auth uses the
+// `api-key` header; every other provider — and Azure Entra-token auth, selected
+// by authScheme "bearer" — uses `Authorization: Bearer`. `apiKey` is optional so
+// a keyless local gateway sends no auth header at all.
+function chatCompletionsAuthHeader(
+  provider: ProviderConfig,
+  apiKey: string | undefined
+): Record<string, string> {
+  if (!apiKey) return {};
+  if (provider.name === "azure" && provider.authScheme !== "bearer") {
+    return { "api-key": apiKey };
+  }
+  return { authorization: `Bearer ${apiKey}` };
+}
+
+// prompt_cache_retention body fragment. The runtime pins "in_memory" on every
+// OpenAI-compatible chat-completions / responses call (ADR
+// prompt-cache-in-memory-tier.md), explicitly opting out of the "24h" extended
+// tier. Azure rejects that: some deployments (gpt-5.x) return "This model is
+// compatible only with 24h extended prompt caching", so omit the field for
+// azure and let the resource manage its own prompt caching (Azure controls data
+// retention at the resource level, not via this request field).
+function promptCacheRetentionBody(provider: ProviderConfig): Record<string, string> {
+  if (provider.name === "azure") return {};
+  return { prompt_cache_retention: "in_memory" };
+}
+
+// True when an azure config has no usable resource base URL — missing,
+// whitespace, or a value with no parseable host (e.g. a bare "https://", which
+// would pass a naive non-empty + https-prefix check but build a hostless
+// `https:///openai/deployments/...` URL that fetch rejects). Azure is
+// per-resource with no default, so chatCompletionsUrl would otherwise build a
+// relative/hostless deployment path that fails. The config-entry boundaries
+// (CLI `provider set`, the setup API, and the set_provider tool that funnels
+// through it) reject this before persisting. normalizeProvider itself stays a
+// pure transform and never throws, so config hydration and per-agent override
+// resolution are unaffected.
+export function azureNeedsBaseUrl(name: string, baseUrl: string | undefined): boolean {
+  if (name !== "azure") return false;
+  const value = (baseUrl ?? "").trim();
+  if (value.length === 0) return true;
+  try {
+    return new URL(value).hostname.length === 0;
+  } catch {
+    return true; // unparseable URL → needs a real resource endpoint
+  }
+}
+
+// Azure sends a credential on every call — the resource key in a plaintext
+// `api-key` header, or an Entra access token as `Authorization: Bearer`. Either
+// leaks over plaintext http, so refuse to configure an azure endpoint that
+// isn't https. Azure is https across every cloud, so this never blocks a
+// legitimate setup; requiring https (rather than a host allowlist) keeps it
+// cloud-agnostic. An empty baseUrl is left to azureNeedsBaseUrl.
+export function azureNeedsHttps(name: string, baseUrl: string | undefined): boolean {
+  if (name !== "azure") return false;
+  const value = (baseUrl ?? "").trim().toLowerCase();
+  if (value.length === 0) return false;
+  return !value.startsWith("https://");
 }
 
 // ---------------- Vision (image input) ----------------
@@ -2629,7 +2825,7 @@ async function callVisionChatCompletions(
   const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
   const headers: Record<string, string> = {
     "content-type": "application/json",
-    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...chatCompletionsAuthHeader(provider, apiKey),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
@@ -2640,10 +2836,12 @@ async function callVisionChatCompletions(
   // recognize the newer name yet, so we keep `max_tokens` for them. Send
   // only the field each backend expects to avoid double-counting or
   // 400-level errors.
-  const tokenBudgetField = provider.name === "openai"
+  // Azure serves OpenAI models, whose newer o-series reject `max_tokens` and
+  // require `max_completion_tokens` — so azure follows the openai field choice.
+  const tokenBudgetField = provider.name === "openai" || provider.name === "azure"
     ? { max_completion_tokens: maxTokens }
     : { max_tokens: maxTokens };
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(chatCompletionsUrl(provider, baseUrl), {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -2660,7 +2858,7 @@ async function callVisionChatCompletions(
       ],
       stream: false,
       ...tokenBudgetField,
-      prompt_cache_retention: "in_memory"
+      ...promptCacheRetentionBody(provider)
     })
   });
   const rawPayload = await response.text();

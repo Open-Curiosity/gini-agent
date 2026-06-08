@@ -297,6 +297,32 @@ export function loadConfig(instance: Instance): RuntimeConfig {
   }
 
   const parsed = JSON.parse(readFileSync(path, "utf8")) as RuntimeConfig;
+  // One-time migration: an earlier release configured Azure as a MODE of the
+  // `openai` provider — {name:"openai", apiVersion, deployment, authScheme,
+  // baseUrl:<azure-host>}. Azure is now a first-class `azure` provider keyed on
+  // provider.name, and normalizeProvider drops those fields for `openai`, so a
+  // persisted azure-on-openai config would silently route to the flat
+  // api.openai.com path and break. An `apiVersion` on an `openai` config only
+  // ever came from that azure-on-openai path, so rewrite it to the `azure`
+  // provider here (mirrors the dangerouslyAutoApprove → approvalMode shim
+  // below). The rewrite is persisted via `needsRewrite` so it runs once.
+  const migratedAzureFromOpenai =
+    parsed.provider?.name === "openai" && (parsed.provider.apiVersion?.trim().length ?? 0) > 0;
+  if (migratedAzureFromOpenai) {
+    const legacy = parsed.provider;
+    parsed.provider = {
+      ...legacy,
+      name: "azure",
+      // Preserve the env var the key actually lives under. The azure-on-openai
+      // config wrote its key to OPENAI_API_KEY by default (or to a custom
+      // apiKeyEnv), and this migration only rewrites config.json — it does NOT
+      // move the secret in secrets.env. Switching apiKeyEnv to
+      // AZURE_OPENAI_API_KEY would point the migrated provider at an empty var
+      // and break a working config, so carry the existing apiKeyEnv (defaulting
+      // to OPENAI_API_KEY for the no-custom-env case).
+      apiKeyEnv: legacy.apiKeyEnv ?? "OPENAI_API_KEY"
+    };
+  }
   // `defaultConfig` is both the fresh-install template (which stamps
   // "yolo") AND the merge base for existing files below. An existing
   // on-disk config that predates an explicit `approvalMode` must NOT
@@ -343,7 +369,7 @@ export function loadConfig(instance: Instance): RuntimeConfig {
   const persistedIsOldBare = persistedRoot.startsWith(oldBareInstancePrefix) || persistedRoot === join(baseStateRoot(), instance);
   const persistedIsOldLanes = persistedRoot.startsWith(oldLanesInstancePrefix) || persistedRoot === join(baseStateRoot(), "lanes", instance);
   const persistedIsRepoRoot = persistedRoot === repoRoot;
-  const needsRewrite = persistedIsOldBare || persistedIsOldLanes || persistedIsRepoRoot || !persistedRoot;
+  const needsRewrite = persistedIsOldBare || persistedIsOldLanes || persistedIsRepoRoot || !persistedRoot || migratedAzureFromOpenai;
   const migratedWorkspaceRoot = needsRewrite ? workspaceDir(instance) : persistedRoot;
   const merged: RuntimeConfig = {
     ...defaults,

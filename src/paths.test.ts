@@ -238,3 +238,96 @@ describe("legacy on-disk layout migration", () => {
     });
   });
 });
+
+describe("azure-on-openai config migration", () => {
+  function withTempStateRoot<T>(fn: (root: string) => T): T {
+    const root = mkdtempSync(join(tmpdir(), "gini-paths-azure-"));
+    const previousState = process.env.GINI_STATE_ROOT;
+    const previousLog = process.env.GINI_LOG_ROOT;
+    process.env.GINI_STATE_ROOT = root;
+    delete process.env.GINI_LOG_ROOT;
+    try {
+      return fn(root);
+    } finally {
+      if (previousState === undefined) delete process.env.GINI_STATE_ROOT;
+      else process.env.GINI_STATE_ROOT = previousState;
+      if (previousLog === undefined) delete process.env.GINI_LOG_ROOT;
+      else process.env.GINI_LOG_ROOT = previousLog;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  function writeConfig(root: string, name: string, provider: Record<string, unknown>): string {
+    const dir = join(root, "instances", name);
+    mkdirSync(join(dir, "workspace"), { recursive: true });
+    writeFileSync(
+      join(dir, "config.json"),
+      JSON.stringify(
+        {
+          instance: name,
+          port: 7337,
+          token: "x",
+          provider,
+          workspaceRoot: join(dir, "workspace"),
+          stateRoot: dir,
+          logRoot: join(dir, "logs")
+        },
+        null,
+        2
+      )
+    );
+    return dir;
+  }
+
+  test("rewrites a persisted {name:'openai', apiVersion,...} config to the azure provider and persists it", () => {
+    withTempStateRoot((root) => {
+      const dir = writeConfig(root, "legacy-azure", {
+        name: "openai",
+        model: "gpt-5.4",
+        baseUrl: "https://lilac.openai.azure.com",
+        apiVersion: "2024-12-01-preview",
+        deployment: "gpt-5.4",
+        authScheme: "api-key"
+      });
+      const config = loadConfig("legacy-azure");
+      expect(config.provider.name).toBe("azure");
+      expect(config.provider.baseUrl).toBe("https://lilac.openai.azure.com");
+      expect(config.provider.apiVersion).toBe("2024-12-01-preview");
+      expect(config.provider.deployment).toBe("gpt-5.4");
+      expect(config.provider.authScheme).toBe("api-key");
+      // apiKeyEnv is preserved (the key lives in OPENAI_API_KEY) — the migration
+      // rewrites config.json but never moves the secret in secrets.env.
+      expect(config.provider.apiKeyEnv).toBe("OPENAI_API_KEY");
+      // The upgrade is persisted on load (runs once).
+      const onDisk = JSON.parse(readFileSync(join(dir, "config.json"), "utf8")) as { provider: { name: string } };
+      expect(onDisk.provider.name).toBe("azure");
+    });
+  });
+
+  test("preserves a custom apiKeyEnv during the azure migration", () => {
+    withTempStateRoot((root) => {
+      writeConfig(root, "legacy-azure-custom", {
+        name: "openai",
+        model: "gpt-5.4",
+        apiKeyEnv: "MY_AZURE_KEY",
+        baseUrl: "https://lilac.openai.azure.com",
+        apiVersion: "2024-12-01-preview"
+      });
+      const config = loadConfig("legacy-azure-custom");
+      expect(config.provider.name).toBe("azure");
+      expect(config.provider.apiKeyEnv).toBe("MY_AZURE_KEY");
+    });
+  });
+
+  test("leaves a plain openai config (no apiVersion) untouched", () => {
+    withTempStateRoot((root) => {
+      writeConfig(root, "plain-openai", { name: "openai", model: "gpt-5.4-mini" });
+      const config = loadConfig("plain-openai");
+      // loadConfig does not normalize (that happens at call sites), so an
+      // un-migrated openai config is returned verbatim — no azure rewrite.
+      expect(config.provider.name).toBe("openai");
+      expect(config.provider.apiVersion).toBeUndefined();
+      expect(config.provider.apiKeyEnv).toBeUndefined();
+    });
+  });
+});

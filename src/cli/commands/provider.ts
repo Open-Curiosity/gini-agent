@@ -2,12 +2,13 @@ import { writeFileSync } from "node:fs";
 import type { CliContext } from "../context";
 import { parseSubArgs, restAfter } from "../args";
 import { configPath, writeRuntimeConfig } from "../../paths";
-import { normalizeProvider, providerHealth } from "../../provider";
+import { azureNeedsBaseUrl, azureNeedsHttps, normalizeProvider, providerHealth } from "../../provider";
+import { isValidEnvVarName } from "../../state/secrets-env";
 import { api } from "../api";
 import { print } from "../output";
 import { maybeRefreshAutostart } from "./autostart";
 
-const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deepseek [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]";
+const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deepseek|azure [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>] [--api-version <VERSION>] [--deployment <NAME>] [--auth-scheme bearer|api-key]";
 
 // Single source of truth for value-bearing flags on `gini provider set`.
 // `parseSubArgs` uses this to both partition positionals and extract flag
@@ -16,7 +17,13 @@ const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deeps
 const PROVIDER_SET_FLAGS: ReadonlySet<string> = new Set([
   "--base-url",
   "--api-key-env",
-  "--extra-body"
+  "--extra-body",
+  // Azure OpenAI routing (azure provider only): --api-version selects the
+  // data-plane version (defaults to a GA value), --deployment names the path
+  // segment (defaults to the model), --auth-scheme picks api-key vs Bearer.
+  "--api-version",
+  "--deployment",
+  "--auth-scheme"
 ]);
 
 export async function provider(ctx: CliContext): Promise<void> {
@@ -37,7 +44,8 @@ export async function provider(ctx: CliContext): Promise<void> {
       name !== "codex" &&
       name !== "openrouter" &&
       name !== "local" &&
-      name !== "deepseek"
+      name !== "deepseek" &&
+      name !== "azure"
     ) {
       throw new Error(USAGE);
     }
@@ -50,6 +58,21 @@ export async function provider(ctx: CliContext): Promise<void> {
 
     const baseUrl = flags["--base-url"];
     const apiKeyEnv = flags["--api-key-env"];
+    const apiVersion = flags["--api-version"];
+    const deployment = flags["--deployment"];
+    const authSchemeRaw = flags["--auth-scheme"];
+    let authScheme: "bearer" | "api-key" | undefined;
+    if (authSchemeRaw !== undefined) {
+      if (authSchemeRaw !== "bearer" && authSchemeRaw !== "api-key") {
+        throw new Error(`--auth-scheme must be 'bearer' or 'api-key' (got '${authSchemeRaw}')`);
+      }
+      authScheme = authSchemeRaw;
+    }
+    // The apiKeyEnv name is interpolated into ~/.gini/secrets.env (a
+    // shell-sourced file); reject anything that isn't a plain env-var name.
+    if (apiKeyEnv !== undefined && !isValidEnvVarName(apiKeyEnv)) {
+      throw new Error("--api-key-env must be a valid environment variable name (letters, digits, underscore; not starting with a digit).");
+    }
     const extraBodyRaw = flags["--extra-body"];
     let extraBody: Record<string, unknown> | undefined;
     if (extraBodyRaw !== undefined) {
@@ -78,6 +101,9 @@ export async function provider(ctx: CliContext): Promise<void> {
       if (baseUrl !== undefined) ignored.push("--base-url");
       if (apiKeyEnv !== undefined) ignored.push("--api-key-env");
       if (extraBody !== undefined) ignored.push("--extra-body");
+      if (apiVersion !== undefined) ignored.push("--api-version");
+      if (deployment !== undefined) ignored.push("--deployment");
+      if (authSchemeRaw !== undefined) ignored.push("--auth-scheme");
       if (ignored.length > 0) {
         process.stderr.write(`gini: warning — ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored for the echo provider; echo bypasses HTTP entirely.\n`);
       }
@@ -85,12 +111,36 @@ export async function provider(ctx: CliContext): Promise<void> {
       process.stderr.write("gini: warning — --extra-body is ignored for the codex provider; codex uses the /responses API with its own request shape.\n");
     }
 
+    // Azure routing flags only affect the azure provider; normalizeProvider
+    // drops them for everyone else. Warn so a misplaced flag isn't silently
+    // ignored (echo is already covered above).
+    if (name !== "azure" && name !== "echo") {
+      const azureIgnored: string[] = [];
+      if (apiVersion !== undefined) azureIgnored.push("--api-version");
+      if (deployment !== undefined) azureIgnored.push("--deployment");
+      if (authSchemeRaw !== undefined) azureIgnored.push("--auth-scheme");
+      if (azureIgnored.length > 0) {
+        process.stderr.write(`gini: warning — ${azureIgnored.join(", ")} ${azureIgnored.length > 1 ? "are" : "is"} ignored for the ${name} provider; Azure routing applies only to the azure provider.\n`);
+      }
+    }
+
+    // Azure needs a real https resource endpoint on every call.
+    if (azureNeedsBaseUrl(name, baseUrl)) {
+      throw new Error("The azure provider requires --base-url <https://<resource>.openai.azure.com>.");
+    }
+    if (azureNeedsHttps(name, baseUrl)) {
+      throw new Error("The azure provider requires an https:// --base-url (the credential is sent on every request).");
+    }
+
     config.provider = normalizeProvider({
       name,
-      model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.5" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : name === "deepseek" ? "deepseek-v4-flash" : "gpt-5.4-mini"),
+      model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.5" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : name === "deepseek" ? "deepseek-v4-flash" : name === "azure" ? "gpt-5.5" : "gpt-5.4-mini"),
       ...(baseUrl ? { baseUrl } : {}),
       ...(apiKeyEnv ? { apiKeyEnv } : {}),
-      ...(extraBody ? { extraBody } : {})
+      ...(extraBody ? { extraBody } : {}),
+      ...(apiVersion ? { apiVersion } : {}),
+      ...(deployment ? { deployment } : {}),
+      ...(authScheme ? { authScheme } : {})
     });
     writeRuntimeConfig(config);
     // If an autostart plist already exists for this instance, refresh it

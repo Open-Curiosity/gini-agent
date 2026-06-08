@@ -10,7 +10,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { getSetupStatus, setSetupProvider } from "./setup-api";
+import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./setup-api";
+import { writeKeyToSecretsEnv } from "../state/secrets-env";
 import { loadConfig } from "../paths";
 import type { RuntimeConfig } from "../types";
 
@@ -104,7 +105,7 @@ describe("setup-api", () => {
   test("status: providerConfigured reflects the codex platform default on a fresh instance", () => {
     const status = getSetupStatus(config);
     expect(status.ok).toBe(true);
-    expect(status.providers).toEqual(["openai", "codex", "openrouter", "deepseek", "local"]);
+    expect(status.providers).toEqual(["openai", "codex", "openrouter", "deepseek", "local", "azure"]);
     // Platform default is "codex". providerHealth treats codex as
     // configured when the runtime can find an auth.json; in this
     // scratch env there is none (CODEX_AUTH_JSON is scrubbed in
@@ -203,6 +204,160 @@ describe("setup-api", () => {
     const result = await setSetupProvider(config, { provider: "anthropic" });
     expect(result.ok).toBe(false);
     expect(result.error).toContain("Unsupported provider");
+  });
+
+  test("POST azure with apiKey + baseUrl writes AZURE_OPENAI_API_KEY and persists azure routing", async () => {
+    const prevAzureKey = process.env.AZURE_OPENAI_API_KEY;
+    delete process.env.AZURE_OPENAI_API_KEY;
+    try {
+      const result = await setSetupProvider(config, {
+        provider: "azure",
+        apiKey: "az-secret-key",
+        model: "gpt-4o",
+        baseUrl: "https://lilac.openai.azure.com",
+        deployment: "gpt-4o-deploy"
+      });
+      expect(result.ok).toBe(true);
+      // Key landed under the Azure env var, not OPENAI_API_KEY.
+      const body = readFileSync(join(s.home, ".gini", "secrets.env"), "utf8");
+      expect(body).toContain("AZURE_OPENAI_API_KEY=");
+      expect(body).toContain("az-secret-key");
+      expect(process.env.AZURE_OPENAI_API_KEY as string | undefined).toBe("az-secret-key");
+      // Config persisted the azure provider with its routing fields.
+      const cfgPath = join(s.stateRoot, "instances", config.instance, "config.json");
+      const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+      expect(cfg.provider?.name).toBe("azure");
+      expect(cfg.provider?.baseUrl).toBe("https://lilac.openai.azure.com");
+      expect(cfg.provider?.deployment).toBe("gpt-4o-deploy");
+      expect(cfg.provider?.apiVersion).toBe("2024-10-21");
+      expect(cfg.provider?.authScheme).toBe("api-key");
+    } finally {
+      if (prevAzureKey === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = prevAzureKey;
+    }
+  });
+
+  test("POST azure rejects a missing base URL and a non-https endpoint", async () => {
+    const prevAzureKey = process.env.AZURE_OPENAI_API_KEY;
+    delete process.env.AZURE_OPENAI_API_KEY;
+    try {
+      const noBase = await setSetupProvider(config, { provider: "azure", apiKey: "az-secret-key", model: "gpt-4o" });
+      expect(noBase.ok).toBe(false);
+      expect(noBase.error).toContain("https://<resource>.openai.azure.com");
+      const httpBase = await setSetupProvider(config, {
+        provider: "azure",
+        apiKey: "az-secret-key",
+        model: "gpt-4o",
+        baseUrl: "http://lilac.openai.azure.com"
+      });
+      expect(httpBase.ok).toBe(false);
+      expect(httpBase.error).toContain("https://");
+    } finally {
+      if (prevAzureKey === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = prevAzureKey;
+    }
+  });
+
+  test("a model-only same-provider edit preserves a custom apiKeyEnv and gates on it", async () => {
+    const prevKey = process.env.MY_AZURE_KEY;
+    config.provider = {
+      name: "azure",
+      model: "gpt-5.5",
+      apiKeyEnv: "MY_AZURE_KEY",
+      baseUrl: "https://lilac.openai.azure.com",
+      apiVersion: "2024-10-21",
+      deployment: "gpt-5.5",
+      authScheme: "api-key"
+    };
+    process.env.MY_AZURE_KEY = "az-existing";
+    try {
+      // A keyless model-only edit gates on the CUSTOM env var (already set) and
+      // preserves the apiKeyEnv + baseUrl the partial payload didn't resend.
+      const result = await setSetupProvider(config, { provider: "azure", model: "gpt-4o" });
+      expect(result.ok).toBe(true);
+      expect(config.provider.apiKeyEnv).toBe("MY_AZURE_KEY");
+      expect(config.provider.baseUrl).toBe("https://lilac.openai.azure.com");
+      expect(config.provider.model).toBe("gpt-4o");
+    } finally {
+      if (prevKey === undefined) delete process.env.MY_AZURE_KEY;
+      else process.env.MY_AZURE_KEY = prevKey;
+    }
+  });
+
+  test("a same-provider edit with a key writes to the custom apiKeyEnv, not the default", async () => {
+    const prevCustom = process.env.MY_AZURE_KEY;
+    const prevDefault = process.env.AZURE_OPENAI_API_KEY;
+    delete process.env.AZURE_OPENAI_API_KEY;
+    config.provider = {
+      name: "azure",
+      model: "gpt-5.5",
+      apiKeyEnv: "MY_AZURE_KEY",
+      baseUrl: "https://lilac.openai.azure.com",
+      apiVersion: "2024-10-21",
+      deployment: "gpt-5.5",
+      authScheme: "api-key"
+    };
+    try {
+      const result = await setSetupProvider(config, { provider: "azure", apiKey: "az-rotated", model: "gpt-5.5" });
+      expect(result.ok).toBe(true);
+      // The key lands in the configured env var — the same one the gateway reads.
+      expect(process.env.MY_AZURE_KEY).toBe("az-rotated");
+      expect(process.env.AZURE_OPENAI_API_KEY).toBeUndefined();
+      expect(readFileSync(join(s.home, ".gini", "secrets.env"), "utf8")).toContain("MY_AZURE_KEY=");
+    } finally {
+      if (prevCustom === undefined) delete process.env.MY_AZURE_KEY;
+      else process.env.MY_AZURE_KEY = prevCustom;
+      if (prevDefault === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = prevDefault;
+    }
+  });
+
+  test("a model-only same-provider edit preserves a configured extraBody", async () => {
+    const prevKey = process.env.OPENAI_API_KEY;
+    config.provider = { name: "openai", model: "gpt-5.4", extraBody: { reasoning_effort: "max" } };
+    process.env.OPENAI_API_KEY = "sk-existing";
+    try {
+      const result = await setSetupProvider(config, { provider: "openai", model: "gpt-5.4-mini" });
+      expect(result.ok).toBe(true);
+      expect(config.provider.extraBody).toEqual({ reasoning_effort: "max" });
+    } finally {
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+    }
+  });
+
+  test("removing an azure provider with a custom apiKeyEnv scrubs that env var, not just the default", async () => {
+    const prevKey = process.env.MY_AZURE_KEY;
+    config.provider = {
+      name: "azure",
+      model: "gpt-5.5",
+      apiKeyEnv: "MY_AZURE_KEY",
+      baseUrl: "https://lilac.openai.azure.com",
+      apiVersion: "2024-10-21",
+      deployment: "gpt-5.5",
+      authScheme: "api-key"
+    };
+    writeKeyToSecretsEnv("MY_AZURE_KEY", "az-secret");
+    process.env.MY_AZURE_KEY = "az-secret";
+    try {
+      const result = removeSetupProvider(config, "azure");
+      expect(result.ok).toBe(true);
+      // The secret must be gone from BOTH stores, under the custom env var.
+      expect(process.env.MY_AZURE_KEY).toBeUndefined();
+      const secretsPath = join(s.home, ".gini", "secrets.env");
+      const body = existsSync(secretsPath) ? readFileSync(secretsPath, "utf8") : "";
+      expect(body).not.toContain("MY_AZURE_KEY");
+    } finally {
+      if (prevKey === undefined) delete process.env.MY_AZURE_KEY;
+      else process.env.MY_AZURE_KEY = prevKey;
+    }
+  });
+
+  test("a same-provider edit with a malformed persisted apiKeyEnv is rejected", async () => {
+    config.provider = { name: "openai", model: "gpt-5.4", apiKeyEnv: "FOO=evil" };
+    const result = await setSetupProvider(config, { provider: "openai", model: "gpt-5.4-mini" });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("valid environment variable name");
   });
 
   test("plistRefreshNeeded:true when an autostart plist already exists (macOS only)", async () => {

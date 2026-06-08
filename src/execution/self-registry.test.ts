@@ -313,6 +313,44 @@ describe("direct self tools — mutate", () => {
     expect(payloadArgs?.provider).toBe("echo");
   });
 
+  test("set_provider routes azure transport fields through dispatch onto the live config", async () => {
+    const instance = `self-setprov-azure-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const prevKey = process.env.AZURE_OPENAI_API_KEY;
+    // Pre-set the env var so setSetupProvider accepts a keyless edit (no
+    // secrets.env write, no plist refresh) and we exercise only the routing
+    // forwarding done by the set_provider self-tool (baseUrl/apiVersion/
+    // deployment/authScheme present-clears mapping).
+    process.env.AZURE_OPENAI_API_KEY = "az-test";
+    try {
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "set_provider",
+        "call_1",
+        JSON.stringify({
+          provider: "azure",
+          model: "gpt-5.5",
+          baseUrl: "https://r.openai.azure.com",
+          apiVersion: "2024-10-21",
+          deployment: "gpt-5.5-deploy",
+          authScheme: "api-key"
+        })
+      );
+      expect(result.kind).toBe("sync");
+      // The side effect lands on the live config object.
+      expect(config.provider.name).toBe("azure");
+      expect(config.provider.baseUrl).toBe("https://r.openai.azure.com");
+      expect(config.provider.apiVersion).toBe("2024-10-21");
+      expect(config.provider.deployment).toBe("gpt-5.5-deploy");
+      expect(config.provider.authScheme).toBe("api-key");
+    } finally {
+      if (prevKey === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = prevKey;
+    }
+  });
+
   test("set_approval_mode auto-resolves in auto mode and lands the side effect on config", async () => {
     const instance = `self-approval-auto-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance, "auto");
