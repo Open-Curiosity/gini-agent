@@ -130,7 +130,11 @@ export function signAwsRequest(opts: {
 // the `~/.aws/credentials` profile (AWS_PROFILE, else "default"). Returns null
 // when no usable credentials are found. Secret values never enter config — only
 // env-var names do — so this reads them from the environment / ~/.aws at call
-// time, matching the AWS CLI's own resolution.
+// time. This covers only STATIC credentials (the two sources above), NOT the
+// full AWS CLI provider chain: SSO, `assume-role` profiles in ~/.aws/config,
+// process/web-identity sources, and IMDS/container roles are out of scope —
+// those users export a session into the AWS_* env vars first (e.g. `aws
+// configure export-credentials`).
 export function resolveAwsCredentials(opts: {
   accessKeyIdEnv?: string;
   secretAccessKeyEnv?: string;

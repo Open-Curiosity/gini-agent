@@ -45,7 +45,7 @@
 // child's responsibility.
 
 import { writeRuntimeConfig } from "../paths";
-import { azureNeedsBaseUrl, azureNeedsHttps, hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { anthropicNeedsHttps, azureNeedsBaseUrl, azureNeedsHttps, hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { isValidEnvVarName, removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
@@ -214,6 +214,16 @@ export async function setSetupProvider(
         error: "Azure OpenAI requires an https:// endpoint (the credential is sent on every request)."
       };
     }
+    // anthropic sends its API key on every request, so refuse a plaintext custom
+    // baseUrl (loopback proxies excepted). No-op for non-anthropic providers.
+    if (anthropicNeedsHttps(providerName, baseUrl)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: "The anthropic provider requires an https:// baseUrl (the API key is sent on every request). Use http only for a localhost proxy."
+      };
+    }
 
     if (apiKey) {
       // Persist to secrets.env so the wrapper-sourced env carries it on
@@ -299,7 +309,15 @@ export async function setSetupProvider(
     config.provider = normalizeProvider({
       name: "bedrock",
       model: model ?? "",
-      ...(awsRegion ? { awsRegion } : {})
+      ...(awsRegion ? { awsRegion } : {}),
+      // Preserve custom AWS credential env-var names + a CLI-set extraBody across
+      // an edit/save — the setup gate already probes them (hasUsableAwsCredentials
+      // above), so dropping them here would make a working hand-edited config
+      // read as unconfigured after the next save.
+      ...(existing?.awsAccessKeyIdEnv ? { awsAccessKeyIdEnv: existing.awsAccessKeyIdEnv } : {}),
+      ...(existing?.awsSecretAccessKeyEnv ? { awsSecretAccessKeyEnv: existing.awsSecretAccessKeyEnv } : {}),
+      ...(existing?.awsSessionTokenEnv ? { awsSessionTokenEnv: existing.awsSessionTokenEnv } : {}),
+      ...(existing?.extraBody ? { extraBody: existing.extraBody } : {})
     });
     writeRuntimeConfig(config);
     return { ok: true, provider: providerHealth(config), plistRefreshNeeded: false };

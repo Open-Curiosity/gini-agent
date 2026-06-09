@@ -348,6 +348,19 @@ describe("provider CLI", () => {
     await expect(provider(ctx)).rejects.toThrow(/https:\/\//);
   });
 
+  test("set anthropic rejects a plaintext custom base URL (key-leak guard)", async () => {
+    const ctx = makeCtx(["provider", "set", "anthropic", "claude-opus-4-8", "--base-url", "http://proxy.example/v1"]);
+    await expect(provider(ctx)).rejects.toThrow(/https:\/\//);
+  });
+
+  test("set anthropic accepts an https custom base URL and a localhost http proxy", async () => {
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    await provider(makeCtx(["provider", "set", "anthropic", "claude-opus-4-8", "--base-url", "https://anthropic.gateway.internal/v1"]));
+    expect((JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig).provider.baseUrl).toBe("https://anthropic.gateway.internal/v1");
+    await provider(makeCtx(["provider", "set", "anthropic", "claude-opus-4-8", "--base-url", "http://localhost:8787/v1"]));
+    expect((JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig).provider.baseUrl).toBe("http://localhost:8787/v1");
+  });
+
   test("set azure rejects a hostless base URL (scheme only, no resource host)", async () => {
     // "https://" passes a naive non-empty + https-prefix check but builds a
     // hostless deployment URL that fetch rejects; the guard must catch it.

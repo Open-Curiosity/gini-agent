@@ -42,7 +42,7 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns state 
 - Authenticated localhost gateway and a Next.js + Tailwind + shadcn/ui control plane
 - Persistent chat, runs, tasks, approvals, traces, audit events, jobs, memories, and skills
 - Approval-gated file, terminal, and code tools
-- Provider support: Codex OAuth, OpenAI API key, OpenRouter, and any OpenAI-compatible local server
+- Provider support: Codex OAuth; OpenAI / Azure OpenAI / DeepSeek / OpenRouter API keys; the first-party Anthropic Claude API; Amazon Bedrock (model-agnostic Converse, AWS SigV4 — Claude, Nova, Llama, Mistral, DeepSeek); and any OpenAI-compatible local server
 - Local embeddings, reranking, and voice-message speech-to-text by default
 - Parallel instances with isolated state, ports, and logs
 
@@ -112,6 +112,9 @@ gini provider set codex gpt-5.5            # Codex OAuth (reads ~/.codex/auth.js
 gini provider set openai gpt-5.4-mini      # uses $OPENAI_API_KEY
 gini provider set openrouter <model>       # uses $OPENROUTER_API_KEY
 gini provider set local <model> --base-url http://127.0.0.1:8000/v1
+gini provider set anthropic claude-opus-4-8 # first-party Claude API, uses $ANTHROPIC_API_KEY
+# Amazon Bedrock: model-agnostic Converse signed with your AWS credentials (no API key)
+gini provider set bedrock us.amazon.nova-pro-v1:0 --aws-region us-east-1  # reads ~/.aws or AWS_*
 # Azure OpenAI: a first-class provider targeting a deployment on your resource
 gini provider set azure gpt-4o \
   --base-url https://<resource>.openai.azure.com \

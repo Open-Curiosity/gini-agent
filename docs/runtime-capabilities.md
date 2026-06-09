@@ -42,7 +42,7 @@ bun run gini evidence
 | Terminal/code tools | task inputs: `shell`, `code js|python :: ...`, approval gated under `approvalMode: "strict"`; under the default `"yolo"` mode every gate is bypassed, and the safe-middle `"auto"` mode (which operators can switch to) auto-runs safe commands while dangerous shapes still gate (see ADR approval-mode.md) |
 | Approval settings | `GET/PATCH /api/settings/auto-approve` for `approvalMode` (`strict`/`auto`/`yolo`), `autoApproveCommands` (shell-glob allowlist for `terminal_exec`), and `dangerousTerminalPatterns` (operator extension to the built-in blocklist) |
 | Toolsets | `gini toolsets list/enable/disable`, `/api/toolsets` |
-| Providers | `gini provider show/catalog/set`, Codex OAuth, OpenAI, OpenRouter-compatible records, Azure OpenAI (deployment-scoped; see [azure-provider.md](adr/azure-provider.md)), DeepSeek, local, echo |
+| Providers | `gini provider show/catalog/set`, Codex OAuth, OpenAI, OpenRouter-compatible records, Azure OpenAI (deployment-scoped; see [azure-provider.md](adr/azure-provider.md)), first-party Anthropic Claude (see [anthropic-messages-provider.md](adr/anthropic-messages-provider.md)), Amazon Bedrock (model-agnostic Converse, AWS SigV4; see [bedrock-converse-provider.md](adr/bedrock-converse-provider.md)), DeepSeek, local, echo |
 | Runtime updates | `gini update`, `/api/version`, `/api/update/check`, `/api/update`; installer-managed web runtimes show the current package/git version and can trigger an update |
 | Delegation records | `gini subagents list/spawn`, `/api/subagents` |
 | MCP/plugin records | `gini mcp list/add/health/invoke/disable` |

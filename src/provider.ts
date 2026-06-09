@@ -3863,6 +3863,25 @@ export function azureNeedsHttps(name: string, baseUrl: string | undefined): bool
   return !value.startsWith("https://");
 }
 
+// The anthropic provider sends ANTHROPIC_API_KEY in an x-api-key header on every
+// request, so a plaintext http custom baseUrl would leak the key in transit.
+// Refuse a non-https custom endpoint — EXCEPT an explicit loopback host (a local
+// http proxy is a deliberate, low-risk dev setup). An empty baseUrl uses the
+// https first-party default, so it's left alone.
+export function anthropicNeedsHttps(name: string, baseUrl: string | undefined): boolean {
+  if (name !== "anthropic") return false;
+  const value = (baseUrl ?? "").trim();
+  if (value.length === 0) return false;
+  if (value.toLowerCase().startsWith("https://")) return false;
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "::1") return false;
+  } catch {
+    return true; // unparseable → not a safe https endpoint
+  }
+  return true; // non-https, non-loopback → refuse (key would go in cleartext)
+}
+
 // ---------------- Vision (image input) ----------------
 //
 // Single-shot vision call: caller provides a prompt + one inline base64 PNG/JPEG,

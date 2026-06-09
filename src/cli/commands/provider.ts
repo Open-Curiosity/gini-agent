@@ -1,7 +1,7 @@
 import type { CliContext } from "../context";
 import { parseSubArgs, restAfter } from "../args";
 import { configPath, writeRuntimeConfig } from "../../paths";
-import { azureNeedsBaseUrl, azureNeedsHttps, isValidAwsRegion, normalizeProvider, providerHealth } from "../../provider";
+import { anthropicNeedsHttps, azureNeedsBaseUrl, azureNeedsHttps, isValidAwsRegion, normalizeProvider, providerHealth } from "../../provider";
 import { isSafeEnvVarName } from "../../state/secrets-env";
 import { api } from "../api";
 import { print } from "../output";
@@ -108,8 +108,9 @@ export async function provider(ctx: CliContext): Promise<void> {
     // --extra-body — but it DOES honor --base-url (the codex backend URL)
     // and --api-key-env (codexAuthPath reads process.env[apiKeyEnv] to
     // locate the auth.json file). bedrock derives its endpoint from --aws-region
-    // and signs with AWS creds, so --base-url / --api-key-env / --extra-body
-    // don't apply. Warn precisely.
+    // and signs with AWS creds, so --base-url / --api-key-env don't apply — but
+    // it DOES honor --extra-body (e.g. extraBody.max_tokens caps the Converse
+    // inferenceConfig). Warn precisely.
     if (name === "echo") {
       const ignored: string[] = [];
       if (baseUrl !== undefined) ignored.push("--base-url");
@@ -125,7 +126,6 @@ export async function provider(ctx: CliContext): Promise<void> {
       const ignored: string[] = [];
       if (baseUrl !== undefined) ignored.push("--base-url");
       if (apiKeyEnv !== undefined) ignored.push("--api-key-env");
-      if (extraBody !== undefined) ignored.push("--extra-body");
       if (ignored.length > 0) {
         process.stderr.write(`gini: warning — ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored for the bedrock provider; bedrock derives its endpoint from --aws-region and signs with AWS credentials. Use --aws-region.\n`);
       }
@@ -152,6 +152,11 @@ export async function provider(ctx: CliContext): Promise<void> {
     }
     if (azureNeedsHttps(name, baseUrl)) {
       throw new Error("The azure provider requires an https:// --base-url (the credential is sent on every request).");
+    }
+    // anthropic sends ANTHROPIC_API_KEY on every request, so a plaintext custom
+    // --base-url would leak it; require https (loopback proxies excepted).
+    if (anthropicNeedsHttps(name, baseUrl)) {
+      throw new Error("The anthropic provider requires an https:// --base-url (the API key is sent on every request). Use http only for a localhost proxy.");
     }
 
     config.provider = normalizeProvider({
