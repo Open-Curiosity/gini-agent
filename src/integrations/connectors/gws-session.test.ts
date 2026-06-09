@@ -96,6 +96,15 @@ describe("parseGwsAuthStatus", () => {
     expect(status.scopes).toEqual([]);
   });
 
+  test("tolerates a non-JSON stdout preamble before the JSON", () => {
+    const stdout =
+      "Using keyring backend: keyring\n" +
+      JSON.stringify({ client_config_exists: true, token_valid: true, user: "me@example.com", scopes: [] });
+    const status = parseGwsAuthStatus(stdout);
+    expect(status.signedIn).toBe(true);
+    expect(status.email).toBe("me@example.com");
+  });
+
   test("non-JSON output (gws missing / errored) → not installed", () => {
     const status = parseGwsAuthStatus("zsh: command not found: gws\n");
     expect(status).toEqual({

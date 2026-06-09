@@ -6,7 +6,7 @@
 // end-to-end through a real chat turn, not here.
 
 import { describe, expect, test } from "bun:test";
-import { buildLoginArgs, extractConsentUrl } from "../account-login";
+import { buildLoginArgs, expandHome, extractConsentUrl } from "../account-login";
 
 describe("extractConsentUrl", () => {
   test("finds the consent URL in a realistic gws auth login log blob", () => {
@@ -70,5 +70,20 @@ describe("buildLoginArgs", () => {
       "-s",
       "gmail"
     ]);
+  });
+});
+
+describe("expandHome", () => {
+  test("expands a leading ~/ to the home dir", () => {
+    expect(expandHome("~/.config/gws", "/Users/me")).toBe("/Users/me/.config/gws");
+  });
+
+  test("expands a bare ~ to the home dir", () => {
+    expect(expandHome("~", "/Users/me")).toBe("/Users/me");
+  });
+
+  test("passes an absolute path through unchanged", () => {
+    expect(expandHome("/Users/me/.gini/google-accounts/gacct_ab12", "/Users/me"))
+      .toBe("/Users/me/.gini/google-accounts/gacct_ab12");
   });
 });

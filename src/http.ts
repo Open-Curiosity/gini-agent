@@ -42,7 +42,7 @@ import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, credentialTemplateForProvider, deleteConnector, firstUngrantedCredential, isSkillActive, updateConnector } from "./integrations/connectors";
 import { gwsSessionStatus } from "./integrations/connectors/gws-session";
 import { listAccountsWithStatus, registerAccount, removeAccount, retagAccount } from "./integrations/connectors/google-accounts";
-import { getGoogleAccount } from "./state/google-accounts";
+import { getGoogleAccount, googleAccountsRoot } from "./state/google-accounts";
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
@@ -121,7 +121,8 @@ import { isLogStream, readLogTail } from "./state/logs";
 import { redactLogTail } from "./runtime/log-redaction";
 import { readSecretsEnvBody } from "./state/secrets-env";
 import { clearWebTargetCache, resolveWebPort } from "./web-target";
-import { basename } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
+import { homedir } from "node:os";
 import type { Server, ServerWebSocket } from "bun";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
@@ -1479,6 +1480,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const configDir = typeof payload.configDir === "string" ? payload.configDir.trim() : "";
       if (!tag || !configDir) {
         return json({ error: "Invalid input: tag and configDir are required" }, 400);
+      }
+      // Defense-in-depth: only register the adopted default dir (~/.config/gws)
+      // or a direct child of the machine-global google-accounts root. Removal is
+      // already exact-match-guarded, but this keeps an arbitrary path from ever
+      // entering the registry.
+      const home = process.env.HOME || homedir();
+      const defaultGwsDir = join(home, ".config", "gws");
+      if (!isAbsolute(configDir) || (configDir !== defaultGwsDir && dirname(configDir) !== googleAccountsRoot())) {
+        return json({ error: "Invalid input: configDir must be ~/.config/gws or a direct child of the google-accounts root" }, 400);
       }
       const adopt = payload.adopt === true;
       try {

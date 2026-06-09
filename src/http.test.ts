@@ -5532,6 +5532,32 @@ describe("email watcher routes", () => {
     );
     expect(response.status).toBe(404);
   });
+
+  test("POST /api/google/accounts rejects a configDir outside the allowed roots", async () => {
+    const config = testConfig("http-google-accounts-configdir");
+    const handler = createHandler(config);
+    // A relative path is rejected.
+    const relative = await rawCall(
+      handler,
+      config,
+      "/api/google/accounts",
+      { method: "POST", body: JSON.stringify({ tag: "x", configDir: "relative/gws" }) },
+      config.token
+    );
+    expect(relative.status).toBe(400);
+    expect((await relative.json()).error).toContain("configDir must be");
+    // An absolute but unrelated path is rejected (defense-in-depth — never
+    // reaches registerAccount / a real gws spawn).
+    const arbitrary = await rawCall(
+      handler,
+      config,
+      "/api/google/accounts",
+      { method: "POST", body: JSON.stringify({ tag: "x", configDir: "/etc/passwd" }) },
+      config.token
+    );
+    expect(arbitrary.status).toBe(400);
+    expect((await arbitrary.json()).error).toContain("configDir must be");
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
