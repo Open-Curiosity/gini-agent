@@ -125,7 +125,7 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 - `/api/pairing`, `/api/pairing/request*` (relay device pairing), `/api/devices`, `/api/mobile/bootstrap`
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
 - `/api/tunnel`, `/api/tunnel/select`, `/api/tunnel/connect`, `/api/tunnel/cancel`, `/api/tunnel/disconnect`
-- `/api/audit`, `/api/events`, `/api/events/stream`
+- `/api/audit`, `/api/events`, `/api/events/stream`, `/api/logs`
 - `/api/parity/hermes`, `/api/readiness/v1`
 
 ## On-Machine Lifecycle

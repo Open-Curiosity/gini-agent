@@ -15,14 +15,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { AnthropicLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
+import { AnthropicLogo, AzureLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { BedrockModelSelect } from "../_components/BedrockModelSelect";
 import { api } from "@/lib/api";
 import { displayProviderName, type ProviderCatalogItem } from "../_components/ProviderCard";
 
 // Codex stays first so it lines up with where the Settings list shows
 // its row. Echo is dev-only and never appears here.
-const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "bedrock", "openrouter", "deepseek", "local"] as const;
+const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "bedrock", "openrouter", "deepseek", "azure", "local"] as const;
 
 const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: string }>; description: string }> = {
   codex: { icon: TerminalIcon, description: "OAuth via codex --login" },
@@ -31,6 +31,7 @@ const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: 
   bedrock: { icon: BedrockLogo, description: "Claude, Nova, Llama… on AWS" },
   openrouter: { icon: ZapIcon, description: "Multi-model router" },
   deepseek: { icon: DeepSeekLogo, description: "DeepSeek V4 family" },
+  azure: { icon: AzureLogo, description: "Azure OpenAI deployments" },
   local: { icon: OllamaLogo, description: "Ollama, LM Studio, vLLM" }
 };
 
@@ -61,10 +62,15 @@ export default function AddProviderPage() {
   const [providerName, setProviderName] = useState<string>("");
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [apiKey, setApiKey] = useState("");
-  // Optional first-party endpoint override (anthropic/openai-compatible proxies).
+  // baseUrl is shared: optional first-party/proxy override for anthropic and
+  // OpenAI-compatible providers, and the required resource endpoint for azure.
   const [baseUrl, setBaseUrl] = useState("");
   // Optional AWS region for the bedrock provider (defaults to us-east-1).
   const [awsRegion, setAwsRegion] = useState("");
+  // Azure transport fields. The rest default server-side when blank.
+  const [apiVersion, setApiVersion] = useState("");
+  const [deployment, setDeployment] = useState("");
+  const [authScheme, setAuthScheme] = useState("api-key");
 
   // Seed once the catalog arrives: honor a ?provider= preselection from the
   // settings list (Edit button on a row), else fall back to the first tile.
@@ -82,6 +88,9 @@ export default function AddProviderPage() {
     setApiKey("");
     setBaseUrl("");
     setAwsRegion("");
+    setApiVersion("");
+    setDeployment("");
+    setAuthScheme("api-key");
   };
 
   const entry = tiles.find((t) => t.name === providerName);
@@ -89,6 +98,7 @@ export default function AddProviderPage() {
   const isLocal = providerName === "local";
   const isAnthropic = providerName === "anthropic";
   const isBedrock = providerName === "bedrock";
+  const isAzure = providerName === "azure";
   // Codex (OAuth), bedrock (AWS SigV4), and local (no-auth) hold no gini key.
   const requiresApiKey = providerName !== "" && !isCodex && !isLocal && !isBedrock;
 
@@ -109,8 +119,21 @@ export default function AddProviderPage() {
           provider: providerName,
           ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
           ...(selectedModel.trim() ? { model: selectedModel.trim() } : {}),
-          ...(baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
-          ...(isBedrock && awsRegion.trim() ? { awsRegion: awsRegion.trim() } : {})
+          // baseUrl applies to anthropic and every OpenAI-compatible provider
+          // (local / openai / openrouter / deepseek / azure); codex and bedrock
+          // ignore it. For azure it is the required resource endpoint, for the
+          // others an optional override, so only send it when non-empty.
+          ...(!isCodex && !isBedrock && baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
+          // Bedrock signs with AWS creds; an optional region override travels here.
+          ...(isBedrock && awsRegion.trim() ? { awsRegion: awsRegion.trim() } : {}),
+          // Azure routing fields default server-side when blank.
+          ...(isAzure
+            ? {
+                apiVersion: apiVersion.trim(),
+                deployment: deployment.trim(),
+                authScheme
+              }
+            : {})
         })
       });
     },
@@ -124,12 +147,15 @@ export default function AddProviderPage() {
           ? "Codex OAuth verified."
           : `Provider set to ${providerName} (${selectedModel}).`
       );
-      // Refetch providers BEFORE navigating so the settings list mounts
-      // with the row already present. We can't use useInvalidate here —
-      // it debounces 80ms and its unmount cleanup clears the pending set
-      // when this page unmounts, so the invalidation never fires.
-      queryClient.invalidateQueries({ queryKey: ["status"] });
-      await queryClient.refetchQueries({ queryKey: ["providers"] });
+      // Refetch BOTH providers and status BEFORE navigating so the settings
+      // list mounts with the row present AND the active-provider transport
+      // config (the Edit dialog's prefill source) is fresh. We can't use
+      // useInvalidate here — it debounces 80ms and its unmount cleanup clears
+      // the pending set when this page unmounts, so the invalidation never fires.
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["status"] }),
+        queryClient.refetchQueries({ queryKey: ["providers"] })
+      ]);
       router.push("/settings");
     },
     onError: (error: Error) => toast.error(error.message)
@@ -138,11 +164,16 @@ export default function AddProviderPage() {
   const canSubmit =
     providerName !== "" &&
     !save.isPending &&
-    (isCodex ? true : selectedModel.trim() !== "" && (!requiresApiKey || apiKey.trim().length > 0));
+    (isCodex
+      ? true
+      : selectedModel.trim() !== "" &&
+        (!requiresApiKey || apiKey.trim().length > 0) &&
+        // Azure has no default endpoint — require a base URL before saving.
+        (!isAzure || baseUrl.trim().length > 0));
 
   return (
     <>
-      <header className="flex items-center justify-between border-b border-[#1C1C1E] px-10 py-6">
+      <header className="flex items-center justify-between border-b border-border px-10 py-6">
         <div className="flex items-center gap-4">
           <Button asChild variant="outline" size="icon" aria-label="Back to settings">
             <Link href="/settings">
@@ -162,7 +193,7 @@ export default function AddProviderPage() {
       </header>
 
       <div className="flex flex-1 flex-col gap-5 overflow-auto p-10">
-        <section className="rounded-2xl border border-[#23232B] bg-[#121217] p-7">
+        <section className="rounded-2xl border border-border bg-card p-7">
           <div className="mb-5 space-y-1">
             <h2 className="text-sm font-semibold">Provider type</h2>
             <p className="text-xs text-muted-foreground">Choose the model API surface to configure.</p>
@@ -179,17 +210,17 @@ export default function AddProviderPage() {
                   onClick={() => onProviderChange(tile.name)}
                   className={`relative flex flex-col items-start gap-2 rounded-xl border p-4 text-left transition ${
                     selected
-                      ? "border-[#3D3DC8] bg-[#1B1B33]"
-                      : "border-[#23232B] bg-[#16161B] hover:border-[#2E2E38]"
+                      ? "border-[#4277FB] bg-[#EEF2FF] dark:border-[#3D3DC8] dark:bg-[#1B1B33]"
+                      : "border-border bg-card hover:bg-accent"
                   }`}
                 >
                   {selected ? (
-                    <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-[#4F4FE0]">
+                    <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-[#4277FB]">
                       <CheckIcon className="size-3 text-white" />
                     </span>
                   ) : null}
-                  <span className="flex size-9 items-center justify-center rounded-lg bg-[#1C1C22]">
-                    <Icon className="size-5 text-[#C2C2C8]" />
+                  <span className="flex size-9 items-center justify-center rounded-lg bg-muted">
+                    <Icon className="size-5 text-foreground" />
                   </span>
                   <span className="text-sm font-semibold text-foreground">{displayProviderName(tile)}</span>
                   <span className="text-xs text-muted-foreground">{visual.description}</span>
@@ -199,7 +230,7 @@ export default function AddProviderPage() {
           </div>
         </section>
 
-        <section className="rounded-2xl border border-[#1F1F24] bg-[#141418] p-7">
+        <section className="rounded-2xl border border-border bg-card p-7">
           <div className="mb-5 space-y-1">
             <h2 className="text-sm font-semibold">Configure {entry ? displayProviderName(entry) : "provider"}</h2>
             <p className="text-xs text-muted-foreground">
@@ -225,19 +256,19 @@ export default function AddProviderPage() {
                 <p className="text-sm text-foreground">
                   Run this in your terminal, then click Verify Codex auth:
                 </p>
-                <pre className="rounded-md bg-[#0F0F13] px-4 py-3 font-mono text-xs text-[#C2C2C8]">codex --login</pre>
+                <pre className="rounded-md bg-muted px-4 py-3 font-mono text-xs text-foreground">codex --login</pre>
                 <p className="text-xs text-muted-foreground">
-                  Gini reads <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">~/.codex/auth.json</code> on
-                  every request, so a future <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">codex --login</code> refresh is picked up automatically.
+                  Gini reads <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">~/.codex/auth.json</code> on
+                  every request, so a future <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">codex --login</code> refresh is picked up automatically.
                 </p>
               </div>
             ) : isBedrock ? (
               <>
                 <p className="text-xs text-muted-foreground">
                   Gini signs each Converse request with the AWS credentials it finds in
-                  <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">AWS_ACCESS_KEY_ID</code>/<code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">AWS_SECRET_ACCESS_KEY</code>
-                  (plus <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">AWS_SESSION_TOKEN</code> for temporary sessions)
-                  or your <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">~/.aws/credentials</code> profile. No API key. SSO or assumed-role users: export the session first with <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">aws configure export-credentials</code>.
+                  <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">AWS_ACCESS_KEY_ID</code>/<code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">AWS_SECRET_ACCESS_KEY</code>
+                  (plus <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">AWS_SESSION_TOKEN</code> for temporary sessions)
+                  or your <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">~/.aws/credentials</code> profile. No API key. SSO or assumed-role users: export the session first with <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">aws configure export-credentials</code>.
                 </p>
                 <div className="grid gap-2">
                   <Label htmlFor="bedrock-model">Model (cross-region inference profile)</Label>
@@ -284,7 +315,58 @@ export default function AddProviderPage() {
                   </div>
                 ) : null}
 
-                {isAnthropic ? (
+                {isAzure ? (
+                  <div className="grid gap-5">
+                    <div className="grid gap-2">
+                      <Label htmlFor="provider-base-url">Resource endpoint</Label>
+                      <Input
+                        id="provider-base-url"
+                        type="text"
+                        autoComplete="off"
+                        placeholder="https://<resource>.openai.azure.com"
+                        value={baseUrl}
+                        onChange={(e) => setBaseUrl(e.target.value)}
+                        disabled={save.isPending}
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="grid gap-2">
+                        <Label htmlFor="provider-api-version">API version</Label>
+                        <Input
+                          id="provider-api-version"
+                          type="text"
+                          autoComplete="off"
+                          placeholder="2024-10-21"
+                          value={apiVersion}
+                          onChange={(e) => setApiVersion(e.target.value)}
+                          disabled={save.isPending}
+                        />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor="provider-deployment">Deployment</Label>
+                        <Input
+                          id="provider-deployment"
+                          type="text"
+                          autoComplete="off"
+                          placeholder="Defaults to model"
+                          value={deployment}
+                          onChange={(e) => setDeployment(e.target.value)}
+                          disabled={save.isPending}
+                        />
+                      </div>
+                    </div>
+                    <div className="grid gap-2">
+                      <Label htmlFor="provider-auth-scheme">Auth scheme</Label>
+                      <Select value={authScheme} onValueChange={setAuthScheme} disabled={save.isPending}>
+                        <SelectTrigger id="provider-auth-scheme"><SelectValue placeholder="Select auth scheme" /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="api-key">api-key (resource key)</SelectItem>
+                          <SelectItem value="bearer">bearer (Entra token)</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                ) : isAnthropic ? (
                   <div className="grid gap-2">
                     <Label htmlFor="provider-base-url">
                       Base URL <span className="text-muted-foreground">(optional)</span>
@@ -299,7 +381,22 @@ export default function AddProviderPage() {
                       disabled={save.isPending}
                     />
                   </div>
-                ) : null}
+                ) : (
+                  <div className="grid gap-2">
+                    <Label htmlFor="provider-base-url">
+                      Base URL <span className="font-normal text-muted-foreground">(optional)</span>
+                    </Label>
+                    <Input
+                      id="provider-base-url"
+                      type="text"
+                      autoComplete="off"
+                      placeholder="Override the default endpoint"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      disabled={save.isPending}
+                    />
+                  </div>
+                )}
 
                 <div className="grid gap-2">
                   <Label htmlFor="provider-model">Default model</Label>
@@ -320,7 +417,7 @@ export default function AddProviderPage() {
               </>
             )}
 
-            <div className="flex items-center justify-end gap-3 border-t border-[#1F1F26] pt-5">
+            <div className="flex items-center justify-end gap-3 border-t border-border pt-5">
               <Button asChild variant="outline" type="button">
                 <Link href="/settings">Cancel</Link>
               </Button>

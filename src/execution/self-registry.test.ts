@@ -11,7 +11,7 @@
 // {name, args} envelope) — that is the contract this file pins.
 
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createChatSession, createTask, mutateState, readState, upsertTask } from "../state";
@@ -171,6 +171,32 @@ describe("direct self tools — query", () => {
   test("list_skills takes its filter args at top level (no {name,args} envelope)", async () => {
     const instance = `self-skills-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance);
+    const skillDir = join(ROOT, instance, "skills", "scripted");
+    mkdirSync(join(skillDir, "scripts"), { recursive: true });
+    writeFileSync(join(skillDir, "scripts", "run.ts"), "console.log('{}')");
+    await mutateState(config.instance, (state) => {
+      state.skills.push({
+        id: "skill_scripted",
+        instance: config.instance,
+        name: "scripted",
+        description: "Scripted skill",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "enabled",
+        version: 1,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        tests: [],
+        successCount: 0,
+        failureCount: 0,
+        previousVersions: [],
+        body: "",
+        source: "user",
+        manifestPath: join(skillDir, "SKILL.md")
+      });
+    });
     const taskId = await newTask(config);
     // Top-level args, NOT nested under `args`.
     const result = await dispatchToolCall(
@@ -182,9 +208,10 @@ describe("direct self tools — query", () => {
     );
     expect(result.kind).toBe("sync");
     if (result.kind === "sync") {
-      const parsed = JSON.parse(result.result) as { ok: boolean; skills: unknown[] };
+      const parsed = JSON.parse(result.result) as { ok: boolean; skills: Array<{ name: string; scripts?: string[] }> };
       expect(parsed.ok).toBe(true);
       expect(Array.isArray(parsed.skills)).toBe(true);
+      expect(parsed.skills.find((skill) => skill.name === "scripted")?.scripts).toEqual(["run"]);
     }
   });
 
@@ -353,6 +380,44 @@ describe("direct self tools — mutate", () => {
     expect(payloadArgs?.apiKey).toBe("[redacted]");
     // Non-secret args still survive so the historical row stays legible.
     expect(payloadArgs?.provider).toBe("echo");
+  });
+
+  test("set_provider routes azure transport fields through dispatch onto the live config", async () => {
+    const instance = `self-setprov-azure-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const prevKey = process.env.AZURE_OPENAI_API_KEY;
+    // Pre-set the env var so setSetupProvider accepts a keyless edit (no
+    // secrets.env write, no plist refresh) and we exercise only the routing
+    // forwarding done by the set_provider self-tool (baseUrl/apiVersion/
+    // deployment/authScheme present-clears mapping).
+    process.env.AZURE_OPENAI_API_KEY = "az-test";
+    try {
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "set_provider",
+        "call_1",
+        JSON.stringify({
+          provider: "azure",
+          model: "gpt-5.5",
+          baseUrl: "https://r.openai.azure.com",
+          apiVersion: "2024-10-21",
+          deployment: "gpt-5.5-deploy",
+          authScheme: "api-key"
+        })
+      );
+      expect(result.kind).toBe("sync");
+      // The side effect lands on the live config object.
+      expect(config.provider.name).toBe("azure");
+      expect(config.provider.baseUrl).toBe("https://r.openai.azure.com");
+      expect(config.provider.apiVersion).toBe("2024-10-21");
+      expect(config.provider.deployment).toBe("gpt-5.5-deploy");
+      expect(config.provider.authScheme).toBe("api-key");
+    } finally {
+      if (prevKey === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = prevKey;
+    }
   });
 
   test("set_approval_mode auto-resolves in auto mode and lands the side effect on config", async () => {

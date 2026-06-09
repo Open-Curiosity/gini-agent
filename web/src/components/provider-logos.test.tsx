@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { render } from "@testing-library/react";
-import { AnthropicLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "./provider-logos";
+import { AnthropicLogo, AzureLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "./provider-logos";
 
 describe("provider-logos", () => {
   test("each brand logo renders an svg with a path and forwards className", () => {
-    for (const Logo of [AnthropicLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo]) {
+    for (const Logo of [AnthropicLogo, AzureLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo]) {
       const { container, unmount } = render(<Logo className="size-5" />);
       const svg = container.querySelector("svg");
       expect(svg).not.toBeNull();

@@ -13,6 +13,7 @@ import {
   Trash2Icon,
   ZapIcon
 } from "lucide-react";
+import type { ProviderConfig } from "@runtime/types";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -20,7 +21,7 @@ import {
   DialogDescription,
   DialogTitle
 } from "@/components/ui/dialog";
-import { AnthropicLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
+import { AnthropicLogo, AzureLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
 import { EditProviderDialog } from "./EditProviderDialog";
@@ -29,7 +30,12 @@ import { EditProviderDialog } from "./EditProviderDialog";
 // from this UI: scrubbing the env var + secrets.env line is reversible
 // (the user can add it back). Codex is owned by the codex CLI and local
 // has no key to clear; bedrock signs with ~/.aws credentials gini doesn't
-// manage — so none of those three expose the trash button.
+// manage — so neither row exposes the trash button. Azure is excluded too:
+// its row only renders while it is the active provider (it has no default
+// endpoint, so an inactive azure config isn't "configured"), and the trash
+// button is disabled for the active row — a permanently-dead affordance.
+// Azure is managed by switch + re-add via Add Provider; key cleanup is the
+// CLI `gini provider` path.
 const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek", "anthropic"]);
 
 export interface ProviderCatalogItem {
@@ -59,7 +65,7 @@ export function displayProviderName(item: { displayName: string; name: string })
 // Providers selectable on the Settings page. Echo is dev-only; the four
 // real providers map onto the Pencil mock (Codex, OpenAI, DeepSeek, Ollama
 // stand in for `local`).
-const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "bedrock", "deepseek", "openrouter", "local"] as const;
+const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "bedrock", "deepseek", "openrouter", "azure", "local"] as const;
 
 // Per-provider visual identity. Brand logos for OpenAI/DeepSeek/Ollama
 // come from the authoritative Pencil design file; codex (Terminal) and
@@ -72,6 +78,7 @@ const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: 
   bedrock: { icon: BedrockLogo, authLabel: "AWS" },
   deepseek: { icon: DeepSeekLogo, authLabel: "API key" },
   openrouter: { icon: ZapIcon, authLabel: "API key" },
+  azure: { icon: AzureLogo, authLabel: "API key" },
   local: { icon: OllamaLogo, authLabel: "Local" }
 };
 
@@ -84,7 +91,8 @@ export function ProviderCard({
   catalog,
   activeProviderName,
   activeProviderModel,
-  activeProviderAwsRegion
+  activeProviderAwsRegion,
+  activeProvider
 }: {
   catalog: ProviderCatalogItem[];
   activeProviderName?: string;
@@ -92,6 +100,10 @@ export function ProviderCard({
   // Active bedrock provider's region — threaded into the Edit dialog so it
   // opens pre-filled.
   activeProviderAwsRegion?: string;
+  // Full persisted config for the ACTIVE provider (from /status). Carries the
+  // transport fields the static catalog doesn't — baseUrl + Azure routing —
+  // so the Edit dialog can prefill them when editing the active row.
+  activeProvider?: ProviderConfig;
 }) {
   const invalidate = useInvalidate();
   const rows = SELECTABLE_PROVIDERS
@@ -170,11 +182,11 @@ export function ProviderCard({
       </header>
 
       {rows.length === 0 ? (
-        <div className="rounded-2xl border border-dashed border-[#23232B] bg-[#0F0F13] p-10 text-center">
+        <div className="rounded-2xl border border-dashed border-border bg-background p-10 text-center">
           <p className="text-sm font-medium text-foreground">No providers connected yet</p>
           <p className="mx-auto mt-1.5 max-w-md text-xs text-muted-foreground">
             Add a provider to start chatting. Gini stores keys locally in
-            <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">~/.gini/secrets.env</code>
+            <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">~/.gini/secrets.env</code>
             and never proxies them anywhere except the provider you pick.
           </p>
         </div>
@@ -191,7 +203,7 @@ export function ProviderCard({
           const showRadioFill = switching ? isPending : isActive;
           const radioBorderClass = isPending || (!switching && isActive)
             ? "border-[#4277FB]"
-            : "border-[#3A3A40]";
+            : "border-border";
           const visual = PROVIDER_VISUAL[row.name] ?? { icon: TerminalIcon, authLabel: row.auth };
           const Icon = visual.icon;
           const authLabel = visual.authLabel;
@@ -224,7 +236,7 @@ export function ProviderCard({
                   toggleRow();
                 }
               }}
-              className="flex cursor-pointer items-center gap-4 rounded-2xl border border-[#1F1F24] bg-[#141418] p-5 transition hover:border-[#2A2A30] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4277FB]/40 aria-disabled:cursor-not-allowed"
+              className="flex cursor-pointer items-center gap-4 rounded-2xl border border-border bg-card p-5 transition hover:border-foreground/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4277FB]/40 aria-disabled:cursor-not-allowed"
             >
               {/* Radio is purely visual now — the row itself is the
                   control. Kept aria-hidden so screen readers don't
@@ -236,17 +248,17 @@ export function ProviderCard({
               >
                 {showRadioFill ? <span className="size-2.5 rounded-full bg-[#4277FB]" /> : null}
               </span>
-              <span className="flex size-[42px] items-center justify-center rounded-[11px] bg-[#1C1C22]">
-                <Icon className="size-5 text-[#C2C2C8]" />
+              <span className="flex size-[42px] items-center justify-center rounded-[11px] bg-muted">
+                <Icon className="size-5 text-foreground" />
               </span>
               <div className="flex-1 space-y-1.5">
                 <div className="flex items-center gap-2.5">
                   <span className="text-[15px] font-semibold text-foreground">{displayProviderName(row)}</span>
-                  <span className="rounded-md bg-[#1C1C22] px-2 py-0.5 text-[11px] font-semibold text-[#9A9AA0]">
+                  <span className="rounded-md bg-muted px-2 py-0.5 text-[11px] font-semibold text-muted-foreground">
                     {authLabel}
                   </span>
                   {isActive ? (
-                    <span className="rounded-md bg-[#14321F] px-2 py-0.5 text-[11px] font-semibold text-[#4ADE80]">
+                    <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-[11px] font-semibold text-emerald-600 dark:bg-[#14321F] dark:text-[#4ADE80]">
                       Active
                     </span>
                   ) : null}
@@ -254,7 +266,7 @@ export function ProviderCard({
                 <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
                   <span className="size-2 rounded-full bg-emerald-400" aria-hidden />
                   <span>Connected</span>
-                  <span className="text-[#4A4A50]">·</span>
+                  <span className="text-muted-foreground">·</span>
                   <span className="font-mono">{model}</span>
                 </div>
               </div>
@@ -280,7 +292,7 @@ export function ProviderCard({
                       setEditingRow(row);
                     }}
                   >
-                    <PencilIcon className="size-4 text-[#9A9AA0]" />
+                    <PencilIcon className="size-4 text-muted-foreground" />
                   </Button>
                   {REMOVABLE_PROVIDERS.has(row.name) ? (
                     <Button
@@ -300,7 +312,7 @@ export function ProviderCard({
                         setRemovingRow(row);
                       }}
                     >
-                      <Trash2Icon className="size-4 text-[#9A9AA0]" />
+                      <Trash2Icon className="size-4 text-muted-foreground" />
                     </Button>
                   ) : null}
                 </div>
@@ -316,14 +328,14 @@ export function ProviderCard({
           if (!open && !removeProvider.isPending) setRemovingRow(null);
         }}
       >
-        <DialogContent className="gap-5 border-[#1F1F24] bg-[#141418] p-7 sm:max-w-md">
+        <DialogContent className="gap-5 border-border bg-card p-7 sm:max-w-md">
           <DialogTitle className="text-base font-bold text-foreground">
             Remove {removingRow ? displayProviderName(removingRow) : "provider"}?
           </DialogTitle>
           <DialogDescription className="text-[13px] text-muted-foreground">
             You can reconnect anytime.
           </DialogDescription>
-          <div className="flex items-center justify-end gap-2.5 border-t border-[#1F1F26] pt-4">
+          <div className="flex items-center justify-end gap-2.5 border-t border-border pt-4">
             <Button
               type="button"
               variant="outline"
@@ -350,7 +362,11 @@ export function ProviderCard({
           authLabel={PROVIDER_VISUAL[editingRow.name]?.authLabel ?? editingRow.auth}
           icon={PROVIDER_VISUAL[editingRow.name]?.icon ?? TerminalIcon}
           currentModel={editingRow.name === activeProviderName ? activeProviderModel : undefined}
+          // Active bedrock region — prefilled only when editing the ACTIVE row.
           currentAwsRegion={editingRow.name === activeProviderName ? activeProviderAwsRegion : undefined}
+          // Prefill transport fields only when editing the ACTIVE row — the
+          // persisted config from /status describes the active provider only.
+          activeConfig={editingRow.name === activeProviderName ? activeProvider : undefined}
           open={Boolean(editingRow)}
           onOpenChange={(open) => {
             if (!open) setEditingRow(null);
@@ -359,10 +375,10 @@ export function ProviderCard({
       ) : null}
 
       {switching && pendingRow ? (
-        <div className="flex items-center justify-between gap-4 rounded-xl border border-[#2E3650] bg-[#15171F] px-5 py-4">
+        <div className="flex items-center justify-between gap-4 rounded-xl border border-[#D7DEFA] bg-[#EEF2FF] px-5 py-4 dark:border-[#2E3650] dark:bg-[#15171F]">
           <div className="flex items-center gap-3">
-            <span className="flex size-[30px] items-center justify-center rounded-lg bg-[#1D2333]">
-              <ArrowLeftRightIcon className="size-4 text-[#9DB4FF]" />
+            <span className="flex size-[30px] items-center justify-center rounded-lg bg-[#E0E8FF] dark:bg-[#1D2333]">
+              <ArrowLeftRightIcon className="size-4 text-[#4277FB] dark:text-[#9DB4FF]" />
             </span>
             <div className="space-y-0.5">
               <p className="text-sm font-semibold text-foreground">

@@ -1,13 +1,13 @@
 import type { CliContext } from "../context";
 import { parseSubArgs, restAfter } from "../args";
 import { configPath, writeRuntimeConfig } from "../../paths";
-import { isValidAwsRegion, normalizeProvider, providerHealth } from "../../provider";
+import { azureNeedsBaseUrl, azureNeedsHttps, isValidAwsRegion, normalizeProvider, providerHealth } from "../../provider";
 import { isSafeEnvVarName } from "../../state/secrets-env";
 import { api } from "../api";
 import { print } from "../output";
 import { maybeRefreshAutostart } from "./autostart";
 
-const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deepseek|anthropic|bedrock [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>] [--aws-region <region>]";
+const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deepseek|anthropic|bedrock|azure [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>] [--aws-region <region>] [--api-version <VERSION>] [--deployment <NAME>] [--auth-scheme bearer|api-key]";
 
 // Single source of truth for value-bearing flags on `gini provider set`.
 // `parseSubArgs` uses this to both partition positionals and extract flag
@@ -17,7 +17,14 @@ const PROVIDER_SET_FLAGS: ReadonlySet<string> = new Set([
   "--base-url",
   "--api-key-env",
   "--extra-body",
-  "--aws-region"
+  // Bedrock signing region (bedrock provider only).
+  "--aws-region",
+  // Azure OpenAI routing (azure provider only): --api-version selects the
+  // data-plane version (defaults to a GA value), --deployment names the path
+  // segment (defaults to the model), --auth-scheme picks api-key vs Bearer.
+  "--api-version",
+  "--deployment",
+  "--auth-scheme"
 ]);
 
 export async function provider(ctx: CliContext): Promise<void> {
@@ -40,7 +47,8 @@ export async function provider(ctx: CliContext): Promise<void> {
       name !== "local" &&
       name !== "deepseek" &&
       name !== "anthropic" &&
-      name !== "bedrock"
+      name !== "bedrock" &&
+      name !== "azure"
     ) {
       throw new Error(USAGE);
     }
@@ -53,6 +61,16 @@ export async function provider(ctx: CliContext): Promise<void> {
 
     const baseUrl = flags["--base-url"];
     const apiKeyEnv = flags["--api-key-env"];
+    const apiVersion = flags["--api-version"];
+    const deployment = flags["--deployment"];
+    const authSchemeRaw = flags["--auth-scheme"];
+    let authScheme: "bearer" | "api-key" | undefined;
+    if (authSchemeRaw !== undefined) {
+      if (authSchemeRaw !== "bearer" && authSchemeRaw !== "api-key") {
+        throw new Error(`--auth-scheme must be 'bearer' or 'api-key' (got '${authSchemeRaw}')`);
+      }
+      authScheme = authSchemeRaw;
+    }
     // The env-var name is written into the shell-sourced secrets.env, so reject
     // anything that isn't a plain identifier before it can be persisted.
     if (apiKeyEnv !== undefined && !isSafeEnvVarName(apiKeyEnv)) {
@@ -97,6 +115,9 @@ export async function provider(ctx: CliContext): Promise<void> {
       if (baseUrl !== undefined) ignored.push("--base-url");
       if (apiKeyEnv !== undefined) ignored.push("--api-key-env");
       if (extraBody !== undefined) ignored.push("--extra-body");
+      if (apiVersion !== undefined) ignored.push("--api-version");
+      if (deployment !== undefined) ignored.push("--deployment");
+      if (authSchemeRaw !== undefined) ignored.push("--auth-scheme");
       if (ignored.length > 0) {
         process.stderr.write(`gini: warning — ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored for the echo provider; echo bypasses HTTP entirely.\n`);
       }
@@ -112,13 +133,37 @@ export async function provider(ctx: CliContext): Promise<void> {
       process.stderr.write("gini: warning — --extra-body is ignored for the codex provider; codex uses the /responses API with its own request shape.\n");
     }
 
+    // Azure routing flags only affect the azure provider; normalizeProvider
+    // drops them for everyone else. Warn so a misplaced flag isn't silently
+    // ignored (echo is already covered above).
+    if (name !== "azure" && name !== "echo") {
+      const azureIgnored: string[] = [];
+      if (apiVersion !== undefined) azureIgnored.push("--api-version");
+      if (deployment !== undefined) azureIgnored.push("--deployment");
+      if (authSchemeRaw !== undefined) azureIgnored.push("--auth-scheme");
+      if (azureIgnored.length > 0) {
+        process.stderr.write(`gini: warning — ${azureIgnored.join(", ")} ${azureIgnored.length > 1 ? "are" : "is"} ignored for the ${name} provider; Azure routing applies only to the azure provider.\n`);
+      }
+    }
+
+    // Azure needs a real https resource endpoint on every call.
+    if (azureNeedsBaseUrl(name, baseUrl)) {
+      throw new Error("The azure provider requires --base-url <https://<resource>.openai.azure.com>.");
+    }
+    if (azureNeedsHttps(name, baseUrl)) {
+      throw new Error("The azure provider requires an https:// --base-url (the credential is sent on every request).");
+    }
+
     config.provider = normalizeProvider({
       name,
-      model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.5" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : name === "deepseek" ? "deepseek-v4-flash" : name === "anthropic" ? "claude-opus-4-8" : name === "bedrock" ? "us.anthropic.claude-opus-4-8" : "gpt-5.4-mini"),
+      model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.5" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : name === "deepseek" ? "deepseek-v4-flash" : name === "anthropic" ? "claude-opus-4-8" : name === "bedrock" ? "us.anthropic.claude-opus-4-8" : name === "azure" ? "gpt-5.5" : "gpt-5.4-mini"),
       ...(baseUrl ? { baseUrl } : {}),
       ...(apiKeyEnv ? { apiKeyEnv } : {}),
       ...(extraBody ? { extraBody } : {}),
-      ...(name === "bedrock" && awsRegion ? { awsRegion } : {})
+      ...(name === "bedrock" && awsRegion ? { awsRegion } : {}),
+      ...(apiVersion ? { apiVersion } : {}),
+      ...(deployment ? { deployment } : {}),
+      ...(authScheme ? { authScheme } : {})
     });
     writeRuntimeConfig(config);
     // If an autostart plist already exists for this instance, refresh it

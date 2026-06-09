@@ -308,6 +308,107 @@ describe("provider CLI", () => {
     }
     expect(captured.join("")).toBe("");
   });
+
+  test("set azure persists base URL, deployment, api-version, auth-scheme, and the AZURE env default", async () => {
+    const ctx = makeCtx([
+      "provider", "set", "azure", "gpt-4o",
+      "--base-url", "https://lilac.openai.azure.com",
+      "--deployment", "gpt-4o-prod",
+      "--api-version", "2025-04-01-preview",
+      "--auth-scheme", "api-key"
+    ]);
+    await provider(ctx);
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.name).toBe("azure");
+    expect(persisted.provider.model).toBe("gpt-4o");
+    expect(persisted.provider.baseUrl).toBe("https://lilac.openai.azure.com");
+    expect(persisted.provider.deployment).toBe("gpt-4o-prod");
+    expect(persisted.provider.apiVersion).toBe("2025-04-01-preview");
+    expect(persisted.provider.authScheme).toBe("api-key");
+    expect(persisted.provider.apiKeyEnv).toBe("AZURE_OPENAI_API_KEY");
+  });
+
+  test("set azure defaults api-version and auth-scheme when only a base URL is given", async () => {
+    const ctx = makeCtx(["provider", "set", "azure", "gpt-4o", "--base-url", "https://lilac.openai.azure.com"]);
+    await provider(ctx);
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.apiVersion).toBe("2024-10-21");
+    expect(persisted.provider.authScheme).toBe("api-key");
+  });
+
+  test("set azure rejects a missing base URL", async () => {
+    const ctx = makeCtx(["provider", "set", "azure", "gpt-4o"]);
+    await expect(provider(ctx)).rejects.toThrow(/requires --base-url/);
+  });
+
+  test("set azure rejects a non-https base URL", async () => {
+    const ctx = makeCtx(["provider", "set", "azure", "gpt-4o", "--base-url", "http://lilac.openai.azure.com"]);
+    await expect(provider(ctx)).rejects.toThrow(/https:\/\//);
+  });
+
+  test("set azure rejects a hostless base URL (scheme only, no resource host)", async () => {
+    // "https://" passes a naive non-empty + https-prefix check but builds a
+    // hostless deployment URL that fetch rejects; the guard must catch it.
+    for (const bad of ["https://", "https:////", "https://?", "https://#x"]) {
+      const ctx = makeCtx(["provider", "set", "azure", "gpt-4o", "--base-url", bad]);
+      await expect(provider(ctx)).rejects.toThrow(/requires --base-url/);
+    }
+  });
+
+  test("set azure rejects an invalid --auth-scheme", async () => {
+    const ctx = makeCtx(["provider", "set", "azure", "gpt-4o", "--base-url", "https://lilac.openai.azure.com", "--auth-scheme", "oauth"]);
+    await expect(provider(ctx)).rejects.toThrow(/--auth-scheme must be 'bearer' or 'api-key'/);
+  });
+
+  test("set rejects an invalid --api-key-env name before it reaches the secrets writer", async () => {
+    const ctx = makeCtx(["provider", "set", "openai", "m", "--api-key-env", "BAD NAME=x"]);
+    await expect(provider(ctx)).rejects.toThrow(/valid env var name/);
+  });
+
+  test("Azure routing flags warn on a non-azure provider", async () => {
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx([
+        "provider", "set", "openrouter", "or-model",
+        "--api-version", "2024-10-21", "--deployment", "d", "--auth-scheme", "api-key"
+      ]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    const msg = captured.join("");
+    expect(msg).toContain("--api-version");
+    expect(msg).toContain("--deployment");
+    expect(msg).toContain("--auth-scheme");
+    expect(msg).toContain("openrouter provider");
+  });
+
+  test("azure with its routing flags emits NO azure warning", async () => {
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx([
+        "provider", "set", "azure", "gpt-4o",
+        "--base-url", "https://lilac.openai.azure.com",
+        "--api-version", "2024-10-21", "--deployment", "d", "--auth-scheme", "api-key"
+      ]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    expect(captured.join("")).toBe("");
+  });
 });
 
 function makeCtx(cliArgs: string[]): CliContext {

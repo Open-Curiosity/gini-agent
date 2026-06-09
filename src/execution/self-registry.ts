@@ -1,13 +1,15 @@
 // Self-config / self-introspection operation registry.
 //
-// Each self-config capability is exposed to the chat-task agent loop as a
-// DIRECT deferred tool (see tool-catalog.ts): its name + one-line summary
-// surface in the system-prompt on-demand index, and the model loads the
-// schema via load_tools before calling the tool by name. This registry stays
-// the single source of truth for the OPERATION BEHAVIOR — the catalog entry
-// carries the schema/description the model sees, while the handler + tag +
-// audit live here. Keeping the live full-schema tool count low (which weak
-// local providers need) is now the deferral mechanism's job, not a facade's.
+// Most self-config capabilities are exposed to the chat-task agent loop as
+// DIRECT deferred tools (see tool-catalog.ts): their names + one-line
+// summaries surface in the system-prompt on-demand index, and the model loads
+// a schema via load_tools before calling the tool by name. `list_skills` is
+// an always-on exception because capped skill prompt blocks use it as their
+// discovery fallback. This registry stays the single source of truth for the
+// OPERATION BEHAVIOR — the catalog entry carries the schema/description the
+// model sees, while the handler + tag + audit live here. Keeping the live
+// full-schema tool count low (which weak local providers need) is now the
+// deferral mechanism's job, not a facade's.
 //
 // Each SelfOperation is the single source of truth for one capability: its
 // summary, its tag (query => sync read; mutate => routed through the approval
@@ -28,6 +30,7 @@ import { providerCatalogWithStatus } from "../provider";
 import { setSetupProvider, removeSetupProvider } from "../runtime/setup-api";
 import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability, renameAgent as renameAgentCapability, deleteAgent } from "../capabilities/agents";
 import { listSkills, rollbackSkill, testSkill } from "../capabilities/skills";
+import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { listToolsets, setToolsetStatus } from "../capabilities/toolsets";
 import { addMcpServer, removeMcpServer } from "../integrations/mcp";
 import { deleteConnector, updateConnector } from "../integrations/connectors";
@@ -130,7 +133,7 @@ async function getSelf(config: RuntimeConfig, taskId: string): Promise<string> {
 }
 
 async function listProviders(config: RuntimeConfig, taskId: string): Promise<string> {
-  const catalog = providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv);
+  const catalog = providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv, config.provider?.baseUrl);
   const providers = catalog.map((item) => ({
     id: item.id,
     name: item.name,
@@ -187,6 +190,7 @@ async function listSkillsOp(
   const statusFilter = typeof args.status === "string" && args.status !== "all" ? args.status : undefined;
   const nameContains = typeof args.nameContains === "string" ? args.nameContains.toLowerCase() : undefined;
   const all = listSkills(config);
+  const scriptsBySkill = new Map(listEnabledSkillScripts(readState(config.instance)).map((entry) => [entry.skill, entry.scripts]));
   const filtered = all.filter((skill) => {
     if (statusFilter && skill.status !== statusFilter) return false;
     if (nameContains && !skill.name.toLowerCase().includes(nameContains)) return false;
@@ -199,6 +203,7 @@ async function listSkillsOp(
     status: skill.status,
     trigger: skill.trigger ?? "",
     description: skill.description ?? "",
+    scripts: scriptsBySkill.get(skill.name) ?? [],
     manifestPath: skill.manifestPath ?? null
   }));
   appendTrace(config.instance, taskId, {
@@ -290,10 +295,18 @@ async function setProvider(
   if (typeof args.model === "string" && args.model.trim().length > 0) payload.model = args.model.trim();
   if (typeof args.awsRegion === "string" && args.awsRegion.trim().length > 0) payload.awsRegion = args.awsRegion.trim();
   if (typeof args.apiKey === "string" && args.apiKey.trim().length > 0) payload.apiKey = args.apiKey.trim();
-  // Deliberately NOT forwarding a model-supplied `baseUrl`: an env-keyed
-  // provider's API key is sent to whatever baseUrl is configured, so letting a
-  // (possibly prompt-injected) model repoint the endpoint is a key-exfiltration
-  // vector. Custom endpoints stay a human-only action via the CLI / web setup.
+  // Transport fields pass through when PRESENT (even blank), so the agent can
+  // CLEAR them — matching the setup API's present-clears / absent-preserves
+  // rule. Omitting an arg entirely preserves the persisted value. For the azure
+  // provider these carry the resource endpoint + deployment routing. baseUrl is
+  // NOT forwarded for anthropic/bedrock: bedrock derives its endpoint from
+  // awsRegion, and letting a (possibly prompt-injected) model repoint the
+  // first-party Anthropic endpoint would exfil the Anthropic key — that stays a
+  // human-only action via the CLI / web setup.
+  if (typeof args.baseUrl === "string" && args.provider !== "anthropic" && args.provider !== "bedrock") payload.baseUrl = args.baseUrl.trim();
+  if (typeof args.apiVersion === "string") payload.apiVersion = args.apiVersion.trim();
+  if (typeof args.deployment === "string") payload.deployment = args.deployment.trim();
+  if (args.authScheme === "api-key" || args.authScheme === "bearer") payload.authScheme = args.authScheme;
   const result = await setSetupProvider(config, payload);
   appendTrace(config.instance, taskId, {
     type: "tool",
@@ -866,7 +879,7 @@ export const SELF_OPERATIONS: SelfOperation[] = [
   },
   {
     name: "list_skills",
-    summary: "Installed skills with id, name, category, status, and trigger phrase. Filter by status or nameContains.",
+    summary: "Installed skills with id, name, category, status, trigger phrase, and script names. Filter by status or nameContains.",
     tag: "query",
     schema: {
       type: "object",
@@ -905,10 +918,14 @@ export const SELF_OPERATIONS: SelfOperation[] = [
       properties: {
         provider: {
           type: "string",
-          description: "Provider id (e.g. 'codex', 'openai', 'anthropic', 'bedrock', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`awsRegion` are updated."
+          description: "Provider id (e.g. 'codex', 'openai', 'anthropic', 'bedrock', 'openrouter', 'deepseek', 'local', 'azure', 'echo'). When omitted, the current provider is kept and only `model`/`awsRegion`/`baseUrl` (and any Azure routing fields) are updated."
         },
         model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5', or a Bedrock inference-profile id like 'us.amazon.nova-pro-v1:0'). Defaults to the provider's first catalog model when omitted." },
         awsRegion: { type: "string", description: "AWS region for the 'bedrock' provider's Converse endpoint/signing (e.g. 'us-east-1'). Ignored by other providers." },
+        baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo/anthropic/bedrock. For the azure provider, set this to the resource endpoint (https://<resource>.openai.azure.com) — it is required." },
+        apiVersion: { type: "string", description: "Azure OpenAI api-version (e.g. '2024-10-21'). azure provider only; defaults to a GA value when omitted." },
+        deployment: { type: "string", description: "Azure OpenAI deployment name. Defaults to the model id when omitted. azure provider only." },
+        authScheme: { type: "string", enum: ["bearer", "api-key"], description: "Auth header style for the azure provider. 'api-key' (default) sends Azure's api-key header for a resource key; 'bearer' sends Authorization: Bearer for an Entra token." },
         apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env. Not used by bedrock (AWS SigV4) or codex (OAuth)." }
       },
       required: []
@@ -1028,7 +1045,7 @@ export const SELF_OPERATIONS: SelfOperation[] = [
     schema: {
       type: "object",
       properties: {
-        provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek'). Codex and local cannot be removed here." }
+        provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek', 'azure'). Codex and local cannot be removed here." }
       },
       required: ["provider"]
     },

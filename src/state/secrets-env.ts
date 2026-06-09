@@ -42,15 +42,20 @@ function shellSingleQuote(value: string): string {
 // persistence), and an unconstrained name is also a RegExp-injection / ReDoS
 // vector. Unlike the value (which `shellSingleQuote` neutralizes), the name has
 // no safe-quoting form in `export NAME=…`, so reject anything non-conforming.
+// This guard matters now that a user-configurable apiKeyEnv (a custom
+// ANTHROPIC/AZURE_OPENAI_API_KEY env name, etc.) can reach here.
 const SAFE_ENV_VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 export function isSafeEnvVarName(name: string): boolean {
   return SAFE_ENV_VAR_NAME.test(name);
 }
+// Alias under the name the Azure-provider path on main imports.
+export const isValidEnvVarName = isSafeEnvVarName;
 function assertSafeEnvVarName(name: string): void {
   if (!SAFE_ENV_VAR_NAME.test(name)) {
     throw new Error(`Refusing to use unsafe env var name '${name}'; must match /^[A-Za-z_][A-Za-z0-9_]*$/.`);
   }
 }
+
 
 // Write a `KEY=value` (or replace an existing one) into ~/.gini/secrets.env
 // in a shell-sourceable form. Always lands at mode 0600 — even when the
@@ -130,6 +135,21 @@ export function unquoteSecretsValue(raw: string): string {
     return trimmed.slice(1, -1).replace(/\\(["\\$`])/g, "$1");
   }
   return trimmed;
+}
+
+// Best-effort read of the raw ~/.gini/secrets.env body for literal-redaction
+// inputs (the same `secretsEnvBody` redactReportText consumes). Returns
+// undefined when the file is absent or unreadable — pattern-based redaction
+// still runs regardless, so a read failure must never throw on the redaction
+// path.
+export function readSecretsEnvBody(): string | undefined {
+  const path = secretsEnvPath();
+  try {
+    if (!existsSync(path)) return undefined;
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
 }
 
 // Predicate: does ~/.gini/secrets.env already carry a NON-EMPTY value

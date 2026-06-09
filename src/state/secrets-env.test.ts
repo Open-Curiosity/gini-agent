@@ -12,6 +12,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, write
 import { join } from "node:path";
 import {
   isSafeEnvVarName,
+  isValidEnvVarName,
   removeKeyFromSecretsEnv,
   secretsEnvHasKey,
   secretsEnvPath,
@@ -215,5 +216,27 @@ describe("unquoteSecretsValue", () => {
 
   test("passes through unquoted values verbatim (trimmed)", () => {
     expect(unquoteSecretsValue("  sk-bare  ")).toBe("sk-bare");
+  });
+});
+
+describe("env-var name validation", () => {
+  test("isValidEnvVarName accepts POSIX identifiers and rejects the rest", () => {
+    expect(isValidEnvVarName("OPENAI_API_KEY")).toBe(true);
+    expect(isValidEnvVarName("AZURE_OPENAI_API_KEY")).toBe(true);
+    expect(isValidEnvVarName("_x9")).toBe(true);
+    expect(isValidEnvVarName("9LEADING")).toBe(false);
+    expect(isValidEnvVarName("HAS SPACE")).toBe(false);
+    expect(isValidEnvVarName("FOO=bar")).toBe(false);
+    expect(isValidEnvVarName("FOO\nexport EVIL")).toBe(false);
+    expect(isValidEnvVarName("")).toBe(false);
+  });
+
+  test("the writer rejects, and the remover no-ops on, a malformed name instead of injecting it", () => {
+    // A name carrying `=` or a newline would otherwise inject an extra line into
+    // the shell-sourced secrets.env. The guard runs before any filesystem access,
+    // so no sandbox is needed. The writer throws; the remover treats an
+    // unwritable name as nothing-to-remove (false) without touching the file.
+    expect(() => writeKeyToSecretsEnv("FOO=evil\nexport BAR", "v")).toThrow(/unsafe env var name/);
+    expect(removeKeyFromSecretsEnv("FOO=evil\nexport BAR")).toBe(false);
   });
 });

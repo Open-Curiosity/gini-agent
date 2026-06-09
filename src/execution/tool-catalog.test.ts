@@ -129,6 +129,7 @@ const ALWAYS_ON = new Set([
   "request_remove_messaging_bridge",
   "cancel_task",
   "install_skill",
+  "list_skills",
   "enable_skill",
   "disable_skill",
   // Identity-file edit tools live under the "identity" toolset which is
@@ -149,7 +150,6 @@ const SELF_TOOLS = [
   "get_self",
   "list_providers",
   "list_agents",
-  "list_skills",
   "list_mcp_servers",
   "list_connectors",
   "set_provider",
@@ -240,14 +240,14 @@ describe("buildToolCatalog", () => {
   });
 
   test("core meta-tools remain visible regardless of toolset state", () => {
-    // cancel_task, install_skill, enable_skill, disable_skill have no
+    // cancel_task, list_skills, install_skill, enable_skill, disable_skill have no
     // separate toolset to gate them — they ride alongside spawn_subagent
     // and read_skill and stay always-on.
     const stateEmpty = stateWithToolsets([]);
     const stateAllDisabled = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z").map((t) => ({ ...t, status: "disabled" as const })));
     for (const state of [stateEmpty, stateAllDisabled]) {
       const names = new Set(buildToolCatalog(state).map((t) => t.function.name));
-      for (const tool of ["cancel_task", "install_skill", "enable_skill", "disable_skill"]) {
+      for (const tool of ["cancel_task", "list_skills", "install_skill", "enable_skill", "disable_skill"]) {
         expect(names.has(tool)).toBe(true);
       }
     }
@@ -282,19 +282,22 @@ describe("buildToolCatalog", () => {
     expect(tool?.function.parameters.required).toEqual(["jobId"]);
   });
 
-  test("set_provider's model-facing schema offers bedrock + awsRegion and never a model-set baseUrl", () => {
+  test("set_provider's model-facing schema offers bedrock + awsRegion + azure routing; baseUrl is documented as ignored for anthropic/bedrock", () => {
     // This is the schema the MODEL actually sees (the SELF_OPERATIONS schema is
-    // documentation-only). It must offer bedrock + awsRegion and must NOT expose
-    // a model-settable baseUrl — an env-keyed provider's key is sent to whatever
-    // baseUrl is configured, so a model-set endpoint would be a key-exfil vector.
+    // documentation-only). It offers bedrock + awsRegion and azure transport
+    // fields. baseUrl exists because azure requires its per-resource endpoint,
+    // but is documented as ignored for anthropic/bedrock — an env-keyed
+    // provider's key is sent to whatever baseUrl is configured, so a model
+    // repointing the first-party Anthropic endpoint would be a key-exfil vector.
     const state = stateWithToolsets([]);
     const catalog = buildToolCatalog(state);
     const tool = catalog.find((t) => t.function.name === "set_provider");
     expect(tool).toBeDefined();
     const props = tool!.function.parameters.properties as Record<string, { description?: string }>;
-    expect(Object.keys(props).sort()).toEqual(["apiKey", "awsRegion", "model", "provider"]);
-    expect(props.baseUrl).toBeUndefined();
+    expect(Object.keys(props).sort()).toEqual(["apiKey", "apiVersion", "authScheme", "awsRegion", "baseUrl", "deployment", "model", "provider"]);
     expect(props.provider?.description).toContain("bedrock");
+    expect(props.awsRegion?.description).toContain("bedrock");
+    expect(props.baseUrl?.description).toContain("Ignored for codex/echo/anthropic/bedrock");
   });
 
   test("skill_run is always-on with the expected required args", () => {

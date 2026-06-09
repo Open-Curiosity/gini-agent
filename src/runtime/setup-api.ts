@@ -7,21 +7,23 @@
 //
 // Behavior:
 //   - GET /api/setup/status reflects the live provider config plus the
-//     available picker options (OpenAI, Codex). `current` is the active
-//     provider name when configured; null otherwise. `providerConfigured`
-//     is true when the active provider has valid creds — same definition
-//     `providerHealth` uses.
-//   - POST /api/setup/provider accepts {provider: "openai", apiKey} or
-//     {provider: "codex"}. OpenAI flow writes to ~/.gini/secrets.env using
-//     the existing helper, then updates process.env so the running
-//     gateway picks up the new key on the very next provider call (no
-//     restart needed — readOpenAIBearer in src/provider.ts reads from
-//     env on each call). The runtime config is rewritten to `openai` so
-//     status calls reflect the new active provider. The field is named
+//     available picker options (SUPPORTED_PROVIDERS: openai, codex, openrouter,
+//     deepseek, local, azure). `current` is the active provider name when
+//     configured; null otherwise. `providerConfigured` is true when the active
+//     provider has valid creds — same definition `providerHealth` uses.
+//   - POST /api/setup/provider accepts {provider, apiKey?, model?, baseUrl?}
+//     for the env-keyed providers (openai/openrouter/deepseek/local/azure) —
+//     plus apiVersion/deployment/authScheme for azure's deployment-scoped
+//     routing — or {provider: "codex"}. An env-keyed flow writes the key to
+//     ~/.gini/secrets.env (under the provider's apiKeyEnv) and updates
+//     process.env so the running gateway picks it up on the very next provider
+//     call (no restart needed — readOpenAIBearer in src/provider.ts reads from
+//     env on each call). The runtime config is rewritten to the chosen provider
+//     so status calls reflect the new active provider. The field is named
 //     `provider` (not `kind`) to match the CLI surface — `gini provider
 //     set <name>` already uses this terminology. Note: this is the model
-//     provider (echo/openai/anthropic/codex), distinct from the connector
-//     provider concept introduced by ADR connector-provider-spec-compliance.md.
+//     provider, distinct from the connector provider concept introduced by ADR
+//     connector-provider-spec-compliance.md.
 //
 // What this DOES do for plist refresh: when an OpenAI key is written
 // and a gateway plist exists on disk, this module calls
@@ -43,29 +45,30 @@
 // child's responsibility.
 
 import { writeRuntimeConfig } from "../paths";
-import { hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, providerCatalog, providerHealth } from "../provider";
-import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
+import { azureNeedsBaseUrl, azureNeedsHttps, hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { isValidEnvVarName, removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
-const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local", "anthropic", "bedrock"] as const;
+const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local", "anthropic", "bedrock", "azure"] as const;
 type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
 
 // Env-keyed providers that authenticate via an env var written to
 // ~/.gini/secrets.env. `local` allows an empty key because many local
 // gateways (Ollama, LM Studio) accept no-auth requests. Codex is excluded
-// because it uses its own OAuth/auth.json flow. (anthropic is env-keyed but
-// speaks the native Messages API, not an OpenAI-compatible surface.)
+// because it uses its own OAuth/auth.json flow. `anthropic` is env-keyed but
+// speaks the native Messages API, not an OpenAI-compatible surface. `azure` is
+// the Azure OpenAI resource key (api-key header by default); it additionally
+// requires a per-resource baseUrl, enforced by the azureNeeds* guards below.
+// (bedrock is NOT here — it signs with AWS credentials, no gini-held key.)
 const ENV_KEY_PROVIDERS: Record<string, { envVar: string; allowEmptyKey: boolean; defaultModel: string }> = {
   openai: { envVar: "OPENAI_API_KEY", allowEmptyKey: false, defaultModel: "gpt-5.4-mini" },
   openrouter: { envVar: "OPENROUTER_API_KEY", allowEmptyKey: false, defaultModel: "openrouter/auto" },
   deepseek: { envVar: "DEEPSEEK_API_KEY", allowEmptyKey: false, defaultModel: "deepseek-v4-flash" },
   local: { envVar: "GINI_LOCAL_API_KEY", allowEmptyKey: true, defaultModel: "local/default" },
-  // The key slot holds either a first-party Anthropic key (default baseUrl) or
-  // a Bedrock Mantle bearer token (when baseUrl points at bedrock-mantle).
-  // setSetupProvider already threads payload.baseUrl into normalizeProvider, so
-  // the browser can target either endpoint with the same row.
-  anthropic: { envVar: "ANTHROPIC_API_KEY", allowEmptyKey: false, defaultModel: "claude-opus-4-8" }
+  // First-party Anthropic Messages API key.
+  anthropic: { envVar: "ANTHROPIC_API_KEY", allowEmptyKey: false, defaultModel: "claude-opus-4-8" },
+  azure: { envVar: "AZURE_OPENAI_API_KEY", allowEmptyKey: false, defaultModel: "gpt-5.5" }
 };
 
 export interface SetupStatus {
@@ -86,7 +89,7 @@ export function getSetupStatus(config: RuntimeConfig): SetupStatus {
   // for browser onboarding. Anyone on echo needs to pick a real
   // provider in /setup. Other configured providers (openai with key,
   // codex with auth.json) pass through.
-  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local" || current === "deepseek" || current === "anthropic" || current === "bedrock";
+  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local" || current === "deepseek" || current === "anthropic" || current === "bedrock" || current === "azure";
   const providerConfigured = isRealProvider && Boolean(health.configured);
   return {
     ok: true,
@@ -136,10 +139,28 @@ export async function setSetupProvider(
     const existing = config.provider?.name === providerName ? config.provider : undefined;
     const targetEnvVar = existing?.apiKeyEnv ?? envKeySpec.envVar;
     const apiKey = typeof payload.apiKey === "string" ? payload.apiKey.trim() : "";
+    // On a same-provider edit, preserve transport config the caller didn't
+    // resend. A partial caller — the Settings model picker or the set_provider
+    // tool — posts only { provider, model? }, so without this fallback a
+    // model-only save would wipe a configured baseUrl, apiKeyEnv, and the Azure
+    // routing fields (apiVersion / deployment / authScheme). A provider SWITCH
+    // (different name) starts clean — `existing` is undefined — matching the
+    // cross-provider non-inheritance rule resolveEffectiveContext enforces.
+    // A persisted apiKeyEnv flows into the secrets.env writer; reject a
+    // malformed name (it would otherwise be caught by the writer's guard and
+    // surface as an unhandled 500) rather than try to write it.
+    if (!isValidEnvVarName(targetEnvVar)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: `The configured apiKeyEnv (${targetEnvVar}) is not a valid environment variable name.`
+      };
+    }
     // Accept a no-key payload when the env var is already set — the Edit
-    // Provider dialog uses this to update just the model/baseUrl without making
-    // the user re-type their key. Initial Add Provider still requires a key
-    // because the env var is empty there.
+    // Provider dialog uses this to update the model or transport config (base
+    // URL, Azure routing) without re-typing the key. Initial Add still requires
+    // a key because the env var is empty there.
     const envAlreadySet = Boolean(process.env[targetEnvVar]);
     if (!apiKey && !envKeySpec.allowEmptyKey && !envAlreadySet) {
       return {
@@ -149,32 +170,71 @@ export async function setSetupProvider(
         error: `apiKey is required for the ${providerName} provider.`
       };
     }
+    // Field resolution: a key PRESENT in the payload (even blank) is applied,
+    // with blank clearing the field; a key ABSENT preserves the existing value.
+    // The full web Edit form posts every transport field (blank = clear), while
+    // a partial { provider, model } save preserves transport config it didn't
+    // resend. normalizeProvider carries apiVersion/deployment/authScheme only
+    // for the azure provider, so they are inert for everyone else.
+    const has = (key: string): boolean => Object.prototype.hasOwnProperty.call(payload, key);
+    const trimmedString = (value: unknown): string | undefined =>
+      typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+    const model = typeof payload.model === "string" && payload.model.length > 0
+      ? payload.model
+      : (existing?.model || envKeySpec.defaultModel);
+    const baseUrl = has("baseUrl") ? trimmedString(payload.baseUrl) : existing?.baseUrl;
+    const apiVersion = has("apiVersion") ? trimmedString(payload.apiVersion) : existing?.apiVersion;
+    const deployment = has("deployment") ? trimmedString(payload.deployment) : existing?.deployment;
+    const authScheme = has("authScheme")
+      ? (payload.authScheme === "api-key" || payload.authScheme === "bearer" ? payload.authScheme : undefined)
+      : existing?.authScheme;
+    // Preserve a custom apiKeyEnv (set via `gini provider set --api-key-env`)
+    // and a CLI-set extraBody across a same-provider edit; no web surface sends
+    // them, so a model-only save must not silently drop them.
+    const apiKeyEnv = existing?.apiKeyEnv;
+    const extraBody = existing?.extraBody;
+
+    // Azure needs a real https resource endpoint. Reject BEFORE persisting the
+    // key so we never half-apply an impossible config whose deployment URL
+    // would fail. Covers the set_provider tool too, which funnels through here.
+    // Both guards no-op for non-azure providers.
+    if (azureNeedsBaseUrl(providerName, baseUrl)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: "Azure OpenAI requires a baseUrl of https://<resource>.openai.azure.com."
+      };
+    }
+    if (azureNeedsHttps(providerName, baseUrl)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: "Azure OpenAI requires an https:// endpoint (the credential is sent on every request)."
+      };
+    }
+
     if (apiKey) {
-      // Persist to secrets.env so the wrapper-sourced env carries it on future
-      // shell launches, and update process.env so the running gateway uses it
-      // on the very next call (readers read process.env each call — no restart).
+      // Persist to secrets.env so the wrapper-sourced env carries it on
+      // future shell launches. The shared writer lives in src/state/ —
+      // both CLI and runtime are allowed to depend on src/state/.
       writeKeyToSecretsEnv(targetEnvVar, apiKey);
+      // Make the running gateway use the new key on its very next
+      // provider call. readOpenAIBearer reads process.env on each call,
+      // so this assignment is enough — no restart needed.
       process.env[targetEnvVar] = apiKey;
     }
 
-    // Default omitted model/baseUrl from the already-active provider so the
-    // set-active and edit-model flows (which POST {provider, model} with no
-    // baseUrl) don't silently reset a configured endpoint back to the
-    // per-provider default. Add Provider targets a not-yet-active provider, so
-    // `existing` is undefined there and behavior is unchanged. apiKeyEnv is
-    // preserved so it stays in lockstep with the targetEnvVar the key was
-    // written to.
-    const model = typeof payload.model === "string" && payload.model.length > 0
-      ? payload.model
-      : (existing?.model ?? envKeySpec.defaultModel);
-    const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
-      ? payload.baseUrl.trim()
-      : existing?.baseUrl;
     config.provider = normalizeProvider({
       name: providerName as ProviderConfig["name"],
       model,
       ...(baseUrl ? { baseUrl } : {}),
-      ...(existing?.apiKeyEnv ? { apiKeyEnv: existing.apiKeyEnv } : {})
+      ...(apiKeyEnv ? { apiKeyEnv } : {}),
+      ...(extraBody ? { extraBody } : {}),
+      ...(apiVersion ? { apiVersion } : {}),
+      ...(deployment ? { deployment } : {}),
+      ...(authScheme ? { authScheme } : {})
     });
     writeRuntimeConfig(config);
 
@@ -305,19 +365,17 @@ export function removeSetupProvider(
     };
   }
 
-  // Wipe the bearer from both stores so the running process and future
-  // shell launches stop seeing it. When the provider being removed is the
-  // active one and was configured with a custom apiKeyEnv (e.g. a Bedrock
-  // bearer under BEDROCK_BEARER_TOKEN), the live token lives under that var,
-  // not the canonical one — scrub it alongside the canonical var so removal
-  // never leaves a usable token behind. removeKeyFromSecretsEnv is a no-op
-  // when the line is already absent, so scrubbing both unconditionally (and
-  // deduped) is safe.
-  const activeCustomEnv =
-    config.provider?.name === providerName ? config.provider?.apiKeyEnv : undefined;
-  for (const envVar of new Set(
-    activeCustomEnv ? [envKeySpec.envVar, activeCustomEnv] : [envKeySpec.envVar]
-  )) {
+  // Wipe the bearer from both stores so the running process and future shell
+  // launches stop seeing it. Scrub the env var the active config actually used
+  // (a custom apiKeyEnv like AZURE_OPENAI_API_KEY) as well as the provider
+  // default — the write path stores the key under `apiKeyEnv ?? envKeySpec.envVar`,
+  // so disconnect must clear the same target or the secret survives.
+  // removeKeyFromSecretsEnv / delete are no-ops when the var is already absent.
+  const scrubVars = new Set<string>([envKeySpec.envVar]);
+  if (config.provider?.name === providerName && config.provider.apiKeyEnv && isValidEnvVarName(config.provider.apiKeyEnv)) {
+    scrubVars.add(config.provider.apiKeyEnv);
+  }
+  for (const envVar of scrubVars) {
     removeKeyFromSecretsEnv(envVar);
     delete process.env[envVar];
   }
