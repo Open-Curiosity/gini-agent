@@ -3,10 +3,11 @@
 // Shared model-first picker (ADR model-first-selection.md).
 //
 // The user picks a MODEL; a provider is just a route that serves it. The
-// collapsed trigger shows only the model name — a "· <route>" suffix appears
-// only when the chosen route is a non-default override. The open state is a
-// searchable, name-only list; a model served by more than one configured
-// route shows its default route plus a chevron, and hovering the row (or
+// collapsed trigger leads with the serving route's brand icon and spells
+// the route out ("gpt-5.5 · Codex") — the model name alone can't say which
+// provider a turn rides. The open state is a searchable list of model
+// names, each row naming its serving route; a model served by more than
+// one configured route shows a chevron, and hovering the row (or
 // ArrowRight / tapping the chevron — hover is unreachable on keyboard and
 // touch) opens a side flyout of its routes with the default tagged.
 //
@@ -70,10 +71,10 @@ export function findSelectedRoute(
   return null;
 }
 
-// Collapsed-trigger label: the model name, plus the route label only when
-// the selection is a non-default route. An off-catalog pair always shows
-// its provider — without a catalog match we can't know what the default
-// route would be, and hiding the provider would misread as one.
+// Collapsed-trigger label: the model name plus its serving route — the
+// name alone can't say whether gpt-5.5 rides Codex or OpenAI, so the route
+// is always spelled out. An off-catalog pair falls back to the provider's
+// display label.
 export function modelTriggerLabel(
   entries: ModelCatalogEntry[],
   value: ModelSelection | null | undefined,
@@ -82,10 +83,7 @@ export function modelTriggerLabel(
   if (!value || !value.model) return { model: "Select model" };
   const match = findSelectedRoute(entries, value);
   if (match) {
-    return {
-      model: match.entry.id,
-      route: match.route.default ? undefined : match.route.label
-    };
+    return { model: match.entry.id, route: match.route.label };
   }
   return { model: value.model, route: fallbackProviderLabel(value.provider) };
 }

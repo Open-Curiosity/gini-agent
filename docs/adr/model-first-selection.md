@@ -25,10 +25,11 @@ Three pieces implement this:
    `codex`, then the metered clouds (`azure`, `bedrock`), then the
    deliberate opt-ins (`openrouter`, `local`).
 2. **One shared picker.** `web/src/components/ModelPicker.tsx` renders a
-   collapsed trigger leading with the serving route's brand icon (the model
-   name alone can't say whether gpt-5.5 rides Codex or OpenAI) and the model
-   name — a "· route" text suffix appears only when the selection rides a
-   non-default route. The open state is a searchable list of model names,
+   collapsed trigger leading with the serving route's brand icon and the
+   model name, with the route spelled out ("gpt-5.5 · Codex") — the model
+   name alone can't say whether gpt-5.5 rides Codex or OpenAI, so the route
+   is always visible without opening the picker. The open state is a
+   searchable list of model names,
    each row naming its serving route; a multi-route model adds a chevron,
    and hovering the row (or ArrowRight, or tapping the chevron — hover is
    unreachable on keyboard and touch) opens a side flyout of its routes,
@@ -138,9 +139,9 @@ catalog.
   `config.provider` (persisted) AND `agent_default.providerName/model`; a
   rejected provider save (missing key, unsupported name) leaves the agent
   untouched.
-- Settings shows the Default model trigger with the model name only when on
-  the default route; picking a model via the flyout's non-default route
-  appends "· route" to the trigger.
+- The Default model trigger always names the serving route ("gpt-5.5 ·
+  Codex") with its brand icon; picking a model via a flyout route shows
+  that exact route's label.
 - In the chat Settings tab, picking a model + non-default route persists the
   exact pair on the agent and the next chat turn dispatches through it.
 - The picker is operable by keyboard (arrows + ArrowRight into the flyout +

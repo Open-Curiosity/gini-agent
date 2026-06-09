@@ -82,14 +82,11 @@ describe("findSelectedRoute", () => {
 });
 
 describe("modelTriggerLabel", () => {
-  test("shows only the model name on the default route", () => {
+  test("always names the serving route — default routes included", () => {
     expect(modelTriggerLabel(ENTRIES, { provider: "anthropic", model: "claude-sonnet-4-6" }, rawLabel)).toEqual({
       model: "claude-sonnet-4-6",
-      route: undefined
+      route: "Anthropic"
     });
-  });
-
-  test("appends the route label on a non-default route", () => {
     expect(
       modelTriggerLabel(ENTRIES, { provider: "bedrock", model: "us.anthropic.claude-sonnet-4-6" }, rawLabel)
     ).toEqual({ model: "claude-sonnet-4-6", route: "Amazon Bedrock · us" });
@@ -184,11 +181,12 @@ describe("ModelPicker", () => {
     expect(within(single).queryByRole("button")).toBeNull();
   });
 
-  test("trigger shows only the model name when the selection rides the default route", async () => {
+  test("trigger names the serving route even on the default route", async () => {
     render(<ModelPicker value={{ provider: "codex", model: "gpt-5.5" }} onSelect={mock(() => {})} />);
     const trigger = await screen.findByRole("button", { name: "Select model" });
+    await screen.findByText(/· Codex/);
     expect(trigger.textContent).toContain("gpt-5.5");
-    expect(trigger.textContent).not.toContain("Codex");
+    expect(trigger.textContent).toContain("· Codex");
   });
 
   test("trigger appends the route label for a non-default route", async () => {
