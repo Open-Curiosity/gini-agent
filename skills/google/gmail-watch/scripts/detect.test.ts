@@ -671,6 +671,69 @@ describe("runWatches — multi-watch (one shared job)", () => {
     expect(r.state.byWatcher["w-b"]!.cursor).toBe(String(13_000_000 + 59 * 1000));
   });
 
+  test("a sibling match in the same tick as a backlog carries the notice as a trusted item", async () => {
+    // One watch produces a fresh draftable match; another hits a truncated
+    // (page-cap) window in the SAME tick. The match makes this a context result,
+    // so the backlog notice must ride along (as a TRUSTED item) instead of being
+    // dropped while the truncated watch's cursor advances.
+    const backlog: Meta[] = Array.from({ length: 60 }, (_, i) => ({
+      id: `bk${i}`,
+      internalDate: String(20_000_000 + i * 1000),
+      from: "Bulk <bulk@x.com>",
+      subject: `bk${i}`
+    }));
+    const byId: Record<string, Meta> = {
+      m1: { id: "m1", internalDate: "5000", from: "Alice <alice@x.com>", subject: "fresh" }
+    };
+    for (const m of backlog) byId[m.id] = m;
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = listQuery(joined) ?? "";
+        if (q.startsWith("from:alice")) return listResponse(["m1"]);
+        // The bulk watch's window is truncated (page cap hit).
+        const afterSec = Number(joined.match(/after:(\d+)/)?.[1] ?? "0");
+        const listed = backlog
+          .filter((m) => Math.floor(Number(m.internalDate) / 1000) > afterSec)
+          .sort((a, b) => Number(b.internalDate) - Number(a.internalDate))
+          .slice(0, 10);
+        const pages: string[][] = [];
+        const per = Math.ceil(listed.length / 10);
+        for (let i = 0; i < 10; i++) pages.push(listed.slice(i * per, (i + 1) * per).map((m) => m.id));
+        return pagedListResponse(pages, true);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        return hit && byId[hit] ? metadataResponse(byId[hit]) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-alice", query: "from:alice@x.com is:unread" },
+          { watcherId: "w-bulk", query: "from:bulk@x.com is:unread" }
+        ],
+        state: { byWatcher: { "w-alice": { cursor: "1000", seen: [] }, "w-bulk": { cursor: "1000", seen: [] } } }
+      },
+      spawn
+    );
+    // The match makes it a context turn carrying BOTH the draft AND the notice.
+    expect(r.kind).toBe("context");
+    // Exactly one draftable (untrusted) match — Alice's fresh email.
+    expect(matchCount(r.items)).toBe(1);
+    expect(r.items!.some((i) => i.untrusted && i.text.startsWith("New email from Alice <alice@x.com> — "))).toBe(true);
+    // The backlog notice rides along as a TRUSTED item (not dropped).
+    const notice = r.items!.filter((i) => !i.untrusted);
+    expect(notice).toHaveLength(1);
+    expect(notice[0]!.text).toContain("backlog");
+    expect(notice[0]!.text).toContain("from:bulk@x.com is:unread");
+    // The truncated watch's cursor still jumped to its newest.
+    expect(r.state.byWatcher["w-bulk"]!.cursor).toBe(String(20_000_000 + 59 * 1000));
+  });
+
   test("no watches yields a silent shortCircuit with empty byWatcher", async () => {
     const spawn = multiSpawn({}, {});
     const r = await runWatches({ watches: [], state: null }, spawn);

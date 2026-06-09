@@ -614,8 +614,11 @@ export async function run(
 //     unchanged) and the other watches still run and can still draft.
 //   - Aggregation: all surviving matches across the watches become the items of a
 //     single `context` result (the ONE drafting turn drafts a reply per match,
-//     each labeled by sender), and the per-watch backlog notices are joined into
-//     one non-silent shortCircuit summary when there are no draftable matches.
+//     each labeled by sender). Per-watch backlog notices ride along: when at least
+//     one watch matched they're appended as TRUSTED context items on the same
+//     context result (so a backlog notice firing in the same tick as a sibling
+//     match isn't dropped while its cursor advances); when nothing matched they're
+//     joined into one non-silent shortCircuit summary instead.
 //
 // Commit timing is preserved by the consumer: a context result's state is
 // persisted only after the drafting turn dispatches (at-least-once across the
@@ -680,7 +683,15 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
   // Any matches across the watches => ONE drafting turn (context). Otherwise a
   // shortCircuit: a joined backlog notice if any fired, else silent.
   if (items.length > 0) {
-    return { kind: "context", items, state: { byWatcher: byWatcherOut } };
+    // A sibling watch can hit a truncated-window backlog in the SAME tick that
+    // another watch produces a draftable match. The matching watch makes this a
+    // context result (which commits every watch's advanced cursor on dispatch),
+    // so the backlog notice would otherwise be dropped while its cursor still
+    // advances — losing it for that episode. Carry each notice as a TRUSTED
+    // context item (untrusted:false) so the single drafting turn surfaces the
+    // backlog notice(s) alongside the drafts.
+    const noticeItems: ResultItem[] = notices.map((text) => ({ text, untrusted: false }));
+    return { kind: "context", items: [...items, ...noticeItems], state: { byWatcher: byWatcherOut } };
   }
   const summary = notices.length > 0 ? notices.join("\n\n") : "[SILENT]";
   return { kind: "shortCircuit", summary, state: { byWatcher: byWatcherOut } };
