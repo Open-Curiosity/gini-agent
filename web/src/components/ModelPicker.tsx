@@ -17,13 +17,14 @@
 
 import { useId, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { CheckIcon, ChevronDownIcon, ChevronRightIcon, DiamondIcon, SearchIcon } from "lucide-react";
+import { CheckIcon, ChevronDownIcon, ChevronRightIcon, SearchIcon } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
+import { providerIcon } from "@/components/provider-logos";
 import {
   displayProviderName,
   type ModelCatalogEntry,
@@ -89,9 +90,9 @@ export function modelTriggerLabel(
   return { model: value.model, route: fallbackProviderLabel(value.provider) };
 }
 
-// Keep in sync with the flyout wrapper's w-64 — the constant feeds the
+// Keep in sync with the flyout wrapper's w-72 — the constant feeds the
 // viewport-collision side flip in openFlyout.
-const FLYOUT_WIDTH_PX = 256;
+const FLYOUT_WIDTH_PX = 288;
 
 // Whether a mouseleave on the popover content is a genuine departure that
 // should close the route flyout. Travel to a descendant (the flyout panel
@@ -156,6 +157,7 @@ export function ModelPicker({
     return displayProviderName(row ?? { displayName: provider, name: provider });
   };
   const label = modelTriggerLabel(entries, value, fallbackProviderLabel);
+  const TriggerIcon = providerIcon(value?.model ? value.provider : undefined);
 
   const handleOpenChange = (next: boolean) => {
     setOpen(next);
@@ -240,7 +242,10 @@ export function ModelPicker({
           aria-label={ariaLabel ?? "Select model"}
           className="max-w-full gap-2"
         >
-          <DiamondIcon className="size-4 shrink-0 text-muted-foreground" />
+          {/* The serving route's brand mark — the model name alone can't say
+              whether gpt-5.5 rides Codex or OpenAI. Falls back to the generic
+              model mark when nothing is selected. */}
+          <TriggerIcon className="size-4 shrink-0 text-muted-foreground" />
           <span title={label.model} className="truncate font-mono text-[13px]">{label.model}</span>
           {/* Until the route list resolves, every selection looks off-catalog
               and would flash a spurious "· provider" suffix — hold the
@@ -347,24 +352,22 @@ export function ModelPicker({
                   onClick={() => choose(defaultRoute)}
                 >
                   <span title={entry.id} className="min-w-0 flex-1 truncate font-mono text-[13px]">{entry.id}</span>
-                  {isMulti ? (
-                    <>
-                      {/* Separator for the accessible name — without it the
-                          option reads "claude-sonnet-4-6Amazon Bedrock". */}
-                      <span className="sr-only"> via </span>
-                      {/* The model name wins the space fight: the route label
-                          may shrink/truncate, the name span keeps flex-1. */}
-                      <span
-                        title={defaultRoute.label}
-                        className={cn(
-                          "min-w-0 truncate text-xs",
-                          isActive ? "text-accent-foreground/70" : "text-muted-foreground"
-                        )}
-                      >
-                        {defaultRoute.label}
-                      </span>
-                    </>
-                  ) : null}
+                  {/* Every row names its serving route — the model id alone
+                      can't say whether gpt-5.5 rides Codex or OpenAI. */}
+                  {/* Separator for the accessible name — without it the
+                      option reads "claude-sonnet-4-6Amazon Bedrock". */}
+                  <span className="sr-only"> via </span>
+                  {/* The model name wins the space fight: the route label
+                      may shrink/truncate, the name span keeps flex-1. */}
+                  <span
+                    title={defaultRoute.label}
+                    className={cn(
+                      "min-w-0 truncate text-xs",
+                      isActive ? "text-accent-foreground/70" : "text-muted-foreground"
+                    )}
+                  >
+                    {defaultRoute.label}
+                  </span>
                   {isSelected ? <CheckIcon className="size-4 shrink-0 text-[#4277FB]" /> : null}
                   {isMulti ? (
                     // Touch fallback: hover never fires there, so the chevron
@@ -396,7 +399,7 @@ export function ModelPicker({
           // descendant of the content — a margin gap would fire the content's
           // mouseleave halfway across and close the flyout mid-reach.
           <div
-            className={cn("absolute z-50 w-64", flyout.side === "right" ? "left-full pl-1" : "right-full pr-1")}
+            className={cn("absolute z-50 w-72", flyout.side === "right" ? "left-full pl-1" : "right-full pr-1")}
             style={{ top: flyout.top }}
           >
             <div
@@ -411,6 +414,7 @@ export function ModelPicker({
             {flyoutEntry.routes.map((route, index) => {
               const isCurrent =
                 route.provider === value?.provider && route.providerModelId === value?.model;
+              const RouteIcon = providerIcon(String(route.provider));
               return (
                 <div
                   key={`${route.provider}-${route.providerModelId}`}
@@ -424,6 +428,7 @@ export function ModelPicker({
                   onMouseEnter={() => setFlyoutHighlight(index)}
                   onClick={() => choose(route)}
                 >
+                  <RouteIcon className="size-4 shrink-0 text-muted-foreground" />
                   <span title={route.label} className="min-w-0 flex-1 truncate">{route.label}</span>
                   {route.default ? <Badge variant="secondary">default</Badge> : null}
                   {isCurrent ? <CheckIcon className="size-4 shrink-0 text-[#4277FB]" /> : null}

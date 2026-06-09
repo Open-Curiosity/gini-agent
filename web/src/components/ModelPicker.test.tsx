@@ -174,11 +174,14 @@ describe("ModelPicker", () => {
     const user = userEvent.setup();
     await user.click(trigger);
     expect(await screen.findByRole("option", { name: /gpt-5\.5/ })).not.toBeNull();
-    // Multi-route row carries its default route label; single-route rows don't.
+    // Every row names its serving route; only multi-route rows carry the
+    // route-chooser chevron button.
     const multi = screen.getByRole("option", { name: /claude-sonnet-4-6/ });
     expect(multi.textContent).toContain("Anthropic");
+    expect(within(multi).getByRole("button")).not.toBeNull();
     const single = screen.getByRole("option", { name: /gpt-5\.5/ });
-    expect(single.textContent).not.toContain("Codex");
+    expect(single.textContent).toContain("Codex");
+    expect(within(single).queryByRole("button")).toBeNull();
   });
 
   test("trigger shows only the model name when the selection rides the default route", async () => {

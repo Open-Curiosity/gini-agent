@@ -4,13 +4,7 @@ import Link from "next/link";
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import {
-  PencilIcon,
-  PlusIcon,
-  Terminal as TerminalIcon,
-  Trash2Icon,
-  ZapIcon
-} from "lucide-react";
+import { PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
 import type { ProviderConfig } from "@runtime/types";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,7 +13,7 @@ import {
   DialogDescription,
   DialogTitle
 } from "@/components/ui/dialog";
-import { AnthropicLogo, AzureLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
+import { providerIcon } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { displayProviderName, type ProviderCatalogItem } from "@/lib/providers";
 import { EditProviderDialog } from "./EditProviderDialog";
@@ -40,19 +34,17 @@ const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek", "anthro
 // dev-only and never configured, so it can't appear.
 const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "bedrock", "deepseek", "openrouter", "azure", "local"] as const;
 
-// Per-provider visual identity. Brand logos for OpenAI/DeepSeek/Ollama
-// come from the authoritative Pencil design file; codex (Terminal) and
-// openrouter (Zap) use Lucide because they have no widely-recognized
-// brand mark to swap in.
-const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: string }>; authLabel: string }> = {
-  codex: { icon: TerminalIcon, authLabel: "OAuth" },
-  openai: { icon: OpenAILogo, authLabel: "API key" },
-  anthropic: { icon: AnthropicLogo, authLabel: "API key" },
-  bedrock: { icon: BedrockLogo, authLabel: "AWS" },
-  deepseek: { icon: DeepSeekLogo, authLabel: "API key" },
-  openrouter: { icon: ZapIcon, authLabel: "API key" },
-  azure: { icon: AzureLogo, authLabel: "API key" },
-  local: { icon: OllamaLogo, authLabel: "Local" }
+// Friendly labels for how each provider authenticates; the brand icons live
+// in the shared PROVIDER_ICONS map (provider-logos.tsx).
+const PROVIDER_AUTH_LABEL: Record<string, string> = {
+  codex: "OAuth",
+  openai: "API key",
+  anthropic: "API key",
+  bedrock: "AWS",
+  deepseek: "API key",
+  openrouter: "API key",
+  azure: "API key",
+  local: "Local"
 };
 
 interface SetProviderResult {
@@ -155,9 +147,8 @@ export function ProviderCard({
       <ul className="flex flex-col gap-3">
         {rows.map((row) => {
           const isInstanceProvider = activeProviderName === row.name;
-          const visual = PROVIDER_VISUAL[row.name] ?? { icon: TerminalIcon, authLabel: row.auth };
-          const Icon = visual.icon;
-          const authLabel = visual.authLabel;
+          const Icon = providerIcon(row.name);
+          const authLabel = PROVIDER_AUTH_LABEL[row.name] ?? row.auth;
           const model = isInstanceProvider
             ? (activeProviderModel ?? row.models[0] ?? "")
             : (row.models[0] ?? "");
@@ -267,8 +258,8 @@ export function ProviderCard({
       {editingRow ? (
         <EditProviderDialog
           row={editingRow}
-          authLabel={PROVIDER_VISUAL[editingRow.name]?.authLabel ?? editingRow.auth}
-          icon={PROVIDER_VISUAL[editingRow.name]?.icon ?? TerminalIcon}
+          authLabel={PROVIDER_AUTH_LABEL[editingRow.name] ?? editingRow.auth}
+          icon={providerIcon(editingRow.name)}
           currentModel={editingRow.name === activeProviderName ? activeProviderModel : undefined}
           // Instance bedrock region — prefilled only when editing that row.
           currentAwsRegion={editingRow.name === activeProviderName ? activeProviderAwsRegion : undefined}

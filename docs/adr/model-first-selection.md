@@ -25,15 +25,19 @@ Three pieces implement this:
    `codex`, then the metered clouds (`azure`, `bedrock`), then the
    deliberate opt-ins (`openrouter`, `local`).
 2. **One shared picker.** `web/src/components/ModelPicker.tsx` renders a
-   collapsed trigger showing only the model name — a "· route" suffix
-   appears only when the selection rides a non-default route — and an open
-   state with a searchable, name-only list. A multi-route model shows its
-   default route plus a chevron; hovering the row (or ArrowRight, or tapping
-   the chevron — hover is unreachable on keyboard and touch) opens a side
-   flyout of its routes with the default tagged. Picking a model name takes
-   its default route; picking a route in the flyout takes that exact pair.
-   The same component serves the Settings page and the per-agent chat
-   Settings tab.
+   collapsed trigger leading with the serving route's brand icon (the model
+   name alone can't say whether gpt-5.5 rides Codex or OpenAI) and the model
+   name — a "· route" text suffix appears only when the selection rides a
+   non-default route. The open state is a searchable list of model names,
+   each row naming its serving route; a multi-route model adds a chevron,
+   and hovering the row (or ArrowRight, or tapping the chevron — hover is
+   unreachable on keyboard and touch) opens a side flyout of its routes,
+   brand-iconed, with the default tagged. Picking a model name takes its
+   default route; picking a route in the flyout takes that exact pair. The
+   brand icons come from the shared `PROVIDER_ICONS` map
+   (`web/src/components/provider-logos.tsx`), which the Settings provider
+   rows reuse. The same component serves the Settings page and the
+   per-agent chat Settings tab.
 3. **A default-model write path that updates both layers.**
    `setDefaultModel` (`src/runtime/default-model.ts`), exposed at
    `POST /api/settings/default-model` with body `{ provider, model }`,
