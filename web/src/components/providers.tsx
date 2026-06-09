@@ -57,7 +57,7 @@ export function Providers({ children }: { children: ReactNode }) {
     }
   }));
   return (
-    <ThemeProvider attribute="class" defaultTheme="dark" enableSystem={false} disableTransitionOnChange>
+    <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} disableTransitionOnChange>
       <QueryClientProvider client={client}>
         {!onPairPage && <RuntimeStreamBridge />}
         {/* The update gate blurs the app while a self-update applies. It needs
