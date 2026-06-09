@@ -22,7 +22,9 @@ import { api, type UploadRef } from "@/lib/api";
 import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
 import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
 import {
+  latestInFlightTaskId,
   splitBlocks,
+  TERMINAL_PHASE_LABELS,
   useAgentChat,
   useAllJobs,
   useCancelTask,
@@ -34,10 +36,6 @@ import {
 } from "@/lib/queries";
 import type { ChatBlock } from "@runtime/types";
 import type { ChatSession, ThreadSummary } from "@/lib/view-types";
-
-// Phase labels the runtime emits as the final block of a task; a non-terminal
-// latest phase means a task is still in flight.
-const TERMINAL_PHASE_LABELS = new Set(["Completed", "Cancelled", "Failed"]);
 
 export default function ChatPage() {
   const params = useSearchParams();
@@ -142,7 +140,7 @@ function ChatSurface({
     [allJobs.data, isChannel, sessionId]
   );
 
-  const { blocks, isLoading: blocksLoading } = useChatBlocks(sessionId);
+  const { blocks, isLoading: blocksLoading, refetch } = useChatBlocks(sessionId);
   const threadsQuery = useThreads(sessionId);
   const threads = useMemo(() => threadsQuery.data ?? [], [threadsQuery.data]);
   const { markThreadRead, isThreadUnread } = useThreadReadState(threads);
@@ -214,17 +212,10 @@ function ChatSurface({
   };
 
   // In-flight detection over the main-chat block stream.
-  const inflightTaskId: string | null = useMemo(() => {
-    for (let i = mainBlocks.length - 1; i >= 0; i--) {
-      const b = mainBlocks[i]!;
-      if (b.kind === "phase") {
-        if (TERMINAL_PHASE_LABELS.has(b.label)) return null;
-        return b.taskId ?? null;
-      }
-      if (b.kind === "tool_call" && b.status === "running") return b.taskId ?? null;
-    }
-    return null;
-  }, [mainBlocks]);
+  const inflightTaskId: string | null = useMemo(
+    () => latestInFlightTaskId(mainBlocks),
+    [mainBlocks]
+  );
 
   // Phase blocks are transient — render only the latest while non-terminal.
   const visibleBlocks = useMemo(
@@ -414,7 +405,14 @@ function ChatSurface({
                   busy={Boolean(inflightTaskId) || send.isPending}
                   onStop={() => {
                     if (inflightTaskId) {
+                      // Reconcile against durable state right away — if a
+                      // terminal frame was missed the block list already
+                      // holds the terminal phase, so the indicator clears
+                      // without waiting on the cancel. Refetch again after
+                      // the cancel writes its own Cancelled phase.
+                      refetch();
                       cancel.mutate(inflightTaskId, {
+                        onSuccess: () => refetch(),
                         onError: (error) => toast.error(error.message)
                       });
                     }
