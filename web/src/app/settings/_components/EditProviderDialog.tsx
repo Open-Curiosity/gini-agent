@@ -207,7 +207,7 @@ export function EditProviderDialog({
 
           {isBedrock ? (
             <div className="space-y-2">
-              <Label htmlFor="edit-aws-region" className="text-[13px] font-semibold text-[#C2C2C8]">AWS region</Label>
+              <Label htmlFor="edit-aws-region" className="text-[13px] font-semibold text-foreground">AWS region</Label>
               <BedrockRegionSelect
                 id="edit-aws-region"
                 value={awsRegion}
@@ -222,8 +222,8 @@ export function EditProviderDialog({
           {isAnthropic ? (
             <div className="space-y-2">
               <div className="flex items-center justify-between">
-                <Label htmlFor="edit-base-url" className="text-[13px] font-semibold text-[#C2C2C8]">Base URL</Label>
-                <span className="text-xs text-[#6A6A70]">optional</span>
+                <Label htmlFor="edit-base-url" className="text-[13px] font-semibold text-foreground">Base URL</Label>
+                <span className="text-xs text-muted-foreground">optional</span>
               </div>
               <Input
                 id="edit-base-url"
@@ -233,7 +233,7 @@ export function EditProviderDialog({
                 value={baseUrl}
                 onChange={(e) => setBaseUrl(e.target.value)}
                 disabled={save.isPending}
-                className="h-11 border-[#2A2A2E] bg-[#0E0E11] font-mono text-[13px]"
+                className="h-11 border-border bg-secondary font-mono text-[13px]"
               />
             </div>
           ) : null}
