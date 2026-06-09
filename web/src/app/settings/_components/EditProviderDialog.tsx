@@ -98,7 +98,10 @@ export function EditProviderDialog({
           // default; for azure it is the required resource endpoint, enforced by
           // canSubmit below).
           ...(!isBedrock ? { baseUrl: baseUrl.trim() } : {}),
-          ...(isBedrock && awsRegion.trim() ? { awsRegion: awsRegion.trim() } : {}),
+          // Bedrock sends awsRegion as full state (present-clears): a blank value
+          // clears it so the host resolves from AWS_REGION / the us-east-1
+          // default, rather than being silently dropped and preserved.
+          ...(isBedrock ? { awsRegion: awsRegion.trim() } : {}),
           // Azure routing — sent as the full transport state (present-clears),
           // so blanking api-version/deployment falls back to the GA default /
           // the model id.

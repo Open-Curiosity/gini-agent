@@ -394,7 +394,12 @@ function resolveOpenAIBearer(config: RuntimeConfig): string | null {
 }
 
 function readCodexBearerOrNull(config: RuntimeConfig): string | null {
-  const envName = config.provider.apiKeyEnv;
+  // Only the codex provider's apiKeyEnv names a CODEX_AUTH_JSON-style path. For
+  // any other active provider, apiKeyEnv holds a SECRET key env (e.g.
+  // ANTHROPIC_API_KEY → "sk-ant-…"), so honoring it here would resolve to a
+  // nonsense path AND short-circuit past CODEX_AUTH_JSON. Mirror codexAuthPath
+  // in src/provider.ts — gate on the codex provider.
+  const envName = config.provider.name === "codex" ? config.provider.apiKeyEnv : undefined;
   const envValue = envName ? process.env[envName] : undefined;
   const raw = envValue || process.env.CODEX_AUTH_JSON || "~/.codex/auth.json";
   const path = resolve(raw.startsWith("~/") ? join(homedir(), raw.slice(2)) : raw);

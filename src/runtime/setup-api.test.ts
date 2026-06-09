@@ -354,6 +354,36 @@ describe("setup-api", () => {
     }
   });
 
+  test("bedrock: a blank awsRegion clears to the default; an omitted one preserves it (present-clears)", async () => {
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    const prevRegion = process.env.AWS_REGION;
+    const prevDef = process.env.AWS_DEFAULT_REGION;
+    process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    delete process.env.AWS_REGION;
+    delete process.env.AWS_DEFAULT_REGION;
+    try {
+      await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-west-2" });
+      expect(config.provider.awsRegion).toBe("us-west-2");
+      // Omitting awsRegion preserves it (a partial model-only save from the
+      // model picker / set_provider tool must not reset the region).
+      await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-lite-v1:0" });
+      expect(config.provider.awsRegion).toBe("us-west-2");
+      // A blank awsRegion CLEARS it — the host resolves back to the us-east-1
+      // default (no AWS_REGION/AWS_DEFAULT_REGION set here).
+      const cleared = await setSetupProvider(config, { provider: "bedrock", awsRegion: "" });
+      expect(cleared.ok).toBe(true);
+      expect(config.provider.awsRegion).toBe("us-east-1");
+      expect(config.provider.baseUrl).toBe("https://bedrock-runtime.us-east-1.amazonaws.com");
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+      if (prevRegion === undefined) delete process.env.AWS_REGION; else process.env.AWS_REGION = prevRegion;
+      if (prevDef === undefined) delete process.env.AWS_DEFAULT_REGION; else process.env.AWS_DEFAULT_REGION = prevDef;
+    }
+  });
+
   test("remove rejects codex, local, and unknown providers", () => {
     expect(removeSetupProvider(config, "codex")).toMatchObject({ ok: false, error: expect.stringContaining("codex CLI") });
     expect(removeSetupProvider(config, "local")).toMatchObject({ ok: false });

@@ -278,8 +278,13 @@ export async function setSetupProvider(
     const model = typeof payload.model === "string" && payload.model.length > 0
       ? payload.model
       : existing?.model;
-    const awsRegion = typeof payload.awsRegion === "string" && payload.awsRegion.trim().length > 0
-      ? payload.awsRegion.trim()
+    // Present-clears, like the env-keyed transport fields: a blank awsRegion in
+    // the payload CLEARS the region (the host then resolves from AWS_REGION /
+    // AWS_DEFAULT_REGION / the us-east-1 default), while an OMITTED awsRegion
+    // preserves the existing one so a partial { provider, model } save from the
+    // model picker or set_provider tool doesn't silently reset it.
+    const awsRegion = Object.prototype.hasOwnProperty.call(payload, "awsRegion")
+      ? (typeof payload.awsRegion === "string" && payload.awsRegion.trim().length > 0 ? payload.awsRegion.trim() : undefined)
       : existing?.awsRegion;
     // The region lands in the Converse request host, so reject a malformed one
     // here (the self-tool can supply it) before it ever persists.
