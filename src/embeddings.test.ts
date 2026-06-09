@@ -4,7 +4,7 @@
 // dynamic import via __setTransformersLoaderForTests so the local-provider
 // code path runs without the network or the native binding.
 
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import {
   __setTransformersLoaderForTests,
@@ -30,10 +30,28 @@ afterAll(() => {
   __setTransformersLoaderForTests(null);
 });
 
+// Snapshot the env vars these tests mutate and restore prior values after each,
+// so a developer's/CI's ambient provider keys aren't clobbered by an
+// unconditional delete (these run in the same process as other suites).
+const SNAPSHOT_ENV = [
+  "GINI_EMBEDDING_PROVIDER",
+  "GINI_LOCAL_EMBEDDING_MODEL",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "OPENROUTER_API_KEY"
+];
+let envSnapshot: Record<string, string | undefined> = {};
+
+beforeEach(() => {
+  envSnapshot = {};
+  for (const key of SNAPSHOT_ENV) envSnapshot[key] = process.env[key];
+});
+
 afterEach(() => {
-  delete process.env.GINI_EMBEDDING_PROVIDER;
-  delete process.env.GINI_LOCAL_EMBEDDING_MODEL;
-  delete process.env.OPENAI_API_KEY;
+  for (const key of SNAPSHOT_ENV) {
+    if (envSnapshot[key] === undefined) delete process.env[key];
+    else process.env[key] = envSnapshot[key];
+  }
   __setTransformersLoaderForTests(null);
 });
 
@@ -124,6 +142,61 @@ describe("getEmbeddingProvider", () => {
     const provider = getEmbeddingProvider(makeConfig());
     expect(provider.name).toBe("openai");
     expect(provider.model).toBe("text-embedding-3-small");
+  });
+});
+
+describe("embedOpenAIBatch endpoint routing", () => {
+  // Capture each fetch so we can assert the embeddings request never borrows a
+  // non-OpenAI chat provider's host or key.
+  function stubFetch(): { calls: Array<{ url: string; auth: string }>; restore: () => void } {
+    const calls: Array<{ url: string; auth: string }> = [];
+    const prev = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      calls.push({ url: String(url), auth: headers.authorization ?? "" });
+      return new Response(JSON.stringify({ data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }] }), { status: 200 });
+    }) as typeof fetch;
+    return { calls, restore: () => { globalThis.fetch = prev; } };
+  }
+
+  function withProvider(provider: RuntimeConfig["provider"]): RuntimeConfig {
+    return { ...makeConfig(), provider };
+  }
+
+  test("anthropic active → embeddings hit api.openai.com with OPENAI_API_KEY, never the Anthropic host or key", async () => {
+    process.env.GINI_EMBEDDING_PROVIDER = "openai";
+    process.env.OPENAI_API_KEY = "sk-openai-real";
+    process.env.ANTHROPIC_API_KEY = "sk-ant-secret";
+    const stub = stubFetch();
+    try {
+      const provider = getEmbeddingProvider(
+        withProvider({ name: "anthropic", model: "claude-opus-4-8", baseUrl: "https://api.anthropic.com", apiKeyEnv: "ANTHROPIC_API_KEY" })
+      );
+      await provider.embed(["hello"]);
+      expect(stub.calls).toHaveLength(1);
+      expect(stub.calls[0]!.url).toBe("https://api.openai.com/v1/embeddings");
+      expect(stub.calls[0]!.auth).toBe("Bearer sk-openai-real");
+      expect(stub.calls[0]!.url).not.toContain("anthropic");
+      expect(stub.calls[0]!.auth).not.toContain("sk-ant-secret");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  test("openai-compatible provider (openrouter) reuses its configured baseUrl + key for embeddings", async () => {
+    process.env.GINI_EMBEDDING_PROVIDER = "openai";
+    process.env.OPENROUTER_API_KEY = "sk-or-key";
+    const stub = stubFetch();
+    try {
+      const provider = getEmbeddingProvider(
+        withProvider({ name: "openrouter", model: "x", baseUrl: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY" })
+      );
+      await provider.embed(["hi"]);
+      expect(stub.calls[0]!.url).toBe("https://openrouter.ai/api/v1/embeddings");
+      expect(stub.calls[0]!.auth).toBe("Bearer sk-or-key");
+    } finally {
+      stub.restore();
+    }
   });
 });
 

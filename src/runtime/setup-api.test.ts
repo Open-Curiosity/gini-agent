@@ -40,6 +40,7 @@ describe("setup-api", () => {
     HOME?: string;
     GINI_STATE_ROOT?: string;
     OPENAI_API_KEY?: string;
+    ANTHROPIC_API_KEY?: string;
     CODEX_AUTH_JSON?: string;
     GINI_PROVIDER?: string;
     GINI_MODEL?: string;
@@ -54,6 +55,7 @@ describe("setup-api", () => {
       HOME: process.env.HOME,
       GINI_STATE_ROOT: process.env.GINI_STATE_ROOT,
       OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
       CODEX_AUTH_JSON: process.env.CODEX_AUTH_JSON,
       GINI_PROVIDER: process.env.GINI_PROVIDER,
       GINI_MODEL: process.env.GINI_MODEL
@@ -62,6 +64,7 @@ describe("setup-api", () => {
     process.env.HOME = s.home;
     process.env.GINI_STATE_ROOT = s.stateRoot;
     delete process.env.OPENAI_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
     // Scrub provider/model env so the test's assertions about the
     // platform default ("codex"/gpt-5.5) are not skewed by an ambient
     // GINI_PROVIDER=echo or similar in the caller's shell.
@@ -91,6 +94,8 @@ describe("setup-api", () => {
     else process.env.GINI_STATE_ROOT = env.GINI_STATE_ROOT;
     if (env.OPENAI_API_KEY === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = env.OPENAI_API_KEY;
+    if (env.ANTHROPIC_API_KEY === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = env.ANTHROPIC_API_KEY;
     if (env.CODEX_AUTH_JSON === undefined) delete process.env.CODEX_AUTH_JSON;
     else process.env.CODEX_AUTH_JSON = env.CODEX_AUTH_JSON;
     if (env.GINI_PROVIDER === undefined) delete process.env.GINI_PROVIDER;
@@ -105,7 +110,7 @@ describe("setup-api", () => {
   test("status: providerConfigured reflects the codex platform default on a fresh instance", () => {
     const status = getSetupStatus(config);
     expect(status.ok).toBe(true);
-    expect(status.providers).toEqual(["openai", "codex", "openrouter", "deepseek", "local", "azure"]);
+    expect(status.providers).toEqual(["openai", "codex", "openrouter", "deepseek", "local", "anthropic", "bedrock", "azure"]);
     // Platform default is "codex". providerHealth treats codex as
     // configured when the runtime can find an auth.json; in this
     // scratch env there is none (CODEX_AUTH_JSON is scrubbed in
@@ -201,9 +206,276 @@ describe("setup-api", () => {
   });
 
   test("POST unknown provider rejects with descriptive error", async () => {
-    const result = await setSetupProvider(config, { provider: "anthropic" });
+    const result = await setSetupProvider(config, { provider: "mistral" });
     expect(result.ok).toBe(false);
     expect(result.error).toContain("Unsupported provider");
+  });
+
+  test("POST anthropic with a baseUrl override targets the configured endpoint", async () => {
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    try {
+      const result = await setSetupProvider(config, {
+        provider: "anthropic",
+        apiKey: "bedrock-api-key-token&Version=1",
+        model: "anthropic.claude-opus-4-8",
+        baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic"
+      });
+      expect(result.ok).toBe(true);
+      expect(result.provider.provider.name).toBe("anthropic");
+      expect(result.provider.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+      expect(result.provider.provider.model).toBe("anthropic.claude-opus-4-8");
+      expect(process.env.ANTHROPIC_API_KEY ?? "").toBe("bedrock-api-key-token&Version=1");
+    } finally {
+      if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevKey;
+    }
+  });
+
+  test("re-setting an already-active anthropic provider preserves baseUrl + apiKeyEnv", async () => {
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    try {
+      await setSetupProvider(config, {
+        provider: "anthropic",
+        apiKey: "bedrock-token",
+        model: "anthropic.claude-opus-4-8",
+        baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic"
+      });
+      expect(config.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+
+      // Edit-model / set-active flow: POST {provider, model} with no baseUrl —
+      // the configured Bedrock endpoint and key-env must survive.
+      const edited = await setSetupProvider(config, { provider: "anthropic", model: "anthropic.claude-haiku-4-5" });
+      expect(edited.ok).toBe(true);
+      expect(config.provider.model).toBe("anthropic.claude-haiku-4-5");
+      expect(config.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+      expect(config.provider.apiKeyEnv).toBe("ANTHROPIC_API_KEY");
+
+      // Re-activate with no model either — both model and baseUrl are kept.
+      const reactivated = await setSetupProvider(config, { provider: "anthropic" });
+      expect(reactivated.ok).toBe(true);
+      expect(config.provider.model).toBe("anthropic.claude-haiku-4-5");
+      expect(config.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+    } finally {
+      if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevKey;
+    }
+  });
+
+  test("editing/rotating an active anthropic provider honors a CLI-set custom apiKeyEnv", async () => {
+    const prevBedrock = process.env.BEDROCK_BEARER_TOKEN;
+    process.env.BEDROCK_BEARER_TOKEN = "bedrock-old";
+    // Simulate a CLI-configured provider keyed on a custom env var, with the
+    // canonical ANTHROPIC_API_KEY left unset (scrubbed in beforeEach).
+    config.provider = {
+      name: "anthropic",
+      model: "anthropic.claude-opus-4-8",
+      baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      apiKeyEnv: "BEDROCK_BEARER_TOKEN"
+    };
+    try {
+      // Model-only edit, blank key, ANTHROPIC_API_KEY unset → must succeed
+      // (the env-already-set check honors the custom var) and keep the env var.
+      const edited = await setSetupProvider(config, { provider: "anthropic", model: "anthropic.claude-haiku-4-5" });
+      expect(edited.ok).toBe(true);
+      expect(config.provider.model).toBe("anthropic.claude-haiku-4-5");
+      expect(config.provider.apiKeyEnv).toBe("BEDROCK_BEARER_TOKEN");
+
+      // Rotating the key lands in the custom var (not the canonical one), and
+      // the config keeps reading from it.
+      const rotated = await setSetupProvider(config, { provider: "anthropic", apiKey: "bedrock-new" });
+      expect(rotated.ok).toBe(true);
+      expect(config.provider.apiKeyEnv).toBe("BEDROCK_BEARER_TOKEN");
+      expect(process.env.BEDROCK_BEARER_TOKEN).toBe("bedrock-new");
+      expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
+      const secrets = readFileSync(join(s.home, ".gini", "secrets.env"), "utf8");
+      expect(secrets).toContain("BEDROCK_BEARER_TOKEN=");
+      expect(secrets).not.toContain("ANTHROPIC_API_KEY=");
+    } finally {
+      if (prevBedrock === undefined) delete process.env.BEDROCK_BEARER_TOKEN;
+      else process.env.BEDROCK_BEARER_TOKEN = prevBedrock;
+    }
+  });
+
+  test("bedrock: configures with no apiKey when AWS creds resolve, persisting model + region", async () => {
+    // Like codex, bedrock needs no gini-held key — it signs with AWS creds. When
+    // they resolve, set succeeds and persists the (model-agnostic) model + region.
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    try {
+      const result = await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-west-2" });
+      expect(result.ok).toBe(true);
+      expect(config.provider.name).toBe("bedrock");
+      expect(config.provider.model).toBe("us.amazon.nova-pro-v1:0");
+      expect(config.provider.awsRegion).toBe("us-west-2");
+      expect(config.provider.baseUrl).toBe("https://bedrock-runtime.us-west-2.amazonaws.com");
+      expect(result.provider.message).toContain("AWS SigV4");
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+    }
+  });
+
+  test("bedrock: rejects when no AWS credentials resolve", async () => {
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    const prevFile = process.env.AWS_SHARED_CREDENTIALS_FILE;
+    const prevProfile = process.env.AWS_PROFILE;
+    delete process.env.AWS_ACCESS_KEY_ID;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_SHARED_CREDENTIALS_FILE = "/nonexistent/gini-test/credentials";
+    delete process.env.AWS_PROFILE;
+    try {
+      const result = await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0" });
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/No AWS credentials/);
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+      if (prevFile === undefined) delete process.env.AWS_SHARED_CREDENTIALS_FILE; else process.env.AWS_SHARED_CREDENTIALS_FILE = prevFile;
+      if (prevProfile === undefined) delete process.env.AWS_PROFILE; else process.env.AWS_PROFILE = prevProfile;
+    }
+  });
+
+  test("bedrock: rejects a malformed awsRegion before persisting", async () => {
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    try {
+      const result = await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1/evil" });
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/awsRegion is invalid/);
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+    }
+  });
+
+  test("bedrock: a blank awsRegion clears to the default; an omitted one preserves it (present-clears)", async () => {
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    const prevRegion = process.env.AWS_REGION;
+    const prevDef = process.env.AWS_DEFAULT_REGION;
+    process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    delete process.env.AWS_REGION;
+    delete process.env.AWS_DEFAULT_REGION;
+    try {
+      await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-west-2" });
+      expect(config.provider.awsRegion).toBe("us-west-2");
+      // Omitting awsRegion preserves it (a partial model-only save from the
+      // model picker / set_provider tool must not reset the region).
+      await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-lite-v1:0" });
+      expect(config.provider.awsRegion).toBe("us-west-2");
+      // A blank awsRegion CLEARS it — the persisted field goes absent (no env
+      // baked into config) and the host resolves at request time back to the
+      // us-east-1 default (no AWS_REGION/AWS_DEFAULT_REGION set here).
+      const cleared = await setSetupProvider(config, { provider: "bedrock", awsRegion: "" });
+      expect(cleared.ok).toBe(true);
+      expect(config.provider.awsRegion).toBeUndefined();
+      expect(config.provider.baseUrl).toBe("https://bedrock-runtime.us-east-1.amazonaws.com");
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+      if (prevRegion === undefined) delete process.env.AWS_REGION; else process.env.AWS_REGION = prevRegion;
+      if (prevDef === undefined) delete process.env.AWS_DEFAULT_REGION; else process.env.AWS_DEFAULT_REGION = prevDef;
+    }
+  });
+
+  test("remove rejects codex, local, and unknown providers", () => {
+    expect(removeSetupProvider(config, "codex")).toMatchObject({ ok: false, error: expect.stringContaining("codex CLI") });
+    expect(removeSetupProvider(config, "local")).toMatchObject({ ok: false });
+    expect(removeSetupProvider(config, "mistral")).toMatchObject({ ok: false });
+    expect(removeSetupProvider(config, "mistral").error).toContain("Cannot remove provider 'mistral'");
+  });
+
+  test("remove scrubs the key and falls back to echo when the removed provider was active", () => {
+    const prevKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-active";
+    config.provider = { name: "openai", model: "gpt-5.4-mini", apiKeyEnv: "OPENAI_API_KEY" };
+    try {
+      const result = removeSetupProvider(config, "openai");
+      expect(result.ok).toBe(true);
+      expect(result.switched).toBe(true);
+      expect(config.provider.name).toBe("echo");
+      expect(process.env.OPENAI_API_KEY).toBeUndefined();
+    } finally {
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+    }
+  });
+
+  test("remove switches the active provider to codex when codex auth is available", () => {
+    const prevKey = process.env.OPENAI_API_KEY;
+    const authPath = join(s.stateRoot, "codex-auth.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "a", refresh_token: "b" } }));
+    process.env.CODEX_AUTH_JSON = authPath;
+    process.env.OPENAI_API_KEY = "sk-active";
+    config.provider = { name: "openai", model: "gpt-5.4-mini", apiKeyEnv: "OPENAI_API_KEY" };
+    try {
+      const result = removeSetupProvider(config, "openai");
+      expect(result.ok).toBe(true);
+      expect(result.switched).toBe(true);
+      expect(config.provider.name).toBe("codex");
+    } finally {
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+    }
+  });
+
+  test("remove scrubs the key without switching when the provider was not active", () => {
+    const prevKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-inactive";
+    // config.provider stays at the codex default — removing openai must not switch it.
+    try {
+      const result = removeSetupProvider(config, "openai");
+      expect(result.ok).toBe(true);
+      expect(result.switched).toBe(false);
+      expect(config.provider.name).toBe("codex");
+      expect(process.env.OPENAI_API_KEY).toBeUndefined();
+    } finally {
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+    }
+  });
+
+  test("remove scrubs a custom apiKeyEnv (not just the canonical var) for an active anthropic provider", async () => {
+    const prevBedrock = process.env.BEDROCK_BEARER_TOKEN;
+    process.env.BEDROCK_BEARER_TOKEN = "bedrock-old";
+    // Active anthropic provider keyed on a custom env var, as
+    // `gini provider set anthropic --api-key-env BEDROCK_BEARER_TOKEN` persists.
+    config.provider = {
+      name: "anthropic",
+      model: "anthropic.claude-opus-4-8",
+      baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      apiKeyEnv: "BEDROCK_BEARER_TOKEN"
+    };
+    try {
+      // Rotate the key so the bearer actually lands in secrets.env under the
+      // custom var (setSetupProvider routes the write through apiKeyEnv).
+      const rotated = await setSetupProvider(config, { provider: "anthropic", apiKey: "bedrock-live" });
+      expect(rotated.ok).toBe(true);
+      expect(config.provider.apiKeyEnv).toBe("BEDROCK_BEARER_TOKEN");
+      expect(process.env.BEDROCK_BEARER_TOKEN).toBe("bedrock-live");
+      const before = readFileSync(join(s.home, ".gini", "secrets.env"), "utf8");
+      expect(before).toContain("BEDROCK_BEARER_TOKEN=");
+
+      const result = removeSetupProvider(config, "anthropic");
+      expect(result.ok).toBe(true);
+      expect(result.switched).toBe(true);
+      // The live token must be gone from BOTH stores — the canonical-only
+      // scrub would have left it behind under the custom var.
+      expect(process.env.BEDROCK_BEARER_TOKEN).toBeUndefined();
+      const after = readFileSync(join(s.home, ".gini", "secrets.env"), "utf8");
+      expect(after).not.toContain("BEDROCK_BEARER_TOKEN=");
+    } finally {
+      if (prevBedrock === undefined) delete process.env.BEDROCK_BEARER_TOKEN;
+      else process.env.BEDROCK_BEARER_TOKEN = prevBedrock;
+    }
   });
 
   test("POST azure with apiKey + baseUrl writes AZURE_OPENAI_API_KEY and persists azure routing", async () => {
@@ -255,6 +527,32 @@ describe("setup-api", () => {
     } finally {
       if (prevAzureKey === undefined) delete process.env.AZURE_OPENAI_API_KEY;
       else process.env.AZURE_OPENAI_API_KEY = prevAzureKey;
+    }
+  });
+
+  test("POST anthropic rejects a plaintext custom baseUrl but accepts https (key-leak guard)", async () => {
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    try {
+      const httpBase = await setSetupProvider(config, {
+        provider: "anthropic",
+        apiKey: "sk-ant-secret",
+        model: "claude-opus-4-8",
+        baseUrl: "http://proxy.example/v1"
+      });
+      expect(httpBase.ok).toBe(false);
+      expect(httpBase.error).toContain("https://");
+      const httpsBase = await setSetupProvider(config, {
+        provider: "anthropic",
+        apiKey: "sk-ant-secret",
+        model: "claude-opus-4-8",
+        baseUrl: "https://anthropic.gateway.internal/v1"
+      });
+      expect(httpsBase.ok).toBe(true);
+      expect(config.provider.baseUrl).toBe("https://anthropic.gateway.internal/v1");
+    } finally {
+      if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevKey;
     }
   });
 

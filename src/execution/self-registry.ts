@@ -293,12 +293,21 @@ async function setProvider(
   }
   const payload: Record<string, unknown> = { provider: targetProvider };
   if (typeof args.model === "string" && args.model.trim().length > 0) payload.model = args.model.trim();
+  if (typeof args.awsRegion === "string" && args.awsRegion.trim().length > 0) payload.awsRegion = args.awsRegion.trim();
   if (typeof args.apiKey === "string" && args.apiKey.trim().length > 0) payload.apiKey = args.apiKey.trim();
   // Transport fields pass through when PRESENT (even blank), so the agent can
   // CLEAR them — matching the setup API's present-clears / absent-preserves
   // rule. Omitting an arg entirely preserves the persisted value. For the azure
-  // provider these carry the resource endpoint + deployment routing.
-  if (typeof args.baseUrl === "string") payload.baseUrl = args.baseUrl.trim();
+  // provider these carry the resource endpoint + deployment routing. baseUrl is
+  // NOT forwarded for anthropic/bedrock: bedrock derives its endpoint from
+  // awsRegion, and letting a (possibly prompt-injected) model repoint the
+  // first-party Anthropic endpoint would exfil the Anthropic key — that stays a
+  // human-only action via the CLI / web setup.
+  // Gate on the RESOLVED targetProvider, not raw args.provider: when `provider`
+  // is omitted (or whitespace-padded) the call patches the ACTIVE provider, so
+  // checking args.provider would let `set_provider({ baseUrl })` repoint a live
+  // anthropic endpoint and exfil its key.
+  if (typeof args.baseUrl === "string" && targetProvider !== "anthropic" && targetProvider !== "bedrock") payload.baseUrl = args.baseUrl.trim();
   if (typeof args.apiVersion === "string") payload.apiVersion = args.apiVersion.trim();
   if (typeof args.deployment === "string") payload.deployment = args.deployment.trim();
   if (args.authScheme === "api-key" || args.authScheme === "bearer") payload.authScheme = args.authScheme;
@@ -913,14 +922,15 @@ export const SELF_OPERATIONS: SelfOperation[] = [
       properties: {
         provider: {
           type: "string",
-          description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'azure', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` (and any Azure routing fields) are updated."
+          description: "Provider id (e.g. 'codex', 'openai', 'anthropic', 'bedrock', 'openrouter', 'deepseek', 'local', 'azure', 'echo'). When omitted, the current provider is kept and only `model`/`awsRegion`/`baseUrl` (and any Azure routing fields) are updated."
         },
-        model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5'). Defaults to the provider's first catalog model when omitted." },
-        baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo. For the azure provider, set this to the resource endpoint (https://<resource>.openai.azure.com) — it is required." },
+        model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5', or a Bedrock inference-profile id like 'us.amazon.nova-pro-v1:0'). Defaults to the provider's first catalog model when omitted." },
+        awsRegion: { type: "string", description: "AWS region for the 'bedrock' provider's Converse endpoint/signing (e.g. 'us-east-1'). Ignored by other providers." },
+        baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo/anthropic/bedrock. For the azure provider, set this to the resource endpoint (https://<resource>.openai.azure.com) — it is required." },
         apiVersion: { type: "string", description: "Azure OpenAI api-version (e.g. '2024-10-21'). azure provider only; defaults to a GA value when omitted." },
         deployment: { type: "string", description: "Azure OpenAI deployment name. Defaults to the model id when omitted. azure provider only." },
         authScheme: { type: "string", enum: ["bearer", "api-key"], description: "Auth header style for the azure provider. 'api-key' (default) sends Azure's api-key header for a resource key; 'bearer' sends Authorization: Bearer for an Entra token." },
-        apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env." }
+        apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env. Not used by bedrock (AWS SigV4) or codex (OAuth)." }
       },
       required: []
     },

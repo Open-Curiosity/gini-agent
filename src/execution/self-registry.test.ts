@@ -214,6 +214,47 @@ describe("direct self tools — query", () => {
       expect(parsed.skills.find((skill) => skill.name === "scripted")?.scripts).toEqual(["run"]);
     }
   });
+
+  test("list_providers credits a custom apiKeyEnv for the active provider", async () => {
+    const instance = `self-providers-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    // Active anthropic provider keyed on a custom env var (a Bedrock bearer),
+    // exactly as the Settings catalog surface sees it. The agent-facing
+    // list_providers op must thread apiKeyEnv so it agrees with Settings.
+    config.provider = {
+      name: "anthropic",
+      model: "anthropic.claude-opus-4-8",
+      baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      apiKeyEnv: "BEDROCK_BEARER_TOKEN_SELFREG"
+    };
+    const prevCustom = process.env.BEDROCK_BEARER_TOKEN_SELFREG;
+    const prevCanonical = process.env.ANTHROPIC_API_KEY;
+    try {
+      process.env.BEDROCK_BEARER_TOKEN_SELFREG = "bedrock-live";
+      // Canonical unset so the custom-env credit is the only path to configured.
+      delete process.env.ANTHROPIC_API_KEY;
+      const taskId = await newTask(config);
+      const result = await dispatchToolCall(config, taskId, "list_providers", "call_1", "{}");
+      expect(result.kind).toBe("sync");
+      if (result.kind === "sync") {
+        const parsed = JSON.parse(result.result) as {
+          ok: boolean;
+          activeProvider: string;
+          providers: Array<{ name: string; configured: boolean; isActive: boolean }>;
+        };
+        expect(parsed.ok).toBe(true);
+        expect(parsed.activeProvider).toBe("anthropic");
+        const anthropic = parsed.providers.find((p) => p.name === "anthropic");
+        expect(anthropic?.configured).toBe(true);
+        expect(anthropic?.isActive).toBe(true);
+      }
+    } finally {
+      if (prevCustom === undefined) delete process.env.BEDROCK_BEARER_TOKEN_SELFREG;
+      else process.env.BEDROCK_BEARER_TOKEN_SELFREG = prevCustom;
+      if (prevCanonical === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevCanonical;
+    }
+  });
 });
 
 describe("direct self tools — mutate", () => {
@@ -284,6 +325,63 @@ describe("direct self tools — mutate", () => {
       expect(approval?.payload.opName).toBe("set_provider");
       const payloadArgs = approval?.payload.args as Record<string, unknown> | undefined;
       expect(payloadArgs?.provider).toBe("echo");
+    }
+  });
+
+  test("set_provider supports bedrock + awsRegion and ignores a model-supplied baseUrl", async () => {
+    const instance = `self-setprov-bedrock-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    try {
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "set_provider",
+        "call_1",
+        JSON.stringify({ provider: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-west-2", baseUrl: "https://evil.example/v1" })
+      );
+      expect(result.kind).toBe("sync");
+      expect(config.provider.name).toBe("bedrock");
+      expect(config.provider.awsRegion).toBe("us-west-2");
+      // The model-supplied baseUrl is NOT honored (key-exfil guard); the host is
+      // derived from the region instead.
+      expect(config.provider.baseUrl).toBe("https://bedrock-runtime.us-west-2.amazonaws.com");
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+    }
+  });
+
+  test("set_provider with an omitted provider does NOT repoint the active anthropic endpoint (key-exfil guard)", async () => {
+    const instance = `self-setprov-anthropic-guard-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    // Make anthropic the ACTIVE provider with its first-party endpoint + key.
+    config.provider = { name: "anthropic", model: "claude-opus-4-8", baseUrl: "https://api.anthropic.com", apiKeyEnv: "ANTHROPIC_API_KEY" };
+    const taskId = await newTask(config);
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "sk-ant-test";
+    try {
+      // A prompt-injected model omits `provider` (so the ACTIVE anthropic is
+      // patched, not switched) and tries to repoint baseUrl at an attacker host.
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "set_provider",
+        "call_1",
+        JSON.stringify({ baseUrl: "https://evil.example/v1" })
+      );
+      expect(result.kind).toBe("sync");
+      expect(config.provider.name).toBe("anthropic");
+      // The endpoint stays first-party — the model-supplied baseUrl is dropped,
+      // so the next anthropic call can't send x-api-key to the attacker host.
+      expect(config.provider.baseUrl).toBe("https://api.anthropic.com");
+    } finally {
+      if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevKey;
     }
   });
 

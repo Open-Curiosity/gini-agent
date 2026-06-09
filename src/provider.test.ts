@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import {
@@ -9,17 +9,23 @@ import {
   generateTaskSummary,
   generateToolCallingResponse,
   generateVisionAnalysis,
+  anthropicNeedsHttps,
   isAuthExpiredError,
   isProviderConfigured,
+  isValidAwsRegion,
   normalizeProvider,
   providerAuthFailureText,
   providerAuthNote,
+  providerCatalog,
+  providerCatalogWithStatus,
+  ProviderAuthError,
   providerDisplayLabel,
   providerHealth,
   providerReauth,
   redactSecrets,
   setEchoToolCallingResponse,
   setEchoVisionResponse,
+  type ToolCallingMessage,
   type ToolFunctionSpec
 } from "./provider";
 import { userProfilePath } from "./runtime/identity-files";
@@ -3466,11 +3472,14 @@ describe("auth-error classification", () => {
     expect(providerDisplayLabel("echo")).toBe("Gini Echo");
   });
 
-  test("providerReauth routes OAuth/CLI providers to docs and API-key providers to settings", () => {
+  test("providerReauth routes OAuth/CLI to docs, AWS to an aws-kind, and API-key providers to settings", () => {
     expect(providerReauth("codex")).toEqual({
       kind: "docs",
       url: "https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
     });
+    // Bedrock signs with AWS credentials — distinct kind so the text/CTA never
+    // promise an API-key form.
+    expect(providerReauth("bedrock")).toEqual({ kind: "aws", url: "/settings" });
     expect(providerReauth("openai")).toEqual({ kind: "settings", url: "/settings" });
     expect(providerReauth("deepseek")).toEqual({ kind: "settings", url: "/settings" });
     expect(providerReauth("openrouter")).toEqual({ kind: "settings", url: "/settings" });
@@ -3491,6 +3500,10 @@ describe("auth-error classification", () => {
     expect(providerAuthFailureText("OpenAI", providerReauth("openai"))).toBe(
       "OpenAI authentication failed. Update your OpenAI API key in Settings → Providers."
     );
+    // AWS target — credentials, never an API key.
+    expect(providerAuthFailureText("Amazon Bedrock", providerReauth("bedrock"))).toBe(
+      "Amazon Bedrock authentication failed. Check your AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials) to continue."
+    );
   });
 
   test("redactSecrets masks key/token shapes, leaves prose intact", () => {
@@ -3502,6 +3515,25 @@ describe("auth-error classification", () => {
     );
     expect(redactSecrets("Provided authentication token is expired.")).toBe(
       "Provided authentication token is expired."
+    );
+    // Bedrock Mantle bearer: the whole token (base64 body + &Version=1 tail)
+    // is masked even when no api_key/token label precedes it.
+    expect(redactSecrets("rejected key bedrock-api-key-YWJjZGVm123&Version=1 is invalid")).toBe(
+      "rejected key bedrock-api-key-*** is invalid"
+    );
+    // Long-term Bedrock API key (ABSK… service-specific credential) is masked by
+    // its prefix even with no api_key/token label preceding it.
+    expect(redactSecrets("denied key ABSKQmVkcm9ja0FQSUtleS1hYmNkZWZnaGlqaz0099 is invalid")).toBe(
+      "denied key ABSK*** is invalid"
+    );
+    // AWS SigV4 (aws-sigv4 Bedrock path): the access key id and the request
+    // signature are masked. The secret access key never appears on the wire.
+    expect(
+      redactSecrets(
+        `Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260608/us-east-1/bedrock-mantle/aws4_request, SignedHeaders=host, Signature=${"a".repeat(64)}`
+      )
+    ).toBe(
+      "Authorization: AWS4-HMAC-SHA256 Credential=AWS-ACCESS-KEY-***/20260608/us-east-1/bedrock-mantle/aws4_request, SignedHeaders=host, Signature=***"
     );
   });
 
@@ -3517,5 +3549,1213 @@ describe("auth-error classification", () => {
       }
     });
     expect(providerAuthNote("openai", "Incorrect API key").authError.reauthKind).toBe("settings");
+  });
+});
+
+// ---------------- Anthropic Messages provider ----------------
+
+// Swap globalThis.fetch for a stub that records every call and returns a
+// freshly-built Response. Mirrors the inline pattern the openai/codex tests
+// use, factored out because the anthropic suite exercises many shapes.
+function installFetch(makeResponse: () => Response): {
+  calls: Array<{ url: string; init: RequestInit }>;
+  restore: () => void;
+} {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+    calls.push({ url: String(input), init });
+    return Promise.resolve(makeResponse());
+  }) as unknown as typeof fetch;
+  return { calls, restore: () => { globalThis.fetch = originalFetch; } };
+}
+
+// Set/clear a process.env var and return a restore closure.
+function setEnv(name: string, value: string | undefined): () => void {
+  const original = process.env[name];
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+  return () => {
+    if (original === undefined) delete process.env[name];
+    else process.env[name] = original;
+  };
+}
+
+function anthropicJson(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+// Build a named-event SSE Response. When terminateLast is false the final
+// event omits its trailing "\n\n" so the reader's post-loop buffer flush runs.
+function anthropicSse(
+  events: Array<{ event?: string; data: unknown }>,
+  opts: { terminateLast?: boolean } = {}
+): Response {
+  const terminateLast = opts.terminateLast ?? true;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const enc = new TextEncoder();
+      events.forEach((ev, idx) => {
+        const last = idx === events.length - 1;
+        const prefix = ev.event ? `event: ${ev.event}\n` : "";
+        const sep = last && !terminateLast ? "" : "\n\n";
+        controller.enqueue(enc.encode(`${prefix}data: ${JSON.stringify(ev.data)}${sep}`));
+      });
+      controller.close();
+    }
+  });
+  return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+// Encode Converse events as an AWS event-stream (vnd.amazon.eventstream) body —
+// the binary framing readConverseStream parses. Each frame is
+// [4B totalLen][4B headersLen][4B preludeCRC=0][headers][payload][4B msgCRC=0];
+// readConverseStream doesn't validate CRCs, so zeros are fine. Headers carry the
+// string-typed (:event-type, :message-type) values the parser routes on.
+function converseEventStream(events: Array<{ type: string; payload: unknown; messageType?: string }>): Response {
+  const enc = new TextEncoder();
+  const u8concat = (parts: Uint8Array[]): Uint8Array => {
+    const total = parts.reduce((n, p) => n + p.length, 0);
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const p of parts) { out.set(p, o); o += p.length; }
+    return out;
+  };
+  const strHeader = (name: string, value: string): Uint8Array => {
+    const n = enc.encode(name);
+    const v = enc.encode(value);
+    const h = new Uint8Array(1 + n.length + 1 + 2 + v.length);
+    let o = 0;
+    h[o++] = n.length;
+    h.set(n, o); o += n.length;
+    h[o++] = 7; // value type 7 = string
+    h[o++] = (v.length >> 8) & 0xff;
+    h[o++] = v.length & 0xff;
+    h.set(v, o);
+    return h;
+  };
+  const frames = events.map((ev) => {
+    const payload = enc.encode(JSON.stringify(ev.payload));
+    const headers = u8concat([
+      strHeader(":event-type", ev.type),
+      strHeader(":message-type", ev.messageType ?? "event"),
+      strHeader(":content-type", "application/json")
+    ]);
+    const totalLen = 12 + headers.length + payload.length + 4;
+    const msg = new Uint8Array(totalLen);
+    const dv = new DataView(msg.buffer);
+    dv.setUint32(0, totalLen);
+    dv.setUint32(4, headers.length);
+    dv.setUint32(8, 0);
+    msg.set(headers, 12);
+    msg.set(payload, 12 + headers.length);
+    return msg;
+  });
+  const all = u8concat(frames);
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(all);
+      controller.close();
+    }
+  });
+  return new Response(stream, { status: 200, headers: { "content-type": "application/vnd.amazon.eventstream" } });
+}
+
+describe("anthropic provider", () => {
+  // The bedrock signing assertions below pin an exact SignedHeaders list with no
+  // x-amz-security-token. An ambient AWS_SESSION_TOKEN in the dev/CI environment
+  // would make resolveAwsCredentials fold one in and break those matches, so
+  // clear it for every test here (tests that need a token set their own).
+  let restoreAmbientSessionToken: () => void;
+  beforeEach(() => { restoreAmbientSessionToken = setEnv("AWS_SESSION_TOKEN", undefined); });
+  afterEach(() => { restoreAmbientSessionToken(); });
+
+  test("anthropicNeedsHttps refuses plaintext custom endpoints but allows https and loopback", () => {
+    // No baseUrl uses the https first-party default — fine.
+    expect(anthropicNeedsHttps("anthropic", undefined)).toBe(false);
+    expect(anthropicNeedsHttps("anthropic", "")).toBe(false);
+    // https custom endpoints are fine.
+    expect(anthropicNeedsHttps("anthropic", "https://anthropic.gateway.internal/v1")).toBe(false);
+    // Loopback proxies over http are allowed (incl. bracketed IPv6 from URL.hostname).
+    expect(anthropicNeedsHttps("anthropic", "http://localhost:8787/v1")).toBe(false);
+    expect(anthropicNeedsHttps("anthropic", "http://127.0.0.1/v1")).toBe(false);
+    expect(anthropicNeedsHttps("anthropic", "http://[::1]:8787/v1")).toBe(false);
+    // Plaintext non-loopback and unparseable endpoints are refused.
+    expect(anthropicNeedsHttps("anthropic", "http://proxy.example/v1")).toBe(true);
+    expect(anthropicNeedsHttps("anthropic", "not a url")).toBe(true);
+    // A bare, hostless "https://" is refused (it throws on parse) rather than
+    // passing a naive prefix check and building an unreachable endpoint.
+    expect(anthropicNeedsHttps("anthropic", "https://")).toBe(true);
+    // No-op for every other provider.
+    expect(anthropicNeedsHttps("openai", "http://proxy.example/v1")).toBe(false);
+    expect(anthropicNeedsHttps("bedrock", "http://proxy.example/v1")).toBe(false);
+  });
+
+  test("anthropic: a missing API key surfaces as a typed ProviderAuthError, not a generic failure", async () => {
+    const restoreKey = setEnv("ANTHROPIC_API_KEY", undefined);
+    const fetchStub = installFetch(() => anthropicJson({}));
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const err = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []).catch(
+        (e) => e
+      );
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("anthropic");
+      expect((err as Error).message).toMatch(/ANTHROPIC_API_KEY is not set/);
+      // No request is attempted without a key.
+      expect(fetchStub.calls.length).toBe(0);
+      expect(providerReauth("anthropic")).toEqual({ kind: "settings", url: "/settings" });
+    } finally {
+      fetchStub.restore();
+      restoreKey();
+    }
+  });
+
+  test("normalizeProvider applies defaults and preserves overrides", () => {
+    expect(normalizeProvider({ name: "anthropic", model: "" })).toEqual({
+      name: "anthropic",
+      model: "claude-opus-4-8",
+      baseUrl: "https://api.anthropic.com",
+      apiKeyEnv: "ANTHROPIC_API_KEY"
+    });
+    expect(
+      normalizeProvider({
+        name: "anthropic",
+        model: "anthropic.claude-opus-4-8",
+        baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+        apiKeyEnv: "BEDROCK_BEARER_TOKEN",
+        extraBody: { max_tokens: 256 }
+      })
+    ).toEqual({
+      name: "anthropic",
+      model: "anthropic.claude-opus-4-8",
+      baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      apiKeyEnv: "BEDROCK_BEARER_TOKEN",
+      extraBody: { max_tokens: 256 }
+    });
+  });
+
+  test("providerDisplayLabel + catalog + configured gate", () => {
+    expect(providerDisplayLabel("anthropic")).toBe("Anthropic");
+    const entry = providerCatalog().find((p) => p.name === "anthropic");
+    expect(entry?.displayName).toBe("Anthropic Compatible");
+    expect(entry?.baseUrl).toBe("https://api.anthropic.com");
+    expect(entry?.models).toContain("claude-opus-4-8");
+
+    const restore = setEnv("ANTHROPIC_API_KEY", undefined);
+    try {
+      expect(isProviderConfigured("anthropic")).toBe(false);
+      const health = providerHealth(config(normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" })));
+      expect(health.ok).toBe(false);
+      expect(health.message).toContain("ANTHROPIC_API_KEY");
+
+      process.env.ANTHROPIC_API_KEY = "sk-ant-test";
+      expect(isProviderConfigured("anthropic")).toBe(true);
+      expect(providerHealth(config(normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" }))).ok).toBe(true);
+      const withStatus = providerCatalogWithStatus().find((p) => p.name === "anthropic");
+      expect(withStatus?.configured).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  test("tool-calling: non-stream request shape, headers, and tool_use parsing", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "text", text: "Reading it." },
+          { type: "tool_use", id: "toolu_1", name: "file_read", input: { path: "a.md" } }
+        ],
+        stop_reason: "tool_use",
+        usage: { input_tokens: 11, output_tokens: 7 }
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const tools: ToolFunctionSpec[] = [
+        {
+          type: "function",
+          function: {
+            name: "file_read",
+            description: "read a file",
+            parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+          }
+        }
+      ];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [
+          { role: "system", content: "you are gini" },
+          { role: "user", content: "read a.md" }
+        ],
+        tools
+      );
+      expect(result.finishReason).toBe("tool_calls");
+      expect(result.text).toBe("Reading it.");
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls[0]?.id).toBe("toolu_1");
+      expect(result.toolCalls[0]?.function.name).toBe("file_read");
+      expect(JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}")).toEqual({ path: "a.md" });
+      expect(result.responseId).toBe("msg_1");
+      expect(result.cost?.inputTokens).toBe(11);
+      expect(result.cost?.outputTokens).toBe(7);
+
+      const call = fetchStub.calls[0]!;
+      expect(call.url).toBe("https://api.anthropic.com/v1/messages");
+      const headers = call.init.headers as Record<string, string>;
+      expect(headers["x-api-key"]).toBe("sk-ant-test");
+      expect(headers["anthropic-version"]).toBe("2023-06-01");
+      expect(headers["content-type"]).toBe("application/json");
+      const sent = JSON.parse(String(call.init.body));
+      expect(sent.model).toBe("claude-opus-4-8");
+      expect(sent.max_tokens).toBe(8192);
+      expect(sent.stream).toBe(false);
+      expect(sent.system).toBe("you are gini");
+      expect(sent.messages).toEqual([{ role: "user", content: "read a.md" }]);
+      expect(sent.tools).toEqual([
+        {
+          name: "file_read",
+          description: "read a file",
+          input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+        }
+      ]);
+      expect(sent.tool_choice).toEqual({ type: "auto" });
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("tool-calling: streaming text + tool_use, custom apiKeyEnv (Bedrock bearer)", async () => {
+    const restoreEnv = setEnv("BEDROCK_BEARER_TOKEN", "bedrock-api-key-xyz&Version=1");
+    const fetchStub = installFetch(() =>
+      anthropicSse([
+        { event: "message_start", data: { type: "message_start", message: { id: "msg_stream", usage: { input_tokens: 9 } } } },
+        { event: "content_block_start", data: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hi " } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "there" } } },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 0 } },
+        { event: "content_block_start", data: { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_s", name: "file_list" } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"path":' } } },
+        { event: "content_block_delta", data: { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '"/tmp"}' } } },
+        { event: "content_block_stop", data: { type: "content_block_stop", index: 1 } },
+        { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } } },
+        { event: "message_stop", data: { type: "message_stop" } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({
+        name: "anthropic",
+        model: "anthropic.claude-opus-4-8",
+        baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+        apiKeyEnv: "BEDROCK_BEARER_TOKEN"
+      });
+      let streamed = "";
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "list /tmp" }],
+        [
+          { type: "function", function: { name: "file_list", description: "list", parameters: { type: "object" } } }
+        ],
+        (delta) => { streamed += delta; }
+      );
+      expect(streamed).toBe("Hi there");
+      expect(result.text).toBe("Hi there");
+      expect(result.finishReason).toBe("tool_calls");
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls[0]?.id).toBe("toolu_s");
+      expect(JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}")).toEqual({ path: "/tmp" });
+      expect(result.responseId).toBe("msg_stream");
+      expect(result.cost?.inputTokens).toBe(9);
+      expect(result.cost?.outputTokens).toBe(5);
+
+      const call = fetchStub.calls[0]!;
+      // baseUrl carried the /anthropic prefix → request appends /v1/messages.
+      expect(call.url).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages");
+      const headers = call.init.headers as Record<string, string>;
+      expect(headers["x-api-key"]).toBe("bedrock-api-key-xyz&Version=1");
+      expect(headers["accept"]).toBe("text/event-stream");
+      expect(JSON.parse(String(call.init.body)).stream).toBe(true);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("extraBody.system is denied: hoisted system wins, and a stray extraBody.system can't leak with no system message", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8", extraBody: { system: "poisoned" } });
+      // No system message in the transcript → a stray extraBody.system must NOT
+      // survive into the request (it is stripped by the anthropic denylist).
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      const sentNoSys = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(sentNoSys.system).toBeUndefined();
+      // A real system message is hoisted and is the sole source of body.system.
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "system", content: "real system" }, { role: "user", content: "hi" }],
+        []
+      );
+      const sentWithSys = JSON.parse(String(fetchStub.calls[1]!.init.body));
+      expect(sentWithSys.system).toBe("real system");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("message translation: system hoist, tool grouping, image/document/invalid parts, assistant shapes", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const messages: ToolCallingMessage[] = [
+        { role: "system", content: "sys A" },
+        { role: "system", content: "sys B" },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "look" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+            { type: "image_url", image_url: { url: "https://not-a-data-url" } },
+            { type: "document", document: { mimeType: "application/pdf", data: "BBBB", filename: "d.pdf" } }
+          ]
+        },
+        { role: "assistant", content: "thinking", tool_calls: [{ id: "toolu_x", type: "function", function: { name: "search", arguments: '{"q":"hi"}' } }] },
+        { role: "tool", tool_call_id: "toolu_x", content: "result-1" },
+        { role: "tool", tool_call_id: "toolu_y", content: "result-2" },
+        { role: "assistant", content: [{ type: "text", text: "array text" }] },
+        { role: "assistant", content: null },
+        { role: "user", content: null }
+      ];
+      await generateToolCallingResponse(config(provider), messages, []);
+      const sent = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(sent.system).toBe("sys A\n\nsys B");
+      expect(sent.messages).toEqual([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "look" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+            { type: "document", source: { type: "base64", media_type: "application/pdf", data: "BBBB" } }
+          ]
+        },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "thinking" },
+            { type: "tool_use", id: "toolu_x", name: "search", input: { q: "hi" } }
+          ]
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_x", content: "result-1" },
+            { type: "tool_result", tool_use_id: "toolu_y", content: "result-2" }
+          ]
+        },
+        { role: "assistant", content: [{ type: "text", text: "array text" }] },
+        { role: "assistant", content: [{ type: "text", text: "" }] },
+        { role: "user", content: "" }
+      ]);
+      // No tools passed → no tools/tool_choice in the body.
+      expect(sent.tools).toBeUndefined();
+      expect(sent.tool_choice).toBeUndefined();
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("max_tokens: extraBody override wins; tool_use without id/name is skipped", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        id: "m2",
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "text", text: "hello" },
+          { type: "tool_use", id: "", name: "noid" },
+          { type: "tool_use", name: "noid2", input: {} }
+        ],
+        stop_reason: "end_turn",
+        usage: {}
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8", extraBody: { max_tokens: 1234, top_k: 5 } });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(result.finishReason).toBe("stop");
+      expect(result.toolCalls).toHaveLength(0);
+      const sent = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(sent.max_tokens).toBe(1234);
+      expect(sent.top_k).toBe(5);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("stop_reason mapping covers every branch", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const cases: Array<[string | undefined, "stop" | "length" | "tool_calls" | "unknown"]> = [
+      ["end_turn", "stop"],
+      ["stop_sequence", "stop"],
+      ["max_tokens", "length"],
+      ["tool_use", "tool_calls"],
+      ["something_new", "unknown"],
+      [undefined, "unknown"]
+    ];
+    try {
+      for (const [stopReason, expected] of cases) {
+        const fetchStub = installFetch(() =>
+          anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "x" }], stop_reason: stopReason, usage: {} })
+        );
+        try {
+          const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+          const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+          expect(result.finishReason).toBe(expected);
+        } finally {
+          fetchStub.restore();
+        }
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test("readAnthropicKey throws when the configured env var is unset", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", undefined);
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      await expect(
+        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
+      ).rejects.toThrow("ANTHROPIC_API_KEY is not set");
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test("non-stream HTTP error surfaces the Anthropic error message", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ type: "error", error: { type: "authentication_error", message: "Invalid bearer token" }, request_id: "req_1" }, 401)
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      await expect(
+        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
+      ).rejects.toThrow("Invalid bearer token");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("streaming error event and HTTP error both throw", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    try {
+      const errEvent = installFetch(() =>
+        anthropicSse([{ event: "error", data: { type: "error", error: { type: "overloaded_error", message: "Overloaded" } } }])
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        await expect(
+          generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {})
+        ).rejects.toThrow("Overloaded");
+      } finally {
+        errEvent.restore();
+      }
+
+      const httpErr = installFetch(() =>
+        new Response(JSON.stringify({ error: { message: "stream boom" } }), { status: 500, headers: { "content-type": "application/json" } })
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        await expect(
+          generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {})
+        ).rejects.toThrow("stream boom");
+      } finally {
+        httpErr.restore();
+      }
+
+      const noBody = installFetch(() => new Response(null, { status: 200, headers: { "content-type": "text/event-stream" } }));
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        await expect(
+          generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {})
+        ).rejects.toThrow("no response body");
+      } finally {
+        noBody.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test("streaming tolerates ping, unknown events, stray deltas, and an unterminated final event", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicSse(
+        [
+          { event: "ping", data: { type: "ping" } },
+          { event: "message_start", data: { type: "message_start", message: { id: "msg_u" } } },
+          // content_block_start with no content_block → defaults to a text block.
+          { event: "content_block_start", data: { type: "content_block_start", index: 0 } },
+          // input_json_delta for an index that never opened a block → ignored.
+          { event: "content_block_delta", data: { type: "content_block_delta", index: 9, delta: { type: "input_json_delta", partial_json: "{}" } } },
+          // unknown delta type → ignored.
+          { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "hmm" } } },
+          { event: "content_block_delta", data: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } } },
+          // delta event with no delta object → no-op branch.
+          { event: "content_block_delta", data: { type: "content_block_delta", index: 0 } },
+          // unknown top-level event type → ignored.
+          { event: "some_future_event", data: { type: "some_future_event" } },
+          // data with no `type` → ignored.
+          { data: { note: "no type field" } },
+          { event: "message_stop", data: { type: "message_stop" } }
+        ],
+        { terminateLast: false }
+      )
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {});
+      expect(result.text).toBe("done");
+      expect(result.toolCalls).toHaveLength(0);
+      expect(result.finishReason).toBe("unknown");
+      expect(result.responseId).toBe("msg_u");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("generateTaskSummary routes anthropic and falls back on empty text", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    try {
+      const withText = installFetch(() =>
+        anthropicJson({ id: "s1", type: "message", role: "assistant", content: [{ type: "text", text: "Summary here." }], stop_reason: "end_turn", usage: {} })
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        const result = await generateTaskSummary(config(provider), "summarize");
+        expect(result.text).toBe("Summary here.");
+        expect(result.provider.name).toBe("anthropic");
+        expect(withText.calls[0]!.url).toBe("https://api.anthropic.com/v1/messages");
+      } finally {
+        withText.restore();
+      }
+      const empty = installFetch(() =>
+        anthropicJson({ id: "s2", type: "message", role: "assistant", content: [], stop_reason: "end_turn", usage: {} })
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        const result = await generateTaskSummary(config(provider), "summarize");
+        expect(result.text).toBe("The model returned no text output.");
+      } finally {
+        empty.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test("generateStructured (anthropic): plain JSON, fenced JSON, and invalid JSON", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const validator = { parse: (v: unknown) => v as { ok: boolean } };
+    try {
+      const plain = installFetch(() =>
+        anthropicJson({ id: "j1", type: "message", role: "assistant", content: [{ type: "text", text: '{"ok":true}' }], stop_reason: "end_turn", usage: {} })
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        const out = await generateStructured(config(provider), { system: "s", user: "u", schemaName: "Thing", validator });
+        expect(out.data).toEqual({ ok: true });
+        expect(out.raw).toBe('{"ok":true}');
+      } finally {
+        plain.restore();
+      }
+
+      const fenced = installFetch(() =>
+        anthropicJson({ id: "j2", type: "message", role: "assistant", content: [{ type: "text", text: '```json\n{"ok":false}\n```' }], stop_reason: "end_turn", usage: {} })
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        const out = await generateStructured(config(provider), { system: "s", user: "u", schemaName: "Thing", validator });
+        expect(out.data).toEqual({ ok: false });
+      } finally {
+        fenced.restore();
+      }
+
+      const bad = installFetch(() =>
+        anthropicJson({ id: "j3", type: "message", role: "assistant", content: [{ type: "text", text: "not json" }], stop_reason: "end_turn", usage: {} })
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        await expect(
+          generateStructured(config(provider), { system: "s", user: "u", schemaName: "Thing", validator })
+        ).rejects.toThrow("was not valid JSON");
+      } finally {
+        bad.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test("generateVisionAnalysis (anthropic) sends an image block with the per-call max_tokens", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ id: "v1", type: "message", role: "assistant", content: [{ type: "text", text: "a cat" }], stop_reason: "end_turn", usage: { input_tokens: 3, output_tokens: 2 } })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const result = await generateVisionAnalysis(config(provider), {
+        prompt: "what is this?",
+        imageBase64: "ZZZZ",
+        mimeType: "image/png",
+        maxTokens: 64
+      });
+      expect(result.text).toBe("a cat");
+      const sent = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(sent.max_tokens).toBe(64);
+      expect(sent.system).toBeUndefined();
+      expect(sent.messages[0].content).toEqual([
+        { type: "text", text: "what is this?" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "ZZZZ" } }
+      ]);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("anthropic sends the model id verbatim (first-party; no Bedrock prefix mapping)", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const stub = installFetch(() =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })
+    );
+    try {
+      await generateToolCallingResponse(
+        config(normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" })),
+        [{ role: "user", content: "hi" }],
+        []
+      );
+      expect(JSON.parse(String(stub.calls[0]!.init.body)).model).toBe("claude-opus-4-8");
+    } finally {
+      stub.restore();
+      restoreEnv();
+    }
+  });
+
+  test("catalog 'configured' honors a custom apiKeyEnv for the active provider", () => {
+    const restoreCanonical = setEnv("ANTHROPIC_API_KEY", undefined);
+    const restoreCustom = setEnv("BEDROCK_BEARER_TOKEN", "bedrock-token");
+    // Force-clear the "missing" probe name so the negative assertion never
+    // depends on a stray value in the ambient/CI environment.
+    const restoreMissing = setEnv("GINI_TEST_UNSET_BEARER", undefined);
+    try {
+      // Canonical var unset + not the active provider → not configured.
+      expect(isProviderConfigured("anthropic")).toBe(false);
+      // Active anthropic whose custom apiKeyEnv env var IS set → configured.
+      expect(isProviderConfigured("anthropic", "anthropic", "BEDROCK_BEARER_TOKEN")).toBe(true);
+      expect(
+        providerCatalogWithStatus("anthropic", "BEDROCK_BEARER_TOKEN").find((p) => p.name === "anthropic")?.configured
+      ).toBe(true);
+      // Active anthropic but the named custom env var is unset → not configured.
+      expect(isProviderConfigured("anthropic", "anthropic", "GINI_TEST_UNSET_BEARER")).toBe(false);
+    } finally {
+      restoreMissing();
+      restoreCustom();
+      restoreCanonical();
+    }
+  });
+
+  test("active custom apiKeyEnv: a stray canonical key does not mask a missing custom key", () => {
+    // The active provider reads its bearer from BEDROCK_BEARER_TOKEN (unset);
+    // a present-but-irrelevant ANTHROPIC_API_KEY must NOT make the badge lie —
+    // providerHealth/readAnthropicKey both gate on the custom var, so the
+    // catalog badge has to agree (not fall through to the canonical var).
+    const restoreCanonical = setEnv("ANTHROPIC_API_KEY", "sk-ant-stray");
+    const restoreCustom = setEnv("BEDROCK_BEARER_TOKEN", undefined);
+    try {
+      expect(isProviderConfigured("anthropic", "anthropic", "BEDROCK_BEARER_TOKEN")).toBe(false);
+      expect(
+        providerCatalogWithStatus("anthropic", "BEDROCK_BEARER_TOKEN").find((p) => p.name === "anthropic")?.configured
+      ).toBe(false);
+    } finally {
+      restoreCustom();
+      restoreCanonical();
+    }
+  });
+
+  test("bedrock: SigV4-signs the Converse request (no x-api-key) and sends the converse body", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+    const restoreRegion = setEnv("AWS_REGION", undefined);
+    const restoreDef = setEnv("AWS_DEFAULT_REGION", undefined);
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+        stopReason: "end_turn",
+        usage: { inputTokens: 3, outputTokens: 1, totalTokens: 4 }
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      const call = fetchStub.calls[0]!;
+      // modelId path segment is encodeURIComponent'd (':' -> %3A); non-stream op.
+      expect(call.url).toBe("https://bedrock-runtime.us-east-1.amazonaws.com/model/us.amazon.nova-pro-v1%3A0/converse");
+      const headers = call.init.headers as Record<string, string>;
+      expect(headers["x-api-key"]).toBeUndefined();
+      expect(headers["authorization"]).toMatch(
+        /^AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE\/\d{8}\/us-east-1\/bedrock\/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=[0-9a-f]{64}$/
+      );
+      expect(headers["x-amz-date"]).toMatch(/^\d{8}T\d{6}Z$/);
+      const body = JSON.parse(String(call.init.body));
+      expect(body.messages).toEqual([{ role: "user", content: [{ text: "hi" }] }]);
+      expect(body.inferenceConfig.maxTokens).toBeGreaterThan(0);
+      expect(result.text).toBe("ok");
+      expect(result.usage).toMatchObject({ input_tokens: 3, output_tokens: 1, total_tokens: 4 });
+    } finally {
+      fetchStub.restore();
+      restoreDef();
+      restoreRegion();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: hoists system, maps tools to toolConfig, and parses a toolUse response", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        output: { message: { role: "assistant", content: [{ toolUse: { toolUseId: "tu_1", name: "lookup", input: { q: "x" } } }] } },
+        stopReason: "tool_use",
+        usage: {}
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.anthropic.claude-opus-4-8", awsRegion: "us-east-1" });
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "lookup", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "system", content: "sys" }, { role: "user", content: "go" }],
+        tools
+      );
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(body.system).toEqual([{ text: "sys" }]);
+      expect(body.toolConfig.tools[0].toolSpec).toMatchObject({ name: "lookup", inputSchema: { json: { type: "object" } } });
+      expect(body.toolConfig.toolChoice).toEqual({ auto: {} });
+      expect(result.finishReason).toBe("tool_calls");
+      expect(result.toolCalls[0]).toMatchObject({ id: "tu_1", function: { name: "lookup", arguments: JSON.stringify({ q: "x" }) } });
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: omits toolConfig for DeepSeek (which rejects tool use) even when tools are loaded", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        output: { message: { role: "assistant", content: [{ text: "no tools here" }] } },
+        stopReason: "end_turn",
+        usage: {}
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.deepseek.r1-v1:0", awsRegion: "us-east-1" });
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "lookup", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "go" }],
+        tools
+      );
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      // DeepSeek R1 Converse returns a ValidationException if toolConfig is sent,
+      // so a normal tool-loaded turn must degrade to text-only rather than 400.
+      expect(body.toolConfig).toBeUndefined();
+      expect(result.text).toBe("no tools here");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: streams converse-stream text deltas and tool-use, mapping stop + usage", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const seen: string[] = [];
+    const fetchStub = installFetch(() =>
+      converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "Hel" } } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "lo" } } },
+        { type: "contentBlockStop", payload: { contentBlockIndex: 0 } },
+        { type: "contentBlockStart", payload: { contentBlockIndex: 1, start: { toolUse: { toolUseId: "tu_9", name: "fetch" } } } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 1, delta: { toolUse: { input: "{\"u\":1}" } } } },
+        { type: "contentBlockStop", payload: { contentBlockIndex: 1 } },
+        { type: "messageStop", payload: { stopReason: "tool_use" } },
+        { type: "metadata", payload: { usage: { inputTokens: 7, outputTokens: 2, totalTokens: 9 } } }
+      ])
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-lite-v1:0", awsRegion: "us-east-1" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], (d) => seen.push(d));
+      expect(fetchStub.calls[0]!.url).toContain("/converse-stream");
+      expect(seen.join("")).toBe("Hello");
+      expect(result.text).toBe("Hello");
+      expect(result.finishReason).toBe("tool_calls");
+      expect(result.toolCalls[0]).toMatchObject({ id: "tu_9", function: { name: "fetch", arguments: "{\"u\":1}" } });
+      expect(result.usage).toMatchObject({ input_tokens: 7, output_tokens: 2 });
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: Llama 4 drops to non-stream Converse when tools are attached", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const seen: string[] = [];
+    const fetchStub = installFetch(() =>
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "hi from llama" }] } }, stopReason: "end_turn", usage: {} })
+    );
+    try {
+      // Llama 4 can't carry toolConfig on a streaming request ("tool use in
+      // streaming mode"), so a tool-loaded turn must use non-stream /converse —
+      // and the tools are still attached (Llama 4 supports tools when not streaming).
+      const provider = normalizeProvider({ name: "bedrock", model: "us.meta.llama4-scout-17b-instruct-v1:0", awsRegion: "us-east-1" });
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "lookup", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], tools, (d) => seen.push(d));
+      const url = fetchStub.calls[0]!.url;
+      expect(url.endsWith("/converse")).toBe(true);
+      expect(url).not.toContain("converse-stream");
+      expect(JSON.parse(String(fetchStub.calls[0]!.init.body)).toolConfig).toBeDefined();
+      expect(result.text).toBe("hi from llama");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: Llama 4 still streams a tool-less turn", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const seen: string[] = [];
+    const fetchStub = installFetch(() =>
+      converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "Hi" } } },
+        { type: "contentBlockStop", payload: { contentBlockIndex: 0 } },
+        { type: "messageStop", payload: { stopReason: "end_turn" } },
+        { type: "metadata", payload: { usage: { inputTokens: 5, outputTokens: 1, totalTokens: 6 } } }
+      ])
+    );
+    try {
+      // Without tools there's no streaming/tool conflict, so Llama 4 streams.
+      const provider = normalizeProvider({ name: "bedrock", model: "us.meta.llama4-scout-17b-instruct-v1:0", awsRegion: "us-east-1" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], (d) => seen.push(d));
+      expect(fetchStub.calls[0]!.url).toContain("/converse-stream");
+      expect(seen.join("")).toBe("Hi");
+      expect(result.text).toBe("Hi");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: a converse-stream exception frame throws", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      converseEventStream([{ type: "throttlingException", messageType: "exception", payload: { message: "slow down" } }])
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-lite-v1:0", awsRegion: "us-east-1" });
+      await expect(
+        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], () => {})
+      ).rejects.toThrow(/slow down/);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: a non-OK converse response surfaces the error message", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() => anthropicJson({ message: "ValidationException: bad model id" }, 400));
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-lite-v1:0", awsRegion: "us-east-1" });
+      await expect(
+        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
+      ).rejects.toThrow(/bad model id/);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: providerHealth is configured when AWS credentials resolve", () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    try {
+      const health = providerHealth(config(normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" })));
+      expect(health.configured).toBe(true);
+      expect(health.message).toContain("AWS SigV4");
+    } finally {
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: providerHealth not-configured and errors when no AWS credentials resolve", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", undefined);
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", undefined);
+    const restoreFile = setEnv("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/gini-test/credentials");
+    const restoreProfile = setEnv("AWS_PROFILE", undefined);
+    const fetchStub = installFetch(() => anthropicJson({}));
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1" });
+      const health = providerHealth(config(provider));
+      expect(health.configured).toBe(false);
+      expect(health.message).toMatch(/Set AWS credentials/);
+      // Must surface as a typed ProviderAuthError("bedrock") so the chat-task
+      // classifier routes it to the AWS reauth CTA, not a generic failure.
+      const err = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []).catch(
+        (e) => e
+      );
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("bedrock");
+      expect((err as Error).message).toMatch(/needs AWS credentials/);
+      expect(providerReauth("bedrock")).toEqual({ kind: "aws", url: "/settings" });
+    } finally {
+      fetchStub.restore();
+      restoreProfile();
+      restoreFile();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: defaults region to us-east-1 and signs vision (image) content", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const restoreRegion = setEnv("AWS_REGION", undefined);
+    const restoreDef = setEnv("AWS_DEFAULT_REGION", undefined);
+    const fetchStub = installFetch(() =>
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "a cat" }] } }, stopReason: "end_turn", usage: {} })
+    );
+    try {
+      // No awsRegion set → normalizeProvider defaults to us-east-1.
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" });
+      const result = await generateVisionAnalysis(config(provider), {
+        prompt: "what is this",
+        imageBase64: "aGVsbG8=",
+        mimeType: "image/png"
+      });
+      const call = fetchStub.calls[0]!;
+      expect(call.url).toBe("https://bedrock-runtime.us-east-1.amazonaws.com/model/us.amazon.nova-pro-v1%3A0/converse");
+      const body = JSON.parse(String(call.init.body));
+      expect(body.messages[0].content).toEqual([
+        { text: "what is this" },
+        { image: { format: "png", source: { bytes: "aGVsbG8=" } } }
+      ]);
+      expect(result.text).toBe("a cat");
+    } finally {
+      fetchStub.restore();
+      restoreDef();
+      restoreRegion();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: structured output parses JSON returned via Converse", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        output: { message: { role: "assistant", content: [{ text: "```json\n{\"ok\":true}\n```" }] } },
+        stopReason: "end_turn",
+        usage: {}
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1" });
+      const result = await generateStructured(config(provider), {
+        system: "s",
+        user: "u",
+        schemaName: "T",
+        validator: { parse: (v: unknown) => v as { ok: boolean } }
+      });
+      expect(result.data).toEqual({ ok: true });
+      expect(fetchStub.calls[0]!.url).toContain("/converse");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: isValidAwsRegion accepts region tokens and rejects URL-injection", () => {
+    expect(isValidAwsRegion("us-east-1")).toBe(true);
+    expect(isValidAwsRegion("ap-southeast-2")).toBe(true);
+    expect(isValidAwsRegion("us-east-1/evil")).toBe(false);
+    expect(isValidAwsRegion("x.evil.com")).toBe(false);
+    expect(isValidAwsRegion("a@b")).toBe(false);
+    expect(isValidAwsRegion("")).toBe(false);
+  });
+
+  test("bedrock: AWS_REGION is honored at request time, not baked into the normalized config", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const restoreRegion = setEnv("AWS_REGION", "eu-west-1");
+    const restoreDef = setEnv("AWS_DEFAULT_REGION", undefined);
+    const fetchStub = installFetch(() =>
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "ok" }] } }, stopReason: "end_turn", usage: {} })
+    );
+    try {
+      const p = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" });
+      // No explicit region → the env is NOT frozen into config (no leak); the
+      // informational baseUrl falls back to the built-in default.
+      expect(p.awsRegion).toBeUndefined();
+      expect(p.baseUrl).toBe("https://bedrock-runtime.us-east-1.amazonaws.com");
+      // But a real request resolves AWS_REGION at call time, so a later env
+      // change still takes effect.
+      await generateToolCallingResponse(config(p), [{ role: "user", content: "hi" }], []);
+      expect(fetchStub.calls[0]!.url).toBe(
+        "https://bedrock-runtime.eu-west-1.amazonaws.com/model/us.amazon.nova-pro-v1%3A0/converse"
+      );
+    } finally {
+      fetchStub.restore();
+      restoreDef();
+      restoreRegion();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: providerHealth surfaces the env-aware request host so display can't drift from requests", () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const restoreRegion = setEnv("AWS_REGION", "eu-west-1");
+    const restoreDef = setEnv("AWS_DEFAULT_REGION", undefined);
+    try {
+      // No explicit awsRegion is persisted, but AWS_REGION is set — the displayed
+      // baseUrl must match where requests actually go (eu-west-1), not the
+      // us-east-1 default the env-free normalized config would otherwise show.
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" });
+      expect(provider.awsRegion).toBeUndefined();
+      expect(provider.baseUrl).toBe("https://bedrock-runtime.us-east-1.amazonaws.com");
+      const health = providerHealth(config(provider));
+      expect(health.provider.baseUrl).toBe("https://bedrock-runtime.eu-west-1.amazonaws.com");
+    } finally {
+      restoreDef();
+      restoreRegion();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: a malformed awsRegion is rejected before any request is built", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() => anthropicJson({}));
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1/evil.example" });
+      await expect(
+        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
+      ).rejects.toThrow(/awsRegion is invalid/);
+      expect(fetchStub.calls.length).toBe(0);
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("strips a trailing /v1 from the baseUrl so the request path doesn't double", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const cases: Array<[string | undefined, string]> = [
+      [undefined, "https://api.anthropic.com/v1/messages"],
+      ["https://api.anthropic.com/v1", "https://api.anthropic.com/v1/messages"],
+      ["https://api.anthropic.com/v1/messages", "https://api.anthropic.com/v1/messages"],
+      ["https://bedrock-mantle.us-east-1.api.aws/anthropic", "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages"]
+    ];
+    try {
+      for (const [base, expected] of cases) {
+        const stub = installFetch(() =>
+          anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })
+        );
+        try {
+          const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8", ...(base ? { baseUrl: base } : {}) });
+          await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+          expect(stub.calls[0]!.url).toBe(expected);
+        } finally {
+          stub.restore();
+        }
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe("codex no-tools dispatch", () => {
+  test("routes through stitchSystemFromMessages + /responses when tools are empty", async () => {
+    const { restore } = installCodexAuth("codex-no-tools");
+    const fetchStub = installFetch(() =>
+      anthropicSse([{ data: { type: "response.output_text.delta", delta: "Hi there" } }])
+    );
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [
+          { role: "system", content: "sys one" },
+          { role: "system", content: "sys two" },
+          { role: "user", content: "hello" }
+        ],
+        []
+      );
+      expect(result.text).toBe("Hi there");
+      expect(result.toolCalls).toHaveLength(0);
+      expect(result.finishReason).toBe("stop");
+      expect(fetchStub.calls[0]!.url).toContain("/responses");
+    } finally {
+      fetchStub.restore();
+      restore();
+    }
   });
 });

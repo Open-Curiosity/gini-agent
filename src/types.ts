@@ -23,7 +23,7 @@ export type SkillStatus = "enabled" | "disabled" | "archived";
 
 export type JobStatus = "active" | "paused" | "failed";
 
-export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local" | "deepseek" | "azure";
+export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local" | "deepseek" | "anthropic" | "bedrock" | "azure";
 
 export type ImprovementStatus = "proposed" | "approved" | "rejected" | "applied";
 
@@ -168,6 +168,11 @@ export interface ProviderConfig {
   model: string;
   baseUrl?: string;
   apiKeyEnv?: string;
+  // SigV4 signing region for the `bedrock` provider. normalizeProvider resolves
+  // it from this field, else AWS_REGION, else AWS_DEFAULT_REGION, else a built-in
+  // default (us-east-1); the Converse host is then derived from it. Ignored by
+  // every other provider.
+  awsRegion?: string;
   // Provider-specific request fields merged into chat-completions request
   // bodies (tool-calling, structured JSON, vision, and the chat-completions
   // branch of generateTaskSummary). The local, openrouter, deepseek, and azure
@@ -175,7 +180,9 @@ export interface ProviderConfig {
   // everywhere for them (including the summary call). The openai provider uses
   // /responses for generateTaskSummary, so extraBody only applies on its
   // tool-calling, structured, and vision calls. Codex uses /responses with its
-  // own shape and ignores extraBody; echo bypasses HTTP entirely.
+  // own shape and ignores extraBody; echo bypasses HTTP entirely. The anthropic
+  // provider merges extraBody into its native Messages request body too (and
+  // extraBody.max_tokens overrides the runtime's default Messages max_tokens).
   //
   // Reserved keys are stripped at send time so extraBody can never override
   // runtime-controlled fields. The base denylist covers fields the runtime
@@ -515,8 +522,9 @@ export interface SystemNoteAuthError {
   // Where the CTA sends the user to re-establish the credential. "docs" → the
   // hosted step-through (OAuth/CLI providers like codex, whose re-auth is a
   // non-obvious terminal flow); "settings" → the in-app Settings → Providers
-  // key form (API-key providers). See ADR provider-reauth-guidance.md.
-  reauthKind: "docs" | "settings";
+  // key form (API-key providers); "aws" → Settings, but worded for AWS
+  // credentials (bedrock has no key). See ADR provider-reauth-guidance.md.
+  reauthKind: "docs" | "settings" | "aws";
   reauthUrl: string;
 }
 
@@ -1180,7 +1188,7 @@ export interface ProviderCatalogItem {
   name: ProviderName | "openrouter" | "local" | string;
   displayName: string;
   baseUrl?: string;
-  auth: "none" | "env" | "codex-oauth";
+  auth: "none" | "env" | "codex-oauth" | "aws";
   models: string[];
   capabilities: string[];
   costHint: "free" | "external" | "unknown";

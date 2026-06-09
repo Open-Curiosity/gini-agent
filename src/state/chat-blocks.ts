@@ -240,7 +240,7 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
             provider: raw.provider as ProviderName,
             providerLabel: String(raw.providerLabel ?? raw.provider ?? ""),
             detail: String(raw.detail ?? ""),
-            reauthKind: raw.reauthKind === "docs" ? "docs" : "settings",
+            reauthKind: raw.reauthKind === "docs" || raw.reauthKind === "aws" ? raw.reauthKind : "settings",
             reauthUrl: typeof raw.reauthUrl === "string" ? raw.reauthUrl : "/settings"
           }
         : undefined;

@@ -21,7 +21,7 @@ import {
   DialogDescription,
   DialogTitle
 } from "@/components/ui/dialog";
-import { AzureLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
+import { AnthropicLogo, AzureLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
 import { EditProviderDialog } from "./EditProviderDialog";
@@ -29,13 +29,14 @@ import { EditProviderDialog } from "./EditProviderDialog";
 // Providers whose credentials are env-keyed and therefore safe to remove
 // from this UI: scrubbing the env var + secrets.env line is reversible
 // (the user can add it back). Codex is owned by the codex CLI and local
-// has no key to clear, so neither row exposes the trash button. Azure is
-// excluded too: its row only renders while it is the active provider (it has
-// no default endpoint, so an inactive azure config isn't "configured"), and
-// the trash button is disabled for the active row — a permanently-dead
-// affordance. Azure is managed by switch + re-add via Add Provider; key
-// cleanup is the CLI `gini provider` path.
-const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek"]);
+// has no key to clear; bedrock signs with ~/.aws credentials gini doesn't
+// manage — so neither row exposes the trash button. Azure is excluded too:
+// its row only renders while it is the active provider (it has no default
+// endpoint, so an inactive azure config isn't "configured"), and the trash
+// button is disabled for the active row — a permanently-dead affordance.
+// Azure is managed by switch + re-add via Add Provider; key cleanup is the
+// CLI `gini provider` path.
+const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek", "anthropic"]);
 
 export interface ProviderCatalogItem {
   id: string;
@@ -64,7 +65,7 @@ export function displayProviderName(item: { displayName: string; name: string })
 // Providers selectable on the Settings page. Echo is dev-only; the four
 // real providers map onto the Pencil mock (Codex, OpenAI, DeepSeek, Ollama
 // stand in for `local`).
-const SELECTABLE_PROVIDERS = ["codex", "openai", "deepseek", "openrouter", "azure", "local"] as const;
+const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "bedrock", "deepseek", "openrouter", "azure", "local"] as const;
 
 // Per-provider visual identity. Brand logos for OpenAI/DeepSeek/Ollama
 // come from the authoritative Pencil design file; codex (Terminal) and
@@ -73,6 +74,8 @@ const SELECTABLE_PROVIDERS = ["codex", "openai", "deepseek", "openrouter", "azur
 const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: string }>; authLabel: string }> = {
   codex: { icon: TerminalIcon, authLabel: "OAuth" },
   openai: { icon: OpenAILogo, authLabel: "API key" },
+  anthropic: { icon: AnthropicLogo, authLabel: "API key" },
+  bedrock: { icon: BedrockLogo, authLabel: "AWS" },
   deepseek: { icon: DeepSeekLogo, authLabel: "API key" },
   openrouter: { icon: ZapIcon, authLabel: "API key" },
   azure: { icon: AzureLogo, authLabel: "API key" },
@@ -88,11 +91,15 @@ export function ProviderCard({
   catalog,
   activeProviderName,
   activeProviderModel,
+  activeProviderAwsRegion,
   activeProvider
 }: {
   catalog: ProviderCatalogItem[];
   activeProviderName?: string;
   activeProviderModel?: string;
+  // Active bedrock provider's region — threaded into the Edit dialog so it
+  // opens pre-filled.
+  activeProviderAwsRegion?: string;
   // Full persisted config for the ACTIVE provider (from /status). Carries the
   // transport fields the static catalog doesn't — baseUrl + Azure routing —
   // so the Edit dialog can prefill them when editing the active row.
@@ -199,6 +206,7 @@ export function ProviderCard({
             : "border-border";
           const visual = PROVIDER_VISUAL[row.name] ?? { icon: TerminalIcon, authLabel: row.auth };
           const Icon = visual.icon;
+          const authLabel = visual.authLabel;
           const model = isActive
             ? (activeProviderModel ?? row.models[0] ?? "")
             : (row.models[0] ?? "");
@@ -247,7 +255,7 @@ export function ProviderCard({
                 <div className="flex items-center gap-2.5">
                   <span className="text-[15px] font-semibold text-foreground">{displayProviderName(row)}</span>
                   <span className="rounded-md bg-muted px-2 py-0.5 text-[11px] font-semibold text-muted-foreground">
-                    {visual.authLabel}
+                    {authLabel}
                   </span>
                   {isActive ? (
                     <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-[11px] font-semibold text-emerald-600 dark:bg-[#14321F] dark:text-[#4ADE80]">
@@ -354,6 +362,8 @@ export function ProviderCard({
           authLabel={PROVIDER_VISUAL[editingRow.name]?.authLabel ?? editingRow.auth}
           icon={PROVIDER_VISUAL[editingRow.name]?.icon ?? TerminalIcon}
           currentModel={editingRow.name === activeProviderName ? activeProviderModel : undefined}
+          // Active bedrock region — prefilled only when editing the ACTIVE row.
+          currentAwsRegion={editingRow.name === activeProviderName ? activeProviderAwsRegion : undefined}
           // Prefill transport fields only when editing the ACTIVE row — the
           // persisted config from /status describes the active provider only.
           activeConfig={editingRow.name === activeProviderName ? activeProvider : undefined}

@@ -285,6 +285,24 @@ describe("buildToolCatalog", () => {
     expect(tool?.function.parameters.required).toEqual(["jobId"]);
   });
 
+  test("set_provider's model-facing schema offers bedrock + awsRegion + azure routing; baseUrl is documented as ignored for anthropic/bedrock", () => {
+    // This is the schema the MODEL actually sees (the SELF_OPERATIONS schema is
+    // documentation-only). It offers bedrock + awsRegion and azure transport
+    // fields. baseUrl exists because azure requires its per-resource endpoint,
+    // but is documented as ignored for anthropic/bedrock — an env-keyed
+    // provider's key is sent to whatever baseUrl is configured, so a model
+    // repointing the first-party Anthropic endpoint would be a key-exfil vector.
+    const state = stateWithToolsets([]);
+    const catalog = buildToolCatalog(state);
+    const tool = catalog.find((t) => t.function.name === "set_provider");
+    expect(tool).toBeDefined();
+    const props = tool!.function.parameters.properties as Record<string, { description?: string }>;
+    expect(Object.keys(props).sort()).toEqual(["apiKey", "apiVersion", "authScheme", "awsRegion", "baseUrl", "deployment", "model", "provider"]);
+    expect(props.provider?.description).toContain("bedrock");
+    expect(props.awsRegion?.description).toContain("bedrock");
+    expect(props.baseUrl?.description).toContain("Ignored for codex/echo/anthropic/bedrock");
+  });
+
   test("skill_run is always-on with the expected required args", () => {
     // skill_run is the generic dispatch surface for skill-bundled
     // procedures (signed-URL upload flows, format conversions, multi-

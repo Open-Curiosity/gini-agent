@@ -100,8 +100,75 @@ describe("provider CLI", () => {
   });
 
   test("set rejects unknown provider names", async () => {
-    const ctx = makeCtx(["provider", "set", "anthropic"]);
+    const ctx = makeCtx(["provider", "set", "mistral"]);
     await expect(provider(ctx)).rejects.toThrow(/Usage: gini provider set/);
+  });
+
+  test("set accepts anthropic and persists a Bedrock base URL + custom key env", async () => {
+    const ctx = makeCtx([
+      "provider", "set", "anthropic", "anthropic.claude-opus-4-8",
+      "--base-url", "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      "--api-key-env", "BEDROCK_BEARER_TOKEN"
+    ]);
+    await provider(ctx);
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.name).toBe("anthropic");
+    expect(persisted.provider.model).toBe("anthropic.claude-opus-4-8");
+    expect(persisted.provider.baseUrl).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic");
+    expect(persisted.provider.apiKeyEnv).toBe("BEDROCK_BEARER_TOKEN");
+  });
+
+  test("set bedrock persists the model + AWS region (no api key required)", async () => {
+    const ctx = makeCtx(["provider", "set", "bedrock", "us.amazon.nova-pro-v1:0", "--aws-region", "us-west-2"]);
+    await provider(ctx);
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.name).toBe("bedrock");
+    expect(persisted.provider.model).toBe("us.amazon.nova-pro-v1:0");
+    expect(persisted.provider.awsRegion).toBe("us-west-2");
+    expect(persisted.provider.baseUrl).toBe("https://bedrock-runtime.us-west-2.amazonaws.com");
+  });
+
+  test("set bedrock with no model falls back to the default inference profile", async () => {
+    await provider(makeCtx(["provider", "set", "bedrock"]));
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.name).toBe("bedrock");
+    expect(persisted.provider.model).toBe("us.anthropic.claude-opus-4-8");
+  });
+
+  test("set rejects an unsafe --api-key-env name (shell-injection guard)", async () => {
+    const ctx = makeCtx(["provider", "set", "anthropic", "--api-key-env", "FOO=x; rm -rf /"]);
+    await expect(provider(ctx)).rejects.toThrow(/--api-key-env must be a valid env var name/);
+  });
+
+  test("set anthropic with no model falls back to the catalog default", async () => {
+    await provider(makeCtx(["provider", "set", "anthropic"]));
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.name).toBe("anthropic");
+    expect(persisted.provider.model).toBe("claude-opus-4-8");
+  });
+
+  test("show (default subcommand) prints provider health without a network call", async () => {
+    await provider(makeCtx(["provider"]));
+  });
+
+  test("catalog fetches the providers catalog from the gateway", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(JSON.stringify([{ id: "anthropic", name: "anthropic" }]), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        })
+      )) as unknown as typeof fetch;
+    try {
+      await provider(makeCtx(["provider", "catalog"]));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test("set rejects unknown flags instead of silently ignoring them", async () => {
@@ -281,6 +348,19 @@ describe("provider CLI", () => {
     await expect(provider(ctx)).rejects.toThrow(/https:\/\//);
   });
 
+  test("set anthropic rejects a plaintext custom base URL (key-leak guard)", async () => {
+    const ctx = makeCtx(["provider", "set", "anthropic", "claude-opus-4-8", "--base-url", "http://proxy.example/v1"]);
+    await expect(provider(ctx)).rejects.toThrow(/https:\/\//);
+  });
+
+  test("set anthropic accepts an https custom base URL and a localhost http proxy", async () => {
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    await provider(makeCtx(["provider", "set", "anthropic", "claude-opus-4-8", "--base-url", "https://anthropic.gateway.internal/v1"]));
+    expect((JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig).provider.baseUrl).toBe("https://anthropic.gateway.internal/v1");
+    await provider(makeCtx(["provider", "set", "anthropic", "claude-opus-4-8", "--base-url", "http://localhost:8787/v1"]));
+    expect((JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig).provider.baseUrl).toBe("http://localhost:8787/v1");
+  });
+
   test("set azure rejects a hostless base URL (scheme only, no resource host)", async () => {
     // "https://" passes a naive non-empty + https-prefix check but builds a
     // hostless deployment URL that fetch rejects; the guard must catch it.
@@ -297,7 +377,7 @@ describe("provider CLI", () => {
 
   test("set rejects an invalid --api-key-env name before it reaches the secrets writer", async () => {
     const ctx = makeCtx(["provider", "set", "openai", "m", "--api-key-env", "BAD NAME=x"]);
-    await expect(provider(ctx)).rejects.toThrow(/valid environment variable name/);
+    await expect(provider(ctx)).rejects.toThrow(/valid env var name/);
   });
 
   test("Azure routing flags warn on a non-azure provider", async () => {
@@ -321,6 +401,40 @@ describe("provider CLI", () => {
     expect(msg).toContain("--deployment");
     expect(msg).toContain("--auth-scheme");
     expect(msg).toContain("openrouter provider");
+  });
+
+  test("--aws-region warns on a non-bedrock provider", async () => {
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx(["provider", "set", "openai", "m", "--aws-region", "us-west-2"]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    const msg = captured.join("");
+    expect(msg).toContain("--aws-region");
+    expect(msg).toContain("openai provider");
+  });
+
+  test("bedrock with --aws-region emits NO aws-region warning", async () => {
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx(["provider", "set", "bedrock", "us.amazon.nova-lite-v1:0", "--aws-region", "us-west-2"]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    expect(captured.join("")).not.toContain("--aws-region is ignored");
   });
 
   test("azure with its routing flags emits NO azure warning", async () => {

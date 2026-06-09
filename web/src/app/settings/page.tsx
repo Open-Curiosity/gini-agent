@@ -87,6 +87,7 @@ export default function SettingsPage() {
   // user about which entry their "Set active" click changes.
   const activeProviderName = status.data?.provider?.provider?.name;
   const activeProviderModel = status.data?.provider?.provider?.model;
+  const activeProviderAwsRegion = status.data?.provider?.provider?.awsRegion;
   // The full persisted config for the active provider — carries the transport
   // fields (baseUrl + Azure routing) the static catalog doesn't, so the Edit
   // dialog can prefill them.
@@ -100,6 +101,7 @@ export default function SettingsPage() {
           catalog={catalog.data ?? []}
           activeProviderName={activeProviderName}
           activeProviderModel={activeProviderModel}
+          activeProviderAwsRegion={activeProviderAwsRegion}
           activeProvider={activeProvider}
         />
 

@@ -5,7 +5,8 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import { resolveProviderModality } from "./provider-capabilities";
+import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, resolveProviderModality } from "./provider-capabilities";
+import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
 import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -14,6 +15,33 @@ const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_CODEX_AUTH_PATH = "~/.codex/auth.json";
 const DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1";
 const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
+// Anthropic Messages API (first-party Claude). The default baseUrl is the bare
+// host (no /v1) — callAnthropicMessages appends /v1/messages. Auth is the
+// ANTHROPIC_API_KEY (sk-ant…) in the x-api-key header. Amazon Bedrock is a
+// SEPARATE provider (`bedrock`) that speaks the same Messages wire shape but
+// signs with AWS SigV4; see the bedrock constants below.
+const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
+const DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-8";
+// Amazon Bedrock via the model-agnostic Converse API. The `bedrock` provider is
+// NOT Anthropic-specific: Converse (`bedrock-runtime.{region}.amazonaws.com`,
+// SigV4 service "bedrock") speaks one request/response shape across every
+// Bedrock model family — Claude, Amazon Nova, Meta Llama, Mistral, DeepSeek, …
+// It signs with the caller's ~/.aws / AWS_* credentials (the same chain the
+// `aws` CLI uses, no API key). The model id is a cross-region inference-profile
+// id (e.g. "us.amazon.nova-pro-v1:0") sent verbatim in the request path.
+const DEFAULT_BEDROCK_REGION = "us-east-1";
+const DEFAULT_BEDROCK_MODEL = "us.anthropic.claude-opus-4-8";
+function bedrockRuntimeBaseUrl(region: string): string {
+  return `https://bedrock-runtime.${region}.amazonaws.com`;
+}
+const DEFAULT_BEDROCK_BASE_URL = bedrockRuntimeBaseUrl(DEFAULT_BEDROCK_REGION);
+// Pinned API version sent on every Messages request. Verified current on the
+// live versioning docs (newest entry; the SSE-named-events format). Honored by
+// both the first-party API and Claude in Amazon Bedrock.
+const ANTHROPIC_VERSION = "2023-06-01";
+// The Messages API REQUIRES max_tokens. Applied when the caller didn't pin one
+// via extraBody.max_tokens; vision passes a smaller per-call budget.
+const DEFAULT_ANTHROPIC_MAX_TOKENS = 8192;
 // Azure OpenAI has no universal base URL — it is per-resource
 // (https://<resource>.openai.azure.com), so there is no default and a config
 // without one is rejected at the entry boundaries (CLI / setup API /
@@ -50,6 +78,23 @@ export function providerHealth(config: RuntimeConfig) {
       message: credentials.ok
         ? `Codex credentials are available from ${credentials.authPath}.`
         : credentials.message
+    };
+  }
+
+  if (provider.name === "bedrock") {
+    const configured = Boolean(resolveAwsCredentials());
+    // Surface the live request-time host (region resolved env-aware via
+    // bedrockRegion) so the displayed baseUrl can't drift from where requests
+    // are actually signed and sent. This is display-only — config.json still
+    // persists just an explicit region, so reading env here introduces no leak.
+    const displayed = { ...provider, baseUrl: bedrockRuntimeBaseUrl(bedrockRegion(provider)) };
+    return {
+      ok: configured,
+      provider: displayed,
+      configured,
+      message: configured
+        ? "bedrock provider is configured (AWS SigV4)."
+        : "Set AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials) to use the bedrock provider."
     };
   }
 
@@ -91,8 +136,17 @@ const PROVIDER_API_KEY_ENV: Record<string, string> = {
   openrouter: "OPENROUTER_API_KEY",
   deepseek: "DEEPSEEK_API_KEY",
   local: "GINI_LOCAL_API_KEY",
+  anthropic: "ANTHROPIC_API_KEY",
   azure: "AZURE_OPENAI_API_KEY"
 };
+
+// Whether AWS credentials resolve for the `bedrock` provider — env
+// (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY[/AWS_SESSION_TOKEN]) or the
+// ~/.aws/credentials profile. The bedrock analogue of hasUsableCodexCredentials:
+// there's no gini-held secret, so "configured" means the AWS chain has creds.
+export function hasUsableAwsCredentials(): boolean {
+  return Boolean(resolveAwsCredentials());
+}
 
 // Whether a provider has usable credentials in the current process env.
 // echo is dev-only and never reported as configured. codex consults
@@ -109,6 +163,9 @@ export function isProviderConfigured(
 ): boolean {
   if (name === "echo") return false;
   if (name === "codex") return hasUsableCodexCredentials();
+  // bedrock signs with AWS credentials from ~/.aws or AWS_* env (no gini-held
+  // key), mirroring how codex reads ~/.codex/auth.json — configured when they resolve.
+  if (name === "bedrock") return hasUsableAwsCredentials();
   // Azure has no default endpoint, so an env key alone is NOT a usable config —
   // it counts as configured only when azure is the ACTIVE provider AND carries a
   // valid persisted https resource baseUrl. RuntimeConfig persists a single
@@ -122,16 +179,19 @@ export function isProviderConfigured(
     const azureEnv = activeApiKeyEnv || PROVIDER_API_KEY_ENV[name];
     return Boolean(azureEnv && process.env[azureEnv]);
   }
+  // local is a no-auth opt-in: as the active provider it counts as
+  // configured even without a key (most local gateways accept no-auth).
+  // Kept ahead of the custom-apiKeyEnv branch so local never gates on a key.
+  if (name === "local" && activeProviderName === "local") return true;
   // For the active provider, honor a custom apiKeyEnv (e.g. a custom env var set
   // via `gini provider set --api-key-env`) — the same var readOpenAIBearer /
-  // providerHealth read at call time — so a custom-env config isn't reported
-  // unconfigured and silently hidden by the settings UI. Non-active rows carry
-  // no stored config, so they fall back to the per-provider default env var.
+  // providerHealth / readAnthropicKey read at call time — so a custom-env config
+  // isn't reported unconfigured and silently hidden by the settings UI. Non-active
+  // rows carry no stored config, so they fall back to the per-provider default.
   const envVar = name === activeProviderName && activeApiKeyEnv
     ? activeApiKeyEnv
     : PROVIDER_API_KEY_ENV[name];
   if (envVar && process.env[envVar]) return true;
-  if (name === "local" && activeProviderName === "local") return true;
   return false;
 }
 
@@ -181,6 +241,58 @@ export function providerCatalog(): ProviderCatalogItem[] {
       auth: "env",
       models: ["gpt-5.4-mini", "gpt-5.4"],
       capabilities: ["responses", "tool-calling"],
+      costHint: "external"
+    },
+    {
+      // First-party Claude API: ANTHROPIC_API_KEY (sk-ant…) in x-api-key against
+      // api.anthropic.com. Amazon Bedrock is the separate `bedrock` entry below.
+      id: "anthropic",
+      name: "anthropic",
+      displayName: "Anthropic Compatible",
+      baseUrl: DEFAULT_ANTHROPIC_BASE_URL,
+      auth: "env",
+      models: ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
+      capabilities: ["messages", "tool-calling", "streaming", "vision"],
+      costHint: "external"
+    },
+    {
+      // Amazon Bedrock via the model-agnostic Converse API — Claude, Amazon
+      // Nova, Meta Llama, Mistral, DeepSeek, and more behind one transport.
+      // Signed with AWS SigV4 from the caller's ~/.aws / AWS_* credentials (no
+      // API key), so its `auth` is "aws", mirroring how codex is "codex-oauth".
+      // Models are cross-region inference-profile ids sent verbatim to Converse.
+      // The list below is what the picker offers, grouped by family in the UI and
+      // covering the common us/eu/apac geos; the picker also has a custom-id
+      // escape hatch and the runtime accepts any id, so this isn't a hard allowlist.
+      id: "bedrock",
+      name: "bedrock",
+      displayName: "Amazon Bedrock",
+      baseUrl: DEFAULT_BEDROCK_BASE_URL,
+      auth: "aws",
+      models: [
+        "us.anthropic.claude-opus-4-8",
+        "us.anthropic.claude-opus-4-7",
+        "us.anthropic.claude-sonnet-4-6",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "eu.anthropic.claude-sonnet-4-6",
+        "apac.anthropic.claude-sonnet-4-6",
+        "global.anthropic.claude-sonnet-4-6",
+        "us.amazon.nova-premier-v1:0",
+        "us.amazon.nova-pro-v1:0",
+        "us.amazon.nova-lite-v1:0",
+        "us.amazon.nova-micro-v1:0",
+        "eu.amazon.nova-pro-v1:0",
+        "eu.amazon.nova-lite-v1:0",
+        "apac.amazon.nova-pro-v1:0",
+        "apac.amazon.nova-lite-v1:0",
+        "us.meta.llama3-3-70b-instruct-v1:0",
+        "us.meta.llama4-maverick-17b-instruct-v1:0",
+        "us.meta.llama4-scout-17b-instruct-v1:0",
+        "us.mistral.pixtral-large-2502-v1:0",
+        "us.mistral.mistral-large-2407-v1:0",
+        "us.deepseek.r1-v1:0"
+      ],
+      capabilities: ["converse", "tool-calling", "streaming", "vision"],
       costHint: "external"
     },
     {
@@ -242,6 +354,10 @@ export function providerDisplayLabel(name: ProviderName): string {
       return "OpenRouter";
     case "deepseek":
       return "DeepSeek";
+    case "anthropic":
+      return "Anthropic";
+    case "bedrock":
+      return "Amazon Bedrock";
     case "azure":
       return "Azure OpenAI";
     case "local":
@@ -299,6 +415,22 @@ export function isAuthExpiredError(message: string | undefined): boolean {
 export function redactSecrets(text: string): string {
   return text
     .replace(/\bsk-[A-Za-z0-9_-]{6,}/g, "sk-***")
+    // Bedrock Mantle bearer tokens (minted by aws-bedrock-token-generator,
+    // carried in x-api-key) are `bedrock-api-key-<base64>&Version=1` — the
+    // `&`/`=` fall outside the value class below, so match the whole token by
+    // its prefix to mask the base64 body and the &Version tail in one shot.
+    .replace(/\bbedrock-api-key-[^\s"']+/gi, "bedrock-api-key-***")
+    // Long-term Bedrock API keys (IAM service-specific credentials, also carried
+    // in x-api-key) are a single base64 blob beginning `ABSK…` — a different
+    // shape from the short-term token above, so match the prefix and mask the
+    // base64 body. See AWS "Securing Amazon Bedrock API keys".
+    .replace(/\bABSK[A-Za-z0-9+\/]{16,}={0,2}/g, "ABSK***")
+    // AWS SigV4 wire exposure (aws-sigv4 Bedrock path): the access key id
+    // (AKIA…/ASIA…) rides in the Authorization `Credential=`, and the per-request
+    // signature in `Signature=`. Mask both. The secret access key never goes on
+    // the wire — it only derives the signature locally — so it can't leak here.
+    .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "AWS-ACCESS-KEY-***")
+    .replace(/Signature=[0-9a-f]{64}/gi, "Signature=***")
     .replace(/\bBearer\s+[A-Za-z0-9._-]{6,}/gi, "Bearer ***")
     .replace(/\b(api[_-]?key|token|secret|password)(["'\s:=]+)[A-Za-z0-9._-]{6,}/gi, "$1$2***");
 }
@@ -317,7 +449,7 @@ export class ProviderAuthError extends Error {
   }
 }
 
-export type ProviderReauth = { kind: "docs" | "settings"; url: string };
+export type ProviderReauth = { kind: "docs" | "settings" | "aws"; url: string };
 
 // Hosted documentation root. Re-auth step-throughs for OAuth/CLI providers live
 // here so the instructions have a single source and never drift from code.
@@ -325,11 +457,13 @@ const DOCS_BASE_URL = "https://gini.lilaclabs.ai/docs";
 
 // Where to send the user to re-establish a failed provider credential. OAuth/
 // CLI providers (codex) have no in-app form and a non-obvious terminal flow, so
-// they link to the hosted step-through docs. API-key providers link straight to
+// they link to the hosted step-through docs. AWS providers (bedrock) sign with
+// AWS credentials and have no in-app key form either, so they point at Settings
+// but describe credentials rather than a key. API-key providers link straight to
 // the Settings → Providers key form — the specific cause is already in the
 // provider's own 401/403 message (surfaced as the note's detail), so no doc is
-// needed. The OAuth-vs-API-key split is read from the catalog's `auth` field,
-// not re-encoded here. See ADR provider-reauth-guidance.md.
+// needed. The auth split is read from the catalog's `auth` field, not re-encoded
+// here. See ADR provider-reauth-guidance.md.
 export function providerReauth(name: ProviderName): ProviderReauth {
   const entry = providerCatalog().find((item) => item.name === name);
   if (entry?.auth === "codex-oauth") {
@@ -338,6 +472,7 @@ export function providerReauth(name: ProviderName): ProviderReauth {
     // resolves both in-repo and on the hosted docs site.
     return { kind: "docs", url: `${DOCS_BASE_URL}/providers/${name}#re-authentication` };
   }
+  if (entry?.auth === "aws") return { kind: "aws", url: "/settings" };
   return { kind: "settings", url: "/settings" };
 }
 
@@ -365,6 +500,11 @@ export function providerAuthNote(
 // for the web note, which renders the CTA separately.
 export function providerAuthFailureText(providerLabel: string, reauth?: ProviderReauth): string {
   const base = `${providerLabel} authentication failed.`;
+  // AWS providers sign with credentials, not an API key — never tell the user to
+  // "update a key" they don't have.
+  if (reauth?.kind === "aws") {
+    return `${base} Check your AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials) to continue.`;
+  }
   if (!reauth) return `${base} Re-authenticate ${providerLabel} to continue.`;
   return reauth.kind === "docs"
     ? `${base} Re-authenticate ${providerLabel} to continue: ${reauth.url}`
@@ -560,6 +700,14 @@ export async function generateToolCallingResponse(
       usage: text.usage,
       cost: text.cost
     };
+  }
+
+  if (provider.name === "anthropic") {
+    return callAnthropicMessages(provider, messages, tools, onDelta);
+  }
+
+  if (provider.name === "bedrock") {
+    return callBedrockConverse(provider, messages, tools, onDelta);
   }
 
   return callToolCallingChatCompletions(provider, messages, tools, onDelta);
@@ -1242,6 +1390,950 @@ async function readResponsesToolCallingStream(
   }
 }
 
+// ---------------- Anthropic Messages API ----------------
+//
+// Native /v1/messages provider. ONE builder serves both the first-party
+// Claude API and Claude in Amazon Bedrock — they share an identical wire
+// shape and both authenticate with a token in the x-api-key header. The only
+// per-target differences are the configured baseUrl (the user includes the
+// "/anthropic" path prefix for Bedrock Mantle) and which env var holds the
+// token (apiKeyEnv). We deliberately do NOT use the OpenAI-compatibility shim
+// (api.anthropic.com/v1/chat/completions): it drops prompt caching and ignores
+// tool `strict`, and Bedrock Mantle doesn't expose it at all.
+//
+// Mirrors callToolCallingChatCompletions/callToolCallingResponses: stream when
+// onDelta is present, otherwise parse the JSON body. No codex-style session
+// retry — an env-var key has no rotation surface.
+async function callAnthropicMessages(
+  provider: ProviderConfig,
+  messages: ToolCallingMessage[],
+  tools: ToolFunctionSpec[],
+  onDelta?: (text: string) => void,
+  // Per-call output-token override. Vision passes its small budget; the chat
+  // loop omits it and the default (or extraBody.max_tokens) applies.
+  maxTokensOverride?: number
+): Promise<ToolCallingResult> {
+  const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
+  // The builder owns the /v1/messages path. Tolerate a baseUrl that already
+  // carries it (a common habit from OpenAI-style baseUrls that include /v1) by
+  // stripping a trailing /v1 or /v1/messages first, so it never doubles into
+  // /v1/v1/messages. This normalization applies to every anthropic-path target,
+  // including a Bedrock Mantle Messages baseUrl.
+  const messagesUrl = `${baseUrl.replace(/\/v1(\/messages)?$/, "")}/v1/messages`;
+  const wantStream = Boolean(onDelta);
+  const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
+  const { system, messages: anthropicMessages } = translateMessagesToAnthropic(safeMessages);
+  const extras = sanitizeExtraBody(provider.extraBody, ANTHROPIC_RESERVED_EXTRA_BODY_KEYS);
+  const resolvedMaxTokens =
+    maxTokensOverride ?? (typeof extras.max_tokens === "number" ? extras.max_tokens : DEFAULT_ANTHROPIC_MAX_TOKENS);
+  const body: Record<string, unknown> = {
+    ...extras,
+    model: provider.model,
+    messages: anthropicMessages,
+    max_tokens: resolvedMaxTokens,
+    stream: wantStream
+  };
+  // `system` is stripped from extras by ANTHROPIC_RESERVED_EXTRA_BODY_KEYS, so
+  // the hoisted system prompt is the only source of body.system. On a turn with
+  // no system messages, body.system is simply omitted — a stray
+  // extraBody.system can no longer leak through, independent of spread order.
+  if (system.length > 0) body.system = system;
+  const anthropicTools = translateToolsToAnthropic(tools);
+  if (anthropicTools.length > 0) {
+    body.tools = anthropicTools;
+    body.tool_choice = { type: "auto" };
+  }
+
+  const bodyJson = JSON.stringify(body);
+  const response = await fetch(messagesUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "anthropic-version": ANTHROPIC_VERSION,
+      ...(wantStream ? { accept: "text/event-stream" } : {}),
+      ...anthropicAuthHeaders(provider)
+    },
+    body: bodyJson
+  });
+
+  if (wantStream) {
+    return readAnthropicMessagesStream(response, provider, onDelta);
+  }
+
+  const rawPayload = await response.text();
+  const payload = parseJsonObject(rawPayload);
+  if (!response.ok) {
+    const fallback = rawPayload.slice(0, 500) || `Anthropic request failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  return parseAnthropicMessage(payload, provider);
+}
+
+// First-party Anthropic auth: the sk-ant key in `x-api-key`. (Amazon Bedrock is
+// the separate `bedrock` provider, which SigV4-signs the Converse API instead —
+// see callBedrockConverse.)
+function anthropicAuthHeaders(provider: ProviderConfig): Record<string, string> {
+  return { "x-api-key": readAnthropicKey(provider) };
+}
+
+// Read the token for the x-api-key header from the configured env var
+// (default ANTHROPIC_API_KEY). For a Bedrock Mantle target this env var holds
+// a bearer minted by aws-bedrock-token-generator; the same header carries it.
+// Mirrors readOpenAIBearer, but the value is NOT an Authorization: Bearer.
+function readAnthropicKey(provider: ProviderConfig): string {
+  const envName = provider.apiKeyEnv ?? "ANTHROPIC_API_KEY";
+  const apiKey = process.env[envName];
+  if (!apiKey) {
+    // Typed so the chat-task classifier routes a key unset mid-turn to the
+    // provider reauth CTA instead of a generic failure (mirrors bedrock).
+    throw new ProviderAuthError("anthropic", `Anthropic provider is configured but ${envName} is not set.`);
+  }
+  return apiKey;
+}
+
+
+interface AnthropicTranslation {
+  system: string;
+  messages: Array<Record<string, unknown>>;
+}
+
+// Translate the OpenAI-shaped tool-calling transcript into the Messages API
+// shape: hoist every system message to the top-level `system` string, map
+// user/assistant content, fold assistant tool_calls into tool_use blocks, and
+// group consecutive tool-result messages into a single user message whose
+// content begins with tool_result blocks (the API requires tool_result blocks
+// to lead and to immediately follow the assistant tool_use turn).
+function translateMessagesToAnthropic(messages: ToolCallingMessage[]): AnthropicTranslation {
+  const systemParts: string[] = [];
+  const out: Array<Record<string, unknown>> = [];
+  let i = 0;
+  while (i < messages.length) {
+    const message = messages[i];
+    if (message.role === "system") {
+      if (typeof message.content === "string" && message.content.length > 0) {
+        systemParts.push(message.content);
+      }
+      i++;
+      continue;
+    }
+    if (message.role === "tool") {
+      // Collapse a run of tool results into one user message.
+      const blocks: Array<Record<string, unknown>> = [];
+      while (i < messages.length && messages[i].role === "tool") {
+        const toolMessage = messages[i];
+        blocks.push({
+          type: "tool_result",
+          tool_use_id: toolMessage.tool_call_id ?? "",
+          content:
+            typeof toolMessage.content === "string"
+              ? toolMessage.content
+              : JSON.stringify(toolMessage.content ?? "")
+        });
+        i++;
+      }
+      out.push({ role: "user", content: blocks });
+      continue;
+    }
+    if (message.role === "user") {
+      out.push({ role: "user", content: translateUserContent(message.content) });
+      i++;
+      continue;
+    }
+    // assistant
+    const blocks: Array<Record<string, unknown>> = [];
+    if (typeof message.content === "string" && message.content.length > 0) {
+      blocks.push({ type: "text", text: message.content });
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part.type === "text") blocks.push({ type: "text", text: part.text });
+      }
+    }
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    for (const call of toolCalls) {
+      blocks.push({
+        type: "tool_use",
+        id: call.id,
+        name: call.function.name,
+        input: parseJsonObject(call.function.arguments || "{}")
+      });
+    }
+    // A Messages assistant turn must carry at least one block.
+    if (blocks.length === 0) blocks.push({ type: "text", text: "" });
+    out.push({ role: "assistant", content: blocks });
+    i++;
+  }
+  return { system: systemParts.join("\n\n"), messages: out };
+}
+
+// Map a user message's content to the Messages content shape. A plain string
+// passes through (the API accepts a bare string); a parts array maps text →
+// text, image_url data URLs → base64 image blocks, and document parts →
+// base64 document blocks.
+function translateUserContent(
+  content: string | MessageContentPart[] | null
+): string | Array<Record<string, unknown>> {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const blocks: Array<Record<string, unknown>> = [];
+  for (const part of content) {
+    if (part.type === "text") {
+      blocks.push({ type: "text", text: part.text });
+    } else if (part.type === "image_url") {
+      const parsed = parseDataUrl(part.image_url.url);
+      if (parsed) {
+        blocks.push({ type: "image", source: { type: "base64", media_type: parsed.mediaType, data: parsed.data } });
+      }
+    } else if (part.type === "document") {
+      blocks.push({
+        type: "document",
+        source: { type: "base64", media_type: part.document.mimeType, data: part.document.data }
+      });
+    }
+  }
+  return blocks;
+}
+
+// Split a `data:<mime>;base64,<payload>` URL into its media type and raw
+// base64 payload. Returns undefined for any other URL shape (the runtime only
+// ever inlines base64 data URLs at dispatch time).
+function parseDataUrl(url: string): { mediaType: string; data: string } | undefined {
+  const match = /^data:([^;,]+);base64,([\s\S]*)$/.exec(url);
+  if (!match) return undefined;
+  return { mediaType: match[1] ?? "", data: match[2] ?? "" };
+}
+
+// Map the chat-completions tool spec to the Messages tool shape:
+// {name, description, input_schema}.
+function translateToolsToAnthropic(tools: ToolFunctionSpec[]): Array<Record<string, unknown>> {
+  return tools.map((tool) => ({
+    name: tool.function.name,
+    description: tool.function.description,
+    input_schema: tool.function.parameters
+  }));
+}
+
+// Normalize a Messages stop_reason to the loop's finishReason vocabulary.
+function mapAnthropicStopReason(value: string | undefined): ToolCallingResult["finishReason"] {
+  switch (value) {
+    case "end_turn":
+    case "stop_sequence":
+      return "stop";
+    case "max_tokens":
+      return "length";
+    case "tool_use":
+      return "tool_calls";
+    default:
+      return "unknown";
+  }
+}
+
+// Parse a non-streamed Messages response into a ToolCallingResult: join text
+// blocks, convert tool_use blocks to ToolCall (re-encoding `input` to the JSON
+// arguments string the loop expects), and map stop_reason/usage.
+function parseAnthropicMessage(payload: Record<string, unknown>, provider: ProviderConfig): ToolCallingResult {
+  const content = Array.isArray(payload.content) ? payload.content : [];
+  const textParts: string[] = [];
+  const toolCalls: ToolCall[] = [];
+  for (const block of content) {
+    if (!isRecord(block)) continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      textParts.push(block.text);
+    } else if (block.type === "tool_use") {
+      const id = typeof block.id === "string" ? block.id : "";
+      const name = typeof block.name === "string" ? block.name : "";
+      if (!id || !name) continue;
+      toolCalls.push({
+        id,
+        type: "function",
+        function: { name, arguments: JSON.stringify(isRecord(block.input) ? block.input : {}) }
+      });
+    }
+  }
+  const usage = isRecord(payload.usage) ? payload.usage : undefined;
+  return {
+    provider,
+    text: textParts.join("").trim(),
+    toolCalls,
+    finishReason: mapAnthropicStopReason(typeof payload.stop_reason === "string" ? payload.stop_reason : undefined),
+    responseId: typeof payload.id === "string" ? payload.id : undefined,
+    usage,
+    cost: estimateCost(provider, usage)
+  };
+}
+
+// Consume the Messages SSE stream. Events are NAMED (event: <name>) and each
+// data payload repeats its own `type`. We stream text deltas (text_delta →
+// onDelta) and accumulate tool_use argument fragments (input_json_delta) per
+// content-block index, finalizing tool calls when the stream ends. stop_reason
+// and the cumulative output token count arrive on message_delta.
+async function readAnthropicMessagesStream(
+  response: Response,
+  provider: ProviderConfig,
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  if (!response.ok) {
+    const raw = await response.text();
+    const payload = parseJsonObject(raw);
+    const fallback = raw.slice(0, 500) || `Anthropic stream failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  const body = response.body;
+  if (!body) throw new Error("Anthropic stream returned no response body.");
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  const textParts: string[] = [];
+  // index → in-progress content block. Only tool_use blocks accumulate (their
+  // input arrives as input_json_delta fragments); text streams into textParts.
+  const blocks = new Map<number, { type: string; id: string; name: string; jsonBuf: string }>();
+  let finishReason: ToolCallingResult["finishReason"] = "unknown";
+  let responseId: string | undefined;
+  let usage: Record<string, unknown> | undefined;
+
+  const handleEvent = (eventText: string): void => {
+    const lines = eventText.split(/\r?\n/);
+    const dataLines: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith("data:")) dataLines.push(line.slice("data:".length).trim());
+    }
+    if (dataLines.length === 0) return;
+    const data = dataLines.join("\n");
+    if (!data) return;
+    const payload = parseJsonObject(data);
+    const type = typeof payload.type === "string" ? payload.type : undefined;
+    if (!type) return;
+
+    if (type === "error") {
+      const message =
+        isRecord(payload.error) && typeof payload.error.message === "string"
+          ? payload.error.message
+          : "Anthropic stream errored before completion.";
+      throw new Error(message);
+    }
+    if (type === "message_start") {
+      if (isRecord(payload.message)) {
+        if (typeof payload.message.id === "string") responseId = payload.message.id;
+        if (isRecord(payload.message.usage)) usage = payload.message.usage;
+      }
+      return;
+    }
+    if (type === "content_block_start") {
+      const index = typeof payload.index === "number" ? payload.index : 0;
+      const cb = isRecord(payload.content_block) ? payload.content_block : undefined;
+      blocks.set(index, {
+        type: cb && typeof cb.type === "string" ? cb.type : "text",
+        id: cb && typeof cb.id === "string" ? cb.id : "",
+        name: cb && typeof cb.name === "string" ? cb.name : "",
+        jsonBuf: ""
+      });
+      return;
+    }
+    if (type === "content_block_delta") {
+      const index = typeof payload.index === "number" ? payload.index : 0;
+      const delta = isRecord(payload.delta) ? payload.delta : undefined;
+      if (!delta) return;
+      if (delta.type === "text_delta" && typeof delta.text === "string" && delta.text.length > 0) {
+        textParts.push(delta.text);
+        if (onDelta) {
+          try {
+            onDelta(delta.text);
+          } catch {
+            // never abort the stream consumer on a UI-side error
+          }
+        }
+      } else if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
+        const existing = blocks.get(index);
+        if (existing) existing.jsonBuf += delta.partial_json;
+      }
+      return;
+    }
+    if (type === "message_delta") {
+      const delta = isRecord(payload.delta) ? payload.delta : undefined;
+      if (delta && typeof delta.stop_reason === "string") {
+        finishReason = mapAnthropicStopReason(delta.stop_reason);
+      }
+      if (isRecord(payload.usage)) usage = { ...(usage ?? {}), ...payload.usage };
+      return;
+    }
+    // content_block_stop / message_stop / ping / unknown: nothing to do — tool
+    // calls are finalized from the accumulated block map below.
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const chunk = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (chunk.trim().length > 0) handleEvent(chunk);
+        boundary = buffer.indexOf("\n\n");
+      }
+      if (done) break;
+    }
+    buffer += decoder.decode();
+    if (buffer.trim().length > 0) handleEvent(buffer);
+
+    const toolCalls: ToolCall[] = [];
+    const orderedIndices = [...blocks.keys()].sort((a, b) => a - b);
+    for (const index of orderedIndices) {
+      const block = blocks.get(index)!;
+      if (block.type !== "tool_use" || !block.id || !block.name) continue;
+      toolCalls.push({
+        id: block.id,
+        type: "function",
+        function: { name: block.name, arguments: block.jsonBuf.length > 0 ? block.jsonBuf : "{}" }
+      });
+    }
+
+    return {
+      provider,
+      text: textParts.join("").trim(),
+      toolCalls,
+      finishReason,
+      responseId,
+      usage,
+      cost: estimateCost(provider, usage)
+    };
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {}
+  }
+}
+
+// Anthropic structured-output path. The Messages API has no
+// response_format=json_object, so we prompt for JSON-only, call non-stream,
+// strip a stray ```json fence, parse, and validate — mirroring
+// callStructuredCodex.
+async function callAnthropicStructured<T>(
+  provider: ProviderConfig,
+  request: StructuredRequest<T>
+): Promise<StructuredResult<T>> {
+  const result = await callAnthropicMessages(
+    provider,
+    [
+      { role: "system", content: request.system },
+      {
+        role: "user",
+        content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema. No prose, no markdown fences.`
+      }
+    ],
+    []
+  );
+  const cleaned = stripJsonFences(result.text);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (error) {
+    throw new Error(
+      `Anthropic structured response was not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  return {
+    data: request.validator.parse(parsed),
+    raw: cleaned,
+    usage: result.usage,
+    provider
+  };
+}
+
+// ---------------- Amazon Bedrock (Converse API) ----------------
+//
+// The bedrock provider speaks the model-agnostic Converse API
+// (bedrock-runtime.{region}.amazonaws.com, SigV4 service "bedrock"), so one
+// transport serves every Bedrock family — Claude, Amazon Nova, Meta Llama,
+// Mistral, DeepSeek, … The model id is a cross-region inference-profile id sent
+// verbatim in the request path. Auth is SigV4 over the caller's ~/.aws / AWS_*
+// credentials, never an API key. Converse maps cleanly onto the same
+// OpenAI-shaped transcript the rest of the runtime uses (translate in,
+// parse out), so dispatch differs only by the transport.
+
+interface ConverseTranslation {
+  system: Array<{ text: string }>;
+  messages: Array<Record<string, unknown>>;
+}
+
+// An AWS region token is lowercase letters, digits, and hyphens (e.g.
+// us-east-1). Guard it because the bedrock region is interpolated into the
+// request host — and the model-callable set_provider can supply it — so a value
+// containing '/', '@', or '.' could repoint the request off-AWS or inject a path.
+export function isValidAwsRegion(region: string): boolean {
+  return /^[a-z0-9-]+$/.test(region);
+}
+
+// Signing region for a bedrock provider, resolved at request time so a later
+// AWS_REGION change still takes effect: explicit config region → AWS_REGION →
+// AWS_DEFAULT_REGION → built-in default. normalizeProvider persists only an
+// explicit region, so this fallback chain is the single source of truth.
+function bedrockRegion(provider: ProviderConfig): string {
+  return provider.awsRegion || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || DEFAULT_BEDROCK_REGION;
+}
+
+// Build the Converse[Stream] URL. The modelId carries ':' (e.g.
+// "us.amazon.nova-pro-v1:0") and is a single path segment, so encodeURIComponent
+// it (':' -> %3A). signAwsRequest canonicalizes url.pathname verbatim and fetch
+// sends the same encoded path, so the SigV4 signature matches the wire request.
+function bedrockConverseUrl(region: string, modelId: string, stream: boolean): string {
+  // Defense in depth: setup rejects a malformed region before persisting, but
+  // also refuse to build a host from an unvalidated region here (it lands in the
+  // URL authority).
+  if (!isValidAwsRegion(region)) {
+    throw new Error(`bedrock awsRegion is invalid: '${region}' (must match /^[a-z0-9-]+$/).`);
+  }
+  return `${bedrockRuntimeBaseUrl(region)}/model/${encodeURIComponent(modelId)}/${stream ? "converse-stream" : "converse"}`;
+}
+
+// SigV4-sign a Converse request (service "bedrock"). content-type is folded into
+// the signature because fetch sends it.
+function bedrockAuthHeaders(region: string, url: string, body: string): Record<string, string> {
+  const credentials = resolveAwsCredentials();
+  if (!credentials) {
+    // Typed so the chat-task classifier routes it to the AWS reauth CTA
+    // (providerReauth("bedrock") → kind "aws") instead of a generic failure.
+    throw new ProviderAuthError(
+      "bedrock",
+      "bedrock provider needs AWS credentials but none resolved (set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials)."
+    );
+  }
+  return signAwsRequest({
+    method: "POST",
+    url,
+    body,
+    region,
+    service: "bedrock",
+    credentials,
+    extraSignedHeaders: { "content-type": "application/json" }
+  });
+}
+
+// Read the human-readable message out of a Converse error body ({message}, or
+// the legacy {Message} casing).
+function readBedrockError(payload: Record<string, unknown>): string | undefined {
+  if (typeof payload.message === "string") return payload.message;
+  if (typeof payload.Message === "string") return payload.Message;
+  return undefined;
+}
+
+// Converse image `format` is a bare token (png/jpeg/gif/webp), not a MIME type.
+function converseImageFormat(mediaType: string): string | undefined {
+  const m = mediaType.toLowerCase();
+  if (m === "image/png") return "png";
+  if (m === "image/jpeg" || m === "image/jpg") return "jpeg";
+  if (m === "image/gif") return "gif";
+  if (m === "image/webp") return "webp";
+  return undefined;
+}
+
+// Map a user message's content to Converse content blocks. Text → {text};
+// image_url data URLs → {image:{format, source:{bytes}}} (the base64 string is
+// the blob in JSON). Document parts are dropped here — Converse documents need a
+// name+format the transcript doesn't carry, and support is model-specific.
+function converseUserContent(content: string | MessageContentPart[] | null): Array<Record<string, unknown>> {
+  if (typeof content === "string") return [{ text: content }];
+  if (!Array.isArray(content)) return [{ text: "" }];
+  const blocks: Array<Record<string, unknown>> = [];
+  for (const part of content) {
+    if (part.type === "text") {
+      blocks.push({ text: part.text });
+    } else if (part.type === "image_url") {
+      const parsed = parseDataUrl(part.image_url.url);
+      const format = parsed ? converseImageFormat(parsed.mediaType) : undefined;
+      if (parsed && format) blocks.push({ image: { format, source: { bytes: parsed.data } } });
+    }
+  }
+  // Converse rejects an empty content array; keep at least one block.
+  if (blocks.length === 0) blocks.push({ text: "" });
+  return blocks;
+}
+
+// Translate the OpenAI-shaped transcript into Converse's {system, messages}:
+// hoist system messages to the top-level system array, fold assistant tool_calls
+// into toolUse blocks, and collapse consecutive tool results into one user
+// message of toolResult blocks (Converse requires tool results to lead a user
+// turn that immediately follows the assistant toolUse turn).
+function translateMessagesToConverse(messages: ToolCallingMessage[]): ConverseTranslation {
+  const system: Array<{ text: string }> = [];
+  const out: Array<Record<string, unknown>> = [];
+  let i = 0;
+  while (i < messages.length) {
+    const message = messages[i];
+    if (message.role === "system") {
+      if (typeof message.content === "string" && message.content.length > 0) system.push({ text: message.content });
+      i++;
+      continue;
+    }
+    if (message.role === "tool") {
+      const blocks: Array<Record<string, unknown>> = [];
+      while (i < messages.length && messages[i].role === "tool") {
+        const toolMessage = messages[i];
+        const text = typeof toolMessage.content === "string" ? toolMessage.content : JSON.stringify(toolMessage.content ?? "");
+        blocks.push({
+          toolResult: {
+            toolUseId: toolMessage.tool_call_id ?? "",
+            // Converse rejects an empty tool_result content; pad an empty result.
+            content: [{ text: text.length > 0 ? text : " " }]
+          }
+        });
+        i++;
+      }
+      out.push({ role: "user", content: blocks });
+      continue;
+    }
+    if (message.role === "user") {
+      out.push({ role: "user", content: converseUserContent(message.content) });
+      i++;
+      continue;
+    }
+    // assistant
+    const blocks: Array<Record<string, unknown>> = [];
+    if (typeof message.content === "string" && message.content.length > 0) {
+      blocks.push({ text: message.content });
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content) if (part.type === "text") blocks.push({ text: part.text });
+    }
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    for (const call of toolCalls) {
+      blocks.push({
+        toolUse: { toolUseId: call.id, name: call.function.name, input: parseJsonObject(call.function.arguments || "{}") }
+      });
+    }
+    if (blocks.length === 0) blocks.push({ text: "" });
+    out.push({ role: "assistant", content: blocks });
+    i++;
+  }
+  return { system, messages: out };
+}
+
+// Map tools to Converse's toolConfig. Returns undefined when there are no tools
+// (Converse rejects an empty tools array).
+function translateToolsToConverse(tools: ToolFunctionSpec[]): Record<string, unknown> | undefined {
+  if (tools.length === 0) return undefined;
+  return {
+    tools: tools.map((tool) => ({
+      toolSpec: {
+        name: tool.function.name,
+        description: tool.function.description,
+        inputSchema: { json: tool.function.parameters }
+      }
+    })),
+    toolChoice: { auto: {} }
+  };
+}
+
+// Normalize Converse stopReason to the loop's finishReason vocabulary.
+function mapConverseStopReason(value: string | undefined): ToolCallingResult["finishReason"] {
+  switch (value) {
+    case "end_turn":
+    case "stop_sequence":
+      return "stop";
+    case "max_tokens":
+    case "model_context_window_exceeded":
+      return "length";
+    case "tool_use":
+      return "tool_calls";
+    default:
+      return "unknown";
+  }
+}
+
+// Converse reports usage as {inputTokens,outputTokens,totalTokens}; mirror those
+// into the snake_case keys estimateCost reads so cost/usage records match the
+// other providers (the original camelCase keys are kept too).
+function normalizeConverseUsage(usage: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(usage)) return undefined;
+  const out: Record<string, unknown> = { ...usage };
+  if (typeof usage.inputTokens === "number") out.input_tokens = usage.inputTokens;
+  if (typeof usage.outputTokens === "number") out.output_tokens = usage.outputTokens;
+  if (typeof usage.totalTokens === "number") out.total_tokens = usage.totalTokens;
+  return out;
+}
+
+async function callBedrockConverse(
+  provider: ProviderConfig,
+  messages: ToolCallingMessage[],
+  tools: ToolFunctionSpec[],
+  onDelta?: (text: string) => void,
+  maxTokensOverride?: number
+): Promise<ToolCallingResult> {
+  const region = bedrockRegion(provider);
+  // Omit toolConfig for models that reject it (e.g. DeepSeek R1) so a normal
+  // tool-loaded chat turn degrades to text-only instead of a ValidationException.
+  const toolConfig = bedrockSupportsToolUse(provider.model) ? translateToolsToConverse(tools) : undefined;
+  // Llama 4 streams fine and uses tools fine, but NOT both at once — AWS returns
+  // "This model doesn't support tool use in streaming mode" for a Llama 4
+  // ConverseStream carrying toolConfig. Fall back to non-stream Converse only
+  // when we're actually attaching tools to such a model; tool-less Llama 4 turns
+  // (and every other model) still stream.
+  const wantStream =
+    Boolean(onDelta) && !(toolConfig && !bedrockSupportsStreamingWithTools(provider.model));
+  const url = bedrockConverseUrl(region, provider.model, wantStream);
+  const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
+  const { system, messages: converseMessages } = translateMessagesToConverse(safeMessages);
+  const extraMax =
+    isRecord(provider.extraBody) && typeof provider.extraBody.max_tokens === "number" ? provider.extraBody.max_tokens : undefined;
+  const maxTokens = maxTokensOverride ?? extraMax ?? DEFAULT_ANTHROPIC_MAX_TOKENS;
+  const body: Record<string, unknown> = {
+    messages: converseMessages,
+    inferenceConfig: { maxTokens }
+  };
+  if (system.length > 0) body.system = system;
+  if (toolConfig) body.toolConfig = toolConfig;
+
+  const bodyJson = JSON.stringify(body);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...bedrockAuthHeaders(region, url, bodyJson)
+    },
+    body: bodyJson
+  });
+
+  if (wantStream) return readConverseStream(response, provider, onDelta);
+
+  const rawPayload = await response.text();
+  const payload = parseJsonObject(rawPayload);
+  if (!response.ok) {
+    const fallback = rawPayload.slice(0, 500) || `Bedrock Converse request failed with HTTP ${response.status}`;
+    throw new Error(readBedrockError(payload) ?? fallback);
+  }
+  return parseConverseResponse(payload, provider);
+}
+
+// Parse a non-streamed Converse response: join output.message text blocks,
+// convert toolUse blocks to ToolCall, map stopReason/usage.
+function parseConverseResponse(payload: Record<string, unknown>, provider: ProviderConfig): ToolCallingResult {
+  const output = isRecord(payload.output) ? payload.output : undefined;
+  const message = output && isRecord(output.message) ? output.message : undefined;
+  const content = message && Array.isArray(message.content) ? message.content : [];
+  const textParts: string[] = [];
+  const toolCalls: ToolCall[] = [];
+  for (const block of content) {
+    if (!isRecord(block)) continue;
+    if (typeof block.text === "string") {
+      textParts.push(block.text);
+    } else if (isRecord(block.toolUse)) {
+      const tu = block.toolUse;
+      const id = typeof tu.toolUseId === "string" ? tu.toolUseId : "";
+      const name = typeof tu.name === "string" ? tu.name : "";
+      if (!id || !name) continue;
+      toolCalls.push({
+        id,
+        type: "function",
+        function: { name, arguments: JSON.stringify(isRecord(tu.input) ? tu.input : {}) }
+      });
+    }
+  }
+  const usage = normalizeConverseUsage(payload.usage);
+  return {
+    provider,
+    text: textParts.join("").trim(),
+    toolCalls,
+    finishReason: mapConverseStopReason(typeof payload.stopReason === "string" ? payload.stopReason : undefined),
+    usage,
+    cost: estimateCost(provider, usage)
+  };
+}
+
+function bytesConcat(a: Uint8Array<ArrayBufferLike>, b: Uint8Array<ArrayBufferLike>): Uint8Array<ArrayBufferLike> {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+function readUint32BE(b: Uint8Array<ArrayBufferLike>, offset: number): number {
+  return ((b[offset]! << 24) | (b[offset + 1]! << 16) | (b[offset + 2]! << 8) | b[offset + 3]!) >>> 0;
+}
+
+// Parse one AWS event-stream frame:
+//   [4B totalLen][4B headersLen][4B preludeCRC][headers][payload][4B msgCRC]
+// We pull the `:event-type` / `:message-type` / `:exception-type` string headers
+// to route the JSON payload; CRCs aren't validated (the length framing already
+// delimits the message). Bedrock's event-stream headers are all string-typed
+// (value type 7); a non-string header (unexpected) stops header parsing.
+function parseEventStreamFrame(
+  msg: Uint8Array<ArrayBufferLike>,
+  decoder: TextDecoder
+): { eventType: string; messageType: string; payload: string } | undefined {
+  if (msg.length < 16) return undefined;
+  const headersLen = readUint32BE(msg, 4);
+  const headersStart = 12;
+  const headersEnd = headersStart + headersLen;
+  const payloadEnd = msg.length - 4;
+  if (headersEnd > payloadEnd) return undefined;
+  let eventType = "";
+  let messageType = "";
+  let exceptionType = "";
+  let off = headersStart;
+  while (off + 1 <= headersEnd) {
+    const nameLen = msg[off]!;
+    off += 1;
+    const name = decoder.decode(msg.subarray(off, off + nameLen));
+    off += nameLen;
+    const valueType = msg[off]!;
+    off += 1;
+    if (valueType !== 7) break;
+    const valueLen = (msg[off]! << 8) | msg[off + 1]!;
+    off += 2;
+    const value = decoder.decode(msg.subarray(off, off + valueLen));
+    off += valueLen;
+    if (name === ":event-type") eventType = value;
+    else if (name === ":message-type") messageType = value;
+    else if (name === ":exception-type") exceptionType = value;
+  }
+  const payload = decoder.decode(msg.subarray(headersEnd, payloadEnd));
+  return { eventType: eventType || exceptionType, messageType, payload };
+}
+
+// Consume the Converse event stream (application/vnd.amazon.eventstream). Stream
+// text deltas (contentBlockDelta.delta.text → onDelta), accumulate tool-use
+// input fragments per contentBlockIndex, capture stopReason (messageStop) and
+// usage (metadata), and surface any exception frame as a thrown error.
+async function readConverseStream(
+  response: Response,
+  provider: ProviderConfig,
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  if (!response.ok) {
+    const raw = await response.text();
+    const payload = parseJsonObject(raw);
+    const fallback = raw.slice(0, 500) || `Bedrock Converse stream failed with HTTP ${response.status}`;
+    throw new Error(readBedrockError(payload) ?? fallback);
+  }
+  const bodyStream = response.body;
+  if (!bodyStream) throw new Error("Bedrock Converse stream returned no response body.");
+  const reader = bodyStream.getReader();
+  const decoder = new TextDecoder("utf-8");
+  const textParts: string[] = [];
+  const toolBlocks = new Map<number, { toolUseId: string; name: string; jsonBuf: string }>();
+  let finishReason: ToolCallingResult["finishReason"] = "unknown";
+  let usage: Record<string, unknown> | undefined;
+  let buf: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+
+  const handle = (eventType: string, messageType: string, payload: Record<string, unknown>): void => {
+    if (messageType === "exception" || /exception|error/i.test(eventType)) {
+      throw new Error(readBedrockError(payload) ?? `Bedrock Converse stream error (${eventType || "unknown"}).`);
+    }
+    if (eventType === "contentBlockStart") {
+      const index = typeof payload.contentBlockIndex === "number" ? payload.contentBlockIndex : 0;
+      const start = isRecord(payload.start) ? payload.start : undefined;
+      if (start && isRecord(start.toolUse)) {
+        const tu = start.toolUse;
+        toolBlocks.set(index, {
+          toolUseId: typeof tu.toolUseId === "string" ? tu.toolUseId : "",
+          name: typeof tu.name === "string" ? tu.name : "",
+          jsonBuf: ""
+        });
+      }
+      return;
+    }
+    if (eventType === "contentBlockDelta") {
+      const index = typeof payload.contentBlockIndex === "number" ? payload.contentBlockIndex : 0;
+      const delta = isRecord(payload.delta) ? payload.delta : undefined;
+      if (!delta) return;
+      if (typeof delta.text === "string" && delta.text.length > 0) {
+        textParts.push(delta.text);
+        if (onDelta) {
+          try {
+            onDelta(delta.text);
+          } catch {
+            // never abort the stream consumer on a UI-side error
+          }
+        }
+      } else if (isRecord(delta.toolUse) && typeof delta.toolUse.input === "string") {
+        const block = toolBlocks.get(index);
+        if (block) block.jsonBuf += delta.toolUse.input;
+      }
+      return;
+    }
+    if (eventType === "messageStop") {
+      if (typeof payload.stopReason === "string") finishReason = mapConverseStopReason(payload.stopReason);
+      return;
+    }
+    if (eventType === "metadata") {
+      usage = normalizeConverseUsage(payload.usage) ?? usage;
+      return;
+    }
+    // messageStart / contentBlockStop / unknown: nothing to accumulate.
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value) buf = bytesConcat(buf, value);
+      while (buf.length >= 12) {
+        const totalLen = readUint32BE(buf, 0);
+        if (totalLen < 16 || buf.length < totalLen) break;
+        const frame = parseEventStreamFrame(buf.subarray(0, totalLen), decoder);
+        buf = buf.subarray(totalLen);
+        if (frame) handle(frame.eventType, frame.messageType, parseJsonObject(frame.payload));
+      }
+      if (done) break;
+    }
+
+    const toolCalls: ToolCall[] = [];
+    for (const index of [...toolBlocks.keys()].sort((a, b) => a - b)) {
+      const block = toolBlocks.get(index)!;
+      if (!block.toolUseId || !block.name) continue;
+      toolCalls.push({
+        id: block.toolUseId,
+        type: "function",
+        function: { name: block.name, arguments: block.jsonBuf.length > 0 ? block.jsonBuf : "{}" }
+      });
+    }
+    return {
+      provider,
+      text: textParts.join("").trim(),
+      toolCalls,
+      finishReason,
+      usage,
+      cost: estimateCost(provider, usage)
+    };
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {}
+  }
+}
+
+// Bedrock structured-output path. Converse has no response_format=json_object,
+// so prompt for JSON-only, call non-stream, strip a stray fence, parse, validate
+// — mirroring callAnthropicStructured.
+async function callBedrockStructured<T>(
+  provider: ProviderConfig,
+  request: StructuredRequest<T>
+): Promise<StructuredResult<T>> {
+  const result = await callBedrockConverse(
+    provider,
+    [
+      { role: "system", content: request.system },
+      {
+        role: "user",
+        content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema. No prose, no markdown fences.`
+      }
+    ],
+    []
+  );
+  const cleaned = stripJsonFences(result.text);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (error) {
+    throw new Error(
+      `Bedrock structured response was not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  return {
+    data: request.validator.parse(parsed),
+    raw: cleaned,
+    usage: result.usage,
+    provider
+  };
+}
+
 // Codex tool-call-as-text backstop. The Responses-API parser handles the
 // structured `function_call` items; this complements it by scanning the
 // final assistant text for literal `<tool_call>...</tool_call>` markup.
@@ -1430,7 +2522,7 @@ function toolCallDedupKey(name: string, argsJson: string): string {
     // Leave as-is — non-JSON arguments are vanishingly rare and the raw
     // string is still a stable key for dedup.
   }
-  return `${name} ${normalized}`;
+  return `${name}\0${normalized}`;
 }
 
 // Synthesize a deterministic call id for a text-extracted call. Using a
@@ -1543,6 +2635,34 @@ export async function generateTaskSummary(
   const systemContext = recalledBlock.length > 0
     ? `${stablePrefix}\n\n${recalledBlock}`
     : stablePrefix;
+  if (provider.name === "anthropic" || provider.name === "bedrock") {
+    const result = provider.name === "bedrock"
+      ? await callBedrockConverse(
+          provider,
+          [
+            { role: "system", content: systemContext },
+            { role: "user", content: input }
+          ],
+          [],
+          onDelta
+        )
+      : await callAnthropicMessages(
+          provider,
+          [
+            { role: "system", content: systemContext },
+            { role: "user", content: input }
+          ],
+          [],
+          onDelta
+        );
+    return {
+      provider: result.provider,
+      text: result.text || "The model returned no text output.",
+      responseId: result.responseId,
+      usage: result.usage,
+      cost: result.cost
+    };
+  }
   if (
     provider.name === "openrouter" ||
     provider.name === "local" ||
@@ -1652,6 +2772,18 @@ export async function generateStructured<T>(
       usage: { input_tokens: request.system.length + request.user.length, output_tokens: raw.length },
       provider
     };
+  }
+
+  // Anthropic has no response_format=json_object field, so it gets its own JSON
+  // path: prompt for JSON-only, call Messages non-stream, strip fences, parse,
+  // validate (mirrors callStructuredCodex).
+  if (provider.name === "anthropic") {
+    return callAnthropicStructured(provider, request);
+  }
+  // Bedrock Converse likewise has no response_format; same prompt-for-JSON path
+  // over the Converse transport.
+  if (provider.name === "bedrock") {
+    return callBedrockStructured(provider, request);
   }
 
   // OpenAI / OpenRouter / local OpenAI-compatible: chat-completions with
@@ -1894,6 +3026,34 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || DEFAULT_CODEX_MODEL,
       baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_CODEX_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv
+    };
+  }
+  if (provider.name === "anthropic") {
+    return {
+      name: "anthropic",
+      model: provider.model || DEFAULT_ANTHROPIC_MODEL,
+      baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_ANTHROPIC_BASE_URL),
+      apiKeyEnv: provider.apiKeyEnv ?? "ANTHROPIC_API_KEY",
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
+    };
+  }
+  if (provider.name === "bedrock") {
+    // Persist only an EXPLICIT region. The env/default fallback (explicit →
+    // AWS_REGION → AWS_DEFAULT_REGION → built-in default) is resolved at request
+    // time by bedrockRegion, so config.json never freezes whatever AWS_REGION
+    // happened to be set when `provider set` ran (a later env change still wins).
+    const awsRegion = provider.awsRegion?.trim();
+    return {
+      name: "bedrock",
+      model: provider.model || DEFAULT_BEDROCK_MODEL,
+      // Informational: the regional Converse runtime host, for inspection/trace
+      // — callBedrockConverse builds the real /model/{id}/converse[-stream] URL
+      // from the request-time region. Derive it from the explicit region or the
+      // built-in default with NO env read, so the displayed host can't drift from
+      // the signed host and the persisted file embeds no environment state.
+      baseUrl: bedrockRuntimeBaseUrl(awsRegion || DEFAULT_BEDROCK_REGION),
+      ...(awsRegion ? { awsRegion } : {}),
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
   return {
@@ -2571,6 +3731,14 @@ const VISION_RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
   "max_completion_tokens"
 ]);
 
+// `system` is owned by the Anthropic Messages builder, which hoists every
+// system message into the top-level `system` field. Deny it in extraBody so a
+// stray `extraBody.system` can't shadow the runtime-built system prompt — nor
+// silently become it on a turn that carries no system message. Scoped to the
+// anthropic path via extraDeny because `system` is not a top-level field on the
+// OpenAI chat-completions wire shape, where it stays a normal message.
+const ANTHROPIC_RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set(["system"]);
+
 // Strip trailing slashes from a baseUrl so callers can write either
 // `http://x/v1` or `http://x/v1/` and the resulting request URL stays
 // `http://x/v1/chat/completions` (not `http://x/v1//chat/completions` —
@@ -2602,6 +3770,8 @@ function defaultBaseUrl(provider: ProviderConfig): string {
   if (provider.name === "openrouter") return "https://openrouter.ai/api/v1";
   if (provider.name === "local") return "http://127.0.0.1:11434/v1";
   if (provider.name === "deepseek") return DEFAULT_DEEPSEEK_BASE_URL;
+  if (provider.name === "anthropic") return DEFAULT_ANTHROPIC_BASE_URL;
+  if (provider.name === "bedrock") return bedrockRuntimeBaseUrl(provider.awsRegion ?? DEFAULT_BEDROCK_REGION);
   // Azure has no universal default — it is per-resource. Return empty so a
   // config that slipped through without a baseUrl fails loudly at fetch time
   // instead of silently sending Azure traffic to api.openai.com (a 404).
@@ -2692,6 +3862,32 @@ export function azureNeedsHttps(name: string, baseUrl: string | undefined): bool
   return !value.startsWith("https://");
 }
 
+// The anthropic provider sends ANTHROPIC_API_KEY in an x-api-key header on every
+// request, so a plaintext http custom baseUrl would leak the key in transit.
+// Refuse a non-https custom endpoint — EXCEPT an explicit loopback host (a local
+// http proxy is a deliberate, low-risk dev setup). Parse the URL rather than
+// prefix-matching so a hostless value like a bare "https://" (which would build
+// an unreachable "https:///v1/messages") is refused too. An empty baseUrl uses
+// the https first-party default, so it's left alone.
+export function anthropicNeedsHttps(name: string, baseUrl: string | undefined): boolean {
+  if (name !== "anthropic") return false;
+  const value = (baseUrl ?? "").trim();
+  if (value.length === 0) return false;
+  let host: string;
+  try {
+    // URL.hostname returns an IPv6 literal in brackets, e.g. "[::1]".
+    const parsed = new URL(value);
+    host = parsed.hostname.toLowerCase();
+    if (host.length === 0) return true; // e.g. bare "https://" — no host to reach
+    if (parsed.protocol === "https:") return false; // https with a real host is fine
+  } catch {
+    return true; // unparseable → not a safe https endpoint
+  }
+  // Non-https with a real host: allow only explicit loopback (a local dev proxy).
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]") return false;
+  return true; // non-https, non-loopback → refuse (key would go in cleartext)
+}
+
 // ---------------- Vision (image input) ----------------
 //
 // Single-shot vision call: caller provides a prompt + one inline base64 PNG/JPEG,
@@ -2751,6 +3947,16 @@ export async function generateVisionAnalysis(
   }
   if (provider.name === "codex") {
     return callVisionCodex(provider, request, maxTokens);
+  }
+  if (provider.name === "anthropic" || provider.name === "bedrock") {
+    const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
+    const messages: ToolCallingMessage[] = [
+      { role: "user", content: [{ type: "text", text: request.prompt }, { type: "image_url", image_url: { url: dataUrl } }] }
+    ];
+    const result = provider.name === "bedrock"
+      ? await callBedrockConverse(provider, messages, [], undefined, maxTokens)
+      : await callAnthropicMessages(provider, messages, [], undefined, maxTokens);
+    return { provider: result.provider, text: result.text, usage: result.usage, cost: result.cost };
   }
   // openai / openrouter / local — all expose chat-completions with the same
   // multi-modal content array shape (`type: "image_url"`).

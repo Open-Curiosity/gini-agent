@@ -77,6 +77,26 @@ function openrouterContextWindowTokens(model: string): number {
   return FALLBACK_CONTEXT_WINDOW_TOKENS;
 }
 
+// First-party Anthropic Messages API: the Claude family serves a 200K-token
+// context window. An unrecognized id stays conservative on the fallback.
+function anthropicContextWindowTokens(model: string): number {
+  if (/claude/.test(normalizeModel(model))) return 200_000;
+  return FALLBACK_CONTEXT_WINDOW_TOKENS;
+}
+
+// Bedrock model ids are cross-region inference profiles, e.g.
+// "us.anthropic.claude-opus-4-8" or "us.amazon.nova-pro-v1:0". Key off the
+// provider+family segment so each family gets its real window; unknown ids
+// (other Bedrock families we don't enumerate) keep the conservative fallback.
+function bedrockContextWindowTokens(model: string): number {
+  const slug = normalizeModel(model);
+  if (/anthropic\.claude/.test(slug)) return 200_000;
+  if (/amazon\.nova-premier/.test(slug)) return 1_000_000;
+  if (/amazon\.nova-(pro|lite)/.test(slug)) return 300_000;
+  if (/amazon\.nova-micro/.test(slug)) return 128_000;
+  return FALLBACK_CONTEXT_WINDOW_TOKENS;
+}
+
 export function resolveProviderContextWindowTokens(provider: ProviderConfig): number {
   const model = provider.model ?? "";
   switch (provider.name) {
@@ -90,6 +110,10 @@ export function resolveProviderContextWindowTokens(provider: ProviderConfig): nu
       return openrouterContextWindowTokens(model);
     case "deepseek":
       return deepseekContextWindowTokens(model);
+    case "anthropic":
+      return anthropicContextWindowTokens(model);
+    case "bedrock":
+      return bedrockContextWindowTokens(model);
     case "local":
     case "echo":
       return FALLBACK_CONTEXT_WINDOW_TOKENS;
@@ -139,6 +163,28 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
     case "deepseek":
       // Confirmed text-only API — no image/file content part.
       return { vision: false, nativeDocs: false };
+    case "anthropic":
+      // Claude Opus/Sonnet/Haiku accept image input and ingest documents
+      // natively via the Messages API (image + document content blocks). The
+      // family is uniformly multimodal, so unlike the openai branch there's
+      // no per-model gate. translateMessagesToAnthropic maps image_url and
+      // document parts into the corresponding base64 source blocks.
+      return { vision: true, nativeDocs: true };
+    case "bedrock": {
+      // Bedrock Converse exposes image content blocks per-model; enable vision
+      // for the families that accept them (Claude 3+, the multimodal Nova tiers,
+      // Mistral Pixtral, Llama 4, the Llama 3.2 vision variants). Text-only ids
+      // (DeepSeek R1, Llama 3.3, Nova Micro) and unrecognized ids stay false so
+      // the vision path never sends a block the model rejects.
+      //
+      // nativeDocs is false regardless: the Converse translator (converseUserContent)
+      // does not emit `document` blocks, so document parts must flow through the
+      // runtime's extract-to-text fallback rather than being passed "natively"
+      // and silently dropped. (Native Converse document blocks are a follow-up.)
+      const visionFamily =
+        /anthropic\.claude|amazon\.nova-(?:pro|lite|premier)|pixtral|llama4|llama3-2-(?:11b|90b)/i.test(model);
+      return { vision: visionFamily, nativeDocs: false };
+    }
     case "codex":
       // Verified empirically against the live ChatGPT-backend /responses
       // surface (gpt-5.x): it accepts a native `input_file` document part
@@ -159,4 +205,28 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
       // Unknown provider → conservative default.
       return { vision: false, nativeDocs: false };
   }
+}
+
+// Bedrock Converse tool use (function calling) is per-model. Every family in the
+// catalog accepts a `toolConfig` EXCEPT DeepSeek, whose R1 reasoning model
+// Converse rejects with a ValidationException ("This model doesn't support tool
+// use"). A normal chat turn always loads tools, so without this gate a DeepSeek
+// agent 400s on every turn; omitting toolConfig lets it run text-only instead.
+// Denylist the known-incompatible family rather than allowlisting — the runtime
+// accepts custom ids and the rest of Bedrock (Claude, Nova, Llama, Mistral)
+// supports tool use, so an unrecognized id should default to attaching tools.
+export function bedrockSupportsToolUse(model: string): boolean {
+  return !/deepseek/i.test(model);
+}
+
+// Whether a Bedrock model can carry toolConfig on a streaming (converse-stream)
+// request. Llama 4 streams fine and uses tools fine, but NOT both at once — a
+// Llama 4 ConverseStream with toolConfig returns "This model doesn't support tool
+// use in streaming mode" (verified live; the model card's blanket "no
+// ConverseStream" wording is broader than the actual constraint). callBedrockConverse
+// uses this to drop to non-stream Converse for Llama 4 only when it is attaching
+// tools — tool-less Llama 4 turns still stream. Denylist the known family;
+// everything else supports tools + streaming together.
+export function bedrockSupportsStreamingWithTools(model: string): boolean {
+  return !/llama4/i.test(model);
 }

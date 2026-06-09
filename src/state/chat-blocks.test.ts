@@ -632,6 +632,28 @@ describe("chat-blocks persistence", () => {
     expect(plainNote.authError).toBeUndefined();
   });
 
+  test("system_note preserves the aws reauthKind through the read normalizer", () => {
+    const instance = "chat-blocks-autherror-aws";
+    insertChatBlock(instance, {
+      kind: "system_note",
+      sessionId: "chat_aws",
+      text: "Amazon Bedrock authentication failed. Open Bedrock settings to continue.",
+      authError: {
+        provider: "bedrock",
+        providerLabel: "Amazon Bedrock",
+        detail: "The security token included in the request is invalid.",
+        reauthKind: "aws",
+        reauthUrl: "/settings"
+      }
+    });
+
+    const note = listChatBlocks(instance, "chat_aws")[0];
+    if (note?.kind !== "system_note") throw new Error("expected a system_note block");
+    // "aws" must survive — collapsing it to "settings" makes the renderer tell
+    // the user to update a Bedrock API key that AWS SigV4 auth never has.
+    expect(note.authError?.reauthKind).toBe("aws");
+  });
+
   test("rowToBlock backfills routing fields for a legacy authError row", () => {
     const instance = "chat-blocks-autherror-legacy";
     const inserted = insertChatBlock(instance, {

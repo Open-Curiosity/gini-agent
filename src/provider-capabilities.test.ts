@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
+  bedrockSupportsStreamingWithTools,
+  bedrockSupportsToolUse,
   FALLBACK_CONTEXT_WINDOW_TOKENS,
   resolveDefaultPriorContextTokenBudget,
   resolveProviderContextWindowTokens,
@@ -101,6 +103,64 @@ describe("resolveProviderModality", () => {
     expect(resolveProviderModality({ name: "mystery" as ProviderConfig["name"], model: "x" }))
       .toEqual({ vision: false, nativeDocs: false });
   });
+
+  test("bedrock: vision is per-model, nativeDocs always false (Converse sends no document blocks)", () => {
+    // Multimodal families → vision true.
+    for (const m of [
+      "us.anthropic.claude-opus-4-8",
+      "us.amazon.nova-pro-v1:0",
+      "us.amazon.nova-lite-v1:0",
+      "us.mistral.pixtral-large-2502-v1:0",
+      "us.meta.llama4-maverick-17b-instruct-v1:0",
+      "us.meta.llama3-2-11b-instruct-v1:0"
+    ]) {
+      expect(resolveProviderModality(provider("bedrock", m))).toEqual({ vision: true, nativeDocs: false });
+    }
+    // Text-only / unrecognized ids → vision false. nativeDocs is false either way.
+    for (const m of ["us.deepseek.r1-v1:0", "us.meta.llama3-3-70b-instruct-v1:0", "us.amazon.nova-micro-v1:0", ""]) {
+      expect(resolveProviderModality(provider("bedrock", m))).toEqual({ vision: false, nativeDocs: false });
+    }
+  });
+});
+
+describe("bedrockSupportsToolUse", () => {
+  test("DeepSeek ids are gated off; every other catalog family stays on", () => {
+    // DeepSeek R1 returns a ValidationException when sent a Converse toolConfig.
+    expect(bedrockSupportsToolUse("us.deepseek.r1-v1:0")).toBe(false);
+    expect(bedrockSupportsToolUse("DeepSeek-R1")).toBe(false);
+    // Tool-capable families default to true (incl. unrecognized/custom ids).
+    for (const m of [
+      "us.anthropic.claude-opus-4-8",
+      "us.amazon.nova-micro-v1:0",
+      "us.meta.llama3-3-70b-instruct-v1:0",
+      "us.mistral.mistral-large-2407-v1:0",
+      "some.custom.future-model",
+      ""
+    ]) {
+      expect(bedrockSupportsToolUse(m)).toBe(true);
+    }
+  });
+});
+
+describe("bedrockSupportsStreamingWithTools", () => {
+  test("Llama 4 ids are gated off; every other family streams with tools", () => {
+    // Llama 4 can't carry toolConfig on a streaming request ("tool use in
+    // streaming mode"); callBedrockConverse drops to non-stream only when tools
+    // are attached.
+    expect(bedrockSupportsStreamingWithTools("us.meta.llama4-maverick-17b-instruct-v1:0")).toBe(false);
+    expect(bedrockSupportsStreamingWithTools("us.meta.llama4-scout-17b-instruct-v1:0")).toBe(false);
+    // Other families (incl. Llama 3.3, unrecognized/custom ids) support tools + streaming.
+    for (const m of [
+      "us.anthropic.claude-opus-4-8",
+      "us.amazon.nova-lite-v1:0",
+      "us.meta.llama3-3-70b-instruct-v1:0",
+      "us.deepseek.r1-v1:0",
+      "some.custom.future-model",
+      ""
+    ]) {
+      expect(bedrockSupportsStreamingWithTools(m)).toBe(true);
+    }
+  });
 });
 
 describe("resolveProviderContextWindowTokens", () => {
@@ -133,6 +193,19 @@ describe("resolveProviderContextWindowTokens", () => {
     expect(resolveProviderContextWindowTokens(provider("openrouter", "deepseek/deepseek-v4-flash"))).toBe(1_000_000);
     expect(resolveProviderContextWindowTokens(provider("openrouter", "anthropic/claude-4-sonnet"))).toBe(200_000);
     expect(resolveProviderContextWindowTokens(provider("openrouter", "google/gemini-2.5-pro"))).toBe(1_000_000);
+  });
+
+  test("anthropic + bedrock map to real per-model windows, not the 32K fallback", () => {
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-opus-4-8"))).toBe(200_000);
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-sonnet-4-6"))).toBe(200_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.anthropic.claude-opus-4-8"))).toBe(200_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.amazon.nova-premier-v1:0"))).toBe(1_000_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.amazon.nova-pro-v1:0"))).toBe(300_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "eu.amazon.nova-lite-v1:0"))).toBe(300_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.amazon.nova-micro-v1:0"))).toBe(128_000);
+    // Unrecognized families on each provider stay conservative.
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "mystery-model"))).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.meta.llama3-3-70b-instruct-v1:0"))).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
   });
 
   test("unknown, local, echo, and openrouter auto fall back conservatively", () => {

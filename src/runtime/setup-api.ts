@@ -8,13 +8,16 @@
 // Behavior:
 //   - GET /api/setup/status reflects the live provider config plus the
 //     available picker options (SUPPORTED_PROVIDERS: openai, codex, openrouter,
-//     deepseek, local, azure). `current` is the active provider name when
-//     configured; null otherwise. `providerConfigured` is true when the active
-//     provider has valid creds — same definition `providerHealth` uses.
+//     deepseek, local, anthropic, bedrock, azure). `current` is the active
+//     provider name when configured; null otherwise. `providerConfigured` is
+//     true when the active provider has valid creds — same definition
+//     `providerHealth` uses.
 //   - POST /api/setup/provider accepts {provider, apiKey?, model?, baseUrl?}
-//     for the env-keyed providers (openai/openrouter/deepseek/local/azure) —
-//     plus apiVersion/deployment/authScheme for azure's deployment-scoped
-//     routing — or {provider: "codex"}. An env-keyed flow writes the key to
+//     for the env-keyed providers (openai/openrouter/deepseek/local/anthropic/
+//     azure) — plus apiVersion/deployment/authScheme for azure's
+//     deployment-scoped routing; {provider: "bedrock", model?, awsRegion?},
+//     which signs with AWS credentials and holds no gini key; or
+//     {provider: "codex"}. An env-keyed flow writes the key to
 //     ~/.gini/secrets.env (under the provider's apiKeyEnv) and updates
 //     process.env so the running gateway picks it up on the very next provider
 //     call (no restart needed — readOpenAIBearer in src/provider.ts reads from
@@ -44,27 +47,30 @@
 // handler itself; the actual launchctl interaction is the detached
 // child's responsibility.
 
-import { writeFileSync } from "node:fs";
-import { configPath, writeRuntimeConfig } from "../paths";
-import { azureNeedsBaseUrl, azureNeedsHttps, hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { writeRuntimeConfig } from "../paths";
+import { anthropicNeedsHttps, azureNeedsBaseUrl, azureNeedsHttps, hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { isValidEnvVarName, removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
-const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local", "azure"] as const;
+const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local", "anthropic", "bedrock", "azure"] as const;
 type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
 
-// OpenAI-compatible providers that authenticate via an env var written to
+// Env-keyed providers that authenticate via an env var written to
 // ~/.gini/secrets.env. `local` allows an empty key because many local
 // gateways (Ollama, LM Studio) accept no-auth requests. Codex is excluded
-// because it uses its own OAuth/auth.json flow. `azure` is the Azure OpenAI
-// resource key (api-key header by default); it additionally requires a
-// per-resource baseUrl, enforced by the azureNeeds* guards below.
+// because it uses its own OAuth/auth.json flow. `anthropic` is env-keyed but
+// speaks the native Messages API, not an OpenAI-compatible surface. `azure` is
+// the Azure OpenAI resource key (api-key header by default); it additionally
+// requires a per-resource baseUrl, enforced by the azureNeeds* guards below.
+// (bedrock is NOT here — it signs with AWS credentials, no gini-held key.)
 const ENV_KEY_PROVIDERS: Record<string, { envVar: string; allowEmptyKey: boolean; defaultModel: string }> = {
   openai: { envVar: "OPENAI_API_KEY", allowEmptyKey: false, defaultModel: "gpt-5.4-mini" },
   openrouter: { envVar: "OPENROUTER_API_KEY", allowEmptyKey: false, defaultModel: "openrouter/auto" },
   deepseek: { envVar: "DEEPSEEK_API_KEY", allowEmptyKey: false, defaultModel: "deepseek-v4-flash" },
   local: { envVar: "GINI_LOCAL_API_KEY", allowEmptyKey: true, defaultModel: "local/default" },
+  // First-party Anthropic Messages API key.
+  anthropic: { envVar: "ANTHROPIC_API_KEY", allowEmptyKey: false, defaultModel: "claude-opus-4-8" },
   azure: { envVar: "AZURE_OPENAI_API_KEY", allowEmptyKey: false, defaultModel: "gpt-5.5" }
 };
 
@@ -86,7 +92,7 @@ export function getSetupStatus(config: RuntimeConfig): SetupStatus {
   // for browser onboarding. Anyone on echo needs to pick a real
   // provider in /setup. Other configured providers (openai with key,
   // codex with auth.json) pass through.
-  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local" || current === "deepseek" || current === "azure";
+  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local" || current === "deepseek" || current === "anthropic" || current === "bedrock" || current === "azure";
   const providerConfigured = isRealProvider && Boolean(health.configured);
   return {
     ok: true,
@@ -126,6 +132,15 @@ export async function setSetupProvider(
   }
   const envKeySpec = ENV_KEY_PROVIDERS[providerName];
   if (envKeySpec) {
+    // Resolve the env var this config actually reads from: for an edit of the
+    // already-active provider, honor its configured apiKeyEnv (e.g. a CLI-set
+    // custom var); otherwise the canonical default. Routing the "already set?"
+    // probe, the key write, and the preserved apiKeyEnv all through one
+    // targetEnvVar keeps write-target == stored-config == read-source, so a
+    // custom-apiKeyEnv provider can be edited/rotated from the web without
+    // being rejected or silently flipped back to the canonical var.
+    const existing = config.provider?.name === providerName ? config.provider : undefined;
+    const targetEnvVar = existing?.apiKeyEnv ?? envKeySpec.envVar;
     const apiKey = typeof payload.apiKey === "string" ? payload.apiKey.trim() : "";
     // On a same-provider edit, preserve transport config the caller didn't
     // resend. A partial caller — the Settings model picker or the set_provider
@@ -134,14 +149,6 @@ export async function setSetupProvider(
     // routing fields (apiVersion / deployment / authScheme). A provider SWITCH
     // (different name) starts clean — `existing` is undefined — matching the
     // cross-provider non-inheritance rule resolveEffectiveContext enforces.
-    const existing = config.provider?.name === providerName ? config.provider : undefined;
-    // The env var that actually holds this provider's key. A same-provider edit
-    // honors a custom apiKeyEnv (set via `gini provider set --api-key-env`) so
-    // the "already set?" check and the secret write target the SAME var the
-    // gateway reads at call time (readOpenAIBearer / providerHealth read
-    // provider.apiKeyEnv). Otherwise a config naming a custom env var would get
-    // its key written to the provider default and read back as unconfigured.
-    const targetEnvVar = existing?.apiKeyEnv ?? envKeySpec.envVar;
     // A persisted apiKeyEnv flows into the secrets.env writer; reject a
     // malformed name (it would otherwise be caught by the writer's guard and
     // surface as an unhandled 500) rather than try to write it.
@@ -210,6 +217,16 @@ export async function setSetupProvider(
         error: "Azure OpenAI requires an https:// endpoint (the credential is sent on every request)."
       };
     }
+    // anthropic sends its API key on every request, so refuse a plaintext custom
+    // baseUrl (loopback proxies excepted). No-op for non-anthropic providers.
+    if (anthropicNeedsHttps(providerName, baseUrl)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: "The anthropic provider requires an https:// baseUrl (the API key is sent on every request). Use http only for a localhost proxy."
+      };
+    }
 
     if (apiKey) {
       // Persist to secrets.env so the wrapper-sourced env carries it on
@@ -232,7 +249,7 @@ export async function setSetupProvider(
       ...(deployment ? { deployment } : {}),
       ...(authScheme ? { authScheme } : {})
     });
-    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeRuntimeConfig(config);
 
     // Request plist refresh via a marker file + SIGTERM. A simpler
     // approach (setImmediate → setTimeout(200ms) → detached spawn)
@@ -251,6 +268,55 @@ export async function setSetupProvider(
       provider: providerHealth(config),
       plistRefreshNeeded: refreshed
     };
+  }
+  if (providerName === "bedrock") {
+    // Like codex, bedrock holds no gini-managed key: it signs each Converse
+    // request with the caller's AWS credentials (AWS_* env or the
+    // ~/.aws/credentials profile). "Configured" therefore means those
+    // credentials resolve — reject up front with a clear hint when they don't,
+    // mirroring codex's "run codex --login" gate. Only model + region are
+    // persisted (never secret values).
+    const existing = config.provider?.name === "bedrock" ? config.provider : undefined;
+    if (!hasUsableAwsCredentials()) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error:
+          "No AWS credentials found. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure ~/.aws/credentials, then retry."
+      };
+    }
+    const model = typeof payload.model === "string" && payload.model.length > 0
+      ? payload.model
+      : existing?.model;
+    // Present-clears, like the env-keyed transport fields: a blank awsRegion in
+    // the payload CLEARS the region (the host then resolves from AWS_REGION /
+    // AWS_DEFAULT_REGION / the us-east-1 default), while an OMITTED awsRegion
+    // preserves the existing one so a partial { provider, model } save from the
+    // model picker or set_provider tool doesn't silently reset it.
+    const awsRegion = Object.prototype.hasOwnProperty.call(payload, "awsRegion")
+      ? (typeof payload.awsRegion === "string" && payload.awsRegion.trim().length > 0 ? payload.awsRegion.trim() : undefined)
+      : existing?.awsRegion;
+    // The region lands in the Converse request host, so reject a malformed one
+    // here (the self-tool can supply it) before it ever persists.
+    if (awsRegion !== undefined && !isValidAwsRegion(awsRegion)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: `awsRegion is invalid: '${awsRegion}' (must match /^[a-z0-9-]+$/, e.g. us-east-1).`
+      };
+    }
+    config.provider = normalizeProvider({
+      name: "bedrock",
+      model: model ?? "",
+      ...(awsRegion ? { awsRegion } : {}),
+      // Preserve a CLI-set extraBody across an edit/save (no web surface sends it,
+      // so a model-only save must not silently drop it).
+      ...(existing?.extraBody ? { extraBody: existing.extraBody } : {})
+    });
+    writeRuntimeConfig(config);
+    return { ok: true, provider: providerHealth(config), plistRefreshNeeded: false };
   }
   // providerName === "codex"
   if (!hasUsableCodexCredentials(config.provider)) {
@@ -348,7 +414,7 @@ export function removeSetupProvider(
     } else {
       config.provider = normalizeProvider({ name: "echo", model: "gini-echo-v0" });
     }
-    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeRuntimeConfig(config);
     switched = true;
   }
 

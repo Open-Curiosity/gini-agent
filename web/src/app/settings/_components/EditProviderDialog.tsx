@@ -14,6 +14,8 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { BedrockModelSelect } from "./BedrockModelSelect";
+import { BedrockRegionSelect } from "./BedrockRegionSelect";
 import { api } from "@/lib/api";
 import type { ProviderConfig } from "@runtime/types";
 import { displayProviderName, type ProviderCatalogItem } from "./ProviderCard";
@@ -28,6 +30,7 @@ export function EditProviderDialog({
   authLabel,
   icon: Icon,
   currentModel,
+  currentAwsRegion,
   activeConfig,
   open,
   onOpenChange
@@ -36,6 +39,8 @@ export function EditProviderDialog({
   authLabel: string;
   icon: React.ComponentType<{ className?: string }>;
   currentModel?: string;
+  // The active bedrock provider's persisted region, so the dialog opens pre-filled.
+  currentAwsRegion?: string;
   // Persisted transport config for this provider when it is the active one —
   // used to prefill the Azure base URL + routing fields on open.
   activeConfig?: ProviderConfig;
@@ -43,29 +48,39 @@ export function EditProviderDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const queryClient = useQueryClient();
+  const isAnthropic = row.name === "anthropic";
+  // Bedrock signs with AWS credentials (no gini-held key) and takes any
+  // model id, so its edit surface is a free-text model + optional region.
+  const isBedrock = row.name === "bedrock";
   const isAzure = row.name === "azure";
+  const initialModel = currentModel ?? row.models[0] ?? "";
+  const initialRegion = currentAwsRegion ?? "";
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
-  const [model, setModel] = useState<string>(currentModel ?? row.models[0] ?? "");
-  // Azure transport fields, prefilled from the active config when present.
+  const [model, setModel] = useState<string>(initialModel);
+  const [awsRegion, setAwsRegion] = useState(initialRegion);
+  // Endpoint override, shared by anthropic and azure. Anthropic leaves it blank
+  // to keep the current endpoint; azure prefills the required resource endpoint
+  // from the active config and the remaining transport fields below.
   const [baseUrl, setBaseUrl] = useState<string>(activeConfig?.baseUrl ?? "");
   const [apiVersion, setApiVersion] = useState<string>(activeConfig?.apiVersion ?? "");
   const [deployment, setDeployment] = useState<string>(activeConfig?.deployment ?? "");
   const [authScheme, setAuthScheme] = useState<string>(activeConfig?.authScheme ?? "api-key");
 
-  // Reset transient inputs whenever the dialog opens for a new row.
-  // currentModel can shift if the active provider changes elsewhere; we
-  // want the dialog to reflect the most recent values on each open.
+  // Reset transient inputs whenever the dialog opens for a new row. currentModel
+  // /region can shift if the active provider changes elsewhere; reflect the most
+  // recent values on each open.
   useEffect(() => {
     if (!open) return;
     setApiKey("");
     setShowKey(false);
-    setModel(currentModel ?? row.models[0] ?? "");
+    setModel(initialModel);
+    setAwsRegion(initialRegion);
     setBaseUrl(activeConfig?.baseUrl ?? "");
     setApiVersion(activeConfig?.apiVersion ?? "");
     setDeployment(activeConfig?.deployment ?? "");
     setAuthScheme(activeConfig?.authScheme ?? "api-key");
-  }, [open, row.id, currentModel, row.models, activeConfig]);
+  }, [open, row.id, initialModel, initialRegion, activeConfig]);
 
   const save = useMutation({
     mutationFn: async (): Promise<SetProviderResult> =>
@@ -73,15 +88,21 @@ export function EditProviderDialog({
         method: "POST",
         body: JSON.stringify({
           provider: row.name,
-          // The backend treats apiKey as optional when the env var is
-          // already set, so model-only edits work without a re-type.
-          ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-          ...(model ? { model } : {}),
-          // baseUrl applies to every OpenAI-compatible provider; the Edit pencil
-          // is hidden for codex, so every editable row sends it (present-clears:
-          // blanking it reverts to the provider default; for azure it is the
-          // required resource endpoint, enforced by canSubmit below).
-          baseUrl: baseUrl.trim(),
+          // bedrock holds no key; for the others apiKey is optional when the
+          // env var is already set, so model-only edits work without a re-type.
+          ...(!isBedrock && apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+          ...(model.trim() ? { model: model.trim() } : {}),
+          // baseUrl applies to every OpenAI-compatible provider plus anthropic
+          // (first-party endpoint override). Bedrock derives its endpoint from
+          // awsRegion, so it never sends baseUrl. For the rest it is sent as the
+          // full state (present-clears: blanking it reverts to the provider
+          // default; for azure it is the required resource endpoint, enforced by
+          // canSubmit below).
+          ...(!isBedrock ? { baseUrl: baseUrl.trim() } : {}),
+          // Bedrock sends awsRegion as full state (present-clears): a blank value
+          // clears it so the host resolves from AWS_REGION / the us-east-1
+          // default, rather than being silently dropped and preserved.
+          ...(isBedrock ? { awsRegion: awsRegion.trim() } : {}),
           // Azure routing — sent as the full transport state (present-clears),
           // so blanking api-version/deployment falls back to the GA default /
           // the model id.
@@ -113,19 +134,21 @@ export function EditProviderDialog({
     onError: (error: Error) => toast.error(error.message)
   });
 
-  // Save is allowed when the user changed something. apiKey is optional
-  // for an env-already-set edit; model is required and defaults to the
-  // current selection, so toggling it back to the same value still lets
-  // the user dismiss via Cancel without nagging.
+  // Save is allowed when the user changed something. apiKey is optional for an
+  // env-already-set edit; model defaults to the current selection, so toggling
+  // it back to the same value still lets the user dismiss via Cancel.
+  // transportDirty covers the shared baseUrl (present-clears) and azure's
+  // routing fields; bedrock's region change is tracked separately below.
   const transportDirty =
-    baseUrl.trim() !== (activeConfig?.baseUrl ?? "") ||
+    (!isBedrock && baseUrl.trim() !== (activeConfig?.baseUrl ?? "")) ||
     (isAzure &&
       (apiVersion.trim() !== (activeConfig?.apiVersion ?? "") ||
         deployment.trim() !== (activeConfig?.deployment ?? "") ||
         authScheme !== (activeConfig?.authScheme ?? "api-key")));
   const dirty =
     apiKey.trim().length > 0 ||
-    (model !== "" && model !== (currentModel ?? row.models[0] ?? "")) ||
+    (isBedrock && awsRegion.trim() !== initialRegion.trim()) ||
+    (model.trim() !== "" && model.trim() !== initialModel) ||
     transportDirty;
   // Azure has no default endpoint — a base URL is required on every save.
   const azureValid = !isAzure || baseUrl.trim().length > 0;
@@ -153,32 +176,67 @@ export function EditProviderDialog({
             if (canSubmit) save.mutate();
           }}
         >
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <Label htmlFor="edit-api-key" className="text-[13px] font-semibold text-foreground">API key</Label>
-              <span className="text-xs text-muted-foreground">Stored encrypted</span>
+          {!isBedrock ? (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="edit-api-key" className="text-[13px] font-semibold text-foreground">API key</Label>
+                <span className="text-xs text-muted-foreground">Stored encrypted</span>
+              </div>
+              <div className="relative">
+                <Input
+                  id="edit-api-key"
+                  type={showKey ? "text" : "password"}
+                  autoComplete="off"
+                  placeholder="Leave blank to keep the saved key"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  disabled={save.isPending}
+                  className="h-11 border-border bg-secondary pr-11 font-mono text-[13px]"
+                />
+                <button
+                  type="button"
+                  aria-label={showKey ? "Hide API key" : "Show API key"}
+                  onClick={() => setShowKey((v) => !v)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                >
+                  {showKey ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
+                </button>
+              </div>
             </div>
-            <div className="relative">
-              <Input
-                id="edit-api-key"
-                type={showKey ? "text" : "password"}
-                autoComplete="off"
-                placeholder="Leave blank to keep the saved key"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
+          ) : null}
+
+          {isBedrock ? (
+            <div className="space-y-2">
+              <Label htmlFor="edit-aws-region" className="text-[13px] font-semibold text-foreground">AWS region</Label>
+              <BedrockRegionSelect
+                id="edit-aws-region"
+                value={awsRegion}
+                onChange={setAwsRegion}
                 disabled={save.isPending}
-                className="h-11 border-border bg-secondary pr-11 font-mono text-[13px]"
+                triggerClassName="h-11 border-border bg-secondary font-mono text-[13px]"
               />
-              <button
-                type="button"
-                aria-label={showKey ? "Hide API key" : "Show API key"}
-                onClick={() => setShowKey((v) => !v)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-              >
-                {showKey ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
-              </button>
+              <p className="text-xs text-muted-foreground">Signs with your AWS credentials (AWS_ACCESS_KEY_ID/SECRET env vars or ~/.aws/credentials). No API key needed.</p>
             </div>
-          </div>
+          ) : null}
+
+          {isAnthropic ? (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="edit-base-url" className="text-[13px] font-semibold text-foreground">Base URL</Label>
+                <span className="text-xs text-muted-foreground">optional</span>
+              </div>
+              <Input
+                id="edit-base-url"
+                type="text"
+                autoComplete="off"
+                placeholder="Leave blank to keep the current endpoint"
+                value={baseUrl}
+                onChange={(e) => setBaseUrl(e.target.value)}
+                disabled={save.isPending}
+                className="h-11 border-border bg-secondary font-mono text-[13px]"
+              />
+            </div>
+          ) : null}
 
           <div className="space-y-2">
             <div className="flex items-center justify-between">
@@ -187,19 +245,30 @@ export function EditProviderDialog({
                 {row.models.length} available
               </span>
             </div>
-            <Select value={model} onValueChange={setModel} disabled={save.isPending}>
-              <SelectTrigger
+            {isBedrock ? (
+              <BedrockModelSelect
                 id="edit-model"
-                className="h-11 border-border bg-secondary font-mono text-[13px]"
-              >
-                <SelectValue placeholder="Select model" />
-              </SelectTrigger>
-              <SelectContent>
-                {row.models.map((m) => (
-                  <SelectItem key={m} value={m} className="font-mono text-[13px]">{m}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+                models={row.models}
+                value={model}
+                onChange={setModel}
+                disabled={save.isPending}
+                triggerClassName="h-11 border-border bg-secondary font-mono text-[13px]"
+              />
+            ) : (
+              <Select value={model} onValueChange={setModel} disabled={save.isPending}>
+                <SelectTrigger
+                  id="edit-model"
+                  className="h-11 border-border bg-secondary font-mono text-[13px]"
+                >
+                  <SelectValue placeholder="Select model" />
+                </SelectTrigger>
+                <SelectContent>
+                  {row.models.map((m) => (
+                    <SelectItem key={m} value={m} className="font-mono text-[13px]">{m}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
           </div>
 
           {isAzure ? (
@@ -258,7 +327,10 @@ export function EditProviderDialog({
                 </Select>
               </div>
             </div>
-          ) : (
+          ) : !isAnthropic && !isBedrock ? (
+            // Generic OpenAI-compatible base URL. anthropic renders its own
+            // Base URL field above; bedrock derives its endpoint from awsRegion,
+            // so neither uses this fallback.
             <div className="space-y-2">
               <div className="flex items-center justify-between">
                 <Label htmlFor="edit-base-url" className="text-[13px] font-semibold text-foreground">Base URL</Label>
@@ -275,7 +347,7 @@ export function EditProviderDialog({
                 className="h-11 border-border bg-secondary font-mono text-[13px]"
               />
             </div>
-          )}
+          ) : null}
 
           <div className="flex items-center justify-end gap-2.5 border-t border-border pt-4">
             <Button

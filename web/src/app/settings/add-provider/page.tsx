@@ -15,17 +15,21 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { AzureLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
+import { AnthropicLogo, AzureLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
+import { BedrockModelSelect } from "../_components/BedrockModelSelect";
+import { BedrockRegionSelect } from "../_components/BedrockRegionSelect";
 import { api } from "@/lib/api";
 import { displayProviderName, type ProviderCatalogItem } from "../_components/ProviderCard";
 
 // Codex stays first so it lines up with where the Settings list shows
 // its row. Echo is dev-only and never appears here.
-const SELECTABLE_PROVIDERS = ["codex", "openai", "openrouter", "deepseek", "azure", "local"] as const;
+const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "bedrock", "openrouter", "deepseek", "azure", "local"] as const;
 
 const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: string }>; description: string }> = {
   codex: { icon: TerminalIcon, description: "OAuth via codex --login" },
   openai: { icon: OpenAILogo, description: "GPT-5.4, GPT-5.4 mini, …" },
+  anthropic: { icon: AnthropicLogo, description: "Claude (first-party API key)" },
+  bedrock: { icon: BedrockLogo, description: "Claude, Nova, Llama… on AWS" },
   openrouter: { icon: ZapIcon, description: "Multi-model router" },
   deepseek: { icon: DeepSeekLogo, description: "DeepSeek V4 family" },
   azure: { icon: AzureLogo, description: "Azure OpenAI deployments" },
@@ -59,8 +63,15 @@ export default function AddProviderPage() {
   const [providerName, setProviderName] = useState<string>("");
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [apiKey, setApiKey] = useState("");
-  // Azure transport fields. Base URL is required; the rest default server-side.
+  // baseUrl is shared: optional first-party/proxy override for anthropic and
+  // OpenAI-compatible providers, and the required resource endpoint for azure.
   const [baseUrl, setBaseUrl] = useState("");
+  // AWS region for the bedrock provider. Empty by default so a save that doesn't
+  // touch it persists no region and the runtime resolves AWS_REGION /
+  // AWS_DEFAULT_REGION / us-east-1 at request time (matching `gini provider set`).
+  // The picker shows a "Select a region" placeholder until one is chosen.
+  const [awsRegion, setAwsRegion] = useState("");
+  // Azure transport fields. The rest default server-side when blank.
   const [apiVersion, setApiVersion] = useState("");
   const [deployment, setDeployment] = useState("");
   const [authScheme, setAuthScheme] = useState("api-key");
@@ -80,6 +91,7 @@ export default function AddProviderPage() {
     setSelectedModel(entry?.models[0] ?? "");
     setApiKey("");
     setBaseUrl("");
+    setAwsRegion("");
     setApiVersion("");
     setDeployment("");
     setAuthScheme("api-key");
@@ -88,8 +100,11 @@ export default function AddProviderPage() {
   const entry = tiles.find((t) => t.name === providerName);
   const isCodex = providerName === "codex";
   const isLocal = providerName === "local";
+  const isAnthropic = providerName === "anthropic";
+  const isBedrock = providerName === "bedrock";
   const isAzure = providerName === "azure";
-  const requiresApiKey = providerName !== "" && !isCodex && !isLocal;
+  // Codex (OAuth), bedrock (AWS SigV4), and local (no-auth) hold no gini key.
+  const requiresApiKey = providerName !== "" && !isCodex && !isLocal && !isBedrock;
 
   const save = useMutation({
     mutationFn: async (): Promise<SetProviderResult> => {
@@ -107,11 +122,14 @@ export default function AddProviderPage() {
         body: JSON.stringify({
           provider: providerName,
           ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-          ...(selectedModel ? { model: selectedModel } : {}),
-          // baseUrl applies to every OpenAI-compatible provider (local / openai /
-          // openrouter / deepseek / azure); codex ignores it. For azure it is the
-          // required resource endpoint, for the others an optional override.
-          ...(!isCodex ? { baseUrl: baseUrl.trim() } : {}),
+          ...(selectedModel.trim() ? { model: selectedModel.trim() } : {}),
+          // baseUrl applies to anthropic and every OpenAI-compatible provider
+          // (local / openai / openrouter / deepseek / azure); codex and bedrock
+          // ignore it. For azure it is the required resource endpoint, for the
+          // others an optional override, so only send it when non-empty.
+          ...(!isCodex && !isBedrock && baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
+          // Bedrock signs with AWS creds; an optional region override travels here.
+          ...(isBedrock && awsRegion.trim() ? { awsRegion: awsRegion.trim() } : {}),
           // Azure routing fields default server-side when blank.
           ...(isAzure
             ? {
@@ -152,7 +170,7 @@ export default function AddProviderPage() {
     !save.isPending &&
     (isCodex
       ? true
-      : selectedModel !== "" &&
+      : selectedModel.trim() !== "" &&
         (!requiresApiKey || apiKey.trim().length > 0) &&
         // Azure has no default endpoint — require a base URL before saving.
         (!isAzure || baseUrl.trim().length > 0));
@@ -184,7 +202,7 @@ export default function AddProviderPage() {
             <h2 className="text-sm font-semibold">Provider type</h2>
             <p className="text-xs text-muted-foreground">Choose the model API surface to configure.</p>
           </div>
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
             {tiles.map((tile) => {
               const visual = PROVIDER_VISUAL[tile.name] ?? { icon: TerminalIcon, description: "" };
               const Icon = visual.icon;
@@ -222,9 +240,11 @@ export default function AddProviderPage() {
             <p className="text-xs text-muted-foreground">
               {isCodex
                 ? "Codex authenticates through your existing ChatGPT account — no API key needed."
-                : isLocal
-                  ? "Local providers accept no-auth requests; leave the key blank if your gateway is open."
-                  : "Saved to ~/.gini/secrets.env (mode 0600). Not sent anywhere except the provider."}
+                : isBedrock
+                  ? "Bedrock signs each request with your AWS credentials — no API key needed."
+                  : isLocal
+                    ? "Local providers accept no-auth requests; leave the key blank if your gateway is open."
+                    : "Saved to ~/.gini/secrets.env (mode 0600). Not sent anywhere except the provider."}
             </p>
           </div>
 
@@ -246,6 +266,37 @@ export default function AddProviderPage() {
                   every request, so a future <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">codex --login</code> refresh is picked up automatically.
                 </p>
               </div>
+            ) : isBedrock ? (
+              <>
+                <p className="text-xs text-muted-foreground">
+                  Gini signs each Converse request with the AWS credentials it finds in
+                  <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">AWS_ACCESS_KEY_ID</code>/<code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">AWS_SECRET_ACCESS_KEY</code>
+                  (plus <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">AWS_SESSION_TOKEN</code> for temporary sessions)
+                  or your <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">~/.aws/credentials</code> profile. No API key. SSO or assumed-role users: export the session first with <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">aws configure export-credentials</code>.
+                </p>
+                <div className="grid gap-2">
+                  <Label htmlFor="bedrock-model">Model (cross-region inference profile)</Label>
+                  <BedrockModelSelect
+                    id="bedrock-model"
+                    models={entry?.models ?? []}
+                    value={selectedModel}
+                    onChange={setSelectedModel}
+                    disabled={!entry || save.isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Pick a model, or choose <span className="font-medium">Custom model id…</span> to enter any Bedrock inference-profile id.
+                  </p>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="bedrock-region">AWS region</Label>
+                  <BedrockRegionSelect
+                    id="bedrock-region"
+                    value={awsRegion}
+                    onChange={setAwsRegion}
+                    disabled={save.isPending}
+                  />
+                </div>
+              </>
             ) : (
               <>
                 {requiresApiKey ? (
@@ -313,6 +364,21 @@ export default function AddProviderPage() {
                         </SelectContent>
                       </Select>
                     </div>
+                  </div>
+                ) : isAnthropic ? (
+                  <div className="grid gap-2">
+                    <Label htmlFor="provider-base-url">
+                      Base URL <span className="text-muted-foreground">(optional)</span>
+                    </Label>
+                    <Input
+                      id="provider-base-url"
+                      type="text"
+                      autoComplete="off"
+                      placeholder="https://api.anthropic.com"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      disabled={save.isPending}
+                    />
                   </div>
                 ) : (
                   <div className="grid gap-2">
