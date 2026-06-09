@@ -219,13 +219,14 @@ export function bedrockSupportsToolUse(model: string): boolean {
   return !/deepseek/i.test(model);
 }
 
-// Bedrock Converse streaming (converse-stream) is also per-model. AWS rejects the
-// ConverseStream operation for Llama 4 Instruct ("You can't use the
-// InvokeModelWithResponseStream or ConverseStream (streaming) operations with
-// Llama 4 Instruct" — model-parameters-meta.html). A normal chat turn streams, so
-// without this gate a Llama 4 agent fails every turn; falling back to the
-// non-stream Converse endpoint returns the full text instead. Denylist the known
-// family; everything else streams.
-export function bedrockSupportsStreaming(model: string): boolean {
+// Whether a Bedrock model can carry toolConfig on a streaming (converse-stream)
+// request. Llama 4 streams fine and uses tools fine, but NOT both at once — a
+// Llama 4 ConverseStream with toolConfig returns "This model doesn't support tool
+// use in streaming mode" (verified live; the model card's blanket "no
+// ConverseStream" wording is broader than the actual constraint). callBedrockConverse
+// uses this to drop to non-stream Converse for Llama 4 only when it is attaching
+// tools — tool-less Llama 4 turns still stream. Denylist the known family;
+// everything else supports tools + streaming together.
+export function bedrockSupportsStreamingWithTools(model: string): boolean {
   return !/llama4/i.test(model);
 }

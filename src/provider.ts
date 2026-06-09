@@ -5,7 +5,7 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import { bedrockSupportsStreaming, bedrockSupportsToolUse, resolveProviderModality } from "./provider-capabilities";
+import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, resolveProviderModality } from "./provider-capabilities";
 import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
 import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
@@ -2058,9 +2058,16 @@ async function callBedrockConverse(
   maxTokensOverride?: number
 ): Promise<ToolCallingResult> {
   const region = bedrockRegion(provider);
-  // Some models (Llama 4 Instruct) reject the converse-stream operation; fall
-  // back to non-stream Converse for them so the turn returns full text instead.
-  const wantStream = Boolean(onDelta) && bedrockSupportsStreaming(provider.model);
+  // Omit toolConfig for models that reject it (e.g. DeepSeek R1) so a normal
+  // tool-loaded chat turn degrades to text-only instead of a ValidationException.
+  const toolConfig = bedrockSupportsToolUse(provider.model) ? translateToolsToConverse(tools) : undefined;
+  // Llama 4 streams fine and uses tools fine, but NOT both at once — AWS returns
+  // "This model doesn't support tool use in streaming mode" for a Llama 4
+  // ConverseStream carrying toolConfig. Fall back to non-stream Converse only
+  // when we're actually attaching tools to such a model; tool-less Llama 4 turns
+  // (and every other model) still stream.
+  const wantStream =
+    Boolean(onDelta) && !(toolConfig && !bedrockSupportsStreamingWithTools(provider.model));
   const url = bedrockConverseUrl(region, provider.model, wantStream);
   const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
   const { system, messages: converseMessages } = translateMessagesToConverse(safeMessages);
@@ -2072,9 +2079,6 @@ async function callBedrockConverse(
     inferenceConfig: { maxTokens }
   };
   if (system.length > 0) body.system = system;
-  // Omit toolConfig for models that reject it (e.g. DeepSeek R1) so a normal
-  // tool-loaded chat turn degrades to text-only instead of a ValidationException.
-  const toolConfig = bedrockSupportsToolUse(provider.model) ? translateToolsToConverse(tools) : undefined;
   if (toolConfig) body.toolConfig = toolConfig;
 
   const bodyJson = JSON.stringify(body);

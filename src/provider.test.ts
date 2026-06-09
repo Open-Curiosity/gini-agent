@@ -4437,7 +4437,7 @@ describe("anthropic provider", () => {
     }
   });
 
-  test("bedrock: Llama 4 forces non-stream Converse even when an onDelta is provided", async () => {
+  test("bedrock: Llama 4 drops to non-stream Converse when tools are attached", async () => {
     const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
     const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
     const seen: string[] = [];
@@ -4445,14 +4445,46 @@ describe("anthropic provider", () => {
       anthropicJson({ output: { message: { role: "assistant", content: [{ text: "hi from llama" }] } }, stopReason: "end_turn", usage: {} })
     );
     try {
-      // AWS rejects ConverseStream for Llama 4 Instruct, so a streaming chat turn
-      // must fall back to the non-stream /converse endpoint and still return text.
+      // Llama 4 can't carry toolConfig on a streaming request ("tool use in
+      // streaming mode"), so a tool-loaded turn must use non-stream /converse —
+      // and the tools are still attached (Llama 4 supports tools when not streaming).
       const provider = normalizeProvider({ name: "bedrock", model: "us.meta.llama4-scout-17b-instruct-v1:0", awsRegion: "us-east-1" });
-      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], (d) => seen.push(d));
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "lookup", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], tools, (d) => seen.push(d));
       const url = fetchStub.calls[0]!.url;
       expect(url.endsWith("/converse")).toBe(true);
       expect(url).not.toContain("converse-stream");
+      expect(JSON.parse(String(fetchStub.calls[0]!.init.body)).toolConfig).toBeDefined();
       expect(result.text).toBe("hi from llama");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: Llama 4 still streams a tool-less turn", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const seen: string[] = [];
+    const fetchStub = installFetch(() =>
+      converseEventStream([
+        { type: "messageStart", payload: { role: "assistant" } },
+        { type: "contentBlockDelta", payload: { contentBlockIndex: 0, delta: { text: "Hi" } } },
+        { type: "contentBlockStop", payload: { contentBlockIndex: 0 } },
+        { type: "messageStop", payload: { stopReason: "end_turn" } },
+        { type: "metadata", payload: { usage: { inputTokens: 5, outputTokens: 1, totalTokens: 6 } } }
+      ])
+    );
+    try {
+      // Without tools there's no streaming/tool conflict, so Llama 4 streams.
+      const provider = normalizeProvider({ name: "bedrock", model: "us.meta.llama4-scout-17b-instruct-v1:0", awsRegion: "us-east-1" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], (d) => seen.push(d));
+      expect(fetchStub.calls[0]!.url).toContain("/converse-stream");
+      expect(seen.join("")).toBe("Hi");
+      expect(result.text).toBe("Hi");
     } finally {
       fetchStub.restore();
       restoreSk();

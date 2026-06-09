@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
-  bedrockSupportsStreaming,
+  bedrockSupportsStreamingWithTools,
   bedrockSupportsToolUse,
   FALLBACK_CONTEXT_WINDOW_TOKENS,
   resolveDefaultPriorContextTokenBudget,
@@ -142,12 +142,14 @@ describe("bedrockSupportsToolUse", () => {
   });
 });
 
-describe("bedrockSupportsStreaming", () => {
-  test("Llama 4 ids are gated off; every other family streams", () => {
-    // AWS rejects ConverseStream for Llama 4 Instruct.
-    expect(bedrockSupportsStreaming("us.meta.llama4-maverick-17b-instruct-v1:0")).toBe(false);
-    expect(bedrockSupportsStreaming("us.meta.llama4-scout-17b-instruct-v1:0")).toBe(false);
-    // Other families (incl. Llama 3.3, unrecognized/custom ids) stream.
+describe("bedrockSupportsStreamingWithTools", () => {
+  test("Llama 4 ids are gated off; every other family streams with tools", () => {
+    // Llama 4 can't carry toolConfig on a streaming request ("tool use in
+    // streaming mode"); callBedrockConverse drops to non-stream only when tools
+    // are attached.
+    expect(bedrockSupportsStreamingWithTools("us.meta.llama4-maverick-17b-instruct-v1:0")).toBe(false);
+    expect(bedrockSupportsStreamingWithTools("us.meta.llama4-scout-17b-instruct-v1:0")).toBe(false);
+    // Other families (incl. Llama 3.3, unrecognized/custom ids) support tools + streaming.
     for (const m of [
       "us.anthropic.claude-opus-4-8",
       "us.amazon.nova-lite-v1:0",
@@ -156,7 +158,7 @@ describe("bedrockSupportsStreaming", () => {
       "some.custom.future-model",
       ""
     ]) {
-      expect(bedrockSupportsStreaming(m)).toBe(true);
+      expect(bedrockSupportsStreamingWithTools(m)).toBe(true);
     }
   });
 });
