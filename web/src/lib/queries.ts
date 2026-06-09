@@ -518,7 +518,7 @@ export function useChatBlocks(sessionId: string | null) {
   // terminal frame and strands the UI on "Thinking". 3s matches the
   // session-list / agent-chat cadence; clears once terminal or the
   // session changes.
-  const active = useMemo(() => latestInFlightTaskId(blocks) !== null, [blocks]);
+  const active = useMemo(() => anyConversationInFlight(blocks), [blocks]);
   useEffect(() => {
     if (!sessionId || !active) return;
     const id = setInterval(refetch, 3000);
@@ -543,6 +543,20 @@ export function useChatBlocks(sessionId: string | null) {
   }, [sessionId, refetch]);
 
   return { blocks, isLoading, error, refetch };
+}
+
+// True when the main chat OR any thread has a non-terminal tail. The flat
+// block list interleaves thread blocks in the same ordinal stream, so a
+// single tail-scan would conflate conversations — a thread's terminal
+// phase landing last would mask a still-running main turn (and vice
+// versa). Evaluate each conversation slice independently and OR them.
+export function anyConversationInFlight(blocks: ChatBlock[]): boolean {
+  const { main, byThread } = splitBlocks(blocks);
+  if (latestInFlightTaskId(main) !== null) return true;
+  for (const threadBlocks of byThread.values()) {
+    if (latestInFlightTaskId(threadBlocks) !== null) return true;
+  }
+  return false;
 }
 
 // The single canonical chat for an agent. Resolves via
