@@ -15,6 +15,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { api } from "@/lib/api";
+import type { ProviderConfig } from "@runtime/types";
 import { displayProviderName, type ProviderCatalogItem } from "./ProviderCard";
 
 interface SetProviderResult {
@@ -27,6 +28,7 @@ export function EditProviderDialog({
   authLabel,
   icon: Icon,
   currentModel,
+  activeConfig,
   open,
   onOpenChange
 }: {
@@ -34,13 +36,22 @@ export function EditProviderDialog({
   authLabel: string;
   icon: React.ComponentType<{ className?: string }>;
   currentModel?: string;
+  // Persisted transport config for this provider when it is the active one —
+  // used to prefill the Azure base URL + routing fields on open.
+  activeConfig?: ProviderConfig;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
   const queryClient = useQueryClient();
+  const isAzure = row.name === "azure";
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
   const [model, setModel] = useState<string>(currentModel ?? row.models[0] ?? "");
+  // Azure transport fields, prefilled from the active config when present.
+  const [baseUrl, setBaseUrl] = useState<string>(activeConfig?.baseUrl ?? "");
+  const [apiVersion, setApiVersion] = useState<string>(activeConfig?.apiVersion ?? "");
+  const [deployment, setDeployment] = useState<string>(activeConfig?.deployment ?? "");
+  const [authScheme, setAuthScheme] = useState<string>(activeConfig?.authScheme ?? "api-key");
 
   // Reset transient inputs whenever the dialog opens for a new row.
   // currentModel can shift if the active provider changes elsewhere; we
@@ -50,7 +61,11 @@ export function EditProviderDialog({
     setApiKey("");
     setShowKey(false);
     setModel(currentModel ?? row.models[0] ?? "");
-  }, [open, row.id, currentModel, row.models]);
+    setBaseUrl(activeConfig?.baseUrl ?? "");
+    setApiVersion(activeConfig?.apiVersion ?? "");
+    setDeployment(activeConfig?.deployment ?? "");
+    setAuthScheme(activeConfig?.authScheme ?? "api-key");
+  }, [open, row.id, currentModel, row.models, activeConfig]);
 
   const save = useMutation({
     mutationFn: async (): Promise<SetProviderResult> =>
@@ -61,7 +76,22 @@ export function EditProviderDialog({
           // The backend treats apiKey as optional when the env var is
           // already set, so model-only edits work without a re-type.
           ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-          ...(model ? { model } : {})
+          ...(model ? { model } : {}),
+          // baseUrl applies to every OpenAI-compatible provider; the Edit pencil
+          // is hidden for codex, so every editable row sends it (present-clears:
+          // blanking it reverts to the provider default; for azure it is the
+          // required resource endpoint, enforced by canSubmit below).
+          baseUrl: baseUrl.trim(),
+          // Azure routing — sent as the full transport state (present-clears),
+          // so blanking api-version/deployment falls back to the GA default /
+          // the model id.
+          ...(isAzure
+            ? {
+                apiVersion: apiVersion.trim(),
+                deployment: deployment.trim(),
+                authScheme
+              }
+            : {})
         })
       }),
     onSuccess: async (result) => {
@@ -70,8 +100,14 @@ export function EditProviderDialog({
         return;
       }
       toast.success(`${displayProviderName(row)} updated.`);
-      queryClient.invalidateQueries({ queryKey: ["status"] });
-      await queryClient.refetchQueries({ queryKey: ["providers"] });
+      // Await BOTH refetches before closing. `activeConfig` (this dialog's
+      // prefill source) is threaded from the `status` query, so closing before
+      // status refetches lets a quick reopen read a stale config and overwrite a
+      // just-saved endpoint/deployment on the next save.
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["status"] }),
+        queryClient.refetchQueries({ queryKey: ["providers"] })
+      ]);
       onOpenChange(false);
     },
     onError: (error: Error) => toast.error(error.message)
@@ -81,17 +117,26 @@ export function EditProviderDialog({
   // for an env-already-set edit; model is required and defaults to the
   // current selection, so toggling it back to the same value still lets
   // the user dismiss via Cancel without nagging.
+  const transportDirty =
+    baseUrl.trim() !== (activeConfig?.baseUrl ?? "") ||
+    (isAzure &&
+      (apiVersion.trim() !== (activeConfig?.apiVersion ?? "") ||
+        deployment.trim() !== (activeConfig?.deployment ?? "") ||
+        authScheme !== (activeConfig?.authScheme ?? "api-key")));
   const dirty =
     apiKey.trim().length > 0 ||
-    (model !== "" && model !== (currentModel ?? row.models[0] ?? ""));
-  const canSubmit = dirty && !save.isPending;
+    (model !== "" && model !== (currentModel ?? row.models[0] ?? "")) ||
+    transportDirty;
+  // Azure has no default endpoint — a base URL is required on every save.
+  const azureValid = !isAzure || baseUrl.trim().length > 0;
+  const canSubmit = dirty && azureValid && !save.isPending;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="gap-5 border-[#1F1F24] bg-[#141418] p-7 sm:max-w-md">
+      <DialogContent className="gap-5 border-border bg-card p-7 sm:max-w-md">
         <div className="flex items-start gap-3">
-          <span className="flex size-[38px] shrink-0 items-center justify-center rounded-[10px] bg-[#1D2333]">
-            <Icon className="size-5 text-[#C2C2C8]" />
+          <span className="flex size-[38px] shrink-0 items-center justify-center rounded-[10px] bg-muted">
+            <Icon className="size-5 text-foreground" />
           </span>
           <div className="flex-1 space-y-0.5">
             <DialogTitle className="text-base font-bold text-foreground">Edit provider</DialogTitle>
@@ -110,8 +155,8 @@ export function EditProviderDialog({
         >
           <div className="space-y-2">
             <div className="flex items-center justify-between">
-              <Label htmlFor="edit-api-key" className="text-[13px] font-semibold text-[#C2C2C8]">API key</Label>
-              <span className="text-xs text-[#6A6A70]">Stored encrypted</span>
+              <Label htmlFor="edit-api-key" className="text-[13px] font-semibold text-foreground">API key</Label>
+              <span className="text-xs text-muted-foreground">Stored encrypted</span>
             </div>
             <div className="relative">
               <Input
@@ -122,13 +167,13 @@ export function EditProviderDialog({
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 disabled={save.isPending}
-                className="h-11 border-[#2A2A2E] bg-[#0E0E11] pr-11 font-mono text-[13px]"
+                className="h-11 border-border bg-secondary pr-11 font-mono text-[13px]"
               />
               <button
                 type="button"
                 aria-label={showKey ? "Hide API key" : "Show API key"}
                 onClick={() => setShowKey((v) => !v)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-[#7A7A80] hover:text-foreground"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
               >
                 {showKey ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
               </button>
@@ -137,15 +182,15 @@ export function EditProviderDialog({
 
           <div className="space-y-2">
             <div className="flex items-center justify-between">
-              <Label htmlFor="edit-model" className="text-[13px] font-semibold text-[#C2C2C8]">Default model</Label>
-              <span className="text-xs text-[#6A6A70]">
+              <Label htmlFor="edit-model" className="text-[13px] font-semibold text-foreground">Default model</Label>
+              <span className="text-xs text-muted-foreground">
                 {row.models.length} available
               </span>
             </div>
             <Select value={model} onValueChange={setModel} disabled={save.isPending}>
               <SelectTrigger
                 id="edit-model"
-                className="h-11 border-[#2A2A2E] bg-[#0E0E11] font-mono text-[13px]"
+                className="h-11 border-border bg-secondary font-mono text-[13px]"
               >
                 <SelectValue placeholder="Select model" />
               </SelectTrigger>
@@ -157,7 +202,82 @@ export function EditProviderDialog({
             </Select>
           </div>
 
-          <div className="flex items-center justify-end gap-2.5 border-t border-[#1F1F26] pt-4">
+          {isAzure ? (
+            <div className="space-y-5">
+              <div className="space-y-2">
+                <Label htmlFor="edit-base-url" className="text-[13px] font-semibold text-foreground">Resource endpoint</Label>
+                <Input
+                  id="edit-base-url"
+                  type="text"
+                  autoComplete="off"
+                  placeholder="https://<resource>.openai.azure.com"
+                  value={baseUrl}
+                  onChange={(e) => setBaseUrl(e.target.value)}
+                  disabled={save.isPending}
+                  className="h-11 border-border bg-secondary font-mono text-[13px]"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label htmlFor="edit-api-version" className="text-[13px] font-semibold text-foreground">API version</Label>
+                  <Input
+                    id="edit-api-version"
+                    type="text"
+                    autoComplete="off"
+                    placeholder="2024-10-21"
+                    value={apiVersion}
+                    onChange={(e) => setApiVersion(e.target.value)}
+                    disabled={save.isPending}
+                    className="h-11 border-border bg-secondary font-mono text-[13px]"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="edit-deployment" className="text-[13px] font-semibold text-foreground">Deployment</Label>
+                  <Input
+                    id="edit-deployment"
+                    type="text"
+                    autoComplete="off"
+                    placeholder="Defaults to model"
+                    value={deployment}
+                    onChange={(e) => setDeployment(e.target.value)}
+                    disabled={save.isPending}
+                    className="h-11 border-border bg-secondary font-mono text-[13px]"
+                  />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="edit-auth-scheme" className="text-[13px] font-semibold text-foreground">Auth scheme</Label>
+                <Select value={authScheme} onValueChange={setAuthScheme} disabled={save.isPending}>
+                  <SelectTrigger id="edit-auth-scheme" className="h-11 border-border bg-secondary text-[13px]">
+                    <SelectValue placeholder="Select auth scheme" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="api-key" className="text-[13px]">api-key (resource key)</SelectItem>
+                    <SelectItem value="bearer" className="text-[13px]">bearer (Entra token)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="edit-base-url" className="text-[13px] font-semibold text-foreground">Base URL</Label>
+                <span className="text-xs text-muted-foreground">Blank = default endpoint</span>
+              </div>
+              <Input
+                id="edit-base-url"
+                type="text"
+                autoComplete="off"
+                placeholder="Override the default endpoint"
+                value={baseUrl}
+                onChange={(e) => setBaseUrl(e.target.value)}
+                disabled={save.isPending}
+                className="h-11 border-border bg-secondary font-mono text-[13px]"
+              />
+            </div>
+          )}
+
+          <div className="flex items-center justify-end gap-2.5 border-t border-border pt-4">
             <Button
               type="button"
               variant="outline"

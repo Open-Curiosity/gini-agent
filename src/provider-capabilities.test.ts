@@ -75,6 +75,18 @@ describe("resolveProviderModality", () => {
       .toEqual({ vision: true, nativeDocs: true });
   });
 
+  test("azure follows the openai model family for vision but never native docs", () => {
+    // Azure's deployment-scoped chat/completions has no `file` content part, so
+    // nativeDocs stays false even for a vision-capable family.
+    expect(resolveProviderModality(provider("azure", "gpt-4o")))
+      .toEqual({ vision: true, nativeDocs: false });
+    expect(resolveProviderModality(provider("azure", "gpt-5.5")))
+      .toEqual({ vision: true, nativeDocs: false });
+    // An unknown/text-only Azure deployment stays conservatively false on both.
+    expect(resolveProviderModality(provider("azure", "text-embedding-3-large")))
+      .toEqual({ vision: false, nativeDocs: false });
+  });
+
   test("local is conservatively unknown → false", () => {
     expect(resolveProviderModality(provider("local", "local/default")))
       .toEqual({ vision: false, nativeDocs: false });
@@ -107,6 +119,12 @@ describe("resolveProviderContextWindowTokens", () => {
     // backend; openai must stay unchanged at the model's nominal window.
     expect(resolveProviderContextWindowTokens(provider("codex", "gpt-5.5"))).toBe(275_000);
     expect(resolveProviderContextWindowTokens(provider("openai", "gpt-5.5"))).toBe(1_000_000);
+  });
+
+  test("azure resolves context windows by the underlying openai model family", () => {
+    expect(resolveProviderContextWindowTokens(provider("azure", "gpt-5.5"))).toBe(1_000_000);
+    expect(resolveProviderContextWindowTokens(provider("azure", "gpt-4.1-mini"))).toBe(1_047_576);
+    expect(resolveProviderContextWindowTokens(provider("azure", "o4-mini"))).toBe(200_000);
   });
 
   test("deepseek v4 models and compatibility aliases resolve to one million tokens", () => {

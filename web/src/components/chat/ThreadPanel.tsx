@@ -102,11 +102,11 @@ export function ThreadPanel({
   };
 
   return (
-    <aside className="flex h-full w-full shrink-0 flex-col border-l border-[#1C1C1E] bg-[#0E0E11] md:w-[440px]">
-      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[#1C1C1E] px-[18px] py-4">
+    <aside className="flex h-full w-full shrink-0 flex-col border-l border-border bg-background md:w-[440px]">
+      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border px-[18px] py-4">
         <div className="flex min-w-0 flex-col gap-0.5">
           <span className="text-[15px] font-bold text-foreground">Thread</span>
-          <span className="truncate text-[12px] font-medium text-[#7A7A80]">
+          <span className="truncate text-[12px] font-medium text-muted-foreground">
             {agentName}
             {thread.rootPreview ? ` · ${thread.rootPreview}` : ""}
           </span>
@@ -115,7 +115,7 @@ export function ThreadPanel({
           type="button"
           aria-label="Close thread"
           onClick={onClose}
-          className="flex size-7 items-center justify-center rounded text-[#8A8A90] hover:bg-white/5 hover:text-foreground"
+          className="flex size-7 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
         >
           <X className="size-[18px]" />
         </button>
@@ -136,7 +136,7 @@ export function ThreadPanel({
                 <div className="flex items-center gap-2 pl-1 pb-1 text-xs">
                   <span className="font-semibold text-foreground">{agentName}</span>
                 </div>
-                <div className="max-w-[90%] rounded-xl bg-[#15161C] px-3 py-2.5 text-[13px] text-[#D6D6DC]">
+                <div className="max-w-[90%] rounded-xl bg-card px-3 py-2.5 text-[13px] text-foreground">
                   {thread.rootPreview}
                 </div>
               </div>
@@ -145,8 +145,8 @@ export function ThreadPanel({
 
           {/* Replies divider — frames the reply section even with 0 replies. */}
           <div className="flex items-center gap-2.5">
-            <span className="text-[11px] font-semibold text-[#6A6A70]">Replies</span>
-            <div className="h-px flex-1 bg-[#1C1C1E]" />
+            <span className="text-[11px] font-semibold text-muted-foreground">Replies</span>
+            <div className="h-px flex-1 bg-border" />
           </div>
 
           {isLoading && blocks.length === 0 ? (
@@ -190,7 +190,7 @@ export function ThreadPanel({
         </div>
       </ScrollArea>
 
-      <div className="shrink-0 border-t border-[#1C1C1E] px-4 py-3.5">
+      <div className="shrink-0 border-t border-border px-4 py-3.5">
         <Composer
           value={text}
           onChange={setText}

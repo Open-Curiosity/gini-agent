@@ -1327,6 +1327,39 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Email watcher management (ADR email-watch.md). One tool with an
+    // `action` enum (add | list | remove) keeps the catalog surface
+    // minimal — the same pattern create/list/delete_job follow, collapsed
+    // into a single tool because the watch surface is narrow. Low-risk /
+    // no approval: this only writes a config record (an EmailWatcherRecord)
+    // that the user can remove at any time. The actual reading/replying
+    // happens later in the woken agent turn, gated by terminal_exec's
+    // approval at that point. Always exposed (the "email" toolset isn't a
+    // legacy default) so a fresh instance can set up a watcher from chat.
+    toolset: "email",
+    displayLabel: "Watch email",
+    type: "function",
+    function: {
+      name: "email_watch",
+      description: "Manage email watchers. Use `action: \"add\"` to start watching for emails (optionally from a specific sender) and have a proposed reply drafted in a dedicated chat thread when one arrives — fire this when the user says things like 'watch my email for messages from alice@x.com and draft replies' or 'keep an eye on emails from my boss'. The watcher polls the signed-in Google account roughly once a minute; on each new matching email it wakes a turn that reads the message and posts a PROPOSED reply for review (it never sends without explicit approval). Provide `sender` to scope to one address (builds the query `from:<sender> is:unread`), or `query` for a raw Gmail search query. Use `action: \"list\"` to show existing watchers, `action: \"remove\"` with an `id` to stop one, and `action: \"disable\"` / `action: \"enable\"` with an `id` to pause/resume a watcher without deleting it. Watching requires the user to be signed in to Google via the `gws` CLI; if they aren't, the watcher is created but stays in `needs_auth` until they sign in.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["add", "list", "remove", "disable", "enable"],
+            description: "What to do: 'add' a new watcher, 'list' existing watchers, 'remove' a watcher by id, or 'disable'/'enable' a watcher by id (pause/resume without deleting)."
+          },
+          sender: { type: "string", description: "For action='add': the email address to watch for (e.g. 'alice@example.com'). Builds the Gmail query `from:<sender> is:unread`. Omit to watch all unread mail (or provide `query` instead)." },
+          query: { type: "string", description: "For action='add': a raw Gmail search query (e.g. 'from:boss@x.com subject:urgent is:unread'). Takes precedence over `sender` when both are given." },
+          account: { type: "string", description: "For action='add': the account email to watch. v1 watches the single signed-in gws identity; recorded for the multi-account future." },
+          id: { type: "string", description: "For action='remove'/'disable'/'enable': the watcher id (from action='list')." }
+        },
+        required: ["action"]
+      }
+    }
+  },
+  {
     // Edit the active agent's SOUL.md (per-agent persona). Auto-approved:
     // a clean body lands at SOUL.md directly and rides the system prompt
     // on the next turn. The injection scan still gates content that trips
@@ -1491,10 +1524,13 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         properties: {
           provider: {
             type: "string",
-            description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` are updated."
+            description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'azure', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` (and any Azure routing fields) are updated."
           },
           model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5'). Defaults to the provider's first catalog model when omitted." },
-          baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo." },
+          baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo. For the azure provider, set this to the resource endpoint (https://<resource>.openai.azure.com) — it is required." },
+          apiVersion: { type: "string", description: "Azure OpenAI api-version (e.g. '2024-10-21'). azure provider only; defaults to a GA value when omitted." },
+          deployment: { type: "string", description: "Azure OpenAI deployment name. Defaults to the model id when omitted. azure provider only." },
+          authScheme: { type: "string", enum: ["bearer", "api-key"], description: "Auth header style for the azure provider. 'api-key' (default) sends Azure's api-key header for a resource key; 'bearer' sends Authorization: Bearer for an Entra token." },
           apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env." }
         },
         required: []
@@ -1659,7 +1695,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
       parameters: {
         type: "object",
         properties: {
-          provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek')." }
+          provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek', 'azure')." }
         },
         required: ["provider"]
       }
@@ -1914,6 +1950,11 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (tool.function.name === "update_job") return true;
     if (tool.function.name === "delete_job") return true;
     if (tool.function.name === "run_job") return true;
+    // email_watch (ADR email-watch.md) — config-only watcher management on
+    // the "email" toolset, which isn't a legacy default. Always-on like the
+    // job surface so a fresh instance can set up an email watcher from chat
+    // without a toolset toggle. Low-risk: it only writes a watcher record.
+    if (tool.function.name === "email_watch") return true;
     // mcp_call is a runtime capability not bound to a legacy toolset row.
     // Gating it on the "mcp" toolset would silently hide MCP usage on
     // fresh instances even when a user has configured a server, so it

@@ -90,6 +90,7 @@ Usage:
   bun run gini reranker status
   bun run gini skills list|add|show|search|validate|test|enable|disable|rollback
   bun run gini jobs list|add|run|pause|resume|remove|runs|replay
+  bun run gini email list|add --from <sender>|remove <id>
   bun run gini connectors list|providers|add|remove|rotate|health
   bun run gini improvements list|propose|approve|reject
   bun run gini pairing create|claim
@@ -110,15 +111,20 @@ Usage:
   bun run gini notifications list|queue|send|ack
   bun run gini promotions list|propose|approve|reject
   bun run gini snapshots list|create|restore
-  bun run gini provider show|catalog|set echo|openai|codex|openrouter|local [model]
+  bun run gini provider show|catalog|set echo|openai|codex|openrouter|local|deepseek|azure [model]
                   [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]
-                  --base-url and --api-key-env work for local / openai /
-                  openrouter (point at OpenAI-compatible servers like oMLX,
-                  vLLM, LM Studio) AND for codex (override the backend URL
-                  or auth-file env var). --extra-body forwards server-
-                  specific request fields like \`chat_template_kwargs\` and
-                  applies to local / openai / openrouter chat-completions
-                  calls; codex (/responses) and echo ignore it.
+                  [--api-version <V>] [--deployment <NAME>] [--auth-scheme bearer|api-key]
+                  --base-url and --api-key-env work for every OpenAI-compatible
+                  provider (local / openai / openrouter / deepseek / azure —
+                  point at servers like oMLX, vLLM, LM Studio) AND for codex
+                  (override the backend URL or auth-file env var). --extra-body
+                  forwards server-specific request fields like
+                  \`chat_template_kwargs\` and applies to the chat-completions
+                  calls of local / openai / openrouter / deepseek / azure;
+                  codex (/responses) and echo ignore it. --api-version,
+                  --deployment, and --auth-scheme configure the azure provider
+                  (Azure OpenAI): set --base-url to https://<resource>.openai.azure.com;
+                  --auth-scheme api-key (default) uses a resource key.
   bun run gini trace <task-id>
   bun run gini events
   bun run gini audit

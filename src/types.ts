@@ -23,7 +23,7 @@ export type SkillStatus = "enabled" | "disabled" | "archived";
 
 export type JobStatus = "active" | "paused" | "failed";
 
-export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local" | "deepseek";
+export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local" | "deepseek" | "azure";
 
 export type ImprovementStatus = "proposed" | "approved" | "rejected" | "applied";
 
@@ -170,12 +170,12 @@ export interface ProviderConfig {
   apiKeyEnv?: string;
   // Provider-specific request fields merged into chat-completions request
   // bodies (tool-calling, structured JSON, vision, and the chat-completions
-  // branch of generateTaskSummary). The local and openrouter providers route
-  // every call through chat-completions, so extraBody applies everywhere for
-  // them. The openai provider uses /responses for generateTaskSummary, so
-  // extraBody only applies on its tool-calling, structured, and vision
-  // calls. Codex uses /responses with its own shape and ignores extraBody;
-  // echo bypasses HTTP entirely.
+  // branch of generateTaskSummary). The local, openrouter, deepseek, and azure
+  // providers route every call through chat-completions, so extraBody applies
+  // everywhere for them (including the summary call). The openai provider uses
+  // /responses for generateTaskSummary, so extraBody only applies on its
+  // tool-calling, structured, and vision calls. Codex uses /responses with its
+  // own shape and ignores extraBody; echo bypasses HTTP entirely.
   //
   // Reserved keys are stripped at send time so extraBody can never override
   // runtime-controlled fields. The base denylist covers fields the runtime
@@ -198,6 +198,30 @@ export interface ProviderConfig {
   // referenced by `apiKeyEnv`, never in extraBody. Caller is responsible
   // for keeping values JSON-serializable.
   extraBody?: Record<string, unknown>;
+  // Azure OpenAI transport fields — meaningful for the `azure` provider only;
+  // normalizeProvider carries them through solely for `azure`, so a stray value
+  // on any other provider is inert. Azure does not expose the flat
+  // `${baseUrl}/chat/completions` surface every other OpenAI-compatible provider
+  // speaks: it routes per deployment at
+  // `${baseUrl}/openai/deployments/<deployment>/chat/completions?api-version=<v>`
+  // and authenticates with an `api-key` header (or an Entra bearer token). The
+  // provider NAME is what selects this routing — not the presence of any one
+  // field — so these refine an already-Azure config rather than toggling it.
+  //
+  // Azure `api-version` query value (e.g. "2024-10-21"). Azure requires it on
+  // every data-plane call; normalizeProvider defaults it for the azure provider
+  // so a config that omits it still routes correctly.
+  apiVersion?: string;
+  // Azure deployment name — the path segment under /openai/deployments/. The
+  // model id stays in `model` (modality/context detection key off it);
+  // `deployment` defaults to `model` when omitted, matching the common case
+  // where the Azure deployment is named after the model it serves.
+  deployment?: string;
+  // Auth header style. "api-key" (the azure default) sends Azure's
+  // `api-key: <key>` header for a resource key; "bearer" sends
+  // `Authorization: Bearer <key>` for an Entra access token. Both are valid
+  // Azure auth modes, so the scheme is independent of the rest of the routing.
+  authScheme?: "bearer" | "api-key";
 }
 
 // Approval policy mode for the per-instance runtime and per-job overlay.
@@ -569,6 +593,7 @@ export interface RuntimeState {
   activeAgentId?: string;
   relays: RelayRecord[];
   notifications: NotificationRecord[];
+  emailWatchers: EmailWatcherRecord[];
   events: RuntimeEvent[];
   jobRuns: JobRunRecord[];
   chatSessions: ChatSessionRecord[];
@@ -861,6 +886,14 @@ export interface ChatSessionRecord {
   // sessions may leave this undefined; the new UI treats undefined as
   // hidden.
   kind?: "agent" | "channel";
+  // Stable marker identifying a channel as belonging to the email-watch
+  // feature, used for PRECISE identity-based cleanup of orphan email-watch
+  // channels — NOT title-based matching (which could catch an unrelated
+  // channel that merely happens to be titled "Email watch: ..."). Set when
+  // the shared email-watch session is created and backfilled by the
+  // self-heal migration. DISTINCT from `source` (messaging-bridge routing).
+  // Optional, so legacy sessions just lack it — no normalizeState backfill.
+  feature?: "email-watch";
 }
 
 // `lastInboundMessageId` is the most recent originating-message id the
@@ -1202,6 +1235,54 @@ export interface NotificationRecord {
   error?: string;
 }
 
+// Status of an email watcher. "ok" = polling normally; "error" = the last
+// poll failed (lastError carries a scrubbed message); "needs_auth" = the
+// `gws` session is signed out, so we skip polling until the user re-auths.
+export type EmailWatcherStatus = "ok" | "error" | "needs_auth";
+
+// A durable per-(account, sender-query) email watcher. Each watcher is driven by
+// a backing scheduled job whose `skill-script` pre-run hook runs the gmail-watch
+// detection script — it polls `gws` for new matching mail and, on a match, wakes
+// an agent turn in the watcher's dedicated chat session. The detection cursor +
+// dedup state live on the backing JobRecord.hookState (not here); this record is
+// the durable config. The data model is multi-account-SHAPED (provider +
+// accountEmail + credentialName) but v1 watches the single signed-in `gws`
+// identity. See ADR email-watch.md.
+export interface EmailWatcherRecord {
+  id: string;
+  instance: Instance;
+  // Owning agent — the woken turn runs under this agent so its inbox and
+  // memory attribution stay isolated. Optional only for legacy/hand-edited
+  // rows; create always stamps it.
+  agentId?: string;
+  provider: "gmail";
+  // The watched account's address. v1 watches the single signed-in `gws`
+  // identity; recorded for the multi-account future.
+  accountEmail?: string;
+  // Forward-looking per-account credential handle. Unused in v1 (gws holds
+  // one identity); recorded so the multi-account phase has a stable key.
+  credentialName?: string;
+  // Gmail search query the worker polls (e.g. "from:alice@x.com is:unread").
+  query: string;
+  // Optional Gmail label ids to scope the query. Unused in v1.
+  labelIds?: string[];
+  // Dedicated chat session the woken turn posts its proposed reply into.
+  chatSessionId?: string;
+  // Backing scheduled job that drives this watcher (interval-driven cron job
+  // with a `skill-script` preRunHook bound to `chatSessionId`). The job is the
+  // scheduler; the watcher is the durable detection identity. Optional only for
+  // legacy/hand-edited rows; the startup backfill provisions a job for any
+  // enabled watcher missing a resolvable jobId. See ADR job-pre-run-hooks.md.
+  jobId?: string;
+  enabled: boolean;
+  status: EmailWatcherStatus;
+  // Scrubbed last-error message when status === "error".
+  lastError?: string;
+  lastPolledAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface AuditEvent {
   id: string;
   instance: Instance;
@@ -1430,6 +1511,22 @@ export interface JobRecord {
   name: string;
   prompt: string;
   script?: string;
+  // Pre-LLM hook. When set, runDueJobs/runJobNow run this BEFORE dispatching
+  // the model turn. Its typed result either short-circuits the run (no model
+  // turn), injects fenced untrusted context into the drafting turn, or fails
+  // the run. The shape is the hooks primitive's HookConfig; an inline import
+  // type keeps the dependency one-directional (the primitive imports
+  // RuntimeConfig from here, never the reverse). See ADR job-pre-run-hooks.md.
+  preRunHook?: import("./hooks").HookConfig;
+  // Job-owned hook state. A pure hook handler (the skill-script handler running a
+  // pure detection script) is a function of {config, hookState} -> {result,
+  // newState}; the scheduler threads this blob in as the run's input and persists
+  // the handler's newState back here at the at-least-once commit boundary (a
+  // shortCircuit persists immediately; a context result persists only AFTER the
+  // drafting turn dispatches). Opaque to the runtime — its shape is owned by the
+  // handler/script (e.g. the gmail-watch cursor + a small boundary dedup set).
+  // See ADR job-pre-run-hooks.md.
+  hookState?: Record<string, unknown>;
   // Interval-driven schedule. Optional — cron-driven jobs (cronExpression
   // set) carry no intervalSeconds at all. Exactly one of (intervalSeconds,
   // cronExpression) is the active driver per job. The pair is validated
