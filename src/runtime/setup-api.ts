@@ -8,13 +8,16 @@
 // Behavior:
 //   - GET /api/setup/status reflects the live provider config plus the
 //     available picker options (SUPPORTED_PROVIDERS: openai, codex, openrouter,
-//     deepseek, local, azure). `current` is the active provider name when
-//     configured; null otherwise. `providerConfigured` is true when the active
-//     provider has valid creds — same definition `providerHealth` uses.
+//     deepseek, local, anthropic, bedrock, azure). `current` is the active
+//     provider name when configured; null otherwise. `providerConfigured` is
+//     true when the active provider has valid creds — same definition
+//     `providerHealth` uses.
 //   - POST /api/setup/provider accepts {provider, apiKey?, model?, baseUrl?}
-//     for the env-keyed providers (openai/openrouter/deepseek/local/azure) —
-//     plus apiVersion/deployment/authScheme for azure's deployment-scoped
-//     routing — or {provider: "codex"}. An env-keyed flow writes the key to
+//     for the env-keyed providers (openai/openrouter/deepseek/local/anthropic/
+//     azure) — plus apiVersion/deployment/authScheme for azure's
+//     deployment-scoped routing; {provider: "bedrock", model?, awsRegion?},
+//     which signs with AWS credentials and holds no gini key; or
+//     {provider: "codex"}. An env-keyed flow writes the key to
 //     ~/.gini/secrets.env (under the provider's apiKeyEnv) and updates
 //     process.env so the running gateway picks it up on the very next provider
 //     call (no restart needed — readOpenAIBearer in src/provider.ts reads from
