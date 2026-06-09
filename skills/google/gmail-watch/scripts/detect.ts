@@ -4,24 +4,27 @@
 //
 // Provisioned + trusted: this script is shipped in-tree and run by the generic
 // `skill-script` hook handler with no agent turn and no approval. It is the hook
-// BODY for an email watcher's backing scheduled job.
+// BODY for the ONE shared email-watch scheduled job (one job + one thread for all
+// of an agent's watched senders).
 //
 // Contract:
-//   stdin:  JSON { query, account?, state: { cursor?, seen?, status?, lastError? } | null }
-//   stdout: JSON { kind, items?, summary?, state: { cursor?, seen?, status?, lastError? } }
-//   exit:   0 always (a gws/transport / signed-out condition is reported as a
-//           shortCircuit carrying status in `state`, never a non-zero exit, so the
-//           backing job stays alive and the email read path can derive the
+//   stdin:  JSON { watches: [{ watcherId, query, account? }, ...], state: { byWatcher? } | null }
+//   stdout: JSON { kind, items?, summary?, state: { byWatcher } }
+//   exit:   0 always (a gws/transport / signed-out condition is reported PER WATCH
+//           as a status in that watch's state, never a non-zero exit, so the
+//           backing job stays alive and the email read path can derive each
 //           watcher's displayed status)
 //
-// It polls `gws` for new matching message ids for ONE watch, dedups against the
-// caller-supplied state (cursor + a tiny boundary `seen` set), applies a
-// deterministic safety floor (drop automated senders + self), and emits the raw
-// metadata (From/Subject/Date/snippet) of each surviving NEW match as an
-// untrusted item — it reads ONLY metadata, never message bodies, and emits NO
-// fence (the trusted hook runner fences untrusted items). The script is a PURE
-// function of {query, state}: it never touches files or a DB; the new cursor +
-// seen set ride back on the result and the caller persists them.
+// It iterates the watches and, for each, polls `gws` for new matching message ids,
+// dedups against that watch's caller-supplied state (cursor + a tiny boundary
+// `seen` set), applies a deterministic safety floor (drop automated senders +
+// self), and emits the raw metadata (From/Subject/Date/snippet) of each surviving
+// NEW match as an untrusted item — it reads ONLY metadata, never message bodies,
+// and emits NO fence (the trusted hook runner fences untrusted items). Each watch
+// is wrapped in its OWN try/catch so one sender's gws fault marks only that
+// watch's status and the others still run. The script is a PURE function of
+// {watches, state}: it never touches files or a DB; the new per-watch cursor +
+// seen set ride back on the result keyed by watcherId and the caller persists them.
 
 import { spawn } from "bun";
 
@@ -71,6 +74,34 @@ interface DetectArgs {
   query: string;
   account?: string;
   state?: DetectState | null;
+}
+
+// One declarative watch in the shared job's hook config: a stable watcher id +
+// the Gmail query (and an optional account, recorded for the multi-account
+// future). The shared job carries a LIST of these, rebuilt from the enabled
+// watchers on every add/remove/enable/disable.
+interface Watch {
+  watcherId: string;
+  query: string;
+  account?: string;
+}
+
+// The shared job's multi-watch input: the list of enabled watches + the opaque
+// per-watch state keyed by watcherId.
+interface DetectArgsMulti {
+  watches?: Watch[];
+  state?: { byWatcher?: Record<string, DetectState> } | null;
+}
+
+// The shared job's multi-watch output: all surviving matches across the watches
+// as untrusted items (labeled by sender), an optional non-silent summary (the
+// per-watch backlog notices joined), and the new per-watch state keyed by
+// watcherId for the caller to persist.
+interface DetectResultMulti {
+  kind: "shortCircuit" | "context";
+  items?: ResultItem[];
+  summary?: string;
+  state: { byWatcher: Record<string, DetectState> };
 }
 
 interface EmailMetadata {
@@ -295,18 +326,21 @@ export function shouldDropMessage(meta: EmailMetadata, selfEmail?: string): bool
 
 // ── Item builders (RAW metadata; the runner fences) ──────────────────────────
 
-// The raw matched-email metadata as a single JSON object. The hook runner is the
-// prompt-injection boundary: it fences this untrusted text. The script emits the
-// raw fields only.
+// The raw matched-email metadata as a single JSON object, prefixed with a
+// sender label so the shared thread's drafting turn can attribute each match to
+// its sender (one thread carries matches across all watched senders). The hook
+// runner is the prompt-injection boundary: it fences this untrusted text. The
+// script emits the raw fields only.
 export function buildMatchItem(meta: EmailMetadata): ResultItem {
-  const text = JSON.stringify({
-    from: meta.from ?? "(unknown)",
+  const from = meta.from ?? "(unknown)";
+  const payload = JSON.stringify({
+    from,
     subject: meta.subject ?? "(none)",
     date: meta.date ?? "(unknown)",
     id: meta.id,
     snippet: meta.snippet ?? ""
   });
-  return { text, untrusted: true };
+  return { text: `New email from ${from} — ${payload}`, untrusted: true };
 }
 
 // ── Self-email resolution (ported verbatim) ──────────────────────────────────
@@ -537,22 +571,27 @@ async function readStdinJson<T>(): Promise<T> {
   return (text ? JSON.parse(text) : {}) as T;
 }
 
-// Run one detection tick given the parsed args + an injected gws spawn (the test
-// seam — main() passes defaultGwsSpawn). Maps auth state + transport faults onto
-// the health-in-state contract: signed-out => status:"needs_auth" with the prior
-// cursor/seen UNCHANGED; gws/transport throw => status:"error" + a SCRUBBED
-// lastError, cursor/seen UNCHANGED (the next healthy tick re-detects); a clean
-// poll returns detect()'s status:"ok" result. Never throws — the backing job must
-// stay alive and recover the moment gws is healthy/re-authed.
-export async function run(args: DetectArgs, gwsSpawn: GwsSpawn): Promise<DetectResult> {
+// Run one detection tick for ONE watch given its args + an injected gws spawn.
+// Maps auth state + transport faults onto the health-in-state contract:
+// signed-out => status:"needs_auth" with the prior cursor/seen UNCHANGED;
+// gws/transport throw => status:"error" + a SCRUBBED lastError, cursor/seen
+// UNCHANGED (the next healthy tick re-detects); a clean poll returns detect()'s
+// status:"ok" result. Never throws — the backing job must stay alive and recover
+// the moment gws is healthy/re-authed. An optional pre-resolved `selfEmail` lets
+// the multi-watch loop resolve it once and share it across watches.
+export async function run(
+  args: DetectArgs,
+  gwsSpawn: GwsSpawn,
+  selfEmail?: string
+): Promise<DetectResult> {
   const stateIn: DetectState = args.state ?? {};
   try {
     const status = parseGwsAuthStatus(await gwsSpawn(buildAuthStatusArgs()));
     if (!status.signedIn) {
       return { kind: "shortCircuit", summary: "[SILENT]", state: { ...stateIn, status: "needs_auth", lastError: undefined } };
     }
-    const selfEmail = await resolveSelfEmail(gwsSpawn);
-    return await detect(args, gwsSpawn, selfEmail);
+    const self = selfEmail ?? (await resolveSelfEmail(gwsSpawn));
+    return await detect(args, gwsSpawn, self);
   } catch (error) {
     return {
       kind: "shortCircuit",
@@ -562,21 +601,106 @@ export async function run(args: DetectArgs, gwsSpawn: GwsSpawn): Promise<DetectR
   }
 }
 
-async function main(): Promise<void> {
-  let args: DetectArgs;
+// Run one detection tick across ALL enabled watches of the shared email-watch job
+// (one job + one thread for every watched sender). The gws session is a single
+// signed-in identity, so the auth check + self-address resolution are done ONCE
+// and shared; each watch then runs its own hardened single-watch regime against
+// its own per-watch state in `byWatcher[watcherId]`.
+//
+//   - Signed out: every watch is marked needs_auth with its cursor/seen unchanged
+//     (a session-level condition, shared across watches), 0 model turns.
+//   - Per-watch: each watch is wrapped in its own try/catch so one sender's
+//     gws/transport fault marks ONLY that watch's status:"error" (cursor/seen
+//     unchanged) and the other watches still run and can still draft.
+//   - Aggregation: all surviving matches across the watches become the items of a
+//     single `context` result (the ONE drafting turn drafts a reply per match,
+//     each labeled by sender), and the per-watch backlog notices are joined into
+//     one non-silent shortCircuit summary when there are no draftable matches.
+//
+// Commit timing is preserved by the consumer: a context result's state is
+// persisted only after the drafting turn dispatches (at-least-once across the
+// whole batch — a re-detect/re-drop on dispatch failure is idempotent); a
+// shortCircuit's state persists immediately.
+export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Promise<DetectResultMulti> {
+  const watches = Array.isArray(args.watches) ? args.watches : [];
+  const byWatcherIn = args.state?.byWatcher ?? {};
+  const byWatcherOut: Record<string, DetectState> = {};
+  const items: ResultItem[] = [];
+  const notices: string[] = [];
+
+  // Resolve auth + self ONCE for the shared gws session. A signed-out session is
+  // shared by every watch, so short-circuit the whole tick marking each watch
+  // needs_auth (cursor/seen unchanged).
+  let signedIn: boolean;
   try {
-    args = await readStdinJson<DetectArgs>();
+    signedIn = parseGwsAuthStatus(await gwsSpawn(buildAuthStatusArgs())).signedIn;
   } catch (error) {
-    // Bad stdin is reported as a shortCircuit with status:"error", not a non-zero
-    // exit, so the backing job stays alive. No prior cursor/seen to preserve.
+    // The auth probe itself faulted — a transport-level error shared across the
+    // session. Mark every watch error with its cursor/seen unchanged.
+    const scrubbed = scrubError(error instanceof Error ? error.message : String(error));
+    for (const watch of watches) {
+      byWatcherOut[watch.watcherId] = { ...(byWatcherIn[watch.watcherId] ?? {}), status: "error", lastError: scrubbed };
+    }
+    return { kind: "shortCircuit", summary: "[SILENT]", state: { byWatcher: byWatcherOut } };
+  }
+  if (!signedIn) {
+    for (const watch of watches) {
+      byWatcherOut[watch.watcherId] = { ...(byWatcherIn[watch.watcherId] ?? {}), status: "needs_auth", lastError: undefined };
+    }
+    return { kind: "shortCircuit", summary: "[SILENT]", state: { byWatcher: byWatcherOut } };
+  }
+  const selfEmail = await resolveSelfEmail(gwsSpawn);
+
+  for (const watch of watches) {
+    const stateIn = byWatcherIn[watch.watcherId] ?? {};
+    // run() never throws (it maps gws faults onto status in state). The extra
+    // try/catch is belt-and-suspenders so a bug in one watch can never abort the
+    // others — that watch is marked error and the rest still run.
+    let result: DetectResult;
+    try {
+      result = await run({ query: watch.query, account: watch.account, state: stateIn }, gwsSpawn, selfEmail);
+    } catch (error) {
+      byWatcherOut[watch.watcherId] = {
+        ...stateIn,
+        status: "error",
+        lastError: scrubError(error instanceof Error ? error.message : String(error))
+      };
+      continue;
+    }
+    byWatcherOut[watch.watcherId] = result.state;
+    if (result.kind === "context" && result.items) {
+      items.push(...result.items);
+    } else if (result.summary && result.summary.trim() !== "[SILENT]" && result.summary.trim().length > 0) {
+      // A non-silent shortCircuit summary (a per-watch backlog notice) — collect
+      // it for the joined summary when no watch produced a draftable match.
+      notices.push(result.summary);
+    }
+  }
+
+  // Any matches across the watches => ONE drafting turn (context). Otherwise a
+  // shortCircuit: a joined backlog notice if any fired, else silent.
+  if (items.length > 0) {
+    return { kind: "context", items, state: { byWatcher: byWatcherOut } };
+  }
+  const summary = notices.length > 0 ? notices.join("\n\n") : "[SILENT]";
+  return { kind: "shortCircuit", summary, state: { byWatcher: byWatcherOut } };
+}
+
+async function main(): Promise<void> {
+  let args: DetectArgsMulti;
+  try {
+    args = await readStdinJson<DetectArgsMulti>();
+  } catch (error) {
+    // Bad stdin is reported as a shortCircuit with an empty byWatcher state, not a
+    // non-zero exit, so the backing job stays alive. No prior state to preserve.
     process.stdout.write(JSON.stringify({
       kind: "shortCircuit",
       summary: "[SILENT]",
-      state: { status: "error", lastError: scrubError(error instanceof Error ? error.message : String(error)) }
-    } satisfies DetectResult));
+      state: { byWatcher: {} }
+    } satisfies DetectResultMulti));
     return;
   }
-  process.stdout.write(JSON.stringify(await run(args, defaultGwsSpawn)));
+  process.stdout.write(JSON.stringify(await runWatches(args, defaultGwsSpawn)));
 }
 
 // Parse the JSON `gws auth status` emits. signedIn := token_valid === true.

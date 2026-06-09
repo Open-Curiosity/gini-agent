@@ -14,6 +14,7 @@ import {
   parseFromAddress,
   parseGwsAuthStatus,
   run,
+  runWatches,
   scrubError,
   shouldDropMessage,
   type GwsSpawn
@@ -122,8 +123,15 @@ function matchCount(items: { text: string; untrusted: boolean }[] | undefined): 
   return (items ?? []).filter((i) => i.untrusted).length;
 }
 
+// Each item's text is "New email from <sender> — <json>"; parse the embedded
+// JSON payload (everything after the first " — ").
+function itemPayload(text: string): Record<string, unknown> {
+  const json = text.slice(text.indexOf(" — ") + 3);
+  return JSON.parse(json) as Record<string, unknown>;
+}
+
 function draftedIds(items: { text: string }[] | undefined): string[] {
-  return (items ?? []).map((i) => JSON.parse(i.text).id as string);
+  return (items ?? []).map((i) => itemPayload(i.text).id as string);
 }
 
 describe("parse + safety helpers", () => {
@@ -153,14 +161,17 @@ describe("parse + safety helpers", () => {
     expect(parseFromAddress("no address here")).toBeUndefined();
   });
 
-  test("buildMatchItem emits raw fields as untrusted, no fence", () => {
+  test("buildMatchItem emits a sender-labeled raw item, untrusted, no fence", () => {
     const item = buildMatchItem({ id: "m1", from: "alice@x.com", subject: "hi", snippet: "yo" });
     expect(item.untrusted).toBe(true);
     expect(item.text).not.toContain("UNTRUSTED");
     expect(item.text).not.toContain("matched-context");
-    const data = JSON.parse(item.text);
+    // Labeled by sender so the shared thread can attribute each match.
+    expect(item.text.startsWith("New email from alice@x.com — ")).toBe(true);
+    const data = itemPayload(item.text);
     expect(data.id).toBe("m1");
     expect(data.subject).toBe("hi");
+    expect(data.from).toBe("alice@x.com");
   });
 
   test("scrubError redacts secret-file paths, home-rooted paths, and /root", () => {
@@ -446,5 +457,225 @@ describe("detect — at-least-once boundary", () => {
     const r2 = await detect({ query: "is:unread", state: oldState }, spawn, "me@example.com");
     expect(matchCount(r2.items)).toBe(1);
     expect(draftedIds(r2.items)).toEqual(["d1"]);
+  });
+});
+
+describe("runWatches — multi-watch (one shared job)", () => {
+  // Extract the `q:"..."` value from a `messages list` args line so a stub can
+  // route per-watch by query (each watch lists under its own query).
+  function listQuery(joined: string): string | undefined {
+    return joined.match(/"q":"([^"]*)"/)?.[1];
+  }
+
+  // gws spawn routing list/get per-query: each query maps to a flat id list +
+  // shared metadata map. signedIn is true; getProfile resolves the self address.
+  function multiSpawn(
+    byQuery: Record<string, string[]>,
+    metaById: Record<string, Meta>,
+    self = "me@example.com"
+  ): GwsSpawn {
+    return async (args: string[]) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + JSON.stringify({ emailAddress: self });
+      if (joined.includes("messages list")) {
+        const q = listQuery(joined) ?? "";
+        // Honor any after:<sec> the engine appended to the watch's base query.
+        const base = q.replace(/ after:\d+$/, "");
+        return listResponse(byQuery[base] ?? byQuery[q] ?? []);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        return hit && metaById[hit] ? metadataResponse(metaById[hit]) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+  }
+
+  test("iterates watches with per-watch state, drafts across senders in one turn", async () => {
+    const spawn = multiSpawn(
+      {
+        "from:alice@x.com is:unread": ["a1"],
+        "from:bob@x.com is:unread": ["b1"]
+      },
+      {
+        a1: { id: "a1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "from alice" },
+        b1: { id: "b1", internalDate: "4000", from: "Bob <bob@x.com>", subject: "from bob" }
+      }
+    );
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-alice", query: "from:alice@x.com is:unread" },
+          { watcherId: "w-bob", query: "from:bob@x.com is:unread" }
+        ],
+        state: { byWatcher: { "w-alice": { cursor: "1000", seen: [] }, "w-bob": { cursor: "1000", seen: [] } } }
+      },
+      spawn
+    );
+    // ONE drafting turn carries BOTH senders' matches, each labeled by sender.
+    expect(r.kind).toBe("context");
+    expect(matchCount(r.items)).toBe(2);
+    expect(r.items!.some((i) => i.text.startsWith("New email from Alice <alice@x.com> — "))).toBe(true);
+    expect(r.items!.some((i) => i.text.startsWith("New email from Bob <bob@x.com> — "))).toBe(true);
+    // Per-watch state advanced independently.
+    expect(r.state.byWatcher["w-alice"]!.cursor).toBe("3000");
+    expect(r.state.byWatcher["w-bob"]!.cursor).toBe("4000");
+    expect(r.state.byWatcher["w-alice"]!.status).toBe("ok");
+    expect(r.state.byWatcher["w-bob"]!.status).toBe("ok");
+  });
+
+  test("a per-watch gws error isolates to that watch; the others still draft", async () => {
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = listQuery(joined) ?? "";
+        // The "bad" watch's list throws; the "good" watch lists a match.
+        if (q.startsWith("from:bad@x.com")) {
+          throw new Error("transport blew up reading /Users/alice/.config/gws/token.json");
+        }
+        return listResponse(["g1"]);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        return hit === "g1"
+          ? metadataResponse({ id: "g1", internalDate: "5000", from: "Good <good@x.com>", subject: "ok" })
+          : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-bad", query: "from:bad@x.com is:unread" },
+          { watcherId: "w-good", query: "from:good@x.com is:unread" }
+        ],
+        state: { byWatcher: { "w-bad": { cursor: "1000", seen: [] }, "w-good": { cursor: "1000", seen: [] } } }
+      },
+      spawn
+    );
+    // The good watch still drafts; the bad watch is marked error with a SCRUBBED
+    // lastError and its cursor unchanged.
+    expect(r.kind).toBe("context");
+    expect(matchCount(r.items)).toBe(1);
+    expect(draftedIds(r.items)).toEqual(["g1"]);
+    expect(r.state.byWatcher["w-good"]!.status).toBe("ok");
+    expect(r.state.byWatcher["w-good"]!.cursor).toBe("5000");
+    expect(r.state.byWatcher["w-bad"]!.status).toBe("error");
+    expect(r.state.byWatcher["w-bad"]!.lastError).toBe("transport blew up reading <path>");
+    expect(r.state.byWatcher["w-bad"]!.cursor).toBe("1000");
+  });
+
+  test("signed-out marks every watch needs_auth, no model turn, cursors unchanged", async () => {
+    const signedOut: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":false}';
+      throw new Error("should not poll while signed out");
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w1", query: "from:a@x.com is:unread" },
+          { watcherId: "w2", query: "from:b@x.com is:unread" }
+        ],
+        state: { byWatcher: { w1: { cursor: "1000", seen: ["x"] }, w2: { cursor: "2000", seen: [] } } }
+      },
+      signedOut
+    );
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.summary).toBe("[SILENT]");
+    expect(r.state.byWatcher.w1!.status).toBe("needs_auth");
+    expect(r.state.byWatcher.w2!.status).toBe("needs_auth");
+    // Cursors/seen carried through unchanged (don't advance past unread mail).
+    expect(r.state.byWatcher.w1!.cursor).toBe("1000");
+    expect(r.state.byWatcher.w1!.seen).toEqual(["x"]);
+    expect(r.state.byWatcher.w2!.cursor).toBe("2000");
+  });
+
+  test("seeding a fresh watch (no per-watch state) baselines without drafting", async () => {
+    const spawn = multiSpawn(
+      { "from:new@x.com is:unread": ["n1"] },
+      { n1: { id: "n1", internalDate: "9000", from: "New <new@x.com>", subject: "hi" } }
+    );
+    const r = await runWatches(
+      { watches: [{ watcherId: "w-new", query: "from:new@x.com is:unread" }], state: null },
+      spawn
+    );
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.summary).toBe("[SILENT]");
+    // Baselined at the newest, drafted nothing, recorded the boundary id.
+    expect(r.state.byWatcher["w-new"]!.cursor).toBe("9000");
+    expect(r.state.byWatcher["w-new"]!.seen).toEqual(["n1"]);
+    expect(r.state.byWatcher["w-new"]!.status).toBe("ok");
+  });
+
+  test("per-watch backlog notices join into one non-silent shortCircuit summary", async () => {
+    // Two watches both hit truncated windows (no draftable match); their notices
+    // join into one summary so the shared thread surfaces both.
+    const corpusA: Meta[] = Array.from({ length: 60 }, (_, i) => ({
+      id: `a${i}`,
+      internalDate: String(12_000_000 + i * 1000),
+      from: "Alice <alice@x.com>",
+      subject: `a${i}`
+    }));
+    const corpusB: Meta[] = Array.from({ length: 60 }, (_, i) => ({
+      id: `b${i}`,
+      internalDate: String(13_000_000 + i * 1000),
+      from: "Bob <bob@x.com>",
+      subject: `b${i}`
+    }));
+    const byId: Record<string, Meta> = {};
+    for (const m of [...corpusA, ...corpusB]) byId[m.id] = m;
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = listQuery(joined) ?? "";
+        const corpus = q.startsWith("from:alice") ? corpusA : corpusB;
+        const afterSec = Number(joined.match(/after:(\d+)/)?.[1] ?? "0");
+        const listed = corpus
+          .filter((m) => Math.floor(Number(m.internalDate) / 1000) > afterSec)
+          .sort((a, b) => Number(b.internalDate) - Number(a.internalDate))
+          .slice(0, 10);
+        const pages: string[][] = [];
+        const per = Math.ceil(listed.length / 10);
+        for (let i = 0; i < 10; i++) pages.push(listed.slice(i * per, (i + 1) * per).map((m) => m.id));
+        return pagedListResponse(pages, true);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        return hit && byId[hit] ? metadataResponse(byId[hit]) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-a", query: "from:alice@x.com is:unread" },
+          { watcherId: "w-b", query: "from:bob@x.com is:unread" }
+        ],
+        state: { byWatcher: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.summary).not.toBe("[SILENT]");
+    // Both watches' backlog notices are present in the joined summary.
+    expect(r.summary).toContain("from:alice@x.com is:unread");
+    expect(r.summary).toContain("from:bob@x.com is:unread");
+    // Both cursors jumped to their newest.
+    expect(r.state.byWatcher["w-a"]!.cursor).toBe(String(12_000_000 + 59 * 1000));
+    expect(r.state.byWatcher["w-b"]!.cursor).toBe(String(13_000_000 + 59 * 1000));
+  });
+
+  test("no watches yields a silent shortCircuit with empty byWatcher", async () => {
+    const spawn = multiSpawn({}, {});
+    const r = await runWatches({ watches: [], state: null }, spawn);
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.summary).toBe("[SILENT]");
+    expect(r.state.byWatcher).toEqual({});
   });
 });
