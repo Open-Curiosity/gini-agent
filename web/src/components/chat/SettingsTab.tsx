@@ -73,18 +73,31 @@ export function SettingsTab({ agentId }: { agentId?: string }) {
       resolved?.model === instanceProvider?.model);
 
   const save = useMutation({
+    // The default agent's pair IS the default model, so its picks route
+    // through the two-layer default-model write — a bare agent-override
+    // write would move what new chats start with while config.provider
+    // (embeddings/reranker anchor, provider-removal gate) stayed behind.
+    // Other agents save their own override; clearing one (blank pair) is
+    // always the per-agent endpoint's contract.
     mutationFn: (vars: { providerName: string; model: string }) =>
-      api<AgentProviderResult>(`/agents/${encodeURIComponent(agentId ?? "")}/provider`, {
-        method: "POST",
-        body: JSON.stringify(vars)
-      }),
+      isDefaultAgent && vars.providerName
+        ? api("/settings/default-model", {
+            method: "POST",
+            body: JSON.stringify({ provider: vars.providerName, model: vars.model })
+          })
+        : api<AgentProviderResult>(`/agents/${encodeURIComponent(agentId ?? "")}/provider`, {
+            method: "POST",
+            body: JSON.stringify(vars)
+          }),
     onSuccess: (_result, vars) => {
       toast.success(
         vars.providerName
-          ? `${vars.model} via ${vars.providerName} for this agent`
+          ? isDefaultAgent
+            ? `Default model: ${vars.model} via ${vars.providerName}`
+            : `${vars.model} via ${vars.providerName} for this agent`
           : "Reverted to the default model"
       );
-      invalidate(["status", "agents", "state"]);
+      invalidate(["status", "agents", "state", "providers"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });

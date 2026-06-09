@@ -90,11 +90,15 @@ catalog.
   `config.provider` — keeps the display honest: it is what new chats start
   with even when another surface (CLI `gini provider set`, the Edit dialog,
   add-provider) has moved `config.provider` underneath it.
-- **Chat Settings tab** reads `/api/status.activeAgent.resolvedProvider` and
-  writes the existing `POST /api/agents/:id/provider` contract (ADR
+- **Chat Settings tab** reads `/api/status.activeAgent.resolvedProvider`.
+  For a non-default agent it writes the existing
+  `POST /api/agents/:id/provider` contract (ADR
   per-agent-provider-settings.md) with the route pair; "Use default model"
-  clears the override. Selection applies immediately on pick — no staged
-  save bar.
+  clears the override. For the DEFAULT agent — whose pair is the default
+  model itself — picks route through `POST /api/settings/default-model`
+  instead, so the mirror with `config.provider` holds no matter which
+  surface the default was changed from. Selection applies immediately on
+  pick — no staged save bar.
 - Routes are derived only from **configured** providers, so the picker never
   offers a route the next turn can't authenticate. Azure's configured-gate
   (active instance provider only) means a cross-provider Azure override
