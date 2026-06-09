@@ -4634,6 +4634,28 @@ describe("anthropic provider", () => {
     }
   });
 
+  test("bedrock: providerHealth surfaces the env-aware request host so display can't drift from requests", () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const restoreRegion = setEnv("AWS_REGION", "eu-west-1");
+    const restoreDef = setEnv("AWS_DEFAULT_REGION", undefined);
+    try {
+      // No explicit awsRegion is persisted, but AWS_REGION is set — the displayed
+      // baseUrl must match where requests actually go (eu-west-1), not the
+      // us-east-1 default the env-free normalized config would otherwise show.
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" });
+      expect(provider.awsRegion).toBeUndefined();
+      expect(provider.baseUrl).toBe("https://bedrock-runtime.us-east-1.amazonaws.com");
+      const health = providerHealth(config(provider));
+      expect(health.provider.baseUrl).toBe("https://bedrock-runtime.eu-west-1.amazonaws.com");
+    } finally {
+      restoreDef();
+      restoreRegion();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
   test("bedrock: a malformed awsRegion is rejected before any request is built", async () => {
     const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
     const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");

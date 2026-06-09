@@ -83,9 +83,14 @@ export function providerHealth(config: RuntimeConfig) {
 
   if (provider.name === "bedrock") {
     const configured = Boolean(resolveAwsCredentials());
+    // Surface the live request-time host (region resolved env-aware via
+    // bedrockRegion) so the displayed baseUrl can't drift from where requests
+    // are actually signed and sent. This is display-only — config.json still
+    // persists just an explicit region, so reading env here introduces no leak.
+    const displayed = { ...provider, baseUrl: bedrockRuntimeBaseUrl(bedrockRegion(provider)) };
     return {
       ok: configured,
-      provider,
+      provider: displayed,
       configured,
       message: configured
         ? "bedrock provider is configured (AWS SigV4)."
@@ -1412,7 +1417,8 @@ async function callAnthropicMessages(
   // The builder owns the /v1/messages path. Tolerate a baseUrl that already
   // carries it (a common habit from OpenAI-style baseUrls that include /v1) by
   // stripping a trailing /v1 or /v1/messages first, so it never doubles into
-  // /v1/v1/messages. Bedrock detection below still runs on the raw baseUrl.
+  // /v1/v1/messages. This normalization applies to every anthropic-path target,
+  // including a Bedrock Mantle Messages baseUrl.
   const messagesUrl = `${baseUrl.replace(/\/v1(\/messages)?$/, "")}/v1/messages`;
   const wantStream = Boolean(onDelta);
   const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
