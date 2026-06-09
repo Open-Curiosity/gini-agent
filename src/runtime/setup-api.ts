@@ -202,7 +202,11 @@ export async function setSetupProvider(
     // therefore means those credentials resolve — reject up front with a clear
     // hint when they don't, mirroring codex's "run codex --login" gate. Only
     // model + region are persisted (env-var NAMES, never secret values).
-    if (!hasUsableAwsCredentials()) {
+    // Honor an existing bedrock config's custom credential env-var names (only
+    // reachable via a hand-edited config.json today) so the gate matches what a
+    // signed request would actually resolve.
+    const existing = config.provider?.name === "bedrock" ? config.provider : undefined;
+    if (!hasUsableAwsCredentials(existing)) {
       return {
         ok: false,
         provider: providerHealth(config),
@@ -211,7 +215,6 @@ export async function setSetupProvider(
           "No AWS credentials found. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure ~/.aws/credentials, then retry."
       };
     }
-    const existing = config.provider?.name === "bedrock" ? config.provider : undefined;
     const model = typeof payload.model === "string" && payload.model.length > 0
       ? payload.model
       : existing?.model;

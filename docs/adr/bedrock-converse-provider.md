@@ -42,6 +42,7 @@ Setup mirrors codex: `setSetupProvider`'s bedrock branch requires no `apiKey`, r
 ## Out Of Scope, Linked Follow-Ups
 
 - Full IAM-role / `AssumeRole` sourcing, IMDS/container credentials, and `~/.aws/config` SSO. The signer uses static access keys from env or the `~/.aws/credentials` profile.
+- Custom AWS credential env-var names (`awsAccessKeyIdEnv` etc.) exist on `ProviderConfig` and are honored by the signer, `providerHealth`, and the setup gate, but no CLI/web/tool surface sets them and the catalog `configured` status (`isProviderConfigured`) still probes the canonical `AWS_*` names. Reachable only via a hand-edited `config.json`; the catalog gap closes when `providerCatalogWithStatus` takes the full active `ProviderConfig` instead of positional bits.
 - A live model picker (`ListFoundationModels` / `ListInferenceProfiles`); the catalog ships a cross-family starter list and the UI accepts any id.
 - Bedrock Guardrails, prompt-management resources, and `additionalModelRequestFields` passthrough.
 

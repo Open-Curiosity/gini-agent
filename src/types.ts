@@ -507,8 +507,9 @@ export interface SystemNoteAuthError {
   // Where the CTA sends the user to re-establish the credential. "docs" → the
   // hosted step-through (OAuth/CLI providers like codex, whose re-auth is a
   // non-obvious terminal flow); "settings" → the in-app Settings → Providers
-  // key form (API-key providers). See ADR provider-reauth-guidance.md.
-  reauthKind: "docs" | "settings";
+  // key form (API-key providers); "aws" → Settings, but worded for AWS
+  // credentials (bedrock has no key). See ADR provider-reauth-guidance.md.
+  reauthKind: "docs" | "settings" | "aws";
   reauthUrl: string;
 }
 

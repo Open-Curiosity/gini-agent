@@ -11,9 +11,10 @@ import type { SystemNoteBlock } from "@runtime/types";
 // Provider-credential failures (block.authError) are the exception: they
 // render as an alert card naming the provider, with a CTA whose destination
 // depends on how the provider authenticates (issue #205). OAuth/CLI providers
-// (codex) link to the hosted re-auth step-through; API-key providers link to
-// the Settings → Providers key form, with the provider's own error shown as
-// the specific cause.
+// (codex) link to the hosted re-auth step-through; AWS providers (bedrock) link
+// to Settings but the CTA reads as "open settings" since there's no key to
+// paste; API-key providers link to the Settings → Providers key form, with the
+// provider's own error shown as the specific cause.
 export function BlockSystemNote({ block }: { block: SystemNoteBlock }) {
   if (block.authError) {
     const { providerLabel, detail, reauthKind, reauthUrl } = block.authError;
@@ -24,9 +25,15 @@ export function BlockSystemNote({ block }: { block: SystemNoteBlock }) {
     const url = reauthUrl ?? "/settings";
     // "docs" opens an instruction page (the user re-auths themselves, e.g. in a
     // terminal), so the label must read as "show me how" — not as a button that
-    // performs the auth. "settings" navigates to the in-app key form.
+    // performs the auth. "aws" navigates to Settings but the provider signs with
+    // AWS credentials, so it must not promise a key form. "settings" navigates
+    // to the in-app key form.
     const ctaLabel =
-      kind === "docs" ? `How to re-authenticate ${providerLabel}` : `Update ${providerLabel} key`;
+      kind === "docs"
+        ? `How to re-authenticate ${providerLabel}`
+        : kind === "aws"
+          ? `Open ${providerLabel} settings`
+          : `Update ${providerLabel} key`;
     return (
       <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
         <div className="flex items-center gap-2">

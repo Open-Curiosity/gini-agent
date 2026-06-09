@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import {
@@ -3161,11 +3161,14 @@ describe("auth-error classification", () => {
     expect(providerDisplayLabel("echo")).toBe("Gini Echo");
   });
 
-  test("providerReauth routes OAuth/CLI providers to docs and API-key providers to settings", () => {
+  test("providerReauth routes OAuth/CLI to docs, AWS to an aws-kind, and API-key providers to settings", () => {
     expect(providerReauth("codex")).toEqual({
       kind: "docs",
       url: "https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
     });
+    // Bedrock signs with AWS credentials — distinct kind so the text/CTA never
+    // promise an API-key form.
+    expect(providerReauth("bedrock")).toEqual({ kind: "aws", url: "/settings" });
     expect(providerReauth("openai")).toEqual({ kind: "settings", url: "/settings" });
     expect(providerReauth("deepseek")).toEqual({ kind: "settings", url: "/settings" });
     expect(providerReauth("openrouter")).toEqual({ kind: "settings", url: "/settings" });
@@ -3184,6 +3187,10 @@ describe("auth-error classification", () => {
     // Text-only settings target — point at the in-app key form.
     expect(providerAuthFailureText("OpenAI", providerReauth("openai"))).toBe(
       "OpenAI authentication failed. Update your OpenAI API key in Settings → Providers."
+    );
+    // AWS target — credentials, never an API key.
+    expect(providerAuthFailureText("Amazon Bedrock", providerReauth("bedrock"))).toBe(
+      "Amazon Bedrock authentication failed. Check your AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials) to continue."
     );
   });
 
@@ -3343,6 +3350,14 @@ function converseEventStream(events: Array<{ type: string; payload: unknown; mes
 }
 
 describe("anthropic provider", () => {
+  // The bedrock signing assertions below pin an exact SignedHeaders list with no
+  // x-amz-security-token. An ambient AWS_SESSION_TOKEN in the dev/CI environment
+  // would make resolveAwsCredentials fold one in and break those matches, so
+  // clear it for every test here (tests that need a token set their own).
+  let restoreAmbientSessionToken: () => void;
+  beforeEach(() => { restoreAmbientSessionToken = setEnv("AWS_SESSION_TOKEN", undefined); });
+  afterEach(() => { restoreAmbientSessionToken(); });
+
   test("normalizeProvider applies defaults and preserves overrides", () => {
     expect(normalizeProvider({ name: "anthropic", model: "" })).toEqual({
       name: "anthropic",

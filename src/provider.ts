@@ -377,7 +377,7 @@ export class ProviderAuthError extends Error {
   }
 }
 
-export type ProviderReauth = { kind: "docs" | "settings"; url: string };
+export type ProviderReauth = { kind: "docs" | "settings" | "aws"; url: string };
 
 // Hosted documentation root. Re-auth step-throughs for OAuth/CLI providers live
 // here so the instructions have a single source and never drift from code.
@@ -385,11 +385,13 @@ const DOCS_BASE_URL = "https://gini.lilaclabs.ai/docs";
 
 // Where to send the user to re-establish a failed provider credential. OAuth/
 // CLI providers (codex) have no in-app form and a non-obvious terminal flow, so
-// they link to the hosted step-through docs. API-key providers link straight to
+// they link to the hosted step-through docs. AWS providers (bedrock) sign with
+// AWS credentials and have no in-app key form either, so they point at Settings
+// but describe credentials rather than a key. API-key providers link straight to
 // the Settings → Providers key form — the specific cause is already in the
 // provider's own 401/403 message (surfaced as the note's detail), so no doc is
-// needed. The OAuth-vs-API-key split is read from the catalog's `auth` field,
-// not re-encoded here. See ADR provider-reauth-guidance.md.
+// needed. The auth split is read from the catalog's `auth` field, not re-encoded
+// here. See ADR provider-reauth-guidance.md.
 export function providerReauth(name: ProviderName): ProviderReauth {
   const entry = providerCatalog().find((item) => item.name === name);
   if (entry?.auth === "codex-oauth") {
@@ -398,6 +400,7 @@ export function providerReauth(name: ProviderName): ProviderReauth {
     // resolves both in-repo and on the hosted docs site.
     return { kind: "docs", url: `${DOCS_BASE_URL}/providers/${name}#re-authentication` };
   }
+  if (entry?.auth === "aws") return { kind: "aws", url: "/settings" };
   return { kind: "settings", url: "/settings" };
 }
 
@@ -425,6 +428,11 @@ export function providerAuthNote(
 // for the web note, which renders the CTA separately.
 export function providerAuthFailureText(providerLabel: string, reauth?: ProviderReauth): string {
   const base = `${providerLabel} authentication failed.`;
+  // AWS providers sign with credentials, not an API key — never tell the user to
+  // "update a key" they don't have.
+  if (reauth?.kind === "aws") {
+    return `${base} Check your AWS credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or ~/.aws/credentials) to continue.`;
+  }
   if (!reauth) return `${base} Re-authenticate ${providerLabel} to continue.`;
   return reauth.kind === "docs"
     ? `${base} Re-authenticate ${providerLabel} to continue: ${reauth.url}`

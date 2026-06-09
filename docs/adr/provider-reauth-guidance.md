@@ -11,6 +11,7 @@ in code or duplicated across surfaces:
 | Provider class | `auth` | CTA destination | Where instructions live |
 |---|---|---|---|
 | OAuth / CLI (codex) | `codex-oauth` | The `#re-authentication` section of `https://gini.lilaclabs.ai/docs/providers/<id>`, rendered **inline** in a slide-over (with an Open full docs ↗ escape hatch) | A docs page per such provider |
+| AWS-signed (bedrock) | `aws` | In-app **Settings → Providers** (`/settings`), CTA worded "Open … settings" — there's no key to paste; the text says check AWS credentials (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` or `~/.aws/credentials`) | The provider's own 401/403 message (shown as the note's detail) — no doc |
 | API-key (openai, deepseek, openrouter, local) | `env` | In-app **Settings → Providers** key form (`/settings`) | The provider's own 401/403 message (shown as the note's detail) — no doc |
 
 The runtime classifies the failure, tags it with the provider that served the
