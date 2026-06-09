@@ -352,11 +352,14 @@ describe("shared backing job lifecycle", () => {
     });
     expect(orphanJob.id).not.toBe(sharedJobId);
 
-    // The shared session was ADOPTED from an old per-sender session and never
-    // renamed, plus a truly-orphan "Email watch: <sender>" channel referenced by
-    // nothing (its job was already removed out-of-band).
+    // The shared session AND job were ADOPTED from old per-sender code and never
+    // renamed (both keep the "Email watch: <sender>" label the sidebar renders),
+    // plus a truly-orphan "Email watch: <sender>" channel referenced by nothing
+    // (its job was already removed out-of-band).
     const trulyOrphanChannel = await mutateState(config.instance, (state) => {
       renameChatSession(state, sharedSessionId, "Email watch: alice@x.com");
+      const sharedJobRecord = state.jobs.find((j) => j.id === sharedJobId);
+      if (sharedJobRecord) sharedJobRecord.name = "Email watch: alice@x.com";
       return createChatSession(state, "Email watch: bob@x.com", undefined, undefined, "job", "channel");
     });
 
@@ -369,6 +372,9 @@ describe("shared backing job lifecycle", () => {
     );
     expect(gmailJobs).toHaveLength(1);
     expect(gmailJobs[0]!.id).toBe(sharedJobId);
+    // The adopted job's name was renamed to the canonical "Email watch" so the
+    // sidebar (which renders job.name) no longer shows "Email watch: <sender>".
+    expect(gmailJobs[0]!.name).toBe("Email watch");
     // Exactly ONE email-watch session, titled exactly "Email watch" (adopted
     // title renamed); the orphan job's session + the truly-orphan channel swept.
     const emailSessions = state.chatSessions.filter(
