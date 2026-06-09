@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readAwsProfileCredentials, resolveAwsCredentials, resolveAwsRegion, signAwsRequest } from "./aws-sigv4";
+import { readAwsProfileCredentials, resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
 
 const CREDS = { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" };
 const URL_ = "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages";
@@ -107,28 +107,6 @@ describe("signAwsRequest", () => {
     expect(headers.authorization).toMatch(
       /^AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE\/\d{8}\/us-east-1\/bedrock-mantle\/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=[0-9a-f]{64}$/
     );
-  });
-});
-
-describe("resolveAwsRegion", () => {
-  test("explicit region wins over the host", () => {
-    expect(resolveAwsRegion({ awsRegion: "eu-west-1", url: URL_ })).toBe("eu-west-1");
-  });
-
-  test("parses the region from a Bedrock host", () => {
-    expect(resolveAwsRegion({ url: "https://bedrock-mantle.ap-southeast-2.api.aws/anthropic/v1/messages" })).toBe("ap-southeast-2");
-  });
-
-  test("falls back to AWS_REGION, then AWS_DEFAULT_REGION, then null", () => {
-    withEnv({ AWS_REGION: "us-west-2", AWS_DEFAULT_REGION: undefined }, () => {
-      expect(resolveAwsRegion({ url: "https://api.anthropic.com/v1/messages" })).toBe("us-west-2");
-    });
-    withEnv({ AWS_REGION: undefined, AWS_DEFAULT_REGION: "us-west-1" }, () => {
-      expect(resolveAwsRegion({ url: "https://api.anthropic.com/v1/messages" })).toBe("us-west-1");
-    });
-    withEnv({ AWS_REGION: undefined, AWS_DEFAULT_REGION: undefined }, () => {
-      expect(resolveAwsRegion({ url: "https://api.anthropic.com/v1/messages" })).toBeNull();
-    });
   });
 });
 

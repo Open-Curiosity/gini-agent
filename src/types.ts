@@ -168,9 +168,10 @@ export interface ProviderConfig {
   model: string;
   baseUrl?: string;
   apiKeyEnv?: string;
-  // SigV4 signing region for the `bedrock` provider. When omitted, parsed from
-  // the Bedrock host, then AWS_REGION / AWS_DEFAULT_REGION, then a built-in
-  // default. Ignored by every other provider.
+  // SigV4 signing region for the `bedrock` provider. normalizeProvider resolves
+  // it from this field, else AWS_REGION, else AWS_DEFAULT_REGION, else a built-in
+  // default (us-east-1); the Converse host is then derived from it. Ignored by
+  // every other provider.
   awsRegion?: string;
   // Env vars holding the AWS credentials the `bedrock` provider signs with. When
   // omitted, the standard AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /

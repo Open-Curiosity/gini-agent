@@ -3874,8 +3874,9 @@ export function anthropicNeedsHttps(name: string, baseUrl: string | undefined): 
   if (value.length === 0) return false;
   if (value.toLowerCase().startsWith("https://")) return false;
   try {
+    // URL.hostname returns an IPv6 literal in brackets, e.g. "[::1]".
     const host = new URL(value).hostname.toLowerCase();
-    if (host === "localhost" || host === "127.0.0.1" || host === "::1") return false;
+    if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]") return false;
   } catch {
     return true; // unparseable → not a safe https endpoint
   }

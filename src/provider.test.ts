@@ -9,6 +9,7 @@ import {
   generateTaskSummary,
   generateToolCallingResponse,
   generateVisionAnalysis,
+  anthropicNeedsHttps,
   isAuthExpiredError,
   isProviderConfigured,
   isValidAwsRegion,
@@ -3667,6 +3668,24 @@ describe("anthropic provider", () => {
   let restoreAmbientSessionToken: () => void;
   beforeEach(() => { restoreAmbientSessionToken = setEnv("AWS_SESSION_TOKEN", undefined); });
   afterEach(() => { restoreAmbientSessionToken(); });
+
+  test("anthropicNeedsHttps refuses plaintext custom endpoints but allows https and loopback", () => {
+    // No baseUrl uses the https first-party default — fine.
+    expect(anthropicNeedsHttps("anthropic", undefined)).toBe(false);
+    expect(anthropicNeedsHttps("anthropic", "")).toBe(false);
+    // https custom endpoints are fine.
+    expect(anthropicNeedsHttps("anthropic", "https://anthropic.gateway.internal/v1")).toBe(false);
+    // Loopback proxies over http are allowed (incl. bracketed IPv6 from URL.hostname).
+    expect(anthropicNeedsHttps("anthropic", "http://localhost:8787/v1")).toBe(false);
+    expect(anthropicNeedsHttps("anthropic", "http://127.0.0.1/v1")).toBe(false);
+    expect(anthropicNeedsHttps("anthropic", "http://[::1]:8787/v1")).toBe(false);
+    // Plaintext non-loopback and unparseable endpoints are refused.
+    expect(anthropicNeedsHttps("anthropic", "http://proxy.example/v1")).toBe(true);
+    expect(anthropicNeedsHttps("anthropic", "not a url")).toBe(true);
+    // No-op for every other provider.
+    expect(anthropicNeedsHttps("openai", "http://proxy.example/v1")).toBe(false);
+    expect(anthropicNeedsHttps("bedrock", "http://proxy.example/v1")).toBe(false);
+  });
 
   test("normalizeProvider applies defaults and preserves overrides", () => {
     expect(normalizeProvider({ name: "anthropic", model: "" })).toEqual({

@@ -529,6 +529,32 @@ describe("setup-api", () => {
     }
   });
 
+  test("POST anthropic rejects a plaintext custom baseUrl but accepts https (key-leak guard)", async () => {
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    try {
+      const httpBase = await setSetupProvider(config, {
+        provider: "anthropic",
+        apiKey: "sk-ant-secret",
+        model: "claude-opus-4-8",
+        baseUrl: "http://proxy.example/v1"
+      });
+      expect(httpBase.ok).toBe(false);
+      expect(httpBase.error).toContain("https://");
+      const httpsBase = await setSetupProvider(config, {
+        provider: "anthropic",
+        apiKey: "sk-ant-secret",
+        model: "claude-opus-4-8",
+        baseUrl: "https://anthropic.gateway.internal/v1"
+      });
+      expect(httpsBase.ok).toBe(true);
+      expect(config.provider.baseUrl).toBe("https://anthropic.gateway.internal/v1");
+    } finally {
+      if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevKey;
+    }
+  });
+
   test("a model-only same-provider edit preserves a custom apiKeyEnv and gates on it", async () => {
     const prevKey = process.env.MY_AZURE_KEY;
     config.provider = {

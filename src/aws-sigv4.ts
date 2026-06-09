@@ -184,14 +184,3 @@ export function readAwsProfileCredentials(profile: string): AwsCredentials | nul
   if (accessKeyId && secretAccessKey) return { accessKeyId, secretAccessKey, sessionToken };
   return null;
 }
-
-// Resolve the signing region: explicit config, else parsed from the Bedrock
-// runtime host (bedrock-runtime.{region}.amazonaws.com), else AWS_REGION /
-// AWS_DEFAULT_REGION. Returns null when none resolve.
-export function resolveAwsRegion(opts: { awsRegion?: string; url: string }): string | null {
-  if (opts.awsRegion) return opts.awsRegion;
-  const host = new URL(opts.url).host;
-  const fromHost = host.match(/\.([a-z]{2}-[a-z]+-\d+)\./);
-  if (fromHost) return fromHost[1]!;
-  return process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? null;
-}
