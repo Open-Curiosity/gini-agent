@@ -1344,7 +1344,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }), 201);
     }],
     ["DELETE", /^\/api\/email\/watchers\/([^/]+)$/, async (_request, params) => json(await removeEmailWatcher(config, params[0]))],
-    // PATCH toggles a watcher's enabled flag, pausing/resuming its backing job.
+    // PATCH toggles a watcher's enabled flag, rebuilding the shared job's watch
+    // list (disabling the last enabled watcher tears the shared job down; enabling
+    // recreates it).
     ["PATCH", /^\/api\/email\/watchers\/([^/]+)$/, async (request, params) => {
       const payload = await body(request);
       if (typeof payload.enabled !== "boolean") {

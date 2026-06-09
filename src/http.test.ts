@@ -5308,7 +5308,7 @@ describe("agent-chat and thread endpoints", () => {
 });
 
 describe("email watcher routes", () => {
-  test("PATCH /api/email/watchers/:id toggles enabled and pauses/resumes the backing job", async () => {
+  test("PATCH /api/email/watchers/:id toggles enabled and tears down / recreates the shared job", async () => {
     const config = testConfig("http-email-patch");
     const handler = createHandler(config);
     const created = await call(handler, config, "/api/email/watchers", {
@@ -5318,21 +5318,30 @@ describe("email watcher routes", () => {
     const id = (created as { id: string }).id;
     const jobId = (created as { jobId: string }).jobId;
     expect(jobId).toBeString();
-    expect(readState(config.instance).jobs.find((j) => j.id === jobId)?.status).toBe("active");
+    // The shared email-watch job is active and watches this sole watcher.
+    const sharedJob = () =>
+      readState(config.instance).jobs.find(
+        (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+      );
+    expect(sharedJob()?.id).toBe(jobId);
+    expect(sharedJob()?.status).toBe("active");
 
+    // Disabling the sole watcher tears the shared job down (nothing to poll).
     const disabled = await call(handler, config, `/api/email/watchers/${id}`, {
       method: "PATCH",
       body: JSON.stringify({ enabled: false })
     });
     expect((disabled as { enabled: boolean }).enabled).toBe(false);
-    expect(readState(config.instance).jobs.find((j) => j.id === jobId)?.status).toBe("paused");
+    expect(sharedJob()).toBeUndefined();
 
+    // Re-enabling recreates the shared job and re-stamps the watcher's jobId.
     const enabled = await call(handler, config, `/api/email/watchers/${id}`, {
       method: "PATCH",
       body: JSON.stringify({ enabled: true })
     });
     expect((enabled as { enabled: boolean }).enabled).toBe(true);
-    expect(readState(config.instance).jobs.find((j) => j.id === jobId)?.status).toBe("active");
+    expect(sharedJob()).toBeDefined();
+    expect((enabled as { jobId: string }).jobId).toBe(sharedJob()!.id);
   });
 
   test("PATCH /api/email/watchers/:id rejects a non-boolean enabled with 400", async () => {
