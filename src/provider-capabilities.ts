@@ -206,3 +206,15 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
       return { vision: false, nativeDocs: false };
   }
 }
+
+// Bedrock Converse tool use (function calling) is per-model. Every family in the
+// catalog accepts a `toolConfig` EXCEPT DeepSeek, whose R1 reasoning model
+// Converse rejects with a ValidationException ("This model doesn't support tool
+// use"). A normal chat turn always loads tools, so without this gate a DeepSeek
+// agent 400s on every turn; omitting toolConfig lets it run text-only instead.
+// Denylist the known-incompatible family rather than allowlisting — the runtime
+// accepts custom ids and the rest of Bedrock (Claude, Nova, Llama, Mistral)
+// supports tool use, so an unrecognized id should default to attaching tools.
+export function bedrockSupportsToolUse(model: string): boolean {
+  return !/deepseek/i.test(model);
+}

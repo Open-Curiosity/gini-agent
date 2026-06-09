@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  bedrockSupportsToolUse,
   FALLBACK_CONTEXT_WINDOW_TOKENS,
   resolveDefaultPriorContextTokenBudget,
   resolveProviderContextWindowTokens,
@@ -117,6 +118,25 @@ describe("resolveProviderModality", () => {
     // Text-only / unrecognized ids → vision false. nativeDocs is false either way.
     for (const m of ["us.deepseek.r1-v1:0", "us.meta.llama3-3-70b-instruct-v1:0", "us.amazon.nova-micro-v1:0", ""]) {
       expect(resolveProviderModality(provider("bedrock", m))).toEqual({ vision: false, nativeDocs: false });
+    }
+  });
+});
+
+describe("bedrockSupportsToolUse", () => {
+  test("DeepSeek ids are gated off; every other catalog family stays on", () => {
+    // DeepSeek R1 returns a ValidationException when sent a Converse toolConfig.
+    expect(bedrockSupportsToolUse("us.deepseek.r1-v1:0")).toBe(false);
+    expect(bedrockSupportsToolUse("DeepSeek-R1")).toBe(false);
+    // Tool-capable families default to true (incl. unrecognized/custom ids).
+    for (const m of [
+      "us.anthropic.claude-opus-4-8",
+      "us.amazon.nova-micro-v1:0",
+      "us.meta.llama3-3-70b-instruct-v1:0",
+      "us.mistral.mistral-large-2407-v1:0",
+      "some.custom.future-model",
+      ""
+    ]) {
+      expect(bedrockSupportsToolUse(m)).toBe(true);
     }
   });
 });

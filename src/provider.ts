@@ -5,7 +5,7 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import { resolveProviderModality } from "./provider-capabilities";
+import { bedrockSupportsToolUse, resolveProviderModality } from "./provider-capabilities";
 import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
 import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
@@ -2058,7 +2058,9 @@ async function callBedrockConverse(
     inferenceConfig: { maxTokens }
   };
   if (system.length > 0) body.system = system;
-  const toolConfig = translateToolsToConverse(tools);
+  // Omit toolConfig for models that reject it (e.g. DeepSeek R1) so a normal
+  // tool-loaded chat turn degrades to text-only instead of a ValidationException.
+  const toolConfig = bedrockSupportsToolUse(provider.model) ? translateToolsToConverse(tools) : undefined;
   if (toolConfig) body.toolConfig = toolConfig;
 
   const bodyJson = JSON.stringify(body);

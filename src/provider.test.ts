@@ -4348,6 +4348,38 @@ describe("anthropic provider", () => {
     }
   });
 
+  test("bedrock: omits toolConfig for DeepSeek (which rejects tool use) even when tools are loaded", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() =>
+      anthropicJson({
+        output: { message: { role: "assistant", content: [{ text: "no tools here" }] } },
+        stopReason: "end_turn",
+        usage: {}
+      })
+    );
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.deepseek.r1-v1:0", awsRegion: "us-east-1" });
+      const tools: ToolFunctionSpec[] = [
+        { type: "function", function: { name: "lookup", description: "d", parameters: { type: "object", properties: {} } } }
+      ];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "go" }],
+        tools
+      );
+      const body = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      // DeepSeek R1 Converse returns a ValidationException if toolConfig is sent,
+      // so a normal tool-loaded turn must degrade to text-only rather than 400.
+      expect(body.toolConfig).toBeUndefined();
+      expect(result.text).toBe("no tools here");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
   test("bedrock: streams converse-stream text deltas and tool-use, mapping stop + usage", async () => {
     const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
     const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
