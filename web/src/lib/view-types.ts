@@ -43,12 +43,17 @@ export interface ThreadSummary extends RuntimeThreadSummary {
 }
 
 // Trimmed agent shape returned by `GET /api/agents`. The runtime
-// `AgentRecord` carries provider/toolsets/messaging detail that the
-// list endpoint doesn't ship; keep this view aligned with the wire.
+// `AgentRecord` carries toolsets/messaging detail the UI doesn't consume;
+// keep this view aligned with what callers actually read off the wire.
 export interface AgentRow {
   id: string;
   name: string;
   status: string;
+  // Per-agent provider/model override pair (ADR per-agent-provider-settings.md).
+  // The Settings default-model control reads agent_default's pair — that is
+  // what new chats start with.
+  providerName?: string;
+  model?: string;
 }
 
 // UI-narrowed snapshot returned by GET /state. The runtime sends the full

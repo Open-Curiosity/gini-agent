@@ -5,7 +5,11 @@
 // so the row shape and the brand-label helper live here rather than inside any
 // one route's private component.
 
-import type { ProviderCatalogItem as RuntimeProviderCatalogItem } from "@runtime/types";
+import type {
+  ModelCatalogEntry as RuntimeModelCatalogEntry,
+  ModelRoute as RuntimeModelRoute,
+  ProviderCatalogItem as RuntimeProviderCatalogItem
+} from "@runtime/types";
 
 // The `/providers/catalog` payload is the runtime ProviderCatalogItem enriched
 // with a per-row `configured` flag (see providerCatalogWithStatus). Derive the
@@ -20,6 +24,18 @@ export type ProviderCatalogItem = Pick<
   RuntimeProviderCatalogItem,
   "id" | "name" | "displayName" | "baseUrl" | "auth" | "models"
 > & { configured?: boolean };
+
+// The `/providers/models` payload: canonical models with the routes
+// (configured providers) that serve them. Derived from the runtime types so
+// the fields can't drift; consumed by the shared ModelPicker. A route is the
+// exact { provider, providerModelId } pair the selection endpoints persist.
+export type ModelRoute = Pick<
+  RuntimeModelRoute,
+  "provider" | "providerModelId" | "label" | "default"
+>;
+export type ModelCatalogEntry = Pick<RuntimeModelCatalogEntry, "id"> & {
+  routes: ModelRoute[];
+};
 
 // Trim suffixes that the static catalog stacks on top of the brand name.
 // The Pencil mocks reference providers by short name (OpenAI, OpenRouter,

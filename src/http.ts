@@ -75,6 +75,8 @@ import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./
 import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableMessagingBridge, listAllowedChats, listMessagingMessages, receiveMessagingInput, rejectPendingChat, removeMessagingBridge, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalogWithStatus } from "./provider";
+import { buildModelCatalog } from "./model-routes";
+import { setDefaultModel } from "./runtime/default-model";
 import { createAgent, deleteAgent, listAgents, renameAgent, setAgentProvider, useAgent } from "./capabilities/agents";
 import {
   approveSoul,
@@ -1639,6 +1641,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(await rejectPendingChat(config, params[0], chatId));
     }],
     ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv, config.provider?.baseUrl))],
+    // Model-first view of the same catalog: canonical models with the routes
+    // (configured providers) that serve them. Drives the model picker in the
+    // web Settings page and chat Settings tab (ADR model-first-selection.md).
+    ["GET", /^\/api\/providers\/models$/, () => json(buildModelCatalog(providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv, config.provider?.baseUrl)))],
+    // Set the default model (what new chats start with): writes the instance
+    // provider AND the default agent's override — the latter is what the
+    // default chat actually resolves through. Body: { provider, model }.
+    ["POST", /^\/api\/settings\/default-model$/, async (request) => {
+      const result = await setDefaultModel(config, await body(request));
+      return json(result, result.ok ? 200 : 400);
+    }],
     // Browser-driven onboarding endpoints. The webapp's /setup route polls
     // /api/setup/status to decide whether to render the form, and POSTs
     // /api/setup/provider to set credentials. The runtime writes

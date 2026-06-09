@@ -92,18 +92,15 @@ are per-agent surfaces and are hidden on the recurring-job channel view, which
 is not scoped to the active agent.
 
 The tab reads the active agent's current effective provider from
-`/api/status.activeAgent` (`resolvedProvider` + `providerSource`) and the
-selectable providers from `/api/providers/catalog`. It presents the configured
-providers as radio rows (mirroring the global `ProviderCard`) plus an "Instance
-default" row that clears the override, with a model dropdown on the selected
-provider and a Save bar. On save it `POST`s the contract above and invalidates
-`["status", "agents", "state"]`.
-
-The model dropdown offers the provider's catalog model list and also surfaces
-the agent's currently-saved model when it isn't in the catalog (e.g. a custom
-Bedrock inference-profile id). Entering a brand-new custom model id is not done
-here — that lives in the global Settings provider editor (which the tab links
-to), keeping this tab a focused per-agent selector rather than a second
+`/api/status.activeAgent` (`resolvedProvider` + `providerSource`). Selection is
+model-first (see ADR model-first-selection.md): the shared `ModelPicker` lists
+canonical models with the configured routes that serve them, picking a model
+saves the route pair through the contract above immediately, and a "Use default
+model" action clears the override. The picker surfaces the agent's
+currently-saved pair even when it is off-catalog (e.g. a custom Bedrock
+inference-profile id); entering a brand-new custom model id is not done here —
+that lives in the global Settings provider editor (which the tab links to),
+keeping this tab a focused per-agent selector rather than a second
 provider-configuration surface.
 
 The tab is rendered only on the active agent's own canonical chat. It is hidden
@@ -153,3 +150,14 @@ agent.
   picker.
 - `web/src/components/chat/ChatTabBar.tsx`, `web/src/app/chat/page.tsx` — the
   Settings tab wiring.
+
+## Amendment 2026-06-09: Model-First Picker
+
+The Settings tab's provider radio rows + per-provider model dropdown were
+replaced by the shared model-first `ModelPicker` (the UI section above
+describes the current shape). The `POST /api/agents/:id/provider` contract,
+the credentials-stay-instance-level split, and the resolution semantics are
+unchanged. The global Settings page's per-provider "active" radio was
+likewise replaced by a "Default model" control whose write path updates the
+instance provider and the default agent's override together — see ADR
+model-first-selection.md.

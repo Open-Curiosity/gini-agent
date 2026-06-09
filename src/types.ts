@@ -1194,6 +1194,26 @@ export interface ProviderCatalogItem {
   costHint: "free" | "external" | "unknown";
 }
 
+// One way to reach a model: the (provider, providerModelId) pair dispatch
+// needs, plus a short user-facing route label ("OpenAI", "Amazon Bedrock ·
+// eu"). `default` marks the route the picker selects when the user picks
+// the model by name without choosing a provider. See ADR
+// model-first-selection.md.
+export interface ModelRoute {
+  provider: ProviderCatalogItem["name"];
+  providerModelId: string;
+  label: string;
+  default: boolean;
+}
+
+// A canonical model and every route currently serving it. `id` is the
+// picker-facing model name (provider-specific ids like bedrock inference
+// profiles are folded into it via the alias table in src/model-routes.ts).
+export interface ModelCatalogEntry {
+  id: string;
+  routes: ModelRoute[];
+}
+
 export interface AgentRecord {
   id: string;
   instance: Instance;

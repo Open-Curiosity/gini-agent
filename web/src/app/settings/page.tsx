@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { PageHeader } from "@/components/PageHeader";
 import { api } from "@/lib/api";
 import { useInvalidate, useStatus } from "@/lib/queries";
+import { DefaultModelControl } from "./_components/DefaultModelControl";
 import { ProviderCard } from "./_components/ProviderCard";
 import type { ProviderCatalogItem } from "@/lib/providers";
 import { ToolsetsCard, type ToolsetRow } from "./_components/ToolsetsCard";
@@ -81,23 +82,24 @@ export default function SettingsPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
-  // Settings card lists every provider in the catalog and marks the
-  // instance's active one. Read the instance-level provider (not the
-  // per-agent resolvedProvider) because the Settings UI controls the
-  // instance default, and showing an agent's pin here would mislead the
-  // user about which entry their "Set active" click changes.
+  // The INSTANCE provider (config.provider) — the transport behind the
+  // default model and the fallback for override-less agents. The provider
+  // rows use it to gate removal and prefill the Edit dialog; model
+  // selection itself lives in the Default model picker above the rows.
   const activeProviderName = status.data?.provider?.provider?.name;
   const activeProviderModel = status.data?.provider?.provider?.model;
   const activeProviderAwsRegion = status.data?.provider?.provider?.awsRegion;
-  // The full persisted config for the active provider — carries the transport
-  // fields (baseUrl + Azure routing) the static catalog doesn't, so the Edit
-  // dialog can prefill them.
+  // The full persisted config for the instance provider — carries the
+  // transport fields (baseUrl + Azure routing) the static catalog doesn't,
+  // so the Edit dialog can prefill them.
   const activeProvider = status.data?.provider?.provider;
 
   return (
     <>
       <PageHeader title="Settings" description="Providers, browser, toolsets, integrations, devices" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
+        <DefaultModelControl />
+
         <ProviderCard
           catalog={catalog.data ?? []}
           activeProviderName={activeProviderName}

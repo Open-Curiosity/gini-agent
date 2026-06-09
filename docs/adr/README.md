@@ -15,6 +15,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Subagent Delegation](subagent-delegation.md)
 - [Agents Replace Profiles And Drive Runtime Behavior](agents-replace-profiles.md)
 - [Per-Agent Provider Settings (Editable Override + In-Chat Settings Tab)](per-agent-provider-settings.md)
+- [Model-First Selection (Models With Routes, Not Providers With Models)](model-first-selection.md)
 - [Approval Mode (three-state policy)](approval-mode.md) — supersedes [dangerouslyAutoApprove](dangerously-auto-approve.md)
 - [Per-Agent Memory Isolation](agent-memory-isolation.md)
 - [Connector Secret Storage](connector-secret-storage.md)
