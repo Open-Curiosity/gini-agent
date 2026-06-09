@@ -218,3 +218,14 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
 export function bedrockSupportsToolUse(model: string): boolean {
   return !/deepseek/i.test(model);
 }
+
+// Bedrock Converse streaming (converse-stream) is also per-model. AWS rejects the
+// ConverseStream operation for Llama 4 Instruct ("You can't use the
+// InvokeModelWithResponseStream or ConverseStream (streaming) operations with
+// Llama 4 Instruct" — model-parameters-meta.html). A normal chat turn streams, so
+// without this gate a Llama 4 agent fails every turn; falling back to the
+// non-stream Converse endpoint returns the full text instead. Denylist the known
+// family; everything else streams.
+export function bedrockSupportsStreaming(model: string): boolean {
+  return !/llama4/i.test(model);
+}

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  bedrockSupportsStreaming,
   bedrockSupportsToolUse,
   FALLBACK_CONTEXT_WINDOW_TOKENS,
   resolveDefaultPriorContextTokenBudget,
@@ -137,6 +138,25 @@ describe("bedrockSupportsToolUse", () => {
       ""
     ]) {
       expect(bedrockSupportsToolUse(m)).toBe(true);
+    }
+  });
+});
+
+describe("bedrockSupportsStreaming", () => {
+  test("Llama 4 ids are gated off; every other family streams", () => {
+    // AWS rejects ConverseStream for Llama 4 Instruct.
+    expect(bedrockSupportsStreaming("us.meta.llama4-maverick-17b-instruct-v1:0")).toBe(false);
+    expect(bedrockSupportsStreaming("us.meta.llama4-scout-17b-instruct-v1:0")).toBe(false);
+    // Other families (incl. Llama 3.3, unrecognized/custom ids) stream.
+    for (const m of [
+      "us.anthropic.claude-opus-4-8",
+      "us.amazon.nova-lite-v1:0",
+      "us.meta.llama3-3-70b-instruct-v1:0",
+      "us.deepseek.r1-v1:0",
+      "some.custom.future-model",
+      ""
+    ]) {
+      expect(bedrockSupportsStreaming(m)).toBe(true);
     }
   });
 });

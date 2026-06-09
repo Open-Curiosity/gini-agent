@@ -370,11 +370,12 @@ describe("setup-api", () => {
       // model picker / set_provider tool must not reset the region).
       await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-lite-v1:0" });
       expect(config.provider.awsRegion).toBe("us-west-2");
-      // A blank awsRegion CLEARS it — the host resolves back to the us-east-1
-      // default (no AWS_REGION/AWS_DEFAULT_REGION set here).
+      // A blank awsRegion CLEARS it — the persisted field goes absent (no env
+      // baked into config) and the host resolves at request time back to the
+      // us-east-1 default (no AWS_REGION/AWS_DEFAULT_REGION set here).
       const cleared = await setSetupProvider(config, { provider: "bedrock", awsRegion: "" });
       expect(cleared.ok).toBe(true);
-      expect(config.provider.awsRegion).toBe("us-east-1");
+      expect(config.provider.awsRegion).toBeUndefined();
       expect(config.provider.baseUrl).toBe("https://bedrock-runtime.us-east-1.amazonaws.com");
     } finally {
       if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;

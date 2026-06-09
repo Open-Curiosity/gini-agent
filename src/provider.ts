@@ -5,7 +5,7 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import { bedrockSupportsToolUse, resolveProviderModality } from "./provider-capabilities";
+import { bedrockSupportsStreaming, bedrockSupportsToolUse, resolveProviderModality } from "./provider-capabilities";
 import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
 import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
@@ -1855,9 +1855,10 @@ export function isValidAwsRegion(region: string): boolean {
   return /^[a-z0-9-]+$/.test(region);
 }
 
-// Signing region for a bedrock provider. normalizeProvider always sets
-// awsRegion (default us-east-1); the env/default fallbacks guard an
-// un-normalized config.
+// Signing region for a bedrock provider, resolved at request time so a later
+// AWS_REGION change still takes effect: explicit config region → AWS_REGION →
+// AWS_DEFAULT_REGION → built-in default. normalizeProvider persists only an
+// explicit region, so this fallback chain is the single source of truth.
 function bedrockRegion(provider: ProviderConfig): string {
   return provider.awsRegion || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || DEFAULT_BEDROCK_REGION;
 }
@@ -2049,7 +2050,9 @@ async function callBedrockConverse(
   maxTokensOverride?: number
 ): Promise<ToolCallingResult> {
   const region = bedrockRegion(provider);
-  const wantStream = Boolean(onDelta);
+  // Some models (Llama 4 Instruct) reject the converse-stream operation; fall
+  // back to non-stream Converse for them so the turn returns full text instead.
+  const wantStream = Boolean(onDelta) && bedrockSupportsStreaming(provider.model);
   const url = bedrockConverseUrl(region, provider.model, wantStream);
   const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
   const { system, messages: converseMessages } = translateMessagesToConverse(safeMessages);
@@ -3023,23 +3026,21 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
     };
   }
   if (provider.name === "bedrock") {
-    // Honor the documented resolution order (explicit region → AWS_REGION →
-    // AWS_DEFAULT_REGION → built-in default) here at the single source of truth.
-    // normalizeProvider always populates awsRegion, so resolving the env here is
-    // what makes a user's AWS_REGION actually take effect for both the Converse
-    // endpoint and the SigV4 scope.
-    const awsRegion =
-      provider.awsRegion || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || DEFAULT_BEDROCK_REGION;
+    // Persist only an EXPLICIT region. The env/default fallback (explicit →
+    // AWS_REGION → AWS_DEFAULT_REGION → built-in default) is resolved at request
+    // time by bedrockRegion, so config.json never freezes whatever AWS_REGION
+    // happened to be set when `provider set` ran (a later env change still wins).
+    const awsRegion = provider.awsRegion?.trim();
     return {
       name: "bedrock",
       model: provider.model || DEFAULT_BEDROCK_MODEL,
-      // Informational: the regional Converse runtime host. callBedrockConverse
-      // builds the full /model/{id}/converse[-stream] URL itself from awsRegion,
-      // so this baseUrl is for inspection/trace, not the request path. Derive it
-      // straight from awsRegion (ignoring any stored baseUrl) so the displayed
-      // host can never drift from the host requests actually sign and hit.
-      baseUrl: bedrockRuntimeBaseUrl(awsRegion),
-      awsRegion,
+      // Informational: the regional Converse runtime host, for inspection/trace
+      // — callBedrockConverse builds the real /model/{id}/converse[-stream] URL
+      // from the request-time region. Derive it from the explicit region or the
+      // built-in default with NO env read, so the displayed host can't drift from
+      // the signed host and the persisted file embeds no environment state.
+      baseUrl: bedrockRuntimeBaseUrl(awsRegion || DEFAULT_BEDROCK_REGION),
+      ...(awsRegion ? { awsRegion } : {}),
       ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }

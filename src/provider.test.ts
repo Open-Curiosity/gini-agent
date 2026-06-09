@@ -4414,6 +4414,29 @@ describe("anthropic provider", () => {
     }
   });
 
+  test("bedrock: Llama 4 forces non-stream Converse even when an onDelta is provided", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const seen: string[] = [];
+    const fetchStub = installFetch(() =>
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "hi from llama" }] } }, stopReason: "end_turn", usage: {} })
+    );
+    try {
+      // AWS rejects ConverseStream for Llama 4 Instruct, so a streaming chat turn
+      // must fall back to the non-stream /converse endpoint and still return text.
+      const provider = normalizeProvider({ name: "bedrock", model: "us.meta.llama4-scout-17b-instruct-v1:0", awsRegion: "us-east-1" });
+      const result = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [], (d) => seen.push(d));
+      const url = fetchStub.calls[0]!.url;
+      expect(url.endsWith("/converse")).toBe(true);
+      expect(url).not.toContain("converse-stream");
+      expect(result.text).toBe("hi from llama");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
   test("bedrock: a converse-stream exception frame throws", async () => {
     const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
     const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
@@ -4559,16 +4582,32 @@ describe("anthropic provider", () => {
     expect(isValidAwsRegion("")).toBe(false);
   });
 
-  test("bedrock: normalizeProvider honors AWS_REGION when no explicit region is set", () => {
+  test("bedrock: AWS_REGION is honored at request time, not baked into the normalized config", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
     const restoreRegion = setEnv("AWS_REGION", "eu-west-1");
     const restoreDef = setEnv("AWS_DEFAULT_REGION", undefined);
+    const fetchStub = installFetch(() =>
+      anthropicJson({ output: { message: { role: "assistant", content: [{ text: "ok" }] } }, stopReason: "end_turn", usage: {} })
+    );
     try {
       const p = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" });
-      expect(p.awsRegion).toBe("eu-west-1");
-      expect(p.baseUrl).toBe("https://bedrock-runtime.eu-west-1.amazonaws.com");
+      // No explicit region → the env is NOT frozen into config (no leak); the
+      // informational baseUrl falls back to the built-in default.
+      expect(p.awsRegion).toBeUndefined();
+      expect(p.baseUrl).toBe("https://bedrock-runtime.us-east-1.amazonaws.com");
+      // But a real request resolves AWS_REGION at call time, so a later env
+      // change still takes effect.
+      await generateToolCallingResponse(config(p), [{ role: "user", content: "hi" }], []);
+      expect(fetchStub.calls[0]!.url).toBe(
+        "https://bedrock-runtime.eu-west-1.amazonaws.com/model/us.amazon.nova-pro-v1%3A0/converse"
+      );
     } finally {
+      fetchStub.restore();
       restoreDef();
       restoreRegion();
+      restoreSk();
+      restoreAk();
     }
   });
 
