@@ -21,7 +21,9 @@ import type { ModelCatalogEntry, ModelRoute, ProviderCatalogItem, ProviderName }
 // model. Bedrock's cross-region inference profiles are the same Anthropic
 // models the first-party API serves; the geo prefix is a routing choice,
 // so it surfaces as a route `qualifier` rather than a separate model.
-const MODEL_ALIASES: Record<string, Record<string, { id: string; qualifier?: string }>> = {
+// Exported so the catalog-drift test can assert every alias key still
+// exists in the provider catalog.
+export const MODEL_ALIASES: Record<string, Record<string, { id: string; qualifier?: string }>> = {
   bedrock: {
     "us.anthropic.claude-opus-4-8": { id: "claude-opus-4-8", qualifier: "us" },
     "us.anthropic.claude-opus-4-7": { id: "claude-opus-4-7", qualifier: "us" },

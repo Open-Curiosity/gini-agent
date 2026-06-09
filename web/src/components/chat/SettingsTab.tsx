@@ -58,12 +58,19 @@ export function SettingsTab({ agentId }: { agentId?: string }) {
   const value: ModelSelection | null = resolved
     ? { provider: resolved.name, model: resolved.model }
     : null;
-  // Treat the agent as "on the default" when it carries no override OR its
-  // override matches the instance pair (the default agent's seeded override
-  // is the instance default — surfacing that as an override would be noise).
+  // The DEFAULT agent always carries a seeded override equal to the instance
+  // default (boot reseed + the default-model write keep it mirrored), so for
+  // it a matching override IS "on the default" and surfacing it as an
+  // override would be noise. A NON-default agent's override is a copy, not a
+  // link — even when it currently equals the instance pair it will not
+  // follow later default changes, so it must read as an override and keep
+  // the clear affordance. "profile_default" is the legacy pre-rename id.
+  const isDefaultAgent = agentId === "agent_default" || agentId === "profile_default";
   const isDefault =
     activeAgent?.providerSource !== "agent" ||
-    (resolved?.name === instanceProvider?.name && resolved?.model === instanceProvider?.model);
+    (isDefaultAgent &&
+      resolved?.name === instanceProvider?.name &&
+      resolved?.model === instanceProvider?.model);
 
   const save = useMutation({
     mutationFn: (vars: { providerName: string; model: string }) =>

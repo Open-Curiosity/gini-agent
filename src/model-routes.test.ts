@@ -3,7 +3,7 @@
 // labels, and dedupe. Pure inputs — no env/credential games.
 
 import { describe, expect, test } from "bun:test";
-import { buildModelCatalog } from "./model-routes";
+import { buildModelCatalog, MODEL_ALIASES } from "./model-routes";
 import { providerCatalog } from "./provider";
 import type { ProviderCatalogItem } from "./types";
 
@@ -145,23 +145,28 @@ describe("buildModelCatalog", () => {
   test("every alias key references a model id that exists in the real provider catalog", () => {
     // Guards the hand-curated alias table against catalog drift: an alias
     // whose source id was renamed/removed in providerCatalog() is dead
-    // weight and a sign the canonical mapping needs review. Build the
-    // catalog with everything configured and assert the aliased bedrock
-    // ids landed under canonical entries.
+    // weight and a sign the canonical mapping needs review. Assert the
+    // table directly — behavior-only checks go blind when another provider
+    // natively lists the same canonical id.
+    const byName = new Map(providerCatalog().map((row) => [row.name, new Set(row.models)] as const));
+    for (const [providerName, aliases] of Object.entries(MODEL_ALIASES)) {
+      const models = byName.get(providerName);
+      expect(models).toBeDefined();
+      for (const sourceId of Object.keys(aliases)) {
+        expect(models!.has(sourceId)).toBe(true);
+      }
+    }
+  });
+
+  test("no catalog-wide entry surfaces a raw geo-prefixed anthropic id", () => {
+    // The inverse drift: a NEW bedrock anthropic profile added to the
+    // catalog without an alias entry would surface verbatim instead of
+    // folding into its canonical model. Build over the real catalog with
+    // everything configured and assert none leaks through.
     const all = providerCatalog().map((row) => ({ ...row, configured: true }));
     const entries = buildModelCatalog(all);
-    const ids = new Set(entries.map((e) => e.id));
-    for (const canonical of ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"]) {
-      expect(ids.has(canonical)).toBe(true);
-    }
-    // No raw aliased bedrock id should surface as its own entry.
-    for (const raw of [
-      "us.anthropic.claude-opus-4-8",
-      "us.anthropic.claude-sonnet-4-6",
-      "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-      "eu.anthropic.claude-sonnet-4-6"
-    ]) {
-      expect(ids.has(raw)).toBe(false);
+    for (const entry of entries) {
+      expect(entry.id).not.toMatch(/^(us|eu|apac|global)\.anthropic\./);
     }
   });
 });

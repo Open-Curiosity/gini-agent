@@ -240,7 +240,7 @@ export function EditProviderDialog({
 
           <div className="space-y-2">
             <div className="flex items-center justify-between">
-              <Label htmlFor="edit-model" className="text-[13px] font-semibold text-foreground">Default model</Label>
+              <Label htmlFor="edit-model" className="text-[13px] font-semibold text-foreground">Model</Label>
               <span className="text-xs text-muted-foreground">
                 {row.models.length} available
               </span>
