@@ -14,8 +14,13 @@ endpoint, CLI command, or web control for keeping the cache warm.
    OpenAI-compatible request body in `src/provider.ts`
    (`callToolCallingChatCompletions`, `callStructuredChatCompletions`,
    `callOpenAIResponses` openai branch, `callChatCompletions`,
-   `callVisionChatCompletions`). The codex `/responses` builders deliberately
-   omit the field because the chatgpt.com backend rejects it with HTTP 400.
+   `callVisionChatCompletions`) via the `promptCacheRetentionBody` helper. Two
+   providers are excluded: the codex `/responses` builders deliberately omit the
+   field because the chatgpt.com backend rejects it with HTTP 400, and the
+   **azure** provider omits it because Azure's gpt-5.x deployments reject
+   `in_memory` with "This model is compatible only with 24h extended prompt
+   caching". Azure manages prompt caching at the resource level, so the helper
+   returns no field for it (see ADR azure-provider.md).
 
 2. **No active warming.** Provider-side prompt caching is automatic for
    prompts at or above the provider's minimum size, and the cache is refreshed
@@ -46,10 +51,11 @@ documented facts:
 
 Gini pins `prompt_cache_retention: "in_memory"` on the request body for the
 OpenAI-compatible providers (`openai`, `openrouter`, `deepseek`, `local`);
-`codex` omits the field because its ChatGPT backend rejects it (see the
-Decision above). Sending the field is not the same as the backend caching on
-it: only `openai` (via that pinned tier) and `codex` (via its own server-side
-prefix caching) are known to actually cache. On `openrouter`, `deepseek`, and
+`codex` and `azure` omit the field — codex because its ChatGPT backend rejects
+it, azure because its gpt-5.x deployments require the `24h` tier and 400 on
+`in_memory` (see the Decision above). Sending the field is not the same as the
+backend caching on it: only `openai` (via that pinned tier) and `codex` (via its
+own server-side prefix caching) are known to actually cache. On `openrouter`, `deepseek`, and
 `local` the field is an accept-but-ignore no-op, so the request shape
 guarantees no backend caching there. OpenRouter-routed Claude is a notable
 case: Anthropic's native caching keys on `cache_control` markers Gini does not
@@ -63,8 +69,10 @@ ZDR orgs**, but a non-ZDR org defaults to `24h`. Emitting `in_memory`
 explicitly keeps Gini traffic on the ZDR-aligned tier regardless of org
 posture, and prevents a future server-side default change from quietly
 promoting Gini to the extended-retention tier. On `openrouter`, `deepseek`,
-and `local` the field is an accept-but-ignore no-op; codex is the one
-exclusion because the backend 400s on it.
+and `local` the field is an accept-but-ignore no-op; `codex` and `azure` are
+the two exclusions — codex's backend 400s on it, and Azure's gpt-5.x
+deployments reject `in_memory` outright (they require the `24h` tier), so Azure
+is left to its resource-level caching.
 
 ### Why no active warmer
 
@@ -97,7 +105,9 @@ warmer was removed rather than reworked.
 ## Acceptance checks
 
 - Every OpenAI-compatible builder in `src/provider.ts` emits
-  `prompt_cache_retention: "in_memory"`; codex `/responses` builders do not.
+  `prompt_cache_retention: "in_memory"` via `promptCacheRetentionBody`, except
+  the two documented exclusions: codex `/responses` builders and the `azure`
+  provider both omit the field.
 - `prompt_cache_retention` is in `RESERVED_EXTRA_BODY_KEYS`.
 - No cache warmer / refresh loop runs in `src/server.ts`, and no
   `/api/settings/cache-warmer` endpoint, `gini cache-warmer` command,

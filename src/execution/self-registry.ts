@@ -133,7 +133,7 @@ async function getSelf(config: RuntimeConfig, taskId: string): Promise<string> {
 }
 
 async function listProviders(config: RuntimeConfig, taskId: string): Promise<string> {
-  const catalog = providerCatalogWithStatus(config.provider?.name);
+  const catalog = providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv, config.provider?.baseUrl);
   const providers = catalog.map((item) => ({
     id: item.id,
     name: item.name,
@@ -293,8 +293,15 @@ async function setProvider(
   }
   const payload: Record<string, unknown> = { provider: targetProvider };
   if (typeof args.model === "string" && args.model.trim().length > 0) payload.model = args.model.trim();
-  if (typeof args.baseUrl === "string" && args.baseUrl.trim().length > 0) payload.baseUrl = args.baseUrl.trim();
   if (typeof args.apiKey === "string" && args.apiKey.trim().length > 0) payload.apiKey = args.apiKey.trim();
+  // Transport fields pass through when PRESENT (even blank), so the agent can
+  // CLEAR them — matching the setup API's present-clears / absent-preserves
+  // rule. Omitting an arg entirely preserves the persisted value. For the azure
+  // provider these carry the resource endpoint + deployment routing.
+  if (typeof args.baseUrl === "string") payload.baseUrl = args.baseUrl.trim();
+  if (typeof args.apiVersion === "string") payload.apiVersion = args.apiVersion.trim();
+  if (typeof args.deployment === "string") payload.deployment = args.deployment.trim();
+  if (args.authScheme === "api-key" || args.authScheme === "bearer") payload.authScheme = args.authScheme;
   const result = await setSetupProvider(config, payload);
   appendTrace(config.instance, taskId, {
     type: "tool",
@@ -906,10 +913,13 @@ export const SELF_OPERATIONS: SelfOperation[] = [
       properties: {
         provider: {
           type: "string",
-          description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` are updated."
+          description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'azure', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` (and any Azure routing fields) are updated."
         },
         model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5'). Defaults to the provider's first catalog model when omitted." },
-        baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo." },
+        baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo. For the azure provider, set this to the resource endpoint (https://<resource>.openai.azure.com) — it is required." },
+        apiVersion: { type: "string", description: "Azure OpenAI api-version (e.g. '2024-10-21'). azure provider only; defaults to a GA value when omitted." },
+        deployment: { type: "string", description: "Azure OpenAI deployment name. Defaults to the model id when omitted. azure provider only." },
+        authScheme: { type: "string", enum: ["bearer", "api-key"], description: "Auth header style for the azure provider. 'api-key' (default) sends Azure's api-key header for a resource key; 'bearer' sends Authorization: Bearer for an Entra token." },
         apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env." }
       },
       required: []
@@ -1029,7 +1039,7 @@ export const SELF_OPERATIONS: SelfOperation[] = [
     schema: {
       type: "object",
       properties: {
-        provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek'). Codex and local cannot be removed here." }
+        provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek', 'azure'). Codex and local cannot be removed here." }
       },
       required: ["provider"]
     },

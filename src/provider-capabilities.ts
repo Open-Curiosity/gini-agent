@@ -82,6 +82,9 @@ export function resolveProviderContextWindowTokens(provider: ProviderConfig): nu
   switch (provider.name) {
     case "openai":
     case "codex":
+    // Azure hosts the same OpenAI models, so the context window follows the
+    // model family just like standard OpenAI.
+    case "azure":
       return openaiContextWindowTokens(model);
     case "openrouter":
       return openrouterContextWindowTokens(model);
@@ -122,6 +125,14 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
       // endpoint pointed at a text-only model) stays conservatively false.
       return OPENAI_NATIVE_FAMILY.test(model)
         ? { vision: true, nativeDocs: true }
+        : { vision: false, nativeDocs: false };
+    case "azure":
+      // Azure serves OpenAI models, so vision follows the same model family.
+      // But Azure's deployment-scoped chat/completions does NOT accept the
+      // `file` content part (its content schema is text/image/audio), so a
+      // native `document` part would 400 — keep nativeDocs false in Azure mode.
+      return OPENAI_NATIVE_FAMILY.test(model)
+        ? { vision: true, nativeDocs: false }
         : { vision: false, nativeDocs: false };
     case "openrouter":
       return openrouterModality(model);

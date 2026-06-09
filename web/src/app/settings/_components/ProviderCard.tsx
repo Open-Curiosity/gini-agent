@@ -13,6 +13,7 @@ import {
   Trash2Icon,
   ZapIcon
 } from "lucide-react";
+import type { ProviderConfig } from "@runtime/types";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -20,7 +21,7 @@ import {
   DialogDescription,
   DialogTitle
 } from "@/components/ui/dialog";
-import { DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
+import { AzureLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
 import { EditProviderDialog } from "./EditProviderDialog";
@@ -28,7 +29,12 @@ import { EditProviderDialog } from "./EditProviderDialog";
 // Providers whose credentials are env-keyed and therefore safe to remove
 // from this UI: scrubbing the env var + secrets.env line is reversible
 // (the user can add it back). Codex is owned by the codex CLI and local
-// has no key to clear, so neither row exposes the trash button.
+// has no key to clear, so neither row exposes the trash button. Azure is
+// excluded too: its row only renders while it is the active provider (it has
+// no default endpoint, so an inactive azure config isn't "configured"), and
+// the trash button is disabled for the active row — a permanently-dead
+// affordance. Azure is managed by switch + re-add via Add Provider; key
+// cleanup is the CLI `gini provider` path.
 const REMOVABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek"]);
 
 export interface ProviderCatalogItem {
@@ -58,7 +64,7 @@ export function displayProviderName(item: { displayName: string; name: string })
 // Providers selectable on the Settings page. Echo is dev-only; the four
 // real providers map onto the Pencil mock (Codex, OpenAI, DeepSeek, Ollama
 // stand in for `local`).
-const SELECTABLE_PROVIDERS = ["codex", "openai", "deepseek", "openrouter", "local"] as const;
+const SELECTABLE_PROVIDERS = ["codex", "openai", "deepseek", "openrouter", "azure", "local"] as const;
 
 // Per-provider visual identity. Brand logos for OpenAI/DeepSeek/Ollama
 // come from the authoritative Pencil design file; codex (Terminal) and
@@ -69,6 +75,7 @@ const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: 
   openai: { icon: OpenAILogo, authLabel: "API key" },
   deepseek: { icon: DeepSeekLogo, authLabel: "API key" },
   openrouter: { icon: ZapIcon, authLabel: "API key" },
+  azure: { icon: AzureLogo, authLabel: "API key" },
   local: { icon: OllamaLogo, authLabel: "Local" }
 };
 
@@ -80,11 +87,16 @@ interface SetProviderResult {
 export function ProviderCard({
   catalog,
   activeProviderName,
-  activeProviderModel
+  activeProviderModel,
+  activeProvider
 }: {
   catalog: ProviderCatalogItem[];
   activeProviderName?: string;
   activeProviderModel?: string;
+  // Full persisted config for the ACTIVE provider (from /status). Carries the
+  // transport fields the static catalog doesn't — baseUrl + Azure routing —
+  // so the Edit dialog can prefill them when editing the active row.
+  activeProvider?: ProviderConfig;
 }) {
   const invalidate = useInvalidate();
   const rows = SELECTABLE_PROVIDERS
@@ -342,6 +354,9 @@ export function ProviderCard({
           authLabel={PROVIDER_VISUAL[editingRow.name]?.authLabel ?? editingRow.auth}
           icon={PROVIDER_VISUAL[editingRow.name]?.icon ?? TerminalIcon}
           currentModel={editingRow.name === activeProviderName ? activeProviderModel : undefined}
+          // Prefill transport fields only when editing the ACTIVE row — the
+          // persisted config from /status describes the active provider only.
+          activeConfig={editingRow.name === activeProviderName ? activeProvider : undefined}
           open={Boolean(editingRow)}
           onOpenChange={(open) => {
             if (!open) setEditingRow(null);
