@@ -22,7 +22,12 @@ the session list:
   control tool to branch the current turn into a thread; a leading
   `<route>thread</route>` text directive is a silent fallback. A user
   reply posted into a thread always stays threaded — user context wins
-  over any routing signal.
+  over any routing signal. Because the turn opened in the main chat (its
+  `user_text` and a `Thinking` phase already landed there before the
+  branch), the switch closes that originating main-chat turn with a
+  terminal phase — the turn's work and its own terminal phase continue in
+  the thread, so the main chat's in-flight indicator never strands on
+  `Thinking`.
 - **Channels are job sessions surfaced as chats.** A recurring job's
   dedicated session is surfaced in the rail as a chattable channel
   (`kind:"channel"`, `origin:"job"`). It is a view over the existing
