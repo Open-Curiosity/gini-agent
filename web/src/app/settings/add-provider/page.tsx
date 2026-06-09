@@ -8,7 +8,6 @@ import { toast } from "sonner";
 import {
   ArrowLeftIcon,
   CheckIcon,
-  Cloud as CloudIcon,
   Terminal as TerminalIcon,
   ZapIcon
 } from "lucide-react";
@@ -16,7 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { AnthropicLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
+import { AnthropicLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { displayProviderName, type ProviderCatalogItem } from "../_components/ProviderCard";
 
@@ -28,7 +27,7 @@ const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: 
   codex: { icon: TerminalIcon, description: "OAuth via codex --login" },
   openai: { icon: OpenAILogo, description: "GPT-5.4, GPT-5.4 mini, …" },
   anthropic: { icon: AnthropicLogo, description: "Claude (first-party API key)" },
-  bedrock: { icon: CloudIcon, description: "Claude, Nova, Llama… on AWS" },
+  bedrock: { icon: BedrockLogo, description: "Claude, Nova, Llama… on AWS" },
   openrouter: { icon: ZapIcon, description: "Multi-model router" },
   deepseek: { icon: DeepSeekLogo, description: "DeepSeek V4 family" },
   local: { icon: OllamaLogo, description: "Ollama, LM Studio, vLLM" }

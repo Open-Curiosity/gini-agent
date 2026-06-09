@@ -7,7 +7,6 @@ import { toast } from "sonner";
 import {
   ArrowLeftRightIcon,
   CheckIcon,
-  Cloud as CloudIcon,
   PencilIcon,
   PlusIcon,
   Terminal as TerminalIcon,
@@ -21,7 +20,7 @@ import {
   DialogDescription,
   DialogTitle
 } from "@/components/ui/dialog";
-import { AnthropicLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
+import { AnthropicLogo, BedrockLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
 import { EditProviderDialog } from "./EditProviderDialog";
@@ -70,7 +69,7 @@ const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: 
   codex: { icon: TerminalIcon, authLabel: "OAuth" },
   openai: { icon: OpenAILogo, authLabel: "API key" },
   anthropic: { icon: AnthropicLogo, authLabel: "API key" },
-  bedrock: { icon: CloudIcon, authLabel: "AWS" },
+  bedrock: { icon: BedrockLogo, authLabel: "AWS" },
   deepseek: { icon: DeepSeekLogo, authLabel: "API key" },
   openrouter: { icon: ZapIcon, authLabel: "API key" },
   local: { icon: OllamaLogo, authLabel: "Local" }
