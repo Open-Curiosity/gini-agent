@@ -207,6 +207,63 @@ describe("shared backing job lifecycle", () => {
     expect(new Set(watches(config).map((w) => w.watcherId))).toEqual(new Set([w1.id, w2.id]));
   });
 
+  test("concurrent adds provision EXACTLY one shared job + one session", async () => {
+    const config = buildConfig("ew-job-concurrent-add");
+    // Two adds from independent entrypoints racing the same find-then-create:
+    // without the per-agent provisioning lock both observe "no shared job" and
+    // create a duplicate job + session.
+    const [w1, w2] = await Promise.all([
+      addEmailWatcher(config, { sender: "mallory@x.com" }),
+      addEmailWatcher(config, { sender: "trent@x.com" })
+    ]);
+    const jobs = readState(config.instance).jobs.filter(
+      (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+    );
+    expect(jobs).toHaveLength(1);
+    const sessions = readState(config.instance).chatSessions.filter((s) => s.title === "Email watch");
+    expect(sessions).toHaveLength(1);
+    // Both watchers point at the one shared job + session.
+    expect(w1.jobId).toBe(jobs[0]!.id);
+    expect(w2.jobId).toBe(jobs[0]!.id);
+    expect(w1.chatSessionId).toBe(sessions[0]!.id);
+    expect(w2.chatSessionId).toBe(sessions[0]!.id);
+    // Both senders are in the shared watch list.
+    expect(new Set(watches(config).map((w) => w.watcherId))).toEqual(new Set([w1.id, w2.id]));
+  });
+
+  test("startup backfill racing an incoming add yields ONE shared job + session", async () => {
+    const config = buildConfig("ew-job-backfill-vs-add");
+    // Seed a legacy watcher with no shared job (pre-consolidation), the state the
+    // un-awaited startup backfill reconciles. A fresh add fires concurrently from
+    // a different entrypoint — both must converge on the one shared job.
+    const legacy = await addEmailWatcher(config, { sender: "peggy@x.com" });
+    await mutateState(config.instance, (state) => {
+      state.jobs = state.jobs.filter(
+        (j) => (j.preRunHook?.config as { skill?: string })?.skill !== "gmail-watch"
+      );
+      // Drop the now-orphaned shared session too so the only "Email watch"
+      // session counted below is the one provisioning recreates.
+      state.chatSessions = state.chatSessions.filter((s) => s.title !== "Email watch");
+      for (const w of state.emailWatchers) {
+        w.jobId = "stale-job-id";
+        w.chatSessionId = "stale-session-id";
+      }
+    });
+    const [, added] = await Promise.all([
+      backfillEmailWatcherJobs(config),
+      addEmailWatcher(config, { sender: "victor@x.com" })
+    ]);
+    const jobs = readState(config.instance).jobs.filter(
+      (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+    );
+    expect(jobs).toHaveLength(1);
+    const sessions = readState(config.instance).chatSessions.filter((s) => s.title === "Email watch");
+    expect(sessions).toHaveLength(1);
+    // Both the legacy and the freshly-added watcher end up on the one shared job.
+    expect(getEmailWatcher(config, legacy.id)?.jobId).toBe(jobs[0]!.id);
+    expect(getEmailWatcher(config, added.id)?.jobId).toBe(jobs[0]!.id);
+  });
+
   test("backfill is idempotent: an existing shared job is reconciled, not duplicated", async () => {
     const config = buildConfig("ew-job-backfill-idempotent");
     await addEmailWatcher(config, { sender: "grace@x.com" });
