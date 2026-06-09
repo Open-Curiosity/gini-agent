@@ -120,14 +120,14 @@ an effect, so the generic command path never carries credentials at all.
   `resolveSkillEnv` directly for one named skill, not re-implement an
   aggregate "all active skills" env or a by-name terminal resolver.
 
-- **Follow-up (not done here):** a fresh `gws auth login` performed
-  without a local `client_secret.json` needs
-  `GOOGLE_WORKSPACE_CLI_CLIENT_ID` / `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`
-  in the spawn env. That setup step needs scoped connector env, so it
-  should ship as a `skill_run` script in the `google-workspace-setup`
-  skill (declaring the two env vars and the `google-workspace-oauth`
-  credential) so it gets scoped env through the trusted-bytes path.
-  Tracked as a follow-up issue; this ADR does not implement it.
+- A fresh `gws auth login` performed without a local `client_secret.json`
+  needs `GOOGLE_WORKSPACE_CLI_CLIENT_ID` / `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`
+  in the spawn env. That login step needs scoped connector env, so it ships
+  as the `google-account-login` skill's `scripts/account-login.ts`, invoked
+  via `skill_run` (the skill declares the two env vars and the
+  `google-workspace-oauth` credential), getting scoped env through the
+  trusted-bytes path. See ADR `google-multi-account.md` for why the login is
+  a dedicated skill rather than folded into `google-workspace-setup`.
 
 ### Audited surfaces
 
