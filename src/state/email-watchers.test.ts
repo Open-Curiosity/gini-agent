@@ -6,16 +6,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RuntimeConfig } from "../types";
 import "../hooks/builtins"; // populates the registry so createScheduledJob resolves isKnownHook("skill-script")
+import { createScheduledJob } from "../jobs";
 import {
   addEmailWatcher,
   backfillEmailWatcherJobs,
   buildWatcherQuery,
   closeAllMemoryDbs,
+  createChatSession,
   getEmailWatcher,
   listEmailWatchers,
   mutateState,
   readState,
   removeEmailWatcher,
+  renameChatSession,
   setEmailWatcherEnabled,
   updateEmailWatcher
 } from ".";
@@ -324,6 +327,71 @@ describe("shared backing job lifecycle", () => {
     expect(sharedJob(config)).toBeDefined();
     expect(reenabled?.jobId).toBe(sharedJob(config)!.id);
     expect(watches(config).map((w) => w.watcherId)).toEqual([watcher.id]);
+  });
+
+  test("backfill self-heals adopted titles + orphan jobs/sessions from old->new transitions", async () => {
+    const config = buildConfig("ew-job-backfill-heal");
+    // Real consolidated state: one shared job + session, two watchers on it.
+    const w1 = await addEmailWatcher(config, { sender: "alice@x.com" });
+    const w2 = await addEmailWatcher(config, { sender: "bob@x.com" });
+    const sharedJobId = w1.jobId!;
+    const sharedSessionId = w1.chatSessionId!;
+    expect(w2.jobId).toBe(sharedJobId);
+
+    // An ORPHAN duplicate gmail-watch job (watches:[]) with its own session — the
+    // residue of a pre-atomicity-fix race.
+    const orphanSession = await mutateState(config.instance, (state) =>
+      createChatSession(state, "Email watch: stale@x.com", undefined, undefined, "job", "channel")
+    );
+    const orphanJob = await createScheduledJob(config, {
+      name: "Email watch",
+      prompt: "stale",
+      intervalSeconds: 60,
+      chatSessionId: orphanSession.id,
+      preRunHook: { handlerId: "skill-script", config: { skill: "gmail-watch", script: "detect", watches: [] } }
+    });
+    expect(orphanJob.id).not.toBe(sharedJobId);
+
+    // The shared session was ADOPTED from an old per-sender session and never
+    // renamed, plus a truly-orphan "Email watch: <sender>" channel referenced by
+    // nothing (its job was already removed out-of-band).
+    const trulyOrphanChannel = await mutateState(config.instance, (state) => {
+      renameChatSession(state, sharedSessionId, "Email watch: alice@x.com");
+      return createChatSession(state, "Email watch: bob@x.com", undefined, undefined, "job", "channel");
+    });
+
+    await backfillEmailWatcherJobs(config);
+
+    const state = readState(config.instance);
+    // Exactly ONE gmail-watch job: the shared one; the orphan duplicate is gone.
+    const gmailJobs = state.jobs.filter(
+      (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+    );
+    expect(gmailJobs).toHaveLength(1);
+    expect(gmailJobs[0]!.id).toBe(sharedJobId);
+    // Exactly ONE email-watch session, titled exactly "Email watch" (adopted
+    // title renamed); the orphan job's session + the truly-orphan channel swept.
+    const emailSessions = state.chatSessions.filter(
+      (s) => s.title === "Email watch" || /^Email watch:/.test(s.title)
+    );
+    expect(emailSessions).toHaveLength(1);
+    expect(emailSessions[0]!.id).toBe(sharedSessionId);
+    expect(emailSessions[0]!.title).toBe("Email watch");
+    expect(state.chatSessions.some((s) => s.id === orphanSession.id)).toBe(false);
+    expect(state.chatSessions.some((s) => s.id === trulyOrphanChannel.id)).toBe(false);
+    // Watchers still point at the shared job + session.
+    expect(getEmailWatcher(config, w1.id)?.jobId).toBe(sharedJobId);
+    expect(getEmailWatcher(config, w2.id)?.jobId).toBe(sharedJobId);
+    expect(getEmailWatcher(config, w1.id)?.chatSessionId).toBe(sharedSessionId);
+
+    // A second run is a no-op (idempotent): nothing left to heal.
+    const jobsBefore = state.jobs.length;
+    const sessionsBefore = state.chatSessions.length;
+    await backfillEmailWatcherJobs(config);
+    const after = readState(config.instance);
+    expect(after.jobs).toHaveLength(jobsBefore);
+    expect(after.chatSessions).toHaveLength(sessionsBefore);
+    expect(after.chatSessions.filter((s) => /^Email watch/.test(s.title))).toHaveLength(1);
   });
 });
 
