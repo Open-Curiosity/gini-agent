@@ -77,6 +77,26 @@ function openrouterContextWindowTokens(model: string): number {
   return FALLBACK_CONTEXT_WINDOW_TOKENS;
 }
 
+// First-party Anthropic Messages API: the Claude family serves a 200K-token
+// context window. An unrecognized id stays conservative on the fallback.
+function anthropicContextWindowTokens(model: string): number {
+  if (/claude/.test(normalizeModel(model))) return 200_000;
+  return FALLBACK_CONTEXT_WINDOW_TOKENS;
+}
+
+// Bedrock model ids are cross-region inference profiles, e.g.
+// "us.anthropic.claude-opus-4-8" or "us.amazon.nova-pro-v1:0". Key off the
+// provider+family segment so each family gets its real window; unknown ids
+// (other Bedrock families we don't enumerate) keep the conservative fallback.
+function bedrockContextWindowTokens(model: string): number {
+  const slug = normalizeModel(model);
+  if (/anthropic\.claude/.test(slug)) return 200_000;
+  if (/amazon\.nova-premier/.test(slug)) return 1_000_000;
+  if (/amazon\.nova-(pro|lite)/.test(slug)) return 300_000;
+  if (/amazon\.nova-micro/.test(slug)) return 128_000;
+  return FALLBACK_CONTEXT_WINDOW_TOKENS;
+}
+
 export function resolveProviderContextWindowTokens(provider: ProviderConfig): number {
   const model = provider.model ?? "";
   switch (provider.name) {
@@ -90,6 +110,10 @@ export function resolveProviderContextWindowTokens(provider: ProviderConfig): nu
       return openrouterContextWindowTokens(model);
     case "deepseek":
       return deepseekContextWindowTokens(model);
+    case "anthropic":
+      return anthropicContextWindowTokens(model);
+    case "bedrock":
+      return bedrockContextWindowTokens(model);
     case "local":
     case "echo":
       return FALLBACK_CONTEXT_WINDOW_TOKENS;

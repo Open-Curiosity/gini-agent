@@ -153,6 +153,19 @@ describe("resolveProviderContextWindowTokens", () => {
     expect(resolveProviderContextWindowTokens(provider("openrouter", "google/gemini-2.5-pro"))).toBe(1_000_000);
   });
 
+  test("anthropic + bedrock map to real per-model windows, not the 32K fallback", () => {
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-opus-4-8"))).toBe(200_000);
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "claude-sonnet-4-6"))).toBe(200_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.anthropic.claude-opus-4-8"))).toBe(200_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.amazon.nova-premier-v1:0"))).toBe(1_000_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.amazon.nova-pro-v1:0"))).toBe(300_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "eu.amazon.nova-lite-v1:0"))).toBe(300_000);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.amazon.nova-micro-v1:0"))).toBe(128_000);
+    // Unrecognized families on each provider stay conservative.
+    expect(resolveProviderContextWindowTokens(provider("anthropic", "mystery-model"))).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
+    expect(resolveProviderContextWindowTokens(provider("bedrock", "us.meta.llama3-3-70b-instruct-v1:0"))).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
+  });
+
   test("unknown, local, echo, and openrouter auto fall back conservatively", () => {
     expect(resolveProviderContextWindowTokens(provider("openai", "llama-3-70b"))).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
     expect(resolveProviderContextWindowTokens(provider("local", "local/default"))).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
