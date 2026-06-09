@@ -67,9 +67,13 @@ function servicesFromScopes(scopes: string[]): Record<GwsService, boolean> {
 // Any parse failure / non-object output yields the not-installed shape, so a
 // garbled CLI is treated the same as a missing one (we can't trust it).
 export function parseGwsAuthStatus(stdout: string): GwsSessionStatus {
+  // gws can prefix its JSON with a non-JSON preamble (keyring notice, etc.) on
+  // stdout; slice from the first "{" so a preamble doesn't degrade a live
+  // session to installed:false. Pure JSON input still starts at index 0.
+  const start = stdout.indexOf("{");
   let parsed: unknown;
   try {
-    parsed = JSON.parse(stdout);
+    parsed = JSON.parse(start >= 0 ? stdout.slice(start) : stdout);
   } catch {
     return notInstalled();
   }
@@ -186,6 +190,13 @@ async function runGwsAuthStatus(configDir?: string): Promise<GwsSessionStatus> {
   } catch {
     return notInstalled();
   }
+}
+
+// Drop one config dir's cached status so the next read re-spawns `gws auth
+// status`. Called after a register/remove changes a dir's session, so a freshly
+// signed-in (or removed) dir isn't served a stale entry from before the change.
+export function invalidateGwsSessionDir(configDir: string): void {
+  cachedByDir.delete(configDir);
 }
 
 // Test seam: drop both caches so a unit test can assert fresh behavior.

@@ -78,10 +78,13 @@ function isGoogleAccount(value: unknown): value is GoogleAccount {
 // Atomic registry write: mkdir -p root, write a temp file in the same dir, then
 // rename over the target so a reader never sees a half-written file. Mode 0600,
 // re-chmod after the rename in case the target pre-existed more permissively
-// (writeFileSync's mode only applies on creation — mirrors secrets-env.ts).
+// (writeFileSync's mode only applies on creation — mirrors secrets-env.ts). The
+// root is forced to 0700 (re-chmod for the same pre-existing-dir reason): it
+// holds each account's per-dir OAuth tokens, so it must not be world-readable.
 export function writeGoogleAccounts(accounts: GoogleAccount[]): void {
   const root = googleAccountsRoot();
-  mkdirSync(root, { recursive: true });
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  try { chmodSync(root, 0o700); } catch { /* best-effort tightening */ }
   const path = googleAccountsRegistryPath();
   const tmp = join(root, `accounts.json.${process.pid}.${Date.now()}.tmp`);
   const body = JSON.stringify({ version: REGISTRY_VERSION, accounts }, null, 2) + "\n";

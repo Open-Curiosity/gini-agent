@@ -39,7 +39,11 @@ This is the **exact first-time sequence** (Step 0 short-circuits the re-auth cas
 
 Before anything else, call `list_connectors` and look for a connector named `google-workspace-oauth`.
 
-- **It exists** → the OAuth client is already provisioned and only the user's `gws` session expired. This is a **re-auth**, not setup. Ask once ("Your Google sign-in expired — want me to sign you back in?") and on yes go **straight to Step 6**, which now signs in by calling `skill_run google-account-login` with the relevant account's tag (re-use that account's tag and, when re-authing the default-dir session, pass `adopt: true`). Then run Step 8 (smoke test). Do **not** run `gcloud`, create a project, or call `request_connector` — provisioning already happened and none of it is needed again. (Edge case: if `gws` is not on `$PATH`, run Step 2's install first, then Step 6. If login fails with `invalid_client`, the stored client is broken — fall through to the full first-time flow to re-provision it.)
+- **It exists** → the OAuth client is already provisioned and only the user's `gws` session expired. This is a **re-auth**, not setup. Ask once ("Your Google sign-in expired — want me to sign you back in?") and on yes go **straight to Step 6**, which now signs in by calling `skill_run google-account-login` for the relevant account. Re-auth **re-uses the expired account's existing config dir** so it keeps its id and tag — pass that account's `configDir` (and its `tag`), NOT a fresh login (which would mint a duplicate) and NOT `adopt: true` (which skips login and only works on an already-valid session):
+  - A **tagged account** (from the "Connected Google accounts" block) whose session expired → `skill_run google-account-login` with `{ tag: "<that account's tag>", configDir: "<that account's configDir from the block>" }`.
+  - The **default-dir session** (`~/.config/gws`) that has EXPIRED → `{ tag: "<its tag>", configDir: "~/.config/gws" }` (non-adopt, so it actually re-logs in).
+
+  Then run Step 8 (smoke test). Do **not** run `gcloud`, create a project, or call `request_connector` — provisioning already happened and none of it is needed again. (Edge case: if `gws` is not on `$PATH`, run Step 2's install first, then Step 6. If login fails with `invalid_client`, the stored client is broken — fall through to the full first-time flow to re-provision it.)
 - **It does not exist** → true first-time setup. Continue to Step 1.
 
 ## Step 1 — Confirm setup
@@ -297,7 +301,7 @@ This signs the second account into its own config dir and registers it alongside
 
 ## Adopting the existing sign-in
 
-If `~/.config/gws` already has a signed-in session (e.g. from a pre-existing `gws` setup) and you just want to register it as a tagged account WITHOUT a fresh login, call `skill_run google-account-login` with `adopt: true`:
+Use `adopt: true` ONLY to IMPORT an already-**valid** `~/.config/gws` session as a tagged account without a fresh login — e.g. the user had a pre-existing `gws` setup and you just want it on the account list. It never opens the browser, never touches `~/.config/gws`'s tokens, and **fails if that dir's session is not currently live**.
 
 ```text
 skill_run {
@@ -307,7 +311,7 @@ skill_run {
 }
 ```
 
-This records the default-dir session in place — it never opens the browser and never touches `~/.config/gws`'s tokens. It fails if that dir has no live session.
+Do NOT use `adopt: true` to fix an **expired** default-dir session — adopt skips login, so it can't re-auth. To re-log-in the default dir, pass `configDir: "~/.config/gws"` (non-adopt) per Step 0's re-auth path. Rule of thumb: `adopt` = import a valid session; `configDir` = re-auth / target a specific existing dir with a real login.
 
 ## Step 7 — Stop the per-call approval prompt (optional)
 

@@ -98,6 +98,11 @@ resource, not as instance state:
 - **No per-instance secrets leak in.** The connector creds stay per-instance
   encrypted; only the config-dir *paths* and tags are machine-global. The
   tokens in each config dir are `gws`'s, exactly as before.
+- **Lockless last-writer-wins.** Registry mutations read-modify-write without a
+  lock (matching `src/state/secrets-env.ts`); a concurrent add/remove across
+  instances can drop the loser's change. This is acceptable for the low-frequency,
+  operator-driven account churn here, and the atomic temp+rename guarantees no
+  reader ever sees a corrupt file.
 
 ### Selection / "ask when unclear" policy
 

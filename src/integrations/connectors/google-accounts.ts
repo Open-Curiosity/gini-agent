@@ -23,7 +23,7 @@ import {
   retagGoogleAccount
 } from "../../state/google-accounts";
 import { now } from "../../state/ids";
-import { gwsSessionStatusForDir, type GwsSessionStatus } from "./gws-session";
+import { gwsSessionStatusForDir, invalidateGwsSessionDir, type GwsSessionStatus } from "./gws-session";
 
 type StatusFetcher = (configDir: string) => Promise<GwsSessionStatus>;
 
@@ -91,6 +91,9 @@ export async function registerAccount(
     addedAt: existing?.addedAt ?? now()
   };
   addGoogleAccount(account);
+  // A fresh login just changed this dir's session; drop any cached status so the
+  // next listAccountsWithStatus reads the new state instead of a stale entry.
+  invalidateGwsSessionDir(input.configDir);
   return account;
 }
 
@@ -103,6 +106,8 @@ export function removeAccount(accountId: string): void {
   const account = getGoogleAccount(accountId);
   removeGoogleAccount(accountId);
   if (!account) return;
+  // Drop the removed dir's cached status so a later list doesn't resurrect it.
+  invalidateGwsSessionDir(account.configDir);
   const managedDir = configDirForAccount(accountId);
   if (account.configDir === managedDir && account.configDir.startsWith(googleAccountsRoot())) {
     try { rmSync(account.configDir, { recursive: true, force: true }); } catch { /* best-effort */ }

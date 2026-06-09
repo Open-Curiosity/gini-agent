@@ -49,6 +49,11 @@ interface LoginArgs {
   readonly?: boolean;
   scopes?: string[];
   adopt?: boolean;
+  // Target an EXISTING config dir instead of minting a new one — used to
+  // re-auth an account whose session expired (re-using its tag). Pass the
+  // account's stored configDir (or "~/.config/gws" to re-log-in the default-dir
+  // session). Ignored when adopt is true; when omitted a new dir is minted.
+  configDir?: string;
 }
 
 // ── Pure helpers (unit-tested) ───────────────────────────────────────────────
@@ -78,6 +83,15 @@ export function buildLoginArgs(opts: {
     args.push("-s", services.join(","));
   }
   return args;
+}
+
+// Expand a leading "~" / "~/" to the home dir so a caller-supplied configDir
+// like "~/.config/gws" resolves to a real path. Absolute or other paths pass
+// through unchanged.
+export function expandHome(path: string, home: string): string {
+  if (path === "~") return home;
+  if (path.startsWith("~/")) return join(home, path.slice(2));
+  return path;
 }
 
 // ── gws subprocess boundary ──────────────────────────────────────────────────
@@ -140,9 +154,20 @@ async function runLogin(
     if (await exitedWithin(proc, URL_POLL_INTERVAL_MS)) break;
   }
   if (!url) {
+    // The poll ended with no URL — either gws exited first or the deadline
+    // elapsed. Stop the (already-dead-or-wedged) child, drain its remaining
+    // output, then RE-SCRAPE: a late flush can land the URL after the last poll
+    // tick, especially on the early-exit path. Only if it's still absent do we
+    // surface the real failure — gws's last line carries invalid_client /
+    // redirect_uri mismatch / scope errors the SKILL keys on — instead of the
+    // generic "never printed" message. When a URL did flush late but gws has
+    // already exited, the `code !== 0` check below returns that same error line.
     try { proc.kill(); } catch { /* already exited */ }
     await draining;
-    return { ok: false, error: "gws never printed the consent URL" };
+    url = extractConsentUrl(output);
+    if (!url) {
+      return { ok: false, error: lastMeaningfulLine(output) || "gws never printed the consent URL" };
+    }
   }
 
   openInBrowser(url, env);
@@ -224,6 +249,7 @@ async function login(args: LoginArgs): Promise<Record<string, unknown>> {
   const env = { ...process.env } as Record<string, string>;
 
   const adopt = args.adopt === true;
+  const targetDir = typeof args.configDir === "string" ? args.configDir.trim() : "";
   let configDir: string;
   if (adopt) {
     // Adopt the pre-existing default-dir session in place — no re-login.
@@ -232,6 +258,15 @@ async function login(args: LoginArgs): Promise<Record<string, unknown>> {
     if (status?.token_valid !== true) {
       return { ok: false, error: "No signed-in Google session in the default gws config dir to adopt." };
     }
+  } else if (targetDir) {
+    // Re-auth / target an existing dir: run the login dance into the dir the
+    // caller named instead of minting a new one, so re-registering reuses the
+    // same id (and tag). mkdir is a no-op when the dir already exists.
+    configDir = expandHome(targetDir, home);
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    const loginArgs = buildLoginArgs({ services: args.services, readonly: args.readonly, scopes: args.scopes });
+    const result = await runLogin(loginArgs, configDir, env);
+    if (!result.ok) return { ok: false, error: result.error };
   } else {
     // Mint a gini-managed config dir and run the browser OAuth login into it.
     const id = "gacct_" + crypto.randomUUID().slice(0, 8);

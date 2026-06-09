@@ -41,6 +41,7 @@ The script mints a gini-managed config dir under `~/.gini/google-accounts/<id>`,
 - `services` (string[], optional) — `gws` service names to request. Defaults to all seven: `["drive","gmail","calendar","docs","sheets","meet","forms"]`.
 - `readonly` (boolean, optional) — request read-only scopes for the chosen services.
 - `scopes` (string[], optional) — explicit full scope URLs; overrides `services`. Use only when the user names a specific scope shape `-s` can't express (e.g. full Gmail `https://mail.google.com/`).
+- `configDir` (string, optional) — run the login into a **specific existing** config dir instead of minting a new one. Use it to **re-auth** an account whose session expired: pass that account's stored `configDir` (or `"~/.config/gws"` for the default-dir session) so the account keeps its id and tag. When omitted, a new gini-managed dir is minted. Ignored when `adopt: true`.
 - `adopt` (boolean, optional) — register the **already-signed-in** session in the default config dir (`~/.config/gws`) without a fresh login. No browser opens; fails if that dir has no live session.
 
 ## Result (stdout JSON)

@@ -68,6 +68,13 @@ describe("google account registry", () => {
     expect(mode).toBe(0o600);
   });
 
+  // Mode bits are only meaningful on POSIX platforms; skip on Windows.
+  test.skipIf(process.platform === "win32")("root dir is 0700 (holds per-account token dirs)", () => {
+    addGoogleAccount(account());
+    const mode = statSync(googleAccountsRoot()).mode & 0o777;
+    expect(mode).toBe(0o700);
+  });
+
   test("retag renames an existing account", () => {
     const a = account({ tag: "personal" });
     addGoogleAccount(a);
