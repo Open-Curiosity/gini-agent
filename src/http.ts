@@ -102,7 +102,6 @@ import { isLoopbackHost, isRelayHost, webBoundRequestAllowed } from "./lib/origi
 import { cookieValue, serializeCookie } from "./lib/cookies";
 import { RateLimiter } from "./lib/rate-limit";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
-import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, getOrCreateAgentChat, listChatSessions, renameChat, submitChatMessage, submitThreadReply, syncChatTaskResult } from "./execution/chat";
 import { sttStatus } from "./stt";
@@ -114,6 +113,9 @@ import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
 import { projectRoot } from "./paths";
 import { readDocSection } from "./docs";
+import { isLogStream, readLogTail } from "./state/logs";
+import { redactLogTail } from "./runtime/log-redaction";
+import { readSecretsEnvBody } from "./state/secrets-env";
 import { clearWebTargetCache, resolveWebPort } from "./web-target";
 import { basename } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
@@ -1088,6 +1090,22 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(agentId ? events.filter((event) => event.agentId === agentId) : events);
     }],
     ["GET", /^\/api\/events\/stream$/, (request) => eventStream(config, request)],
+    // Instance log tail for the in-app Logs viewer (ADR logs-viewing.md).
+    // Raw by default (the gateway is loopback + bearer-gated and the operator
+    // already has filesystem access); `redact=true` reuses crash-report
+    // redaction so a copy is safe to attach to a report.
+    ["GET", /^\/api\/logs$/, (request) => {
+      const url = new URL(request.url);
+      const stream = url.searchParams.get("stream") ?? "runtime";
+      if (!isLogStream(stream)) return json({ error: `Unknown log stream: ${stream}` }, 400);
+      const rawLimit = Number(url.searchParams.get("limit") ?? 500);
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 5000) : 500;
+      const redactParam = url.searchParams.get("redact");
+      const redact = redactParam === "true" || redactParam === "1";
+      const tail = readLogTail(config.instance, stream, limit);
+      const out = redact ? redactLogTail(tail, { secretsEnvBody: readSecretsEnvBody() }) : tail;
+      return json({ ...out, redacted: redact });
+    }],
     // Hindsight phase 6: one-time migration trigger.
     ["POST", /^\/api\/memory\/migrate$/, async () => {
       const report = await migrateLegacyMemories(config);
@@ -1620,7 +1638,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const chatId = parseChatIdStrict(payload.chatId);
       return json(await rejectPendingChat(config, params[0], chatId));
     }],
-    ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalogWithStatus(config.provider?.name))],
+    ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv, config.provider?.baseUrl))],
     // Browser-driven onboarding endpoints. The webapp's /setup route polls
     // /api/setup/status to decide whether to render the form, and POSTs
     // /api/setup/provider to set credentials. The runtime writes
@@ -1638,17 +1656,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const payload = await body(request);
       const providerName = typeof payload.provider === "string" ? payload.provider : "";
       const result = removeSetupProvider(config, providerName);
-      return json(result, result.ok ? 200 : 400);
-    }],
-    // Cache warmer: model-agnostic, single-integer-of-state knob. GET
-    // returns the persisted minutes (0 = disabled), POST validates and
-    // saves. The runtime loop in src/server.ts reads `config.cacheWarmerMinutes`
-    // every tick, so a POST takes effect on the next loop iteration
-    // without needing a restart or any pub/sub plumbing.
-    ["GET", /^\/api\/settings\/cache-warmer$/, () => json(getCacheWarmer(config))],
-    ["POST", /^\/api\/settings\/cache-warmer$/, async (request) => {
-      const payload = await body(request);
-      const result = setCacheWarmer(config, payload);
       return json(result, result.ok ? 200 : 400);
     }],
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],

@@ -292,6 +292,23 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Read-only clock. CORE and always-on (never deferred): "what time is it"
+    // must never fail because a toolset is off, and unlike terminal `date` this
+    // carries no approval/audit weight (terminal_exec is high-risk → gated). The
+    // system prefix already states today's DATE at day granularity (cache-stable);
+    // this tool supplies the precise wall-clock TIME on demand, which can't live
+    // in the cached prefix because it changes every minute. See ADR
+    // stable-system-prefix.md.
+    toolset: "core",
+    displayLabel: "Current time",
+    type: "function",
+    function: {
+      name: "get_current_time",
+      description: "Return the current wall-clock date and time (local timezone, plus UTC). Read-only, no side effects. Use whenever you need the exact current time — answering 'what time is it', computing a relative time like 'in 30 minutes', or timestamping something. The system prompt already gives today's date; call this for the precise time of day.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
     toolset: "browser",
     displayLabel: "Open page",
     type: "function",
@@ -1217,6 +1234,76 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Agent-database primitive (ADR agent-database.md): the agent's own
+    // sandboxed SQLite DB for keeping and exhaustively querying structured
+    // records. db_query is the read side — exact, complete results, the
+    // opposite of ranked top-K recall.
+    toolset: "database",
+    displayLabel: "Query database",
+    type: "function",
+    function: {
+      name: "db_query",
+      description: "Run a read-only SQL query (SELECT / WITH) against YOUR per-agent database and get back every matching row. This is your tool for EXHAUSTIVE, exact questions over structured records you've stored — 'how many / list all X where …', counts, GROUP BY, JOINs. Use it instead of recall_memory whenever completeness matters (recall is a fuzzy top-K sample and will undercount). Returns up to a row cap with a `truncated` flag — use COUNT(*) / LIMIT / OFFSET to page large sets. Use parameter placeholders (?) with `params` for any values. Call db_schema first if you don't know what tables exist.",
+      parameters: {
+        type: "object",
+        properties: {
+          sql: { type: "string", description: "A single read-only statement (SELECT or WITH …)." },
+          params: { type: "array", description: "Values bound to ? placeholders, in order.", items: {} }
+        },
+        required: ["sql"]
+      }
+    }
+  },
+  {
+    // Write side of the agent database: DDL + DML. One statement per call.
+    toolset: "database",
+    displayLabel: "Run SQL",
+    type: "function",
+    function: {
+      name: "db_execute",
+      description: "Run a single write/DDL statement (CREATE TABLE, ALTER, DROP, INSERT, UPDATE, DELETE) against YOUR per-agent database. Use this to set up tables for things the user wants tracked as structured records and to add or change rows. One statement per call; use parameter placeholders (?) with `params` for values. For loading a whole CSV/XLSX file, use db_import instead of many INSERTs. The database is private to you and isolated from Gini's system data.",
+      parameters: {
+        type: "object",
+        properties: {
+          sql: { type: "string", description: "A single SQL statement (DDL or DML)." },
+          params: { type: "array", description: "Values bound to ? placeholders, in order.", items: {} }
+        },
+        required: ["sql"]
+      }
+    }
+  },
+  {
+    // Bulk tabular import: file → table, deterministic, one row per record.
+    toolset: "database",
+    displayLabel: "Import table",
+    type: "function",
+    function: {
+      name: "db_import",
+      description: "Load a CSV or XLSX file from your workspace into a table in your per-agent database — one file row becomes one table row, deterministically (no truncation, no summarizing). Columns are derived from the file's header row, stored as TEXT; leading non-table preamble lines (e.g. an export's notes) are skipped automatically (or pin the header with skipLines). Use this whenever the user gives you a spreadsheet/export to remember and query (contacts, transactions, a roster, …). After importing, inspect with db_schema and query with db_query; reshape with db_execute if you want typed/renamed columns.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Workspace-relative path to the CSV/XLSX file (shown in the attachment note)." },
+          table: { type: "string", description: "Destination table name (created if absent)." },
+          skipLines: { type: "number", description: "Optional 0-based index of the header row, to skip preamble lines explicitly." },
+          recreate: { type: "boolean", description: "Drop the table first if it already exists (default false → append)." }
+        },
+        required: ["path", "table"]
+      }
+    }
+  },
+  {
+    // Introspection so the agent can recall what it's already tracking.
+    toolset: "database",
+    displayLabel: "Database schema",
+    type: "function",
+    function: {
+      name: "db_schema",
+      description: "List the tables in your per-agent database with their columns and row counts. Call this to see what you're already tracking before querying or creating tables.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
     // Manually trigger an existing scheduled job. Wraps the same
     // `runJobNow` entrypoint that `POST /api/jobs/<id>/run` calls. Low-risk
     // / no approval: the spawned task itself still flows through the job's
@@ -1378,14 +1465,13 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
-    toolset: "self",
+    toolset: "skills",
     displayLabel: "List skills",
-    deferred: true,
-    indexSummary: "Installed skills with id, name, category, status, and trigger phrase. Filter by status or nameContains.",
+    indexSummary: "Installed skills with id, name, category, status, trigger phrase, and script names. Filter by status or nameContains.",
     type: "function",
     function: {
       name: "list_skills",
-      description: "List installed skills with id, name, category, status, and trigger phrase. Read-only. Filter by `status` or `nameContains`.",
+      description: "List installed skills with id, name, category, status, trigger phrase, and script names. Read-only. Filter by `status` or `nameContains`.",
       parameters: {
         type: "object",
         properties: {
@@ -1438,10 +1524,13 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         properties: {
           provider: {
             type: "string",
-            description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` are updated."
+            description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'azure', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` (and any Azure routing fields) are updated."
           },
           model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5'). Defaults to the provider's first catalog model when omitted." },
-          baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo." },
+          baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo. For the azure provider, set this to the resource endpoint (https://<resource>.openai.azure.com) — it is required." },
+          apiVersion: { type: "string", description: "Azure OpenAI api-version (e.g. '2024-10-21'). azure provider only; defaults to a GA value when omitted." },
+          deployment: { type: "string", description: "Azure OpenAI deployment name. Defaults to the model id when omitted. azure provider only." },
+          authScheme: { type: "string", enum: ["bearer", "api-key"], description: "Auth header style for the azure provider. 'api-key' (default) sends Azure's api-key header for a resource key; 'bearer' sends Authorization: Bearer for an Entra token." },
           apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env." }
         },
         required: []
@@ -1606,7 +1695,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
       parameters: {
         type: "object",
         properties: {
-          provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek')." }
+          provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek', 'azure')." }
         },
         required: ["provider"]
       }
@@ -1810,7 +1899,7 @@ export function allTools(): ToolCatalogTool[] {
 // names). When set, it intersects with the enabled-toolset filter — a tool
 // passes only if its owning toolset is BOTH globally enabled AND in the
 // agent's whitelist. Always-on tools bypass both filters: web_fetch,
-// read_skill, spawn_subagent, the scheduled-job surface (create_job,
+// list_skills, read_skill, spawn_subagent, the scheduled-job surface (create_job,
 // list_jobs, update_job, delete_job, run_job), mcp_call, request_connector,
 // and the core agent-capability meta-tools that have no separate toolset
 // to gate them (cancel_task — sibling to spawn_subagent; install_skill /
@@ -1831,10 +1920,16 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // deferred; the agent needs it on every turn to branch multi-turn work
     // into a thread regardless of which toolsets are enabled.
     if (tool.function.name === "start_thread") return true;
+    // get_current_time is the always-on read-only clock. Like load_tools /
+    // start_thread it lives on `core` (not a legacy default toolset); the model
+    // must be able to answer "what time is it" on any instance regardless of
+    // which toolsets are enabled, and it has no side effects to gate.
+    if (tool.function.name === "get_current_time") return true;
     // Always expose read_skill so the model can load any enabled skill the
     // system prompt advertises. The "skills" toolset isn't part of the
     // legacy default toolsets; gating it on enable would mean a fresh
     // instance can't follow its own skill prompt without a toolset toggle.
+    if (tool.function.name === "list_skills") return true;
     if (tool.function.name === "read_skill") return true;
     // Always expose spawn_subagent. Like read_skill it's a runtime
     // capability not tied to a legacy default toolset row, and gating it
@@ -1946,9 +2041,9 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (tool.function.name === "edit_soul") return true;
     if (tool.function.name === "edit_user_profile") return true;
     // Self-knowledge surface. The self-config / introspection tools
-    // (get_self, the list_* readers, and the mutate ops like set_provider /
-    // use_agent / set_approval_mode) are direct deferred tools on the "self"
-    // toolset, which is not a legacy default;
+    // (get_self, self-list readers other than always-on list_skills, and the
+    // mutate ops like set_provider / use_agent / set_approval_mode) are direct
+    // deferred tools on the "self" toolset, which is not a legacy default;
     // gating on enable would mean a fresh instance couldn't answer "what
     // model are you using" or "switch to deepseek" — the exact asks the
     // surface exists for. They pass gating here; deferral (applied later by
@@ -2265,6 +2360,13 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.query));
     case "recall_memory":
       return truncatePreview(previewValue(safe.query));
+    case "db_query":
+    case "db_execute":
+      return truncatePreview(previewValue(safe.sql));
+    case "db_import":
+      return truncatePreview(`${previewValue(safe.path)} → ${previewValue(safe.table)}`);
+    case "db_schema":
+      return "";
     case "add_memory":
       return truncatePreview(previewValue(safe.content));
     case "update_memory":

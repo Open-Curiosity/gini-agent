@@ -44,17 +44,83 @@ The model rests on four pieces:
   the gateway (`/api/status`, where any HTTP response — including a 401 —
   proves the process is answering) and the web child
   (`/api/runtime/__healthz`, verified to be *our* `gini-web` on the
-  matching instance), and `launchctl kickstart -k`s whichever is dead or
-  hung. This covers the two gaps pure KeepAlive cannot: a
-  hung-but-alive process (KeepAlive only reacts to exit) and a clean exit
-  that launchd defers respawning (observed on macOS 26, where auto-respawn
-  after a SIGKILL frequently pends indefinitely).
+  matching instance), and revives whichever is down: a service launchd
+  still has registered is `launchctl kickstart -k`ed, while a *core*
+  service launchd has **deregistered** is re-bootstrapped via `autostart
+  enable` (kickstart is a no-op on a label launchd no longer knows, and
+  KeepAlive can't respawn a service that isn't registered). This covers the
+  three gaps pure KeepAlive cannot: a hung-but-alive process (KeepAlive only
+  reacts to exit); a clean exit that launchd defers respawning (observed on
+  macOS 26, where auto-respawn after a SIGKILL frequently pends
+  indefinitely); and a deregistered service — e.g. a plist reload whose
+  `bootout` succeeded but whose `bootstrap` lost the launchd I/O-error race —
+  which would otherwise stay down with nothing to revive it. Re-bootstrap
+  only fires under launchd supervision, so a manual foreground `gini
+  watchdog` never creates plists.
+
+Installed plists are reconciled to the current template on startup, so a
+runtime version update propagates supervision-template changes to *existing*
+installs, not just fresh ones. Each generated plist carries a
+`GINI_PLIST_STAMP` in its `EnvironmentVariables` — a short hash over only the
+stable, supervision-critical subset (kind, `Label`, `ProgramArguments`,
+`WorkingDirectory`, the scheduling shape, `ProcessType`, and the
+`GINI_SUPERVISOR`/`GINI_INSTANCE`/`PORT`/`GINI_DIST_DIR` env values). PATH,
+secret values, `HOME`, `SHELL`, the state/log roots, and the stdout/err paths
+are deliberately excluded because they vary legitimately between machines and
+between the shell-merge/no-merge paths — hashing them would cause a
+false-positive reconcile loop. At gateway startup
+`reconcileAutostartPlistOnStartup` (`src/runtime/autostart-reconcile.ts`)
+compares the stamp the current code would generate against the stamp baked into
+each on-disk plist (gateway/web/watchdog). When everything matches it is a
+silent no-op; it is also skipped entirely when no managed gateway plist exists
+(foreground / `gini run` / conductor). On drift it schedules a detached `gini
+autostart enable` — which regenerates the plist files AND reloads them
+(bootout+bootstrap) — whose `bootout` terminates this gateway and re-bootstraps
+it from the regenerated plist. It never self-SIGTERMs or exits — under
+always-respawn KeepAlive a clean exit would be respawned and race the detached
+enable, so letting the child's bootout do the killing avoids that race. The
+reload is **deferred by a stabilization delay** (`RECONCILE_RELOAD_DELAY_MS`)
+rather than dispatched the instant drift is seen, because a startup reconcile
+most often runs right after a self-update respawned this gateway while a client
+(the web UpdateReminder) polls `/api/status` for the new SHA. Dispatching
+immediately would bootout the gateway mid-poll — the client would surface a
+"hasn't reported back" prompt — and a bootout+bootstrap against a service
+launchd only just respawned can fail with an I/O error and deregister it. The
+delay comfortably exceeds the client's poll window, so the gateway stays
+reachable to report the new SHA and launchd settles, then the reload runs as a
+single race-free operation. The deferral timer is in-process and unref'd: if the
+gateway is replaced before it fires, the timer dies with the process and the
+next gateway start re-schedules, so the reload only fires once the gateway has
+been stable for the full delay. The
+reconcile deliberately does NOT pre-write the on-disk plist: writing disk alone
+does not reload launchd (it keeps the def it loaded until a bootout+bootstrap),
+and stamping the file before that reload actually happened would mask drift — a
+matching stamp on the next boot — even if the relaunch had failed. Leaving the
+file untouched keeps a failed relaunch's stamp mismatched, so the reconcile
+re-fires on the next gateway (re)start until the reload truly succeeds. The
+deterministic stamp guarantees convergence (after a successful reconcile the
+on-disk plist equals what the code generates, so the next boot no-ops), and a
+once-per-process latch backs that up.
+
+The reload itself never double-binds the port. `enable` awaits
+`waitForPortFree` (`src/cli/process.ts`) on a port-binding kind's port after a
+successful `bootout` and before the `bootstrap` retry — closing the window
+where `launchctl bootout` returns (the unload was *accepted*) but the old
+process hasn't yet released its socket. This makes every reload caller safe,
+including the detached reconcile/refresh relaunch racing KeepAlive's own
+respawn. The watchdog binds nothing, so it skips the wait.
 
 Auto-update no longer orphans the runtime. For a launchd instance,
 `scheduleRuntimeRestart` (`src/runtime/update.ts`) self-SIGTERMs after the
 update has already run `git reset --hard` + `bun install` synchronously;
 the server's SIGTERM handler drains and exits 0, and KeepAlive respawns
-the gateway with the freshly checked-out code. A detached
+the gateway with the freshly checked-out code. The drain is bounded so the
+restart's downtime window stays short: in-flight responses get a brief grace
+(`SERVER_DRAIN_GRACE_MS`) to finish writing, then the server force-closes —
+idle keep-alive connections would otherwise never let the graceful
+`server.stop(false)` resolve — and every background loop interrupts its
+inter-tick sleep on shutdown instead of sleeping out its full interval (up to
+60s for the connector re-probe). A detached
 `gini autostart kick --kind web` re-execs the web service so any new `web/`
 dependencies take effect. Foreground keeps the existing detached
 stop+start helper because there is no KeepAlive to respawn it. See
@@ -136,4 +202,20 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   the gateway down it `kickstart -k`s the gateway; with web down it
   `kickstart -k`s web (and queues a web crash report for consent-gated
   filing — see the crash ADR).
+- Every generated plist's `EnvironmentVariables` carries a `GINI_PLIST_STAMP`.
+  The stamp is identical for two plists that differ only in PATH, a secret
+  value, `HOME`, `SHELL`, the state/log roots, or the stdout/err paths, and it
+  changes when a supervision-critical field changes (the `GINI_SUPERVISOR`
+  marker, a `ProgramArgument`, the `WorkingDirectory`, or the KeepAlive-vs-
+  periodic scheduling shape).
+- On startup, an instance with a managed gateway plist whose stamps all match
+  the current template takes no reconcile action; an instance with a missing or
+  mismatched stamp dispatches a detached `gini autostart enable` exactly once
+  per process and leaves the on-disk plist untouched (that enable regenerates +
+  reloads it, so a failed relaunch keeps the drift detectable for the next
+  start); an instance with no managed gateway plist is skipped entirely.
+- `gini autostart enable` awaits the port becoming free after a `bootout` of
+  the gateway/web before re-bootstrapping, so a reload (including the
+  detached reconcile/refresh relaunch) never hits EADDRINUSE; the watchdog
+  reload performs no port-free wait.
 - `bun run typecheck`, `bun run test`, and `bun run gini smoke` pass.

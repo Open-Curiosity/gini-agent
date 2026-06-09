@@ -58,12 +58,10 @@ import { id, now } from "./ids";
 // ensureColumn calls. The (session_id, thread_id, ordinal) index covers
 // thread playback; the existing UNIQUE(session_id, ordinal) is untouched.
 //
-// Version 10 was the email-watch `email_seen` dedup store. Email-watch now
-// holds its detection cursor + dedup on the backing JobRecord.hookState
-// (see ADR email-watch.md), so the table is no longer created or used.
-// Version 11: bumped because the v10 schema SHAPE changed when the email_seen
-// table creation was removed (a cleaner signal than silently leaving it at 10).
-export const MEMORY_SCHEMA_VERSION = 11;
+// The agent-database primitive (ADR agent-database.md) intentionally lives in a
+// SEPARATE per-agent SQLite file (src/state/agent-data-db.ts), NOT here — so the
+// agent's own SQL can never reach memory.db. This DB stays Gini-system-only.
+export const MEMORY_SCHEMA_VERSION = 9;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by

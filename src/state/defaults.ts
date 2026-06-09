@@ -92,6 +92,22 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
       updatedAt: at
     },
     {
+      id: "toolset_database",
+      instance,
+      name: "database",
+      description: "The agent's own sandboxed SQL database for keeping and exhaustively querying structured records (db_query/db_execute/db_import/db_schema). Distinct from memory recall — SQL returns every matching row, not a ranked sample. Skills layer use-cases (people-CRM, expense log, …) on top.",
+      status: "enabled",
+      toolNames: [
+        "db.query",
+        "db.execute",
+        "db.import",
+        "db.schema"
+      ],
+      scopes: ["task", "job", "skill", "subagent"],
+      createdAt: at,
+      updatedAt: at
+    },
+    {
       id: "toolset_browser",
       instance,
       name: "browser",
@@ -164,7 +180,8 @@ export const DEFAULT_AGENT_TOOLSETS: readonly string[] = [
   "messaging",
   "mcp",
   "browser",
-  "web_search"
+  "web_search",
+  "database"
 ];
 
 export function defaultAgent(instance: Instance, at: string): AgentRecord {

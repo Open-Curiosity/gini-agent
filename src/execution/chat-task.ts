@@ -38,7 +38,12 @@ import {
   type ToolCall
 } from "../provider";
 import { uploadDataUrl, uploadStat, sanitizeFilename, readUpload } from "../state/uploads";
-import { resolveProviderModality, type ProviderModality } from "../provider-capabilities";
+import {
+  resolveDefaultPriorContextTokenBudget,
+  resolveProviderContextWindowTokens,
+  resolveProviderModality,
+  type ProviderModality
+} from "../provider-capabilities";
 import { materializeUpload } from "../capabilities/attachments-materialize-core";
 import { classifyFormat, extractText } from "../capabilities/attachment-extract";
 import {
@@ -46,6 +51,8 @@ import {
   USER_SOFT_CAP_CHARS,
   buildAgentSystemContext,
   buildBoundJobsBlock,
+  buildCurrentDateBlock,
+  resolveLocalTimeZone,
   decideIdentityEmission,
   identityBudgetState,
   renderEphemeralContext,
@@ -59,6 +66,7 @@ import type {
   IdentitySnapshotRecord,
   JobRecord,
   PendingToolCall,
+  ProviderConfig,
   RuntimeConfig,
   RuntimeState,
   SkillRecord,
@@ -102,6 +110,13 @@ import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider, providerForCredentialName } from "../integrations/connectors/registry";
 import { resolveEffectiveContext } from "./effective-context";
+import {
+  estimateTextTokens,
+  estimateToolCallingMessagesTokens,
+  packPriorContext,
+  type ContextReplayMessage,
+  type PriorContextPackResult
+} from "./context-window";
 
 // Default safety cap on chat-task loop iterations. Each iteration is one
 // model call (followed by zero or more tool dispatches). Most tasks finish
@@ -109,6 +124,10 @@ import { resolveEffectiveContext } from "./effective-context";
 // to be a meaningful budget for normal work. Power users can override this
 // per-instance via `config.agent.maxIterations` in `~/.gini/instances/<inst>/config.json`.
 const MAX_LOOP_ITERATIONS = 90;
+const PRIOR_CONTEXT_RESPONSE_RESERVE_FRACTION = 0.05;
+const MIN_PRIOR_CONTEXT_RESPONSE_RESERVE_TOKENS = 1_024;
+const MAX_INLINE_SKILL_ROWS = 40;
+const MAX_INLINE_SKILL_SCRIPT_ROWS = 40;
 
 // Loop-breaker: how many consecutive iterations of the IDENTICAL tool call(s)
 // yielding the IDENTICAL result(s) we tolerate before deciding the model is
@@ -130,6 +149,66 @@ function resolveIterationCap(config: RuntimeConfig): { cap: number; warnReason?:
     };
   }
   return { cap: raw };
+}
+
+function resolvePriorContextBudget(
+  config: RuntimeConfig,
+  provider: ProviderConfig,
+  nonPriorContextTokens: number
+): {
+  budget: number;
+  defaultBudget: number;
+  requestedBudget: number;
+  availableBudget: number;
+  contextWindowTokens: number;
+  responseReserveTokens: number;
+  nonPriorContextTokens: number;
+  warnReason?: string;
+  clampReason?: string;
+} {
+  const contextWindowTokens = resolveProviderContextWindowTokens(provider);
+  const defaultBudget = resolveDefaultPriorContextTokenBudget(provider);
+  const responseReserveTokens = Math.max(
+    MIN_PRIOR_CONTEXT_RESPONSE_RESERVE_TOKENS,
+    Math.floor(contextWindowTokens * PRIOR_CONTEXT_RESPONSE_RESERVE_FRACTION)
+  );
+  const availableBudget = Math.max(0, contextWindowTokens - nonPriorContextTokens - responseReserveTokens);
+  const raw = config.agent?.priorContextTokens;
+  if (raw === undefined) {
+    return {
+      budget: Math.min(defaultBudget, availableBudget),
+      defaultBudget,
+      requestedBudget: defaultBudget,
+      availableBudget,
+      contextWindowTokens,
+      responseReserveTokens,
+      nonPriorContextTokens
+    };
+  }
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) {
+    return {
+      budget: Math.min(defaultBudget, availableBudget),
+      defaultBudget,
+      requestedBudget: defaultBudget,
+      availableBudget,
+      contextWindowTokens,
+      responseReserveTokens,
+      nonPriorContextTokens,
+      warnReason: `agent.priorContextTokens must be a positive integer; got ${JSON.stringify(raw)}. Using default ${defaultBudget}.`
+    };
+  }
+  return {
+    budget: Math.min(raw, availableBudget),
+    defaultBudget,
+    requestedBudget: raw,
+    availableBudget,
+    contextWindowTokens,
+    responseReserveTokens,
+    nonPriorContextTokens,
+    ...(raw > availableBudget
+      ? { clampReason: `agent.priorContextTokens (${raw}) exceeds available provider context after current prompt reserve (${availableBudget}); clamping.` }
+      : {})
+  };
 }
 
 // Add an incremental cost record (from a single model call) into a running
@@ -427,7 +506,15 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const alreadyLoaded = new Set<string>(task.loadedTools ?? []);
   if (subagent) seedSubagentDeferred(deferredCatalog, subagent, alreadyLoaded);
   const deferredBlock = buildDeferredToolsBlock(deferredToolIndex(deferredCatalog, alreadyLoaded));
-  const sections = [baseSystem];
+  // Stamp today's date (date granularity, local timezone) into the byte-stable
+  // system prefix. Date-only keeps message 0 byte-identical across turns within
+  // a calendar day so the prefix cache stays warm; precise time lives in the
+  // get_current_time tool. Covers subagents too (they share this sections array).
+  // See ADR stable-system-prefix.md.
+  const sections = [
+    baseSystem,
+    buildCurrentDateBlock(new Date(), resolveLocalTimeZone())
+  ];
   if (skillsBlock) sections.push(skillsBlock);
   if (inactiveSkillsBlock) sections.push(inactiveSkillsBlock);
   if (mcpServersBlock) sections.push(mcpServersBlock);
@@ -440,9 +527,44 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // the prior-transcript rebuild and the live user message deliver files the
   // same way (native doc vs extracted-text vs path-only).
   const modality = resolveProviderModality(effectiveForAgent.provider);
+  const ephemeralContext = subagent ? "" : renderEphemeralContext(identityBlock, recalledContext);
+  const currentUserMessage = await buildUserMessage(config, task, modality);
+  const nonPriorMessages: ToolCallingMessage[] = [
+    { role: "system", content: systemContext },
+    ...(ephemeralContext.length > 0 ? [{ role: "user" as const, content: ephemeralContext }] : []),
+    currentUserMessage
+  ];
+  const liveTools = toProviderTools(applyDeferralFilter(deferredCatalog, alreadyLoaded));
+  const toolSchemaTokens = estimateTextTokens(JSON.stringify(liveTools));
+  const nonPriorContextTokens = estimateToolCallingMessagesTokens(nonPriorMessages) + toolSchemaTokens;
   // Conversation history: include prior turns from the same chat session so
-  // the model has multi-turn context (the legacy single-shot path didn't).
-  const prior = await priorChatMessages(config, task, modality);
+  // the model has multi-turn context. Full history stays durable; the replay
+  // tail is packed under a soft token budget so a single agent chat can grow
+  // indefinitely without forcing every turn to carry the whole transcript.
+  const priorBudget = resolvePriorContextBudget(config, effectiveForAgent.provider, nonPriorContextTokens);
+  if (priorBudget.warnReason) {
+    appendTrace(config.instance, taskId, {
+      type: "warning",
+      message: "Invalid agent.priorContextTokens config; using default.",
+      data: { reason: priorBudget.warnReason, defaultBudget: priorBudget.defaultBudget }
+    });
+  }
+  if (priorBudget.clampReason) {
+    appendTrace(config.instance, taskId, {
+      type: "warning",
+      message: "agent.priorContextTokens exceeds available provider context; clamping.",
+      data: {
+        reason: priorBudget.clampReason,
+        requestedBudget: priorBudget.requestedBudget,
+        availableBudget: priorBudget.availableBudget,
+        providerContextWindowTokens: priorBudget.contextWindowTokens,
+        nonPriorContextTokens: priorBudget.nonPriorContextTokens,
+        responseReserveTokens: priorBudget.responseReserveTokens
+      }
+    });
+  }
+  const priorPack = await priorChatMessages(config, task, modality, priorBudget.budget);
+  const prior = priorPack.messages;
   // Ephemeral per-turn context: the emitted identity block and recalled
   // memory ride in a role:"user" message placed after the full prior
   // transcript and immediately before the real user message — so the
@@ -453,18 +575,31 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // override prompt. role:"user" (not system) because codex hoists every
   // system message into its top-level instructions, which would re-merge
   // this content back into the cached prefix. See ADR stable-system-prefix.md.
-  const ephemeralContext = subagent ? "" : renderEphemeralContext(identityBlock, recalledContext);
   const messages: ToolCallingMessage[] = [
     { role: "system", content: systemContext },
     ...prior,
     ...(ephemeralContext.length > 0 ? [{ role: "user" as const, content: ephemeralContext }] : []),
-    await buildUserMessage(config, task, modality)
+    currentUserMessage
   ];
 
   appendTrace(config.instance, taskId, {
     type: "model",
     message: "chat-task system context built",
-    data: { hindsightUnitsRecalled, priorMessages: prior.length }
+    data: {
+      hindsightUnitsRecalled,
+      priorMessages: prior.length,
+      priorMessagesOmitted: priorPack.omittedMessages,
+      priorContextTokensRetained: priorPack.retainedTokens,
+      priorContextTokensOmitted: priorPack.omittedTokens,
+      priorContextTokenBudget: priorBudget.budget,
+      priorContextTokenDefault: priorBudget.defaultBudget,
+      priorContextTokenRequested: priorBudget.requestedBudget,
+      priorContextTokenAvailable: priorBudget.availableBudget,
+      providerContextWindowTokens: priorBudget.contextWindowTokens,
+      nonPriorContextTokens: priorBudget.nonPriorContextTokens,
+      toolSchemaTokens,
+      responseReserveTokens: priorBudget.responseReserveTokens
+    }
   });
 
   return runLoop(config, taskId, messages, 0, pendingIdentitySnapshot, effectiveForAgent);
@@ -572,6 +707,8 @@ function persistTranscriptRow(
       taskId,
       runId: item?.runId,
       kind: "tool_transcript",
+      ...(item?.threadId ? { threadId: item.threadId } : {}),
+      ...(item?.parentBlockId ? { parentBlockId: item.parentBlockId } : {}),
       ...(row.toolCalls ? { toolCalls: row.toolCalls } : {}),
       ...(row.toolCallId ? { toolCallId: row.toolCallId } : {})
     });
@@ -588,11 +725,14 @@ function persistTranscriptRow(
 async function priorChatMessages(
   config: RuntimeConfig,
   task: Task,
-  modality: ProviderModality
-): Promise<ToolCallingMessage[]> {
+  modality: ProviderModality,
+  tokenBudget: number
+): Promise<PriorContextPackResult> {
   const state = readState(config.instance);
   const sessionId = resolveChatSessionId(state, task);
-  if (!sessionId) return [];
+  if (!sessionId) {
+    return packPriorContext([], { tokenBudget, activeThreadId: task.threadId });
+  }
   const stored = state.chatMessages
     .filter((m) => m.sessionId === sessionId && m.taskId !== task.id)
     .sort((a, b) => {
@@ -605,30 +745,42 @@ async function priorChatMessages(
   // and role:"tool" result rows become tool-calling messages; plain
   // user/assistant text rows keep their legacy shape (vision content for
   // user images).
-  const mapped: (ToolCallingMessage & { __toolCallIds?: string[] })[] = [];
+  const mapped: Array<ContextReplayMessage & { toolCallIds?: string[] }> = [];
   for (const m of stored) {
     if (m.role === "tool" && m.kind === "tool_transcript") {
-      mapped.push({ role: "tool", content: m.content, tool_call_id: m.toolCallId });
+      mapped.push({
+        message: { role: "tool", content: m.content, tool_call_id: m.toolCallId },
+        ...(m.threadId ? { threadId: m.threadId } : {})
+      });
       continue;
     }
     if (m.role === "assistant" && m.kind === "tool_transcript") {
       const toolCalls = m.toolCalls ?? [];
       mapped.push({
-        role: "assistant",
-        content: m.content.length > 0 ? m.content : null,
-        tool_calls: toolCalls as ToolCall[],
-        __toolCallIds: toolCalls.map((c) => c.id)
+        message: {
+          role: "assistant",
+          content: m.content.length > 0 ? m.content : null,
+          tool_calls: toolCalls as ToolCall[]
+        },
+        toolCallIds: toolCalls.map((c) => c.id),
+        ...(m.threadId ? { threadId: m.threadId } : {})
       });
       continue;
     }
     if (m.role === "user" || m.role === "assistant") {
       if (m.role === "user" && m.images && m.images.length > 0) {
         mapped.push({
-          role: "user",
-          content: await buildAttachmentContent(config, m.content, m.images, modality, false)
+          message: {
+            role: "user",
+            content: await buildAttachmentContent(config, m.content, m.images, modality, false)
+          },
+          ...(m.threadId ? { threadId: m.threadId } : {})
         });
       } else {
-        mapped.push({ role: m.role, content: m.content });
+        mapped.push({
+          message: { role: m.role, content: m.content },
+          ...(m.threadId ? { threadId: m.threadId } : {})
+        });
       }
     }
   }
@@ -650,33 +802,32 @@ async function priorChatMessages(
   // turn) stay isolated and each pairs with its own result. Drop orphan tool
   // rows, and drop any assistant tool_calls row missing one of its paired
   // results — so replay can never produce a provider 400.
-  const paired: ToolCallingMessage[] = [];
+  const paired: ContextReplayMessage[] = [];
   for (let i = 0; i < mapped.length; i++) {
     const msg = mapped[i]!;
-    if (msg.role === "tool") continue; // emitted alongside its assistant below
-    if (msg.role === "assistant" && msg.__toolCallIds) {
-      const ids = msg.__toolCallIds;
+    if (msg.message.role === "tool") continue; // emitted alongside its assistant below
+    if (msg.message.role === "assistant" && msg.toolCallIds) {
+      const ids = msg.toolCallIds;
       // Collect the tool result rows in this assistant row's turn window.
-      const resultsInWindow = new Map<string, ToolCallingMessage>();
+      const resultsInWindow = new Map<string, ContextReplayMessage>();
       for (let j = i + 1; j < mapped.length; j++) {
         const next = mapped[j]!;
-        if (next.role === "user") break; // turn boundary
-        if (next.role === "assistant" && next.__toolCallIds) break; // next tool round
-        if (next.role !== "tool") continue; // skip approval_reason / plain assistant text
-        if (typeof next.tool_call_id === "string") {
-          resultsInWindow.set(next.tool_call_id, next);
+        if (next.message.role === "user") break; // turn boundary
+        if (next.message.role === "assistant" && next.toolCallIds) break; // next tool round
+        if (next.message.role !== "tool") continue; // skip approval_reason / plain assistant text
+        if (typeof next.message.tool_call_id === "string") {
+          resultsInWindow.set(next.message.tool_call_id, next);
         }
       }
       const results = ids.map((id) => resultsInWindow.get(id));
       if (ids.length === 0 || results.some((r) => r === undefined)) continue; // drop unpaired turn
-      const { __toolCallIds, ...assistant } = msg;
-      paired.push(assistant);
-      for (const result of results) paired.push(result as ToolCallingMessage);
+      paired.push({ message: msg.message, ...(msg.threadId ? { threadId: msg.threadId } : {}) });
+      for (const result of results) paired.push(result as ContextReplayMessage);
       continue;
     }
     paired.push(msg);
   }
-  return paired;
+  return packPriorContext(paired, { tokenBudget, activeThreadId: task.threadId });
 }
 
 // Build the latest user-turn message. When the task carries image refs the
@@ -934,7 +1085,7 @@ function filterSkillsForSubagent(skills: SkillRecord[], subagent: SubagentRecord
 // frontmatter description; the model uses the read_skill tool to fetch
 // the full body when it actually needs the instructions. This keeps the
 // resident system prompt small even when many skills are registered.
-function buildEnabledSkillsBlock(skills: SkillRecord[]): string {
+export function buildEnabledSkillsBlock(skills: SkillRecord[]): string {
   const enabled = skills.filter((s) => s.status === "enabled");
   if (enabled.length === 0) return "";
   // Dedupe by name, preferring bundled records over user records when both
@@ -960,9 +1111,14 @@ function buildEnabledSkillsBlock(skills: SkillRecord[]): string {
       const desc = s.description.trim() || "(no description)";
       return `- ${s.name}: ${desc}`;
     });
+  const shown = lines.slice(0, MAX_INLINE_SKILL_ROWS);
+  const hidden = lines.length - shown.length;
   return [
-    "Available skills (call read_skill with the skill name to load full instructions):",
-    ...lines
+    "Available skills (call list_skills to search the full registry; call read_skill with a skill name to load full instructions):",
+    ...shown,
+    ...(hidden > 0
+      ? [`- ${hidden} more skill${hidden === 1 ? "" : "s"} not shown; call list_skills with nameContains/status filters to find them.`]
+      : [])
   ].join("\n");
 }
 
@@ -1132,9 +1288,14 @@ export function buildMcpServersBlock(state: RuntimeState): string {
 export function buildSkillScriptsBlock(state: RuntimeState, visibleSkillNames: Set<string>): string {
   const entries = listEnabledSkillScripts(state).filter((e) => visibleSkillNames.has(e.skill));
   if (entries.length === 0) return "";
+  const shown = entries.slice(0, MAX_INLINE_SKILL_SCRIPT_ROWS);
+  const hidden = entries.length - shown.length;
   return [
-    "Skill scripts (invoke with skill_run, never re-implement in terminal_exec):",
-    ...entries.map((e) => `- ${e.skill}: ${e.scripts.join(", ")}`)
+    "Skill scripts (invoke with skill_run, never re-implement in terminal_exec; call list_skills/read_skill for omitted skills):",
+    ...shown.map((e) => `- ${e.skill}: ${e.scripts.join(", ")}`),
+    ...(hidden > 0
+      ? [`- ${hidden} more skill script entr${hidden === 1 ? "y" : "ies"} not shown; call list_skills to find the skill, then read_skill for script usage.`]
+      : [])
   ].join("\n");
 }
 

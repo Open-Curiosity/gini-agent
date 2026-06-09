@@ -828,11 +828,14 @@ describe("discord poller supervisor", () => {
   });
 
   test("gateway-pushed MESSAGE_CREATE for a delivery-target channel collapses the next poll sleep", async () => {
-    // Configure the poller with a pollIntervalMs comfortably longer than
-    // the success threshold below so the test doesn't accidentally pass by
-    // simply waiting out the periodic tick. With pollIntervalMs=1000ms the
-    // gateway-driven re-poll must land in under 500ms — well short of the
-    // periodic tick — proving the push drove the re-poll, not the timer.
+    // Configure the poller with a pollIntervalMs far longer than the
+    // success ceiling below so the periodic tick physically cannot fire
+    // inside the assertion window. With pollIntervalMs=10000ms the only
+    // thing that can grow sendCalls within a couple of seconds is the
+    // gateway-driven wake — proving the push drove the re-poll, not the
+    // timer. The wall-clock ceiling stays well below the tick but is set
+    // high enough to absorb event-loop starvation on a loaded CI runner
+    // (the wake fires instantly; a starved loop only inflates elapsed).
     const config = testConfig("disc-push-wake");
     const { client, enqueue, sendCalls } = programmableClient();
     setMessagingDeps({ discordClientFactory: () => client });
@@ -847,7 +850,7 @@ describe("discord poller supervisor", () => {
     const supervisor = createDiscordPollerSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: capturingGateway(slot),
-      pollIntervalMs: 1000,
+      pollIntervalMs: 10000,
       typingRefreshMs: 20
     });
 
@@ -860,8 +863,8 @@ describe("discord poller supervisor", () => {
       "first-contact watermark seed"
     );
 
-    // Queue the real inbound, then fire the gateway push. The poller
-    // is currently mid-sleep (5s); the wake must collapse it.
+    // Queue the real inbound, then fire the gateway push. The poller is
+    // currently mid-sleep (10s); the wake must collapse it.
     enqueue("chan-1", [
       makeMessage({ id: "500", content: "pushed", author: { id: "user-1", username: "lo", bot: false } })
     ]);
@@ -869,9 +872,10 @@ describe("discord poller supervisor", () => {
     slot.fire?.({ channelId: "chan-1" });
     await waitFor(() => sendCalls.length >= 1, "reply dispatched after gateway-pushed wake");
     const elapsed = Date.now() - wakeStart;
-    // Must be well under the 1000ms periodic tick so the pass can only be
-    // attributed to the gateway push collapsing the sleep, not the timer.
-    expect(elapsed).toBeLessThan(500);
+    // Must land far short of the 10000ms periodic tick so the pass can
+    // only be attributed to the gateway push collapsing the sleep, not
+    // the timer firing.
+    expect(elapsed).toBeLessThan(2000);
 
     await supervisor.stopAll();
   });

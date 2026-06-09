@@ -1043,7 +1043,11 @@ const HISTORICAL_DEFAULT_AGENT_TOOLSETS: ReadonlyArray<ReadonlyArray<string>> = 
   // Post-browser, pre-web_search. Lets instances created after `browser`
   // but before `web_search` recognize the default as uncustomized and
   // union in `web_search`.
-  ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp", "browser"]
+  ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp", "browser"],
+  // Post-web_search, pre-database. Lets instances created after `web_search`
+  // but before the `database` toolset recognize the default as uncustomized
+  // and union in `database`.
+  ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp", "browser", "web_search"]
 ];
 
 function migrateDefaultAgentToolsets(state: RuntimeState, instance: Instance): void {

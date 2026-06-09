@@ -76,6 +76,18 @@ export type {
   UpdateBankInput
 } from "./memory-db";
 export {
+  getAgentDataDb,
+  agentDataDbPath,
+  closeAgentDataDb,
+  closeAllAgentDataDbs,
+  dbQuery,
+  dbExecute,
+  dbListTables,
+  AgentDataError,
+  MAX_RESULT_ROWS
+} from "./agent-data-db";
+export type { QueryResult, ExecuteResult, TableInfo } from "./agent-data-db";
+export {
   storeUpload,
   readUpload,
   uploadDataUrl,

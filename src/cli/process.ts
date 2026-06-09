@@ -133,12 +133,24 @@ function readRecordedPort(path: string): number | null {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+// Read the recorded port from the on-disk file by instance NAME, without
+// materializing a RuntimeConfig. The config-based readers below delegate
+// here; callers that only have the instance name (e.g. `autostart enable`,
+// which deliberately never loads config) use these directly.
+export function recordedRuntimePortForInstance(instance: string): number | null {
+  return readRecordedPort(runtimePortPath(instance));
+}
+
+export function recordedWebPortForInstance(instance: string): number | null {
+  return readRecordedPort(webPortPath(instance));
+}
+
 export function recordedRuntimePort(config: RuntimeConfig): number | null {
-  return readRecordedPort(runtimePortPath(config.instance));
+  return recordedRuntimePortForInstance(config.instance);
 }
 
 export function recordedWebPort(config: RuntimeConfig): number | null {
-  return readRecordedPort(webPortPath(config.instance));
+  return recordedWebPortForInstance(config.instance);
 }
 
 export async function start(config: RuntimeConfig, options: WebOptions): Promise<{ runtimeStarted: boolean; banner: Record<string, unknown>; children: ForegroundChildren }> {
@@ -225,8 +237,10 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
     : { running: true, url: url(config), instance: config.instance };
   // Advertise the GATEWAY origin as the operator's Web link, not the inner
   // Next port: the gateway is the single front that serves the UI AND natively
-  // handles /api/pairing/* (device pairing 404s on the direct Next port). The
-  // inner port is kept only for liveness detection (webUrlValue).
+  // handles /api/pairing/* for every relay/remote front. (The inner Next port
+  // bridges /api/pairing/* to the gateway only for loopback — see
+  // web/src/lib/pairing-proxy.ts — so the gateway origin is the one that works
+  // everywhere.) The inner port is kept only for liveness detection (webUrlValue).
   if (webUrlValue) banner.webUrl = operatorWebUrl(config);
   if (foreground) banner.foreground = true;
   return { runtimeStarted, banner, children };
@@ -565,6 +579,29 @@ export async function waitForRuntimeStopped(config: RuntimeConfig, pid?: number,
     const pidAlive = typeof pid === "number" ? processAlive(pid) : false;
     if (!pidAlive && !(await isRunning(config))) return true;
     await Bun.sleep(100);
+  }
+  return false;
+}
+
+// Poll until a specific port is bindable (the prior holder has released it) or
+// the deadline passes. `launchctl bootout` returns as soon as the unload is
+// ACCEPTED, not after the process has died and freed its socket — so a
+// bootout→bootstrap reload can race the kernel's TIME_WAIT/teardown and hit
+// EADDRINUSE. Callers that bootout a port-binding service await this before the
+// re-bootstrap so the port is actually free first. Probes the single host
+// (127.0.0.1 by default) the gateway/web bind to; returns whether it became
+// free within the budget. Timeout/interval are parameters so tests don't poll
+// for real.
+export async function waitForPortFree(
+  port: number,
+  host = "127.0.0.1",
+  timeoutMs = 10_000,
+  intervalMs = 100
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await probe(port, host)) return true;
+    await Bun.sleep(intervalMs);
   }
   return false;
 }

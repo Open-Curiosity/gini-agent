@@ -14,9 +14,10 @@
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { CliContext } from "../context";
-import { parseInstance } from "../../paths";
+import { defaultRuntimePort, defaultWebPort, parseInstance } from "../../paths";
 import { print } from "../output";
 import { flagValue } from "../args";
+import { recordedRuntimePortForInstance, recordedWebPortForInstance, waitForPortFree } from "../process";
 import {
   bootout,
   bootoutTarget,
@@ -53,6 +54,16 @@ const CORE_KINDS: readonly PlistKind[] = ["gateway", "web"];
 
 function isCoreKind(kind: PlistKind): boolean {
   return CORE_KINDS.includes(kind);
+}
+
+// The localhost port a kind binds, used by enable's post-bootout port-free
+// wait. Prefers the port recorded at the instance's last start (the runtime
+// walks ports under contention) and falls back to the per-instance default.
+// The watchdog binds nothing — null means "no wait needed".
+function portForKind(instance: string, kind: PlistKind): number | null {
+  if (kind === "gateway") return recordedRuntimePortForInstance(instance) ?? defaultRuntimePort(instance);
+  if (kind === "web") return recordedWebPortForInstance(instance) ?? defaultWebPort(instance);
+  return null;
 }
 
 // Narrow a raw --kind flag value to a PlistKind. Used to validate the flag
@@ -338,6 +349,11 @@ export interface EnableLaunchctlDeps {
   bootout: typeof bootout;
   bootstrap: typeof bootstrap;
   kickstart: typeof kickstart;
+  // Poll until a freshly-booted-out port-binding kind has actually released
+  // its socket before we re-bootstrap, so the reload can't double-bind
+  // (EADDRINUSE). Injectable so tests can stub it and assert it's awaited
+  // without polling a real port. Defaults to the real waitForPortFree.
+  waitForPortFree: typeof waitForPortFree;
 }
 
 export interface EnableOptions {
@@ -361,7 +377,7 @@ export interface EnableOptions {
 export async function enable(options: EnableOptions): Promise<EnableResult> {
   const { instance, testRoot } = options;
   const kinds = options.kinds ?? KINDS;
-  const deps: EnableLaunchctlDeps = options.launchctl ?? { isLoaded, bootout, bootstrap, kickstart };
+  const deps: EnableLaunchctlDeps = options.launchctl ?? { isLoaded, bootout, bootstrap, kickstart, waitForPortFree };
   // Only the enable path opts in to spawning the user's login shell to
   // merge nvm/asdf/volta dirs into the plist. status / disable / kick
   // (further down this file) don't pass mergeShellPath, so they keep
@@ -481,6 +497,27 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
         });
         allOk = false;
         continue;
+      }
+      // `bootout` returns once launchd ACCEPTS the unload, not after the
+      // process has died and released its socket. Re-bootstrapping (which
+      // RunAtLoad + our kickstart immediately relaunch) into a still-bound
+      // port yields EADDRINUSE — the exact crash loop a stale-plist reload
+      // can trigger. For port-binding kinds (gateway/web) we wait for the
+      // port to actually free before bootstrap. The watchdog binds nothing,
+      // so it has no port to wait on. We only wait when something was loaded
+      // (a bootout happened); a fresh enable never had a binder.
+      const port = portForKind(instance, svc.kind);
+      if (port !== null) {
+        const freed = await deps.waitForPortFree(port);
+        if (!freed) {
+          // The port never freed within the wait. We bootstrap anyway (the
+          // wait is best-effort), but surface it so a resulting EADDRINUSE is
+          // diagnosable rather than silent — a still-bound port here usually
+          // means an orphaned process holds it outside launchd's control.
+          process.stderr.write(
+            `autostart: ${svc.kind} port ${port} still bound after waiting; bootstrapping anyway\n`
+          );
+        }
       }
     }
 

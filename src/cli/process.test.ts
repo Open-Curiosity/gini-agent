@@ -8,8 +8,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
+import { createServer, type Server } from "node:net";
 import { join } from "node:path";
-import { awaitForegroundLogFlush, setupChildLog } from "./process";
+import { awaitForegroundLogFlush, setupChildLog, waitForPortFree } from "./process";
 
 function uniqueInstance(tag: string): string {
   return `process-test-${tag}-${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -117,5 +118,49 @@ describe("setupChildLog", () => {
     const logPath = join(logRoot, instance, "child.log");
     const contents = readFileSync(logPath, "utf8");
     expect(contents).toContain("TAIL_MARKER_LINE");
+  });
+});
+
+describe("waitForPortFree", () => {
+  // Bind a listener on an OS-assigned port (port 0), returning the chosen
+  // port and a closer. Loopback host matches what the gateway/web bind and
+  // what waitForPortFree probes.
+  function holdPort(host = "127.0.0.1"): Promise<{ port: number; server: Server }> {
+    return new Promise((resolve, reject) => {
+      const server = createServer();
+      server.once("error", reject);
+      server.listen(0, host, () => {
+        const address = server.address();
+        if (address && typeof address === "object") resolve({ port: address.port, server });
+        else reject(new Error("no port assigned"));
+      });
+    });
+  }
+
+  function closeServer(server: Server): Promise<void> {
+    return new Promise((resolve) => server.close(() => resolve()));
+  }
+
+  test("returns true quickly when the port is free", async () => {
+    const { port, server } = await holdPort();
+    await closeServer(server);
+    // Port is free now — should resolve true well within the budget.
+    const free = await waitForPortFree(port, "127.0.0.1", 2000, 25);
+    expect(free).toBe(true);
+  });
+
+  test("returns false when a listener holds the port through the timeout", async () => {
+    const { port, server } = await holdPort();
+    try {
+      // A real listener holds the port; a short injected timeout means the
+      // poll exhausts without ever seeing it free.
+      const free = await waitForPortFree(port, "127.0.0.1", 300, 25);
+      expect(free).toBe(false);
+    } finally {
+      await closeServer(server);
+    }
+    // Once released it becomes bindable again.
+    const freeAfter = await waitForPortFree(port, "127.0.0.1", 2000, 25);
+    expect(freeAfter).toBe(true);
   });
 });

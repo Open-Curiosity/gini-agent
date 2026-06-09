@@ -25,6 +25,7 @@
 // risk) because it can exfiltrate workspace files to a remote site.
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import { existsSync, realpathSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
@@ -124,6 +125,13 @@ let pendingAdmissions = 0;
 // before forcing teardown. Better to risk tearing down a slow in-flight
 // call than to wedge disconnect forever waiting on a hung page.goto.
 const DISCONNECT_DRAIN_DEADLINE_MS = 5_000;
+// How long a single Playwright close()/disconnect() in the teardown path
+// may run before we give up on it. context.close() / page.close() never
+// resolve when Chromium is wedged (a page stuck on a heavy/bot-protected
+// navigation), which would otherwise hang the whole connect/disconnect
+// flow for minutes. Overridable via __test.setTeardownCloseTimeoutForTest
+// so close-path tests don't have to wait the full budget.
+let teardownCloseTimeoutMs = 5_000;
 const sessions = new Map<string, Session>();
 // Per-task registry of literal secret values that browserFillByLocator
 // has typed into the page. Populated BEFORE the .fill() call so a
@@ -469,6 +477,54 @@ export async function materializeManagedForConnect(context: BrowserContext): Pro
   startSweeper();
 }
 
+// Bound a Playwright close()/disconnect() that can hang when Chromium is
+// wedged (a page stuck on a heavy/bot-protected navigation). Swallows
+// rejection like the old `.catch(() => undefined)`. Returns true if the op
+// settled within the budget, false if it timed out (caller then force-kills
+// the child so the profile-dir lock frees for the next launch).
+async function settledWithin(op: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const TIMED_OUT = Symbol("timed-out");
+  const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms);
+  });
+  try {
+    const outcome = await Promise.race([op.then(() => undefined, () => undefined), timeout]);
+    return outcome !== TIMED_OUT;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// The managed Chromium child isn't reachable via the playwright-core
+// client API (Browser has no process()), so when context.close() times
+// out we reap it by OS pid: find the process whose --user-data-dir is
+// this instance's profile dir and SIGKILL it, releasing the profile lock
+// for the next launchPersistentContext. Best-effort and overridable for
+// tests. Returns the number of pids signalled.
+let chromeKiller: (profileDir: string) => number = killChromeByProfileDir;
+function killChromeByProfileDir(profileDir: string): number {
+  try {
+    const out = execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
+    let n = 0;
+    for (const line of out.split("\n")) {
+      if (!line.includes(`--user-data-dir=${profileDir}`)) continue;
+      const pid = Number(line.trim().split(/\s+/)[0]);
+      if (Number.isInteger(pid) && pid > 0) {
+        try {
+          process.kill(pid, "SIGKILL");
+          n++;
+        } catch {
+          /* gone */
+        }
+      }
+    }
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
 // Mode-aware teardown of a SharedHandle. Persistent: close the
 // BrowserContext, which also terminates the Chromium child Playwright
 // launched. The profile dir on disk stays put (sign-ins persist).
@@ -479,13 +535,34 @@ export async function materializeManagedForConnect(context: BrowserContext): Pro
 // in-process handle instead).
 async function teardownHandle(handle: SharedHandle): Promise<void> {
   switch (handle.kind) {
-    case "persistent":
-      await handle.context.close().catch(() => undefined);
+    case "persistent": {
+      // Bound the close so a wedged Chromium can't hang teardown forever.
+      // On timeout, force-kill the underlying child to release the
+      // profile-dir lock that the next launchPersistentContext needs.
+      const settled = await settledWithin(handle.context.close(), teardownCloseTimeoutMs);
+      if (!settled && runtimeInstance) {
+        // The close() wedged. Reap the Chromium child by its profile-dir
+        // pid so the lock frees for the relaunch. Best-effort — a kill
+        // failure must never throw out of teardown.
+        try {
+          const killed = chromeKiller(chromeProfileDirFor(runtimeInstance));
+          if (killed >= 1) {
+            // Give the OS a moment to release the profile-dir lock before
+            // launchManaged relaunches against the same directory.
+            await new Promise((r) => setTimeout(r, 300));
+          }
+        } catch {
+          // best effort
+        }
+      }
       return;
+    }
     case "cdp": {
       const candidate = handle.browser as unknown as { disconnect?: () => Promise<void> };
       if (typeof candidate.disconnect === "function") {
-        await candidate.disconnect().catch(() => undefined);
+        // Bound the disconnect like the persistent close, but NEVER kill —
+        // the remote Chrome is the user's own process.
+        await settledWithin(candidate.disconnect(), teardownCloseTimeoutMs);
       }
       // If disconnect() isn't available on this CDP-attached Browser, do
       // NOT fall back to close() — close() over CDP terminates the user's
@@ -718,9 +795,10 @@ export async function disconnectSharedBrowser(): Promise<void> {
         // persistent mode (so agent-opened pages would go away anyway), but
         // in CDP mode the user's browser process stays alive, so any
         // agent-opened tabs we don't close here would survive disconnect
-        // as orphan tabs in the user's window.
+        // as orphan tabs in the user's window. Bound each close so a wedged
+        // page can't block reaching teardownHandle.
         for (const page of session.ownedPageIds) {
-          await page.close().catch(() => undefined);
+          await settledWithin(page.close(), teardownCloseTimeoutMs);
         }
         session.ownedPageIds.clear();
       } catch {
@@ -787,9 +865,10 @@ export async function closeAll(): Promise<void> {
       // Close every agent-owned page. In CDP mode this is the only thing
       // that reaps agent-opened tabs (the user's browser stays alive).
       // In persistent mode teardownHandle closes the whole context next,
-      // so this is harmless redundancy.
+      // so this is harmless redundancy. Bound each close so a wedged page
+      // can't block teardown.
       for (const page of session.ownedPageIds) {
-        await page.close().catch(() => undefined);
+        await settledWithin(page.close(), teardownCloseTimeoutMs);
       }
       session.ownedPageIds.clear();
     } catch {
@@ -920,6 +999,24 @@ function isBlockedIpv6(host: string): string | undefined {
   return undefined;
 }
 
+// The bare loopback hostnames the agent's browser may never reach.
+// safetyCheck and hostnameIsLoopback share this one array so they can't
+// drift. (browser_console's in-page guard pins the validated origin rather
+// than re-classifying hosts, so it does not consume this list.)
+const LOOPBACK_HOSTS: readonly string[] = ["127.0.0.1", "0.0.0.0", "localhost", "::1"];
+
+// True when `hostname` denotes a loopback origin: an exact LOOPBACK_HOSTS
+// entry, anything in 127.0.0.0/8, or a name under the `.localhost` TLD.
+// Strips IPv6 brackets and a trailing root dot and lowercases first, so
+// bracketed / fully-qualified / mixed-case forms classify the same as their
+// bare form. Used by safetyCheck — which separately decodes IPv4-mapped /
+// compat IPv6 forms to a dotted quad before calling this — and exported so
+// the predicate is unit-testable on its own.
+export function hostnameIsLoopback(hostname: string): boolean {
+  const h = hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  return LOOPBACK_HOSTS.includes(h) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h) || h.endsWith(".localhost");
+}
+
 // Exported for direct unit testing in src/tools/browser.test.ts.
 // Returns undefined when the URL is allowed; otherwise a human-readable
 // reason starting with "Blocked:" or "Invalid URL:".
@@ -977,8 +1074,8 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
   // through the metadata path and refuse it even under
   // allowLoopback, breaking CDP attach to [::ffff:127.0.0.1]:9222.
   const host = decodeIpv4Mapped(rawHost) ?? rawHost;
-  const loopbackHosts = new Set(["127.0.0.1", "0.0.0.0", "localhost", "::1"]);
-  if (loopbackHosts.has(host) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || host.endsWith(".localhost")) {
+  const loopbackHosts = new Set(LOOPBACK_HOSTS);
+  if (hostnameIsLoopback(host)) {
     if (options.allowLoopback) return undefined;
     return `Blocked: ${host} is a loopback address; the agent's browser may not reach the local BFF / runtime.`;
   }
@@ -1017,6 +1114,36 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
     }
   }
   return undefined;
+}
+
+// Shared origin boundary check for any tool that reads or executes against
+// the live page. Returns the safetyCheck reason — covering EVERY origin
+// safetyCheck refuses (loopback control-plane, cloud metadata, link-local)
+// — when the page's current URL is disallowed, otherwise undefined; bounces
+// the page to about:blank (best-effort) on a block. browser_navigate blocks
+// these targets up front, but a page can still settle on one afterward via
+// JS navigation, meta-refresh, a link click, or a CDP-attached tab already
+// parked there. snapshot() calls this before reading page state;
+// browser_console before evaluating agent JS; browser_vision before/after
+// the screenshot.
+//
+// Test mocks pass minimal page stubs (often only `evaluate`). Guarding
+// url()/goto() behind typeof keeps those mocks from having to grow a
+// surface just to clear this check.
+async function disallowedOriginReason(page: Page): Promise<string | undefined> {
+  if (typeof page.url !== "function") return undefined;
+  const currentUrl = page.url();
+  if (!currentUrl || currentUrl === "about:blank") return undefined;
+  const blocked = safetyCheck(currentUrl);
+  if (!blocked) return undefined;
+  if (typeof page.goto === "function") {
+    try {
+      await page.goto("about:blank", { waitUntil: "domcontentloaded" });
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+  return blocked;
 }
 
 interface SnapEntry {
@@ -1070,18 +1197,9 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   // (only evaluate is mocked, since the walker only needs DOM
   // access). Guard the url()/goto() calls behind typeof checks so
   // existing unit tests don't have to grow the mock surface.
-  if (typeof page.url === "function") {
-    const currentUrl = page.url();
-    if (currentUrl && currentUrl !== "about:blank") {
-      const blocked = safetyCheck(currentUrl);
-      if (blocked) {
-        if (typeof page.goto === "function") {
-          try { await page.goto("about:blank", { waitUntil: "domcontentloaded" }); }
-          catch { /* best-effort */ }
-        }
-        throw new Error(`${blocked} (page settled on disallowed URL after a navigation; agent must not inspect this surface)`);
-      }
-    }
+  const loopbackBlock = await disallowedOriginReason(page);
+  if (loopbackBlock) {
+    throw new Error(`${loopbackBlock} (page settled on disallowed URL after a navigation; agent must not inspect this surface)`);
   }
   const REF_ATTR = REF_ATTR_GLOBAL;
   // First, clear stale refs from prior snapshots so id allocation stays
@@ -1972,6 +2090,36 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
   const clear = bool(args.clear, false);
   try {
     return await withSession(taskId, async (session) => {
+      // Refuse to run agent JS on any origin the URL guard rejects (loopback
+      // control-plane, cloud metadata, link-local, ...). This is the one tool
+      // that executes agent-supplied code in the page's origin, so a
+      // same-origin fetch from a loopback document would reach the
+      // bearer-injecting BFF. Read the URL ONCE: validate it AND derive the
+      // origin the in-page race assertion pins against, so the two can't
+      // disagree across a navigation. Drop any console output captured while
+      // on a now-refused page so it can't surface on a later call.
+      const preUrl = typeof session.page.url === "function" ? session.page.url() : "";
+      if (preUrl && preUrl !== "about:blank") {
+        const preBlock = safetyCheck(preUrl);
+        if (preBlock) {
+          if (typeof session.page.goto === "function") {
+            try {
+              await session.page.goto("about:blank", { waitUntil: "domcontentloaded" });
+            } catch {
+              /* best-effort */
+            }
+          }
+          // Clear AFTER the bounce: the console listener stays attached, so a
+          // log the blocked page emits as it is navigated away would otherwise
+          // repopulate the buffer after an earlier clear.
+          consoleLogs.delete(taskId);
+          return fail(`${preBlock} (refusing to run console JS on a disallowed origin)`);
+        }
+      }
+      // The origin the in-page assertion pins against, derived from the same
+      // read we just validated (safetyCheck already confirmed it parses).
+      // "null" for about:blank / no-page sessions.
+      const validatedOrigin = preUrl && preUrl !== "about:blank" ? new URL(preUrl).origin : "null";
       // attachConsole is now called eagerly in getOrCreate; this is a
       // belt-and-braces re-attach in case the page was somehow swapped.
       attachConsole(taskId, session.page);
@@ -1992,13 +2140,42 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       let evalError: string | undefined;
       if (expression) {
         try {
-          evalResult = await session.page.evaluate((expr) => {
-            // eslint-disable-next-line no-new-func
-            return new Function(`return (${expr});`)();
-          }, expression);
+          evalResult = await session.page.evaluate(
+            ({ expr, validatedOrigin }: { expr: string; validatedOrigin: string }) => {
+              // In-page race assertion — runs in the SAME execution context
+              // the agent's expression (and any fetch it issues) will. The
+              // server validated the page origin a moment earlier; if a
+              // navigation committed in the gap before this eval, the document
+              // origin no longer matches and we refuse — without re-implementing
+              // the URL policy in the page. Pinning the origin closes the whole
+              // race class (loopback control-plane, cloud metadata, link-local,
+              // any cross-origin): a same-origin BFF write needs the document
+              // origin to BE the control plane, and a changed origin no longer
+              // is. Same-origin client navigation (hash, pushState) keeps
+              // location.origin, so legitimate in-page interaction is unaffected.
+              if (location.origin !== validatedOrigin) {
+                throw new Error(`Blocked: page origin changed to ${location.origin} (expected ${validatedOrigin}); refusing to run console JS on a navigated origin.`);
+              }
+              // eslint-disable-next-line no-new-func
+              return new Function(`return (${expr});`)();
+            },
+            { expr: expression, validatedOrigin }
+          );
         } catch (error) {
           evalError = error instanceof Error ? error.message : String(error);
         }
+      }
+      // The eval can navigate the page, and a navigation kicked off earlier
+      // can commit during it — the race the in-page assertion blocks
+      // *execution* for. If the page is now on a refused origin, withhold the
+      // result rather than returning session.page.url() (the loopback URL) or
+      // messages (console output the page emitted): the write is already
+      // blocked, but returning — or later resurfacing — that state would still
+      // leak it, so drop the captured logs too.
+      const postEvalBlock = await disallowedOriginReason(session.page);
+      if (postEvalBlock) {
+        consoleLogs.delete(taskId);
+        return fail(`${postEvalBlock} (refusing to return console state from a disallowed origin)`);
       }
       const messages = consoleLogs.get(taskId) ?? [];
       // Redact data-gini-secret values from anywhere they could
@@ -2407,6 +2584,15 @@ export async function browserVision(
   const full = bool(args.full, false);
   try {
     return await withSession(taskId, async (session) => {
+      // Refuse to screenshot a page on a refused origin (loopback
+      // control-plane, cloud metadata, link-local). browser_vision ships the
+      // rendered pixels to the vision provider, so an unguarded screenshot of
+      // a loopback page would exfiltrate control-plane state as an image —
+      // the same surface browser_console and snapshot() already gate.
+      const visionBlock = await disallowedOriginReason(session.page);
+      if (visionBlock) {
+        return fail(`${visionBlock} (refusing to screenshot a disallowed origin)`);
+      }
       // Capture the disconnect generation BEFORE the screenshot. A slow
       // screenshot (large full-page captures can take seconds) followed by
       // a disconnect mid-await would otherwise slip past the post-fetch
@@ -2465,6 +2651,13 @@ export async function browserVision(
         return fail(
           `Screenshot too large (${buf.length} bytes > 5MB cap). Try full:false or scroll to a specific section.`
         );
+      }
+      // Re-check after the capture: if the page navigated to a refused origin
+      // while the screenshot was in flight, discard the buffer rather than
+      // sending its pixels to the vision provider.
+      const postShotBlock = await disallowedOriginReason(session.page);
+      if (postShotBlock) {
+        return fail(`${postShotBlock} (page navigated to a disallowed origin during capture; discarding screenshot)`);
       }
       const imageBase64 = Buffer.from(buf).toString("base64");
       const result = await generateVisionAnalysis(config, {
@@ -2682,6 +2875,27 @@ export const __test = {
   resetChromiumImportForTest(): void {
     chromiumImport = undefined;
   },
+  // Shrink the teardown close/disconnect budget so the wedged-Chromium
+  // tests fire the timeout in milliseconds instead of waiting the full 5s.
+  setTeardownCloseTimeoutForTest(ms: number): void {
+    teardownCloseTimeoutMs = ms;
+  },
+  resetTeardownCloseTimeoutForTest(): void {
+    teardownCloseTimeoutMs = 5_000;
+  },
+  // Swap the profile-dir Chromium reaper so the wedged-close test can
+  // assert it's invoked on timeout without scanning real `ps`.
+  setChromeKillerForTest(fn: (profileDir: string) => number): void {
+    chromeKiller = fn;
+  },
+  resetChromeKillerForTest(): void {
+    chromeKiller = killChromeByProfileDir;
+  },
+  // Clear the registered runtime instance so a test that set one via
+  // setBrowserInstance() doesn't leak it into sibling tests.
+  resetBrowserInstanceForTest(): void {
+    runtimeInstance = undefined;
+  },
   // Install a fake shared handle so the close-path tests can assert
   // teardown behavior without launching Chromium. The `headed` flag
   // signals whether the test simulates the visible-window (managed) or
@@ -2802,6 +3016,19 @@ export const __test = {
     // fake sessions then call this helper don't leak state into
     // subsequent tests.
     filledSecretValues.clear();
+  },
+  // Expose the server-side loopback boundary check for direct unit
+  // testing — snapshot() and browser_console both gate on it.
+  disallowedOriginReasonForTest(page: Page): Promise<string | undefined> {
+    return disallowedOriginReason(page);
+  },
+  // Seed / read the per-task console-log buffer so tests can assert that a
+  // blocked browser_console call drops captured control-plane output.
+  seedConsoleLogsForTest(taskId: string, msgs: { type: string; text: string }[]): void {
+    consoleLogs.set(taskId, msgs);
+  },
+  getConsoleLogsForTest(taskId: string): { type: string; text: string }[] | undefined {
+    return consoleLogs.get(taskId);
   },
   // Expose the in-page walker for direct unit testing. Callers supply a
   // fake Page whose `evaluate(fn, arg)` runs `fn(arg)` locally against

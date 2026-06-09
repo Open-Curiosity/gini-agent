@@ -155,6 +155,17 @@ export function useJobs() {
   });
 }
 
+// Unscoped jobs list (all agents) — mirrors the sidebar's inline query so the
+// React Query cache key is shared and the two dedupe. Used by the chat surface
+// to resolve a recurring-job channel back to its originating job.
+export function useAllJobs() {
+  return useQuery<JobRecord[]>({
+    queryKey: ["jobs", "all"],
+    queryFn: () => api<JobRecord[]>("/jobs"),
+    refetchInterval: 3000
+  });
+}
+
 export function useJobRuns(jobId?: string) {
   const agentId = useActiveAgentId();
   return useQuery<JobRunRecord[]>({
@@ -171,7 +182,14 @@ export function useConnectors() {
   return useQuery<ConnectorRecord[]>({
     queryKey: ["connectors"],
     queryFn: () => api<ConnectorRecord[]>("/connectors"),
-    refetchInterval: 60_000
+    // Poll fast only while a connector is provisioned but signed out — the
+    // window where the user is completing OAuth and wants the row to flip to
+    // connected promptly. Otherwise idle at 60s. (Server caches the underlying
+    // gws auth status ~15s, so this won't spawn gws on every tick.)
+    refetchInterval: (query) =>
+      query.state.data?.some((c) => c.session?.clientConfigured && !c.session.signedIn)
+        ? 5_000
+        : 60_000
   });
 }
 

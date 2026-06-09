@@ -32,6 +32,7 @@
 // import them without depending on src/cli/*. This module re-exports them
 // for back-compat with existing test imports.
 
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -653,6 +654,119 @@ function isTestEnv(): boolean {
   );
 }
 
+// The env key under which each generated plist carries its own
+// supervision-template fingerprint. The startup reconcile reads this back
+// off disk and compares it to the stamp the current code would generate;
+// drift means the installed plist predates a supervision-template change
+// (e.g. a new env marker, a KeepAlive shape switch, a bun-path move) and
+// must be rewritten + reloaded. See ADR always-up-supervision.md.
+export const GINI_PLIST_STAMP_KEY = "GINI_PLIST_STAMP";
+
+// The ONLY env keys folded into the stamp. Deliberately excludes PATH,
+// HOME, LANG, SHELL, GINI_STATE_ROOT/GINI_LOG_ROOT, and every secret value
+// from secrets.env — those vary legitimately between machines and between
+// the merge/no-merge code paths, so hashing them would make the stamp
+// non-deterministic and trigger a false-positive reconcile loop. We hash
+// only the supervision-critical keys, whose VALUES are fixed by the
+// template (the marker, the instance, the web/watchdog port, the dist dir).
+const STAMP_ENV_KEYS = ["GINI_SUPERVISOR", "GINI_INSTANCE", "PORT", "GINI_DIST_DIR"] as const;
+
+// The stable supervision-critical subset of a plist, in a FIXED key order.
+// Hashing this (and nothing else) yields a stamp that changes iff the
+// supervision template changes. Built identically at plist-generation time
+// (generatePlist) and at startup-check time (the reconcile module), so the
+// two sides always agree without spawning the login shell or reading secrets.
+export interface PlistStampInput {
+  kind: PlistKind | "legacy";
+  label: string;
+  programArguments: string[];
+  workingDirectory: string;
+  processType: string;
+  // The scheduling shape. Periodic (watchdog) carries startIntervalSeconds and
+  // a true keepAlive=false; long-lived (gateway/web) carries keepAlive=true and
+  // a throttleIntervalSeconds. We record both numbers explicitly so a change to
+  // either interval re-stamps.
+  keepAlive: boolean;
+  throttleIntervalSeconds: number | null;
+  startIntervalSeconds: number | null;
+  runAtLoad: boolean;
+  // Only the supervision env keys (STAMP_ENV_KEYS), filtered + ordered.
+  supervisionEnv: Record<string, string>;
+}
+
+// Extract the stamp input from a resolved LaunchSpec. Pulls out only the
+// enumerated stable fields; everything variable (PATH, secrets, HOME, log
+// paths) is dropped. Used by both generatePlist and the reconcile check so
+// they hash the same bytes.
+export function plistStampInput(args: {
+  kind: PlistKind | "legacy";
+  label: string;
+  spec: LaunchSpec;
+  processType: string;
+  throttleIntervalSeconds: number | null;
+  startIntervalSeconds: number | null;
+}): PlistStampInput {
+  const periodic = args.startIntervalSeconds !== null;
+  const supervisionEnv: Record<string, string> = {};
+  for (const key of STAMP_ENV_KEYS) {
+    const value = args.spec.environment[key];
+    if (value !== undefined) supervisionEnv[key] = value;
+  }
+  return {
+    kind: args.kind,
+    label: args.label,
+    programArguments: [...args.spec.programArguments],
+    workingDirectory: args.spec.workingDirectory,
+    processType: args.processType,
+    keepAlive: !periodic,
+    throttleIntervalSeconds: periodic ? null : args.throttleIntervalSeconds,
+    startIntervalSeconds: periodic ? args.startIntervalSeconds : null,
+    runAtLoad: true,
+    supervisionEnv
+  };
+}
+
+// Hash the stable supervision subset into a short hex fingerprint. The input
+// is serialized in a fixed field order (and supervisionEnv keys are emitted in
+// STAMP_ENV_KEYS order) so the same template always hashes to the same value.
+export function computePlistStamp(input: PlistStampInput): string {
+  const orderedEnv = STAMP_ENV_KEYS
+    .filter((key) => input.supervisionEnv[key] !== undefined)
+    .map((key) => [key, input.supervisionEnv[key]!] as const);
+  const canonical = JSON.stringify([
+    input.kind,
+    input.label,
+    input.programArguments,
+    input.workingDirectory,
+    input.processType,
+    input.keepAlive,
+    input.throttleIntervalSeconds,
+    input.startIntervalSeconds,
+    input.runAtLoad,
+    orderedEnv
+  ]);
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 12);
+}
+
+// Parse the GINI_PLIST_STAMP value out of an on-disk plist. The plist is
+// written by generatePlist as a <key>GINI_PLIST_STAMP</key> immediately
+// followed by its <string>VALUE</string> inside EnvironmentVariables, so we
+// match that pair directly. Returns null when the file is missing, unreadable,
+// or carries no stamp (a pre-stamp plist — which the reconcile treats as drift).
+export function readPlistStamp(plistPath: string): string | null {
+  if (!existsSync(plistPath)) return null;
+  let body: string;
+  try {
+    body = readFileSync(plistPath, "utf8");
+  } catch {
+    return null;
+  }
+  const match = body.match(
+    /<key>GINI_PLIST_STAMP<\/key>\s*<string>([^<]*)<\/string>/
+  );
+  return match && match[1] !== undefined ? match[1] : null;
+}
+
 export interface PlistOptions {
   instance: Instance;
   spec: LaunchSpec;
@@ -676,12 +790,57 @@ export interface PlistOptions {
   startIntervalSeconds?: number;
 }
 
+// ProcessType baked into every plist. Folded into the stamp so a future
+// change to this value re-stamps existing installs on next startup.
+const PLIST_PROCESS_TYPE = "Interactive";
+
+// The single source of truth for a generated plist's stamp. Both
+// generatePlist (write side) and the startup reconcile (check side) call
+// this so they hash byte-identical input. Mirrors generatePlist's
+// throttle-default and periodic-vs-long-lived resolution exactly.
+export function stampForGeneratedPlist(args: {
+  instance: Instance;
+  kind?: PlistKind;
+  spec: LaunchSpec;
+  throttleIntervalSeconds?: number;
+  startIntervalSeconds?: number;
+}): string {
+  const throttle = args.throttleIntervalSeconds ?? THROTTLE_INTERVAL_SECONDS;
+  const periodic = args.startIntervalSeconds !== undefined;
+  const label = args.kind ? labelForKind(args.instance, args.kind) : labelFor(args.instance);
+  return computePlistStamp(
+    plistStampInput({
+      kind: args.kind ?? "legacy",
+      label,
+      spec: args.spec,
+      processType: PLIST_PROCESS_TYPE,
+      throttleIntervalSeconds: periodic ? null : throttle,
+      startIntervalSeconds: periodic ? args.startIntervalSeconds! : null
+    })
+  );
+}
+
 export function generatePlist(options: PlistOptions): string {
   const throttle = options.throttleIntervalSeconds ?? THROTTLE_INTERVAL_SECONDS;
   const periodic = options.startIntervalSeconds !== undefined;
   const label = options.kind ? labelForKind(options.instance, options.kind) : labelFor(options.instance);
   const args = options.spec.programArguments.map(escapeXml).map((a) => `        <string>${a}</string>`).join("\n");
-  const envEntries = Object.entries(options.spec.environment)
+  // Stamp the plist with a fingerprint of its own supervision-critical subset
+  // (computed from the SAME extraction the startup reconcile uses). Inject it
+  // into EnvironmentVariables so it persists in the on-disk plist; the stamp
+  // value itself is never part of what we hash.
+  const stamp = stampForGeneratedPlist({
+    instance: options.instance,
+    kind: options.kind,
+    spec: options.spec,
+    throttleIntervalSeconds: options.throttleIntervalSeconds,
+    startIntervalSeconds: options.startIntervalSeconds
+  });
+  const stampedEnvironment: Record<string, string> = {
+    ...options.spec.environment,
+    [GINI_PLIST_STAMP_KEY]: stamp
+  };
+  const envEntries = Object.entries(stampedEnvironment)
     .map(([key, value]) => `        <key>${escapeXml(key)}</key>\n        <string>${escapeXml(value)}</string>`)
     .join("\n");
 
@@ -746,7 +905,7 @@ ${scheduling}
     <key>StandardErrorPath</key>
     <string>${escapeXml(options.stderrPath)}</string>
     <key>ProcessType</key>
-    <string>Interactive</string>
+    <string>${escapeXml(PLIST_PROCESS_TYPE)}</string>
 </dict>
 </plist>
 `;

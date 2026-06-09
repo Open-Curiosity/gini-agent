@@ -38,6 +38,7 @@ import { fileAccent, previewKind } from "@/src/file-accent";
 import { parseCsv } from "@/src/parse-csv";
 import { family, theme } from "@/src/theme";
 import { markdownRules } from "./chat/BlockAssistantText";
+import { handleMarkdownLinkPress } from "./chat/linkContextMenu";
 
 // Blue swatch + accent for the previewer's title/header (matches the card's
 // doc tint). Kept local since it's specific to this sheet's chrome.
@@ -286,7 +287,12 @@ function PreviewBody({
   if (kind === "markdown") {
     return (
       <View>
-        <Markdown style={markdownStyles} markdownit={markdownIt} rules={markdownRules}>
+        <Markdown
+          style={markdownStyles}
+          markdownit={markdownIt}
+          rules={markdownRules}
+          onLinkPress={handleMarkdownLinkPress}
+        >
           {content}
         </Markdown>
         {data.truncated ? <Text style={styles.truncated}>[truncated]</Text> : null}

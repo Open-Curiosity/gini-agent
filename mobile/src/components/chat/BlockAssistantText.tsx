@@ -1,11 +1,31 @@
-import { useEffect, useRef } from "react";
-import { Animated, Easing, Linking, StyleSheet, Text, View } from "react-native";
+import {
+  Children,
+  cloneElement,
+  isValidElement,
+  useEffect,
+  useRef,
+  type ReactElement,
+  type ReactNode
+} from "react";
+import { Animated, Easing, StyleSheet, Text, View } from "react-native";
 import Markdown, { MarkdownIt } from "react-native-markdown-display";
 import { family, theme } from "@/src/theme";
 import type { AssistantTextBlock } from "@/src/types";
+import {
+  handleMarkdownLinkPress,
+  isWebUrl,
+  openLink,
+  presentLinkMenu
+} from "./linkContextMenu";
 import { SelectableBlockText } from "./SelectableBlockText";
 
-type MarkdownNode = { key: string; content: string; attributes?: { href?: string } };
+type MarkdownNode = {
+  key: string;
+  type?: string;
+  content: string;
+  attributes?: { href?: string };
+  children?: MarkdownNode[];
+};
 type MarkdownStylesMap = Record<string, object>;
 type RuleArgs = [
   node: MarkdownNode,
@@ -18,9 +38,9 @@ type RenderRule = (...args: RuleArgs) => React.ReactNode;
 
 // `linkify: true` autolinks bare URLs (e.g. `https://example.com`) that
 // arrive in assistant text without explicit `[label](url)` markdown, so
-// they render as tappable anchors. The library's default press handler
-// hands the URL to `Linking.openURL`, which on iOS 14+ and Android
-// respects the user's configured default browser (Chrome if set).
+// they render as tappable anchors alongside `[label](url)` links. Taps and
+// long-presses are handled by the custom link rule + `onLinkPress` below,
+// which route through an in-app browser instead of the system default.
 const markdownIt = MarkdownIt({ typographer: true, linkify: true });
 
 // Left-aligned light-gray bubble. Mirror of the user bubble's corner
@@ -40,6 +60,7 @@ export function BlockAssistantText({ block }: { block: AssistantTextBlock }) {
           style={markdownStyles}
           markdownit={markdownIt}
           rules={markdownRules}
+          onLinkPress={handleMarkdownLinkPress}
         >
           {block.text}
         </Markdown>
@@ -116,6 +137,19 @@ const blockTextStyles = StyleSheet.create({
     marginBottom: 4
   }
 });
+// Walk an AST node's subtree for an inline, *interactive* `link`. markdown-it
+// (with `linkify`) collapses `link_open`/`link_close` into a node of type
+// `link`, covering both `[label](url)` and bare autolinked URLs. Only http(s)
+// links get tap/long-press handlers, so only those should flip the block off
+// the selectable path — a non-web link is inert and should keep normal text
+// selection. A block-level `blocklink` (e.g. a linked image) keeps the
+// library's own touchable wrapper and is excluded here.
+function hasLinkDescendant(node: MarkdownNode): boolean {
+  const href = node.attributes?.href;
+  if (node.type === "link" && href !== undefined && isWebUrl(href)) return true;
+  return node.children?.some(hasLinkDescendant) ?? false;
+}
+
 // Block-level renderers wrap inline children in a single selectable
 // block. On iOS that's a `TextInput multiline editable={false}` (the
 // only RN primitive that exposes the loupe + drag handles for partial
@@ -124,13 +158,40 @@ const blockTextStyles = StyleSheet.create({
 // outer wrapper coalesces the library's per-token inline children into
 // one text run so RN's text engine can wrap URLs and long lines
 // cleanly (see comment above).
+//
+// A block that contains an interactive (http/https) link is flagged so
+// SelectableBlockText renders it as a plain, non-selectable Text on every
+// platform: the iOS TextInput wrapper would swallow the link's taps, and a
+// selectable wrapper would let iOS hijack the long-press for text selection
+// instead of showing the link menu.
 const renderAsText =
   (style: object): RenderRule =>
   (node, children) => (
-    <SelectableBlockText key={node.key} style={style}>
+    <SelectableBlockText
+      key={node.key}
+      style={style}
+      containsLink={hasLinkDescendant(node)}
+    >
       {children}
     </SelectableBlockText>
   );
+// A markdown link is interactive (tap opens, long-press shows the menu), so
+// its label must not be selectable — otherwise iOS fires its own text
+// selection "Copy" callout on long-press alongside the link menu. The inline
+// children arrive pre-rendered as selectable <Text> from the text rules, so
+// recursively clone them with selection disabled.
+function nonSelectable(children: ReactNode): ReactNode {
+  return Children.map(children, (child) => {
+    if (!isValidElement(child)) return child;
+    const el = child as ReactElement<{ children?: ReactNode }>;
+    return cloneElement(
+      el as ReactElement<{ selectable?: boolean; children?: ReactNode }>,
+      { selectable: false },
+      nonSelectable(el.props.children)
+    );
+  });
+}
+
 // Inline rules (text/textgroup/link/strong/em/s/inline) need their own
 // `selectable` because react-native-markdown-display emits <Text>
 // wrappers per rule and the defaults omit the prop — without these
@@ -176,14 +237,23 @@ export const markdownRules: Record<string, RenderRule> = {
   ),
   link: (node, children, _parent, styles) => {
     const href = node.attributes?.href;
+    // Only http(s) links are interactive. Tap opens the in-app browser;
+    // long-press raises the link context menu at the touch point. The link
+    // is intentionally not `selectable` so a long-press shows the menu
+    // instead of starting a text selection.
     return (
       <Text
         key={node.key}
         style={styles.link}
-        selectable
-        onPress={href ? () => void Linking.openURL(href) : undefined}
+        onPress={href && isWebUrl(href) ? () => openLink(href) : undefined}
+        onLongPress={
+          href && isWebUrl(href)
+            ? (e) =>
+                presentLinkMenu(href, e.nativeEvent.pageX, e.nativeEvent.pageY)
+            : undefined
+        }
       >
-        {children}
+        {nonSelectable(children)}
       </Text>
     );
   },

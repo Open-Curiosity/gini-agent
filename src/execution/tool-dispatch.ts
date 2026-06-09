@@ -36,6 +36,7 @@ import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
 import { findSelfOperation } from "./self-registry";
 import { isDeferredToolName } from "./tool-catalog";
+import { buildCurrentTimeResult, resolveLocalTimeZone } from "../system-prompt";
 import { recall } from "../memory";
 import {
   dedupeAppendLines,
@@ -53,6 +54,8 @@ import {
   type IdentityFileStatus
 } from "../runtime/identity-files";
 import { resolveEffectiveContext } from "./effective-context";
+import { importTableFromFile } from "../data/import-table";
+import { dbExecute, dbListTables, dbQuery } from "../state";
 import { resolveEmitContext, setToolCallRunningHint } from "./chat-task-emit";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
@@ -142,6 +145,13 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await fileSearch(config, taskId, args) };
     case "web_fetch":
       return { kind: "sync", result: await webFetchTool(config, taskId, args) };
+    case "get_current_time":
+      // Pure read of the runtime clock — no state, no side effects, no approval.
+      // Same tz resolution as the cacheable date block (shared helper).
+      return {
+        kind: "sync",
+        result: buildCurrentTimeResult(new Date(), resolveLocalTimeZone())
+      };
     case "web_search":
       return { kind: "sync", result: await webSearchTool(config, taskId, args) };
     case "read_skill":
@@ -162,6 +172,14 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await emailWatchTool(config, taskId, args) };
     case "recall_memory":
       return { kind: "sync", result: await recallMemoryTool(config, taskId, args) };
+    case "db_query":
+      return { kind: "sync", result: await dbQueryTool(config, taskId, args) };
+    case "db_execute":
+      return { kind: "sync", result: await dbExecuteTool(config, taskId, args) };
+    case "db_import":
+      return { kind: "sync", result: await dbImportTool(config, taskId, args) };
+    case "db_schema":
+      return { kind: "sync", result: await dbSchemaTool(config, taskId, args) };
     case "edit_soul":
       return { kind: "sync", result: await editSoulTool(config, taskId, args) };
     case "edit_user_profile":
@@ -1990,6 +2008,81 @@ async function recallMemoryTool(
   });
 }
 
+// ---- Agent-database primitive tools (ADR agent-database.md) ----
+//
+// db_query / db_execute / db_import / db_schema operate on the active agent's
+// own sandboxed SQLite file (src/state/agent-data-db.ts), isolated from Gini's
+// system data. Low-risk / no-approval: it's the agent's private data store, like
+// memory; the file-level isolation is the safety boundary. AgentDataError from
+// the storage layer propagates as the tool result so the model can correct its
+// SQL.
+
+function requireAgentId(config: RuntimeConfig, what: string): string {
+  const state = readState(config.instance);
+  const effective = resolveEffectiveContext(state, config);
+  if (!effective.agentId) throw new Error(`Cannot ${what}: no active agent.`);
+  return effective.agentId;
+}
+
+// Read an optional string arg as string | undefined (undefined when absent or
+// empty), without the fallback that optionalString applies.
+function optStr(args: Record<string, unknown>, key: string): string | undefined {
+  const value = args[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw new Error(`Argument ${key} must be a string.`);
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function queryParams(args: Record<string, unknown>): unknown[] {
+  if (args.params === undefined || args.params === null) return [];
+  if (!Array.isArray(args.params)) throw new Error("Argument params must be an array.");
+  return args.params;
+}
+
+async function dbQueryTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const agentId = requireAgentId(config, "query the database");
+  const sql = requireString(args, "sql");
+  const result = dbQuery(config.instance, agentId, sql, queryParams(args));
+  await recordLowRiskAudit(config, taskId, "db.query", sql.slice(0, 200), {
+    rows: result.rowCount,
+    truncated: result.truncated
+  });
+  return JSON.stringify(result);
+}
+
+async function dbExecuteTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const agentId = requireAgentId(config, "use the database");
+  const sql = requireString(args, "sql");
+  const result = dbExecute(config.instance, agentId, sql, queryParams(args));
+  appendTrace(config.instance, taskId, { type: "tool", message: "Database write", data: { sql: sql.slice(0, 200), changes: result.changes } });
+  await recordLowRiskAudit(config, taskId, "db.execute", sql.slice(0, 200), { changes: result.changes });
+  return JSON.stringify(result);
+}
+
+async function dbImportTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const agentId = requireAgentId(config, "import into the database");
+  const path = requireString(args, "path");
+  const table = requireString(args, "table");
+  const skipLines = typeof args.skipLines === "number" ? args.skipLines : undefined;
+  const recreate = args.recreate === true;
+  const report = await importTableFromFile(config, agentId, path, table, { skipLines, recreate });
+  appendTrace(config.instance, taskId, { type: "tool", message: "Table imported", data: { ...report } });
+  await recordLowRiskAudit(config, taskId, "db.import", `${path} -> ${report.table}`, {
+    rowsInserted: report.rowsInserted,
+    rowsSkipped: report.rowsSkipped
+  });
+  return JSON.stringify(report);
+}
+
+async function dbSchemaTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const agentId = requireAgentId(config, "read the database schema");
+  void args;
+  const tables = dbListTables(config.instance, agentId);
+  await recordLowRiskAudit(config, taskId, "db.schema", "", { tables: tables.length });
+  return JSON.stringify({ tables });
+}
+
 // Edit the active agent's SOUL.md. Same flow as edit_user_profile:
 // a clean body auto-approves (lands at SOUL.md, effective on the next
 // system prompt); an injection-flagged body routes to SOUL.md.proposed
@@ -2649,7 +2742,9 @@ async function requestSkillConnectorGrant(
         content: reason,
         taskId: item.id,
         runId: item.runId,
-        kind: "approval_reason"
+        kind: "approval_reason",
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.parentBlockId ? { parentBlockId: item.parentBlockId } : {})
       });
     }
     appendTrace(config.instance, item.id, {
@@ -3386,7 +3481,9 @@ async function requestConnectorTool(
         content: reason,
         taskId: item.id,
         runId: item.runId,
-        kind: "approval_reason"
+        kind: "approval_reason",
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.parentBlockId ? { parentBlockId: item.parentBlockId } : {})
       });
     }
     appendTrace(config.instance, item.id, {
@@ -3584,7 +3681,9 @@ async function browserFillSecretsTool(
         content: reason,
         taskId: item.id,
         runId: item.runId,
-        kind: "approval_reason"
+        kind: "approval_reason",
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.parentBlockId ? { parentBlockId: item.parentBlockId } : {})
       });
     }
     appendTrace(config.instance, item.id, {
@@ -3722,7 +3821,9 @@ async function requestMessagingBridgeTool(
         content: reason,
         taskId: item.id,
         runId: item.runId,
-        kind: "approval_reason"
+        kind: "approval_reason",
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.parentBlockId ? { parentBlockId: item.parentBlockId } : {})
       });
     }
     appendTrace(config.instance, item.id, {
@@ -3879,7 +3980,9 @@ async function mintPairingApproval(
         content: reason,
         taskId: item.id,
         runId: item.runId,
-        kind: "approval_reason"
+        kind: "approval_reason",
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.parentBlockId ? { parentBlockId: item.parentBlockId } : {})
       });
     }
     appendTrace(config.instance, item.id, {
@@ -4438,7 +4541,9 @@ async function requestRemoveMessagingBridgeTool(
         content: reason,
         taskId: item.id,
         runId: item.runId,
-        kind: "approval_reason"
+        kind: "approval_reason",
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.parentBlockId ? { parentBlockId: item.parentBlockId } : {})
       });
     }
     appendTrace(config.instance, item.id, {

@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-08
+
+### Added
+
+- Add relay device pairing: front the gateway over a tunnel and bring new web and mobile devices online through a QR-code and universal-link flow, with an operator approval dialog and a live active-sessions panel. (see ADR [device-pairing-auth.md](docs/adr/device-pairing-auth.md))
+- Rebuild chat around one chat per agent with threads and channels — a thread view with a pinned parent and an also-to-main composer, a cross-agent Threads Inbox with All/Unread filters, a Channels screen, and agent-decided threading via a `start_thread` tool. (web, mobile) (see ADR [agent-chat-threads-and-channels.md](docs/adr/agent-chat-threads-and-channels.md))
+- Add a Google Workspace connector with guided setup, splitting provisioning from sign-in and reporting sign-in liveness separately from connector health.
+- Make the agent aware of the current date and time, with a `get_current_time` tool for on-demand checks.
+- Deliver non-image file attachments to the model by capability — native document parts, extracted text (PDF, DOCX, XLSX, plain text), or a file path — with a file-chip composer on web and mobile. (see ADR [chat-file-attachments.md](docs/adr/chat-file-attachments.md))
+- Render referenced docs inline in chat via a `GET /api/docs` endpoint, used by re-auth notes and the connector dialog. (see ADR [in-app-doc-references.md](docs/adr/in-app-doc-references.md))
+- Add a per-agent structured database primitive so the agent can keep and exhaustively query structured records (the access pattern memory recall can't serve). New `db_query`/`db_execute`/`db_import`/`db_schema` tools over a sandboxed per-agent SQLite database, isolated from Gini's system data. `db_import` loads a CSV/XLSX file into a table deterministically. See [Per-Agent Structured Database Primitive](docs/adr/agent-database.md).
+- Add a `people-crm` skill that turns a LinkedIn `Connections.csv` export into a queryable personal CRM (find/count people by company/role/location, track who people are, map who-knows-whom) on top of the database primitive.
+- Add in-chat search that filters and jumps to matches in the current chat.
+- Add a List/Calendar toggle to the Jobs tab and surface every agent's recurring jobs in the sidebar.
+
+### Changed
+
+- Make `browser_navigate` a core tool, refuse a cold `browser_connect` until a page is open, cap Connect cards per sign-in wall, and break identical tool-call loops.
+- Mark a chat or thread as read when it is opened.
+
+### Fixed
+
+- Fix the mobile Files picker stalling behind a dismissing attachment sheet.
+
 ## [0.2.0] - 2026-06-02
 
 ### Added
@@ -50,6 +74,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 - Initial public open-source release. See [README.md](README.md) for what's included and the [Roadmap](ROADMAP.md) for what's planned.
 
-[Unreleased]: https://github.com/Lilac-Labs/gini-agent/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Lilac-Labs/gini-agent/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Lilac-Labs/gini-agent/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Lilac-Labs/gini-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Lilac-Labs/gini-agent/releases/tag/v0.1.0

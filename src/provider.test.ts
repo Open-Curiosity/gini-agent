@@ -10,6 +10,7 @@ import {
   generateToolCallingResponse,
   generateVisionAnalysis,
   isAuthExpiredError,
+  isProviderConfigured,
   normalizeProvider,
   providerAuthFailureText,
   providerAuthNote,
@@ -871,10 +872,196 @@ describe("provider", () => {
     expect(normalizeProvider({ name: "local", model: "m", extraBody }).extraBody).toEqual(extraBody);
     expect(normalizeProvider({ name: "openai", model: "m", extraBody }).extraBody).toEqual(extraBody);
     expect(normalizeProvider({ name: "openrouter", model: "m", extraBody }).extraBody).toEqual(extraBody);
+    expect(normalizeProvider({ name: "azure", model: "m", baseUrl: "https://r.openai.azure.com", extraBody }).extraBody).toEqual(extraBody);
     // echo and codex don't carry extraBody through. Echo is deterministic and
     // bypasses the HTTP path; codex uses /responses (different wire shape).
     expect(normalizeProvider({ name: "echo", model: "m", extraBody }).extraBody).toBeUndefined();
     expect(normalizeProvider({ name: "codex", model: "m", extraBody }).extraBody).toBeUndefined();
+  });
+
+  test("normalizeProvider applies azure defaults: api-key auth, GA api-version, AZURE_OPENAI_API_KEY env", () => {
+    const provider = normalizeProvider({ name: "azure", model: "gpt-4o", baseUrl: "https://r.openai.azure.com" });
+    expect(provider.name).toBe("azure");
+    expect(provider.model).toBe("gpt-4o");
+    expect(provider.baseUrl).toBe("https://r.openai.azure.com");
+    expect(provider.apiKeyEnv).toBe("AZURE_OPENAI_API_KEY");
+    expect(provider.apiVersion).toBe("2024-10-21");
+    expect(provider.authScheme).toBe("api-key");
+    // deployment is not carried unless explicitly set (defaults to model at the URL).
+    expect(provider.deployment).toBeUndefined();
+    // The no-model default matches the azure catalog's first model (gpt-5.5),
+    // keeping the CLI/runtime default in lockstep with the UI's pre-selected one.
+    expect(normalizeProvider({ name: "azure", model: "" }).model).toBe("gpt-5.5");
+  });
+
+  test("normalizeProvider azure honors explicit deployment, api-version, and bearer scheme", () => {
+    const provider = normalizeProvider({
+      name: "azure",
+      model: "gpt-5.5",
+      baseUrl: "https://r.openai.azure.com",
+      deployment: "my-deploy",
+      apiVersion: "2025-04-01-preview",
+      authScheme: "bearer"
+    });
+    expect(provider.deployment).toBe("my-deploy");
+    expect(provider.apiVersion).toBe("2025-04-01-preview");
+    expect(provider.authScheme).toBe("bearer");
+  });
+
+  test("azure tool-calling routes to the deployment-scoped URL with the api-key header", async () => {
+    const original = process.env.AZURE_OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.AZURE_OPENAI_API_KEY = "azure-test-key";
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "az_1",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as unknown as typeof fetch;
+    try {
+      const provider = normalizeProvider({ name: "azure", model: "gpt-4o", baseUrl: "https://r.openai.azure.com" });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(captured?.url).toBe("https://r.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21");
+      const headers = new Headers(captured!.init!.headers as HeadersInit);
+      expect(headers.get("api-key")).toBe("azure-test-key");
+      expect(headers.get("authorization")).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = original;
+    }
+  });
+
+  test("azure tool-calling uses an explicit deployment in the path and omits prompt_cache_retention", async () => {
+    const original = process.env.AZURE_OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.AZURE_OPENAI_API_KEY = "azure-test-key";
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "az_2",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as unknown as typeof fetch;
+    try {
+      const provider = normalizeProvider({
+        name: "azure", model: "gpt-5.5", baseUrl: "https://r.openai.azure.com/",
+        deployment: "prod-deploy", apiVersion: "2025-04-01-preview"
+      });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(captured?.url).toBe("https://r.openai.azure.com/openai/deployments/prod-deploy/chat/completions?api-version=2025-04-01-preview");
+      const sent = JSON.parse(String(captured!.init!.body));
+      // Azure rejects prompt_cache_retention:"in_memory" on some deployments
+      // (gpt-5.x require the 24h tier), so the runtime omits the field for azure.
+      expect(sent.prompt_cache_retention).toBeUndefined();
+      // The model id stays the real model; the deployment is the routing key.
+      expect(sent.model).toBe("gpt-5.5");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = original;
+    }
+  });
+
+  test("azure bearer scheme sends Authorization: Bearer for an Entra token", async () => {
+    const original = process.env.AZURE_OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.AZURE_OPENAI_API_KEY = "entra-token";
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "az_3",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as unknown as typeof fetch;
+    try {
+      const provider = normalizeProvider({ name: "azure", model: "gpt-4o", baseUrl: "https://r.openai.azure.com", authScheme: "bearer" });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      const headers = new Headers(captured!.init!.headers as HeadersInit);
+      expect(headers.get("authorization")).toBe("Bearer entra-token");
+      expect(headers.get("api-key")).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = original;
+    }
+  });
+
+  test("azure is configured only as the active provider with a valid https baseUrl", () => {
+    const prev = process.env.AZURE_OPENAI_API_KEY;
+    process.env.AZURE_OPENAI_API_KEY = "az-key";
+    try {
+      // Env key alone, azure NOT the active provider → not configured (its
+      // baseUrl isn't persisted, so the row would be a dead-end switch).
+      expect(isProviderConfigured("azure", "openai", undefined, undefined)).toBe(false);
+      // Azure active but no baseUrl → not configured.
+      expect(isProviderConfigured("azure", "azure", "AZURE_OPENAI_API_KEY", "")).toBe(false);
+      // Azure active with an http baseUrl → not configured (credential leak).
+      expect(isProviderConfigured("azure", "azure", "AZURE_OPENAI_API_KEY", "http://r.openai.azure.com")).toBe(false);
+      // Azure active with a valid https baseUrl + key → configured.
+      expect(isProviderConfigured("azure", "azure", "AZURE_OPENAI_API_KEY", "https://r.openai.azure.com")).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = prev;
+    }
+  });
+
+  test("providerHealth reports azure configured only with a valid https endpoint", () => {
+    const prev = process.env.AZURE_OPENAI_API_KEY;
+    process.env.AZURE_OPENAI_API_KEY = "az-key";
+    try {
+      const valid = providerHealth(config({ name: "azure", model: "gpt-4o", baseUrl: "https://r.openai.azure.com" }));
+      expect(valid.configured).toBe(true);
+      // Same valid-endpoint gate as isProviderConfigured, so /setup/status agrees
+      // with the catalog and never advertises an azure config with no baseUrl.
+      const noBase = providerHealth(config({ name: "azure", model: "gpt-4o", baseUrl: "" }));
+      expect(noBase.configured).toBe(false);
+      expect(noBase.message).toContain("baseUrl");
+    } finally {
+      if (prev === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = prev;
+    }
+  });
+
+  test("non-azure providers stay configured from their env var alone", () => {
+    const prev = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-x";
+    try {
+      // openai has a working default endpoint, so the env key is enough even
+      // when it isn't the active provider.
+      expect(isProviderConfigured("openai", "azure", undefined, undefined)).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prev;
+    }
+  });
+
+  test("azure task summary routes through chat-completions, not /responses", async () => {
+    const original = process.env.AZURE_OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.AZURE_OPENAI_API_KEY = "azure-test-key";
+    let capturedUrl: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "az_sum",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "done" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as unknown as typeof fetch;
+    try {
+      const provider = normalizeProvider({ name: "azure", model: "gpt-4o", baseUrl: "https://r.openai.azure.com" });
+      const result = await generateTaskSummary(config(provider), "summarize");
+      expect(capturedUrl).toBe("https://r.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21");
+      expect(result.text).toBe("done");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = original;
+    }
   });
 
   test("local tool-calling merges extraBody into the chat-completions request body", async () => {
@@ -2819,6 +3006,50 @@ describe("provider", () => {
     }
   });
 
+  // Baseline demonstration of the caching posture: Gini relies on automatic
+  // prefix caching (the pinned in_memory tier), NOT Anthropic-style explicit
+  // markers. On this representative OpenAI-compatible chat-completions request
+  // the body carries no `cache_control` field — the system message is a plain
+  // string and the messages are sent verbatim. This pins the "automatic only"
+  // decision from ADR stable-system-prefix.md so a future refactor can't
+  // silently start emitting dead Anthropic-shaped breakpoints (no provider in
+  // the catalog speaks the Anthropic Messages API).
+  test("openai chat-completions emits no Anthropic cache_control markers", async () => {
+    const original = process.env.OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "test-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "resp_no_cc",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "openai", model: "gpt-test" });
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "system", content: "stable prefix" }, { role: "user", content: "hi" }],
+        []
+      );
+      const rawBody = String(captured!.init!.body);
+      expect(rawBody).not.toContain("cache_control");
+      const sent = JSON.parse(rawBody);
+      // Automatic caching is on (the tier is pinned)...
+      expect(sent.prompt_cache_retention).toBe("in_memory");
+      // ...and the system message is a plain string, not a content-parts
+      // array carrying an ephemeral breakpoint.
+      expect(typeof sent.messages[0].content).toBe("string");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = original;
+    }
+  });
+
   test("openai structured chat-completions pins prompt_cache_retention to in_memory", async () => {
     const original = process.env.OPENAI_API_KEY;
     const originalFetch = globalThis.fetch;
@@ -3067,6 +3298,84 @@ describe("provider", () => {
       restore();
     }
   });
+
+  test("codex structured /responses omits prompt_cache_retention", async () => {
+    const { restore } = installCodexAuth("codex-pcr-omit-structured");
+    const originalFetch = globalThis.fetch;
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "{\"ok\":true}" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r_pcr_codex_structured", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      await generateStructured(config(provider), {
+        system: "be brief",
+        user: "say ok",
+        schemaName: "Ok",
+        validator: { parse: (v) => v as { ok: boolean } }
+      });
+      expect(captured?.url.endsWith("/responses")).toBe(true);
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex vision /responses omits prompt_cache_retention", async () => {
+    const { restore } = installCodexAuth("codex-pcr-omit-vision");
+    const originalFetch = globalThis.fetch;
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_pcr_codex_vision",
+        output: [
+          { id: "msg_1", type: "message", content: [{ type: "output_text", text: "described." }] }
+        ],
+        usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 }
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      await generateVisionAnalysis(config(provider), {
+        prompt: "what is shown?",
+        imageBase64: "AAAA",
+        mimeType: "image/png"
+      });
+      expect(captured?.url.endsWith("/responses")).toBe(true);
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
 });
 
 // Install a temporary CODEX_AUTH_JSON pointing at a fake auth.json. Tests
@@ -3152,6 +3461,7 @@ describe("auth-error classification", () => {
     expect(providerDisplayLabel("openai")).toBe("OpenAI");
     expect(providerDisplayLabel("openrouter")).toBe("OpenRouter");
     expect(providerDisplayLabel("deepseek")).toBe("DeepSeek");
+    expect(providerDisplayLabel("azure")).toBe("Azure OpenAI");
     expect(providerDisplayLabel("local")).toBe("Local");
     expect(providerDisplayLabel("echo")).toBe("Gini Echo");
   });
@@ -3164,6 +3474,7 @@ describe("auth-error classification", () => {
     expect(providerReauth("openai")).toEqual({ kind: "settings", url: "/settings" });
     expect(providerReauth("deepseek")).toEqual({ kind: "settings", url: "/settings" });
     expect(providerReauth("openrouter")).toEqual({ kind: "settings", url: "/settings" });
+    expect(providerReauth("azure")).toEqual({ kind: "settings", url: "/settings" });
     expect(providerReauth("local")).toEqual({ kind: "settings", url: "/settings" });
   });
 
