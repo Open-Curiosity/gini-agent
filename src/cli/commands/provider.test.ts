@@ -403,6 +403,40 @@ describe("provider CLI", () => {
     expect(msg).toContain("openrouter provider");
   });
 
+  test("--aws-region warns on a non-bedrock provider", async () => {
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx(["provider", "set", "openai", "m", "--aws-region", "us-west-2"]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    const msg = captured.join("");
+    expect(msg).toContain("--aws-region");
+    expect(msg).toContain("openai provider");
+  });
+
+  test("bedrock with --aws-region emits NO aws-region warning", async () => {
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx(["provider", "set", "bedrock", "us.amazon.nova-lite-v1:0", "--aws-region", "us-west-2"]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    expect(captured.join("")).not.toContain("--aws-region is ignored");
+  });
+
   test("azure with its routing flags emits NO azure warning", async () => {
     const captured: string[] = [];
     const original = process.stderr.write.bind(process.stderr);

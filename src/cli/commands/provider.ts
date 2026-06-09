@@ -119,6 +119,7 @@ export async function provider(ctx: CliContext): Promise<void> {
       if (apiVersion !== undefined) ignored.push("--api-version");
       if (deployment !== undefined) ignored.push("--deployment");
       if (authSchemeRaw !== undefined) ignored.push("--auth-scheme");
+      if (awsRegion !== undefined) ignored.push("--aws-region");
       if (ignored.length > 0) {
         process.stderr.write(`gini: warning — ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored for the echo provider; echo bypasses HTTP entirely.\n`);
       }
@@ -144,6 +145,13 @@ export async function provider(ctx: CliContext): Promise<void> {
       if (azureIgnored.length > 0) {
         process.stderr.write(`gini: warning — ${azureIgnored.join(", ")} ${azureIgnored.length > 1 ? "are" : "is"} ignored for the ${name} provider; Azure routing applies only to the azure provider.\n`);
       }
+    }
+
+    // --aws-region only pins the bedrock provider's Converse signing
+    // region/endpoint; normalizeProvider drops it for everyone else. Warn so a
+    // misplaced flag isn't silently ignored (echo is already covered above).
+    if (name !== "bedrock" && name !== "echo" && awsRegion !== undefined) {
+      process.stderr.write(`gini: warning — --aws-region is ignored for the ${name} provider; it applies only to the bedrock provider.\n`);
     }
 
     // Azure needs a real https resource endpoint on every call.
