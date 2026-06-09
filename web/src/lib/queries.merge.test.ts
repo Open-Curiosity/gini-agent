@@ -51,10 +51,10 @@ describe("mergeSeedWithLive", () => {
     expect(merged.map((b) => b.id)).toEqual(["seed-1", "live-1"]);
   });
 
-  test("prev (live) wins on id collision", () => {
-    // The same assistant block id is in both. The live copy has the
-    // fresher streaming text — the merge must keep it, not regress
-    // to the seed's older copy.
+  test("prev (live) wins on id collision when timestamps tie", () => {
+    // The same assistant block id is in both, with equal updatedAt. The
+    // live copy has the fresher streaming text — on a tie the merge keeps
+    // `prev`, so it must not regress to the seed's older copy.
     const seedCopy = assistantBlock("a1", 1, "stale", false);
     const liveCopy = assistantBlock("a1", 1, "fresh streaming...", true);
     const merged = mergeSeedWithLive([seedCopy], [liveCopy]);
@@ -62,6 +62,27 @@ describe("mergeSeedWithLive", () => {
     const only = merged[0] as AssistantTextBlock;
     expect(only.text).toBe("fresh streaming...");
     expect(only.streaming).toBe(true);
+  });
+
+  test("freshest committed copy wins — a recovery refetch replaces a stale streaming block", () => {
+    // Recovery case: the live `prev` holds a stranded streaming:true
+    // block (the terminal SSE frame was missed) with an EARLIER
+    // updatedAt; the refetched durable copy is finalized (streaming:false,
+    // full text) with a LATER updatedAt. Freshest-wins must keep the
+    // finalized copy so the blinking cursor / "Thinking" clears.
+    const stale: AssistantTextBlock = {
+      ...assistantBlock("a1", 1, "partial answer so far", true),
+      updatedAt: "2026-05-28T00:00:01.000Z"
+    };
+    const finalized: AssistantTextBlock = {
+      ...assistantBlock("a1", 1, "the full finalized answer", false),
+      updatedAt: "2026-05-28T00:00:05.000Z"
+    };
+    const merged = mergeSeedWithLive([finalized], [stale]);
+    expect(merged).toHaveLength(1);
+    const only = merged[0] as AssistantTextBlock;
+    expect(only.text).toBe("the full finalized answer");
+    expect(only.streaming).toBe(false);
   });
 
   test("sorts by ordinal regardless of input order", () => {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import type {
@@ -324,21 +324,68 @@ export function useDeleteChatSession() {
 //     a stable id, so the same upsert path covers them.
 //   - All other kinds are append-only, but the merge logic is uniform.
 
-// Merge the REST seed snapshot with whatever's already in state. A live
-// SSE frame can arrive BEFORE the seed promise resolves; a naive
-// setBlocks(seed) would wipe it. For id collisions, prev (live) wins
-// because the live frame is fresher than the REST snapshot — assistant
-// streaming deltas in particular keep updating the same block id, and
-// the seed's older copy would visibly clobber the running total.
+// The block's wall-clock freshness. ChatBlockBase always carries
+// `createdAt`; only `assistant_text` and `tool_call` add `updatedAt`,
+// which advances on every streaming delta / status flip. The
+// `"updatedAt" in b` guard narrows the union safely — kinds without it
+// fall back to `createdAt`.
+function blockTimestamp(b: ChatBlock): string {
+  return "updatedAt" in b ? b.updatedAt : b.createdAt;
+}
+
+// Merge an `incoming` snapshot with whatever's already in state, used by
+// BOTH the initial seed fetch and the recovery refetch (one function so
+// the two paths reconcile identically). A live SSE frame can arrive
+// BEFORE the seed promise resolves; a naive setBlocks(incoming) would
+// wipe it. So we merge by id and pick the FRESHEST committed copy: on an
+// id collision keep the block whose timestamp (`updatedAt ?? createdAt`)
+// is STRICTLY GREATER, and on a TIE keep `prev` (the live frame).
+//
+// Why freshest-wins matters: during normal streaming the live `prev`
+// copy is at least as fresh as the seed (equal or later updatedAt), so
+// the tie/greater rules keep the running total and never regress to the
+// seed's older text. But on a RECOVERY refetch the durable list can be
+// fresher than a stranded live frame — if the terminal SSE was missed,
+// `prev` still holds a stale `streaming:true` assistant block while the
+// refetched copy is the finalized `streaming:false` one with a later
+// updatedAt. Freshest-wins lets that finalized copy replace the stale
+// cursor; ties still favor the live frame so steady-state streaming is
+// unaffected. New ids from either side are kept; sort by ordinal.
 // Exported for unit testing the merge-vs-replace behavior.
 export function mergeSeedWithLive(seed: ChatBlock[], prev: ChatBlock[]): ChatBlock[] {
   const merged = new Map<string, ChatBlock>();
   for (const b of seed) merged.set(b.id, b);
-  for (const b of prev) merged.set(b.id, b);
+  for (const b of prev) {
+    const existing = merged.get(b.id);
+    // Keep `prev` on a tie (>=), so the live frame wins when timestamps
+    // match; only an older `prev` yields to a strictly-fresher seed copy.
+    if (!existing || blockTimestamp(b) >= blockTimestamp(existing)) merged.set(b.id, b);
+  }
   // Sort defensively — the server returns ordinal-asc, but a future
   // server-side change shouldn't silently re-order the UI, and the
   // merge can interleave seed+live arbitrarily.
   return [...merged.values()].sort((a, b) => a.ordinal - b.ordinal);
+}
+
+// Phase labels the runtime emits as the final block of a task; a
+// non-terminal latest phase means a task is still in flight.
+export const TERMINAL_PHASE_LABELS = new Set(["Completed", "Cancelled", "Failed"]);
+
+// The task id of the latest in-flight turn in `blocks`, or null when the
+// transcript is quiescent. Scan from the end: the first `phase` block
+// decides it (null when terminal, else its taskId); a `tool_call` still
+// `running` also marks an in-flight turn. Shared by the chat page's
+// in-flight detection and the poll-while-active gate in useChatBlocks.
+export function latestInFlightTaskId(blocks: ChatBlock[]): string | null {
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i]!;
+    if (b.kind === "phase") {
+      if (TERMINAL_PHASE_LABELS.has(b.label)) return null;
+      return b.taskId ?? null;
+    }
+    if (b.kind === "tool_call" && b.status === "running") return b.taskId ?? null;
+  }
+  return null;
 }
 
 // The SSE stream auto-attaches Last-Event-ID on browser-driven reconnects.
@@ -355,6 +402,36 @@ export function useChatBlocks(sessionId: string | null) {
   // EventSource because the closed-over id no longer matches.
   const activeSessionRef = useRef<string | null>(sessionId);
   activeSessionRef.current = sessionId;
+
+  // Guards a late refetch resolve from setting state after unmount. The
+  // sessionId match below already drops cross-session writes; this drops
+  // the post-unmount case too.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // Silent reconciliation against durable state. GETs the current block
+  // list and merges it into state via mergeSeedWithLive, so a refetch can
+  // replace a stranded `streaming:true` block with the finalized copy
+  // (freshest-wins) without disturbing live frames. Deliberately does NOT
+  // touch isLoading, and swallows errors: a transient poll failure must
+  // never surface an error or blow away the loaded transcript. The
+  // session match (and mountedRef) drop a resolve that lands after the
+  // user switched chats or the component unmounted.
+  const refetch = useCallback(() => {
+    const sid = activeSessionRef.current;
+    if (!sid) return;
+    api<ChatBlock[]>(`/chat/${sid}/blocks`)
+      .then((list) => {
+        if (!mountedRef.current || activeSessionRef.current !== sid) return;
+        setBlocks((prev) => mergeSeedWithLive(list, prev));
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     // Reset on EVERY sessionId change, not just null transitions. Caller
@@ -435,7 +512,37 @@ export function useChatBlocks(sessionId: string | null) {
     };
   }, [sessionId]);
 
-  return { blocks, isLoading, error };
+  // Poll while a task is in flight. The EventSource auto-reconnect is the
+  // primary path; this is the safety net for a half-open/zombie stream
+  // (readyState stays OPEN so onerror never fires) that drops the
+  // terminal frame and strands the UI on "Thinking". 3s matches the
+  // session-list / agent-chat cadence; clears once terminal or the
+  // session changes.
+  const active = useMemo(() => latestInFlightTaskId(blocks) !== null, [blocks]);
+  useEffect(() => {
+    if (!sessionId || !active) return;
+    const id = setInterval(refetch, 3000);
+    return () => clearInterval(id);
+  }, [sessionId, active, refetch]);
+
+  // Recover on tab focus / visibility regained. A backgrounded tab (e.g.
+  // during screensharing) is exactly where the SSE goes zombie; refetch
+  // on return reconciles immediately rather than waiting for the next
+  // poll tick.
+  useEffect(() => {
+    if (!sessionId) return;
+    const onVis = () => {
+      if (document.visibilityState === "visible") refetch();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("focus", refetch);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", refetch);
+    };
+  }, [sessionId, refetch]);
+
+  return { blocks, isLoading, error, refetch };
 }
 
 // The single canonical chat for an agent. Resolves via
