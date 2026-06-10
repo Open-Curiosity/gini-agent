@@ -1313,6 +1313,13 @@ export interface EmailWatcherRecord {
   // Validated at write time (trimmed, capped); never sourced from email
   // content.
   objective?: string;
+  // Gmail thread id for a THREAD-KEYED watch ("watch this conversation").
+  // Ticket systems rotate sending addresses (support@x.com replies arrive
+  // from case-123@x.zendesk.com), so the thread — not a sender query — is the
+  // durable unit. Mode is derived: threadId set => thread watch (this field
+  // is authoritative for detection; `query` holds a human-readable
+  // `thread:<id>` label only); unset => query watch.
+  threadId?: string;
   // Optional Gmail label ids to scope the query. Unused in v1.
   labelIds?: string[];
   // Dedicated chat session the woken turn posts its proposed reply into.

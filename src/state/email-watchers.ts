@@ -84,7 +84,8 @@ function buildWatch(watcher: EmailWatcherRecord): Record<string, unknown> {
     query: watcher.query,
     ...(watcher.accountEmail ? { account: watcher.accountEmail } : {}),
     ...(watcher.sender ? { sender: watcher.sender } : {}),
-    ...(watcher.objective ? { objective: watcher.objective } : {})
+    ...(watcher.objective ? { objective: watcher.objective } : {}),
+    ...(watcher.threadId ? { threadId: watcher.threadId } : {})
   };
 }
 
@@ -136,6 +137,9 @@ export interface AddEmailWatcherInput {
   account?: string;
   // The user's standing goal for this watch (validated: trimmed, capped).
   objective?: string;
+  // Watch one specific Gmail conversation by thread id (thread mode; wins
+  // over `sender` for detection — `query` becomes a `thread:<id>` label).
+  threadId?: string;
   // Owning agent for the watcher + its dedicated chat session. Threaded by
   // internal callers (the email_watch tool) so the woken turns attribute to
   // the originating agent; the HTTP path leaves it to the active agent.
@@ -160,15 +164,18 @@ export function validateObjective(value: unknown): string {
   return trimmed;
 }
 
-// Build the Gmail query for a watcher: a raw query wins; otherwise
-// `from:<sender>`; otherwise the whole inbox. No `is:unread` in the auto-built
-// shapes: the `after:` watermark + boundary seen set already define newness,
-// and `is:unread` loses any mail the user reads on another device before the
+// Build the Gmail query for a watcher: a raw query wins; a thread watch gets
+// a human-readable `thread:<id>` LABEL (threadId is authoritative for
+// detection, the query is display-only there); otherwise `from:<sender>`;
+// otherwise the whole inbox. No `is:unread` in the auto-built shapes: the
+// `after:` watermark + boundary seen set already define newness, and
+// `is:unread` loses any mail the user reads on another device before the
 // ~60s poll tick (read-elsewhere race). The no-sender default is `in:inbox`,
 // never the empty string — an empty Gmail q lists EVERYTHING (sent, spam,
 // trash), which would trigger on our own outbound mail's listing.
-export function buildWatcherQuery(input: { sender?: string; query?: string }): string {
+export function buildWatcherQuery(input: { sender?: string; query?: string; threadId?: string }): string {
   if (input.query) return input.query;
+  if (input.threadId) return `thread:${input.threadId}`;
   if (input.sender) return `from:${input.sender}`;
   return "in:inbox";
 }
@@ -184,14 +191,18 @@ export async function addEmailWatcher(
   config: RuntimeConfig,
   input: AddEmailWatcherInput
 ): Promise<EmailWatcherRecord> {
-  const query = buildWatcherQuery(input);
-  // Persist the explicitly watched sender only when it actually drove the
-  // query (a raw `query` wins and makes this a raw-query watch — no single
-  // sender, so the automated-sender heuristic stays on).
-  const sender = input.query ? undefined : input.sender;
   // Validate BEFORE provisioning so a rejected input can't leave an orphan
   // shared job/session behind.
+  const threadId = input.threadId?.trim();
+  if (input.threadId !== undefined && !threadId) {
+    throw new Error("Invalid input: threadId must be a non-empty string.");
+  }
   const objective = input.objective !== undefined ? validateObjective(input.objective) : undefined;
+  const query = buildWatcherQuery({ ...input, threadId });
+  // Persist the explicitly watched sender only when it actually drove the
+  // query (a raw `query` or a thread watch wins over `sender` — no single
+  // sender drives detection, so the heuristic-bypass key doesn't apply).
+  const sender = input.query || threadId ? undefined : input.sender;
 
   // Ensure the shared job + session before creating the record, so the new
   // watcher points at them and the rebuild below has a job to update.
@@ -206,6 +217,7 @@ export async function addEmailWatcher(
       query,
       ...(sender ? { sender } : {}),
       ...(objective ? { objective } : {}),
+      ...(threadId ? { threadId } : {}),
       chatSessionId: shared.chatSessionId,
       jobId: shared.jobId,
       enabled: true,

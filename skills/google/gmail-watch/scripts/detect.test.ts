@@ -454,6 +454,164 @@ describe("detect — regimes", () => {
   });
 });
 
+describe("detect — thread mode", () => {
+  // A `threads get format=metadata` response: the whole conversation's
+  // message metadata in one document.
+  function threadResponse(threadId: string, metas: Meta[]): string {
+    return (
+      PREAMBLE +
+      JSON.stringify({
+        id: threadId,
+        messages: metas.map((m) => ({
+          id: m.id,
+          threadId,
+          internalDate: m.internalDate,
+          snippet: m.snippet ?? "",
+          payload: {
+            headers: [
+              { name: "From", value: m.from ?? "" },
+              { name: "Subject", value: m.subject ?? "" },
+              { name: "Date", value: m.date ?? "" }
+            ]
+          }
+        }))
+      })
+    );
+  }
+
+  function threadSpawn(threadId: string, metas: Meta[]): GwsSpawn {
+    return async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("threads get")) return threadResponse(threadId, metas);
+      return PREAMBLE + "{}";
+    };
+  }
+
+  test("fetches the thread via a metadata-level threads get", async () => {
+    const calls: string[] = [];
+    const spawn: GwsSpawn = async (args) => {
+      calls.push(args.join(" "));
+      return threadResponse("t-1", []);
+    };
+    await detect({ query: "thread:t-1", threadId: "t-1", state: null }, spawn, "me@example.com");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("gmail users threads get");
+    expect(calls[0]).toContain('"id":"t-1"');
+    expect(calls[0]).toContain('"format":"metadata"');
+    // Metadata only — never bodies.
+    expect(calls[0]).toContain('"metadataHeaders":["From","Subject","Date"]');
+  });
+
+  test("seeding baselines at the newest thread message, drafts nothing", async () => {
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case opened" },
+      { id: "m2", internalDate: "2000", from: "me@example.com", subject: "re: case" }
+    ]);
+    const r = await detect({ query: "thread:t-1", threadId: "t-1", state: null }, spawn, "me@example.com");
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.cursor).toBe("2000");
+    expect(r.state.seen).toEqual(["m2"]);
+    expect(r.state.status).toBe("ok");
+  });
+
+  test("a rotated automated address triggers (no automated filter); self never does", async () => {
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      // The ticket system replies from a rotated no-reply address — exactly
+      // what a thread watch exists to catch.
+      { id: "m2", internalDate: "3000", from: "Case 123 <no-reply@case-123.x.zendesk.com>", subject: "update", snippet: "we shipped it" },
+      // Our own reply advances the cursor but never triggers.
+      { id: "m3", internalDate: "4000", from: "Me <me@example.com>", subject: "re: update" }
+    ]);
+    const r = await detect(
+      { query: "thread:t-1", threadId: "t-1", state: { cursor: "1000", seen: ["m1"] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(matchCount(r.items)).toBe(1);
+    expect(draftedIds(r.items)).toEqual(["m2"]);
+    // The match payload carries the thread id so the drafting turn reads the
+    // full conversation.
+    expect(itemPayload(r.items![0]!.text).threadId).toBe("t-1");
+    // Cursor advanced past our own reply too.
+    expect(r.state.cursor).toBe("4000");
+    expect(r.state.seen).toEqual(["m3"]);
+  });
+
+  test("a self-only new message advances the cursor silently", async () => {
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: "5000", from: "me@example.com", subject: "our reply" }
+    ]);
+    const r = await detect(
+      { query: "thread:t-1", threadId: "t-1", state: { cursor: "1000", seen: ["m1"] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("shortCircuit");
+    expect(r.state.cursor).toBe("5000");
+  });
+
+  test("a matched thread tick appends the trusted objective item with a thread label", async () => {
+    const spawn = threadSpawn("t-9", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: "2000", from: "agent@x.zendesk.com", subject: "offer" }
+    ]);
+    const r = await detect(
+      { query: "thread:t-9", threadId: "t-9", objective: "Get a full refund", state: { cursor: "1000", seen: ["m1"] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    const trusted = r.items!.filter((i) => !i.untrusted);
+    expect(trusted).toHaveLength(1);
+    expect(trusted[0]!.text).toBe("Objective for this watch (thread:t-9): Get a full refund");
+  });
+
+  test("thread detection is at-least-once: old state re-detects, new state goes silent", async () => {
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: "2000", from: "bot@x.zendesk.com", subject: "update" }
+    ]);
+    const oldState = { cursor: "1000", seen: ["m1"] };
+    const r1 = await detect({ query: "thread:t-1", threadId: "t-1", state: oldState }, spawn, "me@example.com");
+    expect(draftedIds(r1.items)).toEqual(["m2"]);
+    // Commit skipped => re-run with the old state re-detects the same message.
+    const r2 = await detect({ query: "thread:t-1", threadId: "t-1", state: oldState }, spawn, "me@example.com");
+    expect(draftedIds(r2.items)).toEqual(["m2"]);
+    // Committed state => silent.
+    const r3 = await detect({ query: "thread:t-1", threadId: "t-1", state: r1.state }, spawn, "me@example.com");
+    expect(r3.kind).toBe("shortCircuit");
+  });
+
+  test("runWatches routes a thread watch through thread detection", async () => {
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("threads get")) {
+        return threadResponse("t-1", [
+          { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+          { id: "m2", internalDate: "2000", from: "no-reply@case-1.x.zendesk.com", subject: "update" }
+        ]);
+      }
+      throw new Error(`unexpected gws call: ${joined}`);
+    };
+    const r = await runWatches(
+      {
+        watches: [{ watcherId: "w-t", query: "thread:t-1", threadId: "t-1" }],
+        state: { byWatcher: { "w-t": { cursor: "1000", seen: ["m1"] } } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual(["m2"]);
+    expect(r.state.byWatcher["w-t"]!.cursor).toBe("2000");
+    expect(r.state.byWatcher["w-t"]!.status).toBe("ok");
+  });
+});
+
 describe("run — health in state", () => {
   test("signed-out tick emits status:needs_auth with cursor/seen unchanged", async () => {
     const signedOut: GwsSpawn = async (args) => {

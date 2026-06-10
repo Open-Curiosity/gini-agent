@@ -82,6 +82,11 @@ interface DetectArgs {
   // emitted as ONE TRUSTED item on ticks where this watch matches, NEVER
   // inside the untrusted fence, and never sourced from email content.
   objective?: string;
+  // Thread mode: watch this Gmail conversation by thread id (authoritative
+  // for detection; `query` is a display label there). No automated-sender
+  // heuristic in thread mode — ticket-bot replies are exactly what's watched;
+  // self-drop stays mandatory.
+  threadId?: string;
   state?: DetectState | null;
 }
 
@@ -96,6 +101,7 @@ interface Watch {
   account?: string;
   sender?: string;
   objective?: string;
+  threadId?: string;
 }
 
 // The shared job's multi-watch input: the list of enabled watches + the opaque
@@ -118,6 +124,7 @@ interface DetectResultMulti {
 
 interface EmailMetadata {
   id: string;
+  threadId?: string;
   internalDate?: string; // epoch ms, as gws returns it
   from?: string;
   subject?: string;
@@ -217,6 +224,20 @@ function buildProfileArgs(): string[] {
   return ["gmail", "users", "getProfile", "--params", jsonParam({ userId: "me" })];
 }
 
+// Fetch a watched thread's message METADATA (never bodies) in one call — the
+// same raw-API shape as `messages get`, rooted at the `threads` resource.
+function buildThreadGetArgs(threadId: string): string[] {
+  return [
+    "gmail", "users", "threads", "get",
+    "--params", jsonParam({
+      userId: "me",
+      id: threadId,
+      format: "metadata",
+      metadataHeaders: ["From", "Subject", "Date"]
+    })
+  ];
+}
+
 // gws prints a "Using keyring backend: keyring" preamble to STDERR before the
 // JSON. With the concurrent stdout/stderr drain stdout begins at the first `{`;
 // the leading-`{` skip below is a defensive guard. Returns undefined on any parse
@@ -269,11 +290,11 @@ function parseMessageWindow(stdout: string): MessageListWindow {
   return { ids, pageLimitHit: pages >= WINDOW_PAGE_LIMIT && lastPageHadToken };
 }
 
-// Parse a `messages get format=metadata` response into EmailMetadata.
-function parseMessageMetadata(stdout: string, id: string): EmailMetadata {
-  const doc = parseGwsJson(stdout);
+// Map one message document (a `messages get` response, or one entry of a
+// thread's `messages[]`) onto EmailMetadata.
+function metadataFromDoc(doc: Record<string, unknown>, id: string): EmailMetadata {
   const meta: EmailMetadata = { id };
-  if (!doc) return meta;
+  if (typeof doc.threadId === "string") meta.threadId = doc.threadId;
   if (typeof doc.internalDate === "string") meta.internalDate = doc.internalDate;
   if (typeof doc.snippet === "string") meta.snippet = doc.snippet;
   const payload = doc.payload as { headers?: unknown } | undefined;
@@ -291,6 +312,29 @@ function parseMessageMetadata(stdout: string, id: string): EmailMetadata {
     }
   }
   return meta;
+}
+
+// Parse a `messages get format=metadata` response into EmailMetadata.
+function parseMessageMetadata(stdout: string, id: string): EmailMetadata {
+  const doc = parseGwsJson(stdout);
+  return doc ? metadataFromDoc(doc, id) : { id };
+}
+
+// Parse a `threads get format=metadata` response into the thread's message
+// metadata list, skipping malformed entries. Order is normalized by the
+// caller (sorted by internalDate).
+function parseThreadMessages(stdout: string): EmailMetadata[] {
+  const doc = parseGwsJson(stdout);
+  const messages = doc?.messages;
+  if (!Array.isArray(messages)) return [];
+  const out: EmailMetadata[] = [];
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    const id = (m as { id?: unknown }).id;
+    if (typeof id !== "string") continue;
+    out.push(metadataFromDoc(m as Record<string, unknown>, id));
+  }
+  return out;
 }
 
 // ── Error scrub (ported verbatim) ────────────────────────────────────────────
@@ -353,6 +397,9 @@ export function buildMatchItem(meta: EmailMetadata): ResultItem {
     subject: meta.subject ?? "(none)",
     date: meta.date ?? "(unknown)",
     id: meta.id,
+    // The containing thread, when known — the drafting turn reads the FULL
+    // thread (the ground truth of the conversation), not just this message.
+    ...(meta.threadId ? { threadId: meta.threadId } : {}),
     snippet: meta.snippet ?? ""
   });
   return { text: `New email from ${from} — ${payload}`, untrusted: true };
@@ -428,6 +475,8 @@ export async function detect(
   gwsSpawn: GwsSpawn,
   selfEmail: string | undefined
 ): Promise<DetectResult> {
+  // Thread mode keys detection on the thread itself, not a Gmail query.
+  if (args.threadId) return detectThread(args, gwsSpawn, selfEmail);
   const stateIn: DetectState = args.state ?? {};
   const cursorIn = stateIn.cursor;
   const seenIn = new Set(stateIn.seen ?? []);
@@ -558,6 +607,67 @@ export async function detect(
   // Surviving matches: the caller persists this state ONLY after the drafting
   // turn dispatches (the context => deferred timing), so a dispatch failure
   // leaves the old cursor and the matches re-trigger next tick (at-least-once).
+  return { kind: "context", items, state: { cursor: newCursor, seen: seenOut, status: "ok" } };
+}
+
+// Run detection for ONE thread-keyed watch. Ticket systems rotate sending
+// addresses (support@x.com replies arrive from case-123@x.zendesk.com), so the
+// Gmail THREAD — not a sender query — is the durable unit of "watch this
+// conversation". One metadata-level `threads get` lists the whole conversation;
+// a NEW match is a message with internalDate > cursor, id not in `seen`, and
+// parsed From ≠ self. There is NO automated-sender heuristic here (replies
+// from ticket bots are exactly what's watched); self-drop stays mandatory (we
+// must never trigger on our own replies — they advance the cursor silently).
+// Seeding mirrors the query regime: baseline the cursor at the newest message
+// and draft nothing; `seen` records the ids at the exact cursor millisecond so
+// an equal-timestamp message isn't re-drafted. Same purity + at-least-once
+// contract: the new state rides back for the caller to persist.
+async function detectThread(
+  args: DetectArgs,
+  gwsSpawn: GwsSpawn,
+  selfEmail: string | undefined
+): Promise<DetectResult> {
+  const stateIn: DetectState = args.state ?? {};
+  const seenIn = new Set(stateIn.seen ?? []);
+  const messages = parseThreadMessages(await gwsSpawn(buildThreadGetArgs(args.threadId!)))
+    .sort((a, b) => (Number(a.internalDate) || 0) - (Number(b.internalDate) || 0));
+  const newest = messages[messages.length - 1];
+
+  // Seeding: baseline at the newest message in the thread, draft nothing
+  // (never draft the existing conversation as a backlog).
+  if (!stateIn.cursor) {
+    const baseline = newest?.internalDate ? Number(newest.internalDate) : 0;
+    const cursor = String(baseline > 0 ? baseline : Date.now());
+    const seen = messages.filter((m) => m.internalDate === cursor).map((m) => m.id);
+    return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor, seen, status: "ok" } };
+  }
+
+  const cursorMs = Number(stateIn.cursor) || 0;
+  let lastConsumed = cursorMs;
+  const items: ResultItem[] = [];
+  for (const m of messages) {
+    const internalDate = Number(m.internalDate) || 0;
+    if (internalDate <= cursorMs || seenIn.has(m.id)) continue;
+    const from = parseFromAddress(m.from ?? "");
+    // Our own reply advances the cursor but never triggers.
+    const isSelf = Boolean(selfEmail && from && from === selfEmail.toLowerCase());
+    if (!isSelf) items.push(buildMatchItem(m));
+    if (internalDate > lastConsumed) lastConsumed = internalDate;
+  }
+
+  const newCursor = String(lastConsumed);
+  // The ids at the new cursor's exact millisecond — an equal-timestamp sibling
+  // re-listed next tick isn't re-drafted.
+  const seenOut = messages.filter((m) => m.internalDate === newCursor).map((m) => m.id);
+
+  // A matched tick carries the watch's standing objective as ONE trusted item.
+  if (items.length > 0 && args.objective) {
+    items.push(buildObjectiveItem(`thread:${args.threadId}`, args.objective));
+  }
+
+  if (items.length === 0) {
+    return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor: newCursor, seen: seenOut, status: "ok" } };
+  }
   return { kind: "context", items, state: { cursor: newCursor, seen: seenOut, status: "ok" } };
 }
 
@@ -693,7 +803,14 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
     let result: DetectResult;
     try {
       result = await run(
-        { query: watch.query, account: watch.account, sender: watch.sender, objective: watch.objective, state: stateIn },
+        {
+          query: watch.query,
+          account: watch.account,
+          sender: watch.sender,
+          objective: watch.objective,
+          threadId: watch.threadId,
+          state: stateIn
+        },
         gwsSpawn,
         selfEmail
       );

@@ -1933,6 +1933,7 @@ async function emailWatchTool(
       id: w.id,
       query: w.query,
       sender: w.sender,
+      threadId: w.threadId,
       objective: w.objective,
       accountEmail: w.accountEmail,
       enabled: w.enabled,
@@ -2023,10 +2024,17 @@ async function emailWatchTool(
     }
     objective = args.objective;
   }
+  let threadId: string | undefined;
+  if (args.threadId !== undefined && args.threadId !== null) {
+    if (typeof args.threadId !== "string" || args.threadId.length === 0) {
+      throw new Error("Invalid input: threadId must be a non-empty string.");
+    }
+    threadId = args.threadId;
+  }
   // Inherit the originating task's agent so the watcher + its dedicated chat
   // session (and the future woken turns) attribute to the right agent.
   const owningAgentId = readState(config.instance).tasks.find((t) => t.id === taskId)?.agentId;
-  const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, objective, agentId: owningAgentId });
+  const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, objective, threadId, agentId: owningAgentId });
 
   appendTrace(config.instance, taskId, {
     type: "tool",

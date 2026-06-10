@@ -60,6 +60,9 @@ describe("buildWatcherQuery", () => {
   test("no sender/query falls back to in:inbox, never an empty q", () => {
     expect(buildWatcherQuery({})).toBe("in:inbox");
   });
+  test("threadId builds a thread:<id> label and wins over sender", () => {
+    expect(buildWatcherQuery({ threadId: "t-123", sender: "a@x.com" })).toBe("thread:t-123");
+  });
 });
 
 describe("watcher CRUD", () => {
@@ -110,6 +113,29 @@ describe("watcher CRUD", () => {
   test("remove on a missing watcher throws", async () => {
     const config = buildConfig("ew-remove-missing");
     await expect(removeEmailWatcher(config, "nope")).rejects.toThrow("Email watcher not found");
+  });
+});
+
+describe("thread-keyed watchers", () => {
+  test("add with threadId stores the id, a thread:<id> label, and no sender", async () => {
+    const config = buildConfig("ew-thread-add");
+    const watcher = await addEmailWatcher(config, { threadId: "t-123", sender: "support@x.com" });
+    expect(watcher.threadId).toBe("t-123");
+    expect(watcher.query).toBe("thread:t-123");
+    // Thread mode has no automated-sender heuristic, so no bypass key.
+    expect(watcher.sender).toBeUndefined();
+    // The shared job's watch entry carries the authoritative threadId.
+    const job = readState(config.instance).jobs.find(
+      (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+    );
+    const watches = (job?.preRunHook?.config as { watches?: { threadId?: string }[] }).watches ?? [];
+    expect(watches[0]?.threadId).toBe("t-123");
+  });
+
+  test("a blank threadId is rejected before provisioning", async () => {
+    const config = buildConfig("ew-thread-blank");
+    await expect(addEmailWatcher(config, { threadId: "  " })).rejects.toThrow("Invalid input: threadId");
+    expect(readState(config.instance).emailWatchers).toHaveLength(0);
   });
 });
 

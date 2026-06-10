@@ -1364,7 +1364,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         sender: typeof payload.sender === "string" ? payload.sender : undefined,
         query: typeof payload.query === "string" ? payload.query : undefined,
         account: typeof payload.account === "string" ? payload.account : undefined,
-        objective: typeof payload.objective === "string" ? payload.objective : undefined
+        objective: typeof payload.objective === "string" ? payload.objective : undefined,
+        threadId: typeof payload.threadId === "string" ? payload.threadId : undefined
       }), 201);
     }],
     ["DELETE", /^\/api\/email\/watchers\/([^/]+)$/, async (_request, params) => json(await removeEmailWatcher(config, params[0]))],
