@@ -282,7 +282,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "start_thread",
-      description: "Branch your reply into a thread off your previous message, keeping the main chat scannable. Call this as your FIRST action (before any text or other tool) when the user's message opens multi-turn work — research, brainstorming, debugging, planning, a comparison, anything you expect follow-ups about. Do nothing (reply in the main chat) for quick answers, confirmations, single facts, or one-shot actions. Never call it when you are already replying inside a thread.",
+      description: "Branch your reply into a thread off the user's message, keeping the main chat scannable. Call this as your FIRST action (before any text or other tool) when the user's message opens multi-turn work — research, brainstorming, debugging, planning, a comparison, anything you expect follow-ups about. Do nothing (reply in the main chat) for quick answers, confirmations, single facts, or one-shot actions. Never call it when you are already replying inside a thread.",
       parameters: {
         type: "object",
         properties: {
