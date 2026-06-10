@@ -68,7 +68,11 @@ therefore also persists a per-provider auth-failure record:
   1. a successful provider call in the chat-task loop (main loop AND the
      iteration-cap summary call) — guarded by a lock-free existence check
      (`clearProviderAuthFailureIfPresent`), so the common healthy path writes
-     no state;
+     no state, and by an evidence-recency check: the call site passes the
+     timestamp at which the successful call *started* (`evidenceFrom`), and
+     a record written at or after that moment survives the clear, since a
+     long call that authenticated before the token expired proves nothing
+     about the credential's current state;
   2. a successful provider-config write through the setup API
      (`setSetupProvider`) for that provider — this covers the Add Provider
      key form, key rotation, the Settings Edit dialog, `set_provider`
@@ -94,7 +98,10 @@ therefore also persists a per-provider auth-failure record:
   with the expiry time and a `codex login` instruction. The probe makes no
   network calls; an unparseable token means "expiry unknown", not unhealthy,
   and `OPENAI_API_KEY`-shaped credentials stay presence-only (no exp to
-  read).
+  read). A read that races the codex CLI's non-atomic auth.json rewrite
+  (flagged `transient` by the credential reader) is retried once after the
+  same rewrite-settle delay the chat path uses, so a re-probe landing inside
+  the rewrite window never flips an authenticated install unhealthy.
 
 ## Context
 
