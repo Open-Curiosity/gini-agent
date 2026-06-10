@@ -889,6 +889,265 @@ describe("snapshot walker — hidden interactive elements", () => {
   });
 });
 
+// Tests for cursor-interactivity augmentation in the snapshot walker. A
+// visible element with no interactive tag and no explicit role still earns
+// a ref (role "clickable") when the page signals clickability via computed
+// cursor:pointer, an onclick attribute, or tabindex >= 0; inherited cursor
+// styles are deduped so only the outermost cursor-qualifying element emits.
+// Hidden radio/checkbox inputs with a visible associated <label> are
+// force-emitted with [hidden] like file inputs. See ADR
+// browser-automation-engine.md.
+describe("snapshot walker — cursor-interactive clickables", () => {
+  // Fake-DOM scaffolding like the hidden-elements suite above, extended
+  // with: per-element computed cursor, parentElement wiring (makeEl links
+  // children to their parent), and a document.querySelector that resolves
+  // `label[for="..."]` over the planted body tree.
+  type FakeEl = {
+    tagName: string;
+    type?: string;
+    value?: string;
+    _attrs: Record<string, string>;
+    _children: FakeEl[];
+    _textContent: string;
+    _visible: boolean;
+    _cursor: string;
+    parentElement: FakeEl | null;
+    getAttribute(name: string): string | null;
+    setAttribute(name: string, value: string): void;
+    removeAttribute(name: string): void;
+    getBoundingClientRect(): { width: number; height: number };
+    get children(): FakeEl[];
+    get textContent(): string;
+    querySelectorAll(selector: string): FakeEl[];
+  };
+  const makeEl = (init: {
+    tagName: string;
+    type?: string;
+    value?: string;
+    visible?: boolean;
+    cursor?: string;
+    children?: FakeEl[];
+    textContent?: string;
+    attrs?: Record<string, string>;
+  }): FakeEl => {
+    const visible = init.visible ?? true;
+    const children = init.children ?? [];
+    const el: FakeEl = {
+      tagName: init.tagName,
+      type: init.type,
+      value: init.value,
+      _attrs: { ...(init.attrs ?? {}) },
+      _children: children,
+      _textContent: init.textContent ?? "",
+      _visible: visible,
+      _cursor: init.cursor ?? "auto",
+      parentElement: null,
+      getAttribute(name: string) {
+        return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
+      },
+      setAttribute(name: string, value: string) {
+        this._attrs[name] = value;
+      },
+      removeAttribute(name: string) {
+        delete this._attrs[name];
+      },
+      getBoundingClientRect() {
+        return this._visible ? { width: 100, height: 20 } : { width: 0, height: 0 };
+      },
+      get children() {
+        return this._children;
+      },
+      get textContent() {
+        return this._textContent;
+      },
+      querySelectorAll(selector: string) {
+        const matches: FakeEl[] = [];
+        const recurse = (node: FakeEl) => {
+          if (selector === "option") {
+            if (node.tagName === "OPTION") matches.push(node);
+          } else if (selector.startsWith("[") && selector.endsWith("]")) {
+            const attr = selector.slice(1, -1);
+            if (Object.prototype.hasOwnProperty.call(node._attrs, attr)) matches.push(node);
+          }
+          for (const child of node._children) recurse(child);
+        };
+        for (const child of this._children) recurse(child);
+        return matches;
+      }
+    };
+    for (const child of children) child.parentElement = el;
+    return el;
+  };
+  const installFakeDom = (body: FakeEl): (() => void) => {
+    const originalDocument = (globalThis as Record<string, unknown>).document;
+    const originalWindow = (globalThis as Record<string, unknown>).window;
+    const originalCSS = (globalThis as Record<string, unknown>).CSS;
+    const findByLabelFor = (target: string): FakeEl | null => {
+      let found: FakeEl | null = null;
+      const recurse = (node: FakeEl) => {
+        if (found) return;
+        if (node.tagName === "LABEL" && node.getAttribute("for") === target) {
+          found = node;
+          return;
+        }
+        for (const child of node._children) recurse(child);
+      };
+      recurse(body);
+      return found;
+    };
+    (globalThis as unknown as { document: unknown }).document = {
+      body,
+      querySelectorAll: (selector: string) => body.querySelectorAll(selector),
+      querySelector: (sel: string) => {
+        const m = /^label\[for="(.+)"\]$/.exec(sel);
+        return m ? findByLabelFor(m[1]!) : null;
+      },
+      getElementById: (_id: string) => null
+    };
+    (globalThis as unknown as { window: unknown }).window = {
+      getComputedStyle: (el: unknown) => ({
+        display: "block",
+        visibility: "visible",
+        cursor: (el as FakeEl)._cursor ?? "auto"
+      })
+    };
+    (globalThis as unknown as { CSS: unknown }).CSS = { escape: (s: string) => s };
+    return () => {
+      if (originalDocument === undefined) {
+        delete (globalThis as Record<string, unknown>).document;
+      } else {
+        (globalThis as Record<string, unknown>).document = originalDocument;
+      }
+      if (originalWindow === undefined) {
+        delete (globalThis as Record<string, unknown>).window;
+      } else {
+        (globalThis as Record<string, unknown>).window = originalWindow;
+      }
+      if (originalCSS === undefined) {
+        delete (globalThis as Record<string, unknown>).CSS;
+      } else {
+        (globalThis as Record<string, unknown>).CSS = originalCSS;
+      }
+    };
+  };
+  const makeFakePage = (): import("playwright-core").Page =>
+    ({
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({ __sel: sel } as unknown)
+    } as unknown as import("playwright-core").Page);
+
+  test("emits cursor:pointer div as [clickable] once, deduping inherited-cursor descendants", async () => {
+    // <body>
+    //   <div style="cursor:pointer">Open settings
+    //     <span>Open settings</span>      ← inherited cursor, deduped
+    //   </div>
+    //   <button>Save</button>             ← control: still a plain button
+    // </body>
+    const span = makeEl({ tagName: "SPAN", cursor: "pointer", textContent: "Open settings" });
+    const card = makeEl({ tagName: "DIV", cursor: "pointer", textContent: "Open settings", children: [span] });
+    const button = makeEl({ tagName: "BUTTON", textContent: "Save" });
+    const body = makeEl({ tagName: "BODY", children: [card, button] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      const clickableLines = result.text.split("\n").filter((line) => line.includes(" clickable "));
+      expect(clickableLines.length).toBe(1);
+      expect(clickableLines[0]).toMatch(/\[@e\d+\] clickable "Open settings"/);
+      // The clickable ref resolves like any other ref.
+      const ref = /\[(@e\d+)\]/.exec(clickableLines[0]!)?.[1];
+      expect(ref).toBeDefined();
+      expect(result.refs.has(ref!)).toBe(true);
+      // Native controls are unaffected.
+      expect(result.text).toMatch(/\[@e\d+\] button "Save"/);
+    } finally {
+      restore();
+    }
+  });
+
+  test("own onclick/tabindex re-qualifies inside a cursor-pointer ancestor; tabindex=-1 and empty names don't", async () => {
+    // <div style="cursor:pointer">Cat card
+    //   <span onclick="like()">Like</span>       ← own handler, NOT deduped
+    //   <span tabindex="0">Share</span>          ← focusable, NOT deduped
+    //   <span tabindex="-1">Skip me</span>       ← not focusable, deduped
+    // </div>
+    // <div style="cursor:pointer"></div>         ← empty name, skipped
+    const like = makeEl({ tagName: "SPAN", cursor: "pointer", textContent: "Like", attrs: { onclick: "like()" } });
+    const share = makeEl({ tagName: "SPAN", cursor: "pointer", textContent: "Share", attrs: { tabindex: "0" } });
+    const skip = makeEl({ tagName: "SPAN", cursor: "pointer", textContent: "Skip me", attrs: { tabindex: "-1" } });
+    const card = makeEl({
+      tagName: "DIV",
+      cursor: "pointer",
+      textContent: "Cat card Like Share Skip me",
+      children: [like, share, skip]
+    });
+    const empty = makeEl({ tagName: "DIV", cursor: "pointer", textContent: "" });
+    const body = makeEl({ tagName: "BODY", children: [card, empty] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      const clickableLines = result.text.split("\n").filter((line) => line.includes(" clickable "));
+      // Card + Like + Share; "Skip me" deduped, empty div skipped.
+      expect(clickableLines.length).toBe(3);
+      expect(result.text).toContain('clickable "Like"');
+      expect(result.text).toContain('clickable "Share"');
+      expect(result.text).not.toContain('"Skip me"');
+      expect(result.text).not.toContain("[...clickable truncated]");
+    } finally {
+      restore();
+    }
+  });
+
+  test("hidden radio/checkbox with a visible label is force-emitted past the hidden budget", async () => {
+    // Fill the hidden budget (50) with hidden role=dialog divs so the
+    // hidden-element fallback path can't be what emits the toggles — only
+    // the label-promotion force-emit can.
+    const filler: FakeEl[] = [];
+    for (let i = 0; i < 50; i++) {
+      filler.push(makeEl({ tagName: "DIV", visible: false, attrs: { role: "dialog" } }));
+    }
+    // <label>Subscribe <input type="radio" hidden></label>   ← wrapping label
+    const radio = makeEl({ tagName: "INPUT", type: "radio", visible: false });
+    const wrapLabel = makeEl({ tagName: "LABEL", textContent: "Subscribe", children: [radio] });
+    // <input type="checkbox" id="tos" hidden> <label for="tos">Agree</label>
+    const checkbox = makeEl({ tagName: "INPUT", type: "checkbox", visible: false, attrs: { id: "tos" } });
+    const forLabel = makeEl({ tagName: "LABEL", textContent: "Agree", attrs: { for: "tos" } });
+    // <input type="checkbox" hidden>   ← no label: stays on the capped path
+    const orphan = makeEl({ tagName: "INPUT", type: "checkbox", visible: false });
+    const body = makeEl({ tagName: "BODY", children: [...filler, wrapLabel, checkbox, forLabel, orphan] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      // Both labeled toggles got refs despite the exhausted hidden budget.
+      expect(result.text).toMatch(/\[@e\d+\] radio \[hidden\]/);
+      expect(result.text).toMatch(/\[@e\d+\] checkbox \[hidden\]/);
+      // The orphan checkbox was over the hidden budget — exactly one
+      // checkbox line means the labeled one is the one that surfaced.
+      const checkboxLines = result.text.split("\n").filter((line) => line.includes(" checkbox "));
+      expect(checkboxLines.length).toBe(1);
+    } finally {
+      restore();
+    }
+  });
+
+  test("caps clickable emissions at 75 and appends [...clickable truncated] marker", async () => {
+    const children: FakeEl[] = [];
+    for (let i = 0; i < 80; i++) {
+      // onclick (not cursor) so ancestor dedupe can't interfere with the count.
+      children.push(makeEl({ tagName: "DIV", textContent: `row-${i}`, attrs: { onclick: "go()" } }));
+    }
+    const body = makeEl({ tagName: "BODY", children });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      const clickableLines = result.text.split("\n").filter((line) => line.includes(" clickable "));
+      expect(clickableLines.length).toBe(75);
+      expect(result.text).toContain("[...clickable truncated]");
+    } finally {
+      restore();
+    }
+  });
+});
+
 describe("chromeProfileDirFor", () => {
   test("derives the per-instance profile path from instance name", async () => {
     const { chromeProfileDirFor } = await import("./browser");

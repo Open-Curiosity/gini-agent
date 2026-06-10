@@ -1163,6 +1163,14 @@ interface SnapEntry {
 // snapshot. Visible entries are budgeted separately via SNAPSHOT_CHAR_BUDGET.
 const SNAPSHOT_HIDDEN_BUDGET = 50;
 
+// Cap on cursor-interactive ("clickable") emissions per snapshot. Div-soup
+// pages style every card/row cursor:pointer; without a cap those rows would
+// crowd real controls out of the 32KB char budget. Capped separately from
+// the hidden budget for the same reason hidden entries are: a marker line
+// tells the model more clickables exist. Ported from agent-browser's
+// cursor-interactivity pass; see ADR browser-automation-engine.md.
+const SNAPSHOT_CLICKABLE_BUDGET = 75;
+
 interface SnapshotResult {
   text: string;
   refs: Map<string, Locator>;
@@ -1220,7 +1228,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   };
 
   const raw = await page.evaluate(
-    ({ attr, fullMode, hiddenBudget }: { attr: string; fullMode: boolean; hiddenBudget: number }) => {
+    ({ attr, fullMode, hiddenBudget, clickableBudget }: { attr: string; fullMode: boolean; hiddenBudget: number; clickableBudget: number }) => {
       const INTERACTIVE_TAGS = new Set([
         "A",
         "BUTTON",
@@ -1314,19 +1322,46 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       let nextId = 1;
       let hiddenEmitted = 0;
       let hiddenTotal = 0;
+      let clickableEmitted = 0;
+      let clickableTotal = 0;
       const isFileInput = (el: Element): boolean =>
         el.tagName === "INPUT" && ((el as HTMLInputElement).type?.toLowerCase() ?? "text") === "file";
-      const walk = (el: Element, depth: number): void => {
+      // A radio/checkbox that fails isVisible but has an associated visible
+      // <label> (wrapping it, or pointing at it via label[for]) is a styled
+      // toggle: the page hides the native input and renders the label as
+      // the control. Without a ref the agent can't toggle it at all, so it
+      // is force-emitted with a [hidden] annotation — same treatment as the
+      // file-input rule below, and exempt from the hidden budget for the
+      // same reason. See ADR browser-automation-engine.md.
+      const isHiddenToggleWithVisibleLabel = (el: Element): boolean => {
+        if (el.tagName !== "INPUT") return false;
+        const type = (el as HTMLInputElement).type?.toLowerCase() ?? "text";
+        if (type !== "radio" && type !== "checkbox") return false;
+        for (let p: Element | null = el.parentElement; p; p = p.parentElement) {
+          if (p.tagName === "LABEL") return isVisible(p);
+        }
+        const id = el.getAttribute("id");
+        if (id) {
+          const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+          if (lbl && isVisible(lbl)) return true;
+        }
+        return false;
+      };
+      const walk = (el: Element, depth: number, underCursorClickable: boolean): void => {
         const tag = el.tagName;
         const role = roleOf(el);
         const interactive = role !== undefined && (INTERACTIVE_TAGS.has(tag) || el.getAttribute("role"));
         const visible = isVisible(el);
+        // When this element qualifies as a cursor-clickable via
+        // cursor:pointer, descendants inherit that computed cursor and must
+        // not each re-qualify on it (see the dedupe note below).
+        let childUnderCursorClickable = underCursorClickable;
         // <input type="file"> always gets a ref — most real upload widgets
         // hide the actual input behind a styled button, and without a ref
         // browser_upload_file can't target it. Counted in the visible
         // budget regardless of visibility; the `[hidden]` annotation tells
         // the model the input isn't directly clickable.
-        const forceEmit = interactive && isFileInput(el);
+        const forceEmit = interactive && (isFileInput(el) || (!visible && isHiddenToggleWithVisibleLabel(el)));
         if (interactive && (visible || forceEmit)) {
           const ref = `@e${nextId++}`;
           el.setAttribute(attr, ref.slice(1));
@@ -1423,36 +1458,73 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
             });
             hiddenEmitted++;
           }
-        } else if (fullMode && visible) {
-          // In full mode, also record landmark/heading text so the snapshot
-          // captures structural cues the model can use for orientation.
-          const landmarkRoles = ["heading", "main", "navigation", "banner", "contentinfo", "region"];
-          const tagToRole: Record<string, string> = {
-            H1: "heading",
-            H2: "heading",
-            H3: "heading",
-            H4: "heading",
-            MAIN: "main",
-            NAV: "navigation",
-            HEADER: "banner",
-            FOOTER: "contentinfo",
-            ARTICLE: "article",
-            SECTION: "region"
-          };
-          const fallbackRole = role ?? tagToRole[tag];
-          if (fallbackRole && landmarkRoles.includes(fallbackRole)) {
-            const text = (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
-            if (text) {
-              out.push({ ref: "", role: fallbackRole, name: text, value: "", url: "", depth, full: true, hidden: false });
+        } else if (visible) {
+          // Reaching here means the element is NOT semantically interactive
+          // (no interactive tag, no explicit role — those were consumed by
+          // the branches above). Cursor-interactivity augmentation: div-soup
+          // UIs signal clickability through styling and handlers instead of
+          // semantics, so a visible element with computed cursor:pointer, an
+          // onclick attribute, or tabindex >= 0 still earns a ref, under the
+          // synthetic role "clickable". Ported from agent-browser's
+          // cursor-interactivity pass; see ADR browser-automation-engine.md.
+          // BODY is excluded: a page styling `body { cursor: pointer }`
+          // would otherwise emit the entire page text as one name AND
+          // dedupe-suppress every real clickable underneath it.
+          const cursorPointer = tag !== "BODY" && window.getComputedStyle(el as HTMLElement).cursor === "pointer";
+          const tabindexAttr = el.getAttribute("tabindex");
+          const selfQualified = el.getAttribute("onclick") !== null
+            || (tabindexAttr !== null && Number.parseInt(tabindexAttr, 10) >= 0);
+          // The computed cursor is inherited, so inside a cursor-pointer
+          // clickable every descendant reports cursor:pointer too. Dedupe:
+          // pointer alone does not re-qualify a descendant (otherwise a
+          // cursor:pointer card would emit every child); an element's OWN
+          // onclick/tabindex always does.
+          const qualifies = selfQualified || (cursorPointer && !underCursorClickable);
+          // Empty-name clickables are un-targetable noise — skipped, and a
+          // skipped element does not suppress its descendants (a child may
+          // carry the only usable name, e.g. an aria-label inside an
+          // icon-only wrapper).
+          const name = qualifies ? nameOf(el) : "";
+          if (qualifies && name) {
+            clickableTotal++;
+            if (clickableEmitted < clickableBudget) {
+              const ref = `@e${nextId++}`;
+              el.setAttribute(attr, ref.slice(1));
+              out.push({ ref, role: "clickable", name, value: "", url: "", depth, full: false, hidden: false });
+              clickableEmitted++;
+            }
+            if (cursorPointer) childUnderCursorClickable = true;
+          } else if (fullMode) {
+            // In full mode, also record landmark/heading text so the snapshot
+            // captures structural cues the model can use for orientation.
+            const landmarkRoles = ["heading", "main", "navigation", "banner", "contentinfo", "region"];
+            const tagToRole: Record<string, string> = {
+              H1: "heading",
+              H2: "heading",
+              H3: "heading",
+              H4: "heading",
+              MAIN: "main",
+              NAV: "navigation",
+              HEADER: "banner",
+              FOOTER: "contentinfo",
+              ARTICLE: "article",
+              SECTION: "region"
+            };
+            const fallbackRole = role ?? tagToRole[tag];
+            if (fallbackRole && landmarkRoles.includes(fallbackRole)) {
+              const text = (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
+              if (text) {
+                out.push({ ref: "", role: fallbackRole, name: text, value: "", url: "", depth, full: true, hidden: false });
+              }
             }
           }
         }
-        for (const child of Array.from(el.children)) walk(child, depth + 1);
+        for (const child of Array.from(el.children)) walk(child, depth + 1, childUnderCursorClickable);
       };
-      walk(document.body, 0);
-      return { entries: out, hiddenEmitted, hiddenTotal, hiddenBudget };
+      walk(document.body, 0, false);
+      return { entries: out, hiddenEmitted, hiddenTotal, hiddenBudget, clickableEmitted, clickableTotal };
     },
-    { attr: REF_ATTR, fullMode: full, hiddenBudget: SNAPSHOT_HIDDEN_BUDGET }
+    { attr: REF_ATTR, fullMode: full, hiddenBudget: SNAPSHOT_HIDDEN_BUDGET, clickableBudget: SNAPSHOT_CLICKABLE_BUDGET }
   );
 
   const refs = new Map<string, Locator>();
@@ -1463,6 +1535,8 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   const entries = (raw as { entries: SnapEntry[] }).entries;
   const hiddenEmitted = (raw as { hiddenEmitted: number }).hiddenEmitted;
   const hiddenTotal = (raw as { hiddenTotal: number }).hiddenTotal;
+  const clickableEmitted = (raw as { clickableEmitted: number }).clickableEmitted;
+  const clickableTotal = (raw as { clickableTotal: number }).clickableTotal;
   for (const entry of entries) {
     const indent = "  ".repeat(entry.depth);
     let line: string;
@@ -1498,6 +1572,10 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   // "more interactive elements exist on the page, just hidden" apart
   // from "snapshot text was clipped at the char budget".
   if (hiddenTotal > hiddenEmitted) text += "\n[...hidden truncated]";
+  // Same idea for the clickable cap: tells the model more cursor-detected
+  // clickables exist beyond SNAPSHOT_CLICKABLE_BUDGET, distinct from
+  // char-budget clipping.
+  if (clickableTotal > clickableEmitted) text += "\n[...clickable truncated]";
   // Defense in depth: redact any literal occurrence of a known
   // data-gini-secret value from the assembled snapshot text. The
   // walker's element-local redaction only catches the stamped
