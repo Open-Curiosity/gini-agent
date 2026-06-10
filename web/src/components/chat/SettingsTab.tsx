@@ -105,34 +105,28 @@ export function SettingsTab({ agentId }: { agentId?: string }) {
           ) : catalog.isLoading ? (
             <EmptyState label="Loading providers…" />
           ) : (
-            <section className="flex flex-col gap-4">
-              <header className="space-y-1">
+            // Same card shape as the Settings page's Default model control:
+            // title + description inside the card, control cluster on the
+            // right.
+            <section className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-border bg-card p-5">
+              <div className="space-y-1">
                 <h3 className="text-base font-semibold text-foreground">Model</h3>
                 <p className="text-xs text-muted-foreground">
-                  This agent&apos;s chats use the model below. Manage API keys and connect new
-                  providers in{" "}
+                  This agent&apos;s chats use the model on the right. Manage API keys and connect
+                  new providers in{" "}
                   <Link href="/settings" className="font-medium text-foreground underline-offset-2 hover:underline">
                     Settings
                   </Link>
                   .
                 </p>
-              </header>
-
-              <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-border bg-card p-5">
-                <ModelPicker
-                  value={value}
-                  onSelect={(selection) =>
-                    save.mutate({ providerName: selection.provider, model: selection.model })
-                  }
-                  disabled={save.isPending}
-                  ariaLabel={`Model for ${activeAgent?.name ?? "this agent"}`}
-                />
+              </div>
+              <div className="flex flex-wrap items-center gap-2.5">
                 {isDefault ? (
                   // The trigger already names the pair and its route — the
                   // caption only states where it comes from.
                   <p className="text-xs text-muted-foreground">Using the default model</p>
                 ) : (
-                  <div className="flex items-center gap-2.5">
+                  <>
                     <p className="text-xs text-muted-foreground">Overriding the default model</p>
                     <Button
                       type="button"
@@ -143,8 +137,16 @@ export function SettingsTab({ agentId }: { agentId?: string }) {
                     >
                       Use default model
                     </Button>
-                  </div>
+                  </>
                 )}
+                <ModelPicker
+                  value={value}
+                  onSelect={(selection) =>
+                    save.mutate({ providerName: selection.provider, model: selection.model })
+                  }
+                  disabled={save.isPending}
+                  ariaLabel={`Model for ${activeAgent?.name ?? "this agent"}`}
+                />
               </div>
             </section>
           )}
