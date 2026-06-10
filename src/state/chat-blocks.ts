@@ -894,14 +894,16 @@ interface ThreadAggRow {
 }
 
 // Builds ThreadSummary objects from aggregate rows, hydrating the parent
-// preview (text of the rooted main-chat assistant block) and the
-// last-reply preview (most recent text-bearing block in the thread).
+// preview + author (text/kind of the rooted main-chat block — a human
+// user_text for an agent-started thread, an assistant_text for a
+// user-started one) and the last-reply preview (most recent text-bearing
+// block in the thread).
 function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAggRow[]): ThreadSummary[] {
   return rows.map((row) => {
     const rootRow = row.parent_block_id
       ? db
-          .query<{ payload_json: string }, [string]>(
-            "SELECT payload_json FROM chat_blocks WHERE id = ?"
+          .query<{ payload_json: string; kind: string }, [string]>(
+            "SELECT payload_json, kind FROM chat_blocks WHERE id = ?"
           )
           .get(row.parent_block_id)
       : null;
@@ -914,6 +916,7 @@ function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAg
       )
       .get(row.session_id, row.thread_id);
     const rootPreview = rootRow ? truncatePreview(textFromPayload(rootRow.payload_json)) : "";
+    const rootAuthor = rootRow ? (rootRow.kind === "user_text" ? "user" : "agent") : undefined;
     const lastReplyPreview = lastReplyRow ? truncatePreview(textFromPayload(lastReplyRow.payload_json)) : "";
     const lastReplyAuthor = lastReplyRow
       ? lastReplyRow.kind === "user_text"
@@ -926,6 +929,7 @@ function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAg
       ...(row.agent_id != null ? { agentId: row.agent_id } : {}),
       ...(row.parent_block_id != null ? { parentBlockId: row.parent_block_id } : {}),
       ...(rootPreview.length > 0 ? { rootPreview } : {}),
+      ...(rootAuthor ? { rootAuthor } : {}),
       replyCount: row.reply_count,
       lastReplyAt: row.last_reply_at,
       ...(lastReplyPreview.length > 0 ? { lastReplyPreview } : {}),
