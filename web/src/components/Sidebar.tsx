@@ -41,6 +41,8 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const mounted = useMounted();
   const invalidate = useInvalidate();
   const [createOpen, setCreateOpen] = useState(false);
+  const [agentsCollapsed, toggleAgents] = useSectionCollapsed("agents");
+  const [jobsCollapsed, toggleJobs] = useSectionCollapsed("jobs");
 
   const status = useStatus();
   const activeAgentId = status.data?.activeAgent?.id;
@@ -152,10 +154,17 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
           {/* Agents (DMs) */}
           <div className="flex flex-col gap-1">
             <div className="flex items-center justify-between px-2">
-              <div className="flex items-center gap-1.5">
-                <ChevronDown className="size-3 text-sidebar-foreground/55" />
-                <span className="text-[11px] font-semibold tracking-[0.5px] text-sidebar-foreground/55">Agents</span>
-              </div>
+              <button
+                type="button"
+                onClick={toggleAgents}
+                aria-expanded={!agentsCollapsed}
+                className="flex items-center gap-1.5 text-sidebar-foreground/55 hover:text-sidebar-foreground/80"
+              >
+                <ChevronDown
+                  className={cn("size-3 transition-transform", agentsCollapsed && "-rotate-90")}
+                />
+                <span className="text-[11px] font-semibold tracking-[0.5px]">Agents</span>
+              </button>
               <button
                 type="button"
                 aria-label="New agent"
@@ -165,7 +174,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                 <Plus className="size-3.5" />
               </button>
             </div>
-            <ul className="flex flex-col gap-0.5">
+            <ul className={cn("flex flex-col gap-0.5", agentsCollapsed && "hidden")}>
               {agents.length === 0 ? (
                 <li className="px-2.5 py-2 text-xs text-sidebar-foreground/55">No agents yet</li>
               ) : (
@@ -206,12 +215,19 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
           {recurringJobs.length > 0 ? (
             <div className="flex flex-col gap-1">
               <div className="flex items-center justify-between px-2">
-                <div className="flex items-center gap-1.5">
-                  <ChevronDown className="size-3 text-sidebar-foreground/55" />
-                  <span className="text-[11px] font-semibold tracking-[0.5px] text-sidebar-foreground/55">Recurring jobs</span>
-                </div>
+                <button
+                  type="button"
+                  onClick={toggleJobs}
+                  aria-expanded={!jobsCollapsed}
+                  className="flex items-center gap-1.5 text-sidebar-foreground/55 hover:text-sidebar-foreground/80"
+                >
+                  <ChevronDown
+                    className={cn("size-3 transition-transform", jobsCollapsed && "-rotate-90")}
+                  />
+                  <span className="text-[11px] font-semibold tracking-[0.5px]">Recurring jobs</span>
+                </button>
               </div>
-              <ul className="flex flex-col gap-0.5">
+              <ul className={cn("flex flex-col gap-0.5", jobsCollapsed && "hidden")}>
                 {recurringJobs.map((job) => {
                   const channelSession = (allSessions.data ?? []).find((s) => s.id === job.chatSessionId);
                   const active = onChat && selectedSession === job.chatSessionId;
@@ -312,6 +328,62 @@ function useMounted() {
     () => true,
     () => false
   );
+}
+
+// Per-device collapse state for sidebar sections, persisted in localStorage so
+// a collapsed section stays collapsed across reloads. Mirrors the
+// useSyncExternalStore + localStorage idiom used for chat/thread read state.
+const COLLAPSE_STORAGE_KEY = "gini.sidebar.collapsed";
+
+type CollapseMap = Record<string, boolean>;
+let collapseCache: CollapseMap | null = null;
+const collapseListeners = new Set<() => void>();
+
+function readCollapse(): CollapseMap {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(COLLAPSE_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") return parsed as CollapseMap;
+    }
+  } catch {
+    // Corrupt or disabled storage — fall through to default.
+  }
+  return {};
+}
+
+function getCollapse(): CollapseMap {
+  if (collapseCache === null) collapseCache = readCollapse();
+  return collapseCache;
+}
+
+function toggleCollapse(key: string) {
+  const current = getCollapse();
+  const next = { ...current, [key]: !current[key] };
+  collapseCache = next;
+  if (typeof window !== "undefined") {
+    try {
+      window.localStorage.setItem(COLLAPSE_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Quota or disabled storage — keep the in-memory toggle, skip persisting.
+    }
+  }
+  for (const listener of collapseListeners) listener();
+}
+
+function subscribeCollapse(listener: () => void) {
+  collapseListeners.add(listener);
+  return () => {
+    collapseListeners.delete(listener);
+  };
+}
+
+const EMPTY_COLLAPSE: CollapseMap = {};
+
+function useSectionCollapsed(key: string): [boolean, () => void] {
+  const map = useSyncExternalStore(subscribeCollapse, getCollapse, () => EMPTY_COLLAPSE);
+  return [map[key] === true, () => toggleCollapse(key)];
 }
 
 // The update lifecycle (mutation, polling, the full-app blur overlay) lives in
