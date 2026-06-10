@@ -155,6 +155,17 @@ describe("parse + safety helpers", () => {
     expect(shouldDropMessage({ id: "x", from: "Alice <alice@x.com>" }, "me@example.com")).toBe(false);
   });
 
+  test("an explicitly watched sender bypasses the automated heuristic; self still drops", () => {
+    // Watching noreply@ups.com by name must fire despite the AUTOMATED_FROM hit.
+    expect(shouldDropMessage({ id: "x", from: "UPS <noreply@ups.com>" }, "me@example.com", "noreply@ups.com")).toBe(false);
+    // Case-insensitive equality on the parsed address.
+    expect(shouldDropMessage({ id: "x", from: "NoReply@UPS.com" }, "me@example.com", "noreply@ups.com")).toBe(false);
+    // A DIFFERENT automated sender on the same watch still drops.
+    expect(shouldDropMessage({ id: "x", from: "notifications@github.com" }, "me@example.com", "noreply@ups.com")).toBe(true);
+    // Self-drop is mandatory — even when self IS the watched address.
+    expect(shouldDropMessage({ id: "x", from: "me@example.com" }, "me@example.com", "me@example.com")).toBe(true);
+  });
+
   test("parseFromAddress extracts the bare address from either form", () => {
     expect(parseFromAddress("Alice <alice@x.com>")).toBe("alice@x.com");
     expect(parseFromAddress("bob@y.com")).toBe("bob@y.com");
@@ -278,6 +289,21 @@ describe("detect — regimes", () => {
     expect(draftedIds(r.items)).toEqual(["m2"]);
     // Cursor advanced to the last consumed item (m4, the newest dropped).
     expect(r.state.cursor).toBe("3200");
+  });
+
+  test("a watch's explicit sender lets an automated address through end to end", async () => {
+    const spawn = stubSpawn(["u1", "u2"], {
+      u1: { id: "u1", internalDate: "3000", from: "UPS <noreply@ups.com>", subject: "package" },
+      u2: { id: "u2", internalDate: "3100", from: "me@example.com", subject: "self" }
+    });
+    const r = await detect(
+      { query: "from:noreply@ups.com", sender: "noreply@ups.com", state: { cursor: "1000", seen: [] } },
+      spawn,
+      "me@example.com"
+    );
+    // The watched automated address fires; self is still dropped.
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual(["u1"]);
   });
 
   test("bounds the query with after:<epochSec> once a cursor exists, but not on seeding", async () => {
@@ -732,6 +758,22 @@ describe("runWatches — multi-watch (one shared job)", () => {
     expect(notice[0]!.text).toContain("from:bulk@x.com is:unread");
     // The truncated watch's cursor still jumped to its newest.
     expect(r.state.byWatcher["w-bulk"]!.cursor).toBe(String(20_000_000 + 59 * 1000));
+  });
+
+  test("a watch entry's sender rides through to the heuristic bypass", async () => {
+    const spawn = multiSpawn(
+      { "from:noreply@ups.com": ["p1"] },
+      { p1: { id: "p1", internalDate: "4000", from: "UPS <noreply@ups.com>", subject: "shipped" } }
+    );
+    const r = await runWatches(
+      {
+        watches: [{ watcherId: "w-ups", query: "from:noreply@ups.com", sender: "noreply@ups.com" }],
+        state: { byWatcher: { "w-ups": { cursor: "1000", seen: [] } } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual(["p1"]);
   });
 
   test("no watches yields a silent shortCircuit with empty byWatcher", async () => {

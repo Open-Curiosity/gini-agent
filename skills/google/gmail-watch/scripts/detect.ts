@@ -73,17 +73,23 @@ interface DetectState {
 interface DetectArgs {
   query: string;
   account?: string;
+  // The explicitly watched sender address. Mail from EXACTLY this address
+  // bypasses the automated-sender heuristic (the user asked for it by name);
+  // self is still always dropped.
+  sender?: string;
   state?: DetectState | null;
 }
 
 // One declarative watch in the shared job's hook config: a stable watcher id +
 // the Gmail query (and an optional account, recorded for the multi-account
-// future). The shared job carries a LIST of these, rebuilt from the enabled
-// watchers on every add/remove/enable/disable.
+// future, plus the explicitly watched sender when one drove the query). The
+// shared job carries a LIST of these, rebuilt from the enabled watchers on
+// every add/remove/enable/disable.
 interface Watch {
   watcherId: string;
   query: string;
   account?: string;
+  sender?: string;
 }
 
 // The shared job's multi-watch input: the list of enabled watches + the opaque
@@ -311,16 +317,19 @@ export function parseFromAddress(from: string): string | undefined {
   return bare ? bare[0].toLowerCase() : undefined;
 }
 
-export function shouldDropMessage(meta: EmailMetadata, selfEmail?: string): boolean {
-  const from = (meta.from ?? "").toLowerCase();
-  if (AUTOMATED_FROM.test(from)) return true;
+export function shouldDropMessage(meta: EmailMetadata, selfEmail?: string, watchedSender?: string): boolean {
   // Compare the parsed sender address by EQUALITY, not substring: a substring
   // match false-drops humans whose address contains self's (self j@gmail.com
-  // would drop aj@gmail.com).
-  if (selfEmail) {
-    const sender = parseFromAddress(meta.from ?? "");
-    if (sender && sender === selfEmail.toLowerCase()) return true;
-  }
+  // would drop aj@gmail.com). Self-drop is checked FIRST and is mandatory —
+  // even an explicitly watched address never triggers on our own mail.
+  const sender = parseFromAddress(meta.from ?? "");
+  if (selfEmail && sender && sender === selfEmail.toLowerCase()) return true;
+  // An explicitly watched sender bypasses the automated-sender heuristic: the
+  // user asked for this exact address by name (e.g. noreply@ups.com), so the
+  // heuristic must not silently swallow it. Exact address equality only.
+  if (watchedSender && sender && sender === watchedSender.toLowerCase()) return false;
+  const from = (meta.from ?? "").toLowerCase();
+  if (AUTOMATED_FROM.test(from)) return true;
   return false;
 }
 
@@ -494,7 +503,7 @@ export async function detect(
     const meta = parseMessageMetadata(await gwsSpawn(buildGetArgs(id)), id);
     const internalDate = meta.internalDate ? Number(meta.internalDate) : 0;
 
-    if (shouldDropMessage(meta, selfEmail)) {
+    if (shouldDropMessage(meta, selfEmail, args.sender)) {
       // Safety floor dropped it — an intentional skip. Re-dropping it on a retry
       // is harmless (the floor is deterministic), so no separate dedup is needed.
       if (Number.isFinite(internalDate) && internalDate > lastConsumedInternalDate) {
@@ -661,7 +670,7 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
     // others — that watch is marked error and the rest still run.
     let result: DetectResult;
     try {
-      result = await run({ query: watch.query, account: watch.account, state: stateIn }, gwsSpawn, selfEmail);
+      result = await run({ query: watch.query, account: watch.account, sender: watch.sender, state: stateIn }, gwsSpawn, selfEmail);
     } catch (error) {
       byWatcherOut[watch.watcherId] = {
         ...stateIn,

@@ -1298,6 +1298,13 @@ export interface EmailWatcherRecord {
   credentialName?: string;
   // Gmail search query the worker polls (e.g. "from:alice@x.com is:unread").
   query: string;
+  // The explicitly watched sender address (set when the watcher was created via
+  // the `sender` input, not a raw query). The detection script bypasses the
+  // automated-sender heuristic for mail from EXACTLY this address (the user
+  // asked for it by name — e.g. noreply@ups.com must fire); self is still
+  // always dropped. Raw-query watches have no single sender and keep the
+  // heuristic.
+  sender?: string;
   // Optional Gmail label ids to scope the query. Unused in v1.
   labelIds?: string[];
   // Dedicated chat session the woken turn posts its proposed reply into.

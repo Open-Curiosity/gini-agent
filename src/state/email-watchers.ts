@@ -75,12 +75,15 @@ const EMAIL_WATCH_JOB_PROMPT = [
 // The declarative watch entry for one enabled watcher inside the shared job's
 // hook config: a stable watcher id (so the detection script keys per-watch state
 // by it) + the Gmail query (and an optional account, recorded for the
-// multi-account future).
+// multi-account future). The explicitly watched sender rides along so the
+// detection script can bypass its automated-sender heuristic for exactly that
+// address.
 function buildWatch(watcher: EmailWatcherRecord): Record<string, unknown> {
   return {
     watcherId: watcher.id,
     query: watcher.query,
-    ...(watcher.accountEmail ? { account: watcher.accountEmail } : {})
+    ...(watcher.accountEmail ? { account: watcher.accountEmail } : {}),
+    ...(watcher.sender ? { sender: watcher.sender } : {})
   };
 }
 
@@ -162,12 +165,18 @@ export async function addEmailWatcher(
   const owningAgentId = input.agentId ?? readState(config.instance).activeAgentId;
   const shared = await ensureSharedJobAndSession(config, owningAgentId);
 
+  // Persist the explicitly watched sender only when it actually drove the
+  // query (a raw `query` wins and makes this a raw-query watch — no single
+  // sender, so the automated-sender heuristic stays on).
+  const sender = input.query ? undefined : input.sender;
+
   const watcher = await mutateState(config.instance, (state) =>
     createEmailWatcher(state, {
       agentId: owningAgentId,
       provider: "gmail",
       accountEmail: input.account,
       query,
+      ...(sender ? { sender } : {}),
       chatSessionId: shared.chatSessionId,
       jobId: shared.jobId,
       enabled: true,

@@ -121,7 +121,7 @@ describe("shared backing job lifecycle", () => {
   }
   function watches(config: ReturnType<typeof buildConfig>) {
     const job = sharedJob(config);
-    return (job?.preRunHook?.config as { watches?: { watcherId: string; query: string }[] }).watches ?? [];
+    return (job?.preRunHook?.config as { watches?: { watcherId: string; query: string; sender?: string }[] }).watches ?? [];
   }
 
   test("first add provisions ONE shared job + session and stamps jobId", async () => {
@@ -139,8 +139,21 @@ describe("shared backing job lifecycle", () => {
     expect(hookConfig.script).toBe("detect");
     expect(job?.chatSessionId).toBe(watcher.chatSessionId);
     expect(job?.intervalSeconds).toBe(60);
-    // The shared job's watch list carries this enabled watcher.
-    expect(watches(config)).toEqual([{ watcherId: watcher.id, query: watcher.query }]);
+    // The shared job's watch list carries this enabled watcher, including the
+    // explicitly watched sender (the detection script's heuristic bypass key).
+    expect(watches(config)).toEqual([{ watcherId: watcher.id, query: watcher.query, sender: "dave@x.com" }]);
+  });
+
+  test("a sender add stores the sender; a raw-query add does not", async () => {
+    const config = buildConfig("ew-job-sender-field");
+    const bySender = await addEmailWatcher(config, { sender: "noreply@ups.com" });
+    expect(bySender.sender).toBe("noreply@ups.com");
+    // A raw query wins and makes this a raw-query watch — no single sender.
+    const byQuery = await addEmailWatcher(config, { sender: "x@y.com", query: "subject:urgent" });
+    expect(byQuery.sender).toBeUndefined();
+    const list = watches(config);
+    expect(list.find((w) => w.watcherId === bySender.id)).toMatchObject({ sender: "noreply@ups.com" });
+    expect((list.find((w) => w.watcherId === byQuery.id) as { sender?: string }).sender).toBeUndefined();
   });
 
   test("a second add reuses the SAME shared job + session and appends to watches", async () => {
