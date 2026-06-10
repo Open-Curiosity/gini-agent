@@ -891,9 +891,36 @@ describe("chat-blocks threading", () => {
     expect(b?.replyCount).toBe(1);
     expect(a?.parentBlockId).toBe(root.id);
     expect(a?.rootPreview).toBe("Here is a research plan you can branch on.");
+    // Rooted at an assistant_text block (user clicked "Reply in thread").
+    expect(a?.rootAuthor).toBe("agent");
     expect(a?.lastReplyPreview).toBe("Step one is done.");
     expect(b?.lastReplyPreview).toBe("Different tangent");
     expect(a?.sessionId).toBe(session);
+  });
+
+  test("summarizeThreads reports rootAuthor 'user' for an agent-started thread rooted at the human message", () => {
+    const instance = "chat-blocks-thread-root-author";
+    const session = "chat_rootauthor";
+    // Agent-started thread: the root is the HUMAN's user_text message.
+    const userMsg = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "Research espresso machines under $500",
+      taskId: "task_r"
+    });
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Here are the tradeoffs.",
+      streaming: false,
+      threadId: "thread_r",
+      parentBlockId: userMsg.id
+    });
+
+    const [summary] = summarizeThreads(instance, session);
+    expect(summary?.parentBlockId).toBe(userMsg.id);
+    expect(summary?.rootAuthor).toBe("user");
+    expect(summary?.rootPreview).toBe("Research espresso machines under $500");
   });
 
   test("summarizeThreads reply count excludes phase and tool blocks", () => {
