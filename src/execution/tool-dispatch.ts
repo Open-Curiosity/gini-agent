@@ -1934,6 +1934,7 @@ async function emailWatchTool(
       query: w.query,
       sender: w.sender,
       threadId: w.threadId,
+      followUpAfterHours: w.followUpAfterHours,
       objective: w.objective,
       accountEmail: w.accountEmail,
       enabled: w.enabled,
@@ -2031,10 +2032,18 @@ async function emailWatchTool(
     }
     threadId = args.threadId;
   }
+  // Deep validation (positive, thread watches only) lives in addEmailWatcher.
+  let followUpAfterHours: number | undefined;
+  if (args.followUpAfterHours !== undefined && args.followUpAfterHours !== null) {
+    if (typeof args.followUpAfterHours !== "number") {
+      throw new Error("Invalid input: followUpAfterHours must be a number.");
+    }
+    followUpAfterHours = args.followUpAfterHours;
+  }
   // Inherit the originating task's agent so the watcher + its dedicated chat
   // session (and the future woken turns) attribute to the right agent.
   const owningAgentId = readState(config.instance).tasks.find((t) => t.id === taskId)?.agentId;
-  const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, objective, threadId, agentId: owningAgentId });
+  const watcher = await addEmailWatcher(config, { sender, query: rawQuery, account, objective, threadId, followUpAfterHours, agentId: owningAgentId });
 
   appendTrace(config.instance, taskId, {
     type: "tool",

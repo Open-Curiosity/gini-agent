@@ -1320,6 +1320,12 @@ export interface EmailWatcherRecord {
   // is authoritative for detection; `query` holds a human-readable
   // `thread:<id>` label only); unset => query watch.
   threadId?: string;
+  // Thread watches only: when the thread's last message is the user's own and
+  // older than this many hours, the detection script nudges a turn to draft a
+  // polite follow-up (exactly once per outbound message — the nudged message
+  // id is pinned in the watch state). Validated: positive number, rejected on
+  // query watches.
+  followUpAfterHours?: number;
   // Optional Gmail label ids to scope the query. Unused in v1.
   labelIds?: string[];
   // Dedicated chat session the woken turn posts its proposed reply into.

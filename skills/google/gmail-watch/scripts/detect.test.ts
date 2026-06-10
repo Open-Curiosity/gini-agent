@@ -569,6 +569,89 @@ describe("detect — thread mode", () => {
     expect(trusted[0]!.text).toBe("Objective for this watch (thread:t-9): Get a full refund");
   });
 
+  test("follow-up nudge fires once per outbound message when the counterparty is silent", async () => {
+    // Our own message is the thread's last, sent far past the 24h threshold.
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: "2000", from: "me@example.com", subject: "our offer" }
+    ]);
+    const args = {
+      query: "thread:t-1",
+      threadId: "t-1",
+      followUpAfterHours: 24,
+      objective: "Get a refund",
+      state: { cursor: "2000", seen: ["m2"] }
+    };
+    const r1 = await detect(args, spawn, "me@example.com");
+    // The nudge wakes a model turn (context) with TRUSTED items only: the
+    // nudge notice + the objective.
+    expect(r1.kind).toBe("context");
+    expect(matchCount(r1.items)).toBe(0);
+    const trusted = r1.items!.filter((i) => !i.untrusted);
+    expect(trusted).toHaveLength(2);
+    expect(trusted[0]!.text).toContain("No reply on this watched thread since 1970-01-01T00:00:02.000Z (over 24 hours).");
+    expect(trusted[0]!.text).toContain("Draft a polite follow-up that advances the objective.");
+    expect(trusted[1]!.text).toBe("Objective for this watch (thread:t-1): Get a refund");
+    expect(r1.state.lastNudgedForMessageId).toBe("m2");
+
+    // Same outbound message on the next tick => NO second nudge (the id is
+    // pinned), not a nudge-per-tick storm.
+    const r2 = await detect({ ...args, state: r1.state }, spawn, "me@example.com");
+    expect(r2.kind).toBe("shortCircuit");
+    expect(r2.state.lastNudgedForMessageId).toBe("m2");
+  });
+
+  test("follow-up nudge respects the threshold and the last-sender", async () => {
+    // Last message is ours but RECENT — below the threshold, no nudge.
+    const recent = String(Date.now() - 60_000);
+    const recentSpawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: recent, from: "me@example.com", subject: "ours" }
+    ]);
+    const r1 = await detect(
+      { query: "thread:t-1", threadId: "t-1", followUpAfterHours: 24, state: { cursor: recent, seen: ["m2"] } },
+      recentSpawn,
+      "me@example.com"
+    );
+    expect(r1.kind).toBe("shortCircuit");
+    expect(r1.state.lastNudgedForMessageId).toBeUndefined();
+
+    // Last message is THEIRS (old) — the ball is in our court, no nudge.
+    const theirsSpawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "me@example.com", subject: "ours" },
+      { id: "m2", internalDate: "2000", from: "support@x.com", subject: "theirs" }
+    ]);
+    const r2 = await detect(
+      { query: "thread:t-1", threadId: "t-1", followUpAfterHours: 24, state: { cursor: "2000", seen: ["m2"] } },
+      theirsSpawn,
+      "me@example.com"
+    );
+    expect(r2.kind).toBe("shortCircuit");
+    expect(r2.state.lastNudgedForMessageId).toBeUndefined();
+  });
+
+  test("a newer outbound message resets the nudge cycle", async () => {
+    // Already nudged for m2; a NEWER self message m3 (also past the
+    // threshold) changes the last-message id => a fresh nudge.
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: "2000", from: "me@example.com", subject: "first follow-up" },
+      { id: "m3", internalDate: "3000", from: "me@example.com", subject: "second follow-up" }
+    ]);
+    const r = await detect(
+      {
+        query: "thread:t-1",
+        threadId: "t-1",
+        followUpAfterHours: 24,
+        state: { cursor: "3000", seen: ["m3"], lastNudgedForMessageId: "m2" }
+      },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(r.state.lastNudgedForMessageId).toBe("m3");
+  });
+
   test("thread detection is at-least-once: old state re-detects, new state goes silent", async () => {
     const spawn = threadSpawn("t-1", [
       { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },

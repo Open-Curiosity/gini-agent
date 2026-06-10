@@ -68,6 +68,10 @@ interface DetectState {
   status?: "ok" | "needs_auth" | "error";
   // Scrubbed last-error message when status === "error" (cleared on "ok").
   lastError?: string;
+  // Thread mode, follow-up-on-silence: the id of OUR last outbound message
+  // that has already been nudged — exactly one nudge per outbound message (a
+  // newer last message changes the id and resets the cycle naturally).
+  lastNudgedForMessageId?: string;
 }
 
 interface DetectArgs {
@@ -87,6 +91,9 @@ interface DetectArgs {
   // heuristic in thread mode — ticket-bot replies are exactly what's watched;
   // self-drop stays mandatory.
   threadId?: string;
+  // Thread mode: nudge a follow-up draft when the thread's last message is
+  // our own and older than this many hours (once per outbound message).
+  followUpAfterHours?: number;
   state?: DetectState | null;
 }
 
@@ -102,6 +109,7 @@ interface Watch {
   sender?: string;
   objective?: string;
   threadId?: string;
+  followUpAfterHours?: number;
 }
 
 // The shared job's multi-watch input: the list of enabled watches + the opaque
@@ -660,15 +668,48 @@ async function detectThread(
   // re-listed next tick isn't re-drafted.
   const seenOut = messages.filter((m) => m.internalDate === newCursor).map((m) => m.id);
 
-  // A matched tick carries the watch's standing objective as ONE trusted item.
+  // Follow-up on silence: NO new matches this tick, the thread's last message
+  // is OUR OWN, and it has sat unanswered past the threshold — nudge a turn to
+  // draft a polite follow-up. Exactly once per outbound message:
+  // lastNudgedForMessageId pins the nudged id, and a fresh reply or a newer
+  // self-message changes the last-message id, resetting the cycle naturally.
+  // The nudge is a TRUSTED item (a deterministic notice over thread metadata,
+  // not email content).
+  let lastNudgedForMessageId = stateIn.lastNudgedForMessageId;
+  if (items.length === 0 && args.followUpAfterHours && newest) {
+    const lastMs = Number(newest.internalDate) || 0;
+    const lastFrom = parseFromAddress(newest.from ?? "");
+    const lastIsSelf = Boolean(selfEmail && lastFrom && lastFrom === selfEmail.toLowerCase());
+    if (
+      lastIsSelf &&
+      lastMs > 0 &&
+      Date.now() - lastMs > args.followUpAfterHours * 3_600_000 &&
+      stateIn.lastNudgedForMessageId !== newest.id
+    ) {
+      items.push({
+        text: `No reply on this watched thread since ${new Date(lastMs).toISOString()} (over ${args.followUpAfterHours} hours). Draft a polite follow-up that advances the objective.`,
+        untrusted: false
+      });
+      lastNudgedForMessageId = newest.id;
+    }
+  }
+
+  // A matched (or nudged) tick carries the watch's standing objective as ONE
+  // trusted item.
   if (items.length > 0 && args.objective) {
     items.push(buildObjectiveItem(`thread:${args.threadId}`, args.objective));
   }
 
+  const stateOut: DetectState = {
+    cursor: newCursor,
+    seen: seenOut,
+    status: "ok",
+    ...(lastNudgedForMessageId !== undefined ? { lastNudgedForMessageId } : {})
+  };
   if (items.length === 0) {
-    return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor: newCursor, seen: seenOut, status: "ok" } };
+    return { kind: "shortCircuit", summary: "[SILENT]", state: stateOut };
   }
-  return { kind: "context", items, state: { cursor: newCursor, seen: seenOut, status: "ok" } };
+  return { kind: "context", items, state: stateOut };
 }
 
 // Compute the small boundary dedup set: the listed ids whose internalDate floors
@@ -809,6 +850,7 @@ export async function runWatches(args: DetectArgsMulti, gwsSpawn: GwsSpawn): Pro
           sender: watch.sender,
           objective: watch.objective,
           threadId: watch.threadId,
+          followUpAfterHours: watch.followUpAfterHours,
           state: stateIn
         },
         gwsSpawn,

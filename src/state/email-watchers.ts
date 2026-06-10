@@ -85,7 +85,8 @@ function buildWatch(watcher: EmailWatcherRecord): Record<string, unknown> {
     ...(watcher.accountEmail ? { account: watcher.accountEmail } : {}),
     ...(watcher.sender ? { sender: watcher.sender } : {}),
     ...(watcher.objective ? { objective: watcher.objective } : {}),
-    ...(watcher.threadId ? { threadId: watcher.threadId } : {})
+    ...(watcher.threadId ? { threadId: watcher.threadId } : {}),
+    ...(watcher.followUpAfterHours !== undefined ? { followUpAfterHours: watcher.followUpAfterHours } : {})
   };
 }
 
@@ -140,6 +141,9 @@ export interface AddEmailWatcherInput {
   // Watch one specific Gmail conversation by thread id (thread mode; wins
   // over `sender` for detection — `query` becomes a `thread:<id>` label).
   threadId?: string;
+  // Thread watches only: nudge a follow-up draft when the counterparty has
+  // been silent this many hours after the user's own last message.
+  followUpAfterHours?: number;
   // Owning agent for the watcher + its dedicated chat session. Threaded by
   // internal callers (the email_watch tool) so the woken turns attribute to
   // the originating agent; the HTTP path leaves it to the active agent.
@@ -198,6 +202,17 @@ export async function addEmailWatcher(
     throw new Error("Invalid input: threadId must be a non-empty string.");
   }
   const objective = input.objective !== undefined ? validateObjective(input.objective) : undefined;
+  const followUpAfterHours = input.followUpAfterHours;
+  if (followUpAfterHours !== undefined) {
+    if (typeof followUpAfterHours !== "number" || !Number.isFinite(followUpAfterHours) || followUpAfterHours <= 0) {
+      throw new Error("Invalid input: followUpAfterHours must be a positive number.");
+    }
+    // Silence is a predicate over the watched THREAD's last message; a query
+    // watch has no single conversation to be silent.
+    if (!threadId) {
+      throw new Error("Invalid input: followUpAfterHours is only supported on thread watches (provide threadId).");
+    }
+  }
   const query = buildWatcherQuery({ ...input, threadId });
   // Persist the explicitly watched sender only when it actually drove the
   // query (a raw `query` or a thread watch wins over `sender` — no single
@@ -218,6 +233,7 @@ export async function addEmailWatcher(
       ...(sender ? { sender } : {}),
       ...(objective ? { objective } : {}),
       ...(threadId ? { threadId } : {}),
+      ...(followUpAfterHours !== undefined ? { followUpAfterHours } : {}),
       chatSessionId: shared.chatSessionId,
       jobId: shared.jobId,
       enabled: true,

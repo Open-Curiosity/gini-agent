@@ -137,6 +137,29 @@ describe("thread-keyed watchers", () => {
     await expect(addEmailWatcher(config, { threadId: "  " })).rejects.toThrow("Invalid input: threadId");
     expect(readState(config.instance).emailWatchers).toHaveLength(0);
   });
+
+  test("followUpAfterHours requires a thread watch and a positive number", async () => {
+    const config = buildConfig("ew-followup-validate");
+    // Rejected on query watches — silence is a thread-level predicate.
+    await expect(addEmailWatcher(config, { sender: "a@x.com", followUpAfterHours: 24 })).rejects.toThrow(
+      "Invalid input: followUpAfterHours is only supported on thread watches"
+    );
+    await expect(addEmailWatcher(config, { threadId: "t-1", followUpAfterHours: 0 })).rejects.toThrow(
+      "Invalid input: followUpAfterHours must be a positive number"
+    );
+    await expect(addEmailWatcher(config, { threadId: "t-1", followUpAfterHours: -2 })).rejects.toThrow(
+      "Invalid input: followUpAfterHours must be a positive number"
+    );
+    expect(readState(config.instance).emailWatchers).toHaveLength(0);
+    // Accepted on a thread watch; the watch entry carries it.
+    const watcher = await addEmailWatcher(config, { threadId: "t-1", followUpAfterHours: 24 });
+    expect(watcher.followUpAfterHours).toBe(24);
+    const job = readState(config.instance).jobs.find(
+      (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+    );
+    const watches = (job?.preRunHook?.config as { watches?: { followUpAfterHours?: number }[] }).watches ?? [];
+    expect(watches[0]?.followUpAfterHours).toBe(24);
+  });
 });
 
 describe("watcher objective", () => {
