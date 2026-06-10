@@ -34,6 +34,7 @@ import {
   mutateState,
   now,
   readState,
+  recordProviderAuthFailure,
   upsertTask
 } from "./state";
 import type { AgentContext } from "./state/audit";
@@ -832,7 +833,13 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
     // Record the failed provider so syncChatTaskResult can render the same
     // actionable, provider-named message for legacy/text-only clients that the
     // chat system note shows the web (issue #205).
-    if (authProvider) task.authErrorProvider = authProvider;
+    if (authProvider) {
+      task.authErrorProvider = authProvider;
+      // Persist the needs-reauth record so persistent surfaces (Settings →
+      // Providers, /api/providers/catalog) reflect the dead credential beyond
+      // this chat turn (issue #233). `message` is already redacted above.
+      recordProviderAuthFailure(state, { provider: authProvider, detail: message, taskId });
+    }
     task.currentStep = "Failed";
     task.updatedAt = now();
     addAudit(

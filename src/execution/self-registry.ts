@@ -574,7 +574,7 @@ async function removeProvider(
   if (!provider) {
     return JSON.stringify({ ok: false, error: "remove_provider requires a 'provider' name." });
   }
-  const result = removeSetupProvider(config, provider);
+  const result = await removeSetupProvider(config, provider);
   appendTrace(config.instance, taskId, {
     type: "tool",
     message: result.ok ? "Removed provider" : "Provider removal failed",

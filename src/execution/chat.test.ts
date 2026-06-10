@@ -647,6 +647,20 @@ describe("chat session waiting-approval placeholder", () => {
     // for codex, the docs link inline since there's no CTA button.
     const failedTask = readState(config.instance).tasks.find((t) => t.id === taskId);
     expect(failedTask?.authErrorProvider).toBe("codex");
+
+    // The failure also lands the persistent per-provider record (issue #233)
+    // so Settings/connector surfaces stop claiming "Connected", plus the
+    // transition audit row.
+    const stateAfterFail = readState(config.instance);
+    expect(stateAfterFail.providerAuthFailures?.codex).toMatchObject({
+      provider: "codex",
+      detail: "Provided authentication token is expired. Please try signing in again.",
+      taskId
+    });
+    expect(typeof stateAfterFail.providerAuthFailures?.codex?.at).toBe("string");
+    expect(
+      stateAfterFail.audit.find((a) => a.action === "provider.auth.needs_reauth" && a.target === "codex")
+    ).toBeDefined();
     const synced = await syncChatTaskResult(config, session.id, taskId);
     expect(synced?.content).toBe(
       "Codex authentication failed. Re-authenticate Codex to continue: https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
@@ -685,6 +699,9 @@ describe("chat session waiting-approval placeholder", () => {
     if (plainNote?.kind !== "system_note") throw new Error("expected a system_note block");
     expect(plainNote.authError).toBeUndefined();
     expect(plainNote.text).toBe("Tool failed: HTTP 401 Unauthorized from example.com");
+    // A plain Error must not write a persistent needs-reauth record either —
+    // the only key still present is the codex one from the typed failure above.
+    expect(Object.keys(readState(config.instance).providerAuthFailures ?? {})).toEqual(["codex"]);
   });
 
   test("ProviderAuthError names the provider that served the turn, not the active one", async () => {
@@ -737,6 +754,11 @@ describe("chat session waiting-approval placeholder", () => {
     expect(readState(config.instance).tasks.find((t) => t.id === taskId)?.error).toBe(
       "Incorrect API key provided: sk-***"
     );
+    // The persistent record stores the SAME redacted detail (issue #233) —
+    // the raw key fragment never lands in state.json.
+    const persisted = readState(config.instance).providerAuthFailures?.openai;
+    expect(persisted?.detail).toBe("Incorrect API key provided: sk-***");
+    expect(JSON.stringify(persisted)).not.toContain("ABC123def456ghi");
     expect(note.text).toBe("OpenAI authentication failed. Re-authenticate OpenAI to continue.");
 
     // Text-only clients get the Settings-form line for an API-key provider.

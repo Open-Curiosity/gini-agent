@@ -7,7 +7,7 @@ import { readState } from "./state";
 import { appendTrace } from "./state/trace";
 import { bedrockSupportsStreamingWithTools, bedrockSupportsToolUse, resolveProviderModality } from "./provider-capabilities";
 import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
-import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
+import type { CostRecord, ProviderAuthFailureRecord, ProviderAuthStatus, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderReauthInfo, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -210,6 +210,30 @@ export function providerCatalogWithStatus(
     ...item,
     configured: isProviderConfigured(item.name, activeProviderName, activeApiKeyEnv, activeBaseUrl)
   }));
+}
+
+// Catalog enrichment with the persistent per-provider auth status (issue
+// #233). `authStatus: "needs_reauth"` plus a `reauth` payload (redacted
+// detail, failure timestamp, and the same reauthKind/reauthUrl routing the
+// chat note carries — derived via providerReauth at read time) when a
+// needs-reauth record exists for the provider; `authStatus: "ok"` otherwise.
+// Layered on top of providerCatalogWithStatus by the /api/providers/catalog
+// handler — the records live in runtime state, which the pure catalog
+// builders deliberately don't read.
+export function withProviderAuthStatus<T extends { name: ProviderCatalogItem["name"] }>(
+  items: T[],
+  providerAuthFailures: Partial<Record<ProviderName, ProviderAuthFailureRecord>> | undefined
+): Array<T & { authStatus: ProviderAuthStatus; reauth?: ProviderReauthInfo }> {
+  return items.map((item) => {
+    const record = providerAuthFailures?.[item.name as ProviderName];
+    if (!record) return { ...item, authStatus: "ok" as const };
+    const target = providerReauth(record.provider);
+    return {
+      ...item,
+      authStatus: "needs_reauth" as const,
+      reauth: { detail: record.detail, at: record.at, reauthKind: target.kind, reauthUrl: target.url }
+    };
+  });
 }
 
 export function providerCatalog(): ProviderCatalogItem[] {
@@ -3595,6 +3619,57 @@ function readCodexCredentials(provider: ProviderConfig): {
 export function hasUsableCodexCredentials(provider?: ProviderConfig): boolean {
   const probe = provider ?? { name: "codex" as const, model: DEFAULT_CODEX_MODEL };
   return readCodexCredentials(probe).ok;
+}
+
+// Bearer-free view of the codex credential state for health probes (the codex
+// connector module). Routes through the same readCodexCredentials resolution
+// the provider uses — CODEX_AUTH_JSON honored as a filesystem path, default
+// ~/.codex/auth.json otherwise — and additionally decodes the JWT `exp` claim
+// off an OAuth access token so a probe can call out an already-expired token
+// WITHOUT a network round-trip. Deliberately never exposes the bearer itself.
+export interface CodexCredentialProbe {
+  ok: boolean;
+  authPath: string;
+  credentialType?: "api_key" | "access_token";
+  message: string;
+  // Unix epoch seconds from the access token's JWT `exp` claim. Undefined for
+  // api_key-shaped credentials (no expiry to read) and for tokens that don't
+  // parse as a JWT — an unparseable token is UNKNOWN, not unhealthy.
+  accessTokenExp?: number;
+}
+
+export function probeCodexCredentials(provider?: ProviderConfig): CodexCredentialProbe {
+  const probe = provider ?? { name: "codex" as const, model: DEFAULT_CODEX_MODEL };
+  const credentials = readCodexCredentials(probe);
+  return {
+    ok: credentials.ok,
+    authPath: credentials.authPath,
+    ...(credentials.credentialType ? { credentialType: credentials.credentialType } : {}),
+    message: credentials.message,
+    ...(credentials.credentialType === "access_token" && credentials.bearer
+      ? (() => {
+          const exp = decodeJwtExp(credentials.bearer);
+          return exp === undefined ? {} : { accessTokenExp: exp };
+        })()
+      : {})
+  };
+}
+
+// Local, network-free read of a JWT's `exp` claim: split on ".", base64url-
+// decode the payload segment, read a finite numeric `exp`. Any deviation from
+// that shape (wrong segment count, bad base64, bad JSON, missing/non-numeric
+// exp) returns undefined — callers must treat that as "expiry unknown", never
+// as "expired".
+function decodeJwtExp(token: string): number | undefined {
+  const segments = token.split(".");
+  if (segments.length !== 3) return undefined;
+  try {
+    const payload = JSON.parse(Buffer.from(segments[1]!, "base64url").toString("utf8")) as unknown;
+    if (!isRecord(payload)) return undefined;
+    return typeof payload.exp === "number" && Number.isFinite(payload.exp) ? payload.exp : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function codexAuthPath(provider: ProviderConfig): string {

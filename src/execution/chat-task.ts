@@ -16,13 +16,15 @@ import {
   appendLog,
   appendTaskPartial,
   appendTrace,
+  clearProviderAuthFailureIfPresent,
   createChatMessage,
   getLastMainChatAssistantTextBlock,
   isTerminalTaskStatus,
   mutateState,
   now,
   readState,
-  readTrace
+  readTrace,
+  recordProviderAuthFailure
 } from "../state";
 import { id as makeId } from "../state/ids";
 import { readGoogleAccounts } from "../state/google-accounts";
@@ -1859,6 +1861,14 @@ async function runLoop(
     await enqueueFlush();
     accumulatedCost = addCost(accumulatedCost, result.cost);
 
+    // A successful call proves this provider's credential works — drop any
+    // persistent needs-reauth record for it (issue #233). The helper checks
+    // lock-free first, so the common healthy path writes no state.
+    await clearProviderAuthFailureIfPresent(config.instance, result.provider.name, {
+      reason: "provider call succeeded",
+      taskId
+    });
+
     // First successful provider call in this runLoop entry: commit the
     // deferred identity snapshot. We only persist once per fresh
     // runChatTask entry; subsequent iterations within the same
@@ -2504,6 +2514,13 @@ async function runLoop(
       throw error;
     }
     accumulatedCost = addCost(accumulatedCost, summaryResult.cost);
+    // Same clear seam as the main loop: a successful summary call proves the
+    // credential works, so drop any persistent needs-reauth record (issue
+    // #233). Lock-free check first — no state write on the healthy path.
+    await clearProviderAuthFailureIfPresent(config.instance, summaryResult.provider.name, {
+      reason: "provider call succeeded",
+      taskId
+    });
     const finalText = summaryResult.text || "(no content)";
     const exhausted = await mutateState(config.instance, (state) => {
       const item = findTask(state, taskId);
@@ -2587,7 +2604,14 @@ async function runLoop(
         : stoppedOnStall
           ? "Chat task stopped: tool loop made no progress."
           : `Chat task exceeded ${cap} model iterations.`;
-      if (authProvider) item.authErrorProvider = authProvider;
+      if (authProvider) {
+        item.authErrorProvider = authProvider;
+        // Mirror failTask: persist the needs-reauth record so persistent
+        // surfaces reflect the dead credential (issue #233). This failure
+        // path settles the task itself rather than routing through failTask,
+        // so it must write the record too. `message` is already redacted.
+        recordProviderAuthFailure(state, { provider: authProvider, detail: message, taskId });
+      }
       // Preserve the accumulated cost from the loop so the audit row
       // reflects all model calls leading up to the failed summary turn.
       item.cost = accumulatedCost;
