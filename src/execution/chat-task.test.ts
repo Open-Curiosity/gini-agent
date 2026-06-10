@@ -1927,7 +1927,7 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  test("connector.request cancel emits a terminal chat phase", async () => {
+  test("connector.request cancel resumes the chat loop with a fallback result", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-blocks-connector-cancel");
     const provider = normalizeProvider(config.provider);
@@ -1945,6 +1945,12 @@ describe("chat-task loop", () => {
       ],
       finishReason: "tool_calls"
     });
+    setEchoToolCallingResponse({
+      provider,
+      text: "I can't look up current weather without Brave Search access. Connect Brave Search or provide the weather details.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
 
     const { submitChatMessage } = await import("./chat");
     const submitted = await submitChatMessage(config, session.id, { content: "what is the weather in sf today" });
@@ -1956,9 +1962,16 @@ describe("chat-task loop", () => {
 
     await resolveSetupRequest(config, setup!.id, "cancel", { actor: "user" });
 
-    const failed = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
-    expect(failed?.status).toBe("failed");
-    expect(failed?.error).toBe("Setup cancelled: brave-search");
+    let finished = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    const deadline = Date.now() + 5000;
+    while (finished?.status !== "completed" && Date.now() < deadline) {
+      await Bun.sleep(20);
+      finished = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    }
+    expect(finished?.status).toBe("completed");
+    expect(finished?.summary).toBe(
+      "I can't look up current weather without Brave Search access. Connect Brave Search or provide the weather details."
+    );
 
     const { listChatBlocks } = await import("../state");
     const blocks = listChatBlocks(config.instance, session.id);
@@ -1971,7 +1984,7 @@ describe("chat-task loop", () => {
     }
     expect(lastPhase?.kind).toBe("phase");
     if (lastPhase?.kind === "phase") {
-      expect(lastPhase.label).toBe("Failed");
+      expect(lastPhase.label).toBe("Completed");
       expect(lastPhase.taskId).toBe(submitted.taskId);
     }
     const requestConnectorCall = blocks.find(
@@ -1979,10 +1992,11 @@ describe("chat-task loop", () => {
     );
     expect(requestConnectorCall?.kind).toBe("tool_call");
     if (requestConnectorCall?.kind === "tool_call") {
-      expect(requestConnectorCall.status).toBe("denied");
-      expect(requestConnectorCall.errorMessage).toBe("Setup cancelled: brave-search");
+      expect(requestConnectorCall.status).toBe("ok");
     }
-    expect(blocks.some((b) => b.kind === "system_note" && b.text === "Setup cancelled: brave-search")).toBe(true);
+    expect(blocks.some((b) => b.kind === "tool_result" && b.preview.includes("User canceled connector setup for brave-search"))).toBe(true);
+    expect(blocks.some((b) => b.kind === "assistant_text" && b.text === finished?.summary)).toBe(true);
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup!.id)?.status).toBe("cancelled");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
