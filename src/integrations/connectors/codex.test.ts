@@ -10,7 +10,13 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { probeCodexCredentials } from "../../provider";
-import { __setCodexWhichForTests, codexProvider, evaluateCodexAuth, whichBinary } from "./codex";
+import {
+  __setCodexRetryDelayForTests,
+  __setCodexWhichForTests,
+  codexProvider,
+  evaluateCodexAuth,
+  whichBinary
+} from "./codex";
 import type { ProbeContext } from "./types";
 
 function b64url(value: unknown): string {
@@ -45,6 +51,7 @@ describe("codex credential probe", () => {
     if (prevOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = prevOpenAiKey;
     __setCodexWhichForTests(null);
+    __setCodexRetryDelayForTests(null);
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -91,6 +98,42 @@ describe("codex credential probe", () => {
     // Parseable payload without a numeric exp → unknown.
     writeAuth({ tokens: { access_token: makeJwt({ exp: "soon" }) } });
     expect(probeCodexCredentials().accessTokenExp).toBeUndefined();
+  });
+
+  test("probeCodexCredentials flags an unparseable auth file as transient (mid-rewrite read)", () => {
+    // The codex CLI saves auth.json via truncate+write; a reader landing
+    // between the two sees a partial document. That must surface as a
+    // retryable transient failure, not steady-state "no credentials".
+    writeAuth('{"tokens":{');
+    const creds = probeCodexCredentials();
+    expect(creds.ok).toBe(false);
+    expect(creds.transient).toBe(true);
+    expect(creds.message).toContain("Could not read Codex credentials");
+  });
+
+  test("probe retries a transient torn read once and succeeds when the rewrite lands", async () => {
+    __setCodexWhichForTests(() => "/usr/local/bin/codex");
+    __setCodexRetryDelayForTests(0);
+    const authPath = writeAuth('{"tokens":{');
+    // The first read happens on the microtask queue (behind the cached
+    // dynamic import), so a macrotask-scheduled repair lands strictly
+    // between the first read and the retry's own setTimeout.
+    setTimeout(() => writeAuth({ tokens: { access_token: "opaque-token" } }), 0);
+    const result = await codexProvider.probe!(PROBE_CTX);
+    expect(result).toEqual({ ok: true, message: `codex available; auth via ${authPath}` });
+  });
+
+  test("probe and detect report a persistently torn auth file as unhealthy after the retry", async () => {
+    __setCodexWhichForTests(() => "/usr/local/bin/codex");
+    __setCodexRetryDelayForTests(0);
+    writeAuth('{"tokens":{');
+    const result = await codexProvider.probe!(PROBE_CTX);
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("Could not read Codex credentials");
+
+    const detected = await codexProvider.detect!();
+    expect(detected.detected).toBe(false);
+    expect(detected.message).toContain("no auth source");
   });
 
   test("probeCodexCredentials reports a missing auth file as not ok with the resolved path", () => {

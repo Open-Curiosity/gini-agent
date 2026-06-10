@@ -65,14 +65,34 @@ export function evaluateCodexAuth(
   return { ok: false, message: creds.message };
 }
 
+// Test seam for the transient-read retry delay below; null means "use the
+// provider's CODEX_RETRY_REWRITE_DELAY_MS".
+let retryDelayMsOverride: number | null = null;
+
+export function __setCodexRetryDelayForTests(ms: number | null): void {
+  retryDelayMsOverride = ms;
+}
+
 // Resolve credentials through the provider's own reader. Imported lazily:
 // provider.ts → src/state → connectors/registry.ts → this module is a static
 // cycle, and registry.ts touches `codexProvider` at module-eval time — a
 // static import here would TDZ-crash any entry point that loads codex.ts
 // first. probe/detect run long after startup, so the dynamic import is safe
 // and resolves from the module cache after the first call.
+//
+// A `transient` failure means the read plausibly raced the codex CLI's
+// non-atomic auth.json rewrite (truncate + write), so retry exactly once
+// after the rewrite-settle delay — the same single-retry contract the chat
+// path's withCodexSessionRetry applies. Without it, a re-probe or detect
+// pass landing inside the rewrite window would report a fully-authenticated
+// install as having no credentials.
 async function readCredentialProbe(): Promise<CodexCredentialProbe> {
-  const { probeCodexCredentials } = await import("../../provider");
+  const { probeCodexCredentials, CODEX_RETRY_REWRITE_DELAY_MS } = await import("../../provider");
+  const first = probeCodexCredentials();
+  if (first.ok || !first.transient) return first;
+  await new Promise<void>((resolve) =>
+    setTimeout(resolve, retryDelayMsOverride ?? CODEX_RETRY_REWRITE_DELAY_MS)
+  );
   return probeCodexCredentials();
 }
 

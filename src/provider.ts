@@ -3514,8 +3514,9 @@ function extractStreamErrorMessage(payload: Record<string, unknown>): string | u
 // reader observing the file between the truncate and the flush can
 // see an empty or partial JSON document. An immediate retry would race
 // that writer; a small wait lets the rewrite settle so the second
-// attempt reads a complete file.
-const CODEX_RETRY_REWRITE_DELAY_MS = 50;
+// attempt reads a complete file. Exported so other auth.json readers
+// (the codex connector probe) can wait out the same window.
+export const CODEX_RETRY_REWRITE_DELAY_MS = 50;
 
 // Single-retry wrapper for codex /responses calls. The codex CLI rotates
 // access tokens out-of-band; a request in flight at the moment of
@@ -3636,6 +3637,11 @@ export interface CodexCredentialProbe {
   // api_key-shaped credentials (no expiry to read) and for tokens that don't
   // parse as a JWT — an unparseable token is UNKNOWN, not unhealthy.
   accessTokenExp?: number;
+  // True when the failure is plausibly a mid-rewrite read of auth.json
+  // (readFileSync threw, or JSON.parse failed) — the same retryable race
+  // window readCodexCredentials flags. Probes should retry once after
+  // CODEX_RETRY_REWRITE_DELAY_MS instead of reporting unhealthy.
+  transient?: boolean;
 }
 
 export function probeCodexCredentials(provider?: ProviderConfig): CodexCredentialProbe {
@@ -3646,6 +3652,7 @@ export function probeCodexCredentials(provider?: ProviderConfig): CodexCredentia
     authPath: credentials.authPath,
     ...(credentials.credentialType ? { credentialType: credentials.credentialType } : {}),
     message: credentials.message,
+    ...(credentials.transient ? { transient: true } : {}),
     ...(credentials.credentialType === "access_token" && credentials.bearer
       ? (() => {
           const exp = decodeJwtExp(credentials.bearer);
