@@ -6,6 +6,7 @@
 // no runtime counterpart, plus aliases that rename a runtime type for UI use.
 
 import type {
+  AgentRecord,
   ChatSessionRecord,
   ChatMessageRecord,
   Task,
@@ -42,14 +43,13 @@ export interface ThreadSummary extends RuntimeThreadSummary {
   agentName?: string;
 }
 
-// Trimmed agent shape returned by `GET /api/agents`. The runtime
-// `AgentRecord` carries provider/toolsets/messaging detail that the
-// list endpoint doesn't ship; keep this view aligned with the wire.
-export interface AgentRow {
-  id: string;
-  name: string;
-  status: string;
-}
+// Trimmed agent shape returned by `GET /api/agents`. Derived from the
+// runtime `AgentRecord` so the fields can't drift; the Pick drops the
+// toolsets/messaging detail the UI doesn't consume. The provider/model pair
+// is the per-agent override (ADR per-agent-provider-settings.md) — the
+// Settings default-model control reads agent_default's pair, which is what
+// new chats start with.
+export type AgentRow = Pick<AgentRecord, "id" | "name" | "status" | "providerName" | "model">;
 
 // UI-narrowed snapshot returned by GET /state. The runtime sends the full
 // RuntimeState; the UI only consumes a subset of fields and treats some

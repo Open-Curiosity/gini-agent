@@ -398,7 +398,7 @@ export default function AddProviderPage() {
                 )}
 
                 <div className="grid gap-2">
-                  <Label htmlFor="provider-model">Default model</Label>
+                  <Label htmlFor="provider-model">Model</Label>
                   <Select
                     key={providerName}
                     defaultValue={selectedModel}
