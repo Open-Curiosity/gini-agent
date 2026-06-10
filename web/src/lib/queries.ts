@@ -166,6 +166,17 @@ export function useAllJobs() {
   });
 }
 
+// Unscoped chat list (all agents) — shares the sidebar's cache key so the two
+// dedupe. Used to resolve a pinned/channel session regardless of which agent
+// is active.
+export function useAllChatSessions() {
+  return useQuery<ChatSession[]>({
+    queryKey: ["chat", "all"],
+    queryFn: () => api<ChatSession[]>("/chat"),
+    refetchInterval: 3000
+  });
+}
+
 export function useJobRuns(jobId?: string) {
   const agentId = useActiveAgentId();
   return useQuery<JobRunRecord[]>({

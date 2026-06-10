@@ -27,6 +27,7 @@ import {
   splitBlocks,
   TERMINAL_PHASE_LABELS,
   useAgentChat,
+  useAllChatSessions,
   useAllJobs,
   useCancelTask,
   useChatBlocks,
@@ -483,11 +484,11 @@ function newThreadFor(
   };
 }
 
-// Resolve a pinned session from the cached chat list by id. Channels and
-// agent-chat links already live in the list the sidebar fetches, so no extra
-// request is needed.
+// Resolve a pinned session from the unscoped chat list the sidebar fetches —
+// channels and agent-chat links live there for every agent, so the lookup
+// works even before an active agent is known.
 function useChannelSession(sessionId: string | null): ChatSession | undefined {
-  const sessions = useChatSessions();
+  const sessions = useAllChatSessions();
   return useMemo(
     () => (sessionId ? (sessions.data ?? []).find((s) => s.id === sessionId) : undefined),
     [sessions.data, sessionId]
