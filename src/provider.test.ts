@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import {
   clearEchoToolCallingResponses,
   clearEchoVisionResponses,
@@ -203,10 +204,8 @@ describe("provider", () => {
   });
 
   test("detects Codex auth.json without exposing token values", () => {
-    const root = "/tmp/gini-provider-codex-test";
+    const root = mkdtempSync(join(tmpdir(), "gini-provider-codex-test-"));
     const authPath = `${root}/auth.json`;
-    rmSync(root, { recursive: true, force: true });
-    mkdirSync(root, { recursive: true });
     writeFileSync(authPath, JSON.stringify({
       auth_mode: "chatgpt",
       tokens: {
@@ -223,6 +222,7 @@ describe("provider", () => {
     expect(JSON.stringify(health)).not.toContain("secret-refresh-token");
     if (original === undefined) delete process.env.CODEX_AUTH_JSON;
     else process.env.CODEX_AUTH_JSON = original;
+    rmSync(root, { recursive: true, force: true });
   });
 
   test("codex tool-calling parses function_call SSE events from /responses", async () => {
@@ -2659,9 +2659,7 @@ describe("provider", () => {
   // these pin codex parity.
 
   test("codex: missing auth.json surfaces as ProviderAuthError without hitting the network", async () => {
-    const root = "/tmp/gini-provider-codex-missing-auth";
-    rmSync(root, { recursive: true, force: true });
-    mkdirSync(root, { recursive: true });
+    const root = mkdtempSync(join(tmpdir(), "gini-provider-codex-missing-auth-"));
     // Point CODEX_AUTH_JSON at a path that exists as a directory but holds
     // no auth.json — the exact state `codex logout` leaves behind.
     const restoreEnv = setEnv("CODEX_AUTH_JSON", `${root}/auth.json`);
@@ -3483,10 +3481,12 @@ describe("provider", () => {
 // that exercise the codex /responses path need this so readCodexBearer
 // resolves a non-empty access token without real OAuth state on disk.
 function installCodexAuth(suffix: string): { authPath: string; restore: () => void } {
-  const root = `/tmp/gini-provider-codex-${suffix}`;
+  // mkdtemp (unique per call) rather than a fixed suffix-derived path: this
+  // machine routinely runs the suite from several worktrees at once, and a
+  // shared /tmp path lets one run's cleanup delete another run's auth.json
+  // mid-test (CLAUDE.md fast-test rules: unique temp dirs).
+  const root = mkdtempSync(join(tmpdir(), `gini-provider-codex-${suffix}-`));
   const authPath = `${root}/auth.json`;
-  rmSync(root, { recursive: true, force: true });
-  mkdirSync(root, { recursive: true });
   writeFileSync(authPath, JSON.stringify({
     auth_mode: "chatgpt",
     tokens: {
