@@ -53,14 +53,29 @@ installer-origin guardrails rather than adding a browser-only shortcut.
 - Browser-triggered updates schedule a post-response restart helper so the
   HTTP response can flush before the current gateway exits.
 - The web client treats a browser-triggered update as a modal operation:
-  it blurs and locks the whole app until the restarted runtime reports the
-  new revision, then confirms completion and reloads onto the new assets.
-  Because the restart only fires after the response flushes (above), a
-  dropped `POST /api/update` connection is read as "restarting, not failed"
-  — the blur is held and released only on a structured (HTTP-status-bearing)
-  gateway error. The in-flight state is persisted to `sessionStorage` so the
-  restart-triggered reload resumes the blur instead of briefly exposing a
-  half-updated app.
+  it blurs and locks the whole app until the restarted stack is verifiably
+  up, then confirms completion and reloads onto the new assets. The new
+  revision alone is not completion — version metadata is read from git per
+  request, so the still-running old gateway reports the new sha while the
+  restart is about to take both servers down. Completion is instead gated
+  on process identity: the gateway must answer `/api/status` with a new
+  `pid`, and the web server must answer its local `/api/runtime/__healthz`
+  with a new `ppid` — the supervising `next` CLI process, i.e. the
+  server-tree identity. (The worker `pid` in that response is diagnostic
+  only: the `next` CLI respawns its worker in-tree when an update touches
+  `next.config.*`, so it proves nothing about a restart.) Both baselines
+  are captured when the update starts; a leg whose baseline could not be
+  captured falls back to a restart-freshness heuristic. Before reloading,
+  the client re-probes `__healthz` once and drops back to waiting if the
+  web server is not actually serving, so the reload can never land on a
+  dead server. The whole gate is bounded by one fixed stall deadline that
+  phase transitions cannot extend; past it the blur is released with a
+  notice instead of trapping the user. Because the restart only fires
+  after the response flushes (above), a dropped `POST /api/update`
+  connection is read as "restarting, not failed" — the blur is held and
+  released only on a structured (HTTP-status-bearing) gateway error. The
+  in-flight state is persisted to `sessionStorage` so the restart-triggered
+  reload resumes the blur instead of briefly exposing a half-updated app.
 - The scheduled restart is supervisor-aware. On a launchd-supervised
   instance the runtime self-SIGTERMs (drains, exits 0) and `KeepAlive`
   respawns it with the freshly checked-out code — no detached stop+start
@@ -80,9 +95,11 @@ installer-origin guardrails rather than adding a browser-only shortcut.
 - The sidebar shows a package/git version and an Update button.
 - Clicking Update calls `POST /api/update`; when commits changed, the
   current runtime is restarted without asking for manual stop/start.
-- A web-triggered update blurs and locks the app for the duration, then
-  shows a completion confirmation before reloading; the blur survives the
-  restart-triggered reload rather than briefly exposing the app.
+- A web-triggered update blurs and locks the app for the duration; the
+  completion confirmation and reload come only after the restarted gateway
+  (new `/api/status` pid) and the restarted web server (new `__healthz`
+  ppid) have both answered, and the blur survives the restart-triggered
+  reload rather than briefly exposing the app.
 - `gini update` no longer prints a manual restart instruction.
 - Existing guardrails still reject missing runtimes and unexpected git
   origins.
