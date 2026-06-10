@@ -538,9 +538,13 @@ export interface SystemNoteBlock extends ChatBlockBase {
 }
 
 // Persistent per-provider auth-failure record (issue #233). Written when a
-// ProviderAuthError fails a task; cleared on the next successful provider
-// call, on a provider-config change through the setup API, or on a successful
-// setup Verify. Only FAILURES are stored — a provider with no record is OK.
+// ProviderAuthError fails a task (failTask records for any task mode,
+// including legacy imperative dispatch); cleared only at the seams that
+// prove the credential works again: a successful provider call in the
+// chat-task loop (main loop and the iteration-cap summary call), a
+// provider-config write or successful setup Verify through the setup API,
+// and provider removal. Successful provider calls outside the chat-task
+// loop do not clear. Only FAILURES are stored — a provider with no record is OK.
 // Lives on `RuntimeState.providerAuthFailures`, keyed by provider name, so
 // persistent surfaces (Settings → Providers, /api/providers/catalog) can
 // report "needs re-authentication" instead of presence-only "Connected".
