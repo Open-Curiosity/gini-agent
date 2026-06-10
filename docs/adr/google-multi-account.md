@@ -110,10 +110,16 @@ The intelligence lives in the prompt and skill text, not in heuristic code:
 
 - **0 accounts** → fall back to setup (`google-workspace-setup`).
 - **exactly 1 account** → use it (still passing its config dir).
-- **2+ accounts** → use the account the user named or clearly implied (an
-  explicit tag, an email address, or unambiguous context). If the request
-  doesn't make the account clear, **ASK before running** — never guess on
-  sends, deletes, or other writes. There is no silent default account.
+- **2+ accounts** → choose by the operation:
+  - The user **named or clearly implied** one account (an explicit tag, an
+    email address, or unambiguous context) → use only that account.
+  - An **unscoped read / lookup / search** the user did not tie to an account
+    ("what's on my calendar", "find the budget doc", "search my email") → run
+    it against **every** connected account (one `gws` call per config dir) and
+    **aggregate** the results, labeled by each account's tag and email. Don't
+    pick one, and don't ask — the user wants the whole picture across accounts.
+  - A **write** (send, create, edit, delete) with no account named → **ASK
+    before running** — never guess. There is no silent default account.
 
 This is surfaced two ways, both byte-stable so they don't churn the prompt
 cache:
@@ -251,13 +257,16 @@ account deletes its config dir (its tokens) but never the user's
   `parseGwsAuthStatus` extracts `.user` (email) and `.scopes`.
 - `bun test src/execution/chat-task.test.ts` — `buildConnectedAccountsBlock`
   emits nothing for 0 accounts, the single-account rule for 1, and the
-  "ask when unclear" rule for 2+; the block is byte-stable for a given registry.
+  aggregate-on-unscoped-read / ask-on-write rule for 2+; the block is
+  byte-stable for a given registry.
 - `bun test skills/google/google-account-login/scripts/__tests__/account-login.test.ts`
   — the pure URL-scrape / arg-build helpers (`extractConsentUrl`,
   `buildLoginArgs`).
-- E2E in a real chat turn: with two accounts connected, a request that doesn't
-  name an account makes the agent ask which one before running a write; a
-  request that names a tag/email runs against that account's config dir.
+- E2E in a real chat turn: with two accounts connected, an unscoped read
+  ("what's on my calendar") runs against every account's config dir and
+  aggregates the results; a write that doesn't name an account makes the agent
+  ask which one first; a request that names a tag/email runs against that
+  account's config dir.
 
 ## Related
 
