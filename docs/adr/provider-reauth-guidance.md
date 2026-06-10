@@ -62,8 +62,8 @@ wrong shape:
   verbatim message as the cause and link straight to the form.
 - **OAuth/CLI providers (codex)** fail with a message that says *nothing* about
   how to recover, and there is no in-app form — re-auth is a non-obvious
-  terminal flow (`codex` → `/logout` → `codex` → sign in). This is the only case
-  that needs a written step-through.
+  terminal flow (`codex logout` → `codex login` → sign in). This is the only
+  case that needs a written step-through.
 
 Re-auth instructions must not live in code: a step list duplicated in a React
 component and a docs page will drift. Keeping the prose in hosted docs (a single
