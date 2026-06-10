@@ -728,6 +728,27 @@ describe("setup-api", () => {
     expect(cleared?.evidence).toMatchObject({ reason: "provider configuration updated" });
   });
 
+  test("POST bedrock clears the needs-reauth record on a successful config write", async () => {
+    // Bedrock has no key form — re-saving the provider with working AWS
+    // credentials IS the recovery seam for that provider class.
+    await seedAuthFailure("bedrock");
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    try {
+      const result = await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-west-2" });
+      expect(result.ok).toBe(true);
+      const state = readState(config.instance);
+      expect(state.providerAuthFailures?.bedrock).toBeUndefined();
+      const cleared = state.audit.find((a) => a.action === "provider.auth.cleared" && a.target === "bedrock");
+      expect(cleared?.evidence).toMatchObject({ reason: "provider configuration updated" });
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+    }
+  });
+
   test("POST codex (the setup Verify seam) clears the codex record once credentials are present", async () => {
     await seedAuthFailure("codex");
     const authPath = join(s.stateRoot, "codex-auth.json");
