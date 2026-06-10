@@ -17,10 +17,23 @@ in code or duplicated across surfaces:
 The runtime classifies the failure, tags it with the provider that served the
 turn, and stamps the chat block so every client renders the same thing:
 
-- `ProviderAuthError` is thrown at the provider-call sites (`src/execution/chat-task.ts`
-  — both the main loop call and the iteration-cap summary call), carrying the
-  provider from the effective context — accurate even if the active agent
-  changed while the call was in flight.
+- `ProviderAuthError` originates in two places:
+  - The provider layer (`src/provider.ts`) throws it directly, with the
+    provider name fixed at the throw site, for credential failures detected
+    before or without a backend rejection: anthropic's missing env key
+    (`readAnthropicKey`), bedrock's unresolved AWS credentials
+    (`bedrockAuthHeaders`), and codex steady-state local credential absence —
+    a missing or wrong-shape `~/.codex/auth.json` — in `readCodexBearer`.
+    Codex additionally converts a **second** consecutive `CodexAuthRaceError`
+    after `withCodexSessionRetry`'s single retry into
+    `ProviderAuthError("codex")`: a persistent auth.json read failure is
+    classified as a credential problem, not a mid-write race.
+  - The provider-call sites (`src/execution/chat-task.ts` — both the main
+    loop call and the iteration-cap summary call) wrap a backend-rejected
+    credential only when the error is not already a `ProviderAuthError` and
+    `isAuthExpiredError` matches its message, carrying the provider from the
+    effective context — accurate even if the active agent changed while the
+    call was in flight.
 - Enrichment is keyed on that typed error, not on message-sniffing. `failTask`
   (`src/agent.ts`) and the iteration-cap path enrich a failure **only** when the
   error is a `ProviderAuthError`, so a tool/browser/terminal failure whose text
