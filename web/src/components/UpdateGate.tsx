@@ -6,6 +6,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode
 } from "react";
@@ -113,10 +114,13 @@ function writePersistedGate(value: PersistedGate | null): void {
 // Hold the "complete" confirmation on screen this long before the final
 // pre-reload probe and the reload onto the freshly built assets.
 const COMPLETE_RELOAD_DELAY_MS = 1_500;
-// Generous ceiling for each waiting phase (git + bun install in both roots,
-// then the restart). If a phase never reports back within this, the gate
-// releases rather than trapping the user behind a permanent blur. The
-// completion detectors normally tear the gate down long before this fires.
+// Whole-gate deadline: a generous ceiling on the entire update (git + bun
+// install in both roots, the restart, and the pre-reload probe). The deadline
+// is fixed the moment the gate leaves idle; phase transitions and probe
+// drop-backs reschedule against it with the remaining time, never extending
+// it. If the update hasn't reloaded by then, the gate releases rather than
+// trapping the user behind a permanent blur. The completion detectors
+// normally tear the gate down long before this fires.
 const STALL_TIMEOUT_MS = 120_000;
 
 export function UpdateGateProvider({ children }: { children: ReactNode }) {
@@ -129,6 +133,9 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
   const [restartExpected, setRestartExpected] = useState(true);
   // When the gate entered "restarting" — see the pid-less fallbacks below.
   const [restartingSince, setRestartingSince] = useState<number | null>(null);
+  // Wall-clock deadline for the whole gate, set once when it leaves "idle"
+  // and cleared when it returns — see the stall safety net below.
+  const stallDeadlineRef = useRef<number | null>(null);
 
   // Poll status fast while updating/restarting so the new revision — and then
   // the restarted gateway — are picked up promptly.
@@ -376,19 +383,28 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
     };
   }, [phase, beforePid, beforeWebPpid]);
 
-  // Safety net spanning the waiting phases: release if the update never
-  // reports back (a hung POST, a failed restart, or a reload that lost the
-  // target revision). Status polling doesn't reset this — its deps are stable
-  // within a phase — but the updating → restarting transition re-arms it, so
-  // the worst case is ~2× STALL_TIMEOUT_MS before the gate releases.
+  // Safety net spanning every non-idle phase: release if the update never
+  // reloads (a hung POST, a failed restart, a reload that lost the target
+  // revision, or a stack that proved its restart and then died — the latter
+  // cycles complete ↔ restarting on pre-reload probe failures because the
+  // latched identity legs re-complete the gate instantly). The deadline is
+  // fixed when the gate leaves idle: phase changes re-run this effect, but
+  // each run schedules the remaining time against that one deadline, so no
+  // amount of transitions or drop-backs can extend the blur. Releasing from
+  // "complete" also tears down the pending probe/reload via that effect's
+  // cancelled-flag cleanup.
   useEffect(() => {
-    if (phase !== "updating" && phase !== "restarting") return;
+    if (phase === "idle") {
+      stallDeadlineRef.current = null;
+      return;
+    }
+    stallDeadlineRef.current ??= Date.now() + STALL_TIMEOUT_MS;
     const timer = setTimeout(() => {
       reset();
       toast.error("Update is taking longer than expected. Reload to check on it.");
       qc.invalidateQueries({ queryKey: ["status"] });
       qc.invalidateQueries({ queryKey: ["version", "check"] });
-    }, STALL_TIMEOUT_MS);
+    }, stallDeadlineRef.current - Date.now());
     return () => clearTimeout(timer);
   }, [phase, reset, qc]);
 

@@ -557,6 +557,49 @@ describe("UpdateGate", () => {
     expect(reloadSpy).not.toHaveBeenCalled();
   });
 
+  test("the complete↔restarting probe-failure cycle cannot outlive the stall deadline", async () => {
+    jest.useFakeTimers();
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    setSystemTime(t0);
+    const { client } = renderGate();
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    statusSha = "sha-new";
+    await pollStatus(client);
+    statusPid = 222;
+    webPid = 999;
+    webPpid = 555;
+    await pollStatus(client);
+    await pollHealthz(client);
+    expect(phase()).toBe("complete");
+
+    // The web server proves its restart, then dies for good. Every pre-reload
+    // probe fails → drop back to restarting → the latched identity legs
+    // re-complete the gate instantly → a fresh probe is armed. Each lap
+    // crosses two phase transitions, so a stall timer re-armed per phase
+    // would be cleared every ~1.5s and never fire. The deadline is fixed when
+    // the gate leaves idle, so once it passes the gate must release — no
+    // reload, back to idle, persisted gate cleared.
+    healthzFailing = true;
+    let now = t0.getTime();
+    // 85 × 1.5s = 127.5s of laps, comfortably past the 120s deadline.
+    for (let i = 0; i < 85 && phase() !== "idle"; i++) {
+      await act(async () => {
+        jest.advanceTimersByTime(1_500);
+        // advanceTimersByTime unpins the mocked clock back to real time;
+        // re-pin it in lockstep so the deadline's remaining wall-clock time
+        // shrinks with the fake-timer laps.
+        now += 1_500;
+        setSystemTime(new Date(now));
+      });
+      await flush();
+    }
+    expect(phase()).toBe("idle");
+    expect(reloadSpy).not.toHaveBeenCalled();
+    expect(window.sessionStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
   test("useUpdateGate outside the provider fails loudly", () => {
     expect(() => rtlRender(<Probe />)).toThrow("useUpdateGate must be used within <UpdateGateProvider>");
   });
