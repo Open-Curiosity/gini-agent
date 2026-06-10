@@ -18,6 +18,7 @@ import {
   loadSoul,
   loadUserProfile,
   migrateInstructionsIdentityLine,
+  migrateInstructionsThreadRouting,
   previewRemoveSoulSection,
   removeSoulSection,
   removeUserProfileSection,
@@ -627,6 +628,53 @@ describe("identity-files", () => {
 
     test("no-op when INSTRUCTIONS.md is absent", () => {
       expect(migrateInstructionsIdentityLine(INSTANCE)).toBe(false);
+    });
+  });
+
+  describe("migrateInstructionsThreadRouting", () => {
+    const START_THREAD_LINE =
+      "Main chat vs thread — decide this FIRST, before anything else. Each agent has ONE chat; keep it scannable by moving multi-turn work into a thread. The instant a user message opens a line of work you expect to exchange several messages about — research, a debugging investigation, brainstorming, planning, a comparison, anything with likely follow-ups — call `start_thread` as your VERY FIRST action, before any prose AND before any other tool call, then proceed normally. For a quick answer, a confirmation, a single fact, or a one-shot action, do nothing and reply in the main chat. Never call it when you are already replying inside a thread (that reply stays in the thread automatically).";
+    const EXAMPLES_LINE =
+      "Examples — thread: \"research X and recommend one\", \"let's brainstorm names\", \"help me debug this failing job\", \"compare A vs B for our use case\". Main chat: \"what's 2+2\", \"say hi\", \"delete job X\", \"what model are you\".";
+    const DIRECTIVE_LINE =
+      "Replying in the main chat vs a thread. Your reply goes to the main chat by default. When your reply opens a multi-turn line of work — research, a debugging investigation, anything you expect several follow-ups about — keep the main chat scannable by answering in a thread instead: make the FIRST characters of that reply exactly `<route>thread</route>` (on its own, before any other text), then write your reply normally. For quick answers, confirmations, or single results, do nothing (main chat). Only use this on a fresh reply to the user, never inside an existing thread.";
+
+    test("removes the start_thread guidance and collapses the blank-line gap", () => {
+      const path = instructionsPath(INSTANCE);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `First rule.\n\n${START_THREAD_LINE}\n${EXAMPLES_LINE}\n\nNext rule.`);
+      expect(migrateInstructionsThreadRouting(INSTANCE)).toBe(true);
+      expect(readFileSync(path, "utf8")).toBe("First rule.\n\nNext rule.");
+    });
+
+    test("removes the older <route>thread</route> directive wording", () => {
+      const path = instructionsPath(INSTANCE);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `First rule.\n\n${DIRECTIVE_LINE}\n\nNext rule.`);
+      expect(migrateInstructionsThreadRouting(INSTANCE)).toBe(true);
+      expect(readFileSync(path, "utf8")).toBe("First rule.\n\nNext rule.");
+    });
+
+    test("is idempotent — a second pass does not rewrite", () => {
+      const path = instructionsPath(INSTANCE);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `First rule.\n\n${START_THREAD_LINE}\n${EXAMPLES_LINE}\n\nNext rule.`);
+      expect(migrateInstructionsThreadRouting(INSTANCE)).toBe(true);
+      expect(migrateInstructionsThreadRouting(INSTANCE)).toBe(false);
+      expect(readFileSync(path, "utf8")).toBe("First rule.\n\nNext rule.");
+    });
+
+    test("leaves reworded guidance untouched", () => {
+      const path = instructionsPath(INSTANCE);
+      mkdirSync(dirname(path), { recursive: true });
+      const custom = "First rule.\n\nUse threads for long research work when asked.\n\nNext rule.";
+      writeFileSync(path, custom);
+      expect(migrateInstructionsThreadRouting(INSTANCE)).toBe(false);
+      expect(readFileSync(path, "utf8")).toBe(custom);
+    });
+
+    test("no-op when INSTRUCTIONS.md is absent", () => {
+      expect(migrateInstructionsThreadRouting(INSTANCE)).toBe(false);
     });
   });
 

@@ -58,9 +58,9 @@ export interface ChatEmitContext {
   runId?: string;
   taskId: string;
   // Thread membership stamped onto every block emitted through this context.
-  // Set when the turn routes into a thread (either pre-seeded from the Task
-  // for a thread-reply, or minted mid-turn when the `<route>thread</route>`
-  // directive fires). Absent for main-chat turns.
+  // Pre-seeded from the Task when it was spawned to reply inside a thread
+  // (the thread-reply endpoint). Absent for main-chat turns — a turn never
+  // re-routes into a thread mid-flight.
   threadId?: string;
   parentBlockId?: string;
 }
@@ -89,8 +89,7 @@ export function resolveEmitContext(
     runId: task.runId,
     taskId,
     // Pre-thread the context when the task was spawned to reply inside a
-    // thread (or had its thread fields persisted mid-turn). The whole
-    // response then threads with no directive — user context wins.
+    // thread. The whole response then threads — user context wins.
     ...(task.threadId ? { threadId: task.threadId } : {}),
     ...(task.parentBlockId ? { parentBlockId: task.parentBlockId } : {})
   };

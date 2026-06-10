@@ -8,7 +8,12 @@ import { resolveEffectiveContext } from "../execution/effective-context";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
 import { migratePinnedMemoriesToUserProfile } from "../memory/migrate-pinned-to-user-md";
 import { providerHealth } from "../provider";
-import { migrateInstructionsIdentityLine, seedAgentSoulFile, scaffoldInstanceIdentityFiles } from "./identity-files";
+import {
+  migrateInstructionsIdentityLine,
+  migrateInstructionsThreadRouting,
+  seedAgentSoulFile,
+  scaffoldInstanceIdentityFiles
+} from "./identity-files";
 import { currentVersionInfo } from "./update";
 
 export function status(config: RuntimeConfig) {
@@ -104,6 +109,12 @@ export async function install(config: RuntimeConfig): Promise<void> {
   // framework wording) to the current generic line. The agent's name now
   // lives in its SOUL.md. Idempotent + best-effort.
   migrateInstructionsIdentityLine(config.instance);
+  // Instances seeded INSTRUCTIONS.md while the bundled default still
+  // instructed agent-initiated thread routing (`start_thread` /
+  // `<route>thread</route>`); that mechanism is gone — main-chat messages
+  // are always answered in the main chat — so strip the stale guidance
+  // lines from the on-disk copy. Idempotent + best-effort.
+  migrateInstructionsThreadRouting(config.instance);
   // Approval-mode migration: legacy configs that carry
   // `dangerouslyAutoApprove: true` without an explicit `approvalMode`
   // get aliased to `approvalMode: "yolo"`. Patch the in-memory config

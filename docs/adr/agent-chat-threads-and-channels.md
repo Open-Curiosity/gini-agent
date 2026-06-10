@@ -18,16 +18,17 @@ the session list:
   branched from (`parent_block_id`). There is **no new session per
   thread** — threads ride the same ordinal stream, SSE, and APNs the
   ChatBlock protocol already provides (see ADR chat-block-protocol.md).
-- **The agent decides routing.** The agent calls a `start_thread`
-  control tool to branch the current turn into a thread; a leading
-  `<route>thread</route>` text directive is a silent fallback. A user
-  reply posted into a thread always stays threaded — user context wins
-  over any routing signal. Because the turn opened in the main chat (its
-  `user_text` and a `Thinking` phase already landed there before the
-  branch), the switch closes that originating main-chat turn with a
-  terminal phase — the turn's work and its own terminal phase continue in
-  the thread, so the main chat's in-flight indicator never strands on
-  `Thinking`.
+- **Threads are user-initiated; routing is fixed at task spawn.** A user
+  starts a thread from a message's "Reply in thread" composer; the first
+  reply creates the thread, rooted at the main-chat block it branched
+  from, and later replies append. A task spawned for a thread reply
+  pre-seeds `threadId` / `parentBlockId` and its whole response threads —
+  user context wins. A task spawned from the main composer carries no
+  thread fields and is always answered in the main timeline; the runtime
+  never re-routes a turn mid-flight. (The earlier agent-decided routing —
+  a `start_thread` control tool with a `<route>thread</route>` directive
+  fallback — silently diverted main-chat replies into threads and was
+  removed; see Thread Routing and Resolved Decisions, B.)
 - **Channels are job sessions surfaced as chats.** A recurring job's
   dedicated session is surfaced in the rail as a chattable channel
   (`kind:"channel"`, `origin:"job"`). It is a view over the existing
@@ -168,59 +169,37 @@ an agent chat; the difference is purely the `kind`/`origin` tags that
 drive the rail grouping and the unread-until-opened behavior job
 sessions already had.
 
-## Agent-Decided Routing
+## Thread Routing
 
-Routing is resolved per turn, before the user sees any text, by three
-mechanisms in priority order:
+A turn's thread membership is decided once, when its task is spawned:
 
-1. **`start_thread` control tool (primary).** Defined in
-   `src/execution/tool-catalog.ts`, it is a core tool — always-on,
-   never deferred (allowlisted alongside `load_tools` in the deferral
-   gate), and never approval-gated. It is handled **inline** in the
-   chat-task loop (`src/execution/chat-task.ts`), not through the
-   dispatch switch, so it produces no `phase` / `tool_call` /
-   `tool_result` chat block — it is a control action, not visible work.
-   On the first model call of a fresh turn it calls `switchTurnToThread()`
-   and returns a small JSON result telling the model whether it is now
-   threaded; a tool result is always pushed so the provider sees the
-   call resolved.
+1. **User reply in a thread.** `submitThreadReply` spawns the task with
+   the thread's `threadId` / `parentBlockId`; `resolveEmitContext`
+   (`src/execution/chat-task-emit.ts`) seeds the emit context from those
+   fields and every block the turn emits — assistant text, tool calls,
+   tool results, phases — carries them. User context wins: nothing the
+   model outputs can move the response out of the thread.
 
-2. **`<route>thread</route>` directive (silent fallback).**
-   `parseLeadingRouteDirective` (`src/execution/route-directive.ts`)
-   inspects the accreted *leading* text of a turn as deltas stream in,
-   distinguishing a complete directive, a strict prefix that could still
-   become one (buffer and wait), and everything else. A recognized
-   directive is parsed and stripped before any text reaches the user or
-   the task summary; `<route>thread</route>` triggers the same
-   `switchTurnToThread()`. If `start_thread` already routed the turn,
-   the text parser does not re-route.
+2. **Main-composer message.** `submitChatMessage` spawns the task with
+   no thread fields, and the runtime never sets them mid-turn, so the
+   whole response lands in the main timeline.
 
-3. **User reply in a thread (user context wins).** When a user posts
-   into a thread via `submitThreadReply`, the whole response stays
-   threaded regardless of any routing signal — `emitCtx` is seeded with
-   the thread's `threadId` / `parentBlockId`, and `switchTurnToThread()`
-   no-ops because the turn is already threaded.
-
-`switchTurnToThread()` mints a `thread_id`, resolves the parent as the
-last main-chat `assistant_text` block of the prior turn
-(`getLastMainChatAssistantTextBlock`), and stamps the emit-context so
-every subsequent emit on the turn — sibling tool calls in the same
-batch and all continued text/tools in later iterations — threads
-automatically. If there is no earlier assistant message to branch from,
-the switch is a no-op and the turn stays in the main chat.
-
-The `start_thread`-as-primary choice was forced by behavior, not
-preference (see Resolved Decisions, B). The verified runtime model did
-not reliably emit a leading `<route>` token for research/brainstorm
-prompts — research went tool-first, so the leading-text directive could
-never fire — but it called tools (`web_search`, `request_connector`)
-readily. A control tool the model invokes as its first action is the
-mechanism it actually reaches for; the directive remains as a
-zero-cost fallback for models that do emit it. The
-"expect multi-turn → thread" guidance lives in the system prompt
-(`src/runtime/defaults/INSTRUCTIONS.md`), instructing the tool as
-primary; there is no programmatic retroactive heuristic, because
-already-streamed blocks cannot be cleanly re-threaded after the fact.
+Earlier revisions let the agent re-route a fresh main-chat turn into a
+newly minted thread: a `start_thread` control tool (primary) with a
+leading `<route>thread</route>` text directive as fallback, both feeding
+a mid-turn emit-context switch. That mechanism was removed (#280).
+Models over-triggered it on any multi-turn-looking prompt, which left
+the main chat showing the user's message with no reply — and because the
+minted thread rooted at the same parent `assistant_text` block as an
+existing user-created thread, the two were indistinguishable in every
+surface (same root preview, one chip per parent block), so the reply
+appeared to land inside a thread the user never sent it to. A message
+sent in the main chat must never silently divert into a thread, so the
+runtime no longer carries the tool, the directive grammar, or the
+mid-turn switch. Instances that seeded the old INSTRUCTIONS.md threading
+guidance get those lines stripped by a one-time boot migration
+(`migrateInstructionsThreadRouting` in `src/runtime/identity-files.ts`),
+mirroring the identity-line migration.
 
 ## Client Contract
 
@@ -239,8 +218,8 @@ New routes (`src/http.ts`):
   user branched from, validated to be an un-threaded block in this
   session); if the thread already exists, the parent is inherited from
   its first block (a missing one is an error, not a silent drop). This
-  is how a user starts a thread off any agent message (Slack-style
-  "Reply in thread"), complementing the agent-initiated `start_thread`.
+  is how a thread comes to exist at all: a user starts one off any agent
+  message (Slack-style "Reply in thread").
   Body also accepts `alsoToMain?` to best-effort mirror the message into
   the main chat (consistent with the existing dual-publish pattern). The
   handler validates the **session** exists first (so a bad `sessionId`
@@ -267,21 +246,22 @@ threads for `filter=unread`; the inbox always receives the full list.
   non-bridge legacy session into the canonical agent chat (lazy promote
   to `kind:"agent"`); leave the rest with `kind` undefined so they are
   hidden, not deleted. Reversible.
-- **B. Thread decision mechanism.** `start_thread` control tool as the
-  primary mechanism, `<route>thread</route>` leading directive as a
-  silent fallback. (This supersedes the original "structured directive,
-  not a tool" plan — the model did not reliably emit the directive; see
-  Agent-Decided Routing.)
+- **B. Thread decision mechanism.** Superseded — threads are
+  user-initiated only (decision E) and a turn's membership is fixed at
+  task spawn (see Thread Routing). The original agent-decided routing
+  (`start_thread` control tool primary, `<route>thread</route>` leading
+  directive fallback) silently moved main-composer replies into threads
+  indistinguishable from existing ones (#280) and was removed.
 - **C. Channels.** A view over the job's existing session
   (`kind:"channel"` + `origin:"job"`), no `ChannelRecord`.
 - **D. Delete-agent cascade.** Deleting an agent deletes its chat and
   threads and detaches its job channels (the jobs themselves survive,
   paused), while `JobRunRecord` audit history is retained.
 - **E. User reply in a thread.** User context wins — the response stays
-  in the thread regardless of any routing directive. A user can also
-  *start* a thread off any agent message: the first reply (carrying its
-  `parentBlockId`) creates the thread, create-or-append (see Client
-  Contract), complementing the agent-initiated `start_thread`.
+  in the thread. A user starts a thread off any agent message: the first
+  reply (carrying its `parentBlockId`) creates the thread,
+  create-or-append (see Client Contract). This is the only way a thread
+  is created.
 - **F. Thread read-state.** Per-thread unread is computed **client-side**
   (web `localStorage`); the server's per-device read cursor stays
   session-level, and opening the main chat does not clear thread badges.
@@ -300,9 +280,10 @@ Pro:
 - The persistence change is purely additive (two nullable columns + one
   index). Every pre-9 row reads back as a main-chat block, so the
   migration needs no data backfill for thread membership.
-- The routing decision is the agent's, made up front, with a tool the
-  model reliably calls and a directive fallback — no client heuristic
-  and no post-hoc re-threading.
+- Routing is deterministic and fixed at task spawn: a thread reply
+  threads, a main-composer message answers in the main timeline. No
+  model judgment call decides where a reply lands, so the main composer
+  can never silently inherit or mint a thread.
 
 Con:
 
@@ -313,11 +294,9 @@ Con:
 - `summarizeThreadsForInstance` must be handed the agent session-id list
   by the caller because sessions live in JSON `RuntimeState` while
   blocks live in SQLite — the two stores can't be joined in one query.
-- `start_thread` is one more always-on tool in every turn's catalog,
-  and the routing decision now depends on the model invoking it (with
-  the directive as the only fallback). A model that does neither stays
-  in the main chat — the safe default, but it means auto-threading
-  quality is model-dependent.
+- The agent cannot move long multi-turn work into a thread on its own;
+  keeping the main chat scannable relies on the user branching threads
+  where they want them.
 
 ## Deferred Follow-Up
 
@@ -336,13 +315,11 @@ Con:
   `kind:"agent"` session, preferring the non-empty chat over an empty
   `kind:"agent"` duplicate (and demoting the duplicate), lazy promotion
   of a legacy session, and fresh creation.
-- `bun test src/execution/route-directive.test.ts` covers the
-  leading-directive parser's `none` / `incomplete` / `directive`
-  states.
-- `bun test src/execution/chat-task-route.test.ts` covers the
-  per-turn routing: `start_thread` branching the turn inline (no
-  visible block), the `<route>` fallback, the already-threaded and
-  no-parent no-ops, and user-reply-stays-threaded.
+- `bun test src/execution/chat-task-route.test.ts` covers per-turn
+  thread membership: a main-composer turn answers in the main chat, a
+  stale leading `<route>thread</route>` text passes through without
+  threading, a `start_thread` tool call cannot move the turn out of the
+  main chat, and a pre-seeded thread reply threads its whole response.
 - `bun test src/state/chat-blocks.test.ts` covers thread tagging on
   insert, `listThreadBlocks` / `listMainChatBlocks`, and the
   `summarizeThreads` / `summarizeThreadsForInstance` aggregates.
@@ -351,8 +328,9 @@ Con:
   create-or-append from a new thread id + `parentBlockId`, the
   session-first 404, and the `parentBlockId` requirement), and the
   `/api/threads` inbox.
-- The live-gateway end-to-end verification confirms the model calls
-  `start_thread` on a brainstorm prompt and the resulting reply (and its
-  follow-ups) thread, the web Thread panel and `/threads` inbox render
-  the thread, and the `UNIQUE (session_id, ordinal)` invariant holds
-  with threaded blocks interleaved in the stream.
+- The live-gateway end-to-end verification confirms a main-composer
+  message — including a multi-turn-shaped brainstorm prompt — is
+  answered in the main timeline, a "Reply in thread" reply stays in its
+  thread, the web Thread panel and `/threads` inbox render the thread,
+  and the `UNIQUE (session_id, ordinal)` invariant holds with threaded
+  blocks interleaved in the stream.

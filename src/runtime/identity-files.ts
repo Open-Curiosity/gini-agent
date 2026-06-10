@@ -274,6 +274,64 @@ export function migrateInstructionsIdentityLine(instance: Instance): boolean {
   }
 }
 
+// Threading guidance shipped by earlier bundled defaults. Agent-initiated
+// thread routing (the `start_thread` tool and the `<route>thread</route>`
+// directive) was removed — a message sent in the main chat is always
+// answered in the main chat, and threads are user-initiated only (see ADR
+// agent-chat-threads-and-channels.md) — but instances seeded
+// INSTRUCTIONS.md first-write-wins, so their on-disk copy keeps steering
+// models toward a tool that no longer exists. Exact-line matches only: a
+// user who reworded the guidance keeps their edit.
+const LEGACY_INSTRUCTIONS_THREAD_LINES = new Set<string>([
+  "Replying in the main chat vs a thread. Your reply goes to the main chat by default. When your reply opens a multi-turn line of work — research, a debugging investigation, anything you expect several follow-ups about — keep the main chat scannable by answering in a thread instead: make the FIRST characters of that reply exactly `<route>thread</route>` (on its own, before any other text), then write your reply normally. For quick answers, confirmations, or single results, do nothing (main chat). Only use this on a fresh reply to the user, never inside an existing thread.",
+  "Main chat vs thread — decide this FIRST, before anything else. Each agent has ONE chat; keep it scannable by moving multi-turn work into a thread. The instant a user message opens a line of work you expect to exchange several messages about — research, a debugging investigation, brainstorming, planning, a comparison, anything with likely follow-ups — call `start_thread` as your VERY FIRST action, before any prose AND before any other tool call, then proceed normally. For a quick answer, a confirmation, a single fact, or a one-shot action, do nothing and reply in the main chat. Never call it when you are already replying inside a thread (that reply stays in the thread automatically).",
+  "Examples — thread: \"research X and recommend one\", \"let's brainstorm names\", \"help me debug this failing job\", \"compare A vs B for our use case\". Main chat: \"what's 2+2\", \"say hi\", \"delete job X\", \"what model are you\"."
+]);
+
+// One-time, per-boot migration: drop the legacy thread-routing guidance
+// lines from the on-disk INSTRUCTIONS.md and collapse the blank-line gap
+// they leave behind. Idempotent — the current bundled default no longer
+// contains these lines — and best-effort, mirroring
+// migrateInstructionsIdentityLine. Returns true when it rewrote the file.
+export function migrateInstructionsThreadRouting(instance: Instance): boolean {
+  const path = instructionsPath(instance);
+  if (!existsSync(path)) return false;
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return false;
+  }
+  const lines = raw.split("\n");
+  // trimEnd drops a trailing \r so a CRLF file still matches.
+  const kept = lines.filter((line) => !LEGACY_INSTRUCTIONS_THREAD_LINES.has(line.trimEnd()));
+  if (kept.length === lines.length) return false;
+  // The removed paragraph sat between blank lines; collapse the doubled
+  // blank so the surrounding rules don't drift apart on every migration.
+  const collapsed: string[] = [];
+  for (const line of kept) {
+    if (line.trim() === "" && collapsed.length > 0 && collapsed[collapsed.length - 1]!.trim() === "") {
+      continue;
+    }
+    collapsed.push(line);
+  }
+  try {
+    writeFileSafe(path, collapsed.join("\n"));
+    return true;
+  } catch (error) {
+    try {
+      appendLog(instance, "identity.migrate.error", {
+        file: "INSTRUCTIONS.md",
+        path,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } catch {
+      // Best-effort — see scaffoldInstanceIdentityFiles.
+    }
+    return false;
+  }
+}
+
 export interface ScaffoldAgentResult {
   created: string | null;
 }

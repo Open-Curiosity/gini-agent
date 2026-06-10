@@ -119,10 +119,9 @@ remote previews, screen readers) would need the same translation code.
   `summarizeThreads` / `summarizeThreadsForInstance` query thread
   membership; inserts and upserts carry the columns forward so streaming
   preserves membership with no extra arguments. See ADR
-  agent-chat-threads-and-channels.md for the threading model, the
-  agent-decided routing (`start_thread` control tool +
-  `<route>thread</route>` fallback), and the one-chat-per-agent /
-  job-channel IA.
+  agent-chat-threads-and-channels.md for the threading model (threads are
+  user-initiated; a turn's thread membership is fixed at task spawn) and
+  the one-chat-per-agent / job-channel IA.
 
 - Emission in `src/execution/chat-task.ts` via helpers in
   `src/execution/chat-task-emit.ts`. The loop resolves an emission

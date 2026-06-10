@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+
+- A message sent from the main chat composer is always answered in the main chat. Agent-initiated thread routing (the `start_thread` tool and the `<route>thread</route>` directive) silently diverted main-composer replies into threads indistinguishable from existing ones (#280); threads are now user-initiated only, and a one-time boot migration strips the stale threading guidance from existing instances' `INSTRUCTIONS.md`. (see ADR [agent-chat-threads-and-channels.md](docs/adr/agent-chat-threads-and-channels.md))
+
 ## [0.3.0] - 2026-06-08
 
 ### Added

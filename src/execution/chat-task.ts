@@ -17,14 +17,12 @@ import {
   appendTaskPartial,
   appendTrace,
   createChatMessage,
-  getLastMainChatAssistantTextBlock,
   isTerminalTaskStatus,
   mutateState,
   now,
   readState,
   readTrace
 } from "../state";
-import { id as makeId } from "../state/ids";
 import { readGoogleAccounts } from "../state/google-accounts";
 import { ApprovedActionFailedError, findTask, scheduleAutoRetain } from "../agent";
 import { recall } from "../memory";
@@ -104,7 +102,6 @@ import {
   type ChatEmitContext
 } from "./chat-task-emit";
 import { dispatchToolCall, parseToolArgsLenient, ToolDisplayError } from "./tool-dispatch";
-import { parseLeadingRouteDirective } from "./route-directive";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn } from "./chat";
@@ -1563,94 +1560,20 @@ async function runLoop(
   // `undefined`, in which case the emit* helpers are no-ops. Per ADR
   // chat-block-protocol.md, subagent inner work stays opaque to the
   // user — only the parent's `spawn_subagent` tool_call surfaces.
-  // `let`, not `const`: the route filter below may reassign emitCtx to a
-  // threaded copy mid-turn when the agent's `<route>thread</route>` directive
-  // fires, so the rest of the turn (continued text, tool calls, tool results,
-  // the terminal phase) all thread.
-  let emitCtx: ChatEmitContext | undefined = resolveEmitContext(config, taskId);
+  //
+  // Thread membership is fixed for the whole turn: a task pre-seeded with
+  // threadId/parentBlockId (a thread reply) threads every block it emits,
+  // and a main-chat task stays in the main timeline. There is no mid-turn
+  // re-route — a message sent from the main composer is always answered in
+  // the main chat (issue #280); threads are user-initiated only (see ADR
+  // agent-chat-threads-and-channels.md).
+  const emitCtx: ChatEmitContext | undefined = resolveEmitContext(config, taskId);
   // Tracks the in-flight assistant_text block id for delta upserts so a
   // streaming model response only emits a single block per loop
   // iteration. Reset between iterations so the next provider call gets
   // a fresh block.
   let inFlightAssistantBlockId: string | undefined;
   let inFlightAssistantText = "";
-
-  // Per-turn chat-vs-thread routing state. Only the FIRST iteration of a
-  // turn can carry the leading `<route>` directive, and only when there's a
-  // prior main-chat assistant message to branch a thread from. Once routing
-  // is resolved (directive seen, or the leading text proves it isn't a
-  // directive) the working text is surfaced unchanged.
-  //
-  // `routeRawText` accretes the raw streamed text so the parser can inspect
-  // the leading bytes; `routeSurfacedLen` tracks how much CLEANED text has
-  // already reached the task partial so each flush appends only the new
-  // delta. The directive must never reach appendTaskPartial, task.summary,
-  // or any block.
-  let routeResolved = false;
-  let routeRawText = "";
-  let routeStrippedPrefix = 0;
-  let routeSurfacedLen = 0;
-  // The thread-switch is performed once per runLoop entry. A task already
-  // threaded (a thread-reply, or a mid-turn switch that persisted) skips
-  // detection entirely — its whole response threads with no directive.
-  const threadDetectionEnabled = (): boolean =>
-    Boolean(emitCtx) && !emitCtx?.threadId;
-
-  // Mint a thread for this turn and re-point emitCtx at it. Branches off the
-  // most recent main-chat assistant message; when there is none (the very
-  // first turn) we stay in the main chat — there's nothing to branch from —
-  // but the directive is still stripped. Persists the thread fields onto the
-  // Task so an approval-resume (which re-runs resolveEmitContext) keeps
-  // threading from the same parent.
-  const switchTurnToThread = async (): Promise<"switched" | "already-threaded" | "no-parent"> => {
-    if (!emitCtx) return "no-parent";
-    if (emitCtx.threadId) return "already-threaded";
-    const parent = getLastMainChatAssistantTextBlock(config.instance, emitCtx.sessionId);
-    if (!parent) return "no-parent"; // First-ever turn — stay in main chat.
-    const threadId = makeId("thread");
-    const parentBlockId = parent.id;
-    const mainCtx = emitCtx; // Pre-switch (main) context — no threadId.
-    emitCtx = { ...emitCtx, threadId, parentBlockId };
-    // The turn began in the main chat (user_text + a "Thinking" phase already
-    // landed there) but its visible work now moves to the thread. Close the
-    // main chat's in-flight phase here so it can't strand on "Thinking" — the
-    // turn's own terminal phase (Completed/Cancelled/Failed) is emitted into
-    // the thread from this point on and never reaches the main chat.
-    emitPhase(mainCtx, "Completed");
-    await mutateState(config.instance, (state) => {
-      const item = state.tasks.find((t) => t.id === taskId);
-      if (item) {
-        item.threadId = threadId;
-        item.parentBlockId = parentBlockId;
-        item.updatedAt = now();
-      }
-    });
-    return "switched";
-  };
-
-  // Resolve the per-turn route from the model's final text and return the
-  // CLEANED text (directive stripped) for the final-answer / one-shot paths.
-  // The thread decision fires here ONLY when streaming never resolved it
-  // (`!routeResolved` — the provider returned the whole string at once, so no
-  // flush ran). When a streamed flush already decided the route, re-running
-  // the switch would (wrongly) branch a thread off this turn's OWN assistant
-  // block; we only re-strip the same directive prefix in that case.
-  const finalizeTurnRoute = async (text: string): Promise<string> => {
-    const detect = !routeResolved && isFirstModelCall && threadDetectionEnabled();
-    const alreadyStrippedThisTurn = routeResolved && routeStrippedPrefix > 0;
-    if (!detect && !alreadyStrippedThisTurn) return text;
-    const parsed = parseLeadingRouteDirective(text);
-    if (parsed.status === "directive") {
-      if (detect && parsed.route === "thread") await switchTurnToThread();
-      return parsed.rest ?? "";
-    }
-    // `none` / `incomplete` — never a directive; surface the text unchanged.
-    return text;
-  };
-  // True while the current loop iteration is the runLoop's first model call —
-  // the only iteration that can carry a leading `<route>` directive. Visible
-  // to finalizeTurnRoute, which runs after the per-iteration assignment.
-  let isFirstModelCall = false;
 
   // Loop-breaker bookkeeping: run-length counters detect a stuck model.
   // The exact-match counter tracks the identical tool call(s) AND result(s);
@@ -1667,11 +1590,6 @@ async function runLoop(
 
   while (iterations < cap) {
     iterations += 1;
-    // The leading `<route>` directive can only appear on the very first model
-    // output of a fresh turn — never on an approval-resume continuation
-    // (iterationsSoFar > 0), where the turn's earlier text already streamed to
-    // the main chat and threading the tail would split the turn.
-    isFirstModelCall = iterationsSoFar === 0 && iterations === 1;
 
     // Terminal-state bail-out. If the task was already moved to any
     // terminal status — cancelled externally, failed by a concurrent
@@ -1712,57 +1630,22 @@ async function runLoop(
     // completion / iteration-cap / cancellation paths below.
     inFlightAssistantBlockId = undefined;
     inFlightAssistantText = "";
-    // Reset the per-turn route state for this model call. Detection only
-    // runs on the first iteration of a fresh turn AND only when the task
-    // isn't already threaded; otherwise routing is pre-resolved and the
-    // text surfaces unchanged (byte-for-byte identical to the legacy path).
-    routeRawText = "";
-    routeStrippedPrefix = 0;
-    routeSurfacedLen = 0;
-    routeResolved = !(isFirstModelCall && threadDetectionEnabled());
     const flush = async (): Promise<void> => {
       if (!pending) return;
       const delta = pending;
       pending = "";
       lastFlush = Date.now();
 
-      // Accrete the raw streamed text first so the route parser can inspect
-      // the leading bytes; nothing is surfaced until routing is resolved.
-      routeRawText += delta;
-      if (!routeResolved) {
-        const parsed = parseLeadingRouteDirective(routeRawText);
-        if (parsed.status === "incomplete") {
-          // The leading text could still become a directive — buffer until
-          // more tokens arrive. This only delays the first flush by a few
-          // tokens. No partial / block write happens yet.
-          return;
-        }
-        if (parsed.status === "directive") {
-          routeStrippedPrefix = routeRawText.length - (parsed.rest?.length ?? 0);
-          if (parsed.route === "thread") await switchTurnToThread();
-        }
-        // `none` (or a non-thread directive): keep routeStrippedPrefix at its
-        // resolved value (0 for `none`) so the cleaned text surfaces as-is.
-        routeResolved = true;
-      }
-
-      // Surface only the CLEANED text — the directive substring (when present)
-      // is removed from both the task partial and the assistant_text block.
-      const cleanedFull = routeRawText.slice(routeStrippedPrefix);
-      const cleanedDelta = cleanedFull.slice(routeSurfacedLen);
-      routeSurfacedLen = cleanedFull.length;
-      if (cleanedDelta) {
-        await mutateState(config.instance, (state) => {
-          appendTaskPartial(state, taskId, cleanedDelta);
-        });
-      }
+      await mutateState(config.instance, (state) => {
+        appendTaskPartial(state, taskId, delta);
+      });
       // Mirror the same flush boundary to the assistant_text block so
       // SSE subscribers see the same cadence the partialSummary path
-      // exposes today. The block carries the FULL accreted (cleaned) text
-      // (not the delta), so a reconnect always observes a monotonically
-      // growing string and never needs to splice deltas itself.
-      if (emitCtx && cleanedFull) {
-        inFlightAssistantText = cleanedFull;
+      // exposes today. The block carries the FULL accreted text (not the
+      // delta), so a reconnect always observes a monotonically growing
+      // string and never needs to splice deltas itself.
+      if (emitCtx) {
+        inFlightAssistantText += delta;
         if (!inFlightAssistantBlockId) {
           const block = emitAssistantTextStart(emitCtx, inFlightAssistantText);
           inFlightAssistantBlockId = block?.id;
@@ -1771,11 +1654,10 @@ async function runLoop(
         }
       }
     };
-    // Serialize flushes so the route resolution (which awaits the thread
-    // switch + a mutateState) inside one flush completes before the next
-    // flush — or the post-model drain — reads the routing state. A
+    // Serialize flushes so one flush's awaited writes complete before the
+    // next flush — or the post-model drain — appends its delta. A
     // fire-and-forget flush could otherwise still be mid-await when the loop
-    // proceeds to strip the directive from the final summary, leaking it.
+    // proceeds to finalize the turn, reordering partial-summary writes.
     let flushChain: Promise<void> = Promise.resolve();
     const enqueueFlush = (): Promise<void> => {
       flushChain = flushChain.then(() => flush());
@@ -1853,8 +1735,8 @@ async function runLoop(
       throw error;
     }
     // Drain any in-flight streamed flush, then flush the remaining buffer so
-    // routing is fully resolved before we strip the directive from the final
-    // text below.
+    // the partial summary and the streaming block carry the full text before
+    // the turn finalizes below.
     await flushChain;
     await enqueueFlush();
     accumulatedCost = addCost(accumulatedCost, result.cost);
@@ -1896,18 +1778,12 @@ async function runLoop(
       }
     });
 
-    // Resolve the turn's route from the model's text and strip the leading
-    // directive once for both the final-answer and tool-call paths. When the
-    // provider returned the whole string at once (no streaming deltas) this
-    // is where the thread switch fires; when streaming already resolved it,
-    // this just re-strips the same prefix. The directive must never reach
-    // task.summary, the assistant_text block, or the user.
-    const cleanedTurnText = await finalizeTurnRoute(result.text || "");
+    const turnText = result.text || "";
 
     // Final answer path: no tool calls, model said stop (or unknown but
     // produced text).
     if (result.toolCalls.length === 0) {
-      const finalText = cleanedTurnText;
+      const finalText = turnText;
       const finished = await mutateState(config.instance, (state) => {
         const item = findTask(state, taskId);
         // Respect a prior terminal status. `cancelTask` may have
@@ -2028,12 +1904,10 @@ async function runLoop(
     // fresh block for whatever text the model emits after the tool
     // results come back.
     if (inFlightAssistantBlockId) {
-      // Use the cleaned text — never the raw result.text — so a leading
-      // route directive doesn't leak into the settled pre-tool-call block.
       finalizeAssistantText(
         emitCtx,
         inFlightAssistantBlockId,
-        inFlightAssistantText || cleanedTurnText
+        inFlightAssistantText || turnText
       );
       inFlightAssistantBlockId = undefined;
       inFlightAssistantText = "";
@@ -2116,47 +1990,6 @@ async function runLoop(
         });
         const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
         return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
-      }
-      // start_thread is the agent-decided threading CONTROL tool, handled
-      // INLINE here (before any phase/tool_call/tool_result emission) so it
-      // produces NO visible chat block — it's a control action, not work.
-      // It reuses the same switchTurnToThread() helper the `<route>`
-      // directive path uses, so the minted threadId / persisted task fields
-      // are identical. Once the switch lands, emitCtx is threaded for the
-      // rest of this turn, so any sibling tool calls later in this batch and
-      // all continued text/tools/final answer in later iterations thread too.
-      // The only state mutation is updateRecentToolCall(done); a tool result
-      // is always pushed so the provider sees the call resolved (a dangling
-      // tool_call breaks the next provider turn).
-      if (call.function.name === "start_thread") {
-        // Detection only fires on the first model call of a fresh turn; a
-        // resume continuation or an already-threaded task can't re-route.
-        const canRoute = isFirstModelCall && threadDetectionEnabled();
-        let resultPayload: { ok: true; threaded: boolean; note: string };
-        if (!canRoute) {
-          resultPayload = emitCtx?.threadId
-            ? { ok: true, threaded: true, note: "Already in a thread." }
-            : { ok: true, threaded: false, note: "Already in the main chat — staying here." };
-        } else {
-          const outcome = await switchTurnToThread();
-          if (outcome === "switched") {
-            routeResolved = true; // The `<route>` text parser must not also re-route this turn.
-            resultPayload = { ok: true, threaded: true, note: "Replying in a thread now. Continue normally." };
-          } else if (outcome === "already-threaded") {
-            resultPayload = { ok: true, threaded: true, note: "Already in a thread." };
-          } else {
-            resultPayload = { ok: true, threaded: false, note: "No earlier message to branch from — replying in the main chat." };
-          }
-        }
-        const content = JSON.stringify(resultPayload);
-        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content });
-        await mutateState(config.instance, (state) => {
-          const item = findTask(state, taskId);
-          if (isTerminalTaskStatus(item.status)) return;
-          updateRecentToolCall(item, call.id, "done");
-          item.updatedAt = now();
-        });
-        continue;
       }
       // Per-tool phase + tool_call(running) emission. Args are parsed
       // leniently — emission must never abort dispatch on malformed
