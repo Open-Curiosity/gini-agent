@@ -29,6 +29,17 @@ interface FileCache {
 const fileCacheTtlMs = 2000;
 const fileCache: Map<string, FileCache> = new Map();
 
+/** Test-only seam: lets tests expire/inspect cache entries instead of
+ * sleeping out the real TTL. */
+export const __fileCacheTestHooks = {
+  clear(): void {
+    fileCache.clear();
+  },
+  entry(path: string): FileCache | undefined {
+    return fileCache.get(path);
+  }
+};
+
 function readFileWithMtimeCache(path: string): string | null {
   const now = Date.now();
   const cached = fileCache.get(path);
@@ -106,6 +117,22 @@ export interface ProxyOptions {
   signal?: AbortSignal;
 }
 
+// Machine-readable marker for "the gateway itself is down", as opposed to a
+// gateway-produced error. The web client keys its transient "reconnecting"
+// treatment on this code, so it must stay in sync with api.ts.
+export const GATEWAY_UNREACHABLE_CODE = "gateway_unreachable";
+
+// A gateway restart is routine (auto-update, watchdog kickstart), so the BFF
+// answers for it with a retryable 503 + JSON body instead of letting the
+// fetch rejection escape the route handler — which Next.js would turn into a
+// bare empty-body 500 that crashes response.json() in every client.
+export function gatewayUnreachableResponse(): Response {
+  return Response.json(
+    { error: "Gini is restarting — reconnecting.", code: GATEWAY_UNREACHABLE_CODE },
+    { status: 503, headers: { "retry-after": "2" } }
+  );
+}
+
 // Forward a small allowlist of response headers from the upstream runtime.
 // The QR endpoints (and any future bearer-gated response that needs
 // browser-caching control) set `Cache-Control: no-store`; without this
@@ -178,7 +205,15 @@ export async function proxyRequest(
     if (body.byteLength > 0) init.body = body;
   }
   const fetcher = options.fetcher ?? fetch;
-  const upstream = await fetcher(target, init);
+  let upstream: Response;
+  try {
+    upstream = await fetcher(target, init);
+  } catch (err) {
+    // The client went away (navigation/unmount) — let the platform handle the
+    // aborted request rather than fabricating a response for nobody.
+    if (signal?.aborted) throw err;
+    return gatewayUnreachableResponse();
+  }
   const isStream = upstream.headers.get("content-type")?.includes("text/event-stream");
   if (isStream) {
     // Return the upstream body directly without materializing — preserves chunking
@@ -384,20 +419,6 @@ export function guardCsrf(request: Request, _pathSegments: string[]): Response |
   }
 
   return null;
-}
-
-export async function runtimeFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  const headers = new Headers(init.headers);
-  headers.set("authorization", `Bearer ${runtimeToken()}`);
-  if (!headers.has("content-type") && init.body) headers.set("content-type", "application/json");
-  return fetch(`${runtimeUrl()}${path}`, { ...init, headers });
-}
-
-export async function runtimeJson<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await runtimeFetch(path, init);
-  const value = (await response.json()) as { error?: string };
-  if (!response.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
-  return value as T;
 }
 
 export function pickForwardHeaders(headers: Headers): Headers {

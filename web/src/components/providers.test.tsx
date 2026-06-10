@@ -41,6 +41,11 @@ beforeAll(async () => {
   mock.module("./RuntimeStreamBridge", () => ({
     RuntimeStreamBridge: () => <div data-testid="stream-bridge-stub" />
   }));
+  // Same rationale: the real ConnectionBanner (and its useRuntimeStream dep)
+  // is covered by its own test file; the stub keeps this one's imports lean.
+  mock.module("./ConnectionBanner", () => ({
+    ConnectionBanner: () => <div data-testid="connection-banner-stub" />
+  }));
   // Same rationale as RuntimeStreamBridge: don't pull the real UpdateGate src
   // (and its query/mutation deps) into the coverage gate. The stub renders its
   // children so the wrapped app still appears on non-/pair routes.
@@ -71,16 +76,18 @@ describe("Providers", () => {
     pathname = "/chat";
     render(<Providers>{CHILD}</Providers>);
     expect(screen.queryByTestId("stream-bridge-stub")).not.toBeNull();
+    expect(screen.queryByTestId("connection-banner-stub")).not.toBeNull();
     expect(screen.queryByTestId("update-gate-stub")).not.toBeNull();
     expect(screen.queryByTestId("child")).not.toBeNull();
     expect(screen.queryByTestId("toaster-stub")).not.toBeNull();
     expect(screen.queryByTestId("theme-provider")).not.toBeNull();
   });
 
-  test("/pair: skips the RuntimeStreamBridge and update gate but still renders children", () => {
+  test("/pair: skips the RuntimeStreamBridge, banner, and update gate but still renders children", () => {
     pathname = "/pair";
     render(<Providers>{CHILD}</Providers>);
     expect(screen.queryByTestId("stream-bridge-stub")).toBeNull();
+    expect(screen.queryByTestId("connection-banner-stub")).toBeNull();
     expect(screen.queryByTestId("update-gate-stub")).toBeNull();
     expect(screen.queryByTestId("child")).not.toBeNull();
   });
