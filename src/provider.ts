@@ -629,15 +629,23 @@ export interface ToolCallingResult {
 // loop calls the provider multiple times. A stub with `error` set makes
 // the echo call throw instead, exercising callers' provider-failure paths
 // (context-overflow retries, auth tagging, task failure).
-const echoToolCallingStubs: Array<{ tag?: string; result?: ToolCallingResult; error?: string; streamTextBeforeFailure?: string }> = [];
+const echoToolCallingStubs: Array<{ tag?: string; result?: ToolCallingResult; nonStreaming?: boolean; error?: string; streamTextBeforeFailure?: string }> = [];
 // Capture the messages each echo call was invoked with. Tests inspect this
 // to assert that the chat-task loop built the expected system prompt /
 // conversation transcript. The buffer is cleared by
 // clearEchoToolCallingResponses so the per-test setup also resets it.
 const echoToolCallingCalls: ToolCallingMessage[][] = [];
 
-export function setEchoToolCallingResponse(result: ToolCallingResult, tag?: string): void {
-  echoToolCallingStubs.push({ tag, result });
+// `nonStreaming` suppresses the synthesized onDelta below, mirroring a
+// provider that returns the whole string at once — callers' no-delta
+// paths (one-shot block emission, route finalization without a stream)
+// are unreachable otherwise, since echo streams every non-empty text.
+export function setEchoToolCallingResponse(
+  result: ToolCallingResult,
+  tag?: string,
+  opts?: { nonStreaming?: boolean }
+): void {
+  echoToolCallingStubs.push({ tag, result, nonStreaming: opts?.nonStreaming });
 }
 
 // Queue an echo tool-calling FAILURE: the next echo-backed
@@ -668,7 +676,7 @@ function nextEchoToolCallingResult(
   provider: ProviderConfig,
   lastUserText: string,
   onDelta?: (text: string) => void
-): ToolCallingResult {
+): { result: ToolCallingResult; nonStreaming: boolean } {
   const stub = echoToolCallingStubs.shift();
   if (stub?.error !== undefined) {
     if (stub.streamTextBeforeFailure && onDelta) {
@@ -680,15 +688,18 @@ function nextEchoToolCallingResult(
     }
     throw new Error(stub.error);
   }
-  if (stub?.result) return stub.result;
+  if (stub?.result) return { result: stub.result, nonStreaming: Boolean(stub.nonStreaming) };
   // Default: behave like generateTaskSummary's echo branch — finish with a
   // canned text response so callers that don't pre-register stubs still see
   // a deterministic shape.
   return {
-    provider,
-    text: `Gini handled: ${lastUserText}`,
-    toolCalls: [],
-    finishReason: "stop"
+    result: {
+      provider,
+      text: `Gini handled: ${lastUserText}`,
+      toolCalls: [],
+      finishReason: "stop"
+    },
+    nonStreaming: false
   };
 }
 
@@ -719,8 +730,8 @@ export async function generateToolCallingResponse(
 
   if (provider.name === "echo") {
     echoToolCallingCalls.push(messages.map((m) => ({ ...m })));
-    const result = nextEchoToolCallingResult(provider, lastUserText, onDelta);
-    if (result.text && onDelta) {
+    const { result, nonStreaming } = nextEchoToolCallingResult(provider, lastUserText, onDelta);
+    if (result.text && onDelta && !nonStreaming) {
       // Synthesize a single streamed delta so callers exercise their
       // streaming pipelines in echo-backed tests.
       try {

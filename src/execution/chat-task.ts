@@ -17,6 +17,7 @@ import {
   appendTaskPartial,
   appendTrace,
   createChatMessage,
+  findInFlightAssistantTextForTask,
   getMainChatUserTextBlockForTask,
   isTerminalTaskStatus,
   mutateState,
@@ -1786,7 +1787,14 @@ async function runLoop(
   const finalizeTurnRoute = async (text: string): Promise<string> => {
     const detect = !routeResolved && isFirstModelCall && threadDetectionEnabled();
     const alreadyStrippedThisTurn = routeResolved && routeStrippedPrefix > 0;
-    if (!detect && !alreadyStrippedThisTurn) return text;
+    // Any first model call can still carry the directive even when detection
+    // is off — e.g. an overflow retry after the failed attempt's stream
+    // already switched the turn to a thread (detection now reads "already
+    // threaded") and the per-attempt reset cleared the strip state. Strip
+    // it regardless: only `detect` may ROUTE (the switch, when one applied,
+    // already happened), but the directive must never reach task.summary or
+    // a block.
+    if (!detect && !alreadyStrippedThisTurn && !isFirstModelCall) return text;
     const parsed = parseLeadingRouteDirective(text);
     if (parsed.status === "directive") {
       if (detect && parsed.route === "thread") await switchTurnToThread();
@@ -1821,6 +1829,13 @@ async function runLoop(
   // raw assistant content can still carry the route directive that must
   // never reach task.summary.
   let lastTurnNarration = "";
+  // Whether lastTurnNarration reached the chat as a settled assistant_text
+  // block. Streamed narration always does (the tool-call path finalizes the
+  // in-flight block); a non-streaming provider's whole-string narration
+  // never opens a block, so the partial-result exit must emit it one-shot
+  // or the timeline shows only the note while task.summary carries the
+  // narration.
+  let lastTurnNarrationSettled = false;
 
   // Graceful partial exit for unrecoverable context exhaustion: the provider
   // call kept overflowing even after compaction (overflow retry below), or
@@ -1847,11 +1862,25 @@ async function runLoop(
       return item;
     });
     if (exhausted.status === "completed") {
-      // The narration (when any) already reached the chat as a settled
-      // assistant_text block in the iteration that produced it, so only the
-      // note is emitted here — exactly once, as a system note. Re-emitting
-      // finalText as a block would duplicate the narration and render the
-      // note twice.
+      // A failed overflow attempt can leave its partial stream's block
+      // in-flight. Settle it — `streaming: false`, text preserved, the same
+      // contract as the cancellation path (ADR chat-block-protocol.md risks
+      // §4) — so a completed task never carries a streaming row.
+      const inFlight = findInFlightAssistantTextForTask(config.instance, taskId);
+      if (inFlight && emitCtx) {
+        finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
+      }
+      // Streamed narration already reached the chat as a settled
+      // assistant_text block in the iteration that produced it; narration
+      // from a non-streaming provider never became a block, so emit it
+      // one-shot here — otherwise the timeline shows only the note while
+      // task.summary carries the narration. The note itself is emitted
+      // exactly once, as a system note: re-emitting finalText as a block
+      // would duplicate settled narration and render the note twice.
+      if (lastTurnNarration && !lastTurnNarrationSettled) {
+        const block = emitAssistantTextStart(emitCtx, lastTurnNarration);
+        if (block?.id) finalizeAssistantText(emitCtx, block.id, lastTurnNarration);
+      }
       emitSystemNote(emitCtx, note);
       emitPhase(emitCtx, "Completed");
     }
@@ -2192,6 +2221,12 @@ async function runLoop(
         }
         if (!isContextOverflowError(message)) throw error;
         if (attempt >= MAX_CONTEXT_OVERFLOW_ATTEMPTS) {
+          // Drain queued flushes before the partial exit, same as the retry
+          // path below: a still-running flush would otherwise append the
+          // failed attempt's text to partialSummary AFTER
+          // completeWithPartialResult cleared it (and keep mutating the
+          // in-flight block it settles).
+          await flushChain;
           appendTrace(config.instance, taskId, {
             type: "warning",
             message: `Provider context overflow persisted after ${attempt} attempts; exiting with partial result.`,
@@ -2408,7 +2443,13 @@ async function runLoop(
     // Track this turn's latest narration for the partial-result exit (see
     // lastTurnNarration above). Only non-empty cleaned text advances it, so
     // a narration-less tool iteration keeps the most recent narration.
-    if (cleanedTurnText.trim()) lastTurnNarration = cleanedTurnText.trim();
+    // Streamed narration has an in-flight block (finalized just below);
+    // a whole-string (non-streaming) response never opened one, which the
+    // partial exit compensates for with a one-shot block.
+    if (cleanedTurnText.trim()) {
+      lastTurnNarration = cleanedTurnText.trim();
+      lastTurnNarrationSettled = Boolean(inFlightAssistantBlockId);
+    }
 
     // Tool-call path: append the assistant message (with tool_calls), then
     // dispatch each call. Synchronous tools resolve immediately; gated

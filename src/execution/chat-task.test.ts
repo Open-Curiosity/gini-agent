@@ -3315,6 +3315,41 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // A provider can stream text before EVERY overflow failure. When the
+  // attempts exhaust, the exit must settle the failed attempt's in-flight
+  // assistant block (streaming:false) and drain queued flushes so the
+  // discarded partial text can't land on the completed task.
+  test("overflow exhaustion settles the failed attempt's stream", async () => {
+    const OVERFLOW_MESSAGE = "prompt is too long: 250000 tokens > 200000 maximum";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-overflow-stream-exhaust");
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "stream-exhaust")
+    );
+    const { submitChatMessage } = await import("./chat");
+
+    // Every attempt streams partial text before throwing the overflow.
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE, { streamTextBeforeFailure: "DISCARDED-PARTIAL " });
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE, { streamTextBeforeFailure: "DISCARDED-PARTIAL " });
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE, { streamTextBeforeFailure: "DISCARDED-PARTIAL " });
+
+    const submitted = await submitChatMessage(config, session.id, { content: "go" });
+    const finished = await waitForTerminal(config, submitted.taskId, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toContain("This is a partial result.");
+    // The discarded stream never resurrects into the partial summary.
+    expect(finished.partialSummary ?? "").toBe("");
+
+    // No block on the completed task is left streaming.
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const streamingBlocks = blocks.filter((b) => b.kind === "assistant_text" && b.streaming);
+    expect(streamingBlocks.length).toBe(0);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   // The partial-result exit surfaces only THIS turn's narration. The packed
   // prior context inside workingMessages carries earlier turns' assistant
   // answers, so a transcript re-scan would resurrect one of those as this
@@ -3399,6 +3434,63 @@ describe("chat-task loop", () => {
       "STEP-NARRATION before reading.\n\n" +
       "Stopped early: the conversation no longer fits the model's context window even after compaction. This is a partial result."
     );
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Narration from a NON-streaming provider never opens an assistant_text
+  // block (the tool-call path only finalizes a streamed one), so the partial
+  // exit must emit it one-shot — otherwise task.summary carries narration
+  // the chat timeline never shows.
+  test("partial exit emits non-streaming narration as a block alongside the note", async () => {
+    const OVERFLOW_MESSAGE = "prompt is too long: 250000 tokens > 200000 maximum";
+    const PARTIAL_NOTE =
+      "Stopped early: the conversation no longer fits the model's context window even after compaction. This is a partial result.";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-partial-nonstream");
+    const provider = normalizeProvider(config.provider);
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "partial-nonstream")
+    );
+    const { submitChatMessage } = await import("./chat");
+
+    writeFileSync(join(workspaceRoot, "note.md"), "note content");
+    // Whole-string response (no deltas) narrating before a tool call, then
+    // persistent overflow.
+    setEchoToolCallingResponse(
+      {
+        provider,
+        text: "ONE-SHOT NARRATION before reading.",
+        toolCalls: [
+          { id: "call_ns1", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "note.md" }) } }
+        ],
+        finishReason: "tool_calls"
+      },
+      undefined,
+      { nonStreaming: true }
+    );
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+
+    const submitted = await submitChatMessage(config, session.id, { content: "read the note" });
+    const finished = await waitForTerminal(config, submitted.taskId, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe(`ONE-SHOT NARRATION before reading.\n\n${PARTIAL_NOTE}`);
+
+    // The narration reaches the timeline as a settled block; the note stays
+    // a system note (never folded into the block).
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const narrationBlocks = blocks.filter(
+      (b) => b.kind === "assistant_text" && b.text === "ONE-SHOT NARRATION before reading."
+    );
+    expect(narrationBlocks.length).toBe(1);
+    expect(narrationBlocks[0]!.kind === "assistant_text" && narrationBlocks[0]!.streaming).toBe(false);
+    const noteBlocks = blocks.filter((b) => JSON.stringify(b).includes("Stopped early"));
+    expect(noteBlocks.length).toBe(1);
+    expect(noteBlocks[0]!.kind).toBe("system_note");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
