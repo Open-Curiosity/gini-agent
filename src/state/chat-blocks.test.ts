@@ -1240,6 +1240,43 @@ describe("chat-blocks threading", () => {
     expect(m2?.activity).toBeUndefined();
   });
 
+  test("summarizeThreads breaks last-reply ties deterministically by thread id", () => {
+    const instance = "chat-blocks-thread-ties";
+    const session = "chat_ties";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Root.",
+      streaming: false
+    });
+    const a = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "reply b-side",
+      threadId: "thread_tie_b",
+      parentBlockId: root.id
+    });
+    const b = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "reply a-side",
+      threadId: "thread_tie_a",
+      parentBlockId: root.id
+    });
+    // Same-millisecond replies are the real shape for a burst of inserts —
+    // pin both to one timestamp so the tiebreak (thread_id ASC) is what
+    // orders the rows, not insertion luck.
+    const db = getMemoryDb(instance);
+    const ts = "2020-02-02T00:00:00.000Z";
+    db.run("UPDATE chat_blocks SET created_at = ? WHERE id = ?", [ts, a.id]);
+    db.run("UPDATE chat_blocks SET created_at = ? WHERE id = ?", [ts, b.id]);
+
+    const ordered = summarizeThreads(instance, session).map((s) => s.threadId);
+    expect(ordered).toEqual(["thread_tie_a", "thread_tie_b"]);
+    const orderedInstance = summarizeThreadsForInstance(instance, [session]).map((s) => s.threadId);
+    expect(orderedInstance).toEqual(["thread_tie_a", "thread_tie_b"]);
+  });
+
   test("summarizeThreadsForInstance scopes to the supplied agent sessions", () => {
     const instance = "chat-blocks-thread-instance";
     const agentSession = "chat_agent";

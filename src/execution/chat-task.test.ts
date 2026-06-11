@@ -2008,6 +2008,58 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  test("approving a gated tool emits a Working phase before the side effect runs", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-approval-phase");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-approval-phase", undefined, "agent_y2")
+    );
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_wp", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "out2.txt", content: "hi" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Wrote it.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, session.id, { content: "write out2.txt" });
+    const paused = await waitForTerminal(config, submitted.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    const { listChatBlocks } = await import("../state");
+    const gate = listChatBlocks(config.instance, session.id).find(
+      (b) => b.kind === "authorization_requested"
+    );
+    if (!gate) throw new Error("missing authorization_requested block");
+
+    await decideApproval(config, paused.approvalIds[0]!, "approve");
+    const finished = await waitForTerminal(config, submitted.taskId);
+    expect(finished.status).toBe("completed");
+
+    // The approval flip itself lands a non-terminal phase NEWER than the
+    // gate block. Without it, the backwards activity scan (thread lists,
+    // panel composer) keeps reporting waiting_approval for the entire
+    // side-effect execution window — the approved action can run for its
+    // full timeout before the resumed loop writes anything else.
+    const blocks = listChatBlocks(config.instance, session.id);
+    const working = blocks.find((b) => b.kind === "phase" && b.label === "Working: file.write");
+    if (working?.kind !== "phase") throw new Error("missing approval Working phase block");
+    expect(working.ordinal).toBeGreaterThan(gate.ordinal);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("connector.request surfaces the reason as an assistant bubble above the setup card", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-blocks-connector");

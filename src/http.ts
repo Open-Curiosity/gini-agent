@@ -516,7 +516,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           ...summary,
           agentName: summary.agentId ? agentNameById.get(summary.agentId) ?? summary.agentId : undefined
         }))
-        .sort((a, b) => b.lastReplyAt.localeCompare(a.lastReplyAt));
+        // threadId tiebreak keeps same-millisecond threads from swapping
+        // between polls.
+        .sort(
+          (a, b) =>
+            b.lastReplyAt.localeCompare(a.lastReplyAt) || a.threadId.localeCompare(b.threadId)
+        );
       return json(summaries);
     }],
     ["GET", /^\/api\/chat\/([^/]+)\/stream$/, async (request, params) => {

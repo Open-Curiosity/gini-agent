@@ -93,6 +93,19 @@ describe("ThreadsTab", () => {
     expect(cards[1]!.getAttribute("aria-label")).toContain("Idle newest");
   });
 
+  test("identical last-reply timestamps order deterministically by thread id", () => {
+    const tieB = makeThread({ threadId: "thread_tie_b", lastReplyAt: "2026-06-02T10:00:00.000Z" });
+    const tieA = makeThread({ threadId: "thread_tie_a", lastReplyAt: "2026-06-02T10:00:00.000Z" });
+    expect(sortThreads([tieB, tieA]).map((t) => t.threadId)).toEqual([
+      "thread_tie_a",
+      "thread_tie_b"
+    ]);
+    expect(sortThreads([tieA, tieB]).map((t) => t.threadId)).toEqual([
+      "thread_tie_a",
+      "thread_tie_b"
+    ]);
+  });
+
   test("aggregateActivity reports the highest-priority in-flight state", () => {
     const idle = makeThread({ threadId: "t_idle" });
     const running = makeThread({ threadId: "t_running", activity: "running" });

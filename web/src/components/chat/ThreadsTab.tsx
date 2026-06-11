@@ -14,7 +14,10 @@ export function sortThreads(threads: ThreadSummary[]): ThreadSummary[] {
   return [...threads].sort((a, b) => {
     const rank = (ACTIVITY_RANK[b.activity ?? ""] ?? 0) - (ACTIVITY_RANK[a.activity ?? ""] ?? 0);
     if (rank !== 0) return rank;
-    return b.lastReplyAt.localeCompare(a.lastReplyAt);
+    const recency = b.lastReplyAt.localeCompare(a.lastReplyAt);
+    // threadId tiebreak keeps same-millisecond threads from swapping
+    // between polls.
+    return recency !== 0 ? recency : a.threadId.localeCompare(b.threadId);
   });
 }
 

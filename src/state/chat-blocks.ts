@@ -984,7 +984,7 @@ export function summarizeThreads(instance: Instance, sessionId: string): ThreadS
        FROM chat_blocks
        WHERE session_id = ? AND thread_id IS NOT NULL
        GROUP BY thread_id, session_id
-       ORDER BY last_reply_at DESC`
+       ORDER BY last_reply_at DESC, thread_id ASC`
     )
     .all(sessionId);
   return buildThreadSummaries(db, rows);
@@ -1016,7 +1016,7 @@ export function summarizeThreadsForInstance(
        FROM chat_blocks
        WHERE instance = ? AND thread_id IS NOT NULL AND session_id IN (${placeholders})
        GROUP BY thread_id, session_id
-       ORDER BY last_reply_at DESC`
+       ORDER BY last_reply_at DESC, thread_id ASC, session_id ASC`
     )
     .all(instance, ...agentSessionIds);
   return buildThreadSummaries(db, rows);

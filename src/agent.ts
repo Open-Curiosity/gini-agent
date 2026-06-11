@@ -1300,6 +1300,24 @@ export async function resolveAuthorization(
 
   if (approval.taskId) {
     appendTrace(config.instance, approval.taskId, { type: "approval", message: "Approval approved", data: { approvalId } });
+    // Flip the chat surface out of "needs approval" for the side-effect
+    // window. The approved action can run for a long time (terminal.exec up
+    // to its timeout) before resumeChatTask writes anything, and the gate
+    // block would otherwise stay the newest activity-bearing row — thread
+    // lists and the panel composer would keep reporting waiting_approval
+    // while the command is actually executing. A non-terminal phase block
+    // emitted before the executor makes the backwards activity scan read
+    // "running" for the whole window. Best-effort like the deny path's
+    // emission: a SQLite failure here must not block the side effect.
+    try {
+      const emitCtx = resolveEmitContext(config, approval.taskId);
+      if (emitCtx) emitPhase(emitCtx, `Working: ${approval.action}`);
+    } catch (error) {
+      appendLog(config.instance, "chat.approve_block.emit_failed", {
+        approvalId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 
   // Route side-effect failures through `failTask` so the HTTP/CLI
