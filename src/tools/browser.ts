@@ -690,8 +690,11 @@ async function getOrCreate(taskId: string): Promise<Session> {
     };
     sessions.set(taskId, session);
     // Attach console capture eagerly so page.goto errors before the
-    // agent's first browser_console call are still observable.
+    // agent's first browser_console call are still observable, and the
+    // dialog handler so the very first navigation's dialogs are
+    // captured instead of silently auto-dismissed by Playwright.
     attachConsole(taskId, page);
+    attachDialogHandler(taskId, page);
     return session;
   })().finally(() => {
     pendingSessions.delete(taskId);
@@ -742,6 +745,8 @@ async function closeSession(taskId: string): Promise<void> {
   if (!session) return;
   sessions.delete(taskId);
   consoleLogs.delete(taskId);
+  pendingDialogResponses.delete(taskId);
+  unreportedDialogs.delete(taskId);
   // Drop the per-task secret-redaction registry when the session
   // closes. The DOM is gone (the page closes below), so the
   // registry would never be consulted again for this task —
@@ -2074,7 +2079,14 @@ async function healLostRef(session: Session, target: RefTarget, ref: string): Pr
 // string leaf — url, title, tab.url, tab.title, plus anything
 // future tool responses surface.
 //
-// taskId is accepted for API symmetry but the redaction consults
+// taskId selects the per-task unreported-dialog buffer (see
+// attachDialogHandler): any JS dialogs that fired since the task's
+// last reported tool result are merged in as a `dialogs` field and
+// the buffer cleared, so each dialog is surfaced to the model
+// exactly once — and the dialog message text rides the same
+// redaction pass as every other string leaf.
+//
+// For redaction, taskId is advisory: the pass consults
 // allRegisteredSecrets() across every active task's registry, not
 // just this task's. The shared BrowserContext (CDP / persistent
 // profile) bleeds DOM state across tasks — Task A's page can copy
@@ -2085,13 +2097,17 @@ async function healLostRef(session: Session, target: RefTarget, ref: string): Pr
 // over-redacting in edge cases where two tasks coincidentally
 // typed the same long string (vanishingly unlikely given the
 // 4-char minimum).
-function ok(payload: Record<string, unknown>, _taskId?: string): string {
-  void _taskId;
+function ok(payload: Record<string, unknown>, taskId?: string): string {
+  const body: Record<string, unknown> = { success: true, ...payload };
+  if (taskId !== undefined) {
+    const dialogs = takeUnreportedDialogs(taskId);
+    if (dialogs.length > 0) body.dialogs = dialogs;
+  }
   const secrets = allRegisteredSecrets();
   if (secrets.length === 0) {
-    return JSON.stringify({ success: true, ...payload });
+    return JSON.stringify(body);
   }
-  const redacted = redactSecretValuesDeep({ success: true, ...payload }, secrets);
+  const redacted = redactSecretValuesDeep(body, secrets);
   return JSON.stringify(redacted);
 }
 
@@ -2635,6 +2651,76 @@ function attachConsole(taskId: string, page: Page): void {
   });
 }
 
+// JS dialog (alert / confirm / prompt / beforeunload) capture. With no
+// "dialog" listener installed, Playwright auto-dismisses every dialog
+// silently — the model never learns a confirm() fired, so an "Are you
+// sure?" flow always takes the cancel path without anyone knowing. The
+// handler below keeps the auto-respond behavior (responding immediately
+// means page JS never blocks on an open dialog, which would freeze every
+// in-flight action) but makes it observable and steerable:
+//   - default response is dismiss, matching Playwright's no-handler
+//     behavior;
+//   - browser_dialog arms a ONE-SHOT response (accept / dismiss /
+//     promptText) consumed by the next dialog that fires for the task;
+//   - every dialog is recorded and surfaced once in a `dialogs` field of
+//     the task's next ok() tool result, riding the standard
+//     secret-redaction pass there.
+interface DialogRecord {
+  type: string;
+  message: string;
+  defaultValue?: string;
+  url: string;
+  at: string;
+  response: "accepted" | "dismissed";
+  promptText?: string;
+}
+// Cap on unreported dialog records held per task. A page firing dialogs
+// in a loop between tool calls would otherwise grow the buffer without
+// bound; the model only needs the most recent few to understand what
+// happened.
+const DIALOG_BUFFER_CAP = 5;
+const dialogHooked = new WeakSet<Page>();
+const pendingDialogResponses = new Map<string, { accept: boolean; promptText?: string }>();
+const unreportedDialogs = new Map<string, DialogRecord[]>();
+
+// Drain the task's unreported dialog records. Called by ok() so each
+// record is surfaced exactly once, in the next successful tool result.
+function takeUnreportedDialogs(taskId: string): DialogRecord[] {
+  const buf = unreportedDialogs.get(taskId);
+  if (!buf || buf.length === 0) return [];
+  unreportedDialogs.delete(taskId);
+  return buf;
+}
+
+function attachDialogHandler(taskId: string, page: Page): void {
+  // Fake test pages may not expose .on — same typeof-guard pattern
+  // snapshot() uses for page.url.
+  if (typeof page.on !== "function" || dialogHooked.has(page)) return;
+  dialogHooked.add(page);
+  page.on("dialog", (dialog) => {
+    const armed = pendingDialogResponses.get(taskId);
+    pendingDialogResponses.delete(taskId);
+    const accept = armed?.accept ?? false;
+    const record: DialogRecord = {
+      type: dialog.type(),
+      message: dialog.message(),
+      ...(dialog.type() === "prompt" ? { defaultValue: dialog.defaultValue() } : {}),
+      url: typeof page.url === "function" ? page.url() : "",
+      at: new Date().toISOString(),
+      response: accept ? "accepted" : "dismissed",
+      ...(accept && armed?.promptText !== undefined ? { promptText: armed.promptText } : {})
+    };
+    const buf = unreportedDialogs.get(taskId) ?? [];
+    buf.push(record);
+    if (buf.length > DIALOG_BUFFER_CAP) buf.splice(0, buf.length - DIALOG_BUFFER_CAP);
+    unreportedDialogs.set(taskId, buf);
+    // Respond immediately so page JS unblocks. Errors (dialog already
+    // handled, page closed mid-response) are swallowed — the record
+    // above already captured what fired.
+    void (accept ? dialog.accept(armed?.promptText) : dialog.dismiss()).catch(() => undefined);
+  });
+}
+
 export async function browserConsole(taskId: string, args: Record<string, unknown>): Promise<string> {
   const expression = str(args.expression);
   const clear = bool(args.clear, false);
@@ -2748,6 +2834,38 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
         messages: redactedMessages,
         evalResult: redactedEvalResult,
         evalError: evalError ? redactSecretValuesFromString(evalError, secretValues) : null
+      }, taskId);
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Arm a one-shot response for the NEXT JavaScript dialog that fires for
+// this task. Dialogs are auto-dismissed (and recorded) the moment they
+// fire — see attachDialogHandler — so this tool cannot answer a dialog
+// retroactively; it pre-registers the answer for the next one, letting
+// the model deliberately complete a confirm()/prompt() flow by arming
+// accept and then re-triggering the action.
+export async function browserDialog(taskId: string, args: Record<string, unknown>): Promise<string> {
+  const action = str(args.action);
+  if (action !== "accept" && action !== "dismiss") {
+    return fail("Argument 'action' must be one of: accept, dismiss.");
+  }
+  if (args.promptText !== undefined && typeof args.promptText !== "string") {
+    return fail("Argument 'promptText' must be a string.");
+  }
+  const promptText = typeof args.promptText === "string" ? args.promptText : undefined;
+  try {
+    return await withSession(taskId, async (session) => {
+      pendingDialogResponses.set(taskId, {
+        accept: action === "accept",
+        ...(promptText !== undefined ? { promptText } : {})
+      });
+      return ok({
+        url: typeof session.page.url === "function" ? session.page.url() : "",
+        armed: action,
+        ...(promptText !== undefined ? { promptText } : {})
       }, taskId);
     });
   } catch (error) {
@@ -3062,6 +3180,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         // model how to address the tab it just opened without re-listing.
         const id = tabHandleFor(session, page);
         attachConsole(taskId, page);
+        attachDialogHandler(taskId, page);
         if (url) {
           await page.goto(url, { waitUntil: "domcontentloaded" });
         }
@@ -3096,6 +3215,10 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         session.refs = new Map();
         session.lastSnapshotUrl = undefined;
         session.page = target;
+        // The target may be a user-opened tab or window.open popup that
+        // never went through getOrCreate / tabs:new — hook its dialogs
+        // now that the agent is acting on it (idempotent via WeakSet).
+        attachDialogHandler(taskId, target);
         await target.bringToFront().catch(() => undefined);
         const snap = await snapshot(session.page, false, taskId);
         session.refs = snap.refs;
@@ -3138,6 +3261,9 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
           session.ownedPageIds.add(fallback);
           session.page = fallback;
         }
+        // Whichever page became active — an adopted survivor or the
+        // fresh fallback — gets the dialog hook (idempotent via WeakSet).
+        attachDialogHandler(taskId, session.page);
       } else {
         // Active page didn't change, but refs map points at the old
         // snapshot we're about to refresh — drop it now for consistency
@@ -3753,10 +3879,22 @@ export const __test = {
   clearFakeSessionsForTest(): void {
     sessions.clear();
     // Match the real session-teardown contract: also drop the
-    // per-task secret-redaction registry so tests that install
-    // fake sessions then call this helper don't leak state into
-    // subsequent tests.
+    // per-task secret-redaction registry and dialog state so tests
+    // that install fake sessions then call this helper don't leak
+    // state into subsequent tests.
     filledSecretValues.clear();
+    pendingDialogResponses.clear();
+    unreportedDialogs.clear();
+  },
+  // Hook a fake page's dialog events for a task exactly as getOrCreate /
+  // browser_tabs would, so dialog capture can be exercised by invoking
+  // the registered handler with a fake Dialog — no Chromium.
+  attachDialogHandlerForTest(taskId: string, page: Page): void {
+    attachDialogHandler(taskId, page);
+  },
+  // Read (without draining) the task's unreported dialog buffer.
+  peekUnreportedDialogsForTest(taskId: string): DialogRecord[] {
+    return unreportedDialogs.get(taskId) ?? [];
   },
   // Expose the server-side loopback boundary check for direct unit
   // testing — snapshot() and browser_console both gate on it.

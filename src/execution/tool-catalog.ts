@@ -465,6 +465,25 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "browser",
+    displayLabel: "Respond to dialog",
+    deferred: true,
+    indexSummary: "Arm an accept/dismiss response for the next JavaScript dialog (alert/confirm/prompt).",
+    type: "function",
+    function: {
+      name: "browser_dialog",
+      description: "Respond to JavaScript dialogs (alert/confirm/prompt/beforeunload). Dialogs are auto-DISMISSED the moment they fire so the page never hangs; each one is then reported once in a `dialogs` field on your next browser tool result. To accept a dialog deliberately (e.g. a confirm() asking 'Are you sure?'), call this FIRST to arm a one-shot response, then perform the action that triggers the dialog (e.g. browser_click) — the armed response is consumed by the next dialog that fires and the outcome appears in that tool result's `dialogs` field. For prompt() dialogs use action 'accept' with promptText.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["accept", "dismiss"], description: "How to answer the next dialog. Unarmed dialogs are dismissed by default; arm 'dismiss' explicitly only to override a previously armed accept." },
+          promptText: { type: "string", description: "Text to enter when accepting a prompt() dialog. Ignored for other dialog types." }
+        },
+        required: ["action"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
     displayLabel: "Close browser",
     deferred: true,
     indexSummary: "Close the browser session for the current task.",
@@ -2390,6 +2409,7 @@ export function chatBlockArgsPreviewFor(
     case "browser_wait_for":
       return truncatePreview(previewValue(safe.ref) || previewValue(safe.text));
     case "browser_tabs":
+    case "browser_dialog":
       return truncatePreview(previewValue(safe.action));
     case "browser_vision":
       return truncatePreview(previewValue(safe.question));

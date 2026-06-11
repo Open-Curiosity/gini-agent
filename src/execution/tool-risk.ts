@@ -11,6 +11,9 @@ export const ACTION_RISK: ReadonlyMap<string, RiskLevel> = new Map<string, RiskL
   ["browser.type", "medium"],
   ["browser.drag", "medium"],
   ["browser.select_option", "medium"],
+  // Arming an accept for the next confirm()/beforeunload commits a page
+  // side effect when it fires — same bucket as the click that triggers it.
+  ["browser.dialog", "medium"],
   ["browser.tabs.new", "medium"],
   ["browser.tabs.switch", "medium"],
   ["browser.tabs.close", "medium"],

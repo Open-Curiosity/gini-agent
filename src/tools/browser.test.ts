@@ -5,6 +5,7 @@ import {
   __test as browserTest,
   browserClick,
   browserConsole,
+  browserDialog,
   browserDrag,
   browserFillByLocator,
   browserHover,
@@ -2991,6 +2992,140 @@ describe("browserDrag", () => {
     expect(JSON.parse(rawMissingFrom).error).toMatch(/fromRef/);
     const rawMissingTo = await browserDrag("drag-noargs", { fromRef: "@e1" });
     expect(JSON.parse(rawMissingTo).error).toMatch(/toRef/);
+  });
+});
+
+// Dialog capture without Chromium: a fake page records the "dialog"
+// listener attachDialogHandler installs, and tests fire fake Dialog
+// objects through it. Surfacing rides ok()'s `dialogs` merge, exercised
+// through real tool entry points (browserSnapshot / browserDialog).
+describe("browser dialog capture and browser_dialog", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.resetFilledSecretsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  function makeDialogPage(url = "https://example.com/") {
+    const handlers = new Map<string, (arg: unknown) => void>();
+    const page = {
+      ...makeFakePageForRefTools(url),
+      on: (event: string, cb: (arg: unknown) => void) => {
+        handlers.set(event, cb);
+      }
+    };
+    return { page: page as unknown as import("playwright-core").Page, handlers };
+  }
+
+  function makeFakeDialog(over: Partial<{ type: string; message: string; defaultValue: string }> = {}) {
+    const responses: string[] = [];
+    const dialog = {
+      type: () => over.type ?? "confirm",
+      message: () => over.message ?? "Are you sure?",
+      defaultValue: () => over.defaultValue ?? "",
+      accept: async (text?: string) => {
+        responses.push(`accept:${text ?? ""}`);
+      },
+      dismiss: async () => {
+        responses.push("dismiss");
+      }
+    };
+    return { dialog, responses };
+  }
+
+  test("an unarmed dialog is auto-dismissed, recorded, and surfaced once in the next tool result", async () => {
+    const { page, handlers } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-task", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-task", page);
+    const { dialog, responses } = makeFakeDialog({ message: "Delete this item?" });
+    handlers.get("dialog")!(dialog);
+    expect(responses).toEqual(["dismiss"]);
+
+    const raw = await browserSnapshot("dlg-task", {});
+    const parsed = JSON.parse(raw) as {
+      success: boolean;
+      dialogs?: Array<{ type: string; message: string; url: string; response: string }>;
+    };
+    expect(parsed.success).toBe(true);
+    expect(parsed.dialogs).toHaveLength(1);
+    expect(parsed.dialogs![0]!.type).toBe("confirm");
+    expect(parsed.dialogs![0]!.message).toBe("Delete this item?");
+    expect(parsed.dialogs![0]!.url).toBe("https://example.com/");
+    expect(parsed.dialogs![0]!.response).toBe("dismissed");
+
+    // Reported exactly once: the next result carries no dialogs field.
+    const second = JSON.parse(await browserSnapshot("dlg-task", {})) as { dialogs?: unknown };
+    expect(second.dialogs).toBeUndefined();
+  });
+
+  test("browser_dialog arms a one-shot accept (with promptText) consumed by the next dialog only", async () => {
+    const { page, handlers } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-arm", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-arm", page);
+
+    const armed = JSON.parse(await browserDialog("dlg-arm", { action: "accept", promptText: "Shelden" })) as {
+      success: boolean;
+      armed?: string;
+      promptText?: string;
+    };
+    expect(armed.success).toBe(true);
+    expect(armed.armed).toBe("accept");
+    expect(armed.promptText).toBe("Shelden");
+
+    const first = makeFakeDialog({ type: "prompt", message: "Your name?", defaultValue: "anon" });
+    handlers.get("dialog")!(first.dialog);
+    expect(first.responses).toEqual(["accept:Shelden"]);
+
+    // One-shot: a second dialog falls back to the default dismiss.
+    const second = makeFakeDialog({ message: "Leave page?" });
+    handlers.get("dialog")!(second.dialog);
+    expect(second.responses).toEqual(["dismiss"]);
+
+    const raw = JSON.parse(await browserSnapshot("dlg-arm", {})) as {
+      dialogs?: Array<{ type: string; response: string; promptText?: string; defaultValue?: string }>;
+    };
+    expect(raw.dialogs).toHaveLength(2);
+    expect(raw.dialogs![0]!.response).toBe("accepted");
+    expect(raw.dialogs![0]!.promptText).toBe("Shelden");
+    expect(raw.dialogs![0]!.defaultValue).toBe("anon");
+    expect(raw.dialogs![1]!.response).toBe("dismissed");
+  });
+
+  test("browser_dialog rejects an unknown action", async () => {
+    const { page } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-bad", page as Partial<import("playwright-core").Page>);
+    const parsed = JSON.parse(await browserDialog("dlg-bad", { action: "retry" })) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("accept, dismiss");
+  });
+
+  test("the unreported buffer is capped at the most recent 5 dialogs", async () => {
+    const { page, handlers } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-cap", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-cap", page);
+    for (let i = 1; i <= 7; i++) {
+      handlers.get("dialog")!(makeFakeDialog({ message: `dialog ${i}` }).dialog);
+    }
+    const records = browserTest.peekUnreportedDialogsForTest("dlg-cap");
+    expect(records).toHaveLength(5);
+    expect(records[0]!.message).toBe("dialog 3");
+    expect(records[4]!.message).toBe("dialog 7");
+  });
+
+  test("a registered secret inside the dialog message is redacted in the surfaced record", async () => {
+    const { page, handlers } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-redact", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-redact", page);
+    browserTest.recordFilledSecretForTest("dlg-redact", "hunter2secret");
+    handlers.get("dialog")!(makeFakeDialog({ message: "Submit hunter2secret to continue?" }).dialog);
+
+    // Surface through browser_dialog's own ok() result — same envelope
+    // every browser tool uses, so the deep-redaction pass applies.
+    const raw = await browserDialog("dlg-redact", { action: "dismiss" });
+    expect(raw).not.toContain("hunter2secret");
+    const parsed = JSON.parse(raw) as { dialogs?: Array<{ message: string }> };
+    expect(parsed.dialogs).toHaveLength(1);
+    expect(parsed.dialogs![0]!.message).toBe("Submit [redacted] to continue?");
   });
 });
 
