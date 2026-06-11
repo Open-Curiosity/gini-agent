@@ -29,8 +29,9 @@ function makeJwt(payload: Record<string, unknown>): string {
   return `${b64url({ alg: "RS256", typ: "JWT" })}.${b64url(payload)}.fake-signature`;
 }
 
-// probe()/detect() take a ProbeContext / nothing; the codex module ignores the
-// context entirely (no secrets, no metadata), so a hollow object suffices.
+// probe() reads only ctx.config.provider (to honor a codex apiKeyEnv custom
+// auth path); a hollow object degrades to the default CODEX_AUTH_JSON /
+// ~/.codex/auth.json resolution, which is what these tests pin.
 const PROBE_CTX = {} as ProbeContext;
 
 describe("codex credential probe", () => {
@@ -242,6 +243,34 @@ describe("codex credential probe", () => {
     const viaEnv = await codexProvider.detect!();
     expect(viaEnv.detected).toBe(true);
     expect(viaEnv.message).toContain("OPENAI_API_KEY");
+  });
+
+  test("probe honors the configured codex provider's apiKeyEnv auth path", async () => {
+    __setCodexWhichForTests(() => "/usr/local/bin/codex");
+    // Default resolution (CODEX_AUTH_JSON) points at a HEALTHY file...
+    writeAuth({ tokens: { access_token: makeJwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), refresh_token: "r" } });
+    // ...but the instance's codex provider names a custom path env whose file
+    // holds an EXPIRED token — the file a chat turn would actually read. The
+    // probe must consult that one, or connector health and chat resolution
+    // disagree about the same install.
+    const customPath = join(root, "custom-auth.json");
+    writeFileSync(
+      customPath,
+      JSON.stringify({ tokens: { access_token: makeJwt({ exp: Math.floor(Date.now() / 1000) - 60 }), refresh_token: "r" } })
+    );
+    const prev = process.env.MY_CODEX_AUTH;
+    process.env.MY_CODEX_AUTH = customPath;
+    try {
+      const ctx = {
+        config: { provider: { name: "codex", model: "gpt-5.5", apiKeyEnv: "MY_CODEX_AUTH" } }
+      } as ProbeContext;
+      const probe = await codexProvider.probe!(ctx);
+      expect(probe.ok).toBe(false);
+      expect(probe.message).toContain("Codex access token expired at");
+    } finally {
+      if (prev === undefined) delete process.env.MY_CODEX_AUTH;
+      else process.env.MY_CODEX_AUTH = prev;
+    }
   });
 
   test("detect ignores token expiry: an expired JWT still materializes the connector while probe reports it unhealthy", async () => {

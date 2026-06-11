@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import type { CodexCredentialProbe } from "../../provider";
+import type { ProviderConfig } from "../../types";
 import type { ProbeResult, ProviderModule } from "./types";
 
 // Codex CLI provider. No managed secrets — auth lives in the codex CLI's
@@ -101,14 +102,14 @@ export function __setCodexRetryDelayForTests(ms: number | null): void {
 // path's withCodexSessionRetry applies. Without it, a re-probe or detect
 // pass landing inside the rewrite window would report a fully-authenticated
 // install as having no credentials.
-async function readCredentialProbe(): Promise<CodexCredentialProbe> {
+async function readCredentialProbe(provider?: ProviderConfig): Promise<CodexCredentialProbe> {
   const { probeCodexCredentials, CODEX_RETRY_REWRITE_DELAY_MS } = await import("../../provider");
-  const first = probeCodexCredentials();
+  const first = probeCodexCredentials(provider);
   if (first.ok || !first.transient) return first;
   await new Promise<void>((resolve) =>
     setTimeout(resolve, retryDelayMsOverride ?? CODEX_RETRY_REWRITE_DELAY_MS)
   );
-  return probeCodexCredentials();
+  return probeCodexCredentials(provider);
 }
 
 export const codexProvider: ProviderModule = {
@@ -116,11 +117,16 @@ export const codexProvider: ProviderModule = {
   label: "Codex",
   description: "Delegate coding work to the Codex CLI. No secrets stored — auth lives in your host install.",
   fields: [],
-  async probe() {
+  async probe(ctx) {
     const path = whichImpl("codex");
     if (!path) return { ok: false, message: "codex not found on PATH." };
+    // Thread the instance's configured provider through so a codex setup with
+    // a custom apiKeyEnv auth-path probes the SAME file a chat turn reads —
+    // codexAuthPath only honors apiKeyEnv when provider.name === "codex", so
+    // a non-codex active provider (or a context without one) degrades to the
+    // default CODEX_AUTH_JSON / ~/.codex/auth.json resolution.
     return evaluateCodexAuth(
-      await readCredentialProbe(),
+      await readCredentialProbe(ctx.config?.provider),
       { OPENAI_API_KEY: process.env.OPENAI_API_KEY },
       Date.now()
     );
