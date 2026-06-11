@@ -11,7 +11,7 @@
 // {name, args} envelope) — that is the contract this file pins.
 
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createChatSession, createTask, mutateState, readState, recordProviderAuthFailure, upsertTask } from "../state";
@@ -486,6 +486,16 @@ describe("direct self tools — mutate", () => {
     const config = buildConfig(instance, "auto");
     const taskId = await newTask(config);
     const prevKey = process.env.OPENAI_API_KEY;
+    const prevHome = process.env.HOME;
+    const prevSkipRefresh = process.env.GINI_SKIP_PLIST_REFRESH;
+    // The supplied apiKey routes through writeKeyToSecretsEnv, which resolves
+    // ~/.gini/secrets.env via process.env.HOME — point HOME at a scratch dir
+    // so the write never touches the real file, and skip the plist refresh so
+    // the key-carrying path can't signal the developer's running gateway.
+    const home = join(ROOT, `home-${instance}`);
+    mkdirSync(home, { recursive: true });
+    process.env.HOME = home;
+    process.env.GINI_SKIP_PLIST_REFRESH = "1";
     try {
       await mutateState(config.instance, (state) => {
         recordProviderAuthFailure(state, { provider: "openai", detail: "token expired", taskId: "task_seed" });
@@ -498,6 +508,8 @@ describe("direct self tools — mutate", () => {
         JSON.stringify({ provider: "openai", model: "gpt-5.4-mini", apiKey: "sk-rotated" })
       );
       expect(result.kind).toBe("sync");
+      // The env-keyed write landed in the sandboxed home, not the real one.
+      expect(readFileSync(join(home, ".gini", "secrets.env"), "utf8")).toContain("sk-rotated");
       // A supplied key is a credential re-establishment — the documented
       // clear seam — so the record drops and the clear is audited.
       const state = readState(config.instance);
@@ -506,6 +518,10 @@ describe("direct self tools — mutate", () => {
     } finally {
       if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = prevKey;
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      if (prevSkipRefresh === undefined) delete process.env.GINI_SKIP_PLIST_REFRESH;
+      else process.env.GINI_SKIP_PLIST_REFRESH = prevSkipRefresh;
     }
   });
 
