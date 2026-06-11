@@ -30,15 +30,16 @@ describe("ChatTabBar", () => {
     expect(screen.getByText("Messages")).not.toBeNull();
   });
 
-  test("shows count pills only when non-zero, with a label on Threads", () => {
+  test("shows count pills only when non-zero, with screen-reader context on Threads", () => {
     const { rerender } = render(
       <ChatTabBar active="messages" onChange={() => {}} threadCount={3} jobCount={2} />
     );
-    expect(screen.getByText("3")).not.toBeNull();
-    expect(screen.getByLabelText("3 unread threads")).not.toBeNull();
+    // The Threads pill carries sr-only context, so its full text is the
+    // labelled form; the Jobs pill is just the number.
+    expect(screen.getByText(/unread threads/)).not.toBeNull();
     expect(screen.getByText("2")).not.toBeNull();
     rerender(<ChatTabBar active="messages" onChange={() => {}} threadCount={0} jobCount={0} />);
-    expect(screen.queryByText("3")).toBeNull();
+    expect(screen.queryByText(/unread threads/)).toBeNull();
     expect(screen.queryByText("2")).toBeNull();
   });
 

@@ -47,7 +47,7 @@ export function ThreadCard({
       type="button"
       onClick={onOpen}
       aria-label={`Open thread: ${rootPreview} (${ariaState})`}
-      className="group w-full cursor-pointer border-b border-border bg-background px-10 py-5 text-left transition-colors hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
+      className="group w-full cursor-pointer border-b border-border bg-background px-10 py-5 text-left transition-colors hover:bg-accent focus-visible:bg-accent focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
     >
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-2.5">
         {/* Meta */}
@@ -109,11 +109,21 @@ export function ThreadCard({
               ) : null}
             </>
           ) : (
-            <span className="text-[13px] font-semibold text-muted-foreground">No replies yet</span>
+            <>
+              <span className="text-[13px] font-semibold text-muted-foreground">No replies yet</span>
+              {lastReply ? (
+                <>
+                  <span className="text-[12px] text-muted-foreground">·</span>
+                  <span className="text-[12px] font-medium text-muted-foreground">
+                    Started {lastReply}
+                  </span>
+                </>
+              ) : null}
+            </>
           )}
           <span className="ml-auto flex shrink-0 items-center gap-1 text-[12px] font-semibold text-[#4277FB] group-hover:underline group-focus-visible:underline dark:text-[#9AB0FF]">
             View thread
-            <ChevronRight className="size-3.5 transition-transform group-hover:translate-x-0.5" />
+            <ChevronRight className="size-3.5 transition-transform group-hover:translate-x-0.5 group-focus-visible:translate-x-0.5" />
           </span>
         </div>
       </div>

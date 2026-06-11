@@ -113,6 +113,9 @@ describe("ThreadCard", () => {
       />
     );
     expect(screen.getByText("No replies yet")).not.toBeNull();
+    // The card still carries a time anchor — the thread's start age — but
+    // never a fabricated "Last reply".
+    expect(screen.getByText(/Started/)).not.toBeNull();
     expect(screen.queryByText(/Last reply/)).toBeNull();
     expect(screen.queryByText(/0 replies/)).toBeNull();
   });

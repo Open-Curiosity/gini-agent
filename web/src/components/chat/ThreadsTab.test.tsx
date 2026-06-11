@@ -78,9 +78,10 @@ describe("ThreadsTab", () => {
       lastReplyAt: "2026-05-30T10:00:00.000Z",
       activity: "waiting_approval"
     });
+    // The actionable state outranks running; both outrank newer idle threads.
     expect(sortThreads([idleNewest, runningOld, waitingOlder]).map((t) => t.threadId)).toEqual([
-      "thread_running",
       "thread_waiting",
+      "thread_running",
       "thread_idle"
     ]);
 

@@ -82,11 +82,9 @@ export function ChatTabBar({
               </>
             ) : null}
             {tab.count ? (
-              <span
-                aria-label={tab.countLabel ? `${tab.count} ${tab.countLabel}` : undefined}
-                className="flex items-center justify-center rounded-full border border-border bg-muted px-1.5 py-px text-[11px] font-bold text-foreground"
-              >
+              <span className="flex items-center justify-center rounded-full border border-border bg-muted px-1.5 py-px text-[11px] font-bold text-foreground">
                 {tab.count}
+                {tab.countLabel ? <span className="sr-only"> {tab.countLabel}</span> : null}
               </span>
             ) : null}
           </button>

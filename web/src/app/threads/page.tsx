@@ -50,32 +50,36 @@ export default function ThreadsInboxPage() {
           </span>
         </header>
 
-        <div className="flex shrink-0 items-center justify-between border-b border-border px-10 py-3">
-          <div className="flex items-center gap-0.5 rounded-lg border border-border bg-card p-0.5">
-            {(["all", "unread"] as const).map((value) => (
-              <button
-                key={value}
-                type="button"
-                onClick={() => setFilter(value)}
-                className={cn(
-                  "rounded-md px-3.5 py-1.5 text-[13px] font-semibold capitalize transition-colors",
-                  filter === value
-                    ? "border border-border bg-muted text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                )}
-              >
-                {value}
-              </button>
-            ))}
+        {/* Toolbar content shares the cards' centered column so the filter
+            and the list edges line up. */}
+        <div className="shrink-0 border-b border-border px-10 py-3">
+          <div className="mx-auto flex w-full max-w-3xl items-center justify-between">
+            <div className="flex items-center gap-0.5 rounded-lg border border-border bg-card p-0.5">
+              {(["all", "unread"] as const).map((value) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setFilter(value)}
+                  className={cn(
+                    "rounded-md px-3.5 py-1.5 text-[13px] font-semibold capitalize transition-colors",
+                    filter === value
+                      ? "border border-border bg-muted text-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  {value}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              onClick={() => markAllThreadsRead(threads)}
+              className="flex items-center gap-1.5 text-[13px] font-medium text-muted-foreground hover:text-foreground"
+            >
+              <Check className="size-3.5" />
+              Mark all read
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={() => markAllThreadsRead(threads)}
-            className="flex items-center gap-1.5 text-[13px] font-medium text-muted-foreground hover:text-foreground"
-          >
-            <Check className="size-3.5" />
-            Mark all read
-          </button>
         </div>
 
         {inbox.isLoading && threads.length === 0 ? (

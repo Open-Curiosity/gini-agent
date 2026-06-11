@@ -6,11 +6,14 @@ import { useThreadReadState } from "@/lib/use-chat-read-state";
 import { ThreadCard } from "./ThreadCard";
 
 // Shared thread ordering for the per-agent tab and the global inbox:
-// threads with a run in flight first, newest reply first within each group.
+// runs parked on the user first (the actionable state), then running
+// threads, then idle — newest reply first within each group.
+const ACTIVITY_RANK: Record<string, number> = { waiting_approval: 2, running: 1 };
+
 export function sortThreads(threads: ThreadSummary[]): ThreadSummary[] {
   return [...threads].sort((a, b) => {
-    const inFlight = Number(Boolean(b.activity)) - Number(Boolean(a.activity));
-    if (inFlight !== 0) return inFlight;
+    const rank = (ACTIVITY_RANK[b.activity ?? ""] ?? 0) - (ACTIVITY_RANK[a.activity ?? ""] ?? 0);
+    if (rank !== 0) return rank;
     return b.lastReplyAt.localeCompare(a.lastReplyAt);
   });
 }
