@@ -131,7 +131,9 @@ interface Watch {
 // transition tick (the first new tick rewrites it flat).
 interface DetectArgsMulti {
   watches?: Watch[];
-  state?: (Record<string, DetectState> & { byWatcher?: Record<string, DetectState> }) | null;
+  // Flat per-route state (the current shape) OR a legacy `{ byWatcher }` blob
+  // (read transparently for one transition tick). readWatchState handles both.
+  state?: Record<string, DetectState | undefined> | { byWatcher?: Record<string, DetectState> } | null;
 }
 
 // The shared job's multi-watch output: ROUTED buckets keyed by routeKey (only
@@ -841,7 +843,10 @@ function readWatchState(
   routeKey: string
 ): DetectState {
   if (!input) return {};
-  return input[routeKey] ?? input.byWatcher?.[routeKey] ?? {};
+  const flat = (input as Record<string, DetectState | undefined>)[routeKey];
+  if (flat) return flat;
+  const legacy = (input as { byWatcher?: Record<string, DetectState> }).byWatcher;
+  return legacy?.[routeKey] ?? {};
 }
 function isTargeted(watch: Watch): boolean {
   return Boolean(watch.sender || watch.threadId);
