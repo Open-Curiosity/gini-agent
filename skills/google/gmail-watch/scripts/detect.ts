@@ -627,8 +627,8 @@ export async function detect(
 // from ticket bots are exactly what's watched); self-drop stays mandatory (we
 // must never trigger on our own replies — they advance the cursor silently).
 // Seeding mirrors the query regime: baseline the cursor at the newest message
-// and draft nothing; `seen` records the ids at the exact cursor millisecond so
-// an equal-timestamp message isn't re-drafted. Same purity + at-least-once
+// and draft nothing; `seen` records the ids at the cursor's epoch second so an
+// equal-timestamp message isn't re-drafted. Same purity + at-least-once
 // contract: the new state rides back for the caller to persist.
 async function detectThread(
   args: DetectArgs,
@@ -646,16 +646,23 @@ async function detectThread(
   if (!stateIn.cursor) {
     const baseline = newest?.internalDate ? Number(newest.internalDate) : 0;
     const cursor = String(baseline > 0 ? baseline : Date.now());
-    const seen = messages.filter((m) => m.internalDate === cursor).map((m) => m.id);
+    const baselineSec = Math.floor(Number(cursor) / 1000);
+    const seen = messages
+      .filter((m) => Math.floor((Number(m.internalDate) || 0) / 1000) === baselineSec)
+      .map((m) => m.id);
     return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor, seen, status: "ok" } };
   }
 
+  // Gmail internalDate is second-granular in practice, so compare on epoch
+  // seconds (mirroring the query regime): a same-second message that becomes
+  // visible on a later tick must still be drafted, not dropped as <= the cursor.
   const cursorMs = Number(stateIn.cursor) || 0;
+  const cursorSec = Math.floor(cursorMs / 1000);
   let lastConsumed = cursorMs;
   const items: ResultItem[] = [];
   for (const m of messages) {
     const internalDate = Number(m.internalDate) || 0;
-    if (internalDate <= cursorMs || seenIn.has(m.id)) continue;
+    if (internalDate <= 0 || Math.floor(internalDate / 1000) < cursorSec || seenIn.has(m.id)) continue;
     const from = parseFromAddress(m.from ?? "");
     // Our own reply advances the cursor but never triggers.
     const isSelf = Boolean(selfEmail && from && from === selfEmail.toLowerCase());
@@ -664,9 +671,13 @@ async function detectThread(
   }
 
   const newCursor = String(lastConsumed);
-  // The ids at the new cursor's exact millisecond — an equal-timestamp sibling
-  // re-listed next tick isn't re-drafted.
-  const seenOut = messages.filter((m) => m.internalDate === newCursor).map((m) => m.id);
+  // The ids sharing the new cursor's epoch second (so an equal-timestamp sibling
+  // re-listed next tick isn't re-drafted). The full thread is re-fetched every
+  // tick, so any prior-seen id still at this second is already in `messages`.
+  const newCursorSec = Math.floor(lastConsumed / 1000);
+  const seenOut = messages
+    .filter((m) => Math.floor((Number(m.internalDate) || 0) / 1000) === newCursorSec)
+    .map((m) => m.id);
 
   // Follow-up on silence: NO new matches this tick, the thread's last message
   // is OUR OWN, and it has sat unanswered past the threshold — nudge a turn to

@@ -668,6 +668,28 @@ describe("detect — thread mode", () => {
     expect(r3.kind).toBe("shortCircuit");
   });
 
+  test("a same-second-as-cursor message visible on a later tick is still drafted", async () => {
+    // Gmail internalDate is second-granular: our outbound and the ticket bot's
+    // auto-ack land in the same epoch second. The bot's message is visible only
+    // on a later tick, so a ms-exact `> cursor` test would drop it forever.
+    const cursor = "1780000000000"; // our reply, at the cursor second
+    const sibling = "1780000000000"; // bot reply, SAME second, not yet seen
+    const spawn = threadSpawn("t-1", [
+      { id: "m1", internalDate: "1779990000000", from: "support@x.com", subject: "case" },
+      { id: "m2", internalDate: cursor, from: "me@example.com", subject: "our offer" },
+      { id: "m3", internalDate: sibling, from: "bot@x.zendesk.com", subject: "auto-ack", snippet: "received" }
+    ]);
+    const r = await detect(
+      { query: "thread:t-1", threadId: "t-1", state: { cursor, seen: ["m2"] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual(["m3"]);
+    // Both same-second ids ride forward in `seen` so neither re-drafts next tick.
+    expect(new Set(r.state.seen)).toEqual(new Set(["m2", "m3"]));
+  });
+
   test("runWatches routes a thread watch through thread detection", async () => {
     const spawn: GwsSpawn = async (args) => {
       const joined = args.join(" ");
