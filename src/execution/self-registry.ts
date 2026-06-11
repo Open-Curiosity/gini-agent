@@ -311,7 +311,14 @@ async function setProvider(
   if (typeof args.apiVersion === "string") payload.apiVersion = args.apiVersion.trim();
   if (typeof args.deployment === "string") payload.deployment = args.deployment.trim();
   if (args.authScheme === "api-key" || args.authScheme === "bearer") payload.authScheme = args.authScheme;
-  const result = await setSetupProvider(config, payload);
+  // Only a call that supplies a new apiKey re-establishes the credential, so
+  // only that shape may clear the needs-reauth record. A model/transport-only
+  // patch proves nothing about the credential (same rationale as
+  // setDefaultModel's opt-out) — without this gate, "switch to <model>" on a
+  // provider with a dead key would flip Settings back to a stale "Connected".
+  const result = await setSetupProvider(config, payload, {
+    clearAuthFailureOnSuccess: typeof payload.apiKey === "string"
+  });
   appendTrace(config.instance, taskId, {
     type: "tool",
     message: result.ok ? "Switched provider" : "Provider switch failed",

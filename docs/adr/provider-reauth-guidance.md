@@ -76,11 +76,13 @@ therefore also persists a per-provider auth-failure record:
   2. a successful provider-config write through the setup API
      (`setSetupProvider`) for that provider — this covers the Add Provider
      key form, key rotation, the Settings Edit dialog, `set_provider`
-     self-tool writes, and the codex setup **Verify** (whose presence gate
-     passing is the verify signal); the default-model selection endpoint
-     (`setDefaultModel`) routes through `setSetupProvider` but opts out of
-     the clear (`clearAuthFailureOnSuccess: false`) because a model-only
-     selection does not re-establish the credential;
+     self-tool writes that carry an `apiKey`, and the codex setup **Verify**
+     (whose presence gate passing is the verify signal); selection-only
+     callers opt out of the clear (`clearAuthFailureOnSuccess: false`)
+     because a model/transport-only write does not re-establish the
+     credential: the default-model selection endpoint (`setDefaultModel`)
+     always opts out, and the `set_provider` self-tool opts out whenever its
+     payload carries no `apiKey`;
   3. provider removal (`removeSetupProvider`) — a removed provider must not
      resurface a stale record when re-added.
 - **Exposure.** `GET /api/providers/catalog` enriches each row with

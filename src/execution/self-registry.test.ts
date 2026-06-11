@@ -14,7 +14,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createChatSession, createTask, mutateState, readState, upsertTask } from "../state";
+import { createChatSession, createTask, mutateState, readState, recordProviderAuthFailure, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 import { dispatchToolCall } from "./tool-dispatch";
 import { findSelfOperation, SELF_OPERATIONS } from "./self-registry";
@@ -446,6 +446,66 @@ describe("direct self tools — mutate", () => {
     } finally {
       if (prevKey === undefined) delete process.env.AZURE_OPENAI_API_KEY;
       else process.env.AZURE_OPENAI_API_KEY = prevKey;
+    }
+  });
+
+  test("a model-only set_provider patch does not clear the provider's needs-reauth record", async () => {
+    const instance = `self-setprov-keyless-keep-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const prevKey = process.env.OPENAI_API_KEY;
+    // The dead key sits in process.env, so the keyless patch passes
+    // setSetupProvider's env-already-set gate without touching the credential.
+    process.env.OPENAI_API_KEY = "sk-dead";
+    try {
+      await mutateState(config.instance, (state) => {
+        recordProviderAuthFailure(state, { provider: "openai", detail: "token expired", taskId: "task_seed" });
+      });
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "set_provider",
+        "call_1",
+        JSON.stringify({ provider: "openai", model: "gpt-5.4-mini" })
+      );
+      expect(result.kind).toBe("sync");
+      // "Switch to <model>" proves nothing about the credential: the record
+      // (and the amber Settings row it drives) must survive, and no clear may
+      // be audited — otherwise the row flips back to a stale "Connected".
+      const state = readState(config.instance);
+      expect(state.providerAuthFailures?.openai).toBeDefined();
+      expect(state.audit.some((a) => a.action === "provider.auth.cleared" && a.target === "openai")).toBe(false);
+    } finally {
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
+    }
+  });
+
+  test("a set_provider write carrying an apiKey clears the provider's needs-reauth record", async () => {
+    const instance = `self-setprov-key-clears-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const prevKey = process.env.OPENAI_API_KEY;
+    try {
+      await mutateState(config.instance, (state) => {
+        recordProviderAuthFailure(state, { provider: "openai", detail: "token expired", taskId: "task_seed" });
+      });
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "set_provider",
+        "call_1",
+        JSON.stringify({ provider: "openai", model: "gpt-5.4-mini", apiKey: "sk-rotated" })
+      );
+      expect(result.kind).toBe("sync");
+      // A supplied key is a credential re-establishment — the documented
+      // clear seam — so the record drops and the clear is audited.
+      const state = readState(config.instance);
+      expect(state.providerAuthFailures?.openai).toBeUndefined();
+      expect(state.audit.some((a) => a.action === "provider.auth.cleared" && a.target === "openai")).toBe(true);
+    } finally {
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = prevKey;
     }
   });
 
