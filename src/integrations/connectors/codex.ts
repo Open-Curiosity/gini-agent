@@ -44,14 +44,29 @@ export function __setCodexWhichForTests(impl: ((bin: string) => string | null) |
 //     fallback the codex CLI itself honors).
 //   - nothing anywhere → not ok with the resolver's own message (it names
 //     the path it looked at).
+// ISO timestamp at which a probe's OAuth access token provably expired, or
+// undefined when it is not provably expired: api_key-shaped credentials carry
+// no exp, unparseable tokens are "expiry unknown" (decodeJwtExp already
+// returns undefined for those), and a future exp is healthy. The single
+// expiry threshold shared by the connector probe and the setup Verify gate —
+// the two surfaces must never disagree about the same credential.
+export function codexAccessTokenExpiredAt(
+  creds: CodexCredentialProbe,
+  nowMs: number
+): string | undefined {
+  if (typeof creds.accessTokenExp !== "number") return undefined;
+  if (creds.accessTokenExp * 1000 > nowMs) return undefined;
+  return new Date(creds.accessTokenExp * 1000).toISOString();
+}
+
 export function evaluateCodexAuth(
   creds: CodexCredentialProbe,
   env: { OPENAI_API_KEY?: string },
   nowMs: number
 ): ProbeResult {
   if (creds.ok) {
-    if (typeof creds.accessTokenExp === "number" && creds.accessTokenExp * 1000 <= nowMs) {
-      const expiredAt = new Date(creds.accessTokenExp * 1000).toISOString();
+    const expiredAt = codexAccessTokenExpiredAt(creds, nowMs);
+    if (expiredAt) {
       return {
         ok: false,
         message: `Codex access token expired at ${expiredAt}. Run \`codex login\` to re-authenticate.`

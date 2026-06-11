@@ -48,7 +48,8 @@
 // child's responsibility.
 
 import { writeRuntimeConfig } from "../paths";
-import { anthropicNeedsHttps, azureNeedsBaseUrl, azureNeedsHttps, hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { anthropicNeedsHttps, azureNeedsBaseUrl, azureNeedsHttps, hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, probeCodexCredentials, providerCatalog, providerHealth } from "../provider";
+import { codexAccessTokenExpiredAt } from "../integrations/connectors/codex";
 import { clearProviderAuthFailureIfPresent } from "../state";
 import { isValidEnvVarName, removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
@@ -257,12 +258,16 @@ export async function setSetupProvider(
     });
     writeRuntimeConfig(config);
 
-    // A successful config write for this provider supersedes any persistent
-    // needs-reauth record — a rotated key, edited transport config, or a
-    // re-verify is the user re-establishing the credential (issue #233). The
-    // next provider call re-records if it still fails. Cleared BEFORE the
-    // plist-refresh SIGTERM below so the write can't be lost to the restart.
-    if (options?.clearAuthFailureOnSuccess !== false) {
+    // A key-carrying write supersedes any persistent needs-reauth record —
+    // a rotated key is the user re-establishing the credential (issue #233).
+    // A keyless edit (the dialog leaves the key field blank to keep the saved
+    // key, so a model/baseUrl-only save reaches here) proves nothing about
+    // the credential and must NOT clear, or the amber row flips back to a
+    // stale "Connected" on the same dead key — mirrors the set_provider
+    // self-tool gate. The next provider call re-records if it still fails.
+    // Cleared BEFORE the plist-refresh SIGTERM below so the write can't be
+    // lost to the restart.
+    if (options?.clearAuthFailureOnSuccess !== false && apiKey) {
       await clearProviderAuthFailureIfPresent(config.instance, providerName as ProviderName, {
         reason: "provider configuration updated"
       });
@@ -343,12 +348,28 @@ export async function setSetupProvider(
     return { ok: true, provider: providerHealth(config), plistRefreshNeeded: false };
   }
   // providerName === "codex"
-  if (!hasUsableCodexCredentials(config.provider)) {
+  const codexProbe = probeCodexCredentials(config.provider);
+  if (!codexProbe.ok) {
     return {
       ok: false,
       provider: providerHealth(config),
       plistRefreshNeeded: false,
       error: "Codex credentials not found. Run `codex --login` in your terminal, then retry."
+    };
+  }
+  // Presence is not enough to Verify: the runtime can decode the OAuth JWT's
+  // exp locally (zero network), and the connector probe already reports an
+  // expired token as unhealthy — a button named "Verify" must not bless the
+  // very credential the probe calls dead, or the amber row flips back to a
+  // stale "Connected" until the next failed turn. api_key-shaped and
+  // exp-unknown credentials stay presence-only (no exp to consult).
+  const codexExpiredAt = codexAccessTokenExpiredAt(codexProbe, Date.now());
+  if (codexExpiredAt) {
+    return {
+      ok: false,
+      provider: providerHealth(config),
+      plistRefreshNeeded: false,
+      error: `Codex access token expired at ${codexExpiredAt}. Run \`codex login\` to re-authenticate, then retry.`
     };
   }
   const codexCatalog = providerCatalog().find((p) => p.id === "codex");
@@ -357,8 +378,9 @@ export async function setSetupProvider(
     : (config.provider?.name === "codex" && config.provider.model ? config.provider.model : codexCatalog?.models[0] ?? "gpt-5.5");
   config.provider = normalizeProvider({ name: "codex", model } as ProviderConfig);
   writeRuntimeConfig(config);
-  // The presence gate above passed, so the user has (re-)established codex
-  // credentials — this is the setup Verify seam. Clear the needs-reauth
+  // The gate above passed — credentials are present AND not provably expired
+  // (locally-decoded JWT exp) — so the user has (re-)established codex
+  // credentials; this is the setup Verify seam. Clear the needs-reauth
   // record; the next codex call re-records if the token is still dead.
   if (options?.clearAuthFailureOnSuccess !== false) {
     await clearProviderAuthFailureIfPresent(config.instance, "codex", {

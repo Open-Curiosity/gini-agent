@@ -728,6 +728,30 @@ describe("setup-api", () => {
     expect(cleared?.evidence).toMatchObject({ reason: "provider configuration updated" });
   });
 
+  test("a keyless model-only edit of an env-keyed provider leaves the needs-reauth record", async () => {
+    // The Edit dialog leaves the key field blank to keep the saved key, so a
+    // model-only save submits no apiKey; the dead key in process.env passes
+    // the env-already-set gate. The write must succeed WITHOUT clearing —
+    // editing the model proves nothing about the credential.
+    await seedAuthFailure("openai");
+    process.env.OPENAI_API_KEY = "sk-dead";
+    const result = await setSetupProvider(config, { provider: "openai", model: "gpt-5.4-mini" });
+    expect(result.ok).toBe(true);
+    const state = readState(config.instance);
+    expect(state.providerAuthFailures?.openai).toBeDefined();
+    expect(state.audit.some((a) => a.action === "provider.auth.cleared" && a.target === "openai")).toBe(false);
+  });
+
+  test("a keyless baseUrl-only edit of an env-keyed provider leaves the needs-reauth record", async () => {
+    await seedAuthFailure("openai");
+    process.env.OPENAI_API_KEY = "sk-dead";
+    const result = await setSetupProvider(config, { provider: "openai", baseUrl: "https://proxy.example.com/v1" });
+    expect(result.ok).toBe(true);
+    const state = readState(config.instance);
+    expect(state.providerAuthFailures?.openai).toBeDefined();
+    expect(state.audit.some((a) => a.action === "provider.auth.cleared" && a.target === "openai")).toBe(false);
+  });
+
   test("POST bedrock clears the needs-reauth record on a successful config write", async () => {
     // Bedrock has no key form — re-saving the provider with working AWS
     // credentials IS the recovery seam for that provider class.
@@ -754,6 +778,38 @@ describe("setup-api", () => {
     const authPath = join(s.stateRoot, "codex-auth.json");
     mkdirSync(s.stateRoot, { recursive: true });
     writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fresh", refresh_token: "r" } }));
+    process.env.CODEX_AUTH_JSON = authPath;
+    const result = await setSetupProvider(config, { provider: "codex" });
+    expect(result.ok).toBe(true);
+    expect(readState(config.instance).providerAuthFailures?.codex).toBeUndefined();
+  });
+
+  test("codex Verify fails on a provably-expired JWT and leaves the needs-reauth record", async () => {
+    // The runtime decodes the OAuth JWT exp locally; Verify must not bless
+    // the very credential the connector probe reports as expired.
+    await seedAuthFailure("codex");
+    const enc = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+    const pastExp = Math.floor(Date.now() / 1000) - 60;
+    const expiredJwt = `${enc({ alg: "none" })}.${enc({ exp: pastExp })}.sig`;
+    const authPath = join(s.stateRoot, "codex-auth-expired.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: expiredJwt, refresh_token: "r" } }));
+    process.env.CODEX_AUTH_JSON = authPath;
+    const result = await setSetupProvider(config, { provider: "codex" });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("Codex access token expired at");
+    expect(result.error).toContain("codex login");
+    expect(readState(config.instance).providerAuthFailures?.codex).toBeDefined();
+  });
+
+  test("codex Verify passes on a future-exp JWT and clears the needs-reauth record", async () => {
+    await seedAuthFailure("codex");
+    const enc = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+    const futureExp = Math.floor(Date.now() / 1000) + 3600;
+    const freshJwt = `${enc({ alg: "none" })}.${enc({ exp: futureExp })}.sig`;
+    const authPath = join(s.stateRoot, "codex-auth-fresh.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: freshJwt, refresh_token: "r" } }));
     process.env.CODEX_AUTH_JSON = authPath;
     const result = await setSetupProvider(config, { provider: "codex" });
     expect(result.ok).toBe(true);

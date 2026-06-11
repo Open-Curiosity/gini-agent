@@ -73,16 +73,21 @@ therefore also persists a per-provider auth-failure record:
      a record written at or after that moment survives the clear, since a
      long call that authenticated before the token expired proves nothing
      about the credential's current state;
-  2. a successful provider-config write through the setup API
+  2. a credential-carrying provider-config write through the setup API
      (`setSetupProvider`) for that provider — this covers the Add Provider
-     key form, key rotation, the Settings Edit dialog, `set_provider`
-     self-tool writes that carry an `apiKey`, and the codex setup **Verify**
-     (whose presence gate passing is the verify signal); selection-only
-     callers opt out of the clear (`clearAuthFailureOnSuccess: false`)
-     because a model/transport-only write does not re-establish the
-     credential: the default-model selection endpoint (`setDefaultModel`)
-     always opts out, and the `set_provider` self-tool opts out whenever its
-     payload carries no `apiKey`;
+     key form, key rotation via the Settings Edit dialog, `set_provider`
+     self-tool writes that carry an `apiKey`, the bedrock re-save (its AWS
+     credential gate is the signal — bedrock has no key form), and the codex
+     setup **Verify**, which requires credentials to be present AND not
+     provably expired (the locally-decoded JWT `exp`; api_key-shaped and
+     exp-unknown credentials stay presence-only). Writes that carry no
+     credential evidence never clear: for env-keyed providers a keyless
+     model/baseUrl-only save (the Edit dialog with the key field left blank)
+     leaves the record, the default-model selection endpoint
+     (`setDefaultModel`) always opts out (`clearAuthFailureOnSuccess:
+     false`), and the `set_provider` self-tool opts out whenever its payload
+     carries no `apiKey` — a model/transport-only write proves nothing about
+     the credential;
   3. provider removal (`removeSetupProvider`) — a removed provider must not
      resurface a stale record when re-added.
 - **Exposure.** `GET /api/providers/catalog` enriches each row with
@@ -161,12 +166,15 @@ avoids that entirely.
 - After a `ProviderAuthError` task failure, `/api/providers/catalog` reports
   `authStatus: "needs_reauth"` for that provider and Settings → Providers
   shows the amber state with the redacted detail and kind-routed CTA — until
-  a successful provider call, a setup-API config write for that provider, or
-  its removal clears it.
+  a successful provider call, a credential-carrying setup-API config write
+  for that provider, or its removal clears it. A keyless model/baseUrl-only
+  save, a default-model pick, or a keyless `set_provider` patch leaves the
+  amber state in place.
 - With an expired-`exp` access token in the codex auth file, the codex
   connector probe reports unhealthy naming the expiry time and `codex login`,
-  without any network call; a valid or unparseable token keeps the
-  presence-based result.
+  without any network call, and the setup **Verify** fails with the same
+  expiry-naming error instead of clearing the record; a valid or unparseable
+  token keeps the presence-based result.
 
 ## Related
 
