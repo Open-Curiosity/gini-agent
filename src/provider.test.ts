@@ -3462,6 +3462,32 @@ describe("auth-error classification", () => {
     }
   });
 
+  test("auth failures are attributed to the provider resolved at call entry, not the post-switch one", async () => {
+    // A Settings POST or the agent's own set_provider can swap
+    // config.provider while a call is in flight. The 401 belongs to the
+    // provider that SERVED the call — the needs-reauth record keys off this
+    // name, so a stale attribution would flag the wrong provider (issue #233).
+    const restoreEnv = setEnv("OPENAI_API_KEY", "sk-dead");
+    const cfg = config(normalizeProvider({ name: "openai", model: "gpt-test" }));
+    const fetchStub = installFetch(() => {
+      // The switch lands mid-call, before the 401 resolves.
+      cfg.provider = normalizeProvider({ name: "openrouter", model: "or-test" });
+      return new Response(
+        JSON.stringify({ error: { message: "Incorrect API key provided" } }),
+        { status: 401, headers: { "content-type": "application/json" } }
+      );
+    });
+    try {
+      const err = await generateToolCallingResponse(cfg, [{ role: "user", content: "hi" }], []).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("openai");
+      expect((err as Error).message).toContain("Incorrect API key provided");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
   test("providerDisplayLabel returns clean brand labels", () => {
     expect(providerDisplayLabel("codex")).toBe("Codex");
     expect(providerDisplayLabel("openai")).toBe("OpenAI");

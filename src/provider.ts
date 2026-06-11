@@ -701,40 +701,59 @@ export async function generateToolCallingResponse(
     return result;
   }
 
-  // Codex/responses API. Route to the native function-calling responses
-  // path whenever tools are present OR the message history already
-  // contains tool-calling traffic (assistant tool_calls / tool results).
-  // The latter matters for the graceful-exhaustion summary call: it
-  // passes `tools: []` but needs the prior tool transcript preserved so
-  // the model can summarize what it learned. Falling back to the text-
-  // only `/responses` path here would strip that transcript.
-  if (provider.name === "codex") {
-    if (tools.length > 0 || messagesContainToolTraffic(messages)) {
-      return callToolCallingResponses(provider, messages, tools, onDelta);
+  const dispatch = async (): Promise<ToolCallingResult> => {
+    // Codex/responses API. Route to the native function-calling responses
+    // path whenever tools are present OR the message history already
+    // contains tool-calling traffic (assistant tool_calls / tool results).
+    // The latter matters for the graceful-exhaustion summary call: it
+    // passes `tools: []` but needs the prior tool transcript preserved so
+    // the model can summarize what it learned. Falling back to the text-
+    // only `/responses` path here would strip that transcript.
+    if (provider.name === "codex") {
+      if (tools.length > 0 || messagesContainToolTraffic(messages)) {
+        return callToolCallingResponses(provider, messages, tools, onDelta);
+      }
+      const systemContext = stitchSystemFromMessages(messages);
+      const userInput = lastUserText || "";
+      const text = await callOpenAIResponses(provider, userInput, systemContext, onDelta);
+      return {
+        provider: text.provider,
+        text: text.text,
+        toolCalls: [],
+        finishReason: "stop",
+        responseId: text.responseId,
+        usage: text.usage,
+        cost: text.cost
+      };
     }
-    const systemContext = stitchSystemFromMessages(messages);
-    const userInput = lastUserText || "";
-    const text = await callOpenAIResponses(provider, userInput, systemContext, onDelta);
-    return {
-      provider: text.provider,
-      text: text.text,
-      toolCalls: [],
-      finishReason: "stop",
-      responseId: text.responseId,
-      usage: text.usage,
-      cost: text.cost
-    };
-  }
 
-  if (provider.name === "anthropic") {
-    return callAnthropicMessages(provider, messages, tools, onDelta);
-  }
+    if (provider.name === "anthropic") {
+      return callAnthropicMessages(provider, messages, tools, onDelta);
+    }
 
-  if (provider.name === "bedrock") {
-    return callBedrockConverse(provider, messages, tools, onDelta);
-  }
+    if (provider.name === "bedrock") {
+      return callBedrockConverse(provider, messages, tools, onDelta);
+    }
 
-  return callToolCallingChatCompletions(provider, messages, tools, onDelta);
+    return callToolCallingChatCompletions(provider, messages, tools, onDelta);
+  };
+  try {
+    return await dispatch();
+  } catch (error) {
+    // Pin auth attribution to the provider resolved at THIS call's entry.
+    // The chat-task wraps tag with the loop's effective-context snapshot,
+    // but an instance-sourced call late-binds config.provider above — a
+    // provider switch landing mid-turn (Settings POST or the agent's own
+    // set_provider) would otherwise let an untyped 401 from the OLD
+    // provider be recorded under the NEW provider's needs-reauth key.
+    // Typed errors (anthropic/bedrock/codex local throws, codex session
+    // errors) already carry the correct hard-coded name and pass through.
+    const message = error instanceof Error ? error.message : String(error);
+    if (!(error instanceof ProviderAuthError) && isAuthExpiredError(message)) {
+      throw new ProviderAuthError(provider.name, message);
+    }
+    throw error;
+  }
 }
 
 // True when the message array carries assistant `tool_calls` entries or
