@@ -48,7 +48,7 @@
 // child's responsibility.
 
 import { writeRuntimeConfig } from "../paths";
-import { anthropicNeedsHttps, azureNeedsBaseUrl, azureNeedsHttps, hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, probeCodexCredentials, providerCatalog, providerHealth } from "../provider";
+import { anthropicNeedsHttps, azureNeedsBaseUrl, azureNeedsHttps, CODEX_RETRY_REWRITE_DELAY_MS, hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, probeCodexCredentials, providerCatalog, providerHealth } from "../provider";
 import { codexAccessTokenExpiredAt } from "../integrations/connectors/codex";
 import { clearProviderAuthFailureIfPresent } from "../state";
 import { isValidEnvVarName, removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
@@ -348,7 +348,16 @@ export async function setSetupProvider(
     return { ok: true, provider: providerHealth(config), plistRefreshNeeded: false };
   }
   // providerName === "codex"
-  const codexProbe = probeCodexCredentials(config.provider);
+  let codexProbe = probeCodexCredentials(config.provider);
+  if (!codexProbe.ok && codexProbe.transient) {
+    // Mid-rewrite torn read of auth.json — same single-retry contract as the
+    // connector probe (readCredentialProbe) and the chat path's
+    // withCodexSessionRetry, so Verify can't falsely report "not found" to a
+    // fully-authenticated user (or an unattended set_provider flow) that
+    // raced the codex CLI's non-atomic rewrite.
+    await new Promise<void>((resolve) => setTimeout(resolve, CODEX_RETRY_REWRITE_DELAY_MS));
+    codexProbe = probeCodexCredentials(config.provider);
+  }
   if (!codexProbe.ok) {
     return {
       ok: false,

@@ -816,6 +816,37 @@ describe("setup-api", () => {
     expect(readState(config.instance).providerAuthFailures?.codex).toBeUndefined();
   });
 
+  test("codex Verify recovers from a torn auth.json read via the single retry", async () => {
+    // A read landing inside the codex CLI's non-atomic rewrite produces a
+    // transient parse failure; Verify retries once after the rewrite-settle
+    // delay (same contract as the connector probe), so a fully-authenticated
+    // user racing the rewrite doesn't get a false "not found".
+    await seedAuthFailure("codex");
+    const authPath = join(s.stateRoot, "codex-auth-torn.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, "{ torn mid-write");
+    process.env.CODEX_AUTH_JSON = authPath;
+    // Repair lands on the task queue immediately — well inside the 50ms
+    // retry delay — simulating the CLI finishing its rewrite.
+    setTimeout(() => {
+      writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: "fresh", refresh_token: "r" } }));
+    }, 0);
+    const result = await setSetupProvider(config, { provider: "codex" });
+    expect(result.ok).toBe(true);
+    expect(readState(config.instance).providerAuthFailures?.codex).toBeUndefined();
+  });
+
+  test("codex Verify fails after the retry when auth.json stays unreadable", async () => {
+    await seedAuthFailure("codex");
+    const authPath = join(s.stateRoot, "codex-auth-stays-torn.json");
+    mkdirSync(s.stateRoot, { recursive: true });
+    writeFileSync(authPath, "{ torn mid-write");
+    process.env.CODEX_AUTH_JSON = authPath;
+    const result = await setSetupProvider(config, { provider: "codex" });
+    expect(result.ok).toBe(false);
+    expect(readState(config.instance).providerAuthFailures?.codex).toBeDefined();
+  });
+
   test("a FAILED setup/provider write leaves the needs-reauth record in place", async () => {
     await seedAuthFailure("codex");
     // CODEX_AUTH_JSON still points at the scrubbed nonexistent path from
