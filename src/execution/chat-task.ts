@@ -32,6 +32,7 @@ import {
   ProviderAuthError,
   generateToolCallingResponse,
   isAuthExpiredError,
+  isContextOverflowError,
   providerAuthNote,
   redactSecrets,
   type ToolCallingMessage,
@@ -126,6 +127,13 @@ import {
 // to be a meaningful budget for normal work. Power users can override this
 // per-instance via `config.agent.maxIterations` in `~/.gini/instances/<inst>/config.json`.
 const MAX_LOOP_ITERATIONS = 90;
+// Reactive recovery for provider context-overflow errors. When the provider
+// rejects a call because the prompt no longer fits its window (the chars/4
+// estimate — even calibrated — can miss), the loop compacts the transcript
+// harder and retries instead of failing the task. Total attempts per model
+// call, including the first; after exhaustion the task exits gracefully
+// with a partial result.
+const MAX_CONTEXT_OVERFLOW_ATTEMPTS = 3;
 const PRIOR_CONTEXT_RESPONSE_RESERVE_FRACTION = 0.05;
 const MIN_PRIOR_CONTEXT_RESPONSE_RESERVE_TOKENS = 1_024;
 const MAX_INLINE_SKILL_ROWS = 40;
@@ -199,9 +207,15 @@ export function nextNavWithoutAction(prev: number, toolNames: string[]): number 
 // count fits `budget`. Never drops a message (that would orphan a codex
 // function_call/function_call_output pair); only replaces oversized string
 // content with a short marker, preserving role + tool_call_id. The most-recent
-// KEEP_RECENT_TOOL_RESULTS tool results are protected. Mutates `messages` in
-// place and returns the number of messages elided. Exported for unit testing.
-export function elideOldToolResultsToBudget(messages: ToolCallingMessage[], budget: number): number {
+// `keepRecent` tool results (default KEEP_RECENT_TOOL_RESULTS) are protected;
+// the context-overflow retry path lowers the protection on its last attempt
+// so even the freshest oversized results shrink. Mutates `messages` in place
+// and returns the number of messages elided. Exported for unit testing.
+export function elideOldToolResultsToBudget(
+  messages: ToolCallingMessage[],
+  budget: number,
+  keepRecent: number = KEEP_RECENT_TOOL_RESULTS
+): number {
   if (estimateToolCallingMessagesTokens(messages) <= budget) return 0;
   // Indices of elidable tool results: string content, not already elided,
   // longer than a small floor (tiny results aren't worth shrinking).
@@ -215,9 +229,9 @@ export function elideOldToolResultsToBudget(messages: ToolCallingMessage[], budg
         m.content.length > 200
     )
     .map(({ i }) => i);
-  // Protect the most-recent KEEP_RECENT_TOOL_RESULTS by trimming them off the
-  // tail; walk the rest oldest→newest, shrinking until we fit.
-  const candidates = elidable.slice(0, Math.max(0, elidable.length - KEEP_RECENT_TOOL_RESULTS));
+  // Protect the most-recent `keepRecent` by trimming them off the tail; walk
+  // the rest oldest→newest, shrinking until we fit.
+  const candidates = elidable.slice(0, Math.max(0, elidable.length - keepRecent));
   let elided = 0;
   for (const i of candidates) {
     messages[i]!.content = ELIDED_TOOL_RESULT_MARKER;
@@ -1696,6 +1710,64 @@ async function runLoop(
   let navWithoutAction = 0;
   let loopStallReason: "repeat" | "navigation" | undefined;
 
+  // Graceful partial exit for unrecoverable context exhaustion: the provider
+  // call kept overflowing even after compaction (overflow retry below), or
+  // in-turn compaction bailed out. Completes the task with the latest
+  // assistant text plus an explicit partial-result note — mirroring the
+  // iteration-cap exit's summary-rather-than-failure contract — WITHOUT
+  // another model call: the transcript provably no longer fits the provider
+  // window, so the tool-less summary turn the iteration-cap path makes would
+  // itself overflow.
+  const completeWithPartialResult = async (note: string): Promise<Task> => {
+    const lastAssistantMessage = [...workingMessages]
+      .reverse()
+      .find((m) => m.role === "assistant" && typeof m.content === "string" && m.content.trim().length > 0);
+    const partialText =
+      typeof lastAssistantMessage?.content === "string" ? lastAssistantMessage.content.trim() : "";
+    const finalText = partialText ? `${partialText}\n\n${note}` : note;
+    const exhausted = await mutateState(config.instance, (state) => {
+      const item = findTask(state, taskId);
+      // Respect a prior terminal status (a cancel may have raced this exit).
+      if (isTerminalTaskStatus(item.status)) return item;
+      item.status = "completed";
+      item.currentStep = "Completed (stopped: context window exhausted)";
+      item.summary = finalText;
+      item.cost = accumulatedCost;
+      item.partialSummary = undefined;
+      item.toolCallState = undefined;
+      item.loadedTools = undefined;
+      item.updatedAt = now();
+      return item;
+    });
+    if (exhausted.status === "completed") {
+      const block = emitAssistantTextStart(emitCtx, finalText);
+      if (block?.id) finalizeAssistantText(emitCtx, block.id, finalText);
+      emitSystemNote(emitCtx, note);
+      emitPhase(emitCtx, "Completed");
+    }
+    appendTrace(config.instance, taskId, {
+      type: "warning",
+      message: "Context window exhausted; completed with partial result.",
+      data: { iterations, note }
+    });
+    await updateRunFromTask(config, exhausted);
+    await syncSubagentFromTask(config, exhausted);
+    if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
+    if (exhausted.status === "completed") {
+      void scheduleAutoRetain(config, exhausted);
+      if (exhausted.chatSessionId) {
+        void autoRenameChatAfterTurn(config, exhausted.chatSessionId).catch((error) => {
+          appendLog(config.instance, "chat.auto_title.failed", {
+            sessionId: exhausted.chatSessionId,
+            taskId: exhausted.id,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        });
+      }
+    }
+    return exhausted;
+  };
+
   while (iterations < cap) {
     iterations += 1;
     // The leading `<route>` directive can only appear on the very first model
@@ -1874,24 +1946,55 @@ async function runLoop(
     // updated from this call's reported usage below.
     const estimatedPromptTokens = estimateToolCallingMessagesTokens(workingMessages) + toolSchemaTokens;
 
-    let result: Awaited<ReturnType<typeof generateToolCallingResponse>>;
-    try {
-      result = await generateToolCallingResponse(
-        config,
-        workingMessages,
-        providerTools,
-        onDelta,
-        effective.providerSource === "agent" ? effective.provider : undefined
-      );
-    } catch (error) {
-      // Tag a provider auth failure with the provider that actually served
-      // this turn, so failTask names the right credential even if the active
-      // agent switched while the call was in flight (issue #205).
-      const message = error instanceof Error ? error.message : String(error);
-      if (!(error instanceof ProviderAuthError) && isAuthExpiredError(message)) {
-        throw new ProviderAuthError(effective.provider.name, message);
+    // Provider call with bounded compact-and-retry on context overflow. A
+    // prompt the provider rejects as too long is recoverable: shrink the
+    // transcript (tighter elision budget per failed attempt; the last retry
+    // also drops the recent-result protection) and call again. Non-overflow
+    // errors keep their existing behavior (auth tagging + propagation).
+    // After MAX_CONTEXT_OVERFLOW_ATTEMPTS total attempts the task exits
+    // gracefully with a partial result — the transcript provably cannot
+    // reach the model, so failing the whole task would discard real work.
+    let result: Awaited<ReturnType<typeof generateToolCallingResponse>> | undefined;
+    for (let attempt = 1; result === undefined; attempt++) {
+      try {
+        result = await generateToolCallingResponse(
+          config,
+          workingMessages,
+          providerTools,
+          onDelta,
+          effective.providerSource === "agent" ? effective.provider : undefined
+        );
+      } catch (error) {
+        // Tag a provider auth failure with the provider that actually served
+        // this turn, so failTask names the right credential even if the active
+        // agent switched while the call was in flight (issue #205).
+        const message = error instanceof Error ? error.message : String(error);
+        if (!(error instanceof ProviderAuthError) && isAuthExpiredError(message)) {
+          throw new ProviderAuthError(effective.provider.name, message);
+        }
+        if (!isContextOverflowError(message)) throw error;
+        if (attempt >= MAX_CONTEXT_OVERFLOW_ATTEMPTS) {
+          appendTrace(config.instance, taskId, {
+            type: "warning",
+            message: `Provider context overflow persisted after ${attempt} attempts; exiting with partial result.`,
+            data: { iterations, attempt }
+          });
+          return completeWithPartialResult(
+            "Stopped early: the conversation no longer fits the model's context window even after compaction. This is a partial result."
+          );
+        }
+        // Compact harder than the proactive pass above: halve the budget per
+        // failed attempt, and drop the recent-result protection on the final
+        // retry so even the freshest oversized results shrink.
+        const tighterBudget = Math.max(0, Math.floor(liveMessageBudget / 2 ** attempt));
+        const keepRecent = attempt >= MAX_CONTEXT_OVERFLOW_ATTEMPTS - 1 ? 0 : KEEP_RECENT_TOOL_RESULTS;
+        const compacted = elideOldToolResultsToBudget(workingMessages, tighterBudget, keepRecent);
+        appendTrace(config.instance, taskId, {
+          type: "warning",
+          message: `Provider rejected the prompt as too long; compacted ${compacted} tool result(s) and retrying.`,
+          data: { iterations, attempt, tighterBudget, keepRecent, compacted }
+        });
       }
-      throw error;
     }
     // Drain any in-flight streamed flush, then flush the remaining buffer so
     // routing is fully resolved before we strip the directive from the final

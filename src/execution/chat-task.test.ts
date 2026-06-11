@@ -13,6 +13,7 @@ import { join } from "node:path";
 import {
   clearEchoToolCallingResponses,
   getEchoToolCallingCalls,
+  setEchoToolCallingFailure,
   setEchoToolCallingResponse,
   normalizeProvider,
   type ToolCallingMessage
@@ -3101,6 +3102,136 @@ describe("chat-task loop", () => {
     for (let c = 0; c < 8; c++) {
       expect(calls[c]!.some((m) => m.content === ELISION_MARKER)).toBe(false);
     }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Reactive overflow recovery: a provider that rejects the prompt as too
+  // long gets a compacted transcript on retry (bounded attempts). Two
+  // overflow failures followed by a success must complete the task with the
+  // retried call's answer — and the retried call must carry elided results.
+  test("compacts and retries when the provider reports a context overflow, then completes", async () => {
+    const ELISION_MARKER =
+      "[Earlier tool result elided to fit the context window. Re-run the tool if you still need its output.]";
+    const OVERFLOW_MESSAGE =
+      "This model's maximum context length is 32000 tokens. However, your messages resulted in 99999 tokens.";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-overflow-retry");
+    const provider = normalizeProvider(config.provider);
+
+    // Seven big tool results (distinct files so no loop-breaker trips) give
+    // the compaction passes something to shrink.
+    for (let i = 0; i < 7; i++) {
+      writeFileSync(join(workspaceRoot, `bulk${i}.md`), `bulk-${i} ${"x".repeat(11_000)}`);
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_o${i}`, type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: `bulk${i}.md` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Iteration 8's model call: two overflow rejections, then success.
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingResponse({
+      provider,
+      text: "Recovered after compaction.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "read all the bulk files", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Recovered after compaction.");
+    expect(finished.error).toBeUndefined();
+
+    // 7 tool turns + 2 failed attempts + 1 successful retry = 10 calls.
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(10);
+    // The successful retry saw a harder-compacted transcript than the first
+    // failed attempt (the proactive pre-call elision may already have shrunk
+    // the oldest results; the overflow passes must shrink strictly more,
+    // including into the protected-recent window on the final retry).
+    const elidedInFirstAttempt = calls[7]!.filter((m) => m.content === ELISION_MARKER).length;
+    const elidedInRetry = calls[9]!.filter((m) => m.content === ELISION_MARKER).length;
+    expect(elidedInRetry).toBeGreaterThan(elidedInFirstAttempt);
+    expect(elidedInRetry).toBeGreaterThanOrEqual(2);
+
+    // The compact-and-retry warnings landed in the trace.
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const retries = traces.filter(
+      (t) => t.type === "warning" && /rejected the prompt as too long/.test(t.message)
+    );
+    expect(retries.length).toBe(2);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Overflow that persists through every retry must exit gracefully with a
+  // partial result — completed, not failed — without making the tool-less
+  // summary call (which would itself overflow).
+  test("persistent context overflow exits gracefully with a partial result", async () => {
+    const OVERFLOW_MESSAGE = "prompt is too long: 250000 tokens > 200000 maximum";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-overflow-exhaust");
+    const provider = normalizeProvider(config.provider);
+
+    // Two small tool turns first so the partial exit has prior work behind it.
+    for (let i = 0; i < 2; i++) {
+      writeFileSync(join(workspaceRoot, `note${i}.md`), `note-${i} content`);
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_x${i}`, type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: `note${i}.md` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Every attempt of iteration 3's model call overflows (3 total attempts).
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+    setEchoToolCallingFailure(OVERFLOW_MESSAGE);
+
+    const task = await submitTask(config, "read the notes", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.currentStep).toBe("Completed (stopped: context window exhausted)");
+    expect(finished.summary).toContain("This is a partial result.");
+    expect(finished.error).toBeUndefined();
+
+    // 2 tool turns + 3 failed attempts, and no summary call after exhaustion.
+    expect(getEchoToolCallingCalls().length).toBe(5);
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    expect(
+      traces.some((t) => t.type === "warning" && /overflow persisted after 3 attempts/.test(t.message))
+    ).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Non-overflow provider errors keep their existing contract: the task
+  // fails with the raw error, no compact-and-retry.
+  test("non-overflow provider errors still fail the task without retrying", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-provider-error");
+
+    setEchoToolCallingFailure("upstream exploded (500)");
+
+    const task = await submitTask(config, "say hi", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("failed");
+    expect(finished.error).toContain("upstream exploded");
+    // Exactly one provider call — no retry on a non-overflow failure.
+    expect(getEchoToolCallingCalls().length).toBe(1);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

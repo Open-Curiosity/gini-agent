@@ -11,6 +11,7 @@ import {
   generateVisionAnalysis,
   anthropicNeedsHttps,
   isAuthExpiredError,
+  isContextOverflowError,
   isProviderConfigured,
   isValidAwsRegion,
   normalizeProvider,
@@ -3459,6 +3460,33 @@ describe("auth-error classification", () => {
     ];
     for (const message of negatives) {
       expect(isAuthExpiredError(message)).toBe(false);
+    }
+  });
+
+  test("isContextOverflowError flags known provider context-window rejections", () => {
+    const positives = [
+      "This model's maximum context length is 128000 tokens. However, your messages resulted in 130001 tokens.",
+      "Error code 400: context_length_exceeded",
+      "prompt is too long: 250000 tokens > 200000 maximum",
+      "input length and `max_tokens` exceed context limit: 199000 + 4096 > 200000",
+      "ValidationException: Input is too long for requested model."
+    ];
+    for (const message of positives) {
+      expect(isContextOverflowError(message)).toBe(true);
+    }
+  });
+
+  test("isContextOverflowError ignores unrelated failures", () => {
+    const negatives = [
+      "Rate limit exceeded",
+      "401 Unauthorized",
+      "Internal server error (500)",
+      "model returned an empty response",
+      "max_tokens must be greater than 0",
+      undefined
+    ];
+    for (const message of negatives) {
+      expect(isContextOverflowError(message)).toBe(false);
     }
   });
 

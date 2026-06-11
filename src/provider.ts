@@ -409,6 +409,31 @@ export function isAuthExpiredError(message: string | undefined): boolean {
   return AUTH_EXPIRED_RE.test(message);
 }
 
+// Detects provider errors that mean the request prompt exceeded the model's
+// context window — the only provider failure the chat-task loop is allowed to
+// compact-and-retry (see runLoop). Deliberately a conservative, reviewable
+// marker list rather than a broad regex: a false positive would silently
+// shrink a healthy conversation, so each entry mirrors a documented provider
+// message:
+//   - "context_length_exceeded"               OpenAI-compatible error code
+//   - "maximum context length"                OpenAI: "This model's maximum context length is …"
+//   - "prompt is too long"                    Anthropic: "prompt is too long: X tokens > Y maximum"
+//   - "exceed context limit"                  Anthropic: "input length and max_tokens exceed context limit"
+//   - "input is too long for requested model" Bedrock ValidationException
+const CONTEXT_OVERFLOW_MARKERS = [
+  "context_length_exceeded",
+  "maximum context length",
+  "prompt is too long",
+  "exceed context limit",
+  "input is too long for requested model"
+];
+
+export function isContextOverflowError(message: string | undefined): boolean {
+  if (!message) return false;
+  const lower = message.toLowerCase();
+  return CONTEXT_OVERFLOW_MARKERS.some((marker) => lower.includes(marker));
+}
+
 // Mask credential-shaped substrings before a provider's raw error is stored or
 // rendered — some providers echo a partial key in their auth error. Conservative
 // on purpose: only well-known key/token shapes, so ordinary prose is untouched.
@@ -599,8 +624,10 @@ export interface ToolCallingResult {
 // Echo provider stub registry for tool-calling. Tests register a sequence
 // of canned responses (each is the next ToolCallingResult to return) keyed
 // by an optional tag — useful for end-to-end chat-task tests where the
-// loop calls the provider multiple times.
-const echoToolCallingStubs: Array<{ tag?: string; result: ToolCallingResult }> = [];
+// loop calls the provider multiple times. A stub with `error` set makes
+// the echo call throw instead, exercising callers' provider-failure paths
+// (context-overflow retries, auth tagging, task failure).
+const echoToolCallingStubs: Array<{ tag?: string; result?: ToolCallingResult; error?: string }> = [];
 // Capture the messages each echo call was invoked with. Tests inspect this
 // to assert that the chat-task loop built the expected system prompt /
 // conversation transcript. The buffer is cleared by
@@ -609,6 +636,14 @@ const echoToolCallingCalls: ToolCallingMessage[][] = [];
 
 export function setEchoToolCallingResponse(result: ToolCallingResult, tag?: string): void {
   echoToolCallingStubs.push({ tag, result });
+}
+
+// Queue an echo tool-calling FAILURE: the next echo-backed
+// generateToolCallingResponse call throws `new Error(message)` instead of
+// returning a result. The call is still recorded in echoToolCallingCalls so
+// tests can assert what payload the failed attempt carried.
+export function setEchoToolCallingFailure(message: string): void {
+  echoToolCallingStubs.push({ error: message });
 }
 
 export function clearEchoToolCallingResponses(): void {
@@ -625,7 +660,8 @@ export function getEchoToolCallingCalls(): ToolCallingMessage[][] {
 
 function nextEchoToolCallingResult(provider: ProviderConfig, lastUserText: string): ToolCallingResult {
   const stub = echoToolCallingStubs.shift();
-  if (stub) return stub.result;
+  if (stub?.error !== undefined) throw new Error(stub.error);
+  if (stub?.result) return stub.result;
   // Default: behave like generateTaskSummary's echo branch — finish with a
   // canned text response so callers that don't pre-register stubs still see
   // a deterministic shape.
