@@ -618,12 +618,14 @@ export interface ThreadSummary {
   // inbox can label who replied last. `user_text` ⇒ "user", otherwise
   // "agent". Absent when the thread has no text-bearing block yet.
   lastReplyAuthor?: "user" | "agent";
-  // Present while the thread's latest run is in flight; absent when idle.
-  // "running" — the agent is working (newest phase block non-terminal, or a
-  // tool call still running ahead of it; the same backwards scan the thread
-  // panel uses for its composer busy state). "waiting_approval" — the run is
-  // parked on a user gate (an authorization/setup request with nothing newer
-  // in the thread's stream). Drives activity indicators on thread lists.
+  // Present while any of the thread's tasks is in flight; absent when idle.
+  // Overlapping tasks can interleave blocks in one thread, so each task is
+  // judged by its own newest decisive block (gate ⇒ waiting; non-terminal
+  // phase or still-running tool call ⇒ running — the per-task backwards
+  // scan in threadActivity, src/state/chat-blocks.ts), then the thread
+  // aggregates: any task parked on a user gate ⇒ "waiting_approval" (the
+  // actionable state wins), else any running task ⇒ "running". Drives
+  // activity indicators on thread lists.
   activity?: "running" | "waiting_approval";
 }
 
