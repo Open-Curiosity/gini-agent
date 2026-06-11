@@ -76,7 +76,7 @@ import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/sub
 import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./integrations/mcp";
 import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableMessagingBridge, listAllowedChats, listMessagingMessages, receiveMessagingInput, rejectPendingChat, removeMessagingBridge, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
-import { providerCatalogWithStatus } from "./provider";
+import { providerCatalogWithStatus, withProviderAuthStatus } from "./provider";
 import { buildModelCatalog } from "./model-routes";
 import { setDefaultModel } from "./runtime/default-model";
 import { createAgent, deleteAgent, listAgents, renameAgent, setAgentProvider, useAgent } from "./capabilities/agents";
@@ -640,6 +640,53 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // unit-tested in isolation.
         const result = await runFillSecretConnect(config, setup, secrets);
         return json(result.body, result.status);
+      }
+
+      if (setup.action === "chat.choice") {
+        // ask_user's single-select answer. Body is { choice: { label } } for a
+        // listed option (validated against the options the dispatcher stored
+        // in the TRUSTED setup payload) or { choice: { other } } for the
+        // card's freeform input. Validation happens BEFORE the claim: a bad
+        // body 400s and leaves the row pending so the user can pick again.
+        // Skip is the /cancel endpoint, not a /complete body shape.
+        const choice = payload.choice && typeof payload.choice === "object" && !Array.isArray(payload.choice)
+          ? payload.choice as { label?: unknown; other?: unknown }
+          : null;
+        const options = Array.isArray(setup.payload.options)
+          ? (setup.payload.options as Array<{ label?: unknown; description?: unknown }>)
+          : [];
+        let toolResult: string;
+        let outcomeMessage: string;
+        if (choice && typeof choice.label === "string") {
+          const match = options.find((o) => o && typeof o === "object" && o.label === choice.label);
+          if (!match) {
+            return json({ error: `Unknown option label: ${choice.label}` }, 400);
+          }
+          const description = typeof match.description === "string" ? match.description : "";
+          toolResult = `User selected: "${choice.label}"${description ? ` — ${description}` : ""}`;
+          outcomeMessage = `You selected: ${choice.label}`;
+        } else if (choice && typeof choice.other === "string" && choice.other.trim().length > 0) {
+          const other = choice.other.trim();
+          toolResult = `User answered: "${other}"`;
+          outcomeMessage = `You answered: ${other}`;
+        } else {
+          return json({ error: "Body must be { choice: { label } } for a listed option or { choice: { other } } for a freeform answer." }, 400);
+        }
+
+        // Atomically claim the row, then persist the human-readable outcome
+        // (so the resolved card reads truthfully after reload) and resume the
+        // chat-task loop detached — same shape as connector.request's winning
+        // path, minus side effects (nothing is created here).
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
+        await persistConnectOutcome(config, setupId, { ok: true, message: outcomeMessage });
+        const choiceToolCallId = typeof setup.payload.toolCallId === "string" ? setup.payload.toolCallId : undefined;
+        if (setup.taskId && choiceToolCallId) {
+          void safeResume(config, setup.taskId, choiceToolCallId, toolResult, {
+            context: "chat.choice",
+            approvalId: setupId
+          });
+        }
+        return json({ ok: true });
       }
 
       if (setup.action === "connector.request") {
@@ -1727,7 +1774,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const chatId = parseChatIdStrict(payload.chatId);
       return json(await rejectPendingChat(config, params[0], chatId));
     }],
-    ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv, config.provider?.baseUrl))],
+    // Catalog rows carry the persistent per-provider auth status (issue #233)
+    // so Settings can render "Needs re-authentication" instead of presence-only
+    // "Connected" when a provider call failed on a dead credential.
+    ["GET", /^\/api\/providers\/catalog$/, () => json(withProviderAuthStatus(
+      providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv, config.provider?.baseUrl),
+      readState(config.instance).providerAuthFailures
+    ))],
     // Model-first view of the same catalog: canonical models with the routes
     // (configured providers) that serve them. Drives the model picker in the
     // web Settings page and chat Settings tab (ADR model-first-selection.md).
@@ -1755,7 +1808,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/setup\/provider\/remove$/, async (request) => {
       const payload = await body(request);
       const providerName = typeof payload.provider === "string" ? payload.provider : "";
-      const result = removeSetupProvider(config, providerName);
+      const result = await removeSetupProvider(config, providerName);
       return json(result, result.ok ? 200 : 400);
     }],
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],

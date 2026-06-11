@@ -73,10 +73,15 @@ import {
   browserClick,
   browserClose,
   browserConsole,
+  browserCookies,
+  browserDialog,
   browserDrag,
+  browserFillForm,
   browserHover,
   browserNavigate,
   browserPress,
+  browserRequests,
+  browserResize,
   browserScroll,
   browserSelectOption,
   browserSnapshot,
@@ -260,6 +265,8 @@ async function dispatchToolCallInner(
       return { kind: "sync", result: await visionQueryTool(config, taskId, args) };
     case "request_connector":
       return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
+    case "ask_user":
+      return await askUserTool(config, taskId, toolCallId, args);
     case "browser_fill_secrets":
       return await browserFillSecretsTool(config, taskId, toolCallId, args);
     case "request_messaging_bridge":
@@ -275,13 +282,15 @@ async function dispatchToolCallInner(
     case "request_remove_messaging_bridge":
       return await requestRemoveMessagingBridgeTool(config, taskId, toolCallId, args);
     case "browser_navigate":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args, config), args) };
     case "browser_snapshot":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.snapshot", () => browserSnapshot(taskId, args), args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.snapshot", () => browserSnapshot(taskId, args, config), args) };
     case "browser_click":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.click", () => browserClick(taskId, args), args) };
     case "browser_type":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.type", () => browserType(taskId, args), args) };
+    case "browser_fill_form":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.fill_form", () => browserFillForm(taskId, args), args) };
     case "browser_press":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.press", () => browserPress(taskId, args), args) };
     case "browser_scroll":
@@ -290,6 +299,14 @@ async function dispatchToolCallInner(
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.back", () => browserBack(taskId, args), args) };
     case "browser_console":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.console", () => browserConsole(taskId, args), args) };
+    case "browser_dialog":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.dialog", () => browserDialog(taskId, args), args) };
+    case "browser_requests":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.requests", () => browserRequests(taskId, args), args) };
+    case "browser_resize":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.resize", () => browserResize(taskId, args), args) };
+    case "browser_cookies":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.cookies", () => browserCookies(taskId, args), args) };
     case "browser_close":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.close", () => browserClose(taskId, args), args) };
     case "browser_hover":
@@ -328,6 +345,12 @@ async function dispatchToolCallInner(
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
       return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
+    case "browser_download":
+      // Downloading writes remote bytes onto the local disk (the
+      // instance-scoped downloads dir). Route through the approval gate
+      // the same way browser_upload_file does; the approved click runs
+      // in agent.executeApprovedAction's "browser.download" branch.
+      return pendingOrAuto(config, "browser.download", undefined, (reason) => requestBrowserDownload(config, taskId, toolCallId, args, reason));
     // Self-config / self-introspection direct tools. Each maps to a
     // SelfOperation; query tools resolve sync, mutate tools route through the
     // generic self.config approval branch. The tool name IS the op name and
@@ -568,9 +591,9 @@ async function fileSearch(config: RuntimeConfig, taskId: string, args: Record<st
 // the dispatch and pass it through. Audit risk is derived from the single
 // source of truth in src/execution/tool-risk.ts:
 //   - read-only paths (navigate/snapshot/hover/scroll/back/press/console/
-//     close/wait_for/tabs.list/vision) are "low"
-//   - side-effecting calls (click/type/drag/select_option/tabs.{new,switch,
-//     close}) are "medium"
+//     requests/resize/cookies/close/wait_for/tabs.list/vision) are "low"
+//   - side-effecting calls (click/type/fill_form/drag/select_option/
+//     dialog/tabs.{new,switch,close}) are "medium"
 // browser.upload_file is classified "high" in the registry but never
 // reaches this dispatcher: it's intercepted as an approval request in
 // requestBrowserUpload and executed via agent.executeApprovedAction after
@@ -3099,6 +3122,44 @@ async function requestBrowserUpload(
   });
 }
 
+// Approval-gated browser_download. Captures the ref the agent wants to
+// click plus the page it is sitting on, so the approval card shows the
+// user where the download will come from. The actual click + download
+// capture runs in agent.executeApprovedAction's "browser.download"
+// branch, which calls browserDownloadApproved with the captured ref.
+async function requestBrowserDownload(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>,
+  reasonOverride?: string
+): Promise<string> {
+  const ref = requireString(args, "ref");
+  const currentUrl = peekCurrentBrowserUrl(taskId) ?? null;
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createAuthorization(state, {
+      taskId: item.id,
+      action: "browser.download",
+      target: currentUrl ?? ref,
+      risk: "high",
+      reason: reasonOverride ?? "Downloading a file from a remote site onto this machine is a side effect and requires explicit approval.",
+      payload: { ref, currentUrl, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for browser download (chat-task)",
+      data: { approvalId: approval.id, ref, toolCallId, source: currentUrl }
+    });
+    return approval.id;
+  });
+}
+
 // At most this many Connect cards per sign-in wall (host) per task. One prompt
 // plus a retry is legitimate (mistyped credential, or a genuinely different
 // wall on the same host later in the task); beyond that, re-prompting just spams
@@ -3627,6 +3688,110 @@ async function requestConnectorTool(
       type: "approval",
       message: "Approval requested for connector connect (chat-task)",
       data: { approvalId: approval.id, provider: target, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
+}
+
+// ask_user tool. Mints a chat.choice SetupRequest whose payload carries the
+// question + options; the chat-task loop's pending handler emits a
+// setup_requested block and the web chat renders the single-select choice
+// card (which adds its own "Other" freeform input and Skip affordance — they
+// are not tool params). POST /api/setup-requests/<id>/complete resumes the
+// loop with the user's pick; /cancel (Skip) resumes with a skip fallback
+// instead of failing the task. Unlike connector.request, no approval_reason
+// assistant bubble is persisted — the question lives in the card itself.
+// See docs/adr/user-choice-prompt.md.
+async function askUserTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  const question = typeof args.question === "string" ? args.question.trim() : "";
+  if (!question) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: "ask_user needs a non-empty `question` string." })
+    };
+  }
+  const rawOptions = args.options;
+  if (!Array.isArray(rawOptions) || rawOptions.length < 2 || rawOptions.length > 6) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: "ask_user needs `options`: an array of 2-6 entries, each { label, description? }." })
+    };
+  }
+  const options: Array<{ label: string; description?: string }> = [];
+  for (const entry of rawOptions) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({ ok: false, error: "Each ask_user option must be an object: { label: string, description?: string }." })
+      };
+    }
+    const candidate = entry as { label?: unknown; description?: unknown };
+    const label = typeof candidate.label === "string" ? candidate.label.trim() : "";
+    if (!label) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({ ok: false, error: "Each ask_user option needs a non-empty `label` string." })
+      };
+    }
+    if (options.some((o) => o.label === label)) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({ ok: false, error: `Duplicate ask_user option label: "${label}". Labels must be distinct.` })
+      };
+    }
+    const description = typeof candidate.description === "string" && candidate.description.trim().length > 0
+      ? candidate.description.trim()
+      : undefined;
+    options.push({ label, ...(description ? { description } : {}) });
+  }
+
+  // Surface guard — same rationale as requestConnectorTool. The choice card
+  // is React UI rendered only in the web chat; a task running over a
+  // messaging bridge or in a headless job session would park in
+  // waiting_approval with no way to answer. Fail synchronously so the agent
+  // asks the question as a regular message instead.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (!surfaceSession || surfaceSession.origin === "job" || surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "The choice card only renders in a web chat session — this task isn't attached to one. Ask the question as a regular message listing the options and continue from the user's reply."
+      })
+    };
+  }
+
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createSetupRequest(mutable, {
+      taskId: item.id,
+      action: "chat.choice",
+      target: question,
+      // `reason` is the question so the setup_requested block summary (and
+      // transcripts) read as the question itself.
+      reason: question,
+      payload: { question, options, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "User choice requested (chat-task)",
+      data: { approvalId: approval.id, question, toolCallId }
     });
     return approval.id;
   });

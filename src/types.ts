@@ -315,6 +315,14 @@ export interface RuntimeConfig {
     // falls back to the provider-derived default.
     priorContextTokens?: number;
   };
+  // Opt-in browser session trace recording, OFF by default (enabled only
+  // when explicitly true; read at server boot). When enabled, browser
+  // sessions record a Playwright trace that is saved under
+  // <instanceRoot>/browser-traces/ when the session closes, with bounded
+  // retention and a browser.trace_saved audit row per save. Trace archives
+  // are raw page captures for local debugging/audit review — they never
+  // enter the model context. See src/tools/browser.ts.
+  browserRecording?: boolean;
 }
 
 // ChatBlock — semantic, typed conversation block emitted by the runtime so
@@ -497,6 +505,12 @@ export interface AuthorizationRequestedBlock extends ChatBlockBase {
 //   - `messaging.remove_bridge` → destructive confirmation card showing
 //     bridge name + irreversibility warning. Submit POSTs `{}` to /complete
 //     → server calls removeMessagingBridge.
+//   - `chat.choice` → single-select question card (ask_user tool). Options
+//     live in the SetupRequest payload; the card always adds its own
+//     "Other (type your answer)" freeform input and a Skip affordance.
+//     Submit POSTs `{ choice: { label } }` or `{ choice: { other } }` to
+//     /complete; Skip POSTs to /cancel, which resumes the loop with a skip
+//     fallback instead of failing the task.
 // Cancel always POSTs to /api/setup-requests/<id>/cancel.
 export interface SetupRequestedBlock extends ChatBlockBase {
   kind: "setup_requested";
@@ -535,6 +549,45 @@ export interface SystemNoteBlock extends ChatBlockBase {
   // (see SystemNoteAuthError). Absent for ordinary notes (cancellation,
   // iteration-cap, approval-denied).
   authError?: SystemNoteAuthError;
+}
+
+// Persistent per-provider auth-failure record (issue #233). Written when a
+// ProviderAuthError fails a task (failTask records for any task mode,
+// including legacy imperative dispatch); cleared only at the seams that
+// prove the credential works again: a successful provider call in the
+// chat-task loop (main loop and the iteration-cap summary call), a
+// provider-config write or successful setup Verify through the setup API,
+// and provider removal. Successful provider calls outside the chat-task
+// loop do not clear. Only FAILURES are stored — a provider with no record is OK.
+// Lives on `RuntimeState.providerAuthFailures`, keyed by provider name, so
+// persistent surfaces (Settings → Providers, /api/providers/catalog) can
+// report "needs re-authentication" instead of presence-only "Connected".
+// See ADR provider-reauth-guidance.md.
+export interface ProviderAuthFailureRecord {
+  // Provider whose credential failed (e.g. "codex").
+  provider: ProviderName;
+  // The provider's error message, redacted via redactSecrets by the writer —
+  // some providers echo a partial key in their auth error.
+  detail: string;
+  // ISO timestamp when the failure was recorded.
+  at: string;
+  // Task whose provider call observed the failure, for the audit trail.
+  taskId?: string;
+}
+
+// Per-provider auth status surfaced on the /api/providers/catalog payload.
+// "ok" means no failure record exists; "needs_reauth" means a provider call
+// failed on a credential error and nothing has cleared it since.
+export type ProviderAuthStatus = "ok" | "needs_reauth";
+
+// Re-auth payload accompanying `authStatus: "needs_reauth"` on the catalog.
+// `reauthKind`/`reauthUrl` mirror SystemNoteAuthError so the Settings card and
+// the chat note render the same CTA (derived via providerReauth at read time).
+export interface ProviderReauthInfo {
+  detail: string;
+  at: string;
+  reauthKind: "docs" | "settings" | "aws";
+  reauthUrl: string;
 }
 
 export type ChatBlock =
@@ -650,6 +703,11 @@ export interface RuntimeState {
   // full block is re-emitted to bound the delta-reconstruction depth.
   // Optional so legacy state files don't need a schema migration.
   identitySnapshots?: Record<string, IdentitySnapshotRecord>;
+  // Per-provider needs-reauth records (issue #233). Absence of a key means
+  // that provider's credential is OK as far as the runtime knows. Optional
+  // so legacy state files don't need a schema migration; the helpers in
+  // src/state/provider-auth.ts treat undefined as empty.
+  providerAuthFailures?: Partial<Record<ProviderName, ProviderAuthFailureRecord>>;
 }
 
 // Captured agent-runtime identity surfaced into the system prompt so
@@ -1237,6 +1295,20 @@ export interface ModelCatalogEntry {
   routes: ModelRoute[];
 }
 
+// User-managed browsing boundary for one agent's browser tools. Entries
+// are bare domains (no scheme, no wildcards); a URL's host matches an
+// entry when it equals the entry or is a subdomain of it, case-insensitive
+// (`example.com` matches `sub.example.com`). `deny` always blocks first; a
+// non-empty `allow` additionally switches the agent to allow-only browsing.
+// Enforced in src/tools/browser.ts at navigate pre-flight AND at the
+// post-redirect / live-page origin boundary. The SSRF/loopback gate runs
+// first and cannot be overridden by `allow`. See ADR
+// browser-domain-policy.md.
+export interface BrowserDomainPolicy {
+  deny?: string[];
+  allow?: string[];
+}
+
 export interface AgentRecord {
   id: string;
   instance: Instance;
@@ -1246,6 +1318,10 @@ export interface AgentRecord {
   model?: string;
   toolsets: string[];
   messagingTargets: string[];
+  // Optional browsing domain policy. Absent ⇒ no domain restrictions
+  // beyond the always-on SSRF gate. User-managed by editing the agent
+  // record (no CLI/UI surface yet — see ADR browser-domain-policy.md).
+  browserDomainPolicy?: BrowserDomainPolicy;
   createdAt: string;
   updatedAt: string;
 }
@@ -1423,6 +1499,7 @@ export type AuthorizationAction =
   | "skill.enable"
   | "connector.enable"
   | "browser.upload_file"
+  | "browser.download"
   | "messaging.send"
   | "self.config";
 
@@ -1460,7 +1537,14 @@ export type SetupRequestAction =
   | "skill.grant_connector"
   | "messaging.add_bridge"
   | "messaging.approve_pairing"
-  | "messaging.remove_bridge";
+  | "messaging.remove_bridge"
+  // chat.choice — the ask_user tool's single-select question card. The
+  // payload carries { question, options: [{label, description?}], toolCallId };
+  // /complete resolves with the user's pick ({choice:{label}} for a listed
+  // option, {choice:{other}} for the freeform answer) and /cancel is the Skip
+  // affordance, which resumes the loop with a skip fallback rather than
+  // failing the task. See docs/adr/user-choice-prompt.md.
+  | "chat.choice";
 
 export interface SetupRequest {
   id: string;

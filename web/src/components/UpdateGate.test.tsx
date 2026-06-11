@@ -23,6 +23,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, jest, mock, setSyste
 import { act, fireEvent, render as rtlRender, screen } from "@testing-library/react";
 import { defaultScheduler, notifyManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { UpdateGateProvider, useUpdateGate } from "./UpdateGate";
+import { GATEWAY_RESTARTING_MESSAGE, GATEWAY_UNREACHABLE_CODE } from "@/lib/gateway-codes";
 import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
 
 // react-query delivers observer notifications through a deferred scheduler by
@@ -132,11 +133,11 @@ function Probe() {
   );
 }
 
-function renderGate() {
+function renderGate(props: { stallTimeoutMs?: number } = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = rtlRender(
     <QueryClientProvider client={client}>
-      <UpdateGateProvider>
+      <UpdateGateProvider {...props}>
         <Probe />
       </UpdateGateProvider>
     </QueryClientProvider>
@@ -539,18 +540,39 @@ describe("UpdateGate", () => {
     expect(phase()).toBe("updating");
   });
 
+  test("the BFF's gateway_unreachable 503 keeps the gate up (gateway died mid-POST, not a pre-flight failure)", async () => {
+    // The wire shape the BFF answers with when the gateway drops the in-flight
+    // POST: a structured 503 envelope. It carries an HTTP status like a real
+    // gateway error, so a status-only release check would tear the gate down
+    // in exactly the restart window it exists to cover — the unreachable tag
+    // from the shared envelope contract must keep the blur.
+    updateResponse = async () =>
+      jsonResponse({ error: GATEWAY_RESTARTING_MESSAGE, code: GATEWAY_UNREACHABLE_CODE }, 503);
+    renderGate();
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    expect(phase()).toBe("updating");
+    expect(window.sessionStorage.getItem(STORAGE_KEY)).not.toBeNull();
+  });
+
   test("the stall timer releases a gate that never completes", async () => {
     jest.useFakeTimers();
-    // A POST that never settles, with status forever on the old sha.
+    // A POST that never settles, with status forever on the old sha. The
+    // deadline is injected short so the release lands inside one sub-poll tick.
+    // Advancing the 120s production default in one synchronous step instead
+    // would fire each 1.5s poll interval 80 times (120000 / 1500) across the
+    // status and healthz queries — 160 refetch cycles — which wedges the worker
+    // under `bun test --isolate`.
     updateResponse = () => new Promise<Response>(() => {});
-    renderGate();
+    renderGate({ stallTimeoutMs: 1_000 });
     await flush();
 
     fireEvent.click(screen.getByRole("button", { name: "start-update" }));
     expect(phase()).toBe("updating");
 
     await act(async () => {
-      jest.advanceTimersByTime(120_000);
+      jest.advanceTimersByTime(1_000);
     });
     await flush();
     expect(phase()).toBe("idle");
@@ -561,7 +583,7 @@ describe("UpdateGate", () => {
     jest.useFakeTimers();
     const t0 = new Date("2026-01-01T00:00:00.000Z");
     setSystemTime(t0);
-    const { client } = renderGate();
+    const { client } = renderGate({ stallTimeoutMs: 5_000 });
     await flush();
     fireEvent.click(screen.getByRole("button", { name: "start-update" }));
     await flush();
@@ -578,13 +600,16 @@ describe("UpdateGate", () => {
     // probe fails → drop back to restarting → the latched identity legs
     // re-complete the gate instantly → a fresh probe is armed. Each lap
     // crosses two phase transitions, so a stall timer re-armed per phase
-    // would be cleared every ~1.5s and never fire. The deadline is fixed when
+    // would be cleared every 1.5s and never fire. The deadline is fixed when
     // the gate leaves idle, so once it passes the gate must release — no
-    // reload, back to idle, persisted gate cleared.
+    // reload, back to idle, persisted gate cleared. The deadline is injected
+    // short so this runs in a few laps: at the 120s default it would take 80
+    // laps, and each lap's 1.5s advance fires the poll intervals, which wedges
+    // the worker under `bun test --isolate`.
     healthzFailing = true;
     let now = t0.getTime();
-    // 85 × 1.5s = 127.5s of laps, comfortably past the 120s deadline.
-    for (let i = 0; i < 85 && phase() !== "idle"; i++) {
+    // 4 laps of 1.5s reach 6s, past the 5s injected deadline.
+    for (let i = 0; i < 6 && phase() !== "idle"; i++) {
       await act(async () => {
         jest.advanceTimersByTime(1_500);
         // advanceTimersByTime unpins the mocked clock back to real time;

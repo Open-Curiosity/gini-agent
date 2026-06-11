@@ -2,10 +2,12 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { ArrowLeft, ArrowRight, List, Calendar } from "lucide-react";
+import { ArrowLeft, ArrowRight, List, Calendar, Trash2 } from "lucide-react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { scheduleLabel } from "@/app/jobs/_components/schedule-label";
@@ -37,12 +39,25 @@ export function JobsTab() {
   const [view, setView] = useState<View>("list");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Job pending delete confirmation. Null when the dialog is closed. Deleting a
+  // job cascade-removes its run history, so the confirmation is mandatory.
+  const [deletingJob, setDeletingJob] = useState<JobRecord | null>(null);
 
   const action = useMutation({
     mutationFn: ({ id, op }: { id: string; op: "run" | "pause" | "resume" }) =>
       api<JobRecord>(`/jobs/${id}/${op}`, { method: "POST" }),
     onSuccess: (_, vars) => {
       toast.success(`${vars.op}: ${vars.id}`);
+      invalidate(["jobs", "jobRuns", "events"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  const remove = useMutation({
+    mutationFn: (id: string) => api<JobRecord>(`/jobs/${id}`, { method: "DELETE" }),
+    onSuccess: (job) => {
+      toast.success(`Deleted ${job.name}`);
+      setDeletingJob(null);
       invalidate(["jobs", "jobRuns", "events"]);
     },
     onError: (error: Error) => toast.error(error.message)
@@ -140,6 +155,7 @@ export function JobsTab() {
                     actionPending={action.isPending}
                     onAction={(op) => action.mutate({ id: job.id, op })}
                     onSelect={() => setSelectedId(job.id)}
+                    onRequestDelete={() => setDeletingJob(job)}
                   />
                 ))
               )}
@@ -189,6 +205,40 @@ export function JobsTab() {
           </div>
         </div>
       )}
+
+      <Dialog
+        open={Boolean(deletingJob)}
+        onOpenChange={(open) => {
+          if (!open && !remove.isPending) setDeletingJob(null);
+        }}
+      >
+        <DialogContent className="gap-5 border-border bg-card p-7 sm:max-w-md">
+          <DialogTitle className="text-base font-bold text-foreground">
+            Delete {deletingJob?.name ?? "job"}?
+          </DialogTitle>
+          <DialogDescription className="text-[13px] text-muted-foreground">
+            This permanently removes the job and its run history. This can&rsquo;t be undone.
+          </DialogDescription>
+          <div className="flex items-center justify-end gap-2.5 border-t border-border pt-4">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setDeletingJob(null)}
+              disabled={remove.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={() => deletingJob && remove.mutate(deletingJob.id)}
+              disabled={!deletingJob || remove.isPending}
+            >
+              {remove.isPending ? "Deleting…" : "Delete"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -231,12 +281,14 @@ function JobCard({
   job,
   actionPending,
   onAction,
-  onSelect
+  onSelect,
+  onRequestDelete
 }: {
   job: JobRecord;
   actionPending: boolean;
   onAction: (op: "run" | "pause" | "resume") => void;
   onSelect: () => void;
+  onRequestDelete: () => void;
 }) {
   return (
     <div className="flex flex-col gap-3.5 rounded-[10px] border border-border bg-card p-4">
@@ -288,6 +340,16 @@ function JobCard({
             Resume
           </button>
         )}
+        <button
+          type="button"
+          onClick={onRequestDelete}
+          aria-label={`Delete ${job.name}`}
+          title="Delete job"
+          className="ml-auto flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-[13px] font-semibold text-muted-foreground transition-colors hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
+        >
+          <Trash2 className="size-[15px]" />
+          Delete
+        </button>
       </div>
     </div>
   );
