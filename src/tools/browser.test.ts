@@ -1474,6 +1474,41 @@ describe("snapshot remainder summarization", () => {
     }
   });
 
+  test("elementCount counts what the result carries: rendered rows only, plus the remainder when summarized", async () => {
+    const restore = installFakeDom(makeBigBody(400));
+    try {
+      // With a summary appended, every ref'd row is reachable from the
+      // result (rendered head + summarized remainder, whose refs stay
+      // registered and actionable).
+      browserTest.installFakeSessionWithPageForTest("aux-count", makeFakePage({ url: "https://example.com/big" }));
+      setEchoAuxTextResponse({ text: "summary of the rest" });
+      const summarized = JSON.parse(await browserSnapshot("aux-count", {}, echoConfig)) as {
+        snapshot: string;
+        elementCount: number;
+      };
+      expect(summarized.snapshot).toContain("remainder summarized");
+      expect(summarized.elementCount).toBe(400);
+
+      // Plain counted truncation (no config): elementCount must agree with
+      // the rendered rows and the truncation marker, not silently include
+      // clipped entries the model cannot see.
+      clearEchoAuxTextResponses();
+      browserTest.clearFakeSessionsForTest();
+      browserTest.installFakeSessionWithPageForTest("aux-count-plain", makeFakePage({ url: "https://example.com/big" }));
+      const plain = JSON.parse(await browserSnapshot("aux-count-plain", {})) as {
+        snapshot: string;
+        elementCount: number;
+      };
+      expect(plain.snapshot).not.toContain("remainder summarized");
+      const emitted = plain.snapshot.split("\n").filter((line) => line.includes(" button ")).length;
+      expect(plain.elementCount).toBe(emitted);
+      const marker = /\[\.\.\.truncated \+(\d+) more entries\]/.exec(plain.snapshot);
+      expect(emitted + Number(marker![1])).toBe(400);
+    } finally {
+      restore();
+    }
+  });
+
   test("post-action diff snapshots never trigger summarization", async () => {
     const body = makeBigBody(400);
     const restore = installFakeDom(body);
@@ -1661,6 +1696,30 @@ describe("snapshot walker — iframes", () => {
       const result = await browserTest.snapshotForTest(makeFakePage(), false);
       expect(result.text).toContain('iframe "https://tracker.example.com/px" [hidden]');
       expect(result.text).not.toContain("Inside hidden frame");
+    } finally {
+      restore();
+    }
+  });
+
+  test("nth ordinals are frame-local so main-frame healing is not skewed by same-name framed entries", async () => {
+    // A framed "Submit" button is emitted BEFORE the main-frame one.
+    // Healing re-queries page.getByRole, which searches the main frame
+    // only — there the main-frame button is the first (and only) match,
+    // so its recorded nth must be 0, not inflated by the framed entry.
+    const frameButton = makeEl({ tagName: "BUTTON", textContent: "Submit" });
+    const frameBody = makeEl({ tagName: "BODY", children: [frameButton] });
+    const iframe = makeEl({ tagName: "IFRAME", attrs: { src: "https://forms.example.com/f" } });
+    iframe.contentDocument = makeFrameDoc(frameBody, "https://forms.example.com/f");
+    const mainButton = makeEl({ tagName: "BUTTON", textContent: "Submit" });
+    const body = makeEl({ tagName: "BODY", children: [iframe, mainButton] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage({ frameLocator: true }), false);
+      const targets = [...result.refs.values()] as Array<{ role: string; name: string; nth: number; framed?: boolean }>;
+      const framedSubmit = targets.find((t) => t.name === "Submit" && t.framed);
+      const mainSubmit = targets.find((t) => t.name === "Submit" && !t.framed);
+      expect(framedSubmit?.nth).toBe(0);
+      expect(mainSubmit?.nth).toBe(0);
     } finally {
       restore();
     }
@@ -3796,6 +3855,29 @@ describe("browser dialog capture and browser_dialog", () => {
     expect(records[4]!.message).toBe("dialog 7");
   });
 
+  test("an adopted page resolves dialogs against the task that owns it now, not the hooking task", async () => {
+    const { page, handlers } = makeDialogPage();
+    browserTest.installFakeSessionWithPageForTest("dlg-owner-a", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-owner-a", page);
+    // The page survives task A and is adopted by task B: the re-attach
+    // refreshes ownership without installing a second listener.
+    browserTest.clearFakeSessionsForTest();
+    browserTest.installFakeSessionWithPageForTest("dlg-owner-b", page as Partial<import("playwright-core").Page>);
+    browserTest.attachDialogHandlerForTest("dlg-owner-b", page);
+
+    // Task B arms an accept; the next dialog must consume B's arming even
+    // though the listener was installed while task A owned the page.
+    const armed = JSON.parse(await browserDialog("dlg-owner-b", { action: "accept" })) as { success: boolean };
+    expect(armed.success).toBe(true);
+    const { dialog, responses } = makeFakeDialog({ message: "Proceed?" });
+    handlers.get("dialog")!(dialog);
+    expect(responses).toEqual(["accept:"]);
+
+    // The record lands in B's buffer, not the dead task A's.
+    expect(browserTest.peekUnreportedDialogsForTest("dlg-owner-a")).toHaveLength(0);
+    expect(browserTest.peekUnreportedDialogsForTest("dlg-owner-b")).toHaveLength(1);
+  });
+
   test("browser_dialog refuses a promptText containing a registered secret and arms nothing", async () => {
     const { page, handlers } = makeDialogPage();
     browserTest.installFakeSessionWithPageForTest("dlg-secret-arm", page as Partial<import("playwright-core").Page>);
@@ -3920,6 +4002,25 @@ describe("browser network capture and browser_requests", () => {
     const parsed = JSON.parse(await browserRequests("net-filter", { filter: "api." })) as { requests?: Array<{ url: string }> };
     expect(parsed.requests).toHaveLength(1);
     expect(parsed.requests![0]!.url).toBe("https://api.example.com/items");
+  });
+
+  test("an adopted page logs requests against the task that owns it now, not the hooking task", async () => {
+    const { page, handlers } = makeNetworkPage();
+    browserTest.installFakeSessionWithPageForTest("net-owner-a", page as Partial<import("playwright-core").Page>);
+    browserTest.attachNetworkCaptureForTest("net-owner-a", page);
+    // Adoption by a later task refreshes ownership without re-listening.
+    browserTest.clearFakeSessionsForTest();
+    browserTest.installFakeSessionWithPageForTest("net-owner-b", page as Partial<import("playwright-core").Page>);
+    browserTest.attachNetworkCaptureForTest("net-owner-b", page);
+
+    handlers.get("response")!(fakeResponse("https://api.example.com/after-adoption"));
+
+    const forB = JSON.parse(await browserRequests("net-owner-b", {})) as { requests?: Array<{ url: string }> };
+    expect(forB.requests).toHaveLength(1);
+    expect(forB.requests![0]!.url).toBe("https://api.example.com/after-adoption");
+    browserTest.installFakeSessionWithPageForTest("net-owner-a", page as Partial<import("playwright-core").Page>);
+    const forA = JSON.parse(await browserRequests("net-owner-a", {})) as { requests?: Array<{ url: string }> };
+    expect(forA.requests ?? []).toHaveLength(0);
   });
 
   test("a registered secret inside a recorded URL is redacted in the tool result", async () => {

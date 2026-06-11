@@ -1559,7 +1559,14 @@ function detectBotWall(title: string, snapshotText: string): boolean {
 interface SnapshotResult {
   text: string;
   refs: Map<string, RefTarget>;
+  // Ref-bearing entries rendered in `text` — what the model sees on the
+  // plain counted-truncation path.
   elementCount: number;
+  // Ref-bearing entries that fell past the char budget into the bounded
+  // remainder. Their refs ARE registered (an @eN a summary preserves stays
+  // actionable); result builders add this to elementCount only when the
+  // aux summary is actually appended.
+  remainderElementCount: number;
   truncated: boolean;
   // True when this snapshot detected a navigation (URL change since the
   // session's last snapshot, or an explicit navigate/back/tab swap that
@@ -1624,16 +1631,18 @@ async function summarizeSnapshotRemainder(config: RuntimeConfig, remainder: stri
 // Shared by browser_navigate / browser_snapshot: append the aux summary
 // of the clipped remainder under a divider, or return the text unchanged
 // when summarization is unavailable. The summary still rides the ok()
-// deep-redaction pass like every other string in the result.
+// deep-redaction pass like every other string in the result. `summarized`
+// tells the caller whether the remainder's refs are reachable from this
+// result (so they belong in its elementCount) or were clipped away.
 async function withSummarizedRemainder(
   text: string,
   truncatedRemainder: string | undefined,
   config: RuntimeConfig | undefined
-): Promise<string> {
-  if (truncatedRemainder === undefined || config === undefined) return text;
+): Promise<{ text: string; summarized: boolean }> {
+  if (truncatedRemainder === undefined || config === undefined) return { text, summarized: false };
   const summary = await summarizeSnapshotRemainder(config, truncatedRemainder);
-  if (summary === undefined) return text;
-  return `${text}\n${SNAPSHOT_SUMMARY_DIVIDER}\n${summary}`;
+  if (summary === undefined) return { text, summarized: false };
+  return { text: `${text}\n${SNAPSHOT_SUMMARY_DIVIDER}\n${summary}`, summarized: true };
 }
 
 // Marker attribute stamped on snapshot-rendered elements so the
@@ -2137,6 +2146,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   let charCount = 0;
   let truncated = false;
   let elementCount = 0;
+  let remainderElementCount = 0;
   const allEntries = (raw as { entries: SnapEntry[] }).entries;
   // Frame gating: the walker inlines same-origin iframe content, but
   // whether that content may REACH the model is decided here, where the
@@ -2204,7 +2214,8 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       if (entry.hidden) line += " [hidden]";
       if (entry.note) line += entry.note;
     }
-    if (truncated || charCount + line.length + 1 > SNAPSHOT_CHAR_BUDGET) {
+    const clipped = truncated || charCount + line.length + 1 > SNAPSHOT_CHAR_BUDGET;
+    if (clipped) {
       truncated = true;
       // Stop all work (rendering AND ref registration) once the
       // summarization input cap is full — the counted marker below only
@@ -2218,7 +2229,12 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       charCount += line.length + 1;
     }
     if (entry.ref) {
-      const nthKey = `${entry.role}\u0000${entry.name}`;
+      // nth is FRAME-LOCAL: healing re-queries page.getByRole / getByText,
+      // which search the main frame only, so framed entries sharing a
+      // role+name with main-frame ones must not inflate the main-frame
+      // ordinals (framed refs never heal — see resolveRefForAction — so
+      // their own nth is never queried).
+      const nthKey = `${entry.frameRef ?? ""}\u0000${entry.role}\u0000${entry.name}`;
       const nth = nthByRoleName.get(nthKey) ?? 0;
       nthByRoleName.set(nthKey, nth + 1);
       // page.locator does not pierce iframes: entries walked from a
@@ -2237,7 +2253,12 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
         nth,
         ...(entry.frameRef ? { framed: true } : {})
       });
-      elementCount++;
+      // Count rendered and remainder refs separately so result builders
+      // can report exactly what the model sees: rendered rows only on the
+      // plain counted-truncation path, plus the remainder's refs when the
+      // aux summary (which preserves them) is actually appended.
+      if (clipped) remainderElementCount++;
+      else elementCount++;
     }
   }
   let text = lines.join("\n");
@@ -2295,6 +2316,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     text,
     refs,
     elementCount,
+    remainderElementCount,
     truncated,
     navigated,
     botWallSuspected,
@@ -2829,12 +2851,16 @@ export async function browserNavigate(
       }
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
+      const rendered = await withSummarizedRemainder(snap.text, snap.truncatedRemainder, config);
       return ok({
         url: finalUrl,
         status: response?.status() ?? null,
         title: await session.page.title(),
-        snapshot: await withSummarizedRemainder(snap.text, snap.truncatedRemainder, config),
-        elementCount: snap.elementCount,
+        snapshot: rendered.text,
+        // Count what THIS result lets the model act on: the rendered rows,
+        // plus the remainder's refs only when the appended summary actually
+        // carries them.
+        elementCount: snap.elementCount + (rendered.summarized ? snap.remainderElementCount : 0),
         truncated: snap.truncated,
         ...(snap.botWallSuspected ? { botWallSuspected: true, warning: BOT_WALL_WARNING } : {})
       }, taskId);
@@ -2856,11 +2882,14 @@ export async function browserSnapshot(
     return await withSession(taskId, async (session) => {
       const snap = await snapshot(session.page, full, taskId);
       session.refs = snap.refs;
+      const rendered = await withSummarizedRemainder(snap.text, snap.truncatedRemainder, config);
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        snapshot: await withSummarizedRemainder(snap.text, snap.truncatedRemainder, config),
-        elementCount: snap.elementCount,
+        snapshot: rendered.text,
+        // Same accounting as browser_navigate: remainder refs count only
+        // when the appended summary carries them.
+        elementCount: snap.elementCount + (rendered.summarized ? snap.remainderElementCount : 0),
         truncated: snap.truncated,
         ...(snap.botWallSuspected ? { botWallSuspected: true, warning: BOT_WALL_WARNING } : {})
       }, taskId);
@@ -3330,14 +3359,26 @@ export async function browserBack(taskId: string, _args: Record<string, unknown>
 const consoleLogs = new Map<string, Array<{ type: string; text: string }>>();
 const consoleHooked = new WeakSet<Page>();
 
+// Pages outlive tasks: an adopted user tab survives closeSession and is
+// re-instrumented by a LATER task, but the console/dialog/network
+// listeners install once per page (re-listening would duplicate records).
+// Handlers therefore resolve the OWNING task at EVENT time through this
+// map — refreshed by every attach call — instead of closing over the
+// taskId that happened to do the hooking, which would route a later
+// task's records (and ignore its browser_dialog arming) into a dead
+// task's buffers.
+const pageTaskOwner = new WeakMap<Page, string>();
+
 function attachConsole(taskId: string, page: Page): void {
+  pageTaskOwner.set(page, taskId);
   if (consoleHooked.has(page)) return;
   consoleHooked.add(page);
   page.on("console", (msg) => {
-    const buf = consoleLogs.get(taskId) ?? [];
+    const owner = pageTaskOwner.get(page) ?? taskId;
+    const buf = consoleLogs.get(owner) ?? [];
     buf.push({ type: msg.type(), text: msg.text() });
     if (buf.length > 200) buf.splice(0, buf.length - 200);
-    consoleLogs.set(taskId, buf);
+    consoleLogs.set(owner, buf);
   });
 }
 
@@ -3402,13 +3443,17 @@ const networkHooked = new WeakSet<Page>();
 function attachNetworkCapture(taskId: string, page: Page): void {
   // Fake test pages may not expose .on — same typeof-guard pattern
   // snapshot() uses for page.url.
-  if (typeof page.on !== "function" || networkHooked.has(page)) return;
+  if (typeof page.on !== "function") return;
+  pageTaskOwner.set(page, taskId);
+  if (networkHooked.has(page)) return;
   networkHooked.add(page);
   const push = (entry: NetworkLogEntry): void => {
-    const buf = networkLogs.get(taskId) ?? [];
+    // Resolve the owner at event time — see pageTaskOwner.
+    const owner = pageTaskOwner.get(page) ?? taskId;
+    const buf = networkLogs.get(owner) ?? [];
     buf.push(entry);
     if (buf.length > NETWORK_LOG_CAP) buf.splice(0, buf.length - NETWORK_LOG_CAP);
-    networkLogs.set(taskId, buf);
+    networkLogs.set(owner, buf);
   };
   page.on("response", (response) => {
     try {
@@ -3442,11 +3487,17 @@ function attachNetworkCapture(taskId: string, page: Page): void {
 function attachDialogHandler(taskId: string, page: Page): void {
   // Fake test pages may not expose .on — same typeof-guard pattern
   // snapshot() uses for page.url.
-  if (typeof page.on !== "function" || dialogHooked.has(page)) return;
+  if (typeof page.on !== "function") return;
+  pageTaskOwner.set(page, taskId);
+  if (dialogHooked.has(page)) return;
   dialogHooked.add(page);
   page.on("dialog", (dialog) => {
-    const armed = pendingDialogResponses.get(taskId);
-    pendingDialogResponses.delete(taskId);
+    // Resolve the owner at event time — see pageTaskOwner. A page adopted
+    // by a later task consumes THAT task's armed response and records into
+    // its buffer, not the buffer of whichever task installed the listener.
+    const owner = pageTaskOwner.get(page) ?? taskId;
+    const armed = pendingDialogResponses.get(owner);
+    pendingDialogResponses.delete(owner);
     const accept = armed?.accept ?? false;
     const record: DialogRecord = {
       type: dialog.type(),
@@ -3457,10 +3508,10 @@ function attachDialogHandler(taskId: string, page: Page): void {
       response: accept ? "accepted" : "dismissed",
       ...(accept && armed?.promptText !== undefined ? { promptText: armed.promptText } : {})
     };
-    const buf = unreportedDialogs.get(taskId) ?? [];
+    const buf = unreportedDialogs.get(owner) ?? [];
     buf.push(record);
     if (buf.length > DIALOG_BUFFER_CAP) buf.splice(0, buf.length - DIALOG_BUFFER_CAP);
-    unreportedDialogs.set(taskId, buf);
+    unreportedDialogs.set(owner, buf);
     // Respond immediately so page JS unblocks. Errors (dialog already
     // handled, page closed mid-response) are swallowed — the record
     // above already captured what fired.
