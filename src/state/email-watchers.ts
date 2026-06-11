@@ -589,13 +589,16 @@ const LEGACY_SENDER_QUERY = /^from:(\S+) is:unread$/;
 // on another device before the ~60s tick stopped matching `is:unread` and was
 // missed forever; the `after:` watermark + seen set already handle newness).
 // ONLY the exact auto-built shapes are touched — a user-supplied raw query may
-// include `is:unread` on purpose and is never rewritten.
+// include `is:unread` on purpose. The heal runs exactly ONCE (gated by the
+// emailWatcherQueryHealedAt marker, stamped in the same write): after the first
+// upgrade boot a user can create a raw `from:X is:unread` query and it will
+// never be rewritten on a later restart. The one-time rewrite of a truly
+// pre-existing raw query on first boot is unavoidable (old data has no
+// provenance) and accepted; perpetual re-application is not.
 async function healLegacyWatcherQueries(config: RuntimeConfig): Promise<void> {
-  const needsHeal = readState(config.instance).emailWatchers.some(
-    (w) => w.query === "is:unread" || LEGACY_SENDER_QUERY.test(w.query)
-  );
-  if (!needsHeal) return;
+  if (readState(config.instance).emailWatcherQueryHealedAt) return;
   await mutateState(config.instance, (state) => {
+    if (state.emailWatcherQueryHealedAt) return;
     for (const w of state.emailWatchers) {
       const match = w.query.match(LEGACY_SENDER_QUERY);
       if (match) {
@@ -606,6 +609,7 @@ async function healLegacyWatcherQueries(config: RuntimeConfig): Promise<void> {
         w.updatedAt = now();
       }
     }
+    state.emailWatcherQueryHealedAt = now();
   });
 }
 

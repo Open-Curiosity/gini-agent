@@ -492,6 +492,18 @@ describe("shared backing job lifecycle", () => {
     expect(queries).toEqual(new Set(["from:alice@x.com", "in:inbox", "subject:invoice is:unread"]));
   });
 
+  test("heal runs once: a later user-created from:X is:unread survives the next backfill", async () => {
+    const config = buildConfig("ew-job-heal-once");
+    // First backfill stamps the run-once marker (no legacy data to rewrite).
+    await backfillEmailWatcherJobs(config);
+    expect(readState(config.instance).emailWatcherQueryHealedAt).toBeDefined();
+    // The user now deliberately creates a raw query that is byte-identical to
+    // the retired auto-built shape. A second backfill must NOT rewrite it.
+    const raw = await addEmailWatcher(config, { query: "from:x@y.com is:unread" });
+    await backfillEmailWatcherJobs(config);
+    expect(getEmailWatcher(config, raw.id)?.query).toBe("from:x@y.com is:unread");
+  });
+
   test("backfill self-heals adopted titles + orphan jobs/sessions from old->new transitions", async () => {
     const config = buildConfig("ew-job-backfill-heal");
     // Real consolidated state: one shared job + session, two watchers on it.

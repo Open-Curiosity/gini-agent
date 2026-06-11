@@ -608,6 +608,11 @@ export interface RuntimeState {
   relays: RelayRecord[];
   notifications: NotificationRecord[];
   emailWatchers: EmailWatcherRecord[];
+  // Run-once marker for the retired-query-shape heal (ISO timestamp of the
+  // first heal pass). Once set, the heal returns early so it can never rewrite
+  // a user's raw query that happens to match a retired auto-built shape on a
+  // later boot. Legacy states omit it (treated as "not yet healed").
+  emailWatcherQueryHealedAt?: string;
   events: RuntimeEvent[];
   jobRuns: JobRunRecord[];
   chatSessions: ChatSessionRecord[];
