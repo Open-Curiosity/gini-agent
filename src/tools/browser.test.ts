@@ -944,6 +944,10 @@ type WalkerFakeEl = {
   _textContent: string;
   _visible: boolean;
   _cursor: string;
+  // Planted by iframe tests onto IFRAME fakes: a fake frame document
+  // ({ body, location, querySelectorAll }) for same-origin frames, or a
+  // throwing getter (via Object.defineProperty) for cross-origin ones.
+  contentDocument?: unknown;
   parentElement: WalkerFakeEl | null;
   getAttribute(name: string): string | null;
   setAttribute(name: string, value: string): void;
@@ -1006,6 +1010,8 @@ const makeWalkerEl = (init: {
       const recurse = (node: WalkerFakeEl) => {
         if (selector === "option") {
           if (node.tagName === "OPTION") matches.push(node);
+        } else if (selector === "iframe") {
+          if (node.tagName === "IFRAME") matches.push(node);
         } else if (selector.startsWith("[") && selector.endsWith("]")) {
           const attr = selector.slice(1, -1);
           if (Object.prototype.hasOwnProperty.call(node._attrs, attr)) matches.push(node);
@@ -1337,6 +1343,213 @@ describe("snapshot walker — char-budget truncation count", () => {
       expect(emitted + Number(match![1])).toBe(400);
     } finally {
       restore();
+    }
+  });
+});
+
+// Iframe visibility: every iframe gets a row; same-origin frames are
+// walked INLINE (shared budgets, refs resolved via page.frameLocator),
+// cross-origin frames get an opaque [cross-origin] placeholder, and a
+// same-origin frame whose document URL fails the SSRF gate keeps a
+// [blocked] placeholder with its content rows stripped host-side.
+describe("snapshot walker — iframes", () => {
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
+
+  // Fake frame document: enough surface for the walker (body walk), the
+  // stamp prescan (querySelectorAll over the frame body), and the
+  // host-side URL gate (location.href).
+  const makeFrameDoc = (body: WalkerFakeEl, href: string) => ({
+    body,
+    location: { href },
+    querySelectorAll: (sel: string) => body.querySelectorAll(sel)
+  });
+
+  const makeFakePage = (opts: { frameLocator?: boolean } = {}): import("playwright-core").Page =>
+    ({
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({ __sel: sel } as unknown),
+      ...(opts.frameLocator
+        ? {
+            frameLocator: (frameSel: string) => ({
+              locator: (sel: string) => ({ __frame: frameSel, __sel: sel } as unknown)
+            })
+          }
+        : {})
+    } as unknown as import("playwright-core").Page);
+
+  test("walks a same-origin iframe inline: iframe row + in-frame refs chained through frameLocator", async () => {
+    const cardInput = makeEl({ tagName: "INPUT", type: "text", value: "", attrs: { "aria-label": "Card number" } });
+    const payButton = makeEl({ tagName: "BUTTON", textContent: "Pay now" });
+    const frameBody = makeEl({ tagName: "BODY", children: [cardInput, payButton] });
+    const iframe = makeEl({
+      tagName: "IFRAME",
+      attrs: { src: "https://payments.example.com/checkout", name: "checkout" }
+    });
+    iframe.contentDocument = makeFrameDoc(frameBody, "https://payments.example.com/checkout");
+    const mainButton = makeEl({ tagName: "BUTTON", textContent: "Main action" });
+    const body = makeEl({ tagName: "BODY", children: [iframe, mainButton] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage({ frameLocator: true }), false);
+
+      // The iframe itself gets a ref'd row labeled "name|src".
+      const frameLine = result.text.split("\n").find((line) => line.includes(" iframe "));
+      expect(frameLine).toMatch(/\[@e\d+\] iframe "checkout\|https:\/\/payments\.example\.com\/checkout"/);
+
+      // In-frame content rows are present, indented under the iframe row,
+      // with refs of their own.
+      expect(result.text).toMatch(/\[@e\d+\] textbox "Card number"/);
+      expect(result.text).toMatch(/\[@e\d+\] button "Pay now"/);
+      expect(result.text).toMatch(/\[@e\d+\] button "Main action"/);
+
+      // The in-frame button's locator chains through frameLocator on the
+      // OWNING iframe's stamp, and the RefTarget is marked framed (no
+      // self-healing). The main-frame button stays a flat locator.
+      const frameRef = /\[(@e\d+)\] iframe /.exec(result.text)![1]!;
+      const payRef = /\[(@e\d+)\] button "Pay now"/.exec(result.text)![1]!;
+      const mainRef = /\[(@e\d+)\] button "Main action"/.exec(result.text)![1]!;
+      const payTarget = result.refs.get(payRef) as unknown as { locator: { __frame?: string; __sel?: string }; framed?: boolean };
+      expect(payTarget.framed).toBe(true);
+      expect(payTarget.locator.__frame).toBe(`[data-gini-ref="${frameRef.slice(1)}"]`);
+      expect(payTarget.locator.__sel).toBe(`[data-gini-ref="${payRef.slice(1)}"]`);
+      const mainTarget = result.refs.get(mainRef) as unknown as { locator: { __frame?: string }; framed?: boolean };
+      expect(mainTarget.framed).toBeUndefined();
+      expect(mainTarget.locator.__frame).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  test("cross-origin iframe (contentDocument throws) gets an opaque placeholder row", async () => {
+    const iframe = makeEl({
+      tagName: "IFRAME",
+      attrs: { src: "https://ads.example.net/frame", name: "ads" }
+    });
+    Object.defineProperty(iframe, "contentDocument", {
+      get() {
+        throw new Error("Blocked a frame with origin from accessing a cross-origin frame.");
+      }
+    });
+    const body = makeEl({ tagName: "BODY", children: [iframe] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      expect(result.text).toContain('iframe "ads|https://ads.example.net/frame" [cross-origin]');
+      // Placeholder only: no ref on the row, nothing walked from inside.
+      expect(result.text).not.toMatch(/\[@e\d+\] iframe/);
+      expect(result.refs.size).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a same-origin frame whose URL fails the SSRF gate is placeholder-only ([blocked], content stripped)", async () => {
+    const stealButton = makeEl({ tagName: "BUTTON", textContent: "Steal state" });
+    const frameBody = makeEl({ tagName: "BODY", children: [stealButton] });
+    const iframe = makeEl({
+      tagName: "IFRAME",
+      attrs: { src: "http://127.0.0.1:7777/admin" }
+    });
+    iframe.contentDocument = makeFrameDoc(frameBody, "http://127.0.0.1:7777/admin");
+    const okButton = makeEl({ tagName: "BUTTON", textContent: "Fine" });
+    const body = makeEl({ tagName: "BODY", children: [iframe, okButton] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      expect(result.text).toContain('iframe "http://127.0.0.1:7777/admin" [blocked]');
+      // The blocked frame's content never reaches the snapshot text or
+      // the refs map; main-frame content is unaffected.
+      expect(result.text).not.toContain("Steal state");
+      expect(result.text).toMatch(/\[@e\d+\] button "Fine"/);
+      for (const target of result.refs.values()) {
+        expect((target as unknown as { framed?: boolean }).framed).toBeUndefined();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("hidden-element budget is shared across frames, not reset per frame", async () => {
+    const mainHidden: WalkerFakeEl[] = [];
+    for (let i = 0; i < 30; i++) {
+      mainHidden.push(makeEl({ tagName: "BUTTON", visible: false, textContent: `main-${i}` }));
+    }
+    const frameHidden: WalkerFakeEl[] = [];
+    for (let i = 0; i < 30; i++) {
+      frameHidden.push(makeEl({ tagName: "BUTTON", visible: false, textContent: `frame-${i}` }));
+    }
+    const frameBody = makeEl({ tagName: "BODY", children: frameHidden });
+    const iframe = makeEl({ tagName: "IFRAME", attrs: { src: "https://widgets.example.com/w" } });
+    iframe.contentDocument = makeFrameDoc(frameBody, "https://widgets.example.com/w");
+    const body = makeEl({ tagName: "BODY", children: [...mainHidden, iframe] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      const hiddenLines = result.text.split("\n").filter((line) => line.includes("[hidden]") && !line.includes(" iframe "));
+      // 60 hidden across both documents against the shared budget of 50.
+      expect(hiddenLines.length).toBe(50);
+      expect(result.text).toContain("[...hidden truncated +10 more hidden]");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a hidden iframe gets a placeholder row and is not walked", async () => {
+    const frameBody = makeEl({
+      tagName: "BODY",
+      children: [makeEl({ tagName: "BUTTON", textContent: "Inside hidden frame" })]
+    });
+    const iframe = makeEl({ tagName: "IFRAME", visible: false, attrs: { src: "https://tracker.example.com/px" } });
+    iframe.contentDocument = makeFrameDoc(frameBody, "https://tracker.example.com/px");
+    const body = makeEl({ tagName: "BODY", children: [iframe] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage(), false);
+      expect(result.text).toContain('iframe "https://tracker.example.com/px" [hidden]');
+      expect(result.text).not.toContain("Inside hidden frame");
+    } finally {
+      restore();
+    }
+  });
+
+  test("framed refs never self-heal: a lost in-frame stamp fails loudly without querying the main frame", async () => {
+    let healingQueried = 0;
+    const fakePage = {
+      url: () => "https://example.com/",
+      title: async () => "Example",
+      waitForLoadState: async () => undefined,
+      evaluate: async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 }),
+      getByRole: () => {
+        healingQueried++;
+        return { nth: () => ({ count: async () => 1 }) };
+      },
+      getByText: () => {
+        healingQueried++;
+        return { nth: () => ({ count: async () => 1 }) };
+      }
+    } as unknown as Partial<import("playwright-core").Page>;
+    browserTest.installFakeSessionWithPageForTest("framed-no-heal", fakePage);
+    const refs = new Map<string, unknown>();
+    // Stamp lost: count() resolves 0. A main-frame target would heal via
+    // getByRole; a framed target must fail instead.
+    refs.set("@e5", {
+      locator: { count: async () => 0, click: async () => undefined },
+      role: "button",
+      name: "Pay now",
+      nth: 0,
+      framed: true
+    });
+    browserTest.setFakeSessionRefsForTest("framed-no-heal", refs);
+    try {
+      const raw = await browserClick("framed-no-heal", { ref: "@e5" });
+      const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain("Unknown ref @e5");
+      expect(healingQueried).toBe(0);
+    } finally {
+      browserTest.clearFakeSessionsForTest();
+      browserTest.setInFlightDisconnectsForTest(0);
     }
   });
 });

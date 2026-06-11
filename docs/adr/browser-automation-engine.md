@@ -37,6 +37,15 @@ Verified in agent-browser's source; each stood alone as an improvement to `src/t
 4. **Annotated screenshots sharing the ref namespace**: numbered badges on the `browser_vision` screenshot keyed to the same `@eN` refs, so vision answers can point at elements the model can act on. Badges carry only ref ids, cover only refs the session holds, and skip secret-stamped elements.
 5. **Stable, never-reused tab handles** (`t1`, `t2`, …) instead of positional indices in `browser_tabs`.
 
+## Iframes in snapshots
+
+The snapshot walker emits a row for every iframe and inlines same-origin frame content one level deep, inside the SAME budgets (char / hidden / clickable) and the same redaction pass as main-frame content:
+
+- **Same-origin frames** (reachable via `contentDocument` from the in-page walk) contribute normal `@eN` rows nested under their `iframe "name|src"` row. Refs are stamped with the same `data-gini-ref` scheme; host-side resolution chains `page.frameLocator('[data-gini-ref="<frame stamp>"]')` → element stamp, because `page.locator` does not pierce frame boundaries. Framed refs **never self-heal** — healing re-queries the main frame's tree and could restamp a same-name bystander outside the targeted frame, so a lost in-frame stamp fails loudly.
+- **Cross-origin frames** (contentDocument throws / null) get an opaque `iframe "name|src" [cross-origin]` placeholder.
+- **Gated frames**: whether a same-origin frame's content may reach the model is decided host-side — the frame document's URL runs through the same `safetyCheck` SSRF gate and agent domain policy as navigations. A blocked frame keeps a `[blocked]` placeholder and has its content rows stripped before the snapshot text is assembled. `about:blank`/`about:srcdoc` frames have no remote origin and are allowed.
+- Hidden frames and frames nested inside an already-inlined frame are placeholder-only (one `frameLocator` hop maximum).
+
 ## Downloads
 
 `browser_download` captures a page-initiated file download (Playwright's `download` event around a click on an approved `@eN` ref) and saves it under the instance-scoped downloads directory (`paths.downloadsDir` → `~/.gini/instances/<inst>/downloads/`), so downloaded artifacts live and die with the instance like uploads do. Trust contract:

@@ -77,6 +77,11 @@ interface RefTarget {
   role: string;
   name: string;
   nth: number;
+  // True when the element lives inside a same-origin iframe and the
+  // locator chains through page.frameLocator. Framed refs never
+  // self-heal: healing re-queries the MAIN frame's tree and could
+  // restamp a same-name bystander outside the frame the model targeted.
+  framed?: boolean;
 }
 
 interface Session {
@@ -1280,6 +1285,19 @@ interface SnapEntry {
   depth: number;
   full: boolean; // true when emitted only because we're in `full` mode
   hidden: boolean; // true when the element exists but isn't visible
+  // Stamp id (e.g. "e7") of the same-origin iframe this entry was walked
+  // from. Host-side ref resolution chains through
+  // page.frameLocator('[data-gini-ref="e7"]') for these entries since
+  // page.locator does not pierce iframes.
+  frameRef?: string;
+  // For role:"iframe" rows of walkable same-origin frames: the frame
+  // document's URL, checked host-side against safetyCheck + the agent
+  // domain policy. A blocked frame keeps its placeholder row but has
+  // its content rows stripped before the snapshot text is assembled.
+  frameUrl?: string;
+  // Rendering marker appended to placeholder rows (" [cross-origin]",
+  // " [blocked]").
+  note?: string;
 }
 
 // Cap on the number of invisible-but-locatable interactive elements we
@@ -1355,7 +1373,20 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   const navigated = session !== undefined && session.lastSnapshotUrl !== currentUrl;
   if (navigated && session) {
     await page.evaluate((attr) => {
-      for (const el of document.querySelectorAll(`[${attr}]`)) el.removeAttribute(attr);
+      const clearDoc = (doc: Pick<Document, "querySelectorAll">): void => {
+        for (const el of doc.querySelectorAll(`[${attr}]`)) el.removeAttribute(attr);
+      };
+      clearDoc(document);
+      // Same-origin iframe documents carry stamps from the inline frame
+      // walk; strip those too (cross-origin access throws — skip).
+      for (const frame of Array.from(document.querySelectorAll("iframe"))) {
+        try {
+          const doc = (frame as HTMLIFrameElement).contentDocument;
+          if (doc) clearDoc(doc);
+        } catch {
+          /* cross-origin frame — nothing of ours in there */
+        }
+      }
     }, REF_ATTR).catch(() => undefined);
     session.nextRefId = 1;
     session.lastSnapshotText = undefined;
@@ -1371,6 +1402,9 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     depth: number;
     full: boolean;
     hidden: boolean;
+    frameRef?: string;
+    frameUrl?: string;
+    note?: string;
   };
 
   const raw = await page.evaluate(
@@ -1423,19 +1457,28 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
         return ROLE_FROM_TAG[el.tagName];
       };
 
+      // Document/window of the element itself: inline-walked same-origin
+      // iframe elements belong to the FRAME's document, so id lookups
+      // (aria-labelledby, label[for]) and computed styles must resolve
+      // against that document/view, not the main frame's. Falls back to
+      // the globals for elements without ownerDocument wiring (the unit-
+      // test fakes).
+      const docOf = (el: Element): Document => (el.ownerDocument ?? document) as Document;
+      const viewOf = (el: Element): Window => (el.ownerDocument?.defaultView ?? window) as Window;
+
       const nameOf = (el: Element): string => {
         const aria = el.getAttribute("aria-label");
         if (aria) return aria.trim();
         const labelledby = el.getAttribute("aria-labelledby");
         if (labelledby) {
-          const refs = labelledby.split(/\s+/).map((id) => document.getElementById(id)?.textContent ?? "");
+          const refs = labelledby.split(/\s+/).map((id) => docOf(el).getElementById(id)?.textContent ?? "");
           const joined = refs.join(" ").trim();
           if (joined) return joined;
         }
         if (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT") {
           const id = el.getAttribute("id");
           if (id) {
-            const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+            const lbl = docOf(el).querySelector(`label[for="${CSS.escape(id)}"]`);
             const text = lbl?.textContent?.trim();
             if (text) return text;
           }
@@ -1459,7 +1502,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
         const rect = (el as HTMLElement).getBoundingClientRect?.();
         if (!rect) return false;
         if (rect.width === 0 && rect.height === 0) return false;
-        const style = window.getComputedStyle(el as HTMLElement);
+        const style = viewOf(el).getComputedStyle(el as HTMLElement);
         if (style.display === "none" || style.visibility === "hidden") return false;
         return true;
       };
@@ -1475,9 +1518,23 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       // Ids are bounded to 9 digits: beyond that a page-planted stamp
       // could push the counter into float-imprecision territory (2^53)
       // where ++ stops incrementing and every fresh allocation collides.
-      for (const el of Array.from(document.querySelectorAll(`[${attr}]`))) {
-        const m = /^e(\d{1,9})$/.exec(el.getAttribute(attr) ?? "");
-        if (m) nextId = Math.max(nextId, Number(m[1]) + 1);
+      // Accessible same-origin iframe documents are scanned too — the
+      // inline frame walk stamps elements in there, and missing them
+      // would let the counter collide with a frame-held stamp.
+      const stampScanDocs: Array<Pick<Document, "querySelectorAll">> = [document];
+      for (const frame of Array.from(document.querySelectorAll("iframe"))) {
+        try {
+          const doc = (frame as HTMLIFrameElement).contentDocument;
+          if (doc) stampScanDocs.push(doc);
+        } catch {
+          /* cross-origin frame — unreachable, carries no stamps of ours */
+        }
+      }
+      for (const doc of stampScanDocs) {
+        for (const el of Array.from(doc.querySelectorAll(`[${attr}]`))) {
+          const m = /^e(\d{1,9})$/.exec(el.getAttribute(attr) ?? "");
+          if (m) nextId = Math.max(nextId, Number(m[1]) + 1);
+        }
       }
       // Reuse an existing stamp (refs are stable within a page lifetime);
       // only unstamped elements get a freshly-allocated id. Two stamps are
@@ -1528,13 +1585,59 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
         }
         const id = el.getAttribute("id");
         if (id) {
-          const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+          const lbl = docOf(el).querySelector(`label[for="${CSS.escape(id)}"]`);
           if (lbl && isVisible(lbl)) return true;
         }
         return false;
       };
-      const walk = (el: Element, depth: number, underCursorClickable: boolean): void => {
+      // `frameId` is the stamp id (e.g. "e7") of the same-origin iframe
+      // currently being walked inline, or undefined in the main frame.
+      // Entries emitted under a frame carry it as `frameRef` so host-side
+      // ref resolution can chain through page.frameLocator (page.locator
+      // does not pierce iframes).
+      const walk = (el: Element, depth: number, underCursorClickable: boolean, frameId?: string): void => {
         const tag = el.tagName;
+        // Iframes: every frame gets a row. Same-origin frames (reachable
+        // via contentDocument) are walked INLINE one level deep, sharing
+        // this walk's budgets and ref numbering; cross-origin frames
+        // (contentDocument throws or is null) get an opaque placeholder.
+        // Frames nested inside an already-inlined frame are placeholder-
+        // only — host-side ref resolution chains exactly one frameLocator
+        // hop. Whether a same-origin frame's CONTENT may be included is
+        // decided host-side (safetyCheck + domain policy on frameUrl);
+        // blocked frames keep the placeholder and lose their content rows.
+        if (tag === "IFRAME") {
+          const src = el.getAttribute("src") ?? "";
+          const frameName = el.getAttribute("name") ?? el.getAttribute("title") ?? "";
+          const label = [frameName, src].filter(Boolean).join("|") || "(no src)";
+          const visible = isVisible(el);
+          let frameDoc: Document | null = null;
+          try {
+            frameDoc = (el as HTMLIFrameElement).contentDocument;
+          } catch {
+            frameDoc = null;
+          }
+          if (!frameDoc || !frameDoc.body) {
+            out.push({ ref: "", role: "iframe", name: label, value: "", url: "", depth, full: false, hidden: !visible, note: " [cross-origin]", frameRef: frameId });
+            return;
+          }
+          if (!visible || frameId !== undefined) {
+            // Hidden frames and frames nested inside an inlined frame:
+            // placeholder only, no inline content.
+            out.push({ ref: "", role: "iframe", name: label, value: "", url: "", depth, full: false, hidden: !visible, frameRef: frameId });
+            return;
+          }
+          let frameUrl = src;
+          try {
+            frameUrl = frameDoc.location?.href || src;
+          } catch {
+            /* keep the src attribute as the best-effort URL */
+          }
+          const ref = refFor(el);
+          out.push({ ref, role: "iframe", name: label, value: "", url: "", depth, full: false, hidden: false, frameUrl });
+          walk(frameDoc.body, depth + 1, false, ref.slice(1));
+          return;
+        }
         const role = roleOf(el);
         const interactive = role !== undefined && (INTERACTIVE_TAGS.has(tag) || el.getAttribute("role"));
         const visible = isVisible(el);
@@ -1596,7 +1699,8 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
             url,
             depth,
             full: false,
-            hidden: !visible
+            hidden: !visible,
+            frameRef: frameId
           });
           // For <select>, surface its <option> children as sibling rows at
           // depth+1 so the agent can address each option by its own @eN
@@ -1620,7 +1724,8 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
                 url: "",
                 depth: depth + 1,
                 full: false,
-                hidden: false
+                hidden: false,
+                frameRef: frameId
               });
             }
           }
@@ -1641,7 +1746,8 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
               url: "",
               depth,
               full: false,
-              hidden: true
+              hidden: true,
+              frameRef: frameId
             });
             hiddenEmitted++;
           }
@@ -1657,7 +1763,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
           // BODY is excluded: a page styling `body { cursor: pointer }`
           // would otherwise emit the entire page text as one name AND
           // dedupe-suppress every real clickable underneath it.
-          const cursorPointer = tag !== "BODY" && window.getComputedStyle(el as HTMLElement).cursor === "pointer";
+          const cursorPointer = tag !== "BODY" && viewOf(el).getComputedStyle(el as HTMLElement).cursor === "pointer";
           const tabindexAttr = el.getAttribute("tabindex");
           const selfQualified = el.getAttribute("onclick") !== null
             || (tabindexAttr !== null && Number.parseInt(tabindexAttr, 10) >= 0);
@@ -1676,7 +1782,7 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
             clickableTotal++;
             if (clickableEmitted < clickableBudget) {
               const ref = refFor(el);
-              out.push({ ref, role: "clickable", name, value: "", url: "", depth, full: false, hidden: false });
+              out.push({ ref, role: "clickable", name, value: "", url: "", depth, full: false, hidden: false, frameRef: frameId });
               clickableEmitted++;
             }
             if (cursorPointer) childUnderCursorClickable = true;
@@ -1700,12 +1806,12 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
             if (fallbackRole && landmarkRoles.includes(fallbackRole)) {
               const text = (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
               if (text) {
-                out.push({ ref: "", role: fallbackRole, name: text, value: "", url: "", depth, full: true, hidden: false });
+                out.push({ ref: "", role: fallbackRole, name: text, value: "", url: "", depth, full: true, hidden: false, frameRef: frameId });
               }
             }
           }
         }
-        for (const child of Array.from(el.children)) walk(child, depth + 1, childUnderCursorClickable);
+        for (const child of Array.from(el.children)) walk(child, depth + 1, childUnderCursorClickable, frameId);
       };
       walk(document.body, 0, false);
       return { entries: out, hiddenEmitted, hiddenTotal, hiddenBudget, clickableEmitted, clickableTotal, nextId };
@@ -1721,7 +1827,31 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   let charCount = 0;
   let truncated = false;
   let elementCount = 0;
-  const entries = (raw as { entries: SnapEntry[] }).entries;
+  const allEntries = (raw as { entries: SnapEntry[] }).entries;
+  // Frame gating: the walker inlines same-origin iframe content, but
+  // whether that content may REACH the model is decided here, where the
+  // SSRF gate and the agent domain policy live. A frame whose document
+  // URL fails either check keeps its placeholder row (marked
+  // " [blocked]", ref dropped) and loses every content row walked from
+  // it. about:blank / about:srcdoc frames have no remote origin and are
+  // allowed — mirrors the snapshot boundary's about:blank special case.
+  const domainPolicy = agentDomainPolicyForTask(taskId);
+  const blockedFrameIds = new Set<string>();
+  for (const entry of allEntries) {
+    if (entry.role === "iframe" && entry.ref && entry.frameUrl !== undefined) {
+      const frameUrl = entry.frameUrl;
+      const localDoc = frameUrl === "" || frameUrl === "about:blank" || frameUrl === "about:srcdoc";
+      const blocked = localDoc ? undefined : safetyCheck(frameUrl) ?? domainPolicyBlockReason(frameUrl, domainPolicy);
+      if (blocked) {
+        blockedFrameIds.add(entry.ref.slice(1));
+        entry.ref = "";
+        entry.note = " [blocked]";
+      }
+    }
+  }
+  const entries = blockedFrameIds.size > 0
+    ? allEntries.filter((e) => !e.frameRef || !blockedFrameIds.has(e.frameRef))
+    : allEntries;
   const hiddenEmitted = (raw as { hiddenEmitted: number }).hiddenEmitted;
   const hiddenTotal = (raw as { hiddenTotal: number }).hiddenTotal;
   const clickableEmitted = (raw as { clickableEmitted: number }).clickableEmitted;
@@ -1750,6 +1880,12 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       }
     } else {
       line = `${indent}${entry.role} "${entry.name}"`;
+      // Placeholder iframe rows annotate why their content is absent:
+      // [hidden] (frame not visible), [cross-origin] (contentDocument
+      // unreachable), or [blocked] (frame URL failed the SSRF gate /
+      // domain policy above).
+      if (entry.hidden) line += " [hidden]";
+      if (entry.note) line += entry.note;
     }
     if (charCount + line.length + 1 > SNAPSHOT_CHAR_BUDGET) {
       truncated = true;
@@ -1761,11 +1897,21 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       const nthKey = `${entry.role}\u0000${entry.name}`;
       const nth = nthByRoleName.get(nthKey) ?? 0;
       nthByRoleName.set(nthKey, nth + 1);
+      // page.locator does not pierce iframes: entries walked from a
+      // same-origin frame resolve through page.frameLocator on the
+      // OWNING iframe's stamp, then the element's stamp inside it.
+      // Fake test pages may not implement frameLocator — fall back to
+      // the flat locator there (their refs are usually planted directly).
+      const ownSelector = `[${REF_ATTR}="${entry.ref.slice(1)}"]`;
+      const locator = entry.frameRef && typeof page.frameLocator === "function"
+        ? page.frameLocator(`[${REF_ATTR}="${entry.frameRef}"]`).locator(ownSelector)
+        : page.locator(ownSelector);
       refs.set(entry.ref, {
-        locator: page.locator(`[${REF_ATTR}="${entry.ref.slice(1)}"]`),
+        locator,
         role: entry.role,
         name: entry.name,
-        nth
+        nth,
+        ...(entry.frameRef ? { framed: true } : {})
       });
       elementCount++;
     }
@@ -1972,6 +2118,11 @@ async function resolveRefForAction(
     // element or the action fails with the standard message.
   }
   if (stampedCount > 0) return { locator: target.locator, healed: false };
+  // In-frame refs fail loudly on stamp loss instead of healing: the
+  // healing queries below search the MAIN frame only, so they could find
+  // a same-role/name bystander outside the iframe and restamp it with
+  // this ref's id — the action would land in the wrong document.
+  if (target.framed) return undefined;
   const healed = await healLostRef(session, target, ref);
   return healed ? { locator: healed, healed: true } : undefined;
 }
@@ -4105,13 +4256,14 @@ export const __test = {
     if (!session) return;
     const normalized = new Map<string, RefTarget>();
     for (const [key, value] of refs) {
-      const maybe = value as { locator?: unknown; role?: unknown; name?: unknown; nth?: unknown };
+      const maybe = value as { locator?: unknown; role?: unknown; name?: unknown; nth?: unknown; framed?: unknown };
       if (maybe !== null && typeof maybe === "object" && typeof maybe.locator === "object" && maybe.locator !== null) {
         normalized.set(key, {
           locator: maybe.locator as Locator,
           role: typeof maybe.role === "string" ? maybe.role : "",
           name: typeof maybe.name === "string" ? maybe.name : "",
-          nth: typeof maybe.nth === "number" ? maybe.nth : 0
+          nth: typeof maybe.nth === "number" ? maybe.nth : 0,
+          ...(maybe.framed === true ? { framed: true } : {})
         });
       } else {
         normalized.set(key, { locator: value as Locator, role: "", name: "", nth: 0 });

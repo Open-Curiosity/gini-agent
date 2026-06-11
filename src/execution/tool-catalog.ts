@@ -351,7 +351,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_snapshot",
-      description: "Re-snapshot the current browser page. Always returns the full tree (action results may return diffs vs the previous snapshot). Default returns interactive elements with @eN refs; entries with role `clickable` are cursor-detected clickables (non-semantic elements styled cursor:pointer or carrying onclick/tabindex). Pass full=true for a richer tree including landmarks and headings.",
+      description: "Re-snapshot the current browser page. Always returns the full tree (action results may return diffs vs the previous snapshot). Default returns interactive elements with @eN refs; entries with role `clickable` are cursor-detected clickables (non-semantic elements styled cursor:pointer or carrying onclick/tabindex). Same-origin iframes are walked inline (their elements get actionable @eN refs under an `iframe` row); cross-origin or blocked iframes show an opaque placeholder row. Pass full=true for a richer tree including landmarks and headings.",
       parameters: {
         type: "object",
         properties: {
