@@ -462,6 +462,177 @@ describe("detect — regimes", () => {
   });
 });
 
+describe("detect — body in matched items", () => {
+  // base64url-encode a string the way Gmail returns part `body.data`.
+  function b64url(s: string): string {
+    return Buffer.from(s, "utf8").toString("base64url");
+  }
+
+  // A `messages get format=full` response with a single text/plain part.
+  function fullPlainResponse(id: string, meta: Meta, plain: string): string {
+    return (
+      PREAMBLE +
+      JSON.stringify({
+        id,
+        internalDate: meta.internalDate,
+        snippet: meta.snippet ?? "",
+        payload: {
+          mimeType: "text/plain",
+          headers: [{ name: "From", value: meta.from ?? "" }],
+          body: { data: b64url(plain) }
+        }
+      })
+    );
+  }
+
+  // A `messages get format=full` response with a multipart text/html part only.
+  function fullHtmlResponse(id: string, meta: Meta, html: string): string {
+    return (
+      PREAMBLE +
+      JSON.stringify({
+        id,
+        internalDate: meta.internalDate,
+        snippet: meta.snippet ?? "",
+        payload: {
+          mimeType: "multipart/alternative",
+          headers: [{ name: "From", value: meta.from ?? "" }],
+          parts: [{ mimeType: "text/html", body: { data: b64url(html) } }]
+        }
+      })
+    );
+  }
+
+  // Was `format=full` requested in this `messages get` args line?
+  function isFullGet(joined: string): boolean {
+    return joined.includes("messages get") && joined.includes('"format":"full"');
+  }
+
+  test("a matched item carries the fetched text/plain body", async () => {
+    const meta: Meta = { id: "m2", internalDate: "3000", from: "Alice <alice@x.com>", subject: "offer", snippet: "short snippet" };
+    const fullBody = "Hi there — here is the full body of the email with the real content.";
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2"]);
+      if (isFullGet(joined)) return fullPlainResponse("m2", meta, fullBody);
+      if (joined.includes("messages get")) return metadataResponse(meta);
+      return PREAMBLE + "{}";
+    };
+    const r = await detect(
+      { query: "from:alice@x.com", state: { cursor: "1000", seen: [] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(itemPayload(r.items![0]!.text).body).toBe(fullBody);
+  });
+
+  test("a body-fetch error falls back to the snippet without failing the tick", async () => {
+    const meta: Meta = { id: "m2", internalDate: "3000", from: "Alice <alice@x.com>", subject: "offer", snippet: "snippet fallback" };
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2"]);
+      // The full-format body fetch throws; detection must degrade to the snippet.
+      if (isFullGet(joined)) throw new Error("transport blew up");
+      if (joined.includes("messages get")) return metadataResponse(meta);
+      return PREAMBLE + "{}";
+    };
+    const r = await detect(
+      { query: "from:alice@x.com", state: { cursor: "1000", seen: [] } },
+      spawn,
+      "me@example.com"
+    );
+    // The tick still produces the match — body is the snippet, not a thrown fault.
+    expect(r.kind).toBe("context");
+    expect(matchCount(r.items)).toBe(1);
+    expect(itemPayload(r.items![0]!.text).body).toBe("snippet fallback");
+  });
+
+  test("a text/html-only body is tag-stripped", async () => {
+    const meta: Meta = { id: "m2", internalDate: "3000", from: "Alice <alice@x.com>", subject: "offer", snippet: "s" };
+    const html = "<html><head><style>p{color:red}</style></head><body><p>Hello&nbsp;<b>world</b></p></body></html>";
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2"]);
+      if (isFullGet(joined)) return fullHtmlResponse("m2", meta, html);
+      if (joined.includes("messages get")) return metadataResponse(meta);
+      return PREAMBLE + "{}";
+    };
+    const r = await detect(
+      { query: "from:alice@x.com", state: { cursor: "1000", seen: [] } },
+      spawn,
+      "me@example.com"
+    );
+    const body = itemPayload(r.items![0]!.text).body as string;
+    // Tags + the <style> block stripped; entity decoded; whitespace collapsed.
+    expect(body).toBe("Hello world");
+    expect(body).not.toContain("<");
+    expect(body).not.toContain("color:red");
+  });
+
+  test("a long body is truncated with a marker", async () => {
+    const meta: Meta = { id: "m2", internalDate: "3000", from: "Alice <alice@x.com>", subject: "offer", snippet: "s" };
+    const long = "x".repeat(5000);
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2"]);
+      if (isFullGet(joined)) return fullPlainResponse("m2", meta, long);
+      if (joined.includes("messages get")) return metadataResponse(meta);
+      return PREAMBLE + "{}";
+    };
+    const r = await detect(
+      { query: "from:alice@x.com", state: { cursor: "1000", seen: [] } },
+      spawn,
+      "me@example.com"
+    );
+    const body = itemPayload(r.items![0]!.text).body as string;
+    expect(body.endsWith("…[truncated]")).toBe(true);
+    expect(body.length).toBe(4000 + "…[truncated]".length);
+  });
+
+  test("seeding does NOT fetch a body (no format=full get)", async () => {
+    let fullGets = 0;
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2", "m1"]);
+      if (isFullGet(joined)) {
+        fullGets += 1;
+        return PREAMBLE + "{}";
+      }
+      if (joined.includes("messages get")) {
+        const id = getArgId(joined)!;
+        return metadataResponse({ id, internalDate: id === "m2" ? "2000" : "1000", from: "alice@x.com" });
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await detect({ query: "from:alice@x.com", state: null }, spawn, "me@example.com");
+    expect(r.kind).toBe("shortCircuit"); // seeding, drafts nothing
+    expect(fullGets).toBe(0);
+  });
+
+  test("a short-circuit (only-dropped) tick does NOT fetch a body", async () => {
+    let fullGets = 0;
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages list")) return listResponse(["m2"]);
+      if (isFullGet(joined)) {
+        fullGets += 1;
+        return PREAMBLE + "{}";
+      }
+      // The only new message is automated => dropped, no surviving match.
+      if (joined.includes("messages get")) return metadataResponse({ id: "m2", internalDate: "3000", from: "no-reply@x.com", subject: "auto" });
+      return PREAMBLE + "{}";
+    };
+    const r = await detect(
+      { query: "in:inbox", state: { cursor: "1000", seen: [] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("shortCircuit");
+    // The dropped message never triggers a body fetch.
+    expect(fullGets).toBe(0);
+  });
+});
+
 describe("detect — thread mode", () => {
   // A `threads get format=metadata` response: the whole conversation's
   // message metadata in one document.
@@ -567,6 +738,46 @@ describe("detect — thread mode", () => {
     // Cursor advanced past our own reply too.
     expect(r.state.cursor).toBe("4000");
     expect(r.state.seen).toEqual(["m3"]);
+  });
+
+  test("a surviving thread match carries the fetched body; seeding does not fetch one", async () => {
+    let fullGets = 0;
+    const fullBody = "The ticket bot's full reply with the substantive content.";
+    const spawn: GwsSpawn = async (args) => {
+      const joined = args.join(" ");
+      if (joined.includes("messages get") && joined.includes('"format":"full"')) {
+        fullGets += 1;
+        return (
+          PREAMBLE +
+          JSON.stringify({
+            id: "m2",
+            payload: { mimeType: "text/plain", body: { data: Buffer.from(fullBody, "utf8").toString("base64url") } }
+          })
+        );
+      }
+      if (joined.includes("threads get")) {
+        return threadResponse("t-1", [
+          { id: "m1", internalDate: "1000", from: "support@x.com", subject: "case" },
+          { id: "m2", internalDate: "3000", from: "bot@x.zendesk.com", subject: "update", snippet: "short" }
+        ]);
+      }
+      return PREAMBLE + "{}";
+    };
+    // Seeding tick drafts nothing => no body fetch.
+    const seed = await detect({ query: "thread:t-1", threadId: "t-1", state: null }, spawn, "me@example.com");
+    expect(seed.kind).toBe("shortCircuit");
+    expect(fullGets).toBe(0);
+
+    // Steady tick: the bot's new message survives => its body is fetched.
+    const r = await detect(
+      { query: "thread:t-1", threadId: "t-1", state: { cursor: "1000", seen: ["m1"] } },
+      spawn,
+      "me@example.com"
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.items)).toEqual(["m2"]);
+    expect(itemPayload(r.items![0]!.text).body).toBe(fullBody);
+    expect(fullGets).toBe(1);
   });
 
   test("a self-only new message advances the cursor silently", async () => {

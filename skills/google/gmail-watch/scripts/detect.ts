@@ -28,8 +28,10 @@
 // dedups against that watch's caller-supplied state (cursor + a tiny boundary
 // `seen` set), applies a deterministic safety floor (drop automated senders +
 // self), and emits the raw metadata (From/Subject/Date/snippet) of each surviving
-// NEW match as an untrusted item — it reads ONLY metadata, never message bodies,
-// and emits NO fence (the trusted hook runner fences untrusted items). Each watch
+// NEW match as an untrusted item — and, for the FINAL surviving matches only, the
+// extracted message body (so the drafting turn works from the email's content,
+// not a re-fetch); seeding/short-circuit ticks and dropped messages stay
+// metadata-only. It emits NO fence (the trusted hook runner fences untrusted items). Each watch
 // is wrapped in its OWN try/catch so one sender's gws fault marks only that
 // watch's status and the others still run. The script is a PURE function of
 // {watches, state}: it never touches files or a DB; the new per-watch cursor +
@@ -48,6 +50,14 @@ const SPAWN_TIMEOUT_MS = 15_000;
 // window is drained oldest-first, but only up to this many matches in a single
 // tick; the rest drain over successive ticks as the cursor advances.
 const MAX_MESSAGES_PER_TICK = 25;
+
+// Cap the extracted message body included in a match item (chars). Long enough
+// to carry a real email's content to the drafting turn without bloating the
+// untrusted fence; a truncated body still grounds the reply, and the worker can
+// fetch the full thread by id for the rest. Bodies are fetched ONLY for the
+// final surviving matches that will be drafted, so this rides the items the
+// worker acts on, never the metadata-only detection path.
+const MAX_BODY_CHARS = 4000;
 
 // Per-page result size for the paginated window list. Combined with
 // WINDOW_PAGE_LIMIT this bounds how much of the window a single tick enumerates.
@@ -156,6 +166,11 @@ interface EmailMetadata {
   subject?: string;
   date?: string;
   snippet?: string;
+  // The extracted readable body, fetched ONLY for a surviving matched item right
+  // before it's drafted (never on the metadata-only detection path). Rides into
+  // the SAME untrusted match item the runner fences — it's a longer snippet, not
+  // a new trust surface.
+  body?: string;
 }
 
 // A single injectable context item, matching the hook runner's HookContextItem.
@@ -244,6 +259,18 @@ function buildGetArgs(messageId: string): string[] {
       format: "metadata",
       metadataHeaders: ["From", "Subject", "Date"]
     })
+  ];
+}
+
+// Fetch ONE message in full (payload + part bodies) — used ONLY for a surviving
+// matched item right before it's drafted, so the worker drafts from the email's
+// real content rather than re-fetching it by a hand-typed id. Detection itself
+// stays metadata-only (buildGetArgs); this is the heavier read reserved for the
+// handful of items that actually wake a drafting turn.
+function buildFullGetArgs(messageId: string): string[] {
+  return [
+    "gmail", "users", "messages", "get",
+    "--params", jsonParam({ userId: "me", id: messageId, format: "full" })
   ];
 }
 
@@ -390,6 +417,89 @@ function parseThreadMessages(stdout: string): EmailMetadata[] {
   return out;
 }
 
+// ── Body extraction (final matched items only) ───────────────────────────────
+
+// Decode a Gmail part `body.data` (base64url) to utf8, or "" on any failure.
+function decodeBodyData(data: unknown): string {
+  if (typeof data !== "string" || data.length === 0) return "";
+  try {
+    return Buffer.from(data, "base64url").toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+// Strip HTML to plain-ish text: drop <style>/<script> blocks, replace tags with
+// spaces, decode the handful of common entities, and collapse whitespace. A
+// minimal best-effort strip (not a parser) — the body is untrusted context for
+// the drafting turn, not rendered.
+function stripHtml(html: string): string {
+  return html
+    .replace(/<(?:style|script)[^>]*>[\s\S]*?<\/(?:style|script)>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Find the first part with the given MIME type by walking the payload tree
+// (multipart messages nest parts), returning its decoded data or "".
+function firstPartText(payload: Record<string, unknown> | undefined, mimeType: string): string {
+  if (!payload || typeof payload !== "object") return "";
+  if (payload.mimeType === mimeType) {
+    const body = payload.body as { data?: unknown } | undefined;
+    const decoded = decodeBodyData(body?.data);
+    if (decoded) return decoded;
+  }
+  const parts = payload.parts;
+  if (Array.isArray(parts)) {
+    for (const part of parts) {
+      const found = firstPartText(part as Record<string, unknown>, mimeType);
+      if (found) return found;
+    }
+  }
+  return "";
+}
+
+// Extract a readable body from a `messages get format=full` document: prefer
+// text/plain, fall back to tag-stripped text/html, then the snippet. Truncate to
+// MAX_BODY_CHARS. Returns "" when nothing usable is present.
+function extractBody(doc: Record<string, unknown> | undefined): string {
+  if (!doc) return "";
+  const payload = doc.payload as Record<string, unknown> | undefined;
+  let text = firstPartText(payload, "text/plain").trim();
+  if (!text) {
+    const html = firstPartText(payload, "text/html");
+    if (html) text = stripHtml(html);
+  }
+  if (!text && typeof doc.snippet === "string") text = doc.snippet.trim();
+  if (text.length > MAX_BODY_CHARS) text = `${text.slice(0, MAX_BODY_CHARS)}…[truncated]`;
+  return text;
+}
+
+// Fetch + extract ONE matched message's readable body, for a surviving matched
+// item right before it's drafted. Self-contained and BEST-EFFORT: the entire
+// fetch+parse is wrapped so a body-fetch fault (transport, error body, garbled
+// JSON) falls back to the snippet and NEVER fails the tick — detection degrades
+// to today's metadata-only behavior rather than worse. A gws error BODY (exit 0)
+// is treated the same: parseGwsJson sees the `error` object and extractBody
+// finds no payload/snippet, yielding the snippet fallback. Called ONLY for final
+// matched items (query + thread mode), never during seeding/short-circuit/silent
+// ticks or for dropped (automated/self) messages.
+export async function fetchMessageBody(gwsSpawn: GwsSpawn, id: string, snippet: string): Promise<string> {
+  try {
+    const body = extractBody(parseGwsJson(await gwsSpawn(buildFullGetArgs(id))));
+    return body || snippet;
+  } catch {
+    return snippet;
+  }
+}
+
 // ── Error scrub (ported verbatim) ────────────────────────────────────────────
 
 // Scrub a gws/transport error message before it rides back in state.lastError
@@ -453,7 +563,11 @@ export function buildMatchItem(meta: EmailMetadata): ResultItem {
     // The containing thread, when known — the drafting turn reads the FULL
     // thread (the ground truth of the conversation), not just this message.
     ...(meta.threadId ? { threadId: meta.threadId } : {}),
-    snippet: meta.snippet ?? ""
+    snippet: meta.snippet ?? "",
+    // The extracted email body, fetched for this surviving match — the drafting
+    // turn drafts from it directly instead of re-fetching by a hand-typed id.
+    // Omitted when no body was fetched (the metadata-only path is unchanged).
+    ...(meta.body ? { body: meta.body } : {})
   });
   return { text: `New email from ${from} — ${payload}`, untrusted: true };
 }
@@ -651,6 +765,9 @@ export async function detect(
       continue;
     }
 
+    // A surviving match WILL be drafted: fetch its body now (best-effort, falls
+    // back to the snippet) so the drafting turn works from the email's content.
+    meta.body = await fetchMessageBody(gwsSpawn, id, meta.snippet ?? "");
     items.push(buildMatchItem(meta));
     collected += 1;
     if (Number.isFinite(internalDate) && internalDate > lastConsumedInternalDate) {
@@ -738,7 +855,12 @@ async function detectThread(
     const from = parseFromAddress(m.from ?? "");
     // Our own reply advances the cursor but never triggers.
     const isSelf = Boolean(selfEmail && from && from === selfEmail.toLowerCase());
-    if (!isSelf) items.push(buildMatchItem(m));
+    if (!isSelf) {
+      // A surviving thread match WILL be drafted: fetch its body now (best-effort,
+      // falls back to the snippet) so the drafting turn works from its content.
+      m.body = await fetchMessageBody(gwsSpawn, m.id, m.snippet ?? "");
+      items.push(buildMatchItem(m));
+    }
     if (internalDate > lastConsumed) lastConsumed = internalDate;
   }
 
