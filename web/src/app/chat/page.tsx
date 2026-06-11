@@ -16,7 +16,7 @@ import { ChatTabBar, type ChatTab } from "@/components/chat/ChatTabBar";
 import { ThreadChip } from "@/components/chat/ThreadChip";
 import { ReplyInThreadButton } from "@/components/chat/ReplyInThreadButton";
 import { ThreadPanel } from "@/components/chat/ThreadPanel";
-import { ThreadsTab } from "@/components/chat/ThreadsTab";
+import { ThreadsTab, aggregateActivity } from "@/components/chat/ThreadsTab";
 import { JobsTab } from "@/components/chat/JobsTab";
 import { SettingsTab } from "@/components/chat/SettingsTab";
 import { api, type UploadRef } from "@/lib/api";
@@ -161,13 +161,10 @@ function ChatSurface({
   // threads (and the pill hides at 0), not the total thread count.
   const unreadThreadCount = threads.filter((t) => isThreadUnread(t)).length;
   // Dot the Threads tab while any thread's run is in flight so activity is
-  // visible from the Messages tab without switching over. A run waiting on
-  // the user outranks a running one — it's the actionable state.
-  const threadsActivity = threads.some((t) => t.activity === "waiting_approval")
-    ? ("waiting_approval" as const)
-    : threads.some((t) => t.activity === "running")
-      ? ("running" as const)
-      : undefined;
+  // visible from the Messages tab without switching over. aggregateActivity
+  // shares the sort's ranking, so a run waiting on the user (the actionable
+  // state) outranks a running one here exactly as it does in list order.
+  const threadsActivity = aggregateActivity(threads);
 
   const sessionsQuery = useChatSessions();
   const { markRead, activityAt } = useChatReadState(sessionsQuery.data);

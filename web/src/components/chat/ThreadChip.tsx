@@ -1,5 +1,6 @@
 import { ChevronRight, MessagesSquare } from "lucide-react";
 import type { ThreadSummary } from "@/lib/view-types";
+import { ActivityDot } from "./ActivityDot";
 import { formatRelativeTime } from "./relative-time";
 
 // Inline thread affordance — design `vKElA` / `R3DC9`. Rendered under a
@@ -26,18 +27,12 @@ export function ThreadChip({
       className="flex w-full cursor-pointer items-center gap-2 rounded-lg border border-[#D7DEFA] bg-[#EEF2FF] px-2.5 py-1.5 text-left transition-colors hover:bg-[#E0E8FF] dark:border-[#1E2330] dark:bg-[#10131C] dark:hover:bg-[#141826]"
     >
       <MessagesSquare className="size-3.5 shrink-0 text-[#4277FB] dark:text-[#8893A8]" />
-      {thread.activity === "running" ? (
+      {thread.activity ? (
         <>
-          <span aria-hidden className="relative flex size-2 shrink-0">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500 opacity-60 motion-reduce:animate-none" />
-            <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+          <ActivityDot activity={thread.activity} className="shrink-0" />
+          <span className="sr-only">
+            {thread.activity === "running" ? "running" : "needs approval"}
           </span>
-          <span className="sr-only">running</span>
-        </>
-      ) : thread.activity === "waiting_approval" ? (
-        <>
-          <span aria-hidden className="inline-flex size-2 shrink-0 rounded-full bg-amber-500" />
-          <span className="sr-only">needs approval</span>
         </>
       ) : null}
       {hasReplies ? (

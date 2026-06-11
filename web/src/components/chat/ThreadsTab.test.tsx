@@ -11,7 +11,7 @@
 import { describe, expect, test } from "bun:test";
 import { fireEvent, render, screen } from "@testing-library/react";
 import type { ThreadSummary } from "@/lib/view-types";
-import { ThreadsTab, sortThreads } from "./ThreadsTab";
+import { ThreadsTab, aggregateActivity, sortThreads } from "./ThreadsTab";
 
 function makeThread(overrides: Partial<ThreadSummary> = {}): ThreadSummary {
   return {
@@ -91,6 +91,18 @@ describe("ThreadsTab", () => {
     const cards = screen.getAllByRole("button");
     expect(cards[0]!.getAttribute("aria-label")).toContain("Running but old");
     expect(cards[1]!.getAttribute("aria-label")).toContain("Idle newest");
+  });
+
+  test("aggregateActivity reports the highest-priority in-flight state", () => {
+    const idle = makeThread({ threadId: "t_idle" });
+    const running = makeThread({ threadId: "t_running", activity: "running" });
+    const waiting = makeThread({ threadId: "t_waiting", activity: "waiting_approval" });
+    expect(aggregateActivity([])).toBeUndefined();
+    expect(aggregateActivity([idle])).toBeUndefined();
+    expect(aggregateActivity([idle, running])).toBe("running");
+    // The actionable state wins regardless of position.
+    expect(aggregateActivity([running, idle, waiting])).toBe("waiting_approval");
+    expect(aggregateActivity([waiting, running])).toBe("waiting_approval");
   });
 
   test("threads without an agentName inherit the tab's agent", () => {

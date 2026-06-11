@@ -18,6 +18,20 @@ export function sortThreads(threads: ThreadSummary[]): ThreadSummary[] {
   });
 }
 
+// Highest-priority activity across a thread list, by the SAME ranking the
+// sort uses — so the tab-bar dot can never disagree with list ordering.
+export function aggregateActivity(
+  threads: ThreadSummary[]
+): NonNullable<ThreadSummary["activity"]> | undefined {
+  let best: NonNullable<ThreadSummary["activity"]> | undefined;
+  for (const t of threads) {
+    if (t.activity && (ACTIVITY_RANK[t.activity] ?? 0) > (best ? (ACTIVITY_RANK[best] ?? 0) : 0)) {
+      best = t.activity;
+    }
+  }
+  return best;
+}
+
 // Per-agent Threads tab. Lists this agent's threads as Thread Cards —
 // in-flight threads first (their last text reply can be old while tools
 // churn, and the thing most worth watching shouldn't sink), newest reply

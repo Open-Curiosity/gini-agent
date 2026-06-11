@@ -1,8 +1,8 @@
 import { cn } from "@/lib/utils";
-import type { ThreadSummary } from "@/lib/view-types";
+import { ActivityDot, type ThreadActivity } from "./ActivityDot";
 
 export type ChatTab = "messages" | "threads" | "jobs" | "settings";
-export type ThreadsActivity = NonNullable<ThreadSummary["activity"]>;
+export type ThreadsActivity = ThreadActivity;
 
 interface TabSpec {
   id: ChatTab;
@@ -67,18 +67,12 @@ export function ChatTabBar({
             )}
           >
             {tab.label}
-            {tab.activity === "running" ? (
+            {tab.activity ? (
               <>
-                <span aria-hidden className="relative flex size-2">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500 opacity-60 motion-reduce:animate-none" />
-                  <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+                <ActivityDot activity={tab.activity} />
+                <span className="sr-only">
+                  {tab.activity === "running" ? "a thread is running" : "a thread needs approval"}
                 </span>
-                <span className="sr-only">a thread is running</span>
-              </>
-            ) : tab.activity === "waiting_approval" ? (
-              <>
-                <span aria-hidden className="inline-flex size-2 rounded-full bg-amber-500" />
-                <span className="sr-only">a thread needs approval</span>
               </>
             ) : null}
             {tab.count ? (

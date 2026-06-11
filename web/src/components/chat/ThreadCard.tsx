@@ -2,6 +2,7 @@
 
 import { ChevronRight, MessagesSquare } from "lucide-react";
 import type { ThreadSummary } from "@/lib/view-types";
+import { ActivityDot } from "./ActivityDot";
 import { formatRelativeTime } from "./relative-time";
 import { agentColor } from "@/lib/agent-visuals";
 
@@ -64,15 +65,12 @@ export function ThreadCard({
           ) : null}
           {thread.activity === "running" ? (
             <span className="ml-auto flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
-              <span aria-hidden className="relative flex size-2">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500 opacity-60 motion-reduce:animate-none" />
-                <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
-              </span>
+              <ActivityDot activity="running" />
               Running
             </span>
           ) : thread.activity === "waiting_approval" ? (
             <span className="ml-auto flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] font-semibold text-amber-600 dark:text-amber-400">
-              <span aria-hidden className="inline-flex size-2 rounded-full bg-amber-500" />
+              <ActivityDot activity="waiting_approval" />
               Needs approval
             </span>
           ) : null}
