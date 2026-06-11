@@ -1379,11 +1379,15 @@ export async function resolveAuthorization(
   }
 }
 
-// Resolve a SetupRequest. The user-actor flow: the HTTP handler ran the
-// side effect (connectBrowser, createConnector, playwright.fill) and then
-// calls this to mark the row completed/cancelled and resume the chat-task
-// loop. No side-effect dispatch happens here — that's the difference from
-// resolveAuthorization. See docs/adr/authorization-vs-setup-request.md.
+// Resolve a SetupRequest. The user-actor flow: the HTTP handler claims the
+// row here (pending → completed/cancelled) and runs the action's side
+// effects around that claim per the action's designed flow —
+// browser.connect runs connectBrowser BEFORE resolving; connector
+// create+probe, playwright fill, and messaging connect/remove/pairing run
+// AFTER the claim wins. No side-effect dispatch happens here — that's the
+// difference from resolveAuthorization. See
+// docs/adr/authorization-vs-setup-request.md.
+
 // Whether completing a setup request emits a non-terminal `Working: <action>`
 // phase block right after the complete-claim wins. true: the action's side
 // effects run AFTER the claim (connector probe, playwright fill, messaging

@@ -193,13 +193,15 @@ malformed block can't pin a thread active.
 Two emission points keep the scan truthful through gate-resolution
 windows: approving an authorization emits a best-effort
 `Working: <action>` phase block before the side effect executes
-(`src/agent.ts` `resolveAuthorization`), and the setup `/complete`
-handlers whose side effects run after the claim (connector probe,
-playwright secret fill, messaging connect/remove/pairing) pass
-`emitWorkingPhase` to `resolveSetupRequest` for the same reason —
-without these, a long side effect would leave the resolved gate as the
-newest block and the thread would keep reading `waiting_approval` after
-the user already acted. `skill.grant_connector` deliberately does not
+(`src/agent.ts` `resolveAuthorization`), and completing a setup request
+emits the same block for actions whose side effects run after the
+complete-claim (connector probe, playwright secret fill, messaging
+connect/remove/pairing) — decided per action by the exhaustive
+`SETUP_COMPLETE_EMITS_WORKING_PHASE` map keyed by `SetupRequestAction`
+inside `resolveSetupRequest` (`src/agent.ts`) — without these, a long
+side effect would leave the resolved gate as the newest block and the
+thread would keep reading `waiting_approval` after the user already
+acted. `skill.grant_connector` deliberately does not
 emit: its multi-credential flow mints the next grant card without a new
 gate block, and the old gate staying newest is what keeps the thread
 truthfully waiting on the next credential. `activity` drives the

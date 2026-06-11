@@ -7,8 +7,14 @@ import { ThreadCard } from "./ThreadCard";
 
 // Shared thread ordering for the per-agent tab and the global inbox:
 // runs parked on the user first (the actionable state), then running
-// threads, then idle — newest reply first within each group.
-const ACTIVITY_RANK: Record<string, number> = { waiting_approval: 2, running: 1 };
+// threads, then idle — newest reply first within each group. The satisfies
+// clause keeps the rank table exhaustive over the activity union (a new
+// state must pick a rank at compile time) while the string-keyed annotation
+// keeps the idle sentinel ("") indexing below legal.
+const ACTIVITY_RANK: Record<string, number> = { waiting_approval: 2, running: 1 } satisfies Record<
+  NonNullable<ThreadSummary["activity"]>,
+  number
+>;
 
 export function sortThreads(threads: ThreadSummary[]): ThreadSummary[] {
   return [...threads].sort((a, b) => {
