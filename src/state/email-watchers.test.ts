@@ -27,7 +27,7 @@ import {
   validateObjective,
   validateThreadId
 } from ".";
-import { resolveWatchAccount } from "./email-watchers";
+import { accountSelectionHint, resolveWatchAccount } from "./email-watchers";
 
 const ROOT = mkdtempSync(join(tmpdir(), "gini-email-watchers-test-"));
 
@@ -112,6 +112,33 @@ describe("resolveWatchAccount", () => {
     expect(r.account).toBeUndefined();
     expect(r.warning).toContain("ghost@nowhere.com");
     expect(r.warning).toContain("not a registered");
+  });
+});
+
+describe("accountSelectionHint", () => {
+  const A = { email: "sheldenshi@gmail.com", configDir: "/dir/gacct_a", signedIn: true };
+  const B = { email: "work@lilaclabs.ai", configDir: "/dir/gacct_b", signedIn: true };
+
+  test("no account + 2 signed-in accounts => ask the user, listing both", () => {
+    const hint = accountSelectionHint(undefined, [A, B]);
+    expect(hint).toBeDefined();
+    expect(hint).toContain("sheldenshi@gmail.com");
+    expect(hint).toContain("work@lilaclabs.ai");
+    expect(hint).toContain("ask_user");
+  });
+
+  test("no account + exactly one signed-in account => no hint (auto-defaults)", () => {
+    expect(accountSelectionHint(undefined, [A])).toBeUndefined();
+    // A signed-out sibling doesn't count toward the ambiguity.
+    expect(accountSelectionHint(undefined, [A, { ...B, signedIn: false }])).toBeUndefined();
+  });
+
+  test("no account + zero accounts => no hint (single-account back-compat)", () => {
+    expect(accountSelectionHint(undefined, [])).toBeUndefined();
+  });
+
+  test("an explicit account => no hint even with multiple connected", () => {
+    expect(accountSelectionHint("work@lilaclabs.ai", [A, B])).toBeUndefined();
   });
 });
 
