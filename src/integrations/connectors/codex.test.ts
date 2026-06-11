@@ -244,6 +244,22 @@ describe("codex credential probe", () => {
     expect(viaEnv.message).toContain("OPENAI_API_KEY");
   });
 
+  test("detect ignores token expiry: an expired JWT still materializes the connector while probe reports it unhealthy", async () => {
+    __setCodexWhichForTests(() => "/usr/local/bin/codex");
+    const past = Math.floor(Date.now() / 1000) - 60;
+    const authPath = writeAuth({ tokens: { access_token: makeJwt({ exp: past }) } });
+    const detected = await codexProvider.detect!();
+    expect(detected.detected).toBe(true);
+    expect(detected.suggestedName).toBe("Codex");
+    expect(detected.message).toContain(authPath);
+    // Same credentials, same instant: probe() consults exp and reports
+    // unhealthy. detect() must NOT — the expired install has to materialize
+    // so this probe state is visible (issue #233).
+    const probe = await codexProvider.probe!(PROBE_CTX);
+    expect(probe.ok).toBe(false);
+    expect(probe.message).toContain("Codex access token expired at");
+  });
+
   test("whichBinary resolves an existing binary to a path and a missing one to null", () => {
     // `sh` is guaranteed on every POSIX host this suite runs on.
     expect(whichBinary("sh")).toContain("/sh");
