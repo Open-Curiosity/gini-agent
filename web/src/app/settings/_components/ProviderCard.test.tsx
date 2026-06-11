@@ -247,6 +247,38 @@ describe("ProviderCard rows", () => {
     expect(screen.queryAllByRole("listitem")).toHaveLength(0);
   });
 
+  test("an unconfigured row with a needs_reauth record still renders the amber guidance", () => {
+    // bedrock/anthropic flip configured to false the moment their credentials
+    // VANISH (env scrubbed, ~/.aws/credentials deleted) — exactly a needs-
+    // re-auth state. The row must survive the configured filter or the amber
+    // guidance is unreachable for the failure it explains.
+    renderCard([
+      row("bedrock", {
+        configured: false,
+        authStatus: "needs_reauth",
+        reauth: { detail: REAUTH_DETAIL, at: REAUTH_AT, reauthKind: "aws", reauthUrl: "/settings" }
+      }),
+      row("anthropic", {
+        configured: false,
+        authStatus: "needs_reauth",
+        reauth: { detail: REAUTH_DETAIL, at: REAUTH_AT, reauthKind: "settings", reauthUrl: "/settings" }
+      })
+    ]);
+    const bedrock = rowItem("Amazon Bedrock");
+    expect(within(bedrock).getByText("Needs re-authentication")).not.toBeNull();
+    expect(within(bedrock).getByText(/AWS credentials/)).not.toBeNull();
+    const anthropic = rowItem("Anthropic");
+    expect(within(anthropic).getByText("Needs re-authentication")).not.toBeNull();
+    expect(within(anthropic).getByRole("button", { name: "Update Anthropic key" })).not.toBeNull();
+  });
+
+  test("unconfigured rows without a failure record stay hidden", () => {
+    renderCard([row("openai"), row("anthropic", { configured: false, authStatus: "ok" })]);
+    const items = screen.getAllByRole("listitem");
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toContain("OpenAI");
+  });
+
   test("the instance row shows the active model; other rows show their first catalog model", () => {
     renderCard([row("openai"), row("anthropic")], {
       activeProviderName: "openai",

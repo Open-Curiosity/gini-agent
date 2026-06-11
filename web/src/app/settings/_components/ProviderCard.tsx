@@ -84,9 +84,16 @@ export function ProviderCard({
   // must cover both or the default model's provider becomes removable.
   defaultModelProviderName?: string;
 }) {
+  // Keep needs_reauth rows even when unconfigured: bedrock/anthropic flip
+  // `configured` to false the moment their credentials VANISH (env scrubbed,
+  // ~/.aws/credentials deleted, launchd restart without the shell env), which
+  // is precisely a needs-re-auth state — dropping the row would hide the
+  // amber guidance for the exact failure it explains. Unconfigured rows
+  // without a failure record stay hidden.
   const rows = SELECTABLE_PROVIDERS
     .map((name) => catalog.find((c) => c.name === name))
-    .filter((c): c is ProviderCatalogItem => c !== undefined && c.configured === true);
+    .filter((c): c is ProviderCatalogItem =>
+      c !== undefined && (c.configured === true || c.authStatus === "needs_reauth"));
 
   // Row whose Edit pencil opened the inline dialog. Null when closed.
   const [editingRow, setEditingRow] = useState<ProviderCatalogItem | null>(null);
