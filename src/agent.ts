@@ -17,6 +17,7 @@ import type {
   RuntimeConfig,
   RuntimeState,
   SetupRequest,
+  SetupRequestAction,
   Task
 } from "./types";
 import { statePath, traceDir } from "./paths";
@@ -1383,6 +1384,31 @@ export async function resolveAuthorization(
 // calls this to mark the row completed/cancelled and resume the chat-task
 // loop. No side-effect dispatch happens here — that's the difference from
 // resolveAuthorization. See docs/adr/authorization-vs-setup-request.md.
+// Whether completing a setup request emits a non-terminal `Working: <action>`
+// phase block right after the complete-claim wins. true: the action's side
+// effects run AFTER the claim (connector probe, playwright fill, messaging
+// network calls), so the activity scan must read "running" — not a stale
+// waiting_approval — while they execute, mirroring the authorization approve
+// path. false: emitting would lie —
+//   - browser.connect runs its side effects BEFORE the claim and the resolve
+//     itself stages the toolResult resume;
+//   - skill.grant_connector's multi-credential flow mints the NEXT grant card
+//     without a new gate block, and the old gate block staying newest is what
+//     keeps the thread truthfully waiting on the next credential.
+// Exhaustive over SetupRequestAction so adding an action forces a decision
+// here at compile time instead of silently inheriting the wrong window
+// behavior.
+const SETUP_COMPLETE_EMITS_WORKING_PHASE: Record<SetupRequestAction, boolean> = {
+  "connector.request": true,
+  "browser.fill_secret": true,
+  "messaging.add_bridge": true,
+  "messaging.approve_pairing": true,
+  "messaging.remove_bridge": true,
+  "chat.choice": true,
+  "browser.connect": false,
+  "skill.grant_connector": false
+};
+
 export async function resolveSetupRequest(
   config: RuntimeConfig,
   approvalId: string,
@@ -1392,16 +1418,6 @@ export async function resolveSetupRequest(
     toolResult?: string;
     resumeChatTask?: boolean;
     awaitResume?: boolean;
-    // Emit a non-terminal `Working: <action>` phase block right after the
-    // complete-claim wins. Callers whose side effects run AFTER the claim
-    // (connector probe, playwright fill, messaging network calls) set this
-    // so the activity scan reads "running" — not a stale waiting_approval —
-    // while those side effects execute, mirroring the authorization approve
-    // path. Callers that mint a follow-up gate without a new gate block
-    // (skill.grant_connector's multi-credential flow) must NOT set it: the
-    // old gate block staying newest is exactly what keeps the thread
-    // truthfully waiting on the next credential.
-    emitWorkingPhase?: boolean;
   } = {}
 ): Promise<SetupRequest> {
   const actor = opts.actor ?? "user";
@@ -1474,7 +1490,7 @@ export async function resolveSetupRequest(
     return { item, task: taskRow, resumeCancelledConnector };
   });
 
-  if (decision === "complete" && opts.emitWorkingPhase && result.item.taskId) {
+  if (decision === "complete" && SETUP_COMPLETE_EMITS_WORKING_PHASE[result.item.action] && result.item.taskId) {
     // Best-effort like the cancel path's emission: a SQLite failure here
     // must not block the caller's side effects.
     try {

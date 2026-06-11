@@ -102,7 +102,7 @@ export async function runMessagingBridgeConnect(
   // cancelled task and audit it as approved.
   let resolved: SetupRequest;
   try {
-    resolved = await resolveSetupRequest(config, approval.id, "complete", { actor: "user", resumeChatTask: false, emitWorkingPhase: true });
+    resolved = await resolveSetupRequest(config, approval.id, "complete", { actor: "user", resumeChatTask: false });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {

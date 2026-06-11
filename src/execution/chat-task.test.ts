@@ -2060,7 +2060,7 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  test("completing a setup request with emitWorkingPhase lands a Working phase after the gate", async () => {
+  test("completing a setup request lands a Working phase after the gate", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-blocks-setup-phase");
     const provider = normalizeProvider(config.provider);
@@ -2095,14 +2095,13 @@ describe("chat-task loop", () => {
     if (gate?.kind !== "setup_requested") throw new Error("missing setup_requested block");
 
     // The /complete handlers claim the row with resumeChatTask:false and run
-    // their (potentially slow) side effects afterwards; emitWorkingPhase
-    // covers that window so the activity scan stops reading a resolved gate
-    // as waiting_approval.
+    // their (potentially slow) side effects afterwards; connector.request is
+    // mapped to emit a Working phase on complete, covering that window so the
+    // activity scan stops reading a resolved gate as waiting_approval.
     const { resolveSetupRequest } = await import("../agent");
     await resolveSetupRequest(config, gate.setupRequestId, "complete", {
       actor: "user",
-      resumeChatTask: false,
-      emitWorkingPhase: true
+      resumeChatTask: false
     });
 
     const blocks = listChatBlocks(config.instance, session.id);

@@ -682,7 +682,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // (so the resolved card reads truthfully after reload) and resume the
         // chat-task loop detached — same shape as connector.request's winning
         // path, minus side effects (nothing is created here).
-        await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false, emitWorkingPhase: true });
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
         await persistConnectOutcome(config, setupId, { ok: true, message: outcomeMessage });
         const choiceToolCallId = typeof setup.payload.toolCallId === "string" ? setup.payload.toolCallId : undefined;
         if (setup.taskId && choiceToolCallId) {
@@ -756,7 +756,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // resumeChatTask:false / no toolResult so the resume is staged LATER,
         // exactly once, on the winning claim. Mirrors the skill.grant_connector
         // branch below.
-        await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false, emitWorkingPhase: true });
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
 
         // Only the winner reaches here. Every post-claim path — successful
         // create + grant + enable + resume, probe failure, or an UNEXPECTED
@@ -950,10 +950,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // already non-pending), throws here and performs ZERO side effects.
         // We claim with resumeChatTask:false / no toolResult so the resume is
         // staged LATER, as the final step, exactly once on the winning claim.
-        // No emitWorkingPhase here: the multi-credential flow below mints the
-        // NEXT grant card without a new gate block, and the old gate block
-        // staying newest is what keeps the thread truthfully waiting on the
-        // next credential.
+        // skill.grant_connector deliberately emits no Working phase on
+        // complete (see SETUP_COMPLETE_EMITS_WORKING_PHASE in src/agent.ts):
+        // the multi-credential flow below mints the NEXT grant card without a
+        // new gate block, and the old gate block staying newest is what keeps
+        // the thread truthfully waiting on the next credential.
         await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
 
         // Only the winner reaches here. Record the grant for the approved
