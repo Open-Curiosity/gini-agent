@@ -553,6 +553,39 @@ describe("watchdog", () => {
     expect(process.exitCode).toBe(0);
   });
 
+  test("--help prints usage and returns without probing or looping", async () => {
+    // The default mode loops forever, so help MUST short-circuit before the
+    // loop — falling through would hang the terminal and kickstart services.
+    writePorts();
+    let probes = 0;
+    const realLog = console.log;
+    const logged: string[] = [];
+    console.log = ((...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    }) as typeof console.log;
+    try {
+      for (const helpArg of ["--help", "-h", "help"]) {
+        await watchdog(ctxFor([helpArg]), {
+          probeRuntime: async () => {
+            probes += 1;
+            return true;
+          },
+          probeWeb: async () => true,
+          kickstartImpl: () => okLaunchctl,
+          isLoadedImpl: () => true,
+          supervisorImpl: () => "launchd",
+          sleep: async () => {
+            throw new Error("help must not enter the loop");
+          }
+        });
+      }
+    } finally {
+      console.log = realLog;
+    }
+    expect(probes).toBe(0);
+    expect(logged.join("\n")).toContain("--once");
+  });
+
   test("--once forces a single tick even when deps.maxTicks asks for more (and never sleeps)", async () => {
     writePorts();
     let probes = 0;

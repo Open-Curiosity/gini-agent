@@ -37,6 +37,7 @@ import { arch, platform } from "node:os";
 import { join } from "node:path";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
+import { print } from "../output";
 import { logDir, runtimePortPath, webPortPath } from "../../paths";
 import { isLoaded, kickstart, supervisor, type LaunchctlResult, type PlistKind } from "../../integrations/launchd";
 import { isSupervisedWebChild } from "../../runtime/health-probe";
@@ -154,6 +155,23 @@ function readRedactionLiterals(): {
 }
 
 export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promise<void> {
+  // Help must short-circuit BEFORE the loop (mirroring the autostart
+  // pattern): the default mode runs forever, so falling through on `--help`
+  // would silently hang the terminal — and kickstart services — instead of
+  // printing usage. This is also where `--once` gets discovered.
+  const helpArg = ctx.cliArgs[1];
+  if (helpArg === "help" || helpArg === "--help" || helpArg === "-h") {
+    print({
+      command: "gini watchdog [--once] [--instance <name>]",
+      description:
+        "Health-probe loop for a launchd-supervised instance: probes the gateway and web every 10s and kickstarts whichever is down. Runs forever by default (the launchd watchdog job's entrypoint); --once runs a single probe tick and exits.",
+      flags: {
+        "--once": "run exactly one probe tick instead of the loop",
+        "--instance <name>": "target instance (defaults to the current directory's instance)"
+      }
+    });
+    return;
+  }
   const instance = ctx.config.instance;
   const probeRuntime = deps.probeRuntime ?? defaultProbeRuntime;
   const probeWeb = deps.probeWeb ?? isSupervisedWebChild;

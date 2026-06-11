@@ -361,7 +361,7 @@ export interface EnableOptions {
   // Opt-in scratch state/log root for E2E tests. See ResolveLaunchOptions
   // for the leak-prevention rationale.
   testRoot?: { stateRoot?: string; logRoot?: string };
-  // Which kinds to bootstrap. Defaults to both (gateway + web).
+  // Which kinds to bootstrap. Defaults to all three (gateway + web + watchdog).
   // `--kind gateway` from the CLI narrows this for setup-api's refresh
   // path so it doesn't kill the web service the browser is talking to.
   kinds?: PlistKind[];

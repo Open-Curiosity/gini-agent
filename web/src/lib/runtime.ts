@@ -129,6 +129,35 @@ export function gatewayUnreachableResponse(): Response {
   );
 }
 
+// Server-side trail for the unreachable path. Catching the upstream
+// rejection means Next.js no longer dumps a stack trace per failed proxy
+// request — but those traces were the only record of WHICH address the BFF
+// dialed and WHY it failed, the load-bearing datum when the cause is a
+// persistent misconfig (stale port file, wrong instance) rather than a
+// restart blip. Log one line with target + cause, deduplicated so a normal
+// restart window (dozens of polls against the same dead port) emits one
+// entry instead of a storm; a changed message (different port, different
+// errno) logs immediately.
+const UNREACHABLE_LOG_INTERVAL_MS = 10_000;
+let lastUnreachableLog = { message: "", at: 0 };
+
+function logGatewayUnreachable(target: string, err: unknown): void {
+  const cause =
+    err instanceof Error ? String((err.cause as Error | undefined)?.message ?? err.cause ?? err.message) : String(err);
+  const message = `[bff] gateway unreachable: ${target} (${cause})`;
+  const now = Date.now();
+  if (message === lastUnreachableLog.message && now - lastUnreachableLog.at < UNREACHABLE_LOG_INTERVAL_MS) return;
+  lastUnreachableLog = { message, at: now };
+  console.error(message);
+}
+
+/** Test-only seam: reset the dedup latch between cases. */
+export const __unreachableLogTestHooks = {
+  reset(): void {
+    lastUnreachableLog = { message: "", at: 0 };
+  }
+};
+
 // Forward a small allowlist of response headers from the upstream runtime.
 // The QR endpoints (and any future bearer-gated response that needs
 // browser-caching control) set `Cache-Control: no-store`; without this
@@ -208,6 +237,7 @@ export async function proxyRequest(
     // The client went away (navigation/unmount) — let the platform handle the
     // aborted request rather than fabricating a response for nobody.
     if (signal?.aborted) throw err;
+    logGatewayUnreachable(target, err);
     return gatewayUnreachableResponse();
   }
   const isStream = upstream.headers.get("content-type")?.includes("text/event-stream");

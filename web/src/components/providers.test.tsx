@@ -9,10 +9,13 @@
 // warning and passes every other error through.
 //
 // LEAK SAFETY: mock.module is process-wide in `bun test` and can outlive the file
-// that set it, so every override SPREADS the real module and changes only the
-// exports this file needs; the canonical real namespaces are captured for both
-// spreading and the afterAll revert. None of these specifiers is the SUBJECT of
-// another rendering test, so the spread keeps any residual override harmless.
+// that set it, so the third-party overrides SPREAD the real module and revert in
+// afterAll. The local component stubs (RuntimeStreamBridge, ConnectionBanner,
+// UpdateGate) are NOT reverted on purpose — importing the real modules for a
+// spread would register them (plus their query/stream deps) against the 100%
+// coverage gate without covering them. Their own test files render the real
+// components, which is safe because the suite runs with --isolate (fresh module
+// registry per file — the structural backstop for all module mocks here).
 
 import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { render, screen } from "@testing-library/react";

@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { GATEWAY_UNREACHABLE_CODE } from "./gateway-codes";
 import {
   __fileCacheTestHooks,
+  __unreachableLogTestHooks,
   canonicalizeSegments,
   guardCsrf,
   pickForwardHeaders,
@@ -331,6 +332,49 @@ describe("proxyRequest — gateway unreachable", () => {
     const body = (await res.json()) as { error: string; code: string };
     expect(body.code).toBe(GATEWAY_UNREACHABLE_CODE);
     expect(body.error.length).toBeGreaterThan(0);
+  });
+
+  test("the unreachable path logs target + cause once, deduplicating repeats inside the window", async () => {
+    __unreachableLogTestHooks.reset();
+    const logged: string[] = [];
+    const realConsoleError = console.error;
+    console.error = ((...args: unknown[]) => {
+      logged.push(String(args[0]));
+    }) as typeof console.error;
+    try {
+      const refusedFetcher = (async () => {
+        throw new Error("fetch failed", { cause: new Error("connect ECONNREFUSED 127.0.0.1:9999") });
+      }) as unknown as typeof fetch;
+      const send = () =>
+        proxyRequest(
+          new Request("http://127.0.0.1:7777/api/runtime/status", { method: "GET", headers: { host: "127.0.0.1:7777" } }),
+          ["status"],
+          { runtimeUrl: "http://127.0.0.1:9999", token: "t", fetcher: refusedFetcher }
+        );
+      // A restart window's polling burst: same target, same cause — one line.
+      await send();
+      await send();
+      await send();
+      expect(logged.length).toBe(1);
+      // The single line carries the load-bearing data: dialed target + errno.
+      expect(logged[0]).toContain("http://127.0.0.1:9999/api/status");
+      expect(logged[0]).toContain("ECONNREFUSED");
+
+      // A DIFFERENT failure (new cause) logs immediately despite the window.
+      const timeoutFetcher = (async () => {
+        throw new Error("fetch failed", { cause: new Error("connect ETIMEDOUT 127.0.0.1:9999") });
+      }) as unknown as typeof fetch;
+      await proxyRequest(
+        new Request("http://127.0.0.1:7777/api/runtime/status", { method: "GET", headers: { host: "127.0.0.1:7777" } }),
+        ["status"],
+        { runtimeUrl: "http://127.0.0.1:9999", token: "t", fetcher: timeoutFetcher }
+      );
+      expect(logged.length).toBe(2);
+      expect(logged[1]).toContain("ETIMEDOUT");
+    } finally {
+      console.error = realConsoleError;
+      __unreachableLogTestHooks.reset();
+    }
   });
 
   test("a client-aborted request rethrows instead of fabricating a 503 for nobody", async () => {
