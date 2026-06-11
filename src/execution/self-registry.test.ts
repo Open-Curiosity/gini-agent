@@ -255,6 +255,39 @@ describe("direct self tools — query", () => {
       else process.env.ANTHROPIC_API_KEY = prevCanonical;
     }
   });
+
+  test("list_providers carries authStatus and reauth so the agent sees needs-reauth state", async () => {
+    // The agent participates in the needs-reauth clear lifecycle via
+    // set_provider, so list_providers must expose the same authStatus/reauth
+    // enrichment the HTTP catalog carries — `configured: true` alone is the
+    // misleading presence-only signal issue #233 eliminates.
+    const instance = `self-providers-reauth-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    await mutateState(config.instance, (state) => {
+      recordProviderAuthFailure(state, { provider: "openai", detail: "token expired", taskId: "task_seed" });
+    });
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(config, taskId, "list_providers", "call_1", "{}");
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as {
+        ok: boolean;
+        providers: Array<{
+          name: string;
+          authStatus?: string;
+          reauth?: { detail: string; reauthKind: string; reauthUrl: string };
+        }>;
+      };
+      expect(parsed.ok).toBe(true);
+      const openai = parsed.providers.find((p) => p.name === "openai");
+      expect(openai?.authStatus).toBe("needs_reauth");
+      expect(openai?.reauth?.detail).toBe("token expired");
+      expect(openai?.reauth?.reauthKind).toBe("settings");
+      const echo = parsed.providers.find((p) => p.name === "echo");
+      expect(echo?.authStatus).toBe("ok");
+      expect(echo?.reauth).toBeUndefined();
+    }
+  });
 });
 
 describe("direct self tools — mutate", () => {

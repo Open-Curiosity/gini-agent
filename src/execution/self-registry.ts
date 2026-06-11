@@ -26,7 +26,7 @@
 import type { ApprovalMode, RuntimeConfig, RuntimeState } from "../types";
 import { addAudit, appendTrace, mutateState, now, readState } from "../state";
 import { status as runtimeStatus, updateAutoApproveSettings } from "../runtime";
-import { providerCatalogWithStatus } from "../provider";
+import { providerCatalogWithStatus, withProviderAuthStatus } from "../provider";
 import { setSetupProvider, removeSetupProvider } from "../runtime/setup-api";
 import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability, renameAgent as renameAgentCapability, deleteAgent } from "../capabilities/agents";
 import { listSkills, rollbackSkill, testSkill } from "../capabilities/skills";
@@ -133,7 +133,14 @@ async function getSelf(config: RuntimeConfig, taskId: string): Promise<string> {
 }
 
 async function listProviders(config: RuntimeConfig, taskId: string): Promise<string> {
-  const catalog = providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv, config.provider?.baseUrl);
+  // Same authStatus/reauth enrichment as GET /api/providers/catalog: the
+  // agent participates in the needs-reauth clear lifecycle (set_provider),
+  // so it must be able to SEE the state it preserves — `configured: true`
+  // alone is the misleading presence-only signal issue #233 eliminates.
+  const catalog = withProviderAuthStatus(
+    providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv, config.provider?.baseUrl),
+    readState(config.instance).providerAuthFailures
+  );
   const providers = catalog.map((item) => ({
     id: item.id,
     name: item.name,
@@ -144,7 +151,9 @@ async function listProviders(config: RuntimeConfig, taskId: string): Promise<str
     capabilities: item.capabilities,
     costHint: item.costHint,
     configured: item.configured,
-    isActive: item.name === config.provider?.name
+    isActive: item.name === config.provider?.name,
+    authStatus: item.authStatus,
+    ...(item.reauth ? { reauth: item.reauth } : {})
   }));
   appendTrace(config.instance, taskId, {
     type: "tool",
