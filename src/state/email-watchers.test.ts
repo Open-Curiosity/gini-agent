@@ -242,9 +242,13 @@ describe("shared backing job lifecycle", () => {
         (j.preRunHook.config as { skill?: string }).skill === "gmail-watch"
     );
   }
+  // The per-watcher watch entries only — the constant triage watch
+  // (routeKey/watcherId "triage", a broad in:inbox watch provisioned alongside
+  // the shared job) is filtered out so these assertions pin the per-watcher list.
   function watches(config: ReturnType<typeof buildConfig>) {
     const job = sharedJob(config);
-    return (job?.preRunHook?.config as { watches?: { watcherId: string; routeKey?: string; query: string; sender?: string }[] }).watches ?? [];
+    const all = (job?.preRunHook?.config as { watches?: { watcherId: string; routeKey?: string; query: string; sender?: string }[] }).watches ?? [];
+    return all.filter((w) => w.watcherId !== "triage");
   }
 
   test("first add provisions ONE shared job + session and stamps jobId", async () => {
@@ -595,10 +599,14 @@ describe("shared backing job lifecycle", () => {
     );
     expect(concernChannelIds.size).toBe(2);
     // The MARKED email-watch sessions are exactly the shared session + the two
-    // live concern channels; the orphan job's session + the truly-orphan channel
-    // were swept by identity.
+    // live concern channels + the triage channel; the orphan job's session + the
+    // truly-orphan channel were swept by identity.
+    const triageChannelId = state.chatSessions.find(
+      (s) => s.kind === "channel" && s.feature === "email-watch" && s.title === "Inbox triage"
+    )?.id;
+    expect(triageChannelId).toBeString();
     const emailSessions = state.chatSessions.filter((s) => s.feature === "email-watch");
-    expect(new Set(emailSessions.map((s) => s.id))).toEqual(new Set([sharedSessionId, ...concernChannelIds]));
+    expect(new Set(emailSessions.map((s) => s.id))).toEqual(new Set([sharedSessionId, triageChannelId!, ...concernChannelIds]));
     expect(state.chatSessions.some((s) => s.id === orphanSession.id)).toBe(false);
     expect(state.chatSessions.some((s) => s.id === trulyOrphanChannel.id)).toBe(false);
     // The decoy — titled like an email-watch channel but WITHOUT the marker — is
@@ -616,9 +624,9 @@ describe("shared backing job lifecycle", () => {
     const after = readState(config.instance);
     expect(after.jobs).toHaveLength(jobsBefore);
     expect(after.chatSessions).toHaveLength(sessionsBefore);
-    // Shared session + the two live per-concern channels survive; nothing else
-    // is created or swept on the idempotent second pass.
-    expect(after.chatSessions.filter((s) => s.feature === "email-watch")).toHaveLength(3);
+    // Shared session + the two live per-concern channels + the triage channel
+    // survive; nothing else is created or swept on the idempotent second pass.
+    expect(after.chatSessions.filter((s) => s.feature === "email-watch")).toHaveLength(4);
   });
 });
 
@@ -805,5 +813,120 @@ describe("per-concern channels + fan-out routes", () => {
     await setEmailWatcherEnabled(config, watcher.id, true); // rebuild routes
     const job = readState(config.instance).jobs.find((j) => j.id === watcher.jobId);
     expect(job?.routes?.[watcher.id]?.chatSessionId).toBe(sharedSessionId);
+  });
+});
+
+describe("triage concern + intelligent router", () => {
+  // The agent's triage channel by identity (feature marker + the triage title).
+  function triageChannels(config: ReturnType<typeof buildConfig>) {
+    return readState(config.instance).chatSessions.filter(
+      (s) => s.kind === "channel" && s.feature === "email-watch" && s.title === "Inbox triage"
+    );
+  }
+  function sharedJob(config: ReturnType<typeof buildConfig>) {
+    return readState(config.instance).jobs.find(
+      (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+    );
+  }
+  function allWatches(config: ReturnType<typeof buildConfig>) {
+    return (sharedJob(config)?.preRunHook?.config as { watches?: { watcherId: string; routeKey?: string; query: string }[] }).watches ?? [];
+  }
+
+  test("the first watcher provisions a SINGLE triage channel + a broad in:inbox triage watch", async () => {
+    const config = buildConfig("ew-triage-provision");
+    await addEmailWatcher(config, { sender: "alice@x.com" });
+    // Exactly one triage channel for the agent.
+    expect(triageChannels(config)).toHaveLength(1);
+    const triageId = triageChannels(config)[0]!.id;
+    // The watch list carries the constant triage watch: broad in:inbox, keyed by
+    // the constant "triage" routeKey, with no sender/threadId (so detect treats it
+    // as the non-targeted remainder bucket).
+    const triageWatch = allWatches(config).find((w) => w.watcherId === "triage");
+    expect(triageWatch).toMatchObject({ watcherId: "triage", routeKey: "triage", query: "in:inbox" });
+    expect((triageWatch as { sender?: string }).sender).toBeUndefined();
+    expect((triageWatch as { threadId?: string }).threadId).toBeUndefined();
+    // The shared job routes the "triage" bucket into the triage channel.
+    expect(sharedJob(config)?.routes?.triage?.chatSessionId).toBe(triageId);
+  });
+
+  test("the triage concern is provisioned ONCE — adding more watchers never duplicates it", async () => {
+    const config = buildConfig("ew-triage-idempotent");
+    await addEmailWatcher(config, { sender: "bob@x.com" });
+    const triageId = triageChannels(config)[0]!.id;
+    await addEmailWatcher(config, { sender: "carol@x.com" });
+    await addEmailWatcher(config, { query: "subject:invoice" });
+    // Still exactly one triage channel (same id), one triage watch, one triage route.
+    expect(triageChannels(config)).toHaveLength(1);
+    expect(triageChannels(config)[0]!.id).toBe(triageId);
+    expect(allWatches(config).filter((w) => w.watcherId === "triage")).toHaveLength(1);
+    expect(sharedJob(config)?.routes?.triage?.chatSessionId).toBe(triageId);
+  });
+
+  test("the triage route is a CONSTRAINED subagent: respond-or-flag systemPrompt + minimal toolset whitelist", async () => {
+    const config = buildConfig("ew-triage-route");
+    await addEmailWatcher(config, { sender: "dave@x.com" });
+    const route = sharedJob(config)?.routes?.triage;
+    expect(route).toBeDefined();
+    // The respond-or-flag playbook, with the untrusted-fence rule preserved.
+    expect(route?.systemPrompt).toContain("triaging newly-arrived emails that matched no specific watch");
+    expect(route?.systemPrompt).toContain("UNTRUSTED quoted data");
+    expect(route?.systemPrompt).toContain("⏸ Needs your input");
+    expect(route?.systemPrompt).toContain("PROPOSED reply");
+    // It can escalate a coherent thread into its own concern via email_watch.
+    expect(route?.systemPrompt).toContain("email_watch");
+    expect(route?.systemPrompt).toContain("[SILENT]");
+    // The minimal whitelist: email (owns email_watch) + terminal (owns the gws CLI
+    // via terminal_exec). read_skill / the gmail skill ride in unconstrained.
+    expect(route?.toolsets).toEqual(["email", "terminal"]);
+    expect(route?.toolsets).not.toContain("messaging");
+  });
+
+  test("the triage channel is torn down with the LAST watcher", async () => {
+    const config = buildConfig("ew-triage-teardown");
+    const watcher = await addEmailWatcher(config, { sender: "erin@x.com" });
+    const triageId = triageChannels(config)[0]!.id;
+    expect(triageId).toBeString();
+    await removeEmailWatcher(config, watcher.id);
+    // No shared job left, and the triage channel was deleted (not left orphaned).
+    expect(sharedJob(config)).toBeUndefined();
+    expect(readState(config.instance).chatSessions.some((s) => s.id === triageId)).toBe(false);
+  });
+
+  test("the triage channel survives removing a non-last watcher (never swept while live)", async () => {
+    const config = buildConfig("ew-triage-survives");
+    const keep = await addEmailWatcher(config, { sender: "frank@x.com" });
+    const drop = await addEmailWatcher(config, { sender: "grace@x.com" });
+    const triageId = triageChannels(config)[0]!.id;
+    await removeEmailWatcher(config, drop.id);
+    // The remove rebuild + orphan sweep ran; the triage channel must NOT be swept.
+    expect(readState(config.instance).chatSessions.some((s) => s.id === triageId)).toBe(true);
+    expect(sharedJob(config)?.routes?.triage?.chatSessionId).toBe(triageId);
+    expect(sharedJob(config)?.routes?.[keep.id]?.chatSessionId).toBe(keep.channelId);
+  });
+
+  test("escalation: an email_watch add from a triage context mints a concern + its own route", async () => {
+    const config = buildConfig("ew-triage-escalate");
+    // A live install with triage running over one watcher.
+    const existing = await addEmailWatcher(config, { sender: "heidi@x.com" });
+    const job = sharedJob(config)!;
+    expect(job.routes?.triage).toBeDefined();
+    // The triage worker, having recognized an ongoing thread, calls email_watch —
+    // the SAME addEmailWatcher path a triage-context tool call reaches. It mints a
+    // dedicated concern (its own channel + route) and the next rebuild wires it.
+    const escalated = await addEmailWatcher(config, {
+      threadId: "t-escalated",
+      objective: "Resolve the billing dispute"
+    });
+    expect(escalated.channelId).toBeString();
+    expect(escalated.channelId).not.toBe(existing.channelId);
+    const after = sharedJob(config)!;
+    // The new concern has its own route into its own channel.
+    expect(after.routes?.[escalated.id]?.chatSessionId).toBe(escalated.channelId);
+    // The new concern is a targeted (thread) watch, so detect claims its mail before
+    // triage — the watch list carries it, and the triage watch is still present.
+    const ids = new Set(allWatches(config).map((w) => w.watcherId));
+    expect(ids.has(escalated.id)).toBe(true);
+    expect(ids.has("triage")).toBe(true);
+    expect(allWatches(config).find((w) => w.watcherId === escalated.id)).toMatchObject({ query: "thread:t-escalated" });
   });
 });

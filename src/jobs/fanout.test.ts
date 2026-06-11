@@ -156,6 +156,54 @@ describe("recurring-job fan-out", () => {
     });
   });
 
+  test("a constrained route (the triage shape) spawns a parentless subagent carrying its systemPrompt + toolset whitelist", async () => {
+    const config = buildConfig(workspaceRoot, "fanout-constrained");
+    const provider = normalizeProvider(config.provider);
+    setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+    const triageSession = "session_triage";
+    await createSession(config, triageSession);
+
+    // Detect routed the unclaimed remainder to the constant "triage" bucket.
+    __registerHookForTest("test-fanout-triage", async () => ({
+      kind: "context",
+      buckets: { triage: [{ text: "unmatched email", untrusted: true }] },
+      state: { triage: { cursor: "t1" } }
+    }));
+
+    const job = await createScheduledJob(config, {
+      name: "Email watch",
+      intervalSeconds: 60,
+      prompt: "fallback",
+      preRunHook: { handlerId: "test-fanout-triage", config: {} }
+    });
+    // The triage route the email layer builds: the respond-or-flag playbook as the
+    // worker's systemPrompt + the minimal toolset whitelist (email + terminal).
+    await setRoutes(config, job.id, {
+      triage: {
+        chatSessionId: triageSession,
+        prompt: "triage prompt",
+        systemPrompt: "You are triaging newly-arrived emails that matched no specific watch.",
+        toolsets: ["email", "terminal"]
+      }
+    });
+
+    await runJobNow(config, job.id, "manual");
+
+    const tasks = tasksInSession(config, triageSession);
+    expect(tasks).toHaveLength(1);
+    // The worker is a PARENTLESS subagent (depth cap no-ops) — never job-bound.
+    expect(tasks[0]!.parentTaskId).toBeUndefined();
+    expect(tasks[0]!.jobId).toBeUndefined();
+    expect(tasks[0]!.subagentId).toBeString();
+    // The SubagentRecord pins the constraint: the respond-or-flag systemPrompt +
+    // the email/terminal toolset whitelist (so the worker can email_watch-escalate
+    // and drive gws, but nothing broader).
+    const subagent = readState(config.instance).subagents.find((s) => s.id === tasks[0]!.subagentId);
+    expect(subagent).toBeDefined();
+    expect(subagent!.systemPrompt).toContain("triaging newly-arrived emails that matched no specific watch");
+    expect(subagent!.toolsetIds).toEqual(["email", "terminal"]);
+  });
+
   test("an empty bucket spawns no worker", async () => {
     const config = buildConfig(workspaceRoot, "fanout-empty");
     const provider = normalizeProvider(config.provider);
