@@ -2678,46 +2678,62 @@ export async function generateTaskSummary(
   const systemContext = recalledBlock.length > 0
     ? `${stablePrefix}\n\n${recalledBlock}`
     : stablePrefix;
-  if (provider.name === "anthropic" || provider.name === "bedrock") {
-    const result = provider.name === "bedrock"
-      ? await callBedrockConverse(
-          provider,
-          [
-            { role: "system", content: systemContext },
-            { role: "user", content: input }
-          ],
-          [],
-          onDelta
-        )
-      : await callAnthropicMessages(
-          provider,
-          [
-            { role: "system", content: systemContext },
-            { role: "user", content: input }
-          ],
-          [],
-          onDelta
-        );
-    return {
-      provider: result.provider,
-      text: result.text || "The model returned no text output.",
-      responseId: result.responseId,
-      usage: result.usage,
-      cost: result.cost
-    };
+  const dispatch = async (): Promise<ProviderResult> => {
+    if (provider.name === "anthropic" || provider.name === "bedrock") {
+      const result = provider.name === "bedrock"
+        ? await callBedrockConverse(
+            provider,
+            [
+              { role: "system", content: systemContext },
+              { role: "user", content: input }
+            ],
+            [],
+            onDelta
+          )
+        : await callAnthropicMessages(
+            provider,
+            [
+              { role: "system", content: systemContext },
+              { role: "user", content: input }
+            ],
+            [],
+            onDelta
+          );
+      return {
+        provider: result.provider,
+        text: result.text || "The model returned no text output.",
+        responseId: result.responseId,
+        usage: result.usage,
+        cost: result.cost
+      };
+    }
+    if (
+      provider.name === "openrouter" ||
+      provider.name === "local" ||
+      provider.name === "deepseek" ||
+      // Azure OpenAI exposes deployment-scoped chat/completions, not the flat
+      // /responses surface this path uses for standard OpenAI — route it through
+      // the chat-completions builder so the URL + api-key header come out right.
+      provider.name === "azure"
+    ) {
+      return callChatCompletions(provider, input, systemContext);
+    }
+    return callOpenAIResponses(provider, input, systemContext, onDelta);
+  };
+  try {
+    return await dispatch();
+  } catch (error) {
+    // Same resolved-provider auth tagging as generateToolCallingResponse:
+    // this is the imperative path's model call (runTask → failTask), and
+    // failTask records the needs-reauth state only for typed errors — an
+    // untyped 401 here would leave sessionless tasks invisible to the
+    // amber Settings row (issue #233).
+    const message = error instanceof Error ? error.message : String(error);
+    if (!(error instanceof ProviderAuthError) && isAuthExpiredError(message)) {
+      throw new ProviderAuthError(provider.name, message);
+    }
+    throw error;
   }
-  if (
-    provider.name === "openrouter" ||
-    provider.name === "local" ||
-    provider.name === "deepseek" ||
-    // Azure OpenAI exposes deployment-scoped chat/completions, not the flat
-    // /responses surface this path uses for standard OpenAI — route it through
-    // the chat-completions builder so the URL + api-key header come out right.
-    provider.name === "azure"
-  ) {
-    return callChatCompletions(provider, input, systemContext);
-  }
-  return callOpenAIResponses(provider, input, systemContext, onDelta);
 }
 
 // Best-effort active-agent resolution for the legacy single-shot path.

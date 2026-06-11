@@ -3488,6 +3488,30 @@ describe("auth-error classification", () => {
     }
   });
 
+  test("generateTaskSummary surfaces a backend 401 as a typed ProviderAuthError", async () => {
+    // The imperative path's model call: failTask records the needs-reauth
+    // state only for typed errors, so an untyped 401 here would leave
+    // sessionless tasks invisible to the amber Settings row.
+    const restoreEnv = setEnv("OPENROUTER_API_KEY", "sk-or-dead");
+    const fetchStub = installFetch(() =>
+      new Response(
+        JSON.stringify({ error: { message: "invalid api key" } }),
+        { status: 401, headers: { "content-type": "application/json" } }
+      )
+    );
+    try {
+      const err = await generateTaskSummary(
+        config(normalizeProvider({ name: "openrouter", model: "or-test" })),
+        "summarize this"
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("openrouter");
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
   test("openai: a missing API key env var surfaces as a typed ProviderAuthError, not a generic failure", async () => {
     // Mirrors the anthropic/bedrock pins: the missing-env message never
     // matches isAuthExpiredError, so only a typed throw reaches the
