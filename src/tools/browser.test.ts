@@ -11,6 +11,7 @@ import {
   browserFillForm,
   browserHover,
   browserNavigate,
+  browserRequests,
   browserSelectOption,
   browserSnapshot,
   browserTabs,
@@ -3127,6 +3128,110 @@ describe("browser dialog capture and browser_dialog", () => {
     const parsed = JSON.parse(raw) as { dialogs?: Array<{ message: string }> };
     expect(parsed.dialogs).toHaveLength(1);
     expect(parsed.dialogs![0]!.message).toBe("Submit [redacted] to continue?");
+  });
+});
+
+// Network capture without Chromium: a fake page records the "response" /
+// "requestfailed" listeners attachNetworkCapture installs, and tests fire
+// fake event objects through them, then read the buffer via the
+// browser_requests tool itself.
+describe("browser network capture and browser_requests", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.resetFilledSecretsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  function makeNetworkPage(url = "https://example.com/") {
+    const handlers = new Map<string, (arg: unknown) => void>();
+    const page = {
+      ...makeFakePageForRefTools(url),
+      on: (event: string, cb: (arg: unknown) => void) => {
+        handlers.set(event, cb);
+      }
+    };
+    return { page: page as unknown as import("playwright-core").Page, handlers };
+  }
+
+  function fakeResponse(url: string, status = 200, method = "GET", resourceType = "fetch") {
+    return {
+      url: () => url,
+      status: () => status,
+      request: () => ({ method: () => method, resourceType: () => resourceType })
+    };
+  }
+
+  function fakeFailedRequest(url: string, errorText: string, method = "GET", resourceType = "fetch") {
+    return {
+      url: () => url,
+      method: () => method,
+      resourceType: () => resourceType,
+      failure: () => ({ errorText })
+    };
+  }
+
+  test("records responses and failures in order and returns them via browser_requests", async () => {
+    const { page, handlers } = makeNetworkPage();
+    browserTest.installFakeSessionWithPageForTest("net-task", page as Partial<import("playwright-core").Page>);
+    browserTest.attachNetworkCaptureForTest("net-task", page);
+    handlers.get("response")!(fakeResponse("https://api.example.com/items", 200, "GET", "fetch"));
+    handlers.get("response")!(fakeResponse("https://api.example.com/save", 500, "POST", "xhr"));
+    handlers.get("requestfailed")!(fakeFailedRequest("https://cdn.example.com/app.js", "net::ERR_CONNECTION_REFUSED", "GET", "script"));
+
+    const raw = await browserRequests("net-task", {});
+    const parsed = JSON.parse(raw) as {
+      success: boolean;
+      requests?: Array<{ method: string; url: string; status: number | null; resourceType: string; failure?: string }>;
+    };
+    expect(parsed.success).toBe(true);
+    expect(parsed.requests).toHaveLength(3);
+    expect(parsed.requests![0]).toEqual({ method: "GET", url: "https://api.example.com/items", status: 200, resourceType: "fetch" });
+    expect(parsed.requests![1]).toEqual({ method: "POST", url: "https://api.example.com/save", status: 500, resourceType: "xhr" });
+    expect(parsed.requests![2]).toEqual({
+      method: "GET",
+      url: "https://cdn.example.com/app.js",
+      status: null,
+      resourceType: "script",
+      failure: "net::ERR_CONNECTION_REFUSED"
+    });
+  });
+
+  test("the ring buffer keeps only the most recent 100 entries", async () => {
+    const { page, handlers } = makeNetworkPage();
+    browserTest.installFakeSessionWithPageForTest("net-cap", page as Partial<import("playwright-core").Page>);
+    browserTest.attachNetworkCaptureForTest("net-cap", page);
+    for (let i = 1; i <= 105; i++) {
+      handlers.get("response")!(fakeResponse(`https://example.com/r/${i}`));
+    }
+    const parsed = JSON.parse(await browserRequests("net-cap", {})) as { requests?: Array<{ url: string }> };
+    expect(parsed.requests).toHaveLength(100);
+    expect(parsed.requests![0]!.url).toBe("https://example.com/r/6");
+    expect(parsed.requests![99]!.url).toBe("https://example.com/r/105");
+  });
+
+  test("filter narrows by URL substring", async () => {
+    const { page, handlers } = makeNetworkPage();
+    browserTest.installFakeSessionWithPageForTest("net-filter", page as Partial<import("playwright-core").Page>);
+    browserTest.attachNetworkCaptureForTest("net-filter", page);
+    handlers.get("response")!(fakeResponse("https://api.example.com/items"));
+    handlers.get("response")!(fakeResponse("https://cdn.example.com/app.js"));
+
+    const parsed = JSON.parse(await browserRequests("net-filter", { filter: "api." })) as { requests?: Array<{ url: string }> };
+    expect(parsed.requests).toHaveLength(1);
+    expect(parsed.requests![0]!.url).toBe("https://api.example.com/items");
+  });
+
+  test("a registered secret inside a recorded URL is redacted in the tool result", async () => {
+    const { page, handlers } = makeNetworkPage();
+    browserTest.installFakeSessionWithPageForTest("net-redact", page as Partial<import("playwright-core").Page>);
+    browserTest.attachNetworkCaptureForTest("net-redact", page);
+    browserTest.recordFilledSecretForTest("net-redact", "hunter2secret");
+    handlers.get("response")!(fakeResponse("https://evil.example.com/?q=hunter2secret"));
+
+    const raw = await browserRequests("net-redact", {});
+    expect(raw).not.toContain("hunter2secret");
+    const parsed = JSON.parse(raw) as { requests?: Array<{ url: string }> };
+    expect(parsed.requests![0]!.url).toBe("https://evil.example.com/?q=[redacted]");
   });
 });
 

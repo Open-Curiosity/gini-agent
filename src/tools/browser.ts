@@ -690,11 +690,13 @@ async function getOrCreate(taskId: string): Promise<Session> {
     };
     sessions.set(taskId, session);
     // Attach console capture eagerly so page.goto errors before the
-    // agent's first browser_console call are still observable, and the
+    // agent's first browser_console call are still observable, the
     // dialog handler so the very first navigation's dialogs are
-    // captured instead of silently auto-dismissed by Playwright.
+    // captured instead of silently auto-dismissed by Playwright, and
+    // the network log so the first page load's requests are visible.
     attachConsole(taskId, page);
     attachDialogHandler(taskId, page);
+    attachNetworkCapture(taskId, page);
     return session;
   })().finally(() => {
     pendingSessions.delete(taskId);
@@ -747,6 +749,7 @@ async function closeSession(taskId: string): Promise<void> {
   consoleLogs.delete(taskId);
   pendingDialogResponses.delete(taskId);
   unreportedDialogs.delete(taskId);
+  networkLogs.delete(taskId);
   // Drop the per-task secret-redaction registry when the session
   // closes. The DOM is gone (the page closes below), so the
   // registry would never be consulted again for this task —
@@ -2761,6 +2764,63 @@ function takeUnreportedDialogs(taskId: string): DialogRecord[] {
   return buf;
 }
 
+// Read-only network request visibility. Per-task ring buffer of the most
+// recent completed (and failed) requests on agent-owned pages — method,
+// URL, status, resourceType, optional failure text. No bodies, no
+// headers, no interception/mocking: this is observability only, read by
+// browser_requests. Plain strings keep the buffer cheap; the cap bounds
+// memory on chatty pages (analytics beacons, polling).
+interface NetworkLogEntry {
+  method: string;
+  url: string;
+  status: number | null;
+  resourceType: string;
+  failure?: string;
+}
+const NETWORK_LOG_CAP = 100;
+const networkLogs = new Map<string, NetworkLogEntry[]>();
+const networkHooked = new WeakSet<Page>();
+
+function attachNetworkCapture(taskId: string, page: Page): void {
+  // Fake test pages may not expose .on — same typeof-guard pattern
+  // snapshot() uses for page.url.
+  if (typeof page.on !== "function" || networkHooked.has(page)) return;
+  networkHooked.add(page);
+  const push = (entry: NetworkLogEntry): void => {
+    const buf = networkLogs.get(taskId) ?? [];
+    buf.push(entry);
+    if (buf.length > NETWORK_LOG_CAP) buf.splice(0, buf.length - NETWORK_LOG_CAP);
+    networkLogs.set(taskId, buf);
+  };
+  page.on("response", (response) => {
+    try {
+      const request = response.request();
+      push({
+        method: request.method(),
+        url: response.url(),
+        status: response.status(),
+        resourceType: request.resourceType()
+      });
+    } catch {
+      // A response whose request handle is already gone (page teardown
+      // race) just doesn't get logged.
+    }
+  });
+  page.on("requestfailed", (request) => {
+    try {
+      push({
+        method: request.method(),
+        url: request.url(),
+        status: null,
+        resourceType: request.resourceType(),
+        failure: request.failure()?.errorText ?? "failed"
+      });
+    } catch {
+      // ignore — same teardown race as above
+    }
+  });
+}
+
 function attachDialogHandler(taskId: string, page: Page): void {
   // Fake test pages may not expose .on — same typeof-guard pattern
   // snapshot() uses for page.url.
@@ -2935,6 +2995,29 @@ export async function browserDialog(taskId: string, args: Record<string, unknown
         url: typeof session.page.url === "function" ? session.page.url() : "",
         armed: action,
         ...(promptText !== undefined ? { promptText } : {})
+      }, taskId);
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Read-only list of the task's recent network requests (see
+// attachNetworkCapture). URLs ride the standard ok() redaction pass, so
+// a registered secret appearing in a recorded URL never reaches the
+// model verbatim.
+export async function browserRequests(taskId: string, args: Record<string, unknown>): Promise<string> {
+  if (args.filter !== undefined && typeof args.filter !== "string") {
+    return fail("Argument 'filter' must be a string.");
+  }
+  const filter = str(args.filter);
+  try {
+    return await withSession(taskId, async (session) => {
+      const all = networkLogs.get(taskId) ?? [];
+      const requests = filter ? all.filter((r) => r.url.includes(filter)) : all;
+      return ok({
+        url: typeof session.page.url === "function" ? session.page.url() : "",
+        requests
       }, taskId);
     });
   } catch (error) {
@@ -3250,6 +3333,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         const id = tabHandleFor(session, page);
         attachConsole(taskId, page);
         attachDialogHandler(taskId, page);
+        attachNetworkCapture(taskId, page);
         if (url) {
           await page.goto(url, { waitUntil: "domcontentloaded" });
         }
@@ -3286,8 +3370,10 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         session.page = target;
         // The target may be a user-opened tab or window.open popup that
         // never went through getOrCreate / tabs:new — hook its dialogs
-        // now that the agent is acting on it (idempotent via WeakSet).
+        // and network log now that the agent is acting on it
+        // (idempotent via WeakSet).
         attachDialogHandler(taskId, target);
+        attachNetworkCapture(taskId, target);
         await target.bringToFront().catch(() => undefined);
         const snap = await snapshot(session.page, false, taskId);
         session.refs = snap.refs;
@@ -3331,8 +3417,10 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
           session.page = fallback;
         }
         // Whichever page became active — an adopted survivor or the
-        // fresh fallback — gets the dialog hook (idempotent via WeakSet).
+        // fresh fallback — gets the dialog and network hooks
+        // (idempotent via WeakSet).
         attachDialogHandler(taskId, session.page);
+        attachNetworkCapture(taskId, session.page);
       } else {
         // Active page didn't change, but refs map points at the old
         // snapshot we're about to refresh — drop it now for consistency
@@ -3954,6 +4042,13 @@ export const __test = {
     filledSecretValues.clear();
     pendingDialogResponses.clear();
     unreportedDialogs.clear();
+    networkLogs.clear();
+  },
+  // Hook a fake page's response/requestfailed events for a task exactly
+  // as getOrCreate / browser_tabs would, so network capture can be
+  // exercised by invoking the registered handlers — no Chromium.
+  attachNetworkCaptureForTest(taskId: string, page: Page): void {
+    attachNetworkCapture(taskId, page);
   },
   // Hook a fake page's dialog events for a task exactly as getOrCreate /
   // browser_tabs would, so dialog capture can be exercised by invoking

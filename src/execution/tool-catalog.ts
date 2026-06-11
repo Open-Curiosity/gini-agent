@@ -513,6 +513,23 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "browser",
+    displayLabel: "List network requests",
+    deferred: true,
+    indexSummary: "List recent network requests from the current browser session (method, URL, status; no bodies).",
+    type: "function",
+    function: {
+      name: "browser_requests",
+      description: "List the most recent network requests observed on the task's browser pages (up to the last 100): method, URL, status, resourceType, and failure text for requests that never completed. Read-only — no request/response bodies, no headers, no interception. Useful for spotting failed API calls, redirects, or what a page is talking to.",
+      parameters: {
+        type: "object",
+        properties: {
+          filter: { type: "string", description: "Optional substring; only requests whose URL contains it are returned." }
+        }
+      }
+    }
+  },
+  {
+    toolset: "browser",
     displayLabel: "Close browser",
     deferred: true,
     indexSummary: "Close the browser session for the current task.",
@@ -2457,6 +2474,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(
         `${previewValue(safe.fromRef)} → ${previewValue(safe.toRef)}`
       );
+    case "browser_requests":
+      return truncatePreview(previewValue(safe.filter));
     case "browser_snapshot":
     case "browser_back":
     case "browser_close":
