@@ -348,7 +348,12 @@ export async function setSetupProvider(
     return { ok: true, provider: providerHealth(config), plistRefreshNeeded: false };
   }
   // providerName === "codex"
-  let codexProbe = probeCodexCredentials(config.provider);
+  // Pin the provider across the retry: the 50ms wait is a real macrotask, so
+  // a concurrent provider switch could otherwise make the retry resolve a
+  // different auth file (apiKeyEnv) than the first attempt — the same
+  // resolved-at-entry pinning the connector probe and call attribution use.
+  const verifyProvider = config.provider;
+  let codexProbe = probeCodexCredentials(verifyProvider);
   if (!codexProbe.ok && codexProbe.transient) {
     // Mid-rewrite torn read of auth.json — same single-retry contract as the
     // connector probe (readCredentialProbe) and the chat path's
@@ -356,7 +361,7 @@ export async function setSetupProvider(
     // fully-authenticated user (or an unattended set_provider flow) that
     // raced the codex CLI's non-atomic rewrite.
     await new Promise<void>((resolve) => setTimeout(resolve, CODEX_RETRY_REWRITE_DELAY_MS));
-    codexProbe = probeCodexCredentials(config.provider);
+    codexProbe = probeCodexCredentials(verifyProvider);
   }
   if (!codexProbe.ok) {
     return {

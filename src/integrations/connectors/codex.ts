@@ -33,18 +33,6 @@ export function __setCodexWhichForTests(impl: ((bin: string) => string | null) |
   whichImpl = impl ?? whichBinary;
 }
 
-// Pure auth evaluation, shared by probe() and exercised directly in tests.
-//
-//   - usable OAuth token with a PAST JWT `exp` → not ok, message names the
-//     expiry time and instructs `codex login` (re-auth is a terminal flow).
-//   - usable OAuth token with a future / undecodable `exp` → ok. An
-//     unparseable token means the expiry is UNKNOWN, not that the token is
-//     bad — only the backend can decide that, and the probe makes no calls.
-//   - api_key-shaped credentials carry no exp → presence-only ok.
-//   - no usable file credentials but OPENAI_API_KEY in env → ok (the same
-//     fallback the codex CLI itself honors).
-//   - nothing anywhere → not ok with the resolver's own message (it names
-//     the path it looked at).
 // ISO timestamp at which a probe's OAuth access token provably expired, or
 // undefined when it is not provably expired: api_key-shaped credentials carry
 // no exp, unparseable tokens are "expiry unknown" (decodeJwtExp already
@@ -60,6 +48,18 @@ export function codexAccessTokenExpiredAt(
   return new Date(creds.accessTokenExp * 1000).toISOString();
 }
 
+// Pure auth evaluation, shared by probe() and exercised directly in tests.
+//
+//   - usable OAuth token with a PAST JWT `exp` → not ok, message names the
+//     expiry time and instructs `codex login` (re-auth is a terminal flow).
+//   - usable OAuth token with a future / undecodable `exp` → ok. An
+//     unparseable token means the expiry is UNKNOWN, not that the token is
+//     bad — only the backend can decide that, and the probe makes no calls.
+//   - api_key-shaped credentials carry no exp → presence-only ok.
+//   - no usable file credentials but OPENAI_API_KEY in env → ok (the same
+//     fallback the codex CLI itself honors).
+//   - nothing anywhere → not ok with the resolver's own message (it names
+//     the path it looked at).
 export function evaluateCodexAuth(
   creds: CodexCredentialProbe,
   env: { OPENAI_API_KEY?: string },
