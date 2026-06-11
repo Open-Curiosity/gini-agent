@@ -2667,12 +2667,13 @@ function str(value: unknown): string | undefined {
 // snapshot walker — a useless, near-empty tree. Detect the PDF at the
 // navigation boundary via the response content-type and return extracted
 // text (bounded to the snapshot char budget) instead of a DOM snapshot.
-// The bytes come from the already-buffered navigation response (no second
-// fetch — the URL has already passed the SSRF gate + domain policy +
-// post-redirect re-checks). Extraction reuses the shared attachment
-// extractor (lazy pdfjs-dist); when bytes or extraction are unavailable
-// the result still flags `pdf: true` with an honest note so the model
-// stops re-snapshotting.
+// The bytes come from the navigation response when it can be buffered,
+// falling back to a context-request re-fetch of the same gated URL (the
+// URL has already passed the SSRF gate + domain policy + post-redirect
+// re-checks). Extraction reuses the shared attachment extractor (lazy
+// pdfjs-dist); when bytes or extraction are unavailable the result still
+// flags `pdf: true` with an honest note so the model stops
+// re-snapshotting.
 
 // Cap on PDF bytes handed to the extractor. Injectable for tests.
 const PDF_EXTRACT_MAX_BYTES_DEFAULT = 20 * 1024 * 1024;
@@ -2721,7 +2722,42 @@ async function pdfNavigateResult(
   } catch {
     bytes = null;
   }
-  if (bytes && bytes.byteLength > pdfExtractMaxBytes) {
+  if (bytes && bytes.byteLength === 0) bytes = null;
+  // Chrome's PDF viewer intercepts main-frame PDF responses, so
+  // response.body() throws on real PDF navigations (it only works for
+  // sub-resource responses and test fakes). Re-fetch the bytes through
+  // the context's own request API: finalUrl is the SAME post-redirect URL
+  // that already passed safetyCheck + domain policy above, so the gating
+  // is preserved, and page.request rides the context's cookies/auth.
+  let fetchOversize = false;
+  if (!bytes) {
+    const requestApi = (session.page as unknown as {
+      request?: {
+        get?: (url: string) => Promise<{
+          headers: () => Record<string, string>;
+          body: () => Promise<Uint8Array>;
+        }>;
+      };
+    }).request;
+    if (requestApi && typeof requestApi.get === "function") {
+      try {
+        const fetched = await requestApi.get(finalUrl);
+        // Honor the byte cap before buffering: a declared content-length
+        // over the cap skips the body read entirely; otherwise the
+        // fetched body falls through to the shared byteLength check.
+        const declared = Number(fetched.headers()["content-length"]);
+        if (Number.isFinite(declared) && declared > pdfExtractMaxBytes) {
+          fetchOversize = true;
+        } else {
+          const body = await fetched.body();
+          bytes = body.byteLength > 0 ? body : null;
+        }
+      } catch {
+        bytes = null;
+      }
+    }
+  }
+  if (fetchOversize || (bytes && bytes.byteLength > pdfExtractMaxBytes)) {
     return ok({
       url: finalUrl,
       status,
@@ -2729,13 +2765,21 @@ async function pdfNavigateResult(
       note: `This URL is a PDF document larger than the ${Math.floor(pdfExtractMaxBytes / (1024 * 1024))}MB extraction cap; no text was extracted. There is no DOM to snapshot — do not re-snapshot this page.`
     }, taskId);
   }
+  // Both retrieval attempts failed — degrade honestly, naming the cause
+  // so the model doesn't blame the extractor.
+  if (!bytes) {
+    return ok({
+      url: finalUrl,
+      status,
+      pdf: true,
+      note: "This URL is a PDF document; text extraction was not possible (could not retrieve PDF bytes). There is no DOM to snapshot — do not re-snapshot this page. If the user needs its contents, report that the PDF could not be read."
+    }, taskId);
+  }
   let text: string | null = null;
-  if (bytes) {
-    try {
-      text = (await pdfTextExtractor(bytes))?.text ?? null;
-    } catch {
-      text = null;
-    }
+  try {
+    text = (await pdfTextExtractor(bytes))?.text ?? null;
+  } catch {
+    text = null;
   }
   if (text === null) {
     return ok({
@@ -4627,8 +4671,10 @@ let downloadMaxBytes = DOWNLOAD_MAX_BYTES_DEFAULT;
 
 // How long to wait for the page to actually start a download after the
 // approved click. Generous because the server decides when the
-// Content-Disposition response begins.
-const DOWNLOAD_EVENT_TIMEOUT_MS = 30_000;
+// Content-Disposition response begins. Injectable for tests via
+// __test.setDownloadEventTimeoutForTest.
+const DOWNLOAD_EVENT_TIMEOUT_MS_DEFAULT = 30_000;
+let downloadEventTimeoutMs = DOWNLOAD_EVENT_TIMEOUT_MS_DEFAULT;
 
 // Reduce a server-suggested filename to a safe basename. The suggested
 // name is attacker-controlled (the remote server picks it), so path
@@ -4681,13 +4727,25 @@ export async function browserDownloadApproved(
       if (typeof session.page.waitForEvent !== "function") {
         return fail("Download capture is not supported by this browser session.");
       }
-      const downloadPromise = session.page.waitForEvent("download", { timeout: DOWNLOAD_EVENT_TIMEOUT_MS });
+      const downloadPromise = session.page.waitForEvent("download", { timeout: downloadEventTimeoutMs });
       // Pre-attach a no-op catch: if the click below throws (and we
       // return its failure), the still-pending wait eventually times out
       // and must not surface as an unhandled rejection.
       downloadPromise.catch(() => undefined);
       await target.locator.click({ timeout: 10_000 });
-      const download = await downloadPromise;
+      let download: Awaited<typeof downloadPromise>;
+      try {
+        download = await downloadPromise;
+      } catch {
+        // The wait expired (or the page went away) with no download
+        // event. The common cause: the link points at content the
+        // browser renders inline (Chrome opens PDFs in its viewer
+        // instead of downloading), so no download ever fires. Steer the
+        // model to the path that works for inline content.
+        return fail(
+          "The click did not trigger a file download. Content the browser renders inline (like PDFs) never fires a download — use browser_navigate to open the URL instead; PDF text is extracted on navigation."
+        );
+      }
       // Trust boundary: the approval named the PAGE the click happens on,
       // but the browser fetches the download from wherever the element
       // points (redirect targets, signed CDN URLs, attacker-controlled
@@ -4967,6 +5025,11 @@ export const __test = {
   // need to materialize a 50MB file. Pass null to restore the default.
   setDownloadMaxBytesForTest(value: number | null): void {
     downloadMaxBytes = value ?? DOWNLOAD_MAX_BYTES_DEFAULT;
+  },
+  // Shrink the download-event wait so the no-download failure path can be
+  // exercised without the 30s production timeout. Pass null to restore.
+  setDownloadEventTimeoutForTest(value: number | null): void {
+    downloadEventTimeoutMs = value ?? DOWNLOAD_EVENT_TIMEOUT_MS_DEFAULT;
   },
   // Stub the PDF text extractor so navigation tests never load
   // pdfjs-dist. Pass null to restore the lazy attachment-extract path.

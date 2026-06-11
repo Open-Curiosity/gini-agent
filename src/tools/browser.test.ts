@@ -4985,6 +4985,12 @@ describe("browserNavigate PDF handling", () => {
   function makePdfPage(opts: {
     contentType?: string;
     body?: (() => Promise<Uint8Array>) | null;
+    request?: {
+      get: (url: string) => Promise<{
+        headers: () => Record<string, string>;
+        body: () => Promise<Uint8Array>;
+      }>;
+    };
   } = {}): Partial<import("playwright-core").Page> {
     const response = {
       status: () => 200,
@@ -4995,8 +5001,9 @@ describe("browserNavigate PDF handling", () => {
       url: () => PDF_URL,
       title: async () => "invoice.pdf",
       goto: (async () => response) as unknown as import("playwright-core").Page["goto"],
-      evaluate: (async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 })) as unknown as import("playwright-core").Page["evaluate"]
-    };
+      evaluate: (async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 })) as unknown as import("playwright-core").Page["evaluate"],
+      ...(opts.request ? { request: opts.request } : {})
+    } as Partial<import("playwright-core").Page>;
   }
 
   afterEach(() => {
@@ -5062,6 +5069,94 @@ describe("browserNavigate PDF handling", () => {
     expect(extractorCalls).toBe(0);
   });
 
+  test("re-fetches PDF bytes via the context request API when the response body is unavailable", async () => {
+    // Chrome's PDF viewer intercepts main-frame PDF responses, so
+    // response.body() throws on real PDF navigations — the page.request
+    // re-fetch of the already-gated final URL is the path real PDFs take.
+    browserTest.setPdfTextExtractorForTest(async (bytes) => ({ text: `extracted:${bytes.byteLength}` }));
+    let fetchedUrl: string | undefined;
+    browserTest.installFakeSessionWithPageForTest("pdf-refetch", makePdfPage({
+      body: async () => {
+        throw new Error("Protocol error (Network.getResponseBody): No resource with given identifier found");
+      },
+      request: {
+        get: async (url) => {
+          fetchedUrl = url;
+          return {
+            headers: () => ({}),
+            body: async () => new TextEncoder().encode("%PDF-1.4 real bytes")
+          };
+        }
+      }
+    }));
+
+    const raw = await browserNavigate("pdf-refetch", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; pdfText?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    // The extractor ran on the re-fetched bytes ("%PDF-1.4 real bytes" = 19).
+    expect(parsed.pdfText).toBe("extracted:19");
+    expect(fetchedUrl).toBe(PDF_URL);
+  });
+
+  test("notes that the PDF bytes could not be retrieved when both body and re-fetch fail", async () => {
+    let extractorCalls = 0;
+    browserTest.setPdfTextExtractorForTest(async () => {
+      extractorCalls++;
+      return { text: "should not run" };
+    });
+    browserTest.installFakeSessionWithPageForTest("pdf-no-bytes", makePdfPage({
+      body: async () => {
+        throw new Error("intercepted");
+      },
+      request: {
+        get: async () => {
+          throw new Error("net::ERR_FAILED");
+        }
+      }
+    }));
+
+    const raw = await browserNavigate("pdf-no-bytes", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; note?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.note).toContain("could not retrieve PDF bytes");
+    expect(parsed.note).toContain("do not re-snapshot");
+    expect(extractorCalls).toBe(0);
+  });
+
+  test("enforces the byte cap on re-fetched bytes via content-length before buffering", async () => {
+    let extractorCalls = 0;
+    let bodyReads = 0;
+    browserTest.setPdfTextExtractorForTest(async () => {
+      extractorCalls++;
+      return { text: "should not run" };
+    });
+    browserTest.setPdfExtractMaxBytesForTest(8);
+    browserTest.installFakeSessionWithPageForTest("pdf-refetch-cap", makePdfPage({
+      body: async () => {
+        throw new Error("intercepted");
+      },
+      request: {
+        get: async () => ({
+          headers: () => ({ "content-length": "100" }),
+          body: async () => {
+            bodyReads++;
+            return new Uint8Array(100);
+          }
+        })
+      }
+    }));
+
+    const raw = await browserNavigate("pdf-refetch-cap", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; note?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.note).toContain("extraction cap");
+    expect(bodyReads).toBe(0);
+    expect(extractorCalls).toBe(0);
+  });
+
   test("non-PDF responses keep the normal snapshot path", async () => {
     let extractorCalls = 0;
     browserTest.setPdfTextExtractorForTest(async () => {
@@ -5099,6 +5194,7 @@ describe("browserDownloadApproved", () => {
     browserTest.clearFakeSessionsForTest();
     browserTest.setInFlightDisconnectsForTest(0);
     browserTest.setDownloadMaxBytesForTest(null);
+    browserTest.setDownloadEventTimeoutForTest(null);
     if (prevStateRoot === undefined) delete process.env.GINI_STATE_ROOT;
     else process.env.GINI_STATE_ROOT = prevStateRoot;
     rmSync(DL_ROOT, { recursive: true, force: true });
@@ -5279,6 +5375,41 @@ describe("browserDownloadApproved", () => {
     expect(parsed.success).toBe(false);
     expect(parsed.error).toContain("Unknown ref @e99");
     expect(healingQueried).toBe(0);
+  });
+
+  test("fails with a browser_navigate steer when the click never triggers a download", async () => {
+    // Inline-rendering links (Chrome opens PDFs in its viewer) never fire
+    // the download event, so the wait times out. The failure must tell
+    // the model to reach inline content via browser_navigate instead.
+    browserTest.setDownloadEventTimeoutForTest(25);
+    let clicks = 0;
+    const fakePage = {
+      ...makeFakePageForRefTools("https://portal.example.com/invoices"),
+      // Honors the injected timeout: rejects like Playwright's
+      // TimeoutError when no download event arrives in time.
+      waitForEvent: ((_event: string, opts?: { timeout?: number }) =>
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`Timeout ${opts?.timeout}ms exceeded while waiting for event "download"`)),
+            opts?.timeout ?? 0
+          )
+        )) as unknown as import("playwright-core").Page["waitForEvent"]
+    };
+    browserTest.installFakeSessionWithPageForTest("dl-timeout", fakePage);
+    const refs = new Map<string, unknown>();
+    refs.set("@e2", {
+      click: async () => {
+        clicks++;
+      }
+    });
+    browserTest.setFakeSessionRefsForTest("dl-timeout", refs);
+
+    const raw = await browserDownloadApproved("dl-timeout", "@e2", "dl-timeout-inst");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(clicks).toBe(1);
+    expect(parsed.error).toContain("did not trigger a file download");
+    expect(parsed.error).toContain("browser_navigate");
   });
 
   test("surfaces a click failure as the tool error", async () => {
