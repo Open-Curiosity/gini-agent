@@ -371,6 +371,16 @@ export async function addEmailWatcher(
   // Ensure the shared job + session before creating the record, so the new
   // watcher points at them and the rebuild below has a job to update.
   const owningAgentId = input.agentId ?? readState(config.instance).activeAgentId;
+
+  // Idempotency guard: triage auto-escalation can call this with the same thread
+  // (or sender) more than once. Return an existing enabled watcher for the same
+  // owning agent + same thread (thread watch) or same sender with no thread
+  // (sender watch) instead of minting a duplicate channel + route.
+  const existing = enabledWatchersForAgent(readState(config.instance), owningAgentId).find((w) =>
+    threadId ? w.threadId === threadId : sender !== undefined && w.sender === sender && !w.threadId
+  );
+  if (existing) return existing;
+
   const shared = await ensureSharedJobAndSession(config, owningAgentId);
 
   // Provision this concern's OWN channel before the rebuild, so the route built

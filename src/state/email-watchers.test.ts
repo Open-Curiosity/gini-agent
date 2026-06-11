@@ -330,6 +330,32 @@ describe("shared backing job lifecycle", () => {
     expect(routes[w2.id]?.chatSessionId).toBe(w2.channelId!);
   });
 
+  test("a duplicate add (same thread or sender) returns the existing watcher, no new channel/route", async () => {
+    const config = buildConfig("ew-dedup");
+    // Sender watch: a second add with the same sender returns the same watcher.
+    const s1 = await addEmailWatcher(config, { sender: "alice@x.com" });
+    const s2 = await addEmailWatcher(config, { sender: "alice@x.com" });
+    expect(s2.id).toBe(s1.id);
+    // Thread watch: a second add with the same thread returns the same watcher.
+    const t1 = await addEmailWatcher(config, { threadId: "t-dup" });
+    const t2 = await addEmailWatcher(config, { threadId: "t-dup" });
+    expect(t2.id).toBe(t1.id);
+
+    const state = readState(config.instance);
+    // Exactly two distinct watchers (one sender, one thread) — no duplicates.
+    expect(state.emailWatchers).toHaveLength(2);
+    // One channel per distinct concern (plus the shared session + the triage
+    // channel); the duplicate adds minted no extra channels or routes.
+    const channels = state.chatSessions.filter((s) => s.feature === "email-watch" && s.kind === "channel");
+    const concernChannels = channels.filter((s) => s.title !== "Inbox triage");
+    // shared session + 2 concern channels = 3.
+    expect(concernChannels).toHaveLength(3);
+    const jobs = state.jobs.filter((j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch");
+    const routes = jobs[0]!.routes ?? {};
+    // Routes for exactly the two watchers + triage (no dup route keys).
+    expect(Object.keys(routes).sort()).toEqual([s1.id, t1.id, "triage"].sort());
+  });
+
   test("removing one of several rebuilds watches but keeps the shared job + session", async () => {
     const config = buildConfig("ew-job-remove-one");
     const w1 = await addEmailWatcher(config, { sender: "alice@x.com" });
