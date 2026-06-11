@@ -171,6 +171,17 @@ const KEEP_RECENT_TOOL_RESULTS = 6;
 const ELIDED_TOOL_RESULT_MARKER =
   "[Earlier tool result elided to fit the context window. Re-run the tool if you still need its output.]";
 
+// Extract the provider-reported prompt token count from a model-call usage
+// record. Anthropic reports `input_tokens` (Bedrock Converse usage is
+// normalized to the same key in provider.ts); OpenAI-compatible providers
+// report `prompt_tokens`. Returns undefined when the provider sent no usable
+// count (e.g. the echo provider, or an OpenAI-compatible endpoint that omits
+// usage). Exported for unit testing.
+export function promptTokensFromUsage(usage: Record<string, unknown> | undefined): number | undefined {
+  const raw = usage?.input_tokens ?? usage?.prompt_tokens;
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : undefined;
+}
+
 // Pure step for the navigation-without-action counter. Given the prior count
 // and the tool names emitted this iteration (in order), returns the next count:
 // a navigation tool increments, a page-action resets to 0, anything neutral
@@ -1527,6 +1538,20 @@ async function runLoop(
   );
   // One elision warning trace per turn (not per iteration).
   let elisionTraced = false;
+  // Calibration for the in-turn trim budget. The chars/4 estimate can
+  // undercount what the provider actually tokenizes (tokenizer overhead,
+  // non-Latin text, JSON envelopes, image parts), so after every provider
+  // call that reports real usage we record the gap between the reported
+  // prompt size and our estimate of the exact payload we sent (messages +
+  // tool schemas):
+  //   gap = max(0, observedPromptTokens − estimatedPromptTokens)
+  // The next iteration's elision budget is tightened by this gap, so the
+  // trim threshold is driven by real provider-reported prompt tokens
+  // whenever they exist. Clamped at 0 so a provider reporting FEWER tokens
+  // than the estimate never loosens the budget. Providers that report no
+  // usage (echo, some OpenAI-compatible endpoints) leave the gap at 0 —
+  // identical to the plain chars/4 behavior.
+  let promptTokenEstimateGap = 0;
 
   const { cap, warnReason } = resolveIterationCap(config);
   if (warnReason) {
@@ -1825,19 +1850,29 @@ async function runLoop(
 
     // Trim accumulated tool-result content to fit the live context window before
     // the call. `providerTools` is recomputed by recompute(), so re-estimate the
-    // schema cost each iteration. Elision mutates `workingMessages` in place, so
-    // an old result stays elided once shrunk — bounding growth across the loop.
+    // schema cost each iteration. The budget is tightened by the calibration gap
+    // observed on the previous provider call (see promptTokenEstimateGap above),
+    // so real provider-reported prompt tokens drive the trim trigger when
+    // available. Elision mutates `workingMessages` in place, so an old result
+    // stays elided once shrunk — bounding growth across the loop.
     const toolSchemaTokens = estimateTextTokens(JSON.stringify(providerTools));
-    const liveMessageBudget = Math.max(0, contextWindowTokens - responseReserveTokens - toolSchemaTokens);
+    const liveMessageBudget = Math.max(
+      0,
+      contextWindowTokens - responseReserveTokens - toolSchemaTokens - promptTokenEstimateGap
+    );
     const elided = elideOldToolResultsToBudget(workingMessages, liveMessageBudget);
     if (elided > 0 && !elisionTraced) {
       elisionTraced = true;
       appendTrace(config.instance, taskId, {
         type: "warning",
         message: `Elided ${elided} earlier tool result(s) to fit the context window.`,
-        data: { iterations, elided, liveMessageBudget }
+        data: { iterations, elided, liveMessageBudget, promptTokenEstimateGap }
       });
     }
+    // Estimate of the exact payload going to the provider (post-elision
+    // messages + tool schemas) — the comparison base for the calibration gap
+    // updated from this call's reported usage below.
+    const estimatedPromptTokens = estimateToolCallingMessagesTokens(workingMessages) + toolSchemaTokens;
 
     let result: Awaited<ReturnType<typeof generateToolCallingResponse>>;
     try {
@@ -1864,6 +1899,15 @@ async function runLoop(
     await flushChain;
     await enqueueFlush();
     accumulatedCost = addCost(accumulatedCost, result.cost);
+    // Recalibrate the trim budget from the provider's real prompt-token
+    // count for this call (when reported). Applies from the NEXT iteration's
+    // elision pass onward.
+    {
+      const observedPromptTokens = promptTokensFromUsage(result.usage);
+      if (observedPromptTokens !== undefined) {
+        promptTokenEstimateGap = Math.max(0, observedPromptTokens - estimatedPromptTokens);
+      }
+    }
 
     // First successful provider call in this runLoop entry: commit the
     // deferred identity snapshot. We only persist once per fresh

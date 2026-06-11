@@ -45,7 +45,8 @@ import {
   buildMcpServersBlock,
   buildSkillScriptsBlock,
   elideOldToolResultsToBudget,
-  nextNavWithoutAction
+  nextNavWithoutAction,
+  promptTokensFromUsage
 } from "./chat-task";
 import type { EffectiveContext } from "./effective-context";
 
@@ -3041,6 +3042,108 @@ describe("chat-task loop", () => {
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
+
+  // Provider-reported prompt tokens drive the in-turn trim trigger. The
+  // chars/4 estimate here stays far under the echo provider's 32k-token
+  // window, so without calibration no elision would ever fire. A stubbed
+  // call reporting an enormous real prompt_tokens count must tighten the
+  // NEXT iteration's elision budget so the oldest unprotected tool results
+  // shrink before the following call.
+  test("inflated provider-reported prompt tokens engage the trim path on the next iteration", async () => {
+    const ELISION_MARKER =
+      "[Earlier tool result elided to fit the context window. Re-run the tool if you still need its output.]";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-usage-trim");
+    const provider = normalizeProvider(config.provider);
+
+    // Eight tool-call turns reading DISTINCT files (so no loop-breaker
+    // trips), each result ~1k chars — elidable (>200 chars) but tiny by the
+    // chars/4 estimate. Only the LAST one reports usage: a prompt size far
+    // beyond the echo provider's window, so the calibration gap zeroes the
+    // next elision budget.
+    for (let i = 0; i < 8; i++) {
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(120));
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_u${i}`, type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: `chunk${i}.md` }) } }
+        ],
+        finishReason: "tool_calls",
+        ...(i === 7 ? { usage: { prompt_tokens: 10_000_000 } } : {})
+      });
+    }
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done reading.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "read all the chunks", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Done reading.");
+
+    // The 9th provider call (after the inflated-usage report) must see the
+    // two oldest tool results elided (8 results − 6 protected), and the
+    // protected recent six untouched.
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(9);
+    const finalToolMessages = calls[8]!.filter((m) => m.role === "tool");
+    expect(finalToolMessages.length).toBe(8);
+    expect(finalToolMessages[0]!.content).toBe(ELISION_MARKER);
+    expect(finalToolMessages[1]!.content).toBe(ELISION_MARKER);
+    for (let i = 2; i < 8; i++) {
+      expect(finalToolMessages[i]!.content).toContain(`chunk-${i}`);
+    }
+    // No call BEFORE the usage report saw any elision.
+    for (let c = 0; c < 8; c++) {
+      expect(calls[c]!.some((m) => m.content === ELISION_MARKER)).toBe(false);
+    }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Fallback: a provider that reports no usage (the echo default) keeps the
+  // plain chars/4 behavior — the same small transcript never trims.
+  test("without provider usage the trim path stays on the chars/4 estimate and never engages", async () => {
+    const ELISION_MARKER =
+      "[Earlier tool result elided to fit the context window. Re-run the tool if you still need its output.]";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-no-usage-trim");
+    const provider = normalizeProvider(config.provider);
+
+    for (let i = 0; i < 8; i++) {
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(120));
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: `call_n${i}`, type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: `chunk${i}.md` }) } }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done reading.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "read all the chunks", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(9);
+    for (const call of calls) {
+      expect(call.some((m) => m.content === ELISION_MARKER)).toBe(false);
+    }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
 });
 
 // Navigation-without-action counter (loop-breaker guard 3). Driving the real
@@ -3151,6 +3254,25 @@ describe("elideOldToolResultsToBudget", () => {
     elideOldToolResultsToBudget(messages, 10);
     expect(messages[0]!.content).not.toBe(ELISION_MARKER);
     expect(messages[1]!.content).toBe("tiny");
+  });
+});
+
+// Provider usage records carry the real prompt size under different keys per
+// provider family; the extractor must accept both and reject junk.
+describe("promptTokensFromUsage", () => {
+  test("reads input_tokens (anthropic/bedrock) and prompt_tokens (openai-compatible)", () => {
+    expect(promptTokensFromUsage({ input_tokens: 1234 })).toBe(1234);
+    expect(promptTokensFromUsage({ prompt_tokens: 567 })).toBe(567);
+    // input_tokens wins when both are present (normalized Converse usage).
+    expect(promptTokensFromUsage({ input_tokens: 10, prompt_tokens: 20 })).toBe(10);
+  });
+
+  test("rejects missing, non-numeric, and negative counts", () => {
+    expect(promptTokensFromUsage(undefined)).toBeUndefined();
+    expect(promptTokensFromUsage({})).toBeUndefined();
+    expect(promptTokensFromUsage({ prompt_tokens: "9" })).toBeUndefined();
+    expect(promptTokensFromUsage({ input_tokens: Number.NaN })).toBeUndefined();
+    expect(promptTokensFromUsage({ input_tokens: -5 })).toBeUndefined();
   });
 });
 
