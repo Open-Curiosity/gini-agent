@@ -1387,7 +1387,22 @@ export async function resolveSetupRequest(
   config: RuntimeConfig,
   approvalId: string,
   decision: "complete" | "cancel",
-  opts: { actor?: "user" | "runtime"; toolResult?: string; resumeChatTask?: boolean; awaitResume?: boolean } = {}
+  opts: {
+    actor?: "user" | "runtime";
+    toolResult?: string;
+    resumeChatTask?: boolean;
+    awaitResume?: boolean;
+    // Emit a non-terminal `Working: <action>` phase block right after the
+    // complete-claim wins. Callers whose side effects run AFTER the claim
+    // (connector probe, playwright fill, messaging network calls) set this
+    // so the activity scan reads "running" — not a stale waiting_approval —
+    // while those side effects execute, mirroring the authorization approve
+    // path. Callers that mint a follow-up gate without a new gate block
+    // (skill.grant_connector's multi-credential flow) must NOT set it: the
+    // old gate block staying newest is exactly what keeps the thread
+    // truthfully waiting on the next credential.
+    emitWorkingPhase?: boolean;
+  } = {}
 ): Promise<SetupRequest> {
   const actor = opts.actor ?? "user";
   const resume = opts.resumeChatTask ?? true;
@@ -1458,6 +1473,20 @@ export async function resolveSetupRequest(
     }
     return { item, task: taskRow, resumeCancelledConnector };
   });
+
+  if (decision === "complete" && opts.emitWorkingPhase && result.item.taskId) {
+    // Best-effort like the cancel path's emission: a SQLite failure here
+    // must not block the caller's side effects.
+    try {
+      const emitCtx = resolveEmitContext(config, result.item.taskId);
+      if (emitCtx) emitPhase(emitCtx, `Working: ${result.item.action}`);
+    } catch (error) {
+      appendLog(config.instance, "chat.setup_complete_block.emit_failed", {
+        setupRequestId: approvalId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
 
   if (decision === "cancel" && result.resumeCancelledConnector && result.item.taskId) {
     const toolCallId = approvalToolCallId(result.item.payload);

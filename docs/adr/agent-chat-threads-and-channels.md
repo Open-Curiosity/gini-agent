@@ -174,23 +174,37 @@ compare keys on `lastReplyAt`, so counting those would re-flag a thread the
 user already opened. This matches `replyCount` / `lastReplyPreview` /
 `lastReplyAuthor`, which are also message-derived.
 
-`activity` is present only while the thread's latest run is in flight,
+`activity` is present only while a run in the thread is in flight,
 computed per summary by a newest-first scan of the thread's `phase` /
-`tool_call` / `authorization_requested` / `setup_requested` blocks: a
-gate block at the top of the stream ⇒ `"waiting_approval"` (resolving a
-gate always appends newer blocks, so a gate that is still newest means
-the run is parked on it); otherwise the first phase block decides
-(`"running"` while its label is non-terminal — terminal being
-Completed/Cancelled/Failed, mirroring the web chat surface) and a tool
-call still running ahead of any phase block also reads `"running"`.
-Unparseable rows are skipped so a malformed block can't pin a thread
-active. Approving an authorization emits a best-effort
+`tool_call` / `authorization_requested` / `setup_requested` blocks.
+Overlapping tasks can interleave blocks in one thread (replies are not
+serialized), so each task is decided by its own newest decisive block
+and the thread aggregates — any task parked on a gate ⇒
+`"waiting_approval"` (the actionable state wins, matching the UI's
+ordering), else any running task ⇒ `"running"`. Per task: a gate block
+at the top means the run is parked on it (gate blocks carry no
+resolution state, but resolving one always appends newer blocks);
+otherwise the first phase block decides (`"running"` while its label is
+non-terminal — terminal being Completed/Cancelled/Failed, mirroring the
+web chat surface) and a tool call still running ahead of any phase
+block also reads `"running"`. Unparseable rows are skipped so a
+malformed block can't pin a thread active.
+
+Two emission points keep the scan truthful through gate-resolution
+windows: approving an authorization emits a best-effort
 `Working: <action>` phase block before the side effect executes
-(`src/agent.ts`), so the scan reports `running` — not a stale
-`waiting_approval` — while a long approved action (e.g. a gated
-`terminal.exec`) runs to completion. `activity` drives the running /
-needs-approval pills on thread cards, the chat tab-bar dot, and the
-inline thread chip dot.
+(`src/agent.ts` `resolveAuthorization`), and the setup `/complete`
+handlers whose side effects run after the claim (connector probe,
+playwright secret fill, messaging connect/remove/pairing) pass
+`emitWorkingPhase` to `resolveSetupRequest` for the same reason —
+without these, a long side effect would leave the resolved gate as the
+newest block and the thread would keep reading `waiting_approval` after
+the user already acted. `skill.grant_connector` deliberately does not
+emit: its multi-credential flow mints the next grant card without a new
+gate block, and the old gate staying newest is what keeps the thread
+truthfully waiting on the next credential. `activity` drives the
+running / needs-approval pills on thread cards, the chat tab-bar dot,
+and the inline thread chip dot.
 
 ### Channels
 

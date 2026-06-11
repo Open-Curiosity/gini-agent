@@ -88,7 +88,7 @@ export async function runMessagingPairingConnect(
   // browser.fill_secret / messaging.add_bridge ordering.
   let resolved: SetupRequest;
   try {
-    resolved = await resolveSetupRequest(config, approval.id, "complete", { actor: "user", resumeChatTask: false });
+    resolved = await resolveSetupRequest(config, approval.id, "complete", { actor: "user", resumeChatTask: false, emitWorkingPhase: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {

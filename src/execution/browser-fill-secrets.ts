@@ -190,7 +190,7 @@ export async function runFillSecretConnect(
   // resumeChatTask: false because we own the resume after the fill loop
   // — the result string reflects what actually filled vs errored.
   try {
-    await resolveSetupRequest(config, approval.id, "complete", { actor: "user", resumeChatTask: false });
+    await resolveSetupRequest(config, approval.id, "complete", { actor: "user", resumeChatTask: false, emitWorkingPhase: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { status: 410, body: { ok: false, message: `Could not lock setup request for fill: ${message}` } };

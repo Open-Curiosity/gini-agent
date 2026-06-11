@@ -41,7 +41,7 @@ export async function runMessagingRemoveConnect(
   // Atomic check-and-flip BEFORE the destructive call.
   let resolved: SetupRequest;
   try {
-    resolved = await resolveSetupRequest(config, approval.id, "complete", { actor: "user", resumeChatTask: false });
+    resolved = await resolveSetupRequest(config, approval.id, "complete", { actor: "user", resumeChatTask: false, emitWorkingPhase: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {

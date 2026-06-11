@@ -1172,6 +1172,101 @@ describe("chat-blocks threading", () => {
     expect(byId.get("thread_auth_done")?.activity).toBeUndefined();
   });
 
+  test("summarizeThreads keeps a thread active while an older overlapping task still runs", () => {
+    const instance = "chat-blocks-thread-overlap";
+    const session = "chat_overlap";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Root.",
+      streaming: false
+    });
+
+    // Two tasks interleave in one thread (replies are not serialized):
+    // task A starts a long tool, then task B replies quickly and completes.
+    // B's terminal phase is the thread's NEWEST block, but A's work is
+    // still in flight — the thread must read running, not idle.
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "long job",
+      threadId: "thread_overlap",
+      parentBlockId: root.id,
+      taskId: "task_a"
+    });
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: session,
+      toolName: "terminal_exec",
+      displayLabel: "Run shell command",
+      argsPreview: "sleep 60",
+      argsFull: { command: "sleep 60" },
+      status: "running",
+      callId: "call_overlap_a",
+      threadId: "thread_overlap",
+      parentBlockId: root.id,
+      taskId: "task_a"
+    });
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "quick follow-up",
+      threadId: "thread_overlap",
+      parentBlockId: root.id,
+      taskId: "task_b"
+    });
+    insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Completed",
+      threadId: "thread_overlap",
+      parentBlockId: root.id,
+      taskId: "task_b"
+    });
+
+    // A gate parked on one task outranks another task's running work —
+    // the actionable state wins, matching the UI ordering.
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "gated job",
+      threadId: "thread_overlap_gate",
+      parentBlockId: root.id,
+      taskId: "task_c"
+    });
+    insertChatBlock(instance, {
+      kind: "authorization_requested",
+      sessionId: session,
+      authorizationId: "auth_overlap",
+      action: "terminal.exec",
+      risk: "medium",
+      summary: "Run a shell command",
+      threadId: "thread_overlap_gate",
+      parentBlockId: root.id,
+      taskId: "task_c"
+    });
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "second job",
+      threadId: "thread_overlap_gate",
+      parentBlockId: root.id,
+      taskId: "task_d"
+    });
+    insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Working: terminal",
+      threadId: "thread_overlap_gate",
+      parentBlockId: root.id,
+      taskId: "task_d"
+    });
+
+    const byId = new Map(summarizeThreads(instance, session).map((s) => [s.threadId, s]));
+    expect(byId.get("thread_overlap")?.activity).toBe("running");
+    expect(byId.get("thread_overlap_gate")?.activity).toBe("waiting_approval");
+  });
+
   test("summarizeThreads skips malformed activity rows instead of guessing", () => {
     const instance = "chat-blocks-thread-active-malformed";
     const session = "chat_active_malformed";

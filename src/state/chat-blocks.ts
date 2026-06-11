@@ -877,13 +877,19 @@ interface ThreadAggRow {
 const TERMINAL_PHASE_LABELS = new Set(["Completed", "Cancelled", "Failed"]);
 
 // A thread's in-flight state, or null when idle. Scans the thread's
-// activity-bearing blocks newest-first; the first decisive block wins:
-//   - an authorization/setup gate ⇒ "waiting_approval" — gate blocks carry no
+// activity-bearing blocks newest-first. Overlapping tasks can interleave
+// their blocks in one thread (replies are not serialized), so one task's
+// terminal phase must not mask another task's still-running work: each
+// task is decided by ITS OWN newest decisive block, and the thread
+// aggregates — any task parked on a gate ⇒ "waiting_approval" (the
+// actionable state wins, matching the UI's ordering), else any running
+// task ⇒ "running". Per task, the decisive rules are:
+//   - an authorization/setup gate ⇒ waiting — gate blocks carry no
 //     resolution state, but resolving one always appends newer blocks (the
-//     resumed run's tool calls/phases, or a terminal phase on deny), so a
-//     gate at the top of the stream means the run is parked on it
-//   - a phase block ⇒ "running" while its label is non-terminal
-//   - a tool call still running ahead of any phase block ⇒ "running" (the
+//     resumed run's phases, or a terminal phase on deny), so a gate that is
+//     still the task's newest row means the run is parked on it
+//   - a phase block ⇒ running while its label is non-terminal
+//   - a tool call still running ahead of any phase block ⇒ running (the
 //     same backwards walk the web ThreadPanel uses for its composer state)
 // Rows whose payload doesn't parse (or a phase row with no string label) are
 // skipped rather than guessed at, so a single malformed row can't pin a
@@ -894,16 +900,24 @@ function threadActivity(
   threadId: string
 ): "running" | "waiting_approval" | null {
   const rows = db
-    .query<{ kind: string; payload_json: string }, [string, string]>(
-      `SELECT kind, payload_json FROM chat_blocks
+    .query<{ kind: string; payload_json: string; task_id: string | null }, [string, string]>(
+      `SELECT kind, payload_json, task_id FROM chat_blocks
        WHERE session_id = ? AND thread_id = ?
          AND kind IN ('phase', 'tool_call', 'authorization_requested', 'setup_requested')
        ORDER BY ordinal DESC`
     )
     .all(sessionId, threadId);
+  let anyRunning = false;
+  let anyWaiting = false;
+  const decidedTasks = new Set<string>();
   for (const row of rows) {
+    // Legacy rows without a task id share one pseudo-task bucket.
+    const taskKey = row.task_id ?? "";
+    if (decidedTasks.has(taskKey)) continue;
     if (row.kind === "authorization_requested" || row.kind === "setup_requested") {
-      return "waiting_approval";
+      decidedTasks.add(taskKey);
+      anyWaiting = true;
+      continue;
     }
     let payload: { label?: unknown; status?: unknown };
     try {
@@ -912,11 +926,17 @@ function threadActivity(
       continue;
     }
     if (row.kind === "phase" && typeof payload.label === "string") {
-      return TERMINAL_PHASE_LABELS.has(payload.label) ? null : "running";
+      decidedTasks.add(taskKey);
+      if (!TERMINAL_PHASE_LABELS.has(payload.label)) anyRunning = true;
+      continue;
     }
-    if (row.kind === "tool_call" && payload.status === "running") return "running";
+    if (row.kind === "tool_call" && payload.status === "running") {
+      decidedTasks.add(taskKey);
+      anyRunning = true;
+    }
   }
-  return null;
+  if (anyWaiting) return "waiting_approval";
+  return anyRunning ? "running" : null;
 }
 
 // Builds ThreadSummary objects from aggregate rows, hydrating the parent
