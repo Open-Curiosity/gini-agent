@@ -1002,6 +1002,141 @@ describe("chat-blocks threading", () => {
     expect(thread?.lastReplyAt).toBe(messageTs);
   });
 
+  test("summarizeThreads flags a thread active while its newest run is in flight", () => {
+    const instance = "chat-blocks-thread-active";
+    const session = "chat_active";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Root.",
+      streaming: false
+    });
+    const reply = (threadId: string) =>
+      insertChatBlock(instance, {
+        kind: "user_text",
+        sessionId: session,
+        text: `reply in ${threadId}`,
+        threadId,
+        parentBlockId: root.id
+      });
+    const phase = (threadId: string, label: string) =>
+      insertChatBlock(instance, { kind: "phase", sessionId: session, label, threadId, parentBlockId: root.id });
+    const toolCall = (threadId: string, callId: string, status: "running" | "ok") =>
+      insertChatBlock(instance, {
+        kind: "tool_call",
+        sessionId: session,
+        toolName: "file_read",
+        displayLabel: "Read file",
+        argsPreview: "x.md",
+        argsFull: { path: "x.md" },
+        status,
+        callId,
+        threadId,
+        parentBlockId: root.id
+      });
+
+    // Newest phase is non-terminal → the run is still going.
+    reply("thread_running");
+    phase("thread_running", "Working: terminal");
+    // Newest phase is terminal → done.
+    reply("thread_done");
+    phase("thread_done", "Completed");
+    // A tool call still running AFTER the terminal phase decides first.
+    reply("thread_tool");
+    phase("thread_tool", "Completed");
+    toolCall("thread_tool", "call_active_1", "running");
+    // A stale running tool call BEFORE the terminal phase does not — the
+    // newer phase block wins the backwards scan.
+    reply("thread_tool_done");
+    toolCall("thread_tool_done", "call_active_2", "running");
+    phase("thread_tool_done", "Cancelled");
+    // Only messages → nothing in flight.
+    reply("thread_text");
+    // Only a finished tool call → nothing in flight.
+    reply("thread_tool_ok");
+    toolCall("thread_tool_ok", "call_active_3", "ok");
+
+    const byId = new Map(summarizeThreads(instance, session).map((s) => [s.threadId, s]));
+    expect(byId.get("thread_running")?.active).toBe(true);
+    expect(byId.get("thread_done")?.active).toBe(false);
+    expect(byId.get("thread_tool")?.active).toBe(true);
+    expect(byId.get("thread_tool_done")?.active).toBe(false);
+    expect(byId.get("thread_text")?.active).toBe(false);
+    expect(byId.get("thread_tool_ok")?.active).toBe(false);
+    // The instance-wide inbox query computes the same flag.
+    const inbox = new Map(summarizeThreadsForInstance(instance, [session]).map((s) => [s.threadId, s]));
+    expect(inbox.get("thread_running")?.active).toBe(true);
+    expect(inbox.get("thread_done")?.active).toBe(false);
+  });
+
+  test("summarizeThreads skips malformed activity rows instead of guessing", () => {
+    const instance = "chat-blocks-thread-active-malformed";
+    const session = "chat_active_malformed";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Root.",
+      streaming: false
+    });
+    // Older decisive row says running; the two newer rows are unusable (one
+    // unparseable payload, one phase with no string label) and must be
+    // skipped — not treated as terminal or as active.
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "reply",
+      threadId: "thread_m",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Working: terminal",
+      threadId: "thread_m",
+      parentBlockId: root.id
+    });
+    const labelless = insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Thinking",
+      threadId: "thread_m",
+      parentBlockId: root.id
+    });
+    const corrupt = insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Thinking",
+      threadId: "thread_m",
+      parentBlockId: root.id
+    });
+    const db = getMemoryDb(instance);
+    db.run("UPDATE chat_blocks SET payload_json = ? WHERE id = ?", ["{}", labelless.id]);
+    db.run("UPDATE chat_blocks SET payload_json = ? WHERE id = ?", ["not json", corrupt.id]);
+
+    const [summary] = summarizeThreads(instance, session);
+    expect(summary?.threadId).toBe("thread_m");
+    expect(summary?.active).toBe(true);
+
+    // A thread whose ONLY activity rows are unusable falls back to inactive.
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "reply",
+      threadId: "thread_m2",
+      parentBlockId: root.id
+    });
+    const only = insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Thinking",
+      threadId: "thread_m2",
+      parentBlockId: root.id
+    });
+    db.run("UPDATE chat_blocks SET payload_json = ? WHERE id = ?", ["{}", only.id]);
+    const m2 = summarizeThreads(instance, session).find((s) => s.threadId === "thread_m2");
+    expect(m2?.active).toBe(false);
+  });
+
   test("summarizeThreadsForInstance scopes to the supplied agent sessions", () => {
     const instance = "chat-blocks-thread-instance";
     const agentSession = "chat_agent";

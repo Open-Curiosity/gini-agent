@@ -160,6 +160,9 @@ function ChatSurface({
   // The Threads tab badge mirrors the sidebar nav badge: it counts UNREAD
   // threads (and the pill hides at 0), not the total thread count.
   const unreadThreadCount = threads.filter((t) => isThreadUnread(t)).length;
+  // Pulse the Threads tab while any thread's run is in flight so activity is
+  // visible from the Messages tab without switching over.
+  const anyThreadActive = threads.some((t) => t.active);
 
   const sessionsQuery = useChatSessions();
   const { markRead, activityAt } = useChatReadState(sessionsQuery.data);
@@ -332,6 +335,7 @@ function ChatSurface({
           active={tab}
           onChange={setTab}
           threadCount={unreadThreadCount}
+          threadsActive={anyThreadActive}
           hideJobsTab={isChannel}
           hideSettingsTab={isPinned}
         />

@@ -1,0 +1,83 @@
+/// <reference lib="dom" />
+
+// ThreadsTab tests. Pins the per-agent tab's contract:
+//   - rows render newest-reply-first as full-card buttons
+//   - clicking a row hands the thread summary to onOpen (the chat page opens
+//     the side panel with it — the same flow as the in-chat thread chip)
+//   - threads missing agentName inherit the tab's agent
+//   - the empty state names the agent
+
+import { describe, expect, test } from "bun:test";
+import { fireEvent, render, screen } from "@testing-library/react";
+import type { ThreadSummary } from "@/lib/view-types";
+import { ThreadsTab } from "./ThreadsTab";
+
+function makeThread(overrides: Partial<ThreadSummary> = {}): ThreadSummary {
+  return {
+    threadId: "thread_1",
+    sessionId: "chat_1",
+    rootPreview: "Root message",
+    rootAuthor: "agent",
+    replyCount: 2,
+    lastReplyAt: "2026-06-01T10:00:00.000Z",
+    lastReplyPreview: "Latest reply",
+    lastReplyAuthor: "agent",
+    active: false,
+    ...overrides
+  };
+}
+
+describe("ThreadsTab", () => {
+  test("shows the agent-aware empty state when there are no threads", () => {
+    render(<ThreadsTab threads={[]} agentName="Gini" onOpen={() => {}} />);
+    expect(screen.getByText("No threads yet")).not.toBeNull();
+    expect(screen.getByText(/Replies to Gini's messages branch into threads here/)).not.toBeNull();
+  });
+
+  test("renders threads newest-reply-first and opens the clicked one", () => {
+    const older = makeThread({
+      threadId: "thread_old",
+      rootPreview: "Older thread",
+      lastReplyAt: "2026-06-01T10:00:00.000Z"
+    });
+    const newer = makeThread({
+      threadId: "thread_new",
+      rootPreview: "Newer thread",
+      lastReplyAt: "2026-06-02T10:00:00.000Z"
+    });
+    const opened: ThreadSummary[] = [];
+    render(<ThreadsTab threads={[older, newer]} agentName="Gini" onOpen={(t) => opened.push(t)} />);
+
+    const cards = screen.getAllByRole("button");
+    expect(cards).toHaveLength(2);
+    expect(cards[0]!.getAttribute("aria-label")).toBe("Open thread: Newer thread");
+    expect(cards[1]!.getAttribute("aria-label")).toBe("Open thread: Older thread");
+
+    fireEvent.click(cards[1]!);
+    expect(opened).toHaveLength(1);
+    expect(opened[0]!.threadId).toBe("thread_old");
+  });
+
+  test("threads without an agentName inherit the tab's agent", () => {
+    render(
+      <ThreadsTab
+        threads={[makeThread({ agentName: undefined, rootAuthor: "agent" })]}
+        agentName="Testing"
+        onOpen={() => {}}
+      />
+    );
+    // Chip and root author both resolve to the inherited name.
+    expect(screen.getAllByText("Testing")).not.toHaveLength(0);
+  });
+
+  test("a thread's own agentName wins over the inherited one", () => {
+    render(
+      <ThreadsTab
+        threads={[makeThread({ agentName: "Specialist" })]}
+        agentName="Gini"
+        onOpen={() => {}}
+      />
+    );
+    expect(screen.getAllByText("Specialist")).not.toHaveLength(0);
+  });
+});

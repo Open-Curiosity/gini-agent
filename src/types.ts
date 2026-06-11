@@ -618,6 +618,11 @@ export interface ThreadSummary {
   // inbox can label who replied last. `user_text` ⇒ "user", otherwise
   // "agent". Absent when the thread has no text-bearing block yet.
   lastReplyAuthor?: "user" | "agent";
+  // True while the thread's latest run is still in flight — the newest
+  // `phase` block is non-terminal, or a tool call is still running ahead of
+  // any phase block (the same backwards scan the thread panel uses for its
+  // composer busy state). Drives "running" indicators on thread lists.
+  active?: boolean;
 }
 
 export interface RuntimeState {

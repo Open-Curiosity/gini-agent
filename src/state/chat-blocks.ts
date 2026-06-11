@@ -871,6 +871,45 @@ interface ThreadAggRow {
   last_reply_at: string;
 }
 
+// Phase labels that end a run. Mirrors TERMINAL_PHASE_LABELS on the web chat
+// surface so a thread reports `active` exactly while the chat page would
+// render its run as in flight.
+const TERMINAL_PHASE_LABELS = new Set(["Completed", "Cancelled", "Failed"]);
+
+// Whether a thread's latest run is still in flight. Scans the thread's
+// phase / tool_call blocks newest-first: the first phase block decides
+// (non-terminal label ⇒ active), and a tool call still running ahead of any
+// phase block also counts — the same backwards walk the web ThreadPanel uses
+// for its composer busy state. Rows whose payload doesn't parse (or a phase
+// row with no string label) are skipped rather than guessed at, so a single
+// malformed row can't pin a thread "active" forever.
+function isThreadActive(
+  db: ReturnType<typeof getMemoryDb>,
+  sessionId: string,
+  threadId: string
+): boolean {
+  const rows = db
+    .query<{ kind: string; payload_json: string }, [string, string]>(
+      `SELECT kind, payload_json FROM chat_blocks
+       WHERE session_id = ? AND thread_id = ? AND kind IN ('phase', 'tool_call')
+       ORDER BY ordinal DESC`
+    )
+    .all(sessionId, threadId);
+  for (const row of rows) {
+    let payload: { label?: unknown; status?: unknown };
+    try {
+      payload = JSON.parse(row.payload_json) as { label?: unknown; status?: unknown };
+    } catch {
+      continue;
+    }
+    if (row.kind === "phase" && typeof payload.label === "string") {
+      return !TERMINAL_PHASE_LABELS.has(payload.label);
+    }
+    if (row.kind === "tool_call" && payload.status === "running") return true;
+  }
+  return false;
+}
+
 // Builds ThreadSummary objects from aggregate rows, hydrating the parent
 // preview + author (text/kind of the rooted main-chat block — a human
 // user_text for an agent-started thread, an assistant_text for a
@@ -911,7 +950,8 @@ function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAg
       replyCount: row.reply_count,
       lastReplyAt: row.last_reply_at,
       ...(lastReplyPreview.length > 0 ? { lastReplyPreview } : {}),
-      ...(lastReplyAuthor ? { lastReplyAuthor } : {})
+      ...(lastReplyAuthor ? { lastReplyAuthor } : {}),
+      active: isThreadActive(db, row.session_id, row.thread_id)
     };
   });
 }

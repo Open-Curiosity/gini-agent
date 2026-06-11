@@ -1,50 +1,19 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import type { ChatBlock } from "@runtime/types";
-import { useThread } from "@/lib/queries";
+import { ChevronRight, MessagesSquare } from "lucide-react";
 import type { ThreadSummary } from "@/lib/view-types";
 import { formatRelativeTime, formatMessageTimestamp } from "./relative-time";
 import { agentColor } from "@/lib/agent-visuals";
-import { MarkdownContent } from "./MarkdownContent";
 
-function previewText(block: ChatBlock): string | null {
-  if (block.kind === "user_text") return block.text;
-  if (block.kind === "assistant_text") return block.text;
-  return null;
-}
-
-// One reply row inside an expanded thread card. "You" for user blocks, the
-// agent name otherwise — mirroring the design's name + timestamp + text rows.
-function ReplyRow({ block, agentName }: { block: ChatBlock; agentName: string }) {
-  const text = previewText(block);
-  if (text == null) return null;
-  const isUser = block.kind === "user_text";
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex items-center gap-2">
-        <span className="text-[13px] font-bold text-foreground">{isUser ? "You" : agentName}</span>
-        <span className="text-[12px] font-medium text-muted-foreground">
-          {formatMessageTimestamp(block.createdAt)}
-        </span>
-      </div>
-      {isUser ? (
-        <p className="whitespace-pre-wrap text-[13px] font-medium leading-relaxed text-foreground">{text}</p>
-      ) : (
-        <div className="text-foreground">
-          <MarkdownContent text={text} />
-        </div>
-      )}
-    </div>
-  );
-}
-
-// Cross-agent Thread Card — design `tlViK`. Used in the Threads inbox.
-//   - meta: "in <agent chip> · <time> · <N new> badge"
-//   - original message: agent name + root preview
-//   - expandable: "Show N more replies" loads the thread's blocks
-//   - footer: "N replies · Last reply …"
-// Clicking the card body opens the full thread panel.
+// Thread Card — one row in the cross-agent Threads inbox and the per-agent
+// Threads tab. The WHOLE card is a single button that opens the thread side
+// panel, matching the chat surface's thread chip (no inline expansion — the
+// panel is the one place replies render). Layout:
+//   - meta: "in <agent chip> · <time>" + New badge, with a pulsing "Running"
+//     pill on the right while the thread's run is in flight
+//   - root: author + parent-message preview (clamped to two lines)
+//   - last reply: "<author>: <preview>" one-liner — the freshest context
+//   - footer: reply count + last-reply age + a hover-emphasized "View thread →"
 export function ThreadCard({
   thread,
   isUnread,
@@ -54,26 +23,20 @@ export function ThreadCard({
   isUnread: boolean;
   onOpen: () => void;
 }) {
-  const [expanded, setExpanded] = useState(false);
   const agentName = thread.agentName ?? "Agent";
   const dotColor = agentColor(thread.agentId ?? agentName);
-  const { blocks } = useThread(expanded ? thread.sessionId : null, expanded ? thread.threadId : null);
-
-  // The thread-blocks endpoint returns the thread span (excluding the root
-  // main-chat message). Once expanded, show every reply so "Show N replies"
-  // reveals exactly N rows.
-  const replyBlocks = useMemo(
-    () => blocks.filter((b) => previewText(b) != null),
-    [blocks]
-  );
-  const visibleReplies = expanded ? replyBlocks : [];
-
   const lastReply = thread.lastReplyAt ? formatRelativeTime(thread.lastReplyAt) : "";
+  const lastReplyAuthor = thread.lastReplyAuthor === "user" ? "You" : agentName;
 
   return (
-    <div className="flex flex-col gap-3.5 border-b border-border bg-background px-10 py-5">
+    <button
+      type="button"
+      onClick={onOpen}
+      aria-label={`Open thread: ${thread.rootPreview || thread.lastReplyPreview || "Thread"}`}
+      className="group flex w-full flex-col gap-2.5 border-b border-border bg-background px-10 py-5 text-left transition-colors hover:bg-accent/50"
+    >
       {/* Meta */}
-      <div className="flex flex-wrap items-center gap-2 text-[12px]">
+      <div className="flex w-full flex-wrap items-center gap-2 text-[12px]">
         <span className="font-medium text-muted-foreground">in</span>
         <span className="flex items-center gap-1.5 rounded-md border border-border bg-card px-2 py-0.5">
           <span aria-hidden className="size-[7px] rounded-full" style={{ backgroundColor: dotColor }} />
@@ -82,7 +45,9 @@ export function ThreadCard({
         {thread.lastReplyAt ? (
           <>
             <span className="text-muted-foreground">·</span>
-            <span className="font-medium text-muted-foreground">{formatMessageTimestamp(thread.lastReplyAt)}</span>
+            <span className="font-medium text-muted-foreground">
+              {formatMessageTimestamp(thread.lastReplyAt)}
+            </span>
           </>
         ) : null}
         {isUnread ? (
@@ -90,57 +55,52 @@ export function ThreadCard({
             New
           </span>
         ) : null}
+        {thread.active ? (
+          <span className="ml-auto flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
+            <span aria-hidden className="relative flex size-2">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500 opacity-60" />
+              <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+            </span>
+            Running
+          </span>
+        ) : null}
       </div>
 
       {/* Original message (root preview) */}
-      <button type="button" onClick={onOpen} className="flex flex-col gap-1.5 text-left">
-        <div className="flex items-center gap-2">
-          <span className="text-[13px] font-bold text-foreground">
-            {thread.rootAuthor === "user" ? "You" : agentName}
-          </span>
-        </div>
-        <p className="text-[13px] font-medium leading-relaxed text-foreground">
+      <div className="flex flex-col gap-1">
+        <span className="text-[13px] font-bold text-foreground">
+          {thread.rootAuthor === "user" ? "You" : agentName}
+        </span>
+        <p className="line-clamp-2 text-[13px] font-medium leading-relaxed text-foreground">
           {thread.rootPreview || thread.lastReplyPreview || "Thread"}
         </p>
-      </button>
+      </div>
 
-      {/* Expand to show replies */}
-      {expanded ? (
-        <div className="flex flex-col gap-3.5 pl-2">
-          {visibleReplies.map((b) => (
-            <ReplyRow key={b.id} block={b} agentName={agentName} />
-          ))}
-          <button
-            type="button"
-            onClick={() => setExpanded(false)}
-            className="self-start text-[13px] font-semibold text-[#4277FB] hover:underline"
-          >
-            Hide replies
-          </button>
-        </div>
-      ) : thread.replyCount > 0 ? (
-        <button
-          type="button"
-          onClick={() => setExpanded(true)}
-          className="self-start text-[13px] font-semibold text-[#4277FB] hover:underline"
-        >
-          Show {thread.replyCount} {thread.replyCount === 1 ? "reply" : "replies"}
-        </button>
+      {/* Last reply preview */}
+      {thread.replyCount > 0 && thread.lastReplyPreview ? (
+        <p className="w-full truncate text-[13px] font-medium text-muted-foreground">
+          <span className="font-semibold text-foreground">{lastReplyAuthor}:</span>{" "}
+          {thread.lastReplyPreview}
+        </p>
       ) : null}
 
       {/* Footer */}
-      <div className="flex items-center gap-3.5">
-        <button
-          type="button"
-          onClick={onOpen}
-          className="text-[12px] font-semibold text-foreground hover:underline"
-        >
+      <div className="flex w-full items-center gap-2">
+        <MessagesSquare className="size-3.5 shrink-0 text-[#4277FB] dark:text-[#9AB0FF]" />
+        <span className="text-[13px] font-semibold text-[#4277FB] dark:text-[#9AB0FF]">
           {thread.replyCount} {thread.replyCount === 1 ? "reply" : "replies"}
-        </button>
+        </span>
         {lastReply ? (
-          <span className="text-[12px] font-medium text-muted-foreground">Last reply {lastReply}</span>
+          <>
+            <span className="text-muted-foreground">·</span>
+            <span className="text-[12px] font-medium text-muted-foreground">Last reply {lastReply}</span>
+          </>
         ) : null}
+        <span className="ml-auto flex shrink-0 items-center gap-1 text-[12px] font-semibold text-muted-foreground transition-colors group-hover:text-[#4277FB] dark:group-hover:text-[#9AB0FF]">
+          View thread
+          <ChevronRight className="size-3.5" />
+        </span>
       </div>
-    </div>
+    </button>
   );
 }
