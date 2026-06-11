@@ -149,17 +149,20 @@ In `src/state/chat-blocks.ts`, surfaced through the `src/state` barrel:
 - `listMainChatBlocks(instance, sessionId)` — blocks with no
   `thread_id`.
 - `summarizeThreads(instance, sessionId)` — one `ThreadSummary` per
-  distinct thread in a session, newest reply first.
+  distinct thread in a session, newest reply first (with a `thread_id`
+  tiebreak so same-millisecond replies can't reorder between polls).
 - `summarizeThreadsForInstance(instance, agentSessionIds)` — the
-  cross-agent inbox. It takes an **explicit list of agent session ids**
+  cross-agent inbox, same ordering plus a `session_id` tiebreak. It
+  takes an **explicit list of agent session ids**
   because sessions live in the JSON `RuntimeState`, not SQLite — only
   `chat_blocks` is SQLite, so the helper can't discover which sessions
   are `kind:"agent"` on its own.
 
 `ThreadSummary` (`src/types.ts`) carries `threadId`, `sessionId`,
 optional `agentId` / `parentBlockId` / `rootPreview` / `rootAuthor`,
-`replyCount`, `lastReplyAt`, and optional `lastReplyPreview` /
-`lastReplyAuthor`. `rootAuthor` (`user` / `agent`, from the parent
+`replyCount`, `lastReplyAt`, optional `lastReplyPreview` /
+`lastReplyAuthor`, and optional `activity`. `rootAuthor` (`user` /
+`agent`, from the parent
 block's kind) lets the panel and inbox attribute the root preview
 correctly — "You" for an agent-started thread rooted at the user's
 message, the agent otherwise.
@@ -170,6 +173,24 @@ appends auxiliary blocks (trailing `phase` "Completed", `tool_call` /
 compare keys on `lastReplyAt`, so counting those would re-flag a thread the
 user already opened. This matches `replyCount` / `lastReplyPreview` /
 `lastReplyAuthor`, which are also message-derived.
+
+`activity` is present only while the thread's latest run is in flight,
+computed per summary by a newest-first scan of the thread's `phase` /
+`tool_call` / `authorization_requested` / `setup_requested` blocks: a
+gate block at the top of the stream ⇒ `"waiting_approval"` (resolving a
+gate always appends newer blocks, so a gate that is still newest means
+the run is parked on it); otherwise the first phase block decides
+(`"running"` while its label is non-terminal — terminal being
+Completed/Cancelled/Failed, mirroring the web chat surface) and a tool
+call still running ahead of any phase block also reads `"running"`.
+Unparseable rows are skipped so a malformed block can't pin a thread
+active. Approving an authorization emits a best-effort
+`Working: <action>` phase block before the side effect executes
+(`src/agent.ts`), so the scan reports `running` — not a stale
+`waiting_approval` — while a long approved action (e.g. a gated
+`terminal.exec`) runs to completion. `activity` drives the running /
+needs-approval pills on thread cards, the chat tab-bar dot, and the
+inline thread chip dot.
 
 ### Channels
 
@@ -275,6 +296,16 @@ New routes (`src/http.ts`):
 
 All thread endpoints 404 on an unknown session id, so a stale link
 fails cleanly rather than returning an empty list.
+
+Both list endpoints order newest reply first with a deterministic
+`threadId` tiebreak (the inbox also tiebreaks on `sessionId`). The web
+thread lists — the per-agent Threads tab and the `/threads` inbox —
+re-order client-side through one shared `sortThreads` helper
+(`web/src/components/chat/ThreadsTab.tsx`): threads with a run in
+flight first, `waiting_approval` outranking `running` (the actionable
+state wins), then newest reply within each group. The same ranking
+feeds `aggregateActivity`, which drives the chat tab-bar activity dot,
+so the dot can never disagree with list ordering.
 
 **Thread unread is computed client-side.** The server has no per-thread
 read cursor. The existing `POST` / `DELETE /api/chat/:id/read`
