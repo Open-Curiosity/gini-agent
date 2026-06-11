@@ -323,6 +323,157 @@ function modeFromRecord(record: BrowserConnectionRecord | undefined): Mode {
   return record.mode === "managed" ? "persistent" : "cdp";
 }
 
+// ---------------- Session providers ----------------
+//
+// Seam for WHERE the browser the agent drives comes from. A provider owns
+// exactly one transport concern: acquire a live BrowserContext
+// (`connect`) and release it (`disconnect`). Everything above this seam —
+// snapshot walking, secret redaction, SSRF/domain-policy gating,
+// approvals, audit, traces — runs IN-PROCESS against the Playwright
+// client regardless of which provider supplied the browser; swapping the
+// provider only changes where the launch/CDP endpoint points. That is the
+// property that ruled out subprocess engines (see ADR
+// browser-automation-engine.md, "Remote session provider seam") and it
+// must hold for any future provider.
+//
+// Today's providers are the two modes that always existed: a persistent
+// local launch and a CDP attach to an external Chrome. The one capability
+// the local engine cannot fake is IP reputation (datacenter-IP blocks,
+// geo walls); a future remote/cloud-browser provider slots in as a third
+// entry that resolves its remote endpoint (provision a cloud session,
+// then attach over CDP/WebSocket) and returns a cdp-shaped SharedHandle —
+// or adds its own SharedHandle variant when its teardown needs extra
+// release work (e.g. an API call ending the cloud session). The
+// disconnect-generation choreography stays in ensureShared / teardown
+// call sites; it is transport-agnostic.
+interface BrowserSessionProvider {
+  kind: Mode;
+  // Establish the transport and return the live handle. Called by
+  // ensureShared under the single-flight pendingShared promise.
+  connect(record: BrowserConnectionRecord | undefined): Promise<SharedHandle>;
+  // Release the handle this provider built. Must never throw — teardown
+  // runs on paths (disconnect, exit hooks) that cannot surface errors.
+  disconnect(handle: SharedHandle): Promise<void>;
+}
+
+const persistentSessionProvider: BrowserSessionProvider = {
+  kind: "persistent",
+  async connect(record) {
+    const chromium = await loadChromium();
+    // Persistent mode is used for BOTH the headless default and the
+    // visible "managed" connect. The profile dir is per-instance, so
+    // sign-ins stored during a headed session remain available the next
+    // time the agent relaunches headless against the same dir.
+    const headed = record?.mode === "managed";
+    // Determine the data dir:
+    //   - When a managed record exists and supplies dataDir, prefer that
+    //     (covers explicit Connect flows that already materialized a
+    //     specific dir).
+    //   - Otherwise, derive from the active instance — this is the
+    //     normal path the agent takes when no Connect record exists.
+    //   - If no instance has been registered (raw test imports), refuse
+    //     to launch. Tests should install a fake handle via the __test
+    //     helpers; production callers always set the instance via
+    //     setBrowserInstance() during server boot.
+    let dataDir: string | undefined;
+    if (record?.dataDir) {
+      dataDir = record.dataDir;
+    } else if (runtimeInstance) {
+      dataDir = chromeProfileDirFor(runtimeInstance);
+    }
+    if (!dataDir) {
+      throw new Error(
+        "No instance registered for the browser session manager; call setBrowserInstance() before triggering a browser tool."
+      );
+    }
+    const { context: ctx } = await launchPersistentChrome(chromium, dataDir, {
+      headless: !headed
+    });
+    return { kind: "persistent", context: ctx as BrowserContext, headed };
+  },
+  async disconnect(handle) {
+    // Close the BrowserContext, which also terminates the Chromium child
+    // Playwright launched. The profile dir on disk stays put (sign-ins
+    // persist). Bound the close so a wedged Chromium can't hang teardown
+    // forever; on timeout, force-kill the underlying child to release the
+    // profile-dir lock that the next launchPersistentContext needs.
+    const settled = await settledWithin(handle.context.close(), teardownCloseTimeoutMs);
+    if (!settled && runtimeInstance) {
+      // The close() wedged. Reap the Chromium child by its profile-dir
+      // pid so the lock frees for the relaunch. Best-effort — a kill
+      // failure must never throw out of teardown.
+      try {
+        const killed = chromeKiller(chromeProfileDirFor(runtimeInstance));
+        if (killed >= 1) {
+          // Give the OS a moment to release the profile-dir lock before
+          // launchManaged relaunches against the same directory.
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      } catch {
+        // best effort
+      }
+    }
+  }
+};
+
+const cdpSessionProvider: BrowserSessionProvider = {
+  kind: "cdp",
+  async connect(record) {
+    const chromium = await loadChromium();
+    if (!record?.cdpUrl) {
+      throw new Error(
+        "CDP browser connection record is missing cdpUrl; reconnect via /api/browser/connect."
+      );
+    }
+    // connectOverCDP returns a Browser handle scoped to the remote
+    // process. The remote Chrome's default BrowserContext shows up
+    // under browser.contexts() — we reuse it so signed-in cookies are
+    // visible. Note: CDP attach is known-flaky under playwright-core
+    // 1.60 + Bun; we keep it for users who explicitly attach to their
+    // own Chrome but warn them in the UI.
+    let browser: Browser;
+    try {
+      browser = await chromium.connectOverCDP(record.cdpUrl, { timeout: 60_000 });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/timeout|websocket|protocol/i.test(message)) {
+        throw new Error(
+          `Failed to attach over CDP: ${message}. ` +
+            "CDP attach can hang under the current Playwright + Bun stack. " +
+            "Prefer the managed browser launch (visible Chrome window) via " +
+            "/api/browser/connect without a cdpUrl."
+        );
+      }
+      throw error instanceof Error ? error : new Error(message);
+    }
+    const ctx = browser.contexts()[0] ?? (await browser.newContext());
+    return { kind: "cdp", browser, context: ctx };
+  },
+  async disconnect(handle) {
+    if (handle.kind !== "cdp") return;
+    const candidate = handle.browser as unknown as { disconnect?: () => Promise<void> };
+    if (typeof candidate.disconnect === "function") {
+      // Bound the disconnect like the persistent close, but NEVER kill —
+      // the remote Chrome is the user's own process.
+      await settledWithin(candidate.disconnect(), teardownCloseTimeoutMs);
+    }
+    // If disconnect() isn't available on this CDP-attached Browser, do
+    // NOT fall back to close() — close() over CDP terminates the user's
+    // Chrome. Leaking the in-process handle is strictly better than
+    // killing the user's browser; it'll be garbage-collected once
+    // nothing references it.
+  }
+};
+
+// Registry keyed by Mode. A future remote provider adds its entry here
+// (plus its Mode / modeFromRecord mapping); ensureShared and
+// teardownHandle dispatch through this table and need no changes.
+// Mutable only via __test.setSessionProviderForTest.
+const sessionProviders: Record<Mode, BrowserSessionProvider> = {
+  persistent: persistentSessionProvider,
+  cdp: cdpSessionProvider
+};
+
 // Is a shared/borrowed BrowserContext still backed by a live browser? After
 // an EXTERNAL kill (crash, or — now that the agent launches the user's
 // branded Chrome — the user quitting their everyday Chrome takes the
@@ -392,70 +543,9 @@ async function ensureShared(): Promise<SharedHandle> {
   // resulting handle is closed/disconnected so we don't leak the process.
   const launchGeneration = disconnectGeneration;
   pendingShared = (async () => {
-    const chromium = await loadChromium();
-    let built: SharedHandle;
-    if (mode === "persistent") {
-      // Persistent mode is used for BOTH the headless default and the
-      // visible "managed" connect. The profile dir is per-instance, so
-      // sign-ins stored during a headed session remain available the next
-      // time the agent relaunches headless against the same dir.
-      //
-      // Determine the data dir:
-      //   - When a managed record exists and supplies dataDir, prefer that
-      //     (covers explicit Connect flows that already materialized a
-      //     specific dir).
-      //   - Otherwise, derive from the active instance — this is the
-      //     normal path the agent takes when no Connect record exists.
-      //   - If no instance has been registered (raw test imports), refuse
-      //     to launch. Tests should install a fake handle via the __test
-      //     helpers; production callers always set the instance via
-      //     setBrowserInstance() during server boot.
-      let dataDir: string | undefined;
-      if (record?.dataDir) {
-        dataDir = record.dataDir;
-      } else if (runtimeInstance) {
-        dataDir = chromeProfileDirFor(runtimeInstance);
-      }
-      if (!dataDir) {
-        throw new Error(
-          "No instance registered for the browser session manager; call setBrowserInstance() before triggering a browser tool."
-        );
-      }
-      const { context: ctx } = await launchPersistentChrome(chromium, dataDir, {
-        headless: !headed
-      });
-      built = { kind: "persistent", context: ctx as BrowserContext, headed };
-    } else {
-      // cdp
-      if (!record?.cdpUrl) {
-        throw new Error(
-          "CDP browser connection record is missing cdpUrl; reconnect via /api/browser/connect."
-        );
-      }
-      // connectOverCDP returns a Browser handle scoped to the remote
-      // process. The remote Chrome's default BrowserContext shows up
-      // under browser.contexts() — we reuse it so signed-in cookies are
-      // visible. Note: CDP attach is known-flaky under playwright-core
-      // 1.60 + Bun; we keep it for users who explicitly attach to their
-      // own Chrome but warn them in the UI.
-      let browser: Browser;
-      try {
-        browser = await chromium.connectOverCDP(record.cdpUrl, { timeout: 60_000 });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (/timeout|websocket|protocol/i.test(message)) {
-          throw new Error(
-            `Failed to attach over CDP: ${message}. ` +
-              "CDP attach can hang under the current Playwright + Bun stack. " +
-              "Prefer the managed browser launch (visible Chrome window) via " +
-              "/api/browser/connect without a cdpUrl."
-          );
-        }
-        throw error instanceof Error ? error : new Error(message);
-      }
-      const ctx = browser.contexts()[0] ?? (await browser.newContext());
-      built = { kind: "cdp", browser, context: ctx };
-    }
+    // Transport acquisition is fully delegated to the session provider —
+    // the generation choreography around it is transport-agnostic.
+    const built: SharedHandle = await sessionProviders[mode].connect(record);
     if (disconnectGeneration !== launchGeneration) {
       // Disconnect bumped the generation while we were launching. Clean
       // up the freshly-built handle and surface a clear error to the
@@ -572,53 +662,13 @@ function killChromeByProfileDir(profileDir: string): number {
   }
 }
 
-// Mode-aware teardown of a SharedHandle. Persistent: close the
-// BrowserContext, which also terminates the Chromium child Playwright
-// launched. The profile dir on disk stays put (sign-ins persist).
-// CDP: disconnect the Playwright handle without closing the remote Chrome
-// (close() over CDP would kill the user's browser; falling back to close()
-// when disconnect() is missing is the lesser of two evils only if the
-// user's process is acceptable collateral — we deliberately leak the
-// in-process handle instead).
+// Mode-aware teardown of a SharedHandle, dispatched through the session
+// provider that built it (the seam's release side). Persistent closes the
+// BrowserContext (terminating the launched Chromium child; the profile
+// dir on disk stays put so sign-ins persist); cdp disconnects the
+// Playwright handle WITHOUT closing the remote Chrome.
 async function teardownHandle(handle: SharedHandle): Promise<void> {
-  switch (handle.kind) {
-    case "persistent": {
-      // Bound the close so a wedged Chromium can't hang teardown forever.
-      // On timeout, force-kill the underlying child to release the
-      // profile-dir lock that the next launchPersistentContext needs.
-      const settled = await settledWithin(handle.context.close(), teardownCloseTimeoutMs);
-      if (!settled && runtimeInstance) {
-        // The close() wedged. Reap the Chromium child by its profile-dir
-        // pid so the lock frees for the relaunch. Best-effort — a kill
-        // failure must never throw out of teardown.
-        try {
-          const killed = chromeKiller(chromeProfileDirFor(runtimeInstance));
-          if (killed >= 1) {
-            // Give the OS a moment to release the profile-dir lock before
-            // launchManaged relaunches against the same directory.
-            await new Promise((r) => setTimeout(r, 300));
-          }
-        } catch {
-          // best effort
-        }
-      }
-      return;
-    }
-    case "cdp": {
-      const candidate = handle.browser as unknown as { disconnect?: () => Promise<void> };
-      if (typeof candidate.disconnect === "function") {
-        // Bound the disconnect like the persistent close, but NEVER kill —
-        // the remote Chrome is the user's own process.
-        await settledWithin(candidate.disconnect(), teardownCloseTimeoutMs);
-      }
-      // If disconnect() isn't available on this CDP-attached Browser, do
-      // NOT fall back to close() — close() over CDP terminates the user's
-      // Chrome. Leaking the in-process handle is strictly better than
-      // killing the user's browser; it'll be garbage-collected once
-      // nothing references it.
-      return;
-    }
-  }
+  return sessionProviders[handle.kind].disconnect(handle);
 }
 
 function registerExitHook(): void {
@@ -4492,6 +4542,13 @@ export const __test = {
   // setBrowserInstance() doesn't leak it into sibling tests.
   resetBrowserInstanceForTest(): void {
     runtimeInstance = undefined;
+  },
+  // Swap a session provider so the seam-dispatch test can verify
+  // ensureShared / teardownHandle route through the registry without
+  // touching playwright-core. Pass null to restore the built-in provider.
+  setSessionProviderForTest(kind: Mode, provider: BrowserSessionProvider | null): void {
+    sessionProviders[kind] =
+      provider ?? (kind === "persistent" ? persistentSessionProvider : cdpSessionProvider);
   },
   // Install a fake shared handle so the close-path tests can assert
   // teardown behavior without launching Chromium. The `headed` flag

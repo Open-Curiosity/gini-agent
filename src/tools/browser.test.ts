@@ -2844,6 +2844,62 @@ describe("ensureShared default headless persistent launch", () => {
   });
 });
 
+// Session-provider seam: acquisition (ensureShared) and release
+// (teardownHandle) must both dispatch through the provider registry, so a
+// future remote provider can swap the transport without touching the
+// in-process snapshot/redaction/SSRF layers above the seam.
+describe("browser session provider seam", () => {
+  afterEach(() => {
+    browserTest.setSessionProviderForTest("persistent", null);
+    browserTest.uninstallFakeBrowserForTest();
+    browserTest.clearFakeSessionsForTest();
+    browserTest.clearPendingSharedForTest();
+  });
+
+  test("ensureShared connects and teardown disconnects through the registered provider", async () => {
+    const fakePage = {
+      on: () => undefined,
+      close: () => Promise.resolve(),
+      goto: () => Promise.resolve(null),
+      url: () => "about:blank",
+      title: () => Promise.resolve(""),
+      evaluate: () => Promise.resolve([])
+    };
+    const fakeContext = {
+      pages: () => [],
+      newPage: async () => fakePage,
+      close: async () => undefined,
+      browser: () => ({ isConnected: () => true })
+    };
+    let connectCalls = 0;
+    const disconnectedKinds: string[] = [];
+    browserTest.setSessionProviderForTest("persistent", {
+      kind: "persistent",
+      connect: async () => {
+        connectCalls++;
+        return { kind: "persistent", context: fakeContext as never, headed: false };
+      },
+      disconnect: async (handle) => {
+        disconnectedKinds.push(handle.kind);
+      }
+    });
+
+    try {
+      // Snapshot wiring may throw on the fake page; only the provider
+      // dispatch is under test.
+      await browserNavigate("seam-task", { url: "https://example.com/" });
+    } catch {
+      // ignore
+    }
+    expect(connectCalls).toBe(1);
+
+    await disconnectSharedBrowser();
+    expect(disconnectedKinds).toEqual(["persistent"]);
+    // The shared slot was cleared by the provider-mediated teardown.
+    expect(browserTest.uninstallFakeBrowserForTest().kind).toBe(null);
+  });
+});
+
 // browser_vision native-image fast-path gate: the screenshot may enter the
 // conversation directly ONLY when the active model accepts image input AND
 // no secrets are registered for ANY active task (raw pixels cannot be

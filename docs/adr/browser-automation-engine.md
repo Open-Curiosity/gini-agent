@@ -56,6 +56,14 @@ The snapshot walker emits a row for every iframe and inlines same-origin frame c
 - **Filename safety.** The server-suggested filename is attacker-controlled: it is reduced to a safe basename (separators/traversal stripped, control chars removed) and unique-ified on collision so downloads never overwrite each other.
 - The result envelope (saved path, size, suggested filename) rides the standard `ok()`/`fail()` secret-redaction pass like every other browser tool result.
 
+## Remote session provider seam
+
+The one capability the in-process local engine cannot fake is IP reputation: datacenter-IP blocks and geo walls discriminate on where the browser's traffic originates, not on how it is driven. `src/tools/browser.ts` therefore defines a `BrowserSessionProvider` seam — each provider owns exactly one transport concern (`connect()` returns a live `SharedHandle`, `disconnect()` releases it), and the two modes that always existed (persistent local launch, CDP attach to an external Chrome) are the two registered providers.
+
+- **Integration of an actual remote/cloud provider is deferred.** No provider is shipped; the seam is the deliverable. A future remote provider registers as a third entry that provisions its cloud session, attaches over CDP/WebSocket, and returns a cdp-shaped handle (or its own `SharedHandle` variant when teardown needs extra release work, e.g. an API call ending the cloud session).
+- **The in-process trust machinery is preserved by construction.** Snapshot walking, secret redaction, SSRF/domain-policy gating, approvals, and audit all run in-process against the Playwright client *above* this seam; a provider only changes where the transport endpoint points. This is the same property that ruled out subprocess engines (the Rationale above), restated as a structural requirement on any future provider.
+- One caveat carries over to remote browsers: the SSRF gate's private-IP/loopback checks evaluate addresses from the *runtime's* perspective. A remote provider's browser has its own network locality, so the gate's threat model (protecting the host the runtime runs on) must be revisited as part of any provider integration — another reason integration is deferred rather than stubbed.
+
 ## Revisit triggers
 
 - agent-browser ships a supported programmatic SDK (library entry point with hooks for output filtering and navigation policy).
