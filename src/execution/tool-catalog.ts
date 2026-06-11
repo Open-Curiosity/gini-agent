@@ -333,7 +333,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_navigate",
-      description: "Open a URL in a headless browser session and return a compact accessibility snapshot with @eN refs the agent can click or type into.",
+      description: "Open a URL in a headless browser session and return a compact accessibility snapshot with @eN refs the agent can click or type into. URLs that serve a PDF return the document's extracted text (`pdfText`) instead of a snapshot — there is no DOM to act on.",
       parameters: {
         type: "object",
         properties: {

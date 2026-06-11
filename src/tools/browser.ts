@@ -2292,6 +2292,106 @@ function str(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+// ---------------- PDF navigation handling ----------------
+//
+// A URL that renders as a PDF gives Chrome's PDF-viewer DOM to the
+// snapshot walker — a useless, near-empty tree. Detect the PDF at the
+// navigation boundary via the response content-type and return extracted
+// text (bounded to the snapshot char budget) instead of a DOM snapshot.
+// The bytes come from the already-buffered navigation response (no second
+// fetch — the URL has already passed the SSRF gate + domain policy +
+// post-redirect re-checks). Extraction reuses the shared attachment
+// extractor (lazy pdfjs-dist); when bytes or extraction are unavailable
+// the result still flags `pdf: true` with an honest note so the model
+// stops re-snapshotting.
+
+// Cap on PDF bytes handed to the extractor. Injectable for tests.
+const PDF_EXTRACT_MAX_BYTES_DEFAULT = 20 * 1024 * 1024;
+let pdfExtractMaxBytes = PDF_EXTRACT_MAX_BYTES_DEFAULT;
+
+// Extractor seam: production lazily imports the shared attachment
+// extractor; tests stub it so the suite never loads pdfjs-dist.
+type PdfTextExtractor = (bytes: Uint8Array) => Promise<{ text: string } | null>;
+const defaultPdfTextExtractor: PdfTextExtractor = async (bytes) => {
+  const { extractText } = await import("../capabilities/attachment-extract");
+  return extractText(bytes, "application/pdf", "document.pdf");
+};
+let pdfTextExtractor: PdfTextExtractor = defaultPdfTextExtractor;
+
+// Content-type of a navigation response, lowercased ("" when the response
+// or its headers aren't available — fake test pages, aborted loads).
+function navigationContentType(response: unknown): string {
+  const headersFn = (response as { headers?: () => Record<string, string> } | null | undefined)?.headers;
+  if (typeof headersFn !== "function") return "";
+  try {
+    const headers = headersFn.call(response);
+    return (headers["content-type"] ?? "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+// Build the navigate result for a PDF response. Extracted text rides the
+// standard ok() redaction pass; failures degrade to a structured hint
+// (`pdf: true` + note) rather than an empty snapshot.
+async function pdfNavigateResult(
+  session: Session,
+  response: unknown,
+  finalUrl: string,
+  taskId: string
+): Promise<string> {
+  // A PDF page has no DOM the agent can act on — drop any refs from the
+  // previous page so a stale click can't fire against the viewer.
+  session.refs = new Map();
+  session.lastSnapshotText = undefined;
+  const status = (response as { status?: () => number } | null | undefined)?.status?.() ?? null;
+  let bytes: Uint8Array | null = null;
+  try {
+    const bodyFn = (response as { body?: () => Promise<Uint8Array> } | null | undefined)?.body;
+    if (typeof bodyFn === "function") bytes = await bodyFn.call(response);
+  } catch {
+    bytes = null;
+  }
+  if (bytes && bytes.byteLength > pdfExtractMaxBytes) {
+    return ok({
+      url: finalUrl,
+      status,
+      pdf: true,
+      note: `This URL is a PDF document larger than the ${Math.floor(pdfExtractMaxBytes / (1024 * 1024))}MB extraction cap; no text was extracted. There is no DOM to snapshot — do not re-snapshot this page.`
+    }, taskId);
+  }
+  let text: string | null = null;
+  if (bytes) {
+    try {
+      text = (await pdfTextExtractor(bytes))?.text ?? null;
+    } catch {
+      text = null;
+    }
+  }
+  if (text === null) {
+    return ok({
+      url: finalUrl,
+      status,
+      pdf: true,
+      note: "This URL is a PDF document; text extraction was not possible. There is no DOM to snapshot — do not re-snapshot this page. If the user needs its contents, report that the PDF could not be read."
+    }, taskId);
+  }
+  let truncated = false;
+  if (text.length > SNAPSHOT_CHAR_BUDGET) {
+    const omitted = text.length - SNAPSHOT_CHAR_BUDGET;
+    text = `${text.slice(0, SNAPSHOT_CHAR_BUDGET)}\n[...PDF text truncated +${omitted} more chars]`;
+    truncated = true;
+  }
+  return ok({
+    url: finalUrl,
+    status,
+    pdf: true,
+    pdfText: text,
+    truncated,
+    note: "This URL rendered as a PDF document; extracted text is shown instead of a DOM snapshot."
+  }, taskId);
+}
+
 export async function browserNavigate(taskId: string, args: Record<string, unknown>): Promise<string> {
   const url = str(args.url);
   if (!url) return fail("Missing required string argument: url");
@@ -2369,6 +2469,11 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
       // any stale stamps, restarts ref numbering at @e1, and returns the
       // full tree (never a diff).
       session.lastSnapshotUrl = undefined;
+      // PDF responses have no DOM worth walking — return extracted text
+      // (or an honest hint) instead of a useless viewer snapshot.
+      if (navigationContentType(response).includes("application/pdf")) {
+        return await pdfNavigateResult(session, response, finalUrl, taskId);
+      }
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
@@ -4279,6 +4384,16 @@ export const __test = {
   // need to materialize a 50MB file. Pass null to restore the default.
   setDownloadMaxBytesForTest(value: number | null): void {
     downloadMaxBytes = value ?? DOWNLOAD_MAX_BYTES_DEFAULT;
+  },
+  // Stub the PDF text extractor so navigation tests never load
+  // pdfjs-dist. Pass null to restore the lazy attachment-extract path.
+  setPdfTextExtractorForTest(extractor: ((bytes: Uint8Array) => Promise<{ text: string } | null>) | null): void {
+    pdfTextExtractor = extractor ?? defaultPdfTextExtractor;
+  },
+  // Override the PDF extraction byte cap so over-cap tests don't need a
+  // 20MB buffer. Pass null to restore the default.
+  setPdfExtractMaxBytesForTest(value: number | null): void {
+    pdfExtractMaxBytes = value ?? PDF_EXTRACT_MAX_BYTES_DEFAULT;
   },
   // Register a secret value for a task exactly as browserFillByLocator
   // would, so the safetyCheck registered-secret URL gate can be

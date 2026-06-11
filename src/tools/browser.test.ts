@@ -4232,6 +4232,113 @@ describe("browserUploadFile", () => {
   });
 });
 
+// PDF detection at the navigation boundary: an application/pdf response
+// returns extracted text (bounded to the snapshot char budget) instead of
+// a useless viewer-DOM snapshot; extraction failures degrade to a
+// structured `pdf: true` hint. The extractor is stubbed so the suite
+// never loads pdfjs-dist.
+describe("browserNavigate PDF handling", () => {
+  // IP-literal host: skips the DNS pre-flight lookup, passes safetyCheck
+  // (public documentation range).
+  const PDF_URL = "https://203.0.113.5/invoice.pdf";
+
+  function makePdfPage(opts: {
+    contentType?: string;
+    body?: (() => Promise<Uint8Array>) | null;
+  } = {}): Partial<import("playwright-core").Page> {
+    const response = {
+      status: () => 200,
+      headers: () => ({ "content-type": opts.contentType ?? "application/pdf" }),
+      ...(opts.body === null ? {} : { body: opts.body ?? (async () => new TextEncoder().encode("%PDF-1.4 fake")) })
+    };
+    return {
+      url: () => PDF_URL,
+      title: async () => "invoice.pdf",
+      goto: (async () => response) as unknown as import("playwright-core").Page["goto"],
+      evaluate: (async () => ({ entries: [], hiddenEmitted: 0, hiddenTotal: 0, hiddenBudget: 0 })) as unknown as import("playwright-core").Page["evaluate"]
+    };
+  }
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    browserTest.setPdfTextExtractorForTest(null);
+    browserTest.setPdfExtractMaxBytesForTest(null);
+  });
+
+  test("returns extracted text for an application/pdf response instead of a DOM snapshot", async () => {
+    browserTest.setPdfTextExtractorForTest(async () => ({ text: "INVOICE TOTAL $42 due 2026-07-01" }));
+    browserTest.installFakeSessionWithPageForTest("pdf-ok", makePdfPage());
+
+    const raw = await browserNavigate("pdf-ok", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; pdfText?: string; snapshot?: string; status?: number };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.status).toBe(200);
+    expect(parsed.pdfText).toContain("INVOICE TOTAL $42");
+    expect(parsed.snapshot).toBeUndefined();
+  });
+
+  test("bounds extracted text to the snapshot char budget with a counted marker", async () => {
+    browserTest.setPdfTextExtractorForTest(async () => ({ text: "A".repeat(32_500) }));
+    browserTest.installFakeSessionWithPageForTest("pdf-budget", makePdfPage());
+
+    const raw = await browserNavigate("pdf-budget", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdfText?: string; truncated?: boolean };
+    expect(parsed.success).toBe(true);
+    expect(parsed.truncated).toBe(true);
+    expect(parsed.pdfText).toContain("[...PDF text truncated +500 more chars]");
+    // 32_000 budget chars + the marker line.
+    expect(parsed.pdfText!.length).toBeLessThan(32_100);
+  });
+
+  test("degrades to a structured hint when extraction fails", async () => {
+    browserTest.setPdfTextExtractorForTest(async () => null);
+    browserTest.installFakeSessionWithPageForTest("pdf-fail", makePdfPage());
+
+    const raw = await browserNavigate("pdf-fail", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; pdfText?: string; note?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.pdfText).toBeUndefined();
+    expect(parsed.note).toContain("text extraction was not possible");
+    expect(parsed.note).toContain("do not re-snapshot");
+  });
+
+  test("skips extraction above the byte cap and says so", async () => {
+    let extractorCalls = 0;
+    browserTest.setPdfTextExtractorForTest(async () => {
+      extractorCalls++;
+      return { text: "should not run" };
+    });
+    browserTest.setPdfExtractMaxBytesForTest(8);
+    browserTest.installFakeSessionWithPageForTest("pdf-cap", makePdfPage());
+
+    const raw = await browserNavigate("pdf-cap", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; note?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBe(true);
+    expect(parsed.note).toContain("extraction cap");
+    expect(extractorCalls).toBe(0);
+  });
+
+  test("non-PDF responses keep the normal snapshot path", async () => {
+    let extractorCalls = 0;
+    browserTest.setPdfTextExtractorForTest(async () => {
+      extractorCalls++;
+      return { text: "nope" };
+    });
+    browserTest.installFakeSessionWithPageForTest("pdf-not", makePdfPage({ contentType: "text/html; charset=utf-8" }));
+
+    const raw = await browserNavigate("pdf-not", { url: PDF_URL });
+    const parsed = JSON.parse(raw) as { success: boolean; pdf?: boolean; snapshot?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.pdf).toBeUndefined();
+    expect(typeof parsed.snapshot).toBe("string");
+    expect(extractorCalls).toBe(0);
+  });
+});
+
 // Approved-download executor. Mirrors the upload suite: fake session +
 // fake page whose waitForEvent hands back a stubbed Playwright Download,
 // so save-path, sanitization, collision, and size-cap behavior run
