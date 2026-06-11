@@ -3413,7 +3413,16 @@ function readOpenAIBearer(provider: ProviderConfig): string {
   const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
   const apiKey = process.env[envName];
   if (!apiKey) {
-    throw new Error(`${providerDisplayLabel(provider.name)} provider is configured but ${envName} is not set.`);
+    // Typed so failTask records the needs-reauth state and renders the named
+    // re-auth CTA for a key unset mid-turn (mirrors readAnthropicKey and
+    // bedrock) — the message itself never matches the chat-task classifier
+    // ("is not set" carries no auth verb, and `_` is a word char so the env
+    // var name hides the api-key noun), so an untyped throw here would leave
+    // the whole OpenAI-compatible family invisible to the amber Settings row.
+    throw new ProviderAuthError(
+      provider.name,
+      `${providerDisplayLabel(provider.name)} provider is configured but ${envName} is not set.`
+    );
   }
   return apiKey;
 }

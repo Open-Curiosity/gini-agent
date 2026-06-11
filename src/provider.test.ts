@@ -3488,6 +3488,28 @@ describe("auth-error classification", () => {
     }
   });
 
+  test("openai: a missing API key env var surfaces as a typed ProviderAuthError, not a generic failure", async () => {
+    // Mirrors the anthropic/bedrock pins: the missing-env message never
+    // matches isAuthExpiredError, so only a typed throw reaches the
+    // needs-reauth record and the amber Settings row.
+    const restoreEnv = setEnv("OPENAI_API_KEY", undefined);
+    const fetchStub = installFetch(() => anthropicJson({}));
+    try {
+      const err = await generateToolCallingResponse(
+        config(normalizeProvider({ name: "openai", model: "gpt-test" })),
+        [{ role: "user", content: "hi" }],
+        []
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("openai");
+      expect((err as Error).message).toContain("OPENAI_API_KEY is not set");
+      expect(fetchStub.calls.length).toBe(0);
+    } finally {
+      fetchStub.restore();
+      restoreEnv();
+    }
+  });
+
   test("providerDisplayLabel returns clean brand labels", () => {
     expect(providerDisplayLabel("codex")).toBe("Codex");
     expect(providerDisplayLabel("openai")).toBe("OpenAI");
