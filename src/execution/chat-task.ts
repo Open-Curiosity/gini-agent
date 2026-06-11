@@ -92,6 +92,7 @@ import {
 import {
   emitAuthorizationRequested,
   emitSetupRequested,
+  deleteAssistantTextBlock,
   emitAssistantTextStart,
   emitPhase,
   emitSystemNote,
@@ -1942,7 +1943,19 @@ async function runLoop(
       // cancelTask owns the streaming-text flip in that case so the
       // partial-text invariant from ADR risks §4 holds.
       if (finished.status === "completed") {
-        if (inFlightAssistantBlockId) {
+        // [SILENT] sentinel — a scheduled job (or fan-out subagent
+        // worker) with nothing to report responds with exactly
+        // "[SILENT]" to suppress delivery. The legacy message layer
+        // (syncChatTaskResult) drops the ChatMessageRecord, but the UI
+        // renders chat blocks, so we must also retract the assistant_text
+        // block here or the channel shows a literal "[SILENT]" row. Mirror
+        // the legacy exactness: only the literal token (trailing
+        // whitespace tolerated), never content that merely contains it.
+        if (finalText.trim() === "[SILENT]") {
+          if (inFlightAssistantBlockId) {
+            deleteAssistantTextBlock(emitCtx, inFlightAssistantBlockId);
+          }
+        } else if (inFlightAssistantBlockId) {
           finalizeAssistantText(emitCtx, inFlightAssistantBlockId, finalText || "(no content)");
         } else if (finalText) {
           // No streaming deltas observed (provider returned the whole

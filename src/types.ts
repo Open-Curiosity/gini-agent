@@ -618,6 +618,13 @@ export interface RuntimeState {
   // its own channel exactly once; later boots leave an already-migrated install
   // alone. Legacy states omit it (treated as "not yet migrated").
   emailWatcherChannelsMigratedAt?: string;
+  // Per-agent opt-in for whole-inbox triage (ADR email-watch.md). An agent id
+  // appears here ONLY when the user explicitly asked to triage their entire
+  // inbox ("respond-or-flag all my new mail"); the empty string is the sentinel
+  // for legacy/hand-edited watchers with no agentId. Triage is opt-in: a normal
+  // sender/thread watch never adds an entry, so it never provisions the broad
+  // `in:inbox` triage concern. Absent/empty for installs that never opted in.
+  emailTriageAgents?: string[];
   events: RuntimeEvent[];
   jobRuns: JobRunRecord[];
   chatSessions: ChatSessionRecord[];

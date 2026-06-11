@@ -213,6 +213,20 @@ function buildTriageRoute(triageChannelId: string | undefined, fallbackSessionId
   };
 }
 
+// The opt-in registry key for an agent. The empty string is the sentinel for
+// legacy/hand-edited watchers with no agentId, so they group under one key.
+function triageAgentKey(agentId: string | undefined): string {
+  return agentId ?? "";
+}
+
+// Whether the agent has opted into whole-inbox triage. Triage is OPT-IN: a
+// normal sender/thread watch never sets this, so it never provisions the broad
+// `in:inbox` triage concern. Set only when the user explicitly asks to triage
+// their entire inbox (the email_watch tool's / API's `triage: true`).
+function isTriageEnabled(state: RuntimeState, agentId: string | undefined): boolean {
+  return (state.emailTriageAgents ?? []).includes(triageAgentKey(agentId));
+}
+
 // Find the agent's triage channel by identity: an email-watch-feature channel
 // titled "Inbox triage". At most one per agent (provisioning is idempotent), so
 // this never returns a duplicate. Distinct title from the shared session keeps
@@ -520,19 +534,20 @@ async function rebuildSharedJobWatches(config: RuntimeConfig, agentId: string | 
     return;
   }
 
-  // Provision the triage concern's channel once there is at least one watcher, so
-  // newly-arrived unmatched mail always has a concern to land in. Idempotent. This
+  // Provision the triage concern ONLY when the agent opted into whole-inbox
+  // triage; a normal sender/thread watch never resurrects it. Idempotent. This
   // is an await, so the watch list + routes below are (re)derived from the LIVE
   // state INSIDE the final mutateState — never from the pre-await `enabled`
   // snapshot — so a concurrent add's watcher isn't dropped across this yield.
-  const triageChannelId = await ensureTriageChannel(config, agentId);
+  const triageEnabled = isTriageEnabled(state, agentId);
+  const triageChannelId = triageEnabled ? await ensureTriageChannel(config, agentId) : undefined;
   await mutateState(config.instance, (s) => {
     const job = s.jobs.find((j) => j.id === jobId);
     const sessionId = job?.chatSessionId;
     const liveEnabled = enabledWatchersForAgent(s, agentId);
-    const watches = [...liveEnabled.map(buildWatch), buildTriageWatch()];
+    const watches = triageEnabled ? [...liveEnabled.map(buildWatch), buildTriageWatch()] : liveEnabled.map(buildWatch);
     const routes = buildJobRoutes(liveEnabled, sessionId);
-    const triageRoute = buildTriageRoute(triageChannelId, sessionId);
+    const triageRoute = triageEnabled ? buildTriageRoute(triageChannelId, sessionId) : undefined;
     if (triageRoute) routes[TRIAGE_ROUTE_KEY] = triageRoute;
     if (job?.preRunHook) {
       (job.preRunHook.config as { watches?: unknown }).watches = watches;
@@ -742,6 +757,48 @@ export async function clearEmailWatcherObjective(
   if (!updated) return undefined;
   await rebuildSharedJobWatches(config, updated.agentId);
   return getEmailWatcher(config, watcherId) ?? updated;
+}
+
+// Opt an agent INTO or OUT OF whole-inbox triage, then rebuild the shared job
+// so the broad `in:inbox` triage concern (+ its channel + route) is provisioned
+// on opt-in and torn down on opt-out. Triage is OPT-IN: this is the ONLY thing
+// that adds the agent to the registry, so a normal sender/thread watch never
+// provisions triage. Opting in requires a shared job to attach the triage watch
+// to; ensureSharedJobAndSession is NOT called here, so triage takes effect once
+// the agent has at least one normal watcher (the rebuild is a no-op without a
+// shared job). Opting out removes the registry entry; the rebuild then drops the
+// triage watch/route, and removeTriageChannel sweeps the now-unreferenced
+// channel. Returns whether triage is enabled after the change.
+export async function setEmailTriageEnabled(
+  config: RuntimeConfig,
+  agentId: string | undefined,
+  enabled: boolean
+): Promise<boolean> {
+  const key = triageAgentKey(agentId);
+  await mutateState(config.instance, (state) => {
+    const current = state.emailTriageAgents ?? [];
+    const has = current.includes(key);
+    if (enabled && !has) state.emailTriageAgents = [...current, key];
+    else if (!enabled && has) state.emailTriageAgents = current.filter((k) => k !== key);
+  });
+  await rebuildSharedJobWatches(config, agentId);
+  if (!enabled) await removeTriageChannel(config, agentId);
+  return enabled;
+}
+
+// Delete the agent's triage channel after opt-out. The rebuild already dropped
+// the triage watch + route, so the channel is referenced by nothing; reclaim it
+// explicitly (the identity-based orphan sweep keys on the email-watch marker but
+// keeps any channel a live watcher still references, which the triage channel
+// never is once opted out).
+async function removeTriageChannel(config: RuntimeConfig, agentId: string | undefined): Promise<void> {
+  const triageChannelId = findTriageChannelId(readState(config.instance), agentId);
+  if (!triageChannelId) return;
+  await mutateState(config.instance, (state) => {
+    if (state.chatSessions.some((s) => s.id === triageChannelId)) {
+      deleteChatSession(state, triageChannelId);
+    }
+  });
 }
 
 // Enable / disable a watcher, then rebuild the shared job's watch list so a

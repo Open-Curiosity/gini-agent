@@ -29,6 +29,7 @@ import {
   ensureAgentBank,
   ensureDefaultBank,
   insertMemoryUnit,
+  listChatBlocks,
   mutateState,
   now,
   readState
