@@ -1,16 +1,23 @@
 import { cn } from "@/lib/utils";
+import { ActivityDot, type ThreadActivity } from "./ActivityDot";
 
 export type ChatTab = "messages" | "threads" | "jobs" | "settings";
+export type ThreadsActivity = ThreadActivity;
 
 interface TabSpec {
   id: ChatTab;
   label: string;
   count?: number;
+  countLabel?: string;
+  activity?: ThreadsActivity;
 }
 
 // Chat tab bar — design `i2BaA`. The active tab gets a 2px white bottom
 // border; inactive labels are muted. Threads/Jobs carry an optional count
-// pill. Underline lives on the label row so it hugs the text width like the
+// pill, and Threads adds an activity dot while any of the agent's threads
+// has a run in flight (pulsing green while running, steady amber while a
+// run waits on the user) so activity is visible without switching tabs.
+// Underline lives on the label row so it hugs the text width like the
 // design. Jobs and Settings are per-agent surfaces; the caller hides Jobs on
 // channels and Settings on any pinned session (both can show another agent's
 // session), so their visibility flags are passed separately.
@@ -18,6 +25,7 @@ export function ChatTabBar({
   active,
   onChange,
   threadCount,
+  threadsActivity,
   jobCount,
   hideJobsTab,
   hideSettingsTab
@@ -25,13 +33,20 @@ export function ChatTabBar({
   active: ChatTab;
   onChange: (tab: ChatTab) => void;
   threadCount?: number;
+  threadsActivity?: ThreadsActivity;
   jobCount?: number;
   hideJobsTab?: boolean;
   hideSettingsTab?: boolean;
 }) {
   const tabs: TabSpec[] = [
     { id: "messages", label: "Messages" },
-    { id: "threads", label: "Threads", count: threadCount },
+    {
+      id: "threads",
+      label: "Threads",
+      count: threadCount,
+      countLabel: "unread threads",
+      activity: threadsActivity
+    },
     ...(hideJobsTab ? [] : [{ id: "jobs", label: "Jobs", count: jobCount } as TabSpec]),
     ...(hideSettingsTab ? [] : [{ id: "settings", label: "Settings" } as TabSpec])
   ];
@@ -52,9 +67,18 @@ export function ChatTabBar({
             )}
           >
             {tab.label}
+            {tab.activity ? (
+              <>
+                <ActivityDot activity={tab.activity} />
+                <span className="sr-only">
+                  {tab.activity === "running" ? "a thread is running" : "a thread needs approval"}
+                </span>
+              </>
+            ) : null}
             {tab.count ? (
               <span className="flex items-center justify-center rounded-full border border-border bg-muted px-1.5 py-px text-[11px] font-bold text-foreground">
                 {tab.count}
+                {tab.countLabel ? <span className="sr-only"> {tab.countLabel}</span> : null}
               </span>
             ) : null}
           </button>

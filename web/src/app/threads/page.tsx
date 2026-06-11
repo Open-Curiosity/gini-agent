@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ThreadCard } from "@/components/chat/ThreadCard";
 import { ThreadPanel } from "@/components/chat/ThreadPanel";
+import { sortThreads } from "@/components/chat/ThreadsTab";
 import { useThreadsInbox } from "@/lib/queries";
 import { useThreadReadState } from "@/lib/use-chat-read-state";
 import type { ThreadSummary } from "@/lib/view-types";
@@ -32,8 +33,10 @@ export default function ThreadsInboxPage() {
     markThreadRead(live);
   }, [openThread, threads, markThreadRead]);
 
+  // In-flight threads first (matching the per-agent tab), newest within
+  // each group.
   const visible = useMemo(
-    () => (filter === "unread" ? threads.filter((t) => isThreadUnread(t)) : threads),
+    () => sortThreads(filter === "unread" ? threads.filter((t) => isThreadUnread(t)) : threads),
     [threads, filter, isThreadUnread]
   );
 
@@ -47,35 +50,42 @@ export default function ThreadsInboxPage() {
           </span>
         </header>
 
-        <div className="flex shrink-0 items-center justify-between border-b border-border px-10 py-3">
-          <div className="flex items-center gap-0.5 rounded-lg border border-border bg-card p-0.5">
-            {(["all", "unread"] as const).map((value) => (
-              <button
-                key={value}
-                type="button"
-                onClick={() => setFilter(value)}
-                className={cn(
-                  "rounded-md px-3.5 py-1.5 text-[13px] font-semibold capitalize transition-colors",
-                  filter === value
-                    ? "border border-border bg-muted text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                )}
-              >
-                {value}
-              </button>
-            ))}
+        {/* Toolbar spans the full row like the cards below it. */}
+        <div className="shrink-0 border-b border-border px-10 py-3">
+          <div className="flex w-full items-center justify-between">
+            <div className="flex items-center gap-0.5 rounded-lg border border-border bg-card p-0.5">
+              {(["all", "unread"] as const).map((value) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setFilter(value)}
+                  className={cn(
+                    "rounded-md px-3.5 py-1.5 text-[13px] font-semibold capitalize transition-colors",
+                    filter === value
+                      ? "border border-border bg-muted text-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  {value}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              onClick={() => markAllThreadsRead(threads)}
+              className="flex items-center gap-1.5 text-[13px] font-medium text-muted-foreground hover:text-foreground"
+            >
+              <Check className="size-3.5" />
+              Mark all read
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={() => markAllThreadsRead(threads)}
-            className="flex items-center gap-1.5 text-[13px] font-medium text-muted-foreground hover:text-foreground"
-          >
-            <Check className="size-3.5" />
-            Mark all read
-          </button>
         </div>
 
-        {visible.length === 0 ? (
+        {inbox.isLoading && threads.length === 0 ? (
+          <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+            Loading…
+          </div>
+        ) : visible.length === 0 ? (
           <EmptyState filter={filter} onBrowseAll={() => setFilter("all")} />
         ) : (
           <ScrollArea className="min-h-0 flex-1">
@@ -113,7 +123,20 @@ export default function ThreadsInboxPage() {
   );
 }
 
+// Two distinct zero states: the Unread filter's "caught up" (there ARE
+// threads, none unread) and the true first-run empty where the feature
+// itself needs explaining — mirroring the per-agent tab's explainer copy.
 function EmptyState({ filter, onBrowseAll }: { filter: Filter; onBrowseAll: () => void }) {
+  if (filter === "all") {
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center gap-2 p-10 text-center">
+        <p className="text-[15px] font-semibold text-foreground">No threads yet</p>
+        <p className="text-sm text-muted-foreground">
+          Replies to your agents&apos; messages branch into threads here.
+        </p>
+      </div>
+    );
+  }
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-7 p-10 text-center">
       <div className="flex size-16 items-center justify-center rounded-2xl border border-border bg-card">
@@ -125,15 +148,13 @@ function EmptyState({ filter, onBrowseAll }: { filter: Filter; onBrowseAll: () =
           You have no unread thread replies right now.
         </p>
       </div>
-      {filter === "unread" ? (
-        <button
-          type="button"
-          onClick={onBrowseAll}
-          className="rounded-lg border border-border px-4 py-2 text-[13px] font-semibold text-foreground hover:bg-accent"
-        >
-          Browse all threads
-        </button>
-      ) : null}
+      <button
+        type="button"
+        onClick={onBrowseAll}
+        className="rounded-lg border border-border px-4 py-2 text-[13px] font-semibold text-foreground hover:bg-accent"
+      >
+        Browse all threads
+      </button>
     </div>
   );
 }

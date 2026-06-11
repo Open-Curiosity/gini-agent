@@ -626,6 +626,15 @@ export interface ThreadSummary {
   // inbox can label who replied last. `user_text` ⇒ "user", otherwise
   // "agent". Absent when the thread has no text-bearing block yet.
   lastReplyAuthor?: "user" | "agent";
+  // Present while any of the thread's tasks is in flight; absent when idle.
+  // Overlapping tasks can interleave blocks in one thread, so each task is
+  // judged by its own newest decisive block (gate ⇒ waiting; non-terminal
+  // phase or still-running tool call ⇒ running — the per-task backwards
+  // scan in threadActivity, src/state/chat-blocks.ts), then the thread
+  // aggregates: any task parked on a user gate ⇒ "waiting_approval" (the
+  // actionable state wins), else any running task ⇒ "running". Drives
+  // activity indicators on thread lists.
+  activity?: "running" | "waiting_approval";
 }
 
 export interface RuntimeState {
@@ -1526,10 +1535,13 @@ export interface Authorization {
 // /setup-requests/:id/complete endpoint.
 //
 // The messaging.* actions (add_bridge, approve_pairing, remove_bridge) are
-// connect-only: like browser.connect / connector.request, their side effect
-// (addMessagingBridge / allowChat / removeMessagingBridge) runs inside the
-// /complete handler before the request is marked completed. They carry no
-// approve/deny semantics, so they live here rather than on AuthorizationAction.
+// connect-only: their side effect (addMessagingBridge / allowChat /
+// removeMessagingBridge) runs inside the /complete handler AFTER the row is
+// atomically claimed pending → completed — the same claim-first ordering as
+// connector.request's create+probe. browser.connect is the inverse: its side
+// effect runs before the resolve. See SETUP_COMPLETE_EMITS_WORKING_PHASE in
+// src/agent.ts. They carry no approve/deny semantics, so they live here
+// rather than on AuthorizationAction.
 export type SetupRequestAction =
   | "browser.connect"
   | "connector.request"

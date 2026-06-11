@@ -871,6 +871,74 @@ interface ThreadAggRow {
   last_reply_at: string;
 }
 
+// Phase labels that end a run. Mirrors TERMINAL_PHASE_LABELS on the web chat
+// surface so a thread reports activity exactly while the chat page would
+// render its run as in flight.
+const TERMINAL_PHASE_LABELS = new Set(["Completed", "Cancelled", "Failed"]);
+
+// A thread's in-flight state, or null when idle. Scans the thread's
+// activity-bearing blocks newest-first. Overlapping tasks can interleave
+// their blocks in one thread (replies are not serialized), so one task's
+// terminal phase must not mask another task's still-running work: each
+// task is decided by ITS OWN newest decisive block, and the thread
+// aggregates — any task parked on a gate ⇒ "waiting_approval" (the
+// actionable state wins, matching the UI's ordering), else any running
+// task ⇒ "running". Per task, the decisive rules are:
+//   - an authorization/setup gate ⇒ waiting — gate blocks carry no
+//     resolution state, but resolving one always appends newer blocks (the
+//     resumed run's phases, or a terminal phase on deny), so a gate that is
+//     still the task's newest row means the run is parked on it
+//   - a phase block ⇒ running while its label is non-terminal
+//   - a tool call still running ahead of any phase block ⇒ running (the
+//     same backwards walk the web ThreadPanel uses for its composer state)
+// Rows whose payload doesn't parse (or a phase row with no string label) are
+// skipped rather than guessed at, so a single malformed row can't pin a
+// thread "running" forever.
+function threadActivity(
+  db: ReturnType<typeof getMemoryDb>,
+  sessionId: string,
+  threadId: string
+): "running" | "waiting_approval" | null {
+  const rows = db
+    .query<{ kind: string; payload_json: string; task_id: string | null }, [string, string]>(
+      `SELECT kind, payload_json, task_id FROM chat_blocks
+       WHERE session_id = ? AND thread_id = ?
+         AND kind IN ('phase', 'tool_call', 'authorization_requested', 'setup_requested')
+       ORDER BY ordinal DESC`
+    )
+    .all(sessionId, threadId);
+  let anyRunning = false;
+  let anyWaiting = false;
+  const decidedTasks = new Set<string>();
+  for (const row of rows) {
+    // Legacy rows without a task id share one pseudo-task bucket.
+    const taskKey = row.task_id ?? "";
+    if (decidedTasks.has(taskKey)) continue;
+    if (row.kind === "authorization_requested" || row.kind === "setup_requested") {
+      decidedTasks.add(taskKey);
+      anyWaiting = true;
+      continue;
+    }
+    let payload: { label?: unknown; status?: unknown };
+    try {
+      payload = JSON.parse(row.payload_json) as { label?: unknown; status?: unknown };
+    } catch {
+      continue;
+    }
+    if (row.kind === "phase" && typeof payload.label === "string") {
+      decidedTasks.add(taskKey);
+      if (!TERMINAL_PHASE_LABELS.has(payload.label)) anyRunning = true;
+      continue;
+    }
+    if (row.kind === "tool_call" && payload.status === "running") {
+      decidedTasks.add(taskKey);
+      anyRunning = true;
+    }
+  }
+  if (anyWaiting) return "waiting_approval";
+  return anyRunning ? "running" : null;
+}
+
 // Builds ThreadSummary objects from aggregate rows, hydrating the parent
 // preview + author (text/kind of the rooted main-chat block — a human
 // user_text for an agent-started thread, an assistant_text for a
@@ -901,6 +969,7 @@ function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAg
         ? "user"
         : "agent"
       : undefined;
+    const activity = threadActivity(db, row.session_id, row.thread_id);
     return {
       threadId: row.thread_id,
       sessionId: row.session_id,
@@ -911,7 +980,8 @@ function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAg
       replyCount: row.reply_count,
       lastReplyAt: row.last_reply_at,
       ...(lastReplyPreview.length > 0 ? { lastReplyPreview } : {}),
-      ...(lastReplyAuthor ? { lastReplyAuthor } : {})
+      ...(lastReplyAuthor ? { lastReplyAuthor } : {}),
+      ...(activity ? { activity } : {})
     };
   });
 }
@@ -934,7 +1004,7 @@ export function summarizeThreads(instance: Instance, sessionId: string): ThreadS
        FROM chat_blocks
        WHERE session_id = ? AND thread_id IS NOT NULL
        GROUP BY thread_id, session_id
-       ORDER BY last_reply_at DESC`
+       ORDER BY last_reply_at DESC, thread_id ASC`
     )
     .all(sessionId);
   return buildThreadSummaries(db, rows);
@@ -966,7 +1036,7 @@ export function summarizeThreadsForInstance(
        FROM chat_blocks
        WHERE instance = ? AND thread_id IS NOT NULL AND session_id IN (${placeholders})
        GROUP BY thread_id, session_id
-       ORDER BY last_reply_at DESC`
+       ORDER BY last_reply_at DESC, thread_id ASC, session_id ASC`
     )
     .all(instance, ...agentSessionIds);
   return buildThreadSummaries(db, rows);

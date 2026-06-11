@@ -516,7 +516,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           ...summary,
           agentName: summary.agentId ? agentNameById.get(summary.agentId) ?? summary.agentId : undefined
         }))
-        .sort((a, b) => b.lastReplyAt.localeCompare(a.lastReplyAt));
+        // threadId tiebreak keeps same-millisecond threads from swapping
+        // between polls.
+        .sort(
+          (a, b) =>
+            b.lastReplyAt.localeCompare(a.lastReplyAt) || a.threadId.localeCompare(b.threadId)
+        );
       return json(summaries);
     }],
     ["GET", /^\/api\/chat\/([^/]+)\/stream$/, async (request, params) => {
@@ -945,6 +950,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // already non-pending), throws here and performs ZERO side effects.
         // We claim with resumeChatTask:false / no toolResult so the resume is
         // staged LATER, as the final step, exactly once on the winning claim.
+        // skill.grant_connector deliberately emits no Working phase on
+        // complete (see SETUP_COMPLETE_EMITS_WORKING_PHASE in src/agent.ts):
+        // the multi-credential flow below mints the NEXT grant card without a
+        // new gate block, and the old gate block staying newest is what keeps
+        // the thread truthfully waiting on the next credential.
         await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
 
         // Only the winner reaches here. Record the grant for the approved

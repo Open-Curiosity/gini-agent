@@ -1002,6 +1002,376 @@ describe("chat-blocks threading", () => {
     expect(thread?.lastReplyAt).toBe(messageTs);
   });
 
+  test("summarizeThreads reports thread activity while its newest run is in flight", () => {
+    const instance = "chat-blocks-thread-active";
+    const session = "chat_active";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Root.",
+      streaming: false
+    });
+    const reply = (threadId: string) =>
+      insertChatBlock(instance, {
+        kind: "user_text",
+        sessionId: session,
+        text: `reply in ${threadId}`,
+        threadId,
+        parentBlockId: root.id
+      });
+    const phase = (threadId: string, label: string) =>
+      insertChatBlock(instance, { kind: "phase", sessionId: session, label, threadId, parentBlockId: root.id });
+    const toolCall = (threadId: string, callId: string, status: "running" | "ok") =>
+      insertChatBlock(instance, {
+        kind: "tool_call",
+        sessionId: session,
+        toolName: "file_read",
+        displayLabel: "Read file",
+        argsPreview: "x.md",
+        argsFull: { path: "x.md" },
+        status,
+        callId,
+        threadId,
+        parentBlockId: root.id
+      });
+
+    // Newest phase is non-terminal → the run is still going.
+    reply("thread_running");
+    phase("thread_running", "Working: terminal");
+    // Newest phase is terminal → done.
+    reply("thread_done");
+    phase("thread_done", "Completed");
+    // A tool call still running AFTER the terminal phase decides first.
+    reply("thread_tool");
+    phase("thread_tool", "Completed");
+    toolCall("thread_tool", "call_active_1", "running");
+    // A stale running tool call BEFORE the terminal phase does not — the
+    // newer phase block wins the backwards scan.
+    reply("thread_tool_done");
+    toolCall("thread_tool_done", "call_active_2", "running");
+    phase("thread_tool_done", "Cancelled");
+    // Only messages → nothing in flight.
+    reply("thread_text");
+    // Only a finished tool call → nothing in flight.
+    reply("thread_tool_ok");
+    toolCall("thread_tool_ok", "call_active_3", "ok");
+
+    const byId = new Map(summarizeThreads(instance, session).map((s) => [s.threadId, s]));
+    expect(byId.get("thread_running")?.activity).toBe("running");
+    expect(byId.get("thread_done")?.activity).toBeUndefined();
+    expect(byId.get("thread_tool")?.activity).toBe("running");
+    expect(byId.get("thread_tool_done")?.activity).toBeUndefined();
+    expect(byId.get("thread_text")?.activity).toBeUndefined();
+    expect(byId.get("thread_tool_ok")?.activity).toBeUndefined();
+    // The instance-wide inbox query computes the same flag.
+    const inbox = new Map(summarizeThreadsForInstance(instance, [session]).map((s) => [s.threadId, s]));
+    expect(inbox.get("thread_running")?.activity).toBe("running");
+    expect(inbox.get("thread_done")?.activity).toBeUndefined();
+  });
+
+  test("summarizeThreads reports waiting_approval while a user gate is the newest activity", () => {
+    const instance = "chat-blocks-thread-gates";
+    const session = "chat_gates";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Root.",
+      streaming: false
+    });
+    const reply = (threadId: string) =>
+      insertChatBlock(instance, {
+        kind: "user_text",
+        sessionId: session,
+        text: `reply in ${threadId}`,
+        threadId,
+        parentBlockId: root.id
+      });
+
+    // Run parked on an authorization gate: phase "Working" then the gate,
+    // with nothing newer — the run is waiting on the user, not running.
+    reply("thread_auth");
+    insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Working: terminal",
+      threadId: "thread_auth",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "authorization_requested",
+      sessionId: session,
+      authorizationId: "auth_1",
+      action: "terminal.exec",
+      risk: "medium",
+      summary: "Run a shell command",
+      threadId: "thread_auth",
+      parentBlockId: root.id
+    });
+
+    // Setup gates park the run the same way.
+    reply("thread_setup");
+    insertChatBlock(instance, {
+      kind: "setup_requested",
+      sessionId: session,
+      setupRequestId: "setup_1",
+      action: "connector.request",
+      summary: "Provide a credential",
+      threadId: "thread_setup",
+      parentBlockId: root.id
+    });
+
+    // An approved gate resumes: newer running tool call wins the scan.
+    reply("thread_auth_resumed");
+    insertChatBlock(instance, {
+      kind: "authorization_requested",
+      sessionId: session,
+      authorizationId: "auth_2",
+      action: "terminal.exec",
+      risk: "medium",
+      summary: "Run a shell command",
+      threadId: "thread_auth_resumed",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: session,
+      toolName: "terminal_run",
+      displayLabel: "Run shell command",
+      argsPreview: "sleep 5",
+      argsFull: { command: "sleep 5" },
+      status: "running",
+      callId: "call_gate_1",
+      threadId: "thread_auth_resumed",
+      parentBlockId: root.id
+    });
+
+    // A denied/finished gate ends with a terminal phase after it — idle.
+    reply("thread_auth_done");
+    insertChatBlock(instance, {
+      kind: "authorization_requested",
+      sessionId: session,
+      authorizationId: "auth_3",
+      action: "terminal.exec",
+      risk: "medium",
+      summary: "Run a shell command",
+      threadId: "thread_auth_done",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Cancelled",
+      threadId: "thread_auth_done",
+      parentBlockId: root.id
+    });
+
+    const byId = new Map(summarizeThreads(instance, session).map((s) => [s.threadId, s]));
+    expect(byId.get("thread_auth")?.activity).toBe("waiting_approval");
+    expect(byId.get("thread_setup")?.activity).toBe("waiting_approval");
+    expect(byId.get("thread_auth_resumed")?.activity).toBe("running");
+    expect(byId.get("thread_auth_done")?.activity).toBeUndefined();
+  });
+
+  test("summarizeThreads keeps a thread active while an older overlapping task still runs", () => {
+    const instance = "chat-blocks-thread-overlap";
+    const session = "chat_overlap";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Root.",
+      streaming: false
+    });
+
+    // Two tasks interleave in one thread (replies are not serialized):
+    // task A starts a long tool, then task B replies quickly and completes.
+    // B's terminal phase is the thread's NEWEST block, but A's work is
+    // still in flight — the thread must read running, not idle.
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "long job",
+      threadId: "thread_overlap",
+      parentBlockId: root.id,
+      taskId: "task_a"
+    });
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: session,
+      toolName: "terminal_exec",
+      displayLabel: "Run shell command",
+      argsPreview: "sleep 60",
+      argsFull: { command: "sleep 60" },
+      status: "running",
+      callId: "call_overlap_a",
+      threadId: "thread_overlap",
+      parentBlockId: root.id,
+      taskId: "task_a"
+    });
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "quick follow-up",
+      threadId: "thread_overlap",
+      parentBlockId: root.id,
+      taskId: "task_b"
+    });
+    insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Completed",
+      threadId: "thread_overlap",
+      parentBlockId: root.id,
+      taskId: "task_b"
+    });
+
+    // A gate parked on one task outranks another task's running work —
+    // the actionable state wins, matching the UI ordering.
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "gated job",
+      threadId: "thread_overlap_gate",
+      parentBlockId: root.id,
+      taskId: "task_c"
+    });
+    insertChatBlock(instance, {
+      kind: "authorization_requested",
+      sessionId: session,
+      authorizationId: "auth_overlap",
+      action: "terminal.exec",
+      risk: "medium",
+      summary: "Run a shell command",
+      threadId: "thread_overlap_gate",
+      parentBlockId: root.id,
+      taskId: "task_c"
+    });
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "second job",
+      threadId: "thread_overlap_gate",
+      parentBlockId: root.id,
+      taskId: "task_d"
+    });
+    insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Working: terminal",
+      threadId: "thread_overlap_gate",
+      parentBlockId: root.id,
+      taskId: "task_d"
+    });
+
+    const byId = new Map(summarizeThreads(instance, session).map((s) => [s.threadId, s]));
+    expect(byId.get("thread_overlap")?.activity).toBe("running");
+    expect(byId.get("thread_overlap_gate")?.activity).toBe("waiting_approval");
+  });
+
+  test("summarizeThreads skips malformed activity rows instead of guessing", () => {
+    const instance = "chat-blocks-thread-active-malformed";
+    const session = "chat_active_malformed";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Root.",
+      streaming: false
+    });
+    // Older decisive row says running; the two newer rows are unusable (one
+    // unparseable payload, one phase with no string label) and must be
+    // skipped — not treated as terminal or as active.
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "reply",
+      threadId: "thread_m",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Working: terminal",
+      threadId: "thread_m",
+      parentBlockId: root.id
+    });
+    const labelless = insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Thinking",
+      threadId: "thread_m",
+      parentBlockId: root.id
+    });
+    const corrupt = insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Thinking",
+      threadId: "thread_m",
+      parentBlockId: root.id
+    });
+    const db = getMemoryDb(instance);
+    db.run("UPDATE chat_blocks SET payload_json = ? WHERE id = ?", ["{}", labelless.id]);
+    db.run("UPDATE chat_blocks SET payload_json = ? WHERE id = ?", ["not json", corrupt.id]);
+
+    const [summary] = summarizeThreads(instance, session);
+    expect(summary?.threadId).toBe("thread_m");
+    expect(summary?.activity).toBe("running");
+
+    // A thread whose ONLY activity rows are unusable falls back to idle.
+    insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "reply",
+      threadId: "thread_m2",
+      parentBlockId: root.id
+    });
+    const only = insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Thinking",
+      threadId: "thread_m2",
+      parentBlockId: root.id
+    });
+    db.run("UPDATE chat_blocks SET payload_json = ? WHERE id = ?", ["{}", only.id]);
+    const m2 = summarizeThreads(instance, session).find((s) => s.threadId === "thread_m2");
+    expect(m2?.activity).toBeUndefined();
+  });
+
+  test("summarizeThreads breaks last-reply ties deterministically by thread id", () => {
+    const instance = "chat-blocks-thread-ties";
+    const session = "chat_ties";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Root.",
+      streaming: false
+    });
+    const a = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "reply b-side",
+      threadId: "thread_tie_b",
+      parentBlockId: root.id
+    });
+    const b = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: session,
+      text: "reply a-side",
+      threadId: "thread_tie_a",
+      parentBlockId: root.id
+    });
+    // Same-millisecond replies are the real shape for a burst of inserts —
+    // pin both to one timestamp so the tiebreak (thread_id ASC) is what
+    // orders the rows, not insertion luck.
+    const db = getMemoryDb(instance);
+    const ts = "2020-02-02T00:00:00.000Z";
+    db.run("UPDATE chat_blocks SET created_at = ? WHERE id = ?", [ts, a.id]);
+    db.run("UPDATE chat_blocks SET created_at = ? WHERE id = ?", [ts, b.id]);
+
+    const ordered = summarizeThreads(instance, session).map((s) => s.threadId);
+    expect(ordered).toEqual(["thread_tie_a", "thread_tie_b"]);
+    const orderedInstance = summarizeThreadsForInstance(instance, [session]).map((s) => s.threadId);
+    expect(orderedInstance).toEqual(["thread_tie_a", "thread_tie_b"]);
+  });
+
   test("summarizeThreadsForInstance scopes to the supplied agent sessions", () => {
     const instance = "chat-blocks-thread-instance";
     const agentSession = "chat_agent";

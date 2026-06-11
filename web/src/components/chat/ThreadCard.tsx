@@ -1,50 +1,24 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import type { ChatBlock } from "@runtime/types";
-import { useThread } from "@/lib/queries";
+import { ChevronRight, MessagesSquare } from "lucide-react";
 import type { ThreadSummary } from "@/lib/view-types";
-import { formatRelativeTime, formatMessageTimestamp } from "./relative-time";
+import { ActivityDot } from "./ActivityDot";
+import { formatRelativeTime } from "./relative-time";
 import { agentColor } from "@/lib/agent-visuals";
-import { MarkdownContent } from "./MarkdownContent";
 
-function previewText(block: ChatBlock): string | null {
-  if (block.kind === "user_text") return block.text;
-  if (block.kind === "assistant_text") return block.text;
-  return null;
-}
-
-// One reply row inside an expanded thread card. "You" for user blocks, the
-// agent name otherwise — mirroring the design's name + timestamp + text rows.
-function ReplyRow({ block, agentName }: { block: ChatBlock; agentName: string }) {
-  const text = previewText(block);
-  if (text == null) return null;
-  const isUser = block.kind === "user_text";
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex items-center gap-2">
-        <span className="text-[13px] font-bold text-foreground">{isUser ? "You" : agentName}</span>
-        <span className="text-[12px] font-medium text-muted-foreground">
-          {formatMessageTimestamp(block.createdAt)}
-        </span>
-      </div>
-      {isUser ? (
-        <p className="whitespace-pre-wrap text-[13px] font-medium leading-relaxed text-foreground">{text}</p>
-      ) : (
-        <div className="text-foreground">
-          <MarkdownContent text={text} />
-        </div>
-      )}
-    </div>
-  );
-}
-
-// Cross-agent Thread Card — design `tlViK`. Used in the Threads inbox.
-//   - meta: "in <agent chip> · <time> · <N new> badge"
-//   - original message: agent name + root preview
-//   - expandable: "Show N more replies" loads the thread's blocks
-//   - footer: "N replies · Last reply …"
-// Clicking the card body opens the full thread panel.
+// Thread Card — one row in the cross-agent Threads inbox and the per-agent
+// Threads tab. The WHOLE card is a single button that opens the thread side
+// panel, matching the chat surface's thread chip (no inline expansion — the
+// panel is the one place replies render). Content spans the full row width
+// (Gmail-style list rows; a centered column read as floating text inside
+// full-bleed rows). Layout:
+//   - meta: "in <agent chip>" + New badge, with an activity pill on the
+//     right while the thread's run is in flight (green "Running", or amber
+//     "Needs approval" when the run is parked on a user gate)
+//   - root: "<author>: <parent-message preview>" (clamped to two lines)
+//   - last reply: "<author>: <preview>" one-liner — the freshest context
+//   - footer: reply count + last-reply age + "View thread →", in the same
+//     blue the in-chat thread chip uses for the identical action
 export function ThreadCard({
   thread,
   isUnread,
@@ -54,93 +28,104 @@ export function ThreadCard({
   isUnread: boolean;
   onOpen: () => void;
 }) {
-  const [expanded, setExpanded] = useState(false);
   const agentName = thread.agentName ?? "Agent";
   const dotColor = agentColor(thread.agentId ?? agentName);
-  const { blocks } = useThread(expanded ? thread.sessionId : null, expanded ? thread.threadId : null);
-
-  // The thread-blocks endpoint returns the thread span (excluding the root
-  // main-chat message). Once expanded, show every reply so "Show N replies"
-  // reveals exactly N rows.
-  const replyBlocks = useMemo(
-    () => blocks.filter((b) => previewText(b) != null),
-    [blocks]
-  );
-  const visibleReplies = expanded ? replyBlocks : [];
-
   const lastReply = thread.lastReplyAt ? formatRelativeTime(thread.lastReplyAt) : "";
+  const rootAuthor = thread.rootAuthor === "user" ? "You" : agentName;
+  const lastReplyAuthor = thread.lastReplyAuthor === "user" ? "You" : agentName;
+  const rootPreview = thread.rootPreview || thread.lastReplyPreview || "Thread";
+  // The aria-label replaces the button's content in accessible-name
+  // computation, so it must carry the same state sighted users get from the
+  // badges: reply count, activity, unread.
+  const ariaState = [
+    `${thread.replyCount} ${thread.replyCount === 1 ? "reply" : "replies"}`,
+    ...(thread.activity === "running" ? ["running"] : []),
+    ...(thread.activity === "waiting_approval" ? ["needs approval"] : []),
+    ...(isUnread ? ["unread"] : [])
+  ].join(", ");
 
   return (
-    <div className="flex flex-col gap-3.5 border-b border-border bg-background px-10 py-5">
-      {/* Meta */}
-      <div className="flex flex-wrap items-center gap-2 text-[12px]">
-        <span className="font-medium text-muted-foreground">in</span>
-        <span className="flex items-center gap-1.5 rounded-md border border-border bg-card px-2 py-0.5">
-          <span aria-hidden className="size-[7px] rounded-full" style={{ backgroundColor: dotColor }} />
-          <span className="font-semibold text-foreground">{agentName}</span>
-        </span>
-        {thread.lastReplyAt ? (
-          <>
-            <span className="text-muted-foreground">·</span>
-            <span className="font-medium text-muted-foreground">{formatMessageTimestamp(thread.lastReplyAt)}</span>
-          </>
-        ) : null}
-        {isUnread ? (
-          <span className="flex items-center justify-center rounded-lg bg-primary px-1.5 py-px text-[10px] font-bold text-primary-foreground">
-            New
+    <button
+      type="button"
+      onClick={onOpen}
+      aria-label={`Open thread: ${rootPreview} (${ariaState})`}
+      className="group w-full cursor-pointer border-b border-border bg-background px-10 py-5 text-left transition-colors hover:bg-accent focus-visible:bg-accent focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
+    >
+      <div className="flex w-full flex-col gap-2.5">
+        {/* Meta */}
+        <div className="flex w-full flex-wrap items-center gap-2 text-[12px]">
+          <span className="font-medium text-muted-foreground">in</span>
+          <span className="flex items-center gap-1.5 rounded-md border border-border bg-card px-2 py-0.5">
+            <span aria-hidden className="size-[7px] rounded-full" style={{ backgroundColor: dotColor }} />
+            <span className="font-semibold text-foreground">{agentName}</span>
           </span>
-        ) : null}
-      </div>
-
-      {/* Original message (root preview) */}
-      <button type="button" onClick={onOpen} className="flex flex-col gap-1.5 text-left">
-        <div className="flex items-center gap-2">
-          <span className="text-[13px] font-bold text-foreground">
-            {thread.rootAuthor === "user" ? "You" : agentName}
-          </span>
+          {isUnread ? (
+            <span className="flex items-center justify-center rounded-lg bg-primary px-1.5 py-px text-[10px] font-bold text-primary-foreground">
+              New
+            </span>
+          ) : null}
+          {thread.activity === "running" ? (
+            <span className="ml-auto flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
+              <ActivityDot activity="running" />
+              Running
+            </span>
+          ) : thread.activity === "waiting_approval" ? (
+            <span className="ml-auto flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] font-semibold text-amber-600 dark:text-amber-400">
+              <ActivityDot activity="waiting_approval" />
+              Needs approval
+            </span>
+          ) : null}
         </div>
-        <p className="text-[13px] font-medium leading-relaxed text-foreground">
-          {thread.rootPreview || thread.lastReplyPreview || "Thread"}
+
+        {/* Original message (root preview) */}
+        <p className="line-clamp-2 text-[13px] font-medium leading-relaxed text-foreground">
+          <span className="font-bold">{rootAuthor}:</span> {rootPreview}
         </p>
-      </button>
 
-      {/* Expand to show replies */}
-      {expanded ? (
-        <div className="flex flex-col gap-3.5 pl-2">
-          {visibleReplies.map((b) => (
-            <ReplyRow key={b.id} block={b} agentName={agentName} />
-          ))}
-          <button
-            type="button"
-            onClick={() => setExpanded(false)}
-            className="self-start text-[13px] font-semibold text-[#4277FB] hover:underline"
-          >
-            Hide replies
-          </button>
-        </div>
-      ) : thread.replyCount > 0 ? (
-        <button
-          type="button"
-          onClick={() => setExpanded(true)}
-          className="self-start text-[13px] font-semibold text-[#4277FB] hover:underline"
-        >
-          Show {thread.replyCount} {thread.replyCount === 1 ? "reply" : "replies"}
-        </button>
-      ) : null}
-
-      {/* Footer */}
-      <div className="flex items-center gap-3.5">
-        <button
-          type="button"
-          onClick={onOpen}
-          className="text-[12px] font-semibold text-foreground hover:underline"
-        >
-          {thread.replyCount} {thread.replyCount === 1 ? "reply" : "replies"}
-        </button>
-        {lastReply ? (
-          <span className="text-[12px] font-medium text-muted-foreground">Last reply {lastReply}</span>
+        {/* Last reply preview */}
+        {thread.replyCount > 0 && thread.lastReplyPreview ? (
+          <p className="w-full truncate text-[13px] font-medium text-muted-foreground">
+            <span className="font-semibold text-foreground">{lastReplyAuthor}:</span>{" "}
+            {thread.lastReplyPreview}
+          </p>
         ) : null}
+
+        {/* Footer */}
+        <div className="flex w-full items-center gap-2">
+          <MessagesSquare className="size-3.5 shrink-0 text-[#4277FB] dark:text-[#8893A8]" />
+          {thread.replyCount > 0 ? (
+            <>
+              <span className="text-[13px] font-semibold text-[#4277FB] dark:text-[#9AB0FF]">
+                {thread.replyCount} {thread.replyCount === 1 ? "reply" : "replies"}
+              </span>
+              {lastReply ? (
+                <>
+                  <span className="text-[12px] text-muted-foreground">·</span>
+                  <span className="text-[12px] font-medium text-muted-foreground">
+                    Last reply {lastReply}
+                  </span>
+                </>
+              ) : null}
+            </>
+          ) : (
+            <>
+              <span className="text-[13px] font-semibold text-muted-foreground">No replies yet</span>
+              {lastReply ? (
+                <>
+                  <span className="text-[12px] text-muted-foreground">·</span>
+                  <span className="text-[12px] font-medium text-muted-foreground">
+                    Started {lastReply}
+                  </span>
+                </>
+              ) : null}
+            </>
+          )}
+          <span className="ml-auto flex shrink-0 items-center gap-1 text-[12px] font-semibold text-[#4277FB] group-hover:underline group-focus-visible:underline dark:text-[#9AB0FF]">
+            View thread
+            <ChevronRight className="size-3.5 transition-transform group-hover:translate-x-0.5 group-focus-visible:translate-x-0.5" />
+          </span>
+        </div>
       </div>
-    </div>
+    </button>
   );
 }
