@@ -6,6 +6,9 @@ import { formatRelativeTime } from "./relative-time";
 // main-chat assistant block that a thread branched from. Two states:
 //   - has replies: "N replies in a thread · Last reply … · View thread →"
 //   - empty (no replies yet): "Reply in thread" prompt
+// A run in flight inside the thread shows the same activity dot as the
+// Threads tab (pulsing green while running, steady amber while waiting on
+// the user) so the parent message doesn't look idle while its thread works.
 // Clicking opens the side panel for that thread.
 export function ThreadChip({
   thread,
@@ -20,9 +23,23 @@ export function ThreadChip({
     <button
       type="button"
       onClick={onOpen}
-      className="flex w-full items-center gap-2 rounded-lg border border-[#D7DEFA] bg-[#EEF2FF] px-2.5 py-1.5 text-left transition-colors hover:bg-[#E0E8FF] dark:border-[#1E2330] dark:bg-[#10131C] dark:hover:bg-[#141826]"
+      className="flex w-full cursor-pointer items-center gap-2 rounded-lg border border-[#D7DEFA] bg-[#EEF2FF] px-2.5 py-1.5 text-left transition-colors hover:bg-[#E0E8FF] dark:border-[#1E2330] dark:bg-[#10131C] dark:hover:bg-[#141826]"
     >
       <MessagesSquare className="size-3.5 shrink-0 text-[#4277FB] dark:text-[#8893A8]" />
+      {thread.activity === "running" ? (
+        <>
+          <span aria-hidden className="relative flex size-2 shrink-0">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500 opacity-60 motion-reduce:animate-none" />
+            <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+          </span>
+          <span className="sr-only">running</span>
+        </>
+      ) : thread.activity === "waiting_approval" ? (
+        <>
+          <span aria-hidden className="inline-flex size-2 shrink-0 rounded-full bg-amber-500" />
+          <span className="sr-only">needs approval</span>
+        </>
+      ) : null}
       {hasReplies ? (
         <>
           <span className="text-[13px] font-semibold text-[#4277FB] dark:text-[#9AB0FF]">

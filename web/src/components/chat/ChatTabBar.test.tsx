@@ -2,8 +2,9 @@
 
 // ChatTabBar tests. Pins the tab strip's contract:
 //   - tab visibility flags (Jobs on channels, Settings on pinned sessions)
-//   - count pills hide at zero
-//   - the Threads tab pulses while any thread run is in flight
+//   - count pills hide at zero and carry an accessible label
+//   - the Threads tab dots green while a thread runs, amber while one waits
+//     on the user, with screen-reader text for both
 //   - clicking a tab reports its id
 
 import { describe, expect, test } from "bun:test";
@@ -29,23 +30,30 @@ describe("ChatTabBar", () => {
     expect(screen.getByText("Messages")).not.toBeNull();
   });
 
-  test("shows count pills only when non-zero", () => {
+  test("shows count pills only when non-zero, with a label on Threads", () => {
     const { rerender } = render(
       <ChatTabBar active="messages" onChange={() => {}} threadCount={3} jobCount={2} />
     );
     expect(screen.getByText("3")).not.toBeNull();
+    expect(screen.getByLabelText("3 unread threads")).not.toBeNull();
     expect(screen.getByText("2")).not.toBeNull();
     rerender(<ChatTabBar active="messages" onChange={() => {}} threadCount={0} jobCount={0} />);
     expect(screen.queryByText("3")).toBeNull();
     expect(screen.queryByText("2")).toBeNull();
   });
 
-  test("pulses the Threads tab while a thread run is in flight", () => {
+  test("dots the Threads tab while a thread runs, announcing it to screen readers", () => {
     const { rerender } = render(
-      <ChatTabBar active="messages" onChange={() => {}} threadsActive threadCount={1} />
+      <ChatTabBar active="messages" onChange={() => {}} threadsActivity="running" threadCount={1} />
     );
-    expect(screen.getByLabelText("Thread running")).not.toBeNull();
-    rerender(<ChatTabBar active="messages" onChange={() => {}} threadsActive={false} />);
-    expect(screen.queryByLabelText("Thread running")).toBeNull();
+    expect(screen.getByText("a thread is running")).not.toBeNull();
+    rerender(<ChatTabBar active="messages" onChange={() => {}} />);
+    expect(screen.queryByText("a thread is running")).toBeNull();
+  });
+
+  test("shows the amber waiting state while a thread run is parked on the user", () => {
+    render(<ChatTabBar active="messages" onChange={() => {}} threadsActivity="waiting_approval" />);
+    expect(screen.getByText("a thread needs approval")).not.toBeNull();
+    expect(screen.queryByText("a thread is running")).toBeNull();
   });
 });

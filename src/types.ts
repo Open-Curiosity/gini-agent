@@ -618,11 +618,13 @@ export interface ThreadSummary {
   // inbox can label who replied last. `user_text` ⇒ "user", otherwise
   // "agent". Absent when the thread has no text-bearing block yet.
   lastReplyAuthor?: "user" | "agent";
-  // True while the thread's latest run is still in flight — the newest
-  // `phase` block is non-terminal, or a tool call is still running ahead of
-  // any phase block (the same backwards scan the thread panel uses for its
-  // composer busy state). Drives "running" indicators on thread lists.
-  active?: boolean;
+  // Present while the thread's latest run is in flight; absent when idle.
+  // "running" — the agent is working (newest phase block non-terminal, or a
+  // tool call still running ahead of it; the same backwards scan the thread
+  // panel uses for its composer busy state). "waiting_approval" — the run is
+  // parked on a user gate (an authorization/setup request with nothing newer
+  // in the thread's stream). Drives activity indicators on thread lists.
+  activity?: "running" | "waiting_approval";
 }
 
 export interface RuntimeState {

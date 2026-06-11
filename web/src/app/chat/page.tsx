@@ -160,9 +160,14 @@ function ChatSurface({
   // The Threads tab badge mirrors the sidebar nav badge: it counts UNREAD
   // threads (and the pill hides at 0), not the total thread count.
   const unreadThreadCount = threads.filter((t) => isThreadUnread(t)).length;
-  // Pulse the Threads tab while any thread's run is in flight so activity is
-  // visible from the Messages tab without switching over.
-  const anyThreadActive = threads.some((t) => t.active);
+  // Dot the Threads tab while any thread's run is in flight so activity is
+  // visible from the Messages tab without switching over. A run waiting on
+  // the user outranks a running one — it's the actionable state.
+  const threadsActivity = threads.some((t) => t.activity === "waiting_approval")
+    ? ("waiting_approval" as const)
+    : threads.some((t) => t.activity === "running")
+      ? ("running" as const)
+      : undefined;
 
   const sessionsQuery = useChatSessions();
   const { markRead, activityAt } = useChatReadState(sessionsQuery.data);
@@ -335,7 +340,7 @@ function ChatSurface({
           active={tab}
           onChange={setTab}
           threadCount={unreadThreadCount}
-          threadsActive={anyThreadActive}
+          threadsActivity={threadsActivity}
           hideJobsTab={isChannel}
           hideSettingsTab={isPinned}
         />

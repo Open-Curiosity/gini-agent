@@ -1002,7 +1002,7 @@ describe("chat-blocks threading", () => {
     expect(thread?.lastReplyAt).toBe(messageTs);
   });
 
-  test("summarizeThreads flags a thread active while its newest run is in flight", () => {
+  test("summarizeThreads reports thread activity while its newest run is in flight", () => {
     const instance = "chat-blocks-thread-active";
     const session = "chat_active";
     const root = insertChatBlock(instance, {
@@ -1057,16 +1057,119 @@ describe("chat-blocks threading", () => {
     toolCall("thread_tool_ok", "call_active_3", "ok");
 
     const byId = new Map(summarizeThreads(instance, session).map((s) => [s.threadId, s]));
-    expect(byId.get("thread_running")?.active).toBe(true);
-    expect(byId.get("thread_done")?.active).toBe(false);
-    expect(byId.get("thread_tool")?.active).toBe(true);
-    expect(byId.get("thread_tool_done")?.active).toBe(false);
-    expect(byId.get("thread_text")?.active).toBe(false);
-    expect(byId.get("thread_tool_ok")?.active).toBe(false);
+    expect(byId.get("thread_running")?.activity).toBe("running");
+    expect(byId.get("thread_done")?.activity).toBeUndefined();
+    expect(byId.get("thread_tool")?.activity).toBe("running");
+    expect(byId.get("thread_tool_done")?.activity).toBeUndefined();
+    expect(byId.get("thread_text")?.activity).toBeUndefined();
+    expect(byId.get("thread_tool_ok")?.activity).toBeUndefined();
     // The instance-wide inbox query computes the same flag.
     const inbox = new Map(summarizeThreadsForInstance(instance, [session]).map((s) => [s.threadId, s]));
-    expect(inbox.get("thread_running")?.active).toBe(true);
-    expect(inbox.get("thread_done")?.active).toBe(false);
+    expect(inbox.get("thread_running")?.activity).toBe("running");
+    expect(inbox.get("thread_done")?.activity).toBeUndefined();
+  });
+
+  test("summarizeThreads reports waiting_approval while a user gate is the newest activity", () => {
+    const instance = "chat-blocks-thread-gates";
+    const session = "chat_gates";
+    const root = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: session,
+      text: "Root.",
+      streaming: false
+    });
+    const reply = (threadId: string) =>
+      insertChatBlock(instance, {
+        kind: "user_text",
+        sessionId: session,
+        text: `reply in ${threadId}`,
+        threadId,
+        parentBlockId: root.id
+      });
+
+    // Run parked on an authorization gate: phase "Working" then the gate,
+    // with nothing newer — the run is waiting on the user, not running.
+    reply("thread_auth");
+    insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Working: terminal",
+      threadId: "thread_auth",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "authorization_requested",
+      sessionId: session,
+      authorizationId: "auth_1",
+      action: "terminal.exec",
+      risk: "medium",
+      summary: "Run a shell command",
+      threadId: "thread_auth",
+      parentBlockId: root.id
+    });
+
+    // Setup gates park the run the same way.
+    reply("thread_setup");
+    insertChatBlock(instance, {
+      kind: "setup_requested",
+      sessionId: session,
+      setupRequestId: "setup_1",
+      action: "connector.request",
+      summary: "Provide a credential",
+      threadId: "thread_setup",
+      parentBlockId: root.id
+    });
+
+    // An approved gate resumes: newer running tool call wins the scan.
+    reply("thread_auth_resumed");
+    insertChatBlock(instance, {
+      kind: "authorization_requested",
+      sessionId: session,
+      authorizationId: "auth_2",
+      action: "terminal.exec",
+      risk: "medium",
+      summary: "Run a shell command",
+      threadId: "thread_auth_resumed",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: session,
+      toolName: "terminal_run",
+      displayLabel: "Run shell command",
+      argsPreview: "sleep 5",
+      argsFull: { command: "sleep 5" },
+      status: "running",
+      callId: "call_gate_1",
+      threadId: "thread_auth_resumed",
+      parentBlockId: root.id
+    });
+
+    // A denied/finished gate ends with a terminal phase after it — idle.
+    reply("thread_auth_done");
+    insertChatBlock(instance, {
+      kind: "authorization_requested",
+      sessionId: session,
+      authorizationId: "auth_3",
+      action: "terminal.exec",
+      risk: "medium",
+      summary: "Run a shell command",
+      threadId: "thread_auth_done",
+      parentBlockId: root.id
+    });
+    insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: session,
+      label: "Cancelled",
+      threadId: "thread_auth_done",
+      parentBlockId: root.id
+    });
+
+    const byId = new Map(summarizeThreads(instance, session).map((s) => [s.threadId, s]));
+    expect(byId.get("thread_auth")?.activity).toBe("waiting_approval");
+    expect(byId.get("thread_setup")?.activity).toBe("waiting_approval");
+    expect(byId.get("thread_auth_resumed")?.activity).toBe("running");
+    expect(byId.get("thread_auth_done")?.activity).toBeUndefined();
   });
 
   test("summarizeThreads skips malformed activity rows instead of guessing", () => {
@@ -1115,9 +1218,9 @@ describe("chat-blocks threading", () => {
 
     const [summary] = summarizeThreads(instance, session);
     expect(summary?.threadId).toBe("thread_m");
-    expect(summary?.active).toBe(true);
+    expect(summary?.activity).toBe("running");
 
-    // A thread whose ONLY activity rows are unusable falls back to inactive.
+    // A thread whose ONLY activity rows are unusable falls back to idle.
     insertChatBlock(instance, {
       kind: "user_text",
       sessionId: session,
@@ -1134,7 +1237,7 @@ describe("chat-blocks threading", () => {
     });
     db.run("UPDATE chat_blocks SET payload_json = ? WHERE id = ?", ["{}", only.id]);
     const m2 = summarizeThreads(instance, session).find((s) => s.threadId === "thread_m2");
-    expect(m2?.active).toBe(false);
+    expect(m2?.activity).toBeUndefined();
   });
 
   test("summarizeThreadsForInstance scopes to the supplied agent sessions", () => {

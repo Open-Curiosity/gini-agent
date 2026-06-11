@@ -1,7 +1,8 @@
 /// <reference lib="dom" />
 
 // ThreadsTab tests. Pins the per-agent tab's contract:
-//   - rows render newest-reply-first as full-card buttons
+//   - rows render in-flight-first, then newest-reply-first, as full-card
+//     buttons
 //   - clicking a row hands the thread summary to onOpen (the chat page opens
 //     the side panel with it — the same flow as the in-chat thread chip)
 //   - threads missing agentName inherit the tab's agent
@@ -10,7 +11,7 @@
 import { describe, expect, test } from "bun:test";
 import { fireEvent, render, screen } from "@testing-library/react";
 import type { ThreadSummary } from "@/lib/view-types";
-import { ThreadsTab } from "./ThreadsTab";
+import { ThreadsTab, sortThreads } from "./ThreadsTab";
 
 function makeThread(overrides: Partial<ThreadSummary> = {}): ThreadSummary {
   return {
@@ -22,7 +23,6 @@ function makeThread(overrides: Partial<ThreadSummary> = {}): ThreadSummary {
     lastReplyAt: "2026-06-01T10:00:00.000Z",
     lastReplyPreview: "Latest reply",
     lastReplyAuthor: "agent",
-    active: false,
     ...overrides
   };
 }
@@ -50,12 +50,46 @@ describe("ThreadsTab", () => {
 
     const cards = screen.getAllByRole("button");
     expect(cards).toHaveLength(2);
-    expect(cards[0]!.getAttribute("aria-label")).toBe("Open thread: Newer thread");
-    expect(cards[1]!.getAttribute("aria-label")).toBe("Open thread: Older thread");
+    // Read-state (unread suffix) is per-device localStorage and may be seeded
+    // by earlier tests in this file — pin the order, not the unread flag.
+    expect(cards[0]!.getAttribute("aria-label")).toContain("Open thread: Newer thread (2 replies");
+    expect(cards[1]!.getAttribute("aria-label")).toContain("Open thread: Older thread (2 replies");
 
     fireEvent.click(cards[1]!);
     expect(opened).toHaveLength(1);
     expect(opened[0]!.threadId).toBe("thread_old");
+  });
+
+  test("threads with a run in flight sort ahead of newer idle threads", () => {
+    const idleNewest = makeThread({
+      threadId: "thread_idle",
+      rootPreview: "Idle newest",
+      lastReplyAt: "2026-06-03T10:00:00.000Z"
+    });
+    const runningOld = makeThread({
+      threadId: "thread_running",
+      rootPreview: "Running but old",
+      lastReplyAt: "2026-06-01T10:00:00.000Z",
+      activity: "running"
+    });
+    const waitingOlder = makeThread({
+      threadId: "thread_waiting",
+      rootPreview: "Waiting and older",
+      lastReplyAt: "2026-05-30T10:00:00.000Z",
+      activity: "waiting_approval"
+    });
+    expect(sortThreads([idleNewest, runningOld, waitingOlder]).map((t) => t.threadId)).toEqual([
+      "thread_running",
+      "thread_waiting",
+      "thread_idle"
+    ]);
+
+    render(
+      <ThreadsTab threads={[idleNewest, runningOld]} agentName="Gini" onOpen={() => {}} />
+    );
+    const cards = screen.getAllByRole("button");
+    expect(cards[0]!.getAttribute("aria-label")).toContain("Running but old");
+    expect(cards[1]!.getAttribute("aria-label")).toContain("Idle newest");
   });
 
   test("threads without an agentName inherit the tab's agent", () => {
