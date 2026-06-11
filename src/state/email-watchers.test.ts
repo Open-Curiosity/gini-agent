@@ -27,6 +27,7 @@ import {
   validateObjective,
   validateThreadId
 } from ".";
+import { resolveWatchAccount } from "./email-watchers";
 
 const ROOT = mkdtempSync(join(tmpdir(), "gini-email-watchers-test-"));
 
@@ -74,6 +75,43 @@ describe("buildWatcherQuery", () => {
   });
   test("threadId builds a thread:<id> label and wins over sender", () => {
     expect(buildWatcherQuery({ threadId: "t-123", sender: "a@x.com" })).toBe("thread:t-123");
+  });
+});
+
+describe("resolveWatchAccount", () => {
+  const A = { email: "sheldenshi@gmail.com", configDir: "/dir/gacct_a", signedIn: true };
+  const B = { email: "work@lilaclabs.ai", configDir: "/dir/gacct_b", signedIn: true };
+
+  test("no registered accounts => default gws (no configDir, no warning)", () => {
+    expect(resolveWatchAccount(undefined, [])).toEqual({});
+    expect(resolveWatchAccount("sheldenshi@gmail.com", [])).toEqual({});
+  });
+
+  test("unset accountEmail binds to the single registered+signed-in account", () => {
+    expect(resolveWatchAccount(undefined, [A])).toEqual({ configDir: A.configDir, account: A.email });
+  });
+
+  test("unset accountEmail with a registered-but-signed-out account stays on default gws", () => {
+    expect(resolveWatchAccount(undefined, [{ ...A, signedIn: false }])).toEqual({});
+  });
+
+  test("unset accountEmail is ambiguous across multiple signed-in accounts => default gws", () => {
+    expect(resolveWatchAccount(undefined, [A, B])).toEqual({});
+  });
+
+  test("set accountEmail resolves to the matching account's configDir (case-insensitive)", () => {
+    expect(resolveWatchAccount("SHELDENSHI@gmail.com", [A, B])).toEqual({
+      configDir: A.configDir,
+      account: A.email
+    });
+  });
+
+  test("set accountEmail not registered => no configDir + a visible warning", () => {
+    const r = resolveWatchAccount("ghost@nowhere.com", [A]);
+    expect(r.configDir).toBeUndefined();
+    expect(r.account).toBeUndefined();
+    expect(r.warning).toContain("ghost@nowhere.com");
+    expect(r.warning).toContain("not a registered");
   });
 });
 

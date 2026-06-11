@@ -1690,4 +1690,119 @@ describe("runWatches — multi-watch (one shared job)", () => {
     expect(r2.kind).toBe("shortCircuit");
     expect(allBucketItems(r2.buckets)).toHaveLength(0);
   });
+
+  // A multi-account spawn: like multiSpawn, but records the configDir each gws
+  // call ran under so the per-watch account targeting can be asserted. Returns the
+  // same canned responses regardless of dir (the account binding is the env, not
+  // the data).
+  function dirRecordingSpawn(
+    byQuery: Record<string, string[]>,
+    metaById: Record<string, Meta>,
+    seen: { dirs: string[] }
+  ): GwsSpawn {
+    return async (args: string[], configDir?: string) => {
+      seen.dirs.push(configDir ?? "<default>");
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = listQuery(joined) ?? "";
+        const base = q.replace(/ after:\d+$/, "");
+        return listResponse(byQuery[base] ?? byQuery[q] ?? []);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        return hit && metaById[hit] ? metadataResponse(metaById[hit]) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+  }
+
+  test("a watch with configDir runs EVERY gws call under that account's dir", async () => {
+    const seen = { dirs: [] as string[] };
+    const spawn = dirRecordingSpawn(
+      { "from:alice@x.com": ["a1"] },
+      { a1: { id: "a1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "hi" } },
+      seen
+    );
+    const r = await runWatches(
+      {
+        watches: [{ watcherId: "w-a", query: "from:alice@x.com", sender: "alice@x.com", configDir: "/dir/gacct_a" }],
+        state: { "w-a": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-a"])).toEqual(["a1"]);
+    // auth status + getProfile + list + get + body-fetch all carried the dir; no
+    // gws call leaked to the default config dir.
+    expect(seen.dirs.length).toBeGreaterThan(0);
+    expect(seen.dirs.every((d) => d === "/dir/gacct_a")).toBe(true);
+  });
+
+  test("a watch WITHOUT configDir runs gws on the default config dir (no env)", async () => {
+    const seen = { dirs: [] as string[] };
+    const spawn = dirRecordingSpawn(
+      { "from:alice@x.com": ["a1"] },
+      { a1: { id: "a1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "hi" } },
+      seen
+    );
+    const r = await runWatches(
+      {
+        watches: [{ watcherId: "w-a", query: "from:alice@x.com", sender: "alice@x.com" }],
+        state: { "w-a": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(seen.dirs.length).toBeGreaterThan(0);
+    expect(seen.dirs.every((d) => d === "<default>")).toBe(true);
+  });
+
+  test("two account-scoped watches each target their OWN dir in one tick", async () => {
+    const seen = { dirs: [] as string[] };
+    const spawn: GwsSpawn = async (args, configDir) => {
+      const joined = args.join(" ");
+      if (joined.includes("auth status")) return PREAMBLE + '{"token_valid":true}';
+      if (joined.includes("getProfile")) return PREAMBLE + '{"emailAddress":"me@example.com"}';
+      if (joined.includes("messages list")) {
+        const q = listQuery(joined)?.replace(/ after:\d+$/, "") ?? "";
+        // Tag the listed id by the dir the call ran under so we can assert each
+        // watch polled its own account.
+        if (q.startsWith("from:alice")) {
+          seen.dirs.push(`alice:${configDir}`);
+          return listResponse(["a1"]);
+        }
+        seen.dirs.push(`bob:${configDir}`);
+        return listResponse(["b1"]);
+      }
+      if (joined.includes("messages get")) {
+        const hit = getArgId(joined);
+        const byId: Record<string, Meta> = {
+          a1: { id: "a1", internalDate: "3000", from: "Alice <alice@x.com>", subject: "hi" },
+          b1: { id: "b1", internalDate: "4000", from: "Bob <bob@x.com>", subject: "yo" }
+        };
+        return hit && byId[hit] ? metadataResponse(byId[hit]) : PREAMBLE + "{}";
+      }
+      return PREAMBLE + "{}";
+    };
+    const r = await runWatches(
+      {
+        watches: [
+          { watcherId: "w-a", query: "from:alice@x.com", sender: "alice@x.com", configDir: "/dir/gacct_a" },
+          { watcherId: "w-b", query: "from:bob@x.com", sender: "bob@x.com", configDir: "/dir/gacct_b" }
+        ],
+        state: { "w-a": { cursor: "1000", seen: [] }, "w-b": { cursor: "1000", seen: [] } }
+      },
+      spawn
+    );
+    expect(r.kind).toBe("context");
+    expect(draftedIds(r.buckets!["w-a"])).toEqual(["a1"]);
+    expect(draftedIds(r.buckets!["w-b"])).toEqual(["b1"]);
+    expect(seen.dirs).toContain("alice:/dir/gacct_a");
+    expect(seen.dirs).toContain("bob:/dir/gacct_b");
+    // No cross-account leak: alice's list never ran under bob's dir and vice versa.
+    expect(seen.dirs).not.toContain("alice:/dir/gacct_b");
+    expect(seen.dirs).not.toContain("bob:/dir/gacct_a");
+  });
 });
