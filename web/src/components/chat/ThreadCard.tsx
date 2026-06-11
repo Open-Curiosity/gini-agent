@@ -9,8 +9,9 @@ import { agentColor } from "@/lib/agent-visuals";
 // Thread Card — one row in the cross-agent Threads inbox and the per-agent
 // Threads tab. The WHOLE card is a single button that opens the thread side
 // panel, matching the chat surface's thread chip (no inline expansion — the
-// panel is the one place replies render). Content is width-capped to the
-// chat's column so footers don't straddle ultra-wide rows. Layout:
+// panel is the one place replies render). Content spans the full row width
+// (Gmail-style list rows; a centered column read as floating text inside
+// full-bleed rows). Layout:
 //   - meta: "in <agent chip>" + New badge, with an activity pill on the
 //     right while the thread's run is in flight (green "Running", or amber
 //     "Needs approval" when the run is parked on a user gate)
@@ -50,7 +51,7 @@ export function ThreadCard({
       aria-label={`Open thread: ${rootPreview} (${ariaState})`}
       className="group w-full cursor-pointer border-b border-border bg-background px-10 py-5 text-left transition-colors hover:bg-accent focus-visible:bg-accent focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
     >
-      <div className="mx-auto flex w-full max-w-3xl flex-col gap-2.5">
+      <div className="flex w-full flex-col gap-2.5">
         {/* Meta */}
         <div className="flex w-full flex-wrap items-center gap-2 text-[12px]">
           <span className="font-medium text-muted-foreground">in</span>

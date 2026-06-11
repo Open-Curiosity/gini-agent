@@ -50,10 +50,9 @@ export default function ThreadsInboxPage() {
           </span>
         </header>
 
-        {/* Toolbar content shares the cards' centered column so the filter
-            and the list edges line up. */}
+        {/* Toolbar spans the full row like the cards below it. */}
         <div className="shrink-0 border-b border-border px-10 py-3">
-          <div className="mx-auto flex w-full max-w-3xl items-center justify-between">
+          <div className="flex w-full items-center justify-between">
             <div className="flex items-center gap-0.5 rounded-lg border border-border bg-card p-0.5">
               {(["all", "unread"] as const).map((value) => (
                 <button
