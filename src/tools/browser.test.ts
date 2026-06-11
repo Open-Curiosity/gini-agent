@@ -8,6 +8,7 @@ import {
   browserDialog,
   browserDrag,
   browserFillByLocator,
+  browserFillForm,
   browserHover,
   browserNavigate,
   browserSelectOption,
@@ -3126,6 +3127,133 @@ describe("browser dialog capture and browser_dialog", () => {
     const parsed = JSON.parse(raw) as { dialogs?: Array<{ message: string }> };
     expect(parsed.dialogs).toHaveLength(1);
     expect(parsed.dialogs![0]!.message).toBe("Submit [redacted] to continue?");
+  });
+});
+
+describe("browserFillForm", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.resetFilledSecretsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  function makeFillLocator(log: Array<{ ref: string; text: string }>, ref: string, failWith?: string) {
+    return {
+      fill: async (text: string, _opts?: { timeout?: number }) => {
+        if (failWith) throw new Error(failWith);
+        log.push({ ref, text });
+      }
+    };
+  }
+
+  test("fills every field in order and returns one post-action snapshot", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("fill-form", fakePage);
+    const fills: Array<{ ref: string; text: string }> = [];
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", makeFillLocator(fills, "@e1"));
+    refs.set("@e2", makeFillLocator(fills, "@e2"));
+    browserTest.setFakeSessionRefsForTest("fill-form", refs);
+
+    const raw = await browserFillForm("fill-form", {
+      fields: [
+        { ref: "@e1", text: "Shelden" },
+        { ref: "@e2", text: "Seattle" }
+      ]
+    });
+    const parsed = JSON.parse(raw) as { success: boolean; filled?: string[]; snapshot?: string; snapshotMode?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.filled).toEqual(["@e1", "@e2"]);
+    expect(fills).toEqual([
+      { ref: "@e1", text: "Shelden" },
+      { ref: "@e2", text: "Seattle" }
+    ]);
+    // One snapshot for the whole batch, same shape browser_type returns.
+    expect(parsed.snapshotMode === "full" || parsed.snapshotMode === "diff").toBe(true);
+    expect(typeof parsed.snapshot).toBe("string");
+  });
+
+  test("stops at the first unknown ref and reports filled vs not attempted", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("fill-stop", fakePage);
+    const fills: Array<{ ref: string; text: string }> = [];
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", makeFillLocator(fills, "@e1"));
+    refs.set("@e3", makeFillLocator(fills, "@e3"));
+    browserTest.setFakeSessionRefsForTest("fill-stop", refs);
+
+    const raw = await browserFillForm("fill-stop", {
+      fields: [
+        { ref: "@e1", text: "a" },
+        { ref: "@e2", text: "b" },
+        { ref: "@e3", text: "c" }
+      ]
+    });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown ref @e2");
+    expect(parsed.error).toContain("Filled before failure: @e1");
+    expect(parsed.error).toContain("Not attempted: @e3");
+    // Fields after the failure were never filled.
+    expect(fills).toEqual([{ ref: "@e1", text: "a" }]);
+  });
+
+  test("stops when a fill throws and reports the failing field", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("fill-throw", fakePage);
+    const fills: Array<{ ref: string; text: string }> = [];
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", makeFillLocator(fills, "@e1", "element is not an <input>"));
+    refs.set("@e2", makeFillLocator(fills, "@e2"));
+    browserTest.setFakeSessionRefsForTest("fill-throw", refs);
+
+    const raw = await browserFillForm("fill-throw", {
+      fields: [
+        { ref: "@e1", text: "a" },
+        { ref: "@e2", text: "b" }
+      ]
+    });
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Fill failed at @e1");
+    expect(parsed.error).toContain("element is not an <input>");
+    expect(parsed.error).toContain("Filled before failure: none");
+    expect(parsed.error).toContain("Not attempted: @e2");
+    expect(fills).toEqual([]);
+  });
+
+  test("rejects a field value containing a registered secret without echoing it", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("fill-secret", fakePage);
+    const fills: Array<{ ref: string; text: string }> = [];
+    const refs = new Map<string, unknown>();
+    refs.set("@e1", makeFillLocator(fills, "@e1"));
+    refs.set("@e2", makeFillLocator(fills, "@e2"));
+    browserTest.setFakeSessionRefsForTest("fill-secret", refs);
+    browserTest.recordFilledSecretForTest("fill-secret", "hunter2secret");
+
+    const raw = await browserFillForm("fill-secret", {
+      fields: [
+        { ref: "@e1", text: "ordinary" },
+        { ref: "@e2", text: "prefix hunter2secret suffix" }
+      ]
+    });
+    expect(raw).not.toContain("hunter2secret");
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("registered secret");
+    expect(parsed.error).toContain("browser_fill_secrets");
+    // Fails closed before ANY field is filled.
+    expect(fills).toEqual([]);
+  });
+
+  test("rejects malformed fields arguments", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("fill-args", fakePage);
+    expect(JSON.parse(await browserFillForm("fill-args", {})).error).toMatch(/fields/);
+    expect(JSON.parse(await browserFillForm("fill-args", { fields: [] })).error).toMatch(/fields/);
+    expect(JSON.parse(await browserFillForm("fill-args", { fields: [{ ref: "@e1" }] })).error).toMatch(/text/);
+    expect(JSON.parse(await browserFillForm("fill-args", { fields: [{ text: "x" }] })).error).toMatch(/ref/);
   });
 });
 

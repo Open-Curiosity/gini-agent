@@ -2293,6 +2293,75 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
   }
 }
 
+// Batch form fill for labeled NON-secret fields: each {ref, text} entry
+// is filled with the same semantics as browser_type (clear-then-fill via
+// the self-healing ref resolution), but the page is snapshotted ONCE
+// after all fills instead of once per field. Stops at the first failing
+// field and reports which fields were filled and which were not
+// attempted, so the model can re-snapshot and retry the remainder.
+//
+// Secrets stay exclusively in browser_fill_secrets: as a defensive
+// mirror of the outbound-URL gate in safetyCheck, any field text
+// containing a registered secret value fails closed with a generic
+// message that never echoes the value.
+export async function browserFillForm(taskId: string, args: Record<string, unknown>): Promise<string> {
+  const rawFields = args.fields;
+  if (!Array.isArray(rawFields) || rawFields.length === 0) {
+    return fail("Missing required argument: fields (non-empty array of {ref, text}).");
+  }
+  const fields: Array<{ ref: string; text: string }> = [];
+  for (const entry of rawFields) {
+    const ref = entry !== null && typeof entry === "object" ? str((entry as Record<string, unknown>).ref) : undefined;
+    const text = entry !== null && typeof entry === "object" ? (entry as Record<string, unknown>).text : undefined;
+    if (!ref || typeof text !== "string") {
+      return fail("Each fields entry must be an object with string 'ref' and string 'text'.");
+    }
+    fields.push({ ref, text });
+  }
+  // Values below the redaction floor are skipped for the same reason
+  // recordFilledSecret refuses them: a tiny value substring-matches
+  // ordinary text and would false-positive.
+  for (const secret of allRegisteredSecrets()) {
+    if (secret.length < FILLED_SECRET_MIN_REDACTION_LENGTH) continue;
+    if (fields.some((f) => f.text.includes(secret))) {
+      return fail("Blocked: a field value contains a registered secret. Use browser_fill_secrets for credentials/secrets.");
+    }
+  }
+  try {
+    return await withSession(taskId, async (session) => {
+      const filled: string[] = [];
+      let healedAny = false;
+      const report = (failedRef: string): string => {
+        const notAttempted = fields.slice(filled.length + 1).map((f) => f.ref);
+        return `Filled before failure: ${filled.join(", ") || "none"}. Not attempted: ${notAttempted.join(", ") || "none"}. Take a fresh snapshot and retry the remaining fields starting at ${failedRef}.`;
+      };
+      for (const field of fields) {
+        const resolved = await resolveRefForAction(session, field.ref);
+        if (!resolved) {
+          return fail(`Unknown ref ${field.ref}. ${report(field.ref)}`);
+        }
+        try {
+          await resolved.locator.fill(field.text, { timeout: 10_000 });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return fail(`Fill failed at ${field.ref}: ${message}. ${report(field.ref)}`);
+        }
+        if (resolved.healed) healedAny = true;
+        filled.push(field.ref);
+      }
+      const snapFields = await snapshotAfterAction(session, taskId);
+      return ok({
+        url: session.page.url(),
+        filled,
+        ...snapFields,
+        ...(healedAny ? { healedRef: true } : {})
+      }, taskId);
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
 // Collects the values of every element on the live page that
 // carries the data-gini-secret attribute (stamped by
 // browserFillByLocator after a successful fill_secret submission)

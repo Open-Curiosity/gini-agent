@@ -399,6 +399,35 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "browser",
+    displayLabel: "Fill form",
+    deferred: true,
+    indexSummary: "Fill multiple non-secret form fields in one call, each by its @eN ref.",
+    type: "function",
+    function: {
+      name: "browser_fill_form",
+      description: "Fill MULTIPLE non-secret form fields in one call. Each {ref, text} entry is filled in order with the same clear-and-type semantics as browser_type, then ONE snapshot is returned after all fills (possibly a diff — call browser_snapshot for the full tree). Stops at the FIRST failing field and reports which fields were filled and which were not attempted, so you can re-snapshot and retry the remainder. NEVER use this for passwords, credentials, or other secrets — use browser_fill_secrets for those; field values containing a registered secret are rejected.",
+      parameters: {
+        type: "object",
+        properties: {
+          fields: {
+            type: "array",
+            description: "Fields to fill, in order.",
+            items: {
+              type: "object",
+              properties: {
+                ref: { type: "string", description: "Input ref like '@e3' from the latest snapshot." },
+                text: { type: "string", description: "Text to type into the input." }
+              },
+              required: ["ref", "text"]
+            }
+          }
+        },
+        required: ["fields"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
     displayLabel: "Press key",
     deferred: true,
     indexSummary: "Press a keyboard key on the current page (Enter, Tab, ArrowDown, …).",
@@ -2408,6 +2437,17 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.direction));
     case "browser_wait_for":
       return truncatePreview(previewValue(safe.ref) || previewValue(safe.text));
+    case "browser_fill_form":
+      // Preview the refs only — field text is page content the card
+      // doesn't need, and the ref list tells the user what's touched.
+      return truncatePreview(
+        Array.isArray(safe.fields)
+          ? safe.fields
+              .map((f) => (f !== null && typeof f === "object" ? previewValue((f as Record<string, unknown>).ref) : ""))
+              .filter(Boolean)
+              .join(", ")
+          : ""
+      );
     case "browser_tabs":
     case "browser_dialog":
       return truncatePreview(previewValue(safe.action));

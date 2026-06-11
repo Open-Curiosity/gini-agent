@@ -29,13 +29,14 @@ import {
 import { defaultToolsets } from "../state/defaults";
 import type { RuntimeState, ToolsetRecord } from "../types";
 
-// The 16 browser tools that are deferred (the cluster minus the always-on
+// The 17 browser tools that are deferred (the cluster minus the always-on
 // browser_navigate plus the escalation/onboarding meta-tools
 // browser_fill_secrets and browser_connect).
 const DEFERRED_BROWSER = [
   "browser_snapshot",
   "browser_click",
   "browser_type",
+  "browser_fill_form",
   "browser_press",
   "browser_scroll",
   "browser_back",
@@ -453,7 +454,7 @@ describe("deferred tools", () => {
   // kill switch).
   const fullState = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z"));
 
-  test("the 16 browser tools are deferred; load_tools, browser_navigate, browser_connect, browser_fill_secrets are core", () => {
+  test("the 17 browser tools are deferred; load_tools, browser_navigate, browser_connect, browser_fill_secrets are core", () => {
     const catalog = buildToolCatalog(fullState);
     for (const name of DEFERRED_BROWSER) {
       const tool = catalog.find((t) => t.function.name === name);

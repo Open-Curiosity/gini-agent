@@ -9,6 +9,7 @@ export type RiskLevel = "low" | "medium" | "high";
 export const ACTION_RISK: ReadonlyMap<string, RiskLevel> = new Map<string, RiskLevel>([
   ["browser.click", "medium"],
   ["browser.type", "medium"],
+  ["browser.fill_form", "medium"],
   ["browser.drag", "medium"],
   ["browser.select_option", "medium"],
   // Arming an accept for the next confirm()/beforeunload commits a page

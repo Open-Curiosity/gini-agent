@@ -75,6 +75,7 @@ import {
   browserConsole,
   browserDialog,
   browserDrag,
+  browserFillForm,
   browserHover,
   browserNavigate,
   browserPress,
@@ -285,6 +286,8 @@ async function dispatchToolCallInner(
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.click", () => browserClick(taskId, args), args) };
     case "browser_type":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.type", () => browserType(taskId, args), args) };
+    case "browser_fill_form":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.fill_form", () => browserFillForm(taskId, args), args) };
     case "browser_press":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.press", () => browserPress(taskId, args), args) };
     case "browser_scroll":
@@ -574,8 +577,8 @@ async function fileSearch(config: RuntimeConfig, taskId: string, args: Record<st
 // source of truth in src/execution/tool-risk.ts:
 //   - read-only paths (navigate/snapshot/hover/scroll/back/press/console/
 //     close/wait_for/tabs.list/vision) are "low"
-//   - side-effecting calls (click/type/drag/select_option/dialog/
-//     tabs.{new,switch,close}) are "medium"
+//   - side-effecting calls (click/type/fill_form/drag/select_option/
+//     dialog/tabs.{new,switch,close}) are "medium"
 // browser.upload_file is classified "high" in the registry but never
 // reaches this dispatcher: it's intercepted as an approval request in
 // requestBrowserUpload and executed via agent.executeApprovedAction after
