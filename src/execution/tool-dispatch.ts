@@ -26,7 +26,7 @@ import {
   now,
   readState
 } from "../state";
-import { addEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled, setEmailWatcherObjective } from "../state/email-watchers";
+import { addEmailWatcher, clearEmailWatcherObjective, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled, setEmailWatcherObjective } from "../state/email-watchers";
 import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveAuthorization, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
@@ -1974,10 +1974,21 @@ async function emailWatchTool(
 
   if (action === "update") {
     // Revise a watcher's standing objective (the user changed the goal
-    // mid-conversation). Deep validation (trim, cap, empty) lives in the
-    // shared state helper so the tool, HTTP, and CLI channels enforce the
+    // mid-conversation), or clear it entirely (clearObjective: true) when the
+    // user drops the standing goal. Deep validation (trim, cap, empty) lives in
+    // the shared state helper so the tool, HTTP, and CLI channels enforce the
     // same contract.
     const id = requireString(args, "id");
+    if (args.clearObjective === true) {
+      const updated = await clearEmailWatcherObjective(config, id);
+      if (!updated) throw new Error(`Email watcher not found: ${id}`);
+      appendTrace(config.instance, taskId, {
+        type: "tool",
+        message: "Cleared email watcher objective",
+        data: { watcherId: updated.id }
+      });
+      return `Cleared objective for email watcher ${updated.id}.`;
+    }
     const objective = requireString(args, "objective");
     const updated = await setEmailWatcherObjective(config, id, objective);
     if (!updated) throw new Error(`Email watcher not found: ${id}`);

@@ -206,6 +206,7 @@ export {
   updateEmailWatcher,
   setEmailWatcherEnabled,
   setEmailWatcherObjective,
+  clearEmailWatcherObjective,
   validateObjective,
   validateThreadId,
   removeEmailWatcher,

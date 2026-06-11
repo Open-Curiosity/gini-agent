@@ -517,6 +517,20 @@ export async function setEmailWatcherObjective(
   return getEmailWatcher(config, watcherId) ?? updated;
 }
 
+// Clear a watcher's standing objective, then rebuild the shared job's watch
+// list so the next tick drops it (buildWatch already omits a falsy objective).
+// Used when the user no longer wants standing goal context on the watch.
+// Returns the updated record (or undefined when the watcher vanished mid-flight).
+export async function clearEmailWatcherObjective(
+  config: RuntimeConfig,
+  watcherId: string
+): Promise<EmailWatcherRecord | undefined> {
+  const updated = await updateEmailWatcher(config, watcherId, { objective: undefined });
+  if (!updated) return undefined;
+  await rebuildSharedJobWatches(config, updated.agentId);
+  return getEmailWatcher(config, watcherId) ?? updated;
+}
+
 // Enable / disable a watcher, then rebuild the shared job's watch list so a
 // disabled watcher stops being polled (the job watches only ENABLED watchers).
 // The hook input only lists enabled watches, so a disabled watcher is dropped

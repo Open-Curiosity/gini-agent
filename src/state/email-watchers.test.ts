@@ -21,6 +21,7 @@ import {
   renameChatSession,
   setEmailWatcherEnabled,
   setEmailWatcherObjective,
+  clearEmailWatcherObjective,
   updateEmailWatcher,
   validateObjective,
   validateThreadId
@@ -216,6 +217,20 @@ describe("watcher objective", () => {
     expect(watches[0]?.objective).toBe("Accept a replacement instead");
     // A missing watcher returns undefined.
     expect(await setEmailWatcherObjective(config, "nope", "x")).toBeUndefined();
+  });
+
+  test("clearEmailWatcherObjective drops the goal and the watch list omits it", async () => {
+    const config = buildConfig("ew-objective-clear");
+    const watcher = await addEmailWatcher(config, { sender: "bob@x.com", objective: "Get a refund" });
+    const cleared = await clearEmailWatcherObjective(config, watcher.id);
+    expect(cleared?.objective).toBeUndefined();
+    const job = readState(config.instance).jobs.find(
+      (j) => (j.preRunHook?.config as { skill?: string })?.skill === "gmail-watch"
+    );
+    const watches = (job?.preRunHook?.config as { watches?: { objective?: string }[] }).watches ?? [];
+    expect(watches[0]?.objective).toBeUndefined();
+    // A missing watcher returns undefined.
+    expect(await clearEmailWatcherObjective(config, "nope")).toBeUndefined();
   });
 });
 

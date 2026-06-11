@@ -46,7 +46,7 @@ import { getGoogleAccount, googleAccountsRoot } from "./state/google-accounts";
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
-import { addEmailWatcher, getEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled, setEmailWatcherObjective } from "./state/email-watchers";
+import { addEmailWatcher, clearEmailWatcherObjective, getEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled, setEmailWatcherObjective } from "./state/email-watchers";
 import { migrateLegacyMemories, recall, reflect, retain } from "./memory";
 import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embedding";
 import { rerankerStatus } from "./memory/reranker";
@@ -1373,21 +1373,25 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // PATCH toggles a watcher's enabled flag and/or updates its objective,
     // rebuilding the shared job's watch list (disabling the last enabled
     // watcher tears the shared job down; enabling recreates it; a new
-    // objective rides the rebuilt hook config into the next tick).
+    // objective rides the rebuilt hook config into the next tick). An explicit
+    // `objective: null` CLEARS the objective (distinct from omitted = unchanged
+    // and "" = rejected by validateObjective).
     ["PATCH", /^\/api\/email\/watchers\/([^/]+)$/, async (request, params) => {
       const payload = await body(request);
       if (payload.enabled === undefined && payload.objective === undefined) {
-        return json({ error: "Invalid input: provide enabled (boolean) and/or objective (string)" }, 400);
+        return json({ error: "Invalid input: provide enabled (boolean) and/or objective (string or null to clear)" }, 400);
       }
       if (payload.enabled !== undefined && typeof payload.enabled !== "boolean") {
         return json({ error: "Invalid input: enabled must be a boolean" }, 400);
       }
-      if (payload.objective !== undefined && typeof payload.objective !== "string") {
-        return json({ error: "Invalid input: objective must be a string" }, 400);
+      if (payload.objective !== undefined && payload.objective !== null && typeof payload.objective !== "string") {
+        return json({ error: "Invalid input: objective must be a string or null" }, 400);
       }
       let updated = getEmailWatcher(config, params[0]);
       if (!updated) return json({ error: `Email watcher not found: ${params[0]}` }, 404);
-      if (typeof payload.objective === "string") {
+      if (payload.objective === null) {
+        updated = await clearEmailWatcherObjective(config, params[0]);
+      } else if (typeof payload.objective === "string") {
         updated = await setEmailWatcherObjective(config, params[0], payload.objective);
       }
       if (typeof payload.enabled === "boolean") {
