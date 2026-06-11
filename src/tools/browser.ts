@@ -1314,6 +1314,52 @@ const SNAPSHOT_HIDDEN_BUDGET = 50;
 // cursor-interactivity pass; see ADR browser-automation-engine.md.
 const SNAPSHOT_CLICKABLE_BUDGET = 75;
 
+// Bot-wall / challenge-page detection. Challenge interstitials
+// (Cloudflare "Just a moment...", CAPTCHA walls, Akamai / PerimeterX
+// blocks) render no DOM the agent can act on and never change on
+// re-snapshot, so a model that keeps re-snapshotting one burns its
+// whole context window on identical challenge trees. The heuristic is
+// deliberately structural to avoid flagging pages that merely TALK
+// about CAPTCHAs: suspect a bot wall only when the page TITLE matches
+// a known challenge title, or an IFRAME row in the snapshot text (the
+// walker emits every frame as `iframe "name|src"`) points at a known
+// challenge/captcha provider. Bare body-text mentions ("captcha",
+// "verify you are human" in a paragraph or link) never trigger on
+// their own.
+const BOT_WALL_TITLE_MARKERS = [
+  "just a moment", // Cloudflare interstitial
+  "checking your browser", // Cloudflare legacy interstitial
+  "attention required", // Cloudflare block page
+  "access denied", // Akamai / generic edge block
+  "pardon our interruption", // PerimeterX / HUMAN
+  "verify you are human",
+  "are you a robot",
+  "human verification"
+];
+const BOT_WALL_IFRAME_MARKERS = [
+  "challenges.cloudflare.com", // Turnstile / managed challenge
+  "/cdn-cgi/challenge-platform", // Cloudflare challenge assets
+  "hcaptcha.com",
+  "google.com/recaptcha",
+  "recaptcha.net",
+  "geo.captcha-delivery.com", // DataDome
+  "px-captcha", // PerimeterX
+  "arkoselabs.com" // FunCaptcha
+];
+const BOT_WALL_WARNING =
+  "This page appears to be a bot-detection challenge (CAPTCHA / interstitial). Re-snapshotting will not get past it — stop retrying and report the block to the user.";
+
+function detectBotWall(title: string, snapshotText: string): boolean {
+  const t = title.toLowerCase();
+  if (BOT_WALL_TITLE_MARKERS.some((marker) => t.includes(marker))) return true;
+  for (const line of snapshotText.split("\n")) {
+    if (!line.includes('iframe "')) continue;
+    const lowered = line.toLowerCase();
+    if (BOT_WALL_IFRAME_MARKERS.some((marker) => lowered.includes(marker))) return true;
+  }
+  return false;
+}
+
 interface SnapshotResult {
   text: string;
   refs: Map<string, RefTarget>;
@@ -1324,6 +1370,10 @@ interface SnapshotResult {
   // dropped lastSnapshotUrl). Stamps were cleared and numbering reset;
   // callers must NOT diff this snapshot against the pre-navigation one.
   navigated: boolean;
+  // True when the page looks like a bot-detection challenge (see
+  // detectBotWall above). Result-building callers pair it with
+  // BOT_WALL_WARNING so the model stops re-snapshotting.
+  botWallSuspected: boolean;
 }
 
 // Marker attribute stamped on snapshot-rendered elements so the
@@ -1957,7 +2007,12 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     if (!full) session.lastSnapshotText = text;
     session.lastSnapshotUrl = currentUrl;
   }
-  return { text, refs, elementCount, truncated, navigated };
+  // Bot-wall sniff on the assembled (already-redacted) snapshot text plus
+  // the page title. Fake test pages often mock only evaluate — guard the
+  // title call like the url()/goto() guards above.
+  const pageTitle = typeof page.title === "function" ? await page.title().catch(() => "") : "";
+  const botWallSuspected = detectBotWall(pageTitle, text);
+  return { text, refs, elementCount, truncated, navigated, botWallSuspected };
 }
 
 // Post-action snapshots return a line diff instead of the full tree when
@@ -2069,17 +2124,22 @@ function renderSnapshotDiff(prevText: string, currText: string): string | undefi
 async function snapshotAfterAction(
   session: Session,
   taskId: string
-): Promise<{ snapshot: string; snapshotMode: "full" | "diff"; elementCount: number; truncated: boolean }> {
+): Promise<{ snapshot: string; snapshotMode: "full" | "diff"; elementCount: number; truncated: boolean; botWallSuspected?: true; warning?: string }> {
   const prev = session.lastSnapshotText;
   const snap = await snapshot(session.page, false, taskId);
   session.refs = snap.refs;
+  // An action can land the page on a challenge wall (e.g. a click that
+  // navigated into a Cloudflare interstitial) — surface the same
+  // botWallSuspected flag the navigate/snapshot results carry, so every
+  // action tool inherits it via its spread of these fields.
+  const botWall = snap.botWallSuspected ? { botWallSuspected: true as const, warning: BOT_WALL_WARNING } : {};
   if (!snap.navigated && prev !== undefined) {
     const diff = renderSnapshotDiff(prev, snap.text);
     if (diff !== undefined && diff.length < snap.text.length * SNAPSHOT_DIFF_MAX_RATIO) {
-      return { snapshot: diff, snapshotMode: "diff", elementCount: snap.elementCount, truncated: snap.truncated };
+      return { snapshot: diff, snapshotMode: "diff", elementCount: snap.elementCount, truncated: snap.truncated, ...botWall };
     }
   }
-  return { snapshot: snap.text, snapshotMode: "full", elementCount: snap.elementCount, truncated: snap.truncated };
+  return { snapshot: snap.text, snapshotMode: "full", elementCount: snap.elementCount, truncated: snap.truncated, ...botWall };
 }
 
 // Resolve a ref for an action tool (click / type / hover / drag /
@@ -2482,7 +2542,8 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
         title: await session.page.title(),
         snapshot: snap.text,
         elementCount: snap.elementCount,
-        truncated: snap.truncated
+        truncated: snap.truncated,
+        ...(snap.botWallSuspected ? { botWallSuspected: true, warning: BOT_WALL_WARNING } : {})
       }, taskId);
     });
   } catch (error) {
@@ -2501,7 +2562,8 @@ export async function browserSnapshot(taskId: string, args: Record<string, unkno
         title: await session.page.title(),
         snapshot: snap.text,
         elementCount: snap.elementCount,
-        truncated: snap.truncated
+        truncated: snap.truncated,
+        ...(snap.botWallSuspected ? { botWallSuspected: true, warning: BOT_WALL_WARNING } : {})
       }, taskId);
     });
   } catch (error) {

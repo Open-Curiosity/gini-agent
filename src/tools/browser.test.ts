@@ -1556,6 +1556,82 @@ describe("snapshot walker — iframes", () => {
   });
 });
 
+// Bot-wall detection: a challenge interstitial (Cloudflare "Just a
+// moment...", captcha-provider iframes) never changes on re-snapshot, so
+// snapshot results must flag botWallSuspected + a warning that stops the
+// model from re-snapshotting in a loop. The heuristic requires a title
+// match or a challenge-provider iframe row — body text merely mentioning
+// CAPTCHAs must not trigger it.
+describe("bot-wall detection", () => {
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
+  const makeFakePage = (title: string): import("playwright-core").Page =>
+    ({
+      url: () => "https://example.com/",
+      title: async () => title,
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({ __sel: sel } as unknown)
+    } as unknown as import("playwright-core").Page);
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("Cloudflare-style interstitial title rides the snapshot result as botWallSuspected + warning", async () => {
+    const body = makeEl({ tagName: "BODY", children: [makeEl({ tagName: "BUTTON", textContent: "Retry" })] });
+    const restore = installFakeDom(body);
+    const page = makeFakePage("Just a moment...");
+    browserTest.installFakeSessionWithPageForTest("botwall-title", page as Partial<import("playwright-core").Page>);
+    try {
+      const raw = await browserSnapshot("botwall-title", {});
+      const parsed = JSON.parse(raw) as { success: boolean; botWallSuspected?: boolean; warning?: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.botWallSuspected).toBe(true);
+      expect(parsed.warning).toContain("bot-detection challenge");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a captcha-provider iframe flags botWallSuspected even under a benign title", async () => {
+    // Cross-origin captcha frame: no contentDocument, so the walker emits
+    // an opaque placeholder row whose label carries the src.
+    const iframe = makeEl({
+      tagName: "IFRAME",
+      attrs: { src: "https://challenges.cloudflare.com/turnstile/v0/challenge", title: "Widget containing a security challenge" }
+    });
+    const body = makeEl({ tagName: "BODY", children: [iframe] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage("example.com"), false);
+      expect(result.botWallSuspected).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a page merely mentioning CAPTCHAs in title-adjacent body text is not flagged", async () => {
+    // Article ABOUT captchas: the trigger phrase appears in a link's
+    // accessible name and the title names captchas, but there is no
+    // challenge title phrase and no challenge-provider iframe.
+    const link = makeEl({
+      tagName: "A",
+      attrs: { href: "https://blog.example.com/captcha" },
+      textContent: "Verify you are human — how CAPTCHAs work"
+    });
+    const body = makeEl({ tagName: "BODY", children: [link] });
+    const restore = installFakeDom(body);
+    try {
+      const result = await browserTest.snapshotForTest(makeFakePage("The history of CAPTCHA tests"), false);
+      expect(result.text).toContain("Verify you are human");
+      expect(result.botWallSuspected).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+});
+
 // Feature coverage for stable refs + post-action snapshot diffing: the
 // walker reuses an element's existing data-gini-ref stamp across
 // snapshots (new ids only for unstamped elements, allocation never
