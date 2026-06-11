@@ -32,7 +32,7 @@ import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
 import { downloadsDir, instanceRoot } from "../paths";
 import { launchPersistentChrome } from "./chrome-discovery";
-import { generateVisionAnalysis } from "../provider";
+import { generateAuxText, generateVisionAnalysis } from "../provider";
 import { assertInsideWorkspace, readState } from "../state";
 import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
 import type { BrowserConnectionRecord, BrowserDomainPolicy, Instance, RuntimeConfig } from "../types";
@@ -1374,6 +1374,62 @@ interface SnapshotResult {
   // detectBotWall above). Result-building callers pair it with
   // BOT_WALL_WARNING so the model stops re-snapshotting.
   botWallSuspected: boolean;
+  // Redacted text of the entries that did not fit the char budget
+  // (bounded at SNAPSHOT_SUMMARY_INPUT_CAP). First-visit result builders
+  // (browser_navigate / browser_snapshot) summarize it via an aux model;
+  // diff-mode consumers ignore it. Absent when nothing was clipped.
+  truncatedRemainder?: string;
+}
+
+// Aux-model summarization of an over-budget first-visit snapshot. Diff
+// mode already keeps multi-step loops small; a big FIRST landing (the
+// initial navigate or an explicit browser_snapshot) used to silently
+// lose everything past SNAPSHOT_CHAR_BUDGET. Instead, the clipped
+// remainder (post-redaction) is summarized by a single bounded aux text
+// call and appended under a divider; plain counted truncation remains
+// the fallback when no runtime config reached the tool or the aux call
+// fails. Input and output are both bounded to keep the added latency
+// one small side-call on over-budget first visits only.
+const SNAPSHOT_SUMMARY_INPUT_CAP = 64_000;
+const SNAPSHOT_SUMMARY_MAX_TOKENS = 1_024;
+const SNAPSHOT_SUMMARY_DIVIDER =
+  "[--- remainder summarized by aux model; @eN refs preserved and actionable ---]";
+const SNAPSHOT_SUMMARY_SYSTEM =
+  "You summarize the overflow portion of a web-page accessibility snapshot for a browser-automation agent. "
+  + "Preserve element ref tokens like [@e12] VERBATIM next to the controls they belong to — the agent acts on those refs. "
+  + "Collapse repetitive rows (lists, cards, nav items) into one line each with representative refs. Plain text only, be concise.";
+
+// Returns the aux summary of a clipped snapshot remainder, or undefined
+// when the call fails (callers then keep the plain counted truncation).
+// `remainder` must already be redacted — snapshot() redacts it with the
+// same pass as the snapshot text itself.
+async function summarizeSnapshotRemainder(config: RuntimeConfig, remainder: string): Promise<string | undefined> {
+  try {
+    const result = await generateAuxText(config, {
+      system: SNAPSHOT_SUMMARY_SYSTEM,
+      user: remainder.slice(0, SNAPSHOT_SUMMARY_INPUT_CAP),
+      maxTokens: SNAPSHOT_SUMMARY_MAX_TOKENS
+    });
+    const summary = result.text.trim();
+    return summary.length > 0 ? summary : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Shared by browser_navigate / browser_snapshot: append the aux summary
+// of the clipped remainder under a divider, or return the text unchanged
+// when summarization is unavailable. The summary still rides the ok()
+// deep-redaction pass like every other string in the result.
+async function withSummarizedRemainder(
+  text: string,
+  truncatedRemainder: string | undefined,
+  config: RuntimeConfig | undefined
+): Promise<string> {
+  if (truncatedRemainder === undefined || config === undefined) return text;
+  const summary = await summarizeSnapshotRemainder(config, truncatedRemainder);
+  if (summary === undefined) return text;
+  return `${text}\n${SNAPSHOT_SUMMARY_DIVIDER}\n${summary}`;
 }
 
 // Marker attribute stamped on snapshot-rendered elements so the
@@ -1913,6 +1969,13 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
     const advanced = (raw as { nextId?: number }).nextId;
     session.nextRefId = typeof advanced === "number" ? advanced : startId;
   }
+  // Lines past the char budget are collected (bounded) instead of being
+  // dropped on the floor: first-visit result builders can hand them to an
+  // aux model for summarization (see SNAPSHOT_SUMMARY_INPUT_CAP below).
+  // Their refs are registered too, so an @eN the summary preserves stays
+  // actionable — the stamps exist on the page either way.
+  const remainderLines: string[] = [];
+  let remainderChars = 0;
   for (const entry of entries) {
     const indent = "  ".repeat(entry.depth);
     let line: string;
@@ -1937,12 +2000,19 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
       if (entry.hidden) line += " [hidden]";
       if (entry.note) line += entry.note;
     }
-    if (charCount + line.length + 1 > SNAPSHOT_CHAR_BUDGET) {
+    if (truncated || charCount + line.length + 1 > SNAPSHOT_CHAR_BUDGET) {
       truncated = true;
-      break;
+      // Stop all work (rendering AND ref registration) once the
+      // summarization input cap is full — the counted marker below only
+      // needs entries.length, and refs for rows no summary will ever
+      // mention are dead weight.
+      if (remainderChars > SNAPSHOT_SUMMARY_INPUT_CAP) break;
+      remainderLines.push(line);
+      remainderChars += line.length + 1;
+    } else {
+      lines.push(line);
+      charCount += line.length + 1;
     }
-    lines.push(line);
-    charCount += line.length + 1;
     if (entry.ref) {
       const nthKey = `${entry.role}\u0000${entry.name}`;
       const nth = nthByRoleName.get(nthKey) ?? 0;
@@ -1991,8 +2061,13 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   // snapshot text against the live secret list closes this gap
   // with the same primitive browserConsole and browserVision use.
   const secretValues = await collectSecretValuesFromPageWithSession(page, taskId);
+  let remainderText = remainderLines.join("\n");
   if (secretValues.length > 0) {
     text = redactSecretValuesFromString(text, secretValues);
+    // The remainder can be forwarded to an aux summarization model —
+    // redact it with the exact same pass BEFORE it leaves this function,
+    // so the aux provider never sees a secret the agent loop wouldn't.
+    if (remainderText.length > 0) remainderText = redactSecretValuesFromString(remainderText, secretValues);
   }
   // Store the REDACTED text as the diff base for the next post-action
   // snapshot — diffing always compares redacted text against redacted
@@ -2012,7 +2087,15 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   // title call like the url()/goto() guards above.
   const pageTitle = typeof page.title === "function" ? await page.title().catch(() => "") : "";
   const botWallSuspected = detectBotWall(pageTitle, text);
-  return { text, refs, elementCount, truncated, navigated, botWallSuspected };
+  return {
+    text,
+    refs,
+    elementCount,
+    truncated,
+    navigated,
+    botWallSuspected,
+    ...(remainderText.length > 0 ? { truncatedRemainder: remainderText } : {})
+  };
 }
 
 // Post-action snapshots return a line diff instead of the full tree when
@@ -2452,7 +2535,13 @@ async function pdfNavigateResult(
   }, taskId);
 }
 
-export async function browserNavigate(taskId: string, args: Record<string, unknown>): Promise<string> {
+export async function browserNavigate(
+  taskId: string,
+  args: Record<string, unknown>,
+  // Runtime config enables the over-budget aux summarization fallback;
+  // direct callers / tests may omit it and get plain counted truncation.
+  config?: RuntimeConfig
+): Promise<string> {
   const url = str(args.url);
   if (!url) return fail("Missing required string argument: url");
   const blocked = safetyCheck(url) ?? domainPolicyBlockReason(url, agentDomainPolicyForTask(taskId));
@@ -2540,7 +2629,7 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
         url: finalUrl,
         status: response?.status() ?? null,
         title: await session.page.title(),
-        snapshot: snap.text,
+        snapshot: await withSummarizedRemainder(snap.text, snap.truncatedRemainder, config),
         elementCount: snap.elementCount,
         truncated: snap.truncated,
         ...(snap.botWallSuspected ? { botWallSuspected: true, warning: BOT_WALL_WARNING } : {})
@@ -2551,7 +2640,13 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
   }
 }
 
-export async function browserSnapshot(taskId: string, args: Record<string, unknown>): Promise<string> {
+export async function browserSnapshot(
+  taskId: string,
+  args: Record<string, unknown>,
+  // Runtime config enables the over-budget aux summarization fallback;
+  // direct callers / tests may omit it and get plain counted truncation.
+  config?: RuntimeConfig
+): Promise<string> {
   const full = bool(args.full, false);
   try {
     return await withSession(taskId, async (session) => {
@@ -2560,7 +2655,7 @@ export async function browserSnapshot(taskId: string, args: Record<string, unkno
       return ok({
         url: session.page.url(),
         title: await session.page.title(),
-        snapshot: snap.text,
+        snapshot: await withSummarizedRemainder(snap.text, snap.truncatedRemainder, config),
         elementCount: snap.elementCount,
         truncated: snap.truncated,
         ...(snap.botWallSuspected ? { botWallSuspected: true, warning: BOT_WALL_WARNING } : {})

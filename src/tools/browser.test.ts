@@ -36,7 +36,14 @@ import {
 import { dispatchToolCall } from "../execution/tool-dispatch";
 import { resolveSetupRequest } from "../agent";
 import { completeBrowserConnectSetup } from "../capabilities/browser-connect";
-import { clearEchoVisionResponses, setEchoVisionResponse } from "../provider";
+import {
+  clearEchoAuxTextResponses,
+  clearEchoVisionResponses,
+  getEchoAuxTextRequests,
+  setEchoAuxTextFailure,
+  setEchoAuxTextResponse,
+  setEchoVisionResponse
+} from "../provider";
 import { createAgentRecord, createTask, mutateState, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 
@@ -1343,6 +1350,149 @@ describe("snapshot walker — char-budget truncation count", () => {
       const emitted = result.text.split("\n").filter((line) => line.includes(" button ")).length;
       expect(emitted).toBeGreaterThan(0);
       expect(emitted + Number(match![1])).toBe(400);
+    } finally {
+      restore();
+    }
+  });
+});
+
+// Over-budget FIRST-VISIT snapshots (browser_navigate / explicit
+// browser_snapshot) summarize the clipped remainder via a bounded aux
+// model call instead of silently losing it; plain counted truncation
+// remains the fallback when no config reaches the tool or the aux call
+// fails. The aux INPUT must be redacted with the same pass as the
+// snapshot text, and post-action diff snapshots never summarize.
+describe("snapshot remainder summarization", () => {
+  const makeEl = makeWalkerEl;
+  const installFakeDom = installWalkerDom;
+  const makeFakePage = (state: { url: string; onClick?: () => void }): import("playwright-core").Page =>
+    ({
+      url: () => state.url,
+      title: async () => "Big page",
+      waitForLoadState: async () => undefined,
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => Promise.resolve(fn(arg as A)),
+      locator: (sel: string) => ({
+        __sel: sel,
+        click: async (_opts?: { timeout?: number }) => {
+          state.onClick?.();
+        }
+      })
+    } as unknown as import("playwright-core").Page);
+  const echoConfig: RuntimeConfig = {
+    instance: "test",
+    port: 7337,
+    token: "test",
+    provider: { name: "echo", model: "gini-echo-v0" },
+    workspaceRoot: "/tmp",
+    stateRoot: "/tmp/gini-aux-test",
+    logRoot: "/tmp/gini-aux-test-logs"
+  };
+  // ~110 chars per button line → `count` of them blows the 32k char
+  // budget well before the list ends.
+  const makeBigBody = (count: number, lastText?: string): WalkerFakeEl => {
+    const children: WalkerFakeEl[] = [];
+    for (let i = 0; i < count; i++) {
+      children.push(makeEl({ tagName: "BUTTON", textContent: `button-${i}-${"x".repeat(90)}` }));
+    }
+    if (lastText !== undefined) {
+      children.push(makeEl({ tagName: "BUTTON", textContent: lastText }));
+    }
+    return makeEl({ tagName: "BODY", children });
+  };
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    clearEchoAuxTextResponses();
+  });
+
+  test("over-budget first visit appends kept-head + divider + aux summary; remainder fed to the aux model", async () => {
+    const restore = installFakeDom(makeBigBody(400));
+    browserTest.installFakeSessionWithPageForTest("aux-sum", makeFakePage({ url: "https://example.com/big" }));
+    setEchoAuxTextResponse({ text: "Remaining rows are more list buttons [@e350] through [@e400]." });
+    try {
+      const raw = await browserSnapshot("aux-sum", {}, echoConfig);
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; truncated: boolean };
+      expect(parsed.success).toBe(true);
+      expect(parsed.truncated).toBe(true);
+      // Kept head + counted marker survive unchanged.
+      expect(parsed.snapshot).toContain('[@e1] button "button-0-');
+      expect(parsed.snapshot).toContain("[...truncated +");
+      // Divider + summary (with its verbatim refs) are appended.
+      expect(parsed.snapshot).toContain("remainder summarized by aux model");
+      expect(parsed.snapshot).toContain("[@e350]");
+      // The aux model received the clipped remainder, not the head.
+      const requests = getEchoAuxTextRequests();
+      expect(requests.length).toBe(1);
+      expect(requests[0]!.user).toContain("button-399");
+      expect(requests[0]!.user).not.toContain("button-0-");
+    } finally {
+      restore();
+    }
+  });
+
+  test("aux failure falls back to plain counted truncation; no config never calls the aux model", async () => {
+    const restore = installFakeDom(makeBigBody(400));
+    try {
+      browserTest.installFakeSessionWithPageForTest("aux-fail", makeFakePage({ url: "https://example.com/big" }));
+      setEchoAuxTextFailure("aux model unavailable");
+      const failed = JSON.parse(await browserSnapshot("aux-fail", {}, echoConfig)) as { success: boolean; snapshot: string };
+      expect(failed.success).toBe(true);
+      expect(failed.snapshot).toContain("[...truncated +");
+      expect(failed.snapshot).not.toContain("remainder summarized");
+      expect(getEchoAuxTextRequests().length).toBe(1);
+
+      clearEchoAuxTextResponses();
+      browserTest.clearFakeSessionsForTest();
+      browserTest.installFakeSessionWithPageForTest("aux-none", makeFakePage({ url: "https://example.com/big" }));
+      const noConfig = JSON.parse(await browserSnapshot("aux-none", {})) as { success: boolean; snapshot: string };
+      expect(noConfig.success).toBe(true);
+      expect(noConfig.snapshot).toContain("[...truncated +");
+      expect(noConfig.snapshot).not.toContain("remainder summarized");
+      expect(getEchoAuxTextRequests().length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("the aux model input is redacted: a registered secret in the remainder never reaches the provider", async () => {
+    const secret = "hunter2-super-secret-value";
+    const restore = installFakeDom(makeBigBody(400, `welcome back ${secret}`));
+    browserTest.installFakeSessionWithPageForTest("aux-redact", makeFakePage({ url: "https://example.com/big" }));
+    browserTest.recordFilledSecretForTest("aux-redact", secret);
+    setEchoAuxTextResponse({ text: "summary of remainder" });
+    try {
+      const raw = await browserSnapshot("aux-redact", {}, echoConfig);
+      expect(raw).not.toContain(secret);
+      const requests = getEchoAuxTextRequests();
+      expect(requests.length).toBe(1);
+      expect(requests[0]!.user).not.toContain(secret);
+      expect(requests[0]!.user).toContain("[redacted]");
+    } finally {
+      restore();
+    }
+  });
+
+  test("post-action diff snapshots never trigger summarization", async () => {
+    const body = makeBigBody(400);
+    const restore = installFakeDom(body);
+    const state: { url: string; onClick?: () => void } = { url: "https://example.com/big" };
+    state.onClick = () => {
+      const added = makeEl({ tagName: "BUTTON", textContent: "NewButton" });
+      added.parentElement = body;
+      body._children.push(added);
+    };
+    browserTest.installFakeSessionWithPageForTest("aux-diff", makeFakePage(state));
+    setEchoAuxTextResponse({ text: "should-not-be-requested" });
+    try {
+      // Baseline without config: plain truncation, no aux call.
+      await browserSnapshot("aux-diff", {});
+      const raw = await browserClick("aux-diff", { ref: "@e1" });
+      const parsed = JSON.parse(raw) as { success: boolean; snapshot: string; snapshotMode: string };
+      expect(parsed.success).toBe(true);
+      expect(parsed.snapshotMode).toBe("diff");
+      expect(parsed.snapshot).not.toContain("remainder summarized");
+      expect(getEchoAuxTextRequests().length).toBe(0);
     } finally {
       restore();
     }

@@ -282,9 +282,9 @@ async function dispatchToolCallInner(
     case "request_remove_messaging_bridge":
       return await requestRemoveMessagingBridgeTool(config, taskId, toolCallId, args);
     case "browser_navigate":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args, config), args) };
     case "browser_snapshot":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.snapshot", () => browserSnapshot(taskId, args), args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.snapshot", () => browserSnapshot(taskId, args, config), args) };
     case "browser_click":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.click", () => browserClick(taskId, args), args) };
     case "browser_type":

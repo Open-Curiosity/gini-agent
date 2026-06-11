@@ -3066,9 +3066,13 @@ async function callOpenAIResponses(
   provider: ProviderConfig,
   input: string,
   systemContext: string,
-  onDelta?: (text: string) => void
+  onDelta?: (text: string) => void,
+  // Per-call output-token cap. Aux side-calls pass a small budget; the
+  // chat paths omit it and the model default applies.
+  maxOutputTokens?: number
 ): Promise<ProviderResult> {
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
+  const tokenCapField = maxOutputTokens !== undefined ? { max_output_tokens: maxOutputTokens } : {};
 
   // Codex and OpenAI share the /responses surface but differ on auth,
   // streaming, and retry. Codex needs withCodexSessionRetry so a token
@@ -3099,7 +3103,8 @@ async function callOpenAIResponses(
                 { type: "input_text", text: input }
               ]
             }
-          ]
+          ],
+          ...tokenCapField
         })
       });
       return readCodexStream(response, provider, onDelta);
@@ -3127,6 +3132,7 @@ async function callOpenAIResponses(
           ]
         }
       ],
+      ...tokenCapField,
       ...promptCacheRetentionBody(provider)
     })
   });
@@ -3148,7 +3154,16 @@ async function callOpenAIResponses(
   };
 }
 
-async function callChatCompletions(provider: ProviderConfig, input: string, systemContext: string): Promise<ProviderResult> {
+async function callChatCompletions(
+  provider: ProviderConfig,
+  input: string,
+  systemContext: string,
+  // Per-call output-token cap (aux side-calls). Azure serves OpenAI
+  // models whose newer o-series reject `max_tokens` and require
+  // `max_completion_tokens`; other compat gateways keep the legacy field
+  // (mirrors callVisionChatCompletions).
+  maxTokens?: number
+): Promise<ProviderResult> {
   const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
   const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
   const headers: Record<string, string> = {
@@ -3157,6 +3172,11 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
+  const tokenCapField = maxTokens === undefined
+    ? {}
+    : provider.name === "azure"
+      ? { max_completion_tokens: maxTokens }
+      : { max_tokens: maxTokens };
   const response = await fetch(chatCompletionsUrl(provider, baseUrl), {
     method: "POST",
     headers,
@@ -3168,6 +3188,7 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
         { role: "user", content: input }
       ],
       stream: false,
+      ...tokenCapField,
       ...promptCacheRetentionBody(provider)
     })
   });
@@ -4081,4 +4102,84 @@ async function callVisionChatCompletions(
     usage,
     cost: estimateCost(provider, usage)
   };
+}
+
+// ---------------- Aux text (single-shot side call) ----------------
+//
+// One system instruction + one user input, plain text back. Used by the
+// browser snapshot path to summarize the over-budget remainder of a
+// first-visit snapshot without involving the agent loop. Same
+// tiny-surface philosophy as generateVisionAnalysis: a single turn, no
+// identity files / memory recall, bounded max tokens.
+export interface AuxTextRequest {
+  system: string;
+  user: string;
+  // Caps the model's response length. Defaults to 1024.
+  maxTokens?: number;
+}
+
+export interface AuxTextResult {
+  text: string;
+  provider: ProviderConfig;
+  usage?: Record<string, unknown>;
+  cost?: CostRecord;
+}
+
+// Echo provider aux-text stubs — mirror of echoVisionStubs. Received
+// requests are recorded so tests can assert what the aux model was sent
+// (e.g. that snapshot-summarization input was redacted first). A stub
+// with `error` set makes the echo call throw, exercising callers'
+// aux-failure fallback paths.
+const echoAuxTextStubs: Array<{ result?: Omit<AuxTextResult, "provider"> & { provider?: ProviderConfig }; error?: string }> = [];
+const echoAuxTextRequests: AuxTextRequest[] = [];
+
+export function setEchoAuxTextResponse(
+  result: Omit<AuxTextResult, "provider"> & { provider?: ProviderConfig }
+): void {
+  echoAuxTextStubs.push({ result });
+}
+
+export function setEchoAuxTextFailure(message: string): void {
+  echoAuxTextStubs.push({ error: message });
+}
+
+export function clearEchoAuxTextResponses(): void {
+  echoAuxTextStubs.length = 0;
+  echoAuxTextRequests.length = 0;
+}
+
+export function getEchoAuxTextRequests(): AuxTextRequest[] {
+  return echoAuxTextRequests.map((request) => ({ ...request }));
+}
+
+export async function generateAuxText(
+  config: RuntimeConfig,
+  request: AuxTextRequest
+): Promise<AuxTextResult> {
+  const provider = normalizeProvider(config.provider);
+  const maxTokens = request.maxTokens ?? 1024;
+  if (provider.name === "echo") {
+    echoAuxTextRequests.push({ ...request });
+    const stub = echoAuxTextStubs.shift();
+    if (stub?.error !== undefined) throw new Error(stub.error);
+    if (stub?.result) return { provider: stub.result.provider ?? provider, ...stub.result };
+    return { provider, text: `Aux text stub: ${request.user.slice(0, 80)}` };
+  }
+  if (provider.name === "anthropic" || provider.name === "bedrock") {
+    const messages: ToolCallingMessage[] = [
+      { role: "system", content: request.system },
+      { role: "user", content: request.user }
+    ];
+    const result = provider.name === "bedrock"
+      ? await callBedrockConverse(provider, messages, [], undefined, maxTokens)
+      : await callAnthropicMessages(provider, messages, [], undefined, maxTokens);
+    return { provider: result.provider, text: result.text, usage: result.usage, cost: result.cost };
+  }
+  if (provider.name === "codex" || provider.name === "openai") {
+    const result = await callOpenAIResponses(provider, request.user, request.system, undefined, maxTokens);
+    return { provider: result.provider, text: result.text, usage: result.usage, cost: result.cost };
+  }
+  // openrouter / local / deepseek / azure — OpenAI-compatible chat-completions.
+  const result = await callChatCompletions(provider, request.user, request.system, maxTokens);
+  return { provider: result.provider, text: result.text, usage: result.usage, cost: result.cost };
 }
