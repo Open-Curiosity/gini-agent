@@ -836,9 +836,11 @@ export async function detect(
 // from ticket bots are exactly what's watched); self-drop stays mandatory (we
 // must never trigger on our own replies — they advance the cursor silently).
 // Seeding mirrors the query regime: baseline the cursor at the newest message
-// and draft nothing; `seen` records the ids at the cursor's epoch second so an
-// equal-timestamp message isn't re-drafted. Same purity + at-least-once
-// contract: the new state rides back for the caller to persist.
+// and, when that newest is from the counterparty (not self), draft THAT ONE
+// message so a watch added to a thread with a pending reply drafts immediately;
+// `seen` records the ids at the cursor's epoch second so an equal-timestamp
+// message isn't re-drafted. Same purity + at-least-once contract: the new state
+// rides back for the caller to persist.
 async function detectThread(
   args: DetectArgs,
   gwsSpawn: GwsSpawn,
@@ -856,8 +858,11 @@ async function detectThread(
     .sort((a, b) => (Number(a.internalDate) || 0) - (Number(b.internalDate) || 0));
   const newest = messages[messages.length - 1];
 
-  // Seeding: baseline at the newest message in the thread, draft nothing
-  // (never draft the existing conversation as a backlog).
+  // Seeding: baseline at the newest message in the thread. If that newest
+  // message is from the counterparty (not self), draft THAT ONE message so
+  // creating a watch on a thread with a pending reply produces a draft
+  // immediately; a self newest (the ball is in their court) stays silent. Older
+  // messages in the thread are never drafted as a backlog.
   if (!stateIn.cursor) {
     const baseline = newest?.internalDate ? Number(newest.internalDate) : 0;
     const cursor = String(baseline > 0 ? baseline : Date.now());
@@ -865,6 +870,21 @@ async function detectThread(
     const seen = messages
       .filter((m) => Math.floor((Number(m.internalDate) || 0) / 1000) === baselineSec)
       .map((m) => m.id);
+    const seedItems: ResultItem[] = [];
+    if (newest) {
+      const newestFrom = parseFromAddress(newest.from ?? "");
+      const newestIsSelf = Boolean(selfEmail && newestFrom && newestFrom === selfEmail.toLowerCase());
+      if (!newestIsSelf) {
+        // The pending counterparty reply WILL be drafted: fetch its body now
+        // (best-effort, falls back to the snippet), exactly as the steady path.
+        newest.body = await fetchMessageBody(gwsSpawn, newest.id, newest.snippet ?? "");
+        seedItems.push(buildMatchItem(newest));
+        if (args.objective) seedItems.push(buildObjectiveItem(`thread:${args.threadId}`, args.objective));
+      }
+    }
+    if (seedItems.length > 0) {
+      return { kind: "context", items: seedItems, state: { cursor, seen, status: "ok" } };
+    }
     return { kind: "shortCircuit", summary: "[SILENT]", state: { cursor, seen, status: "ok" } };
   }
 
