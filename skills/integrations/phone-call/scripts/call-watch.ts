@@ -29,6 +29,8 @@
 //                          forever. Terminal context item describing the
 //                          failure + state { done: true }, so the drafting
 //                          turn reports it once and deletes the job.
+//   - missing API key   => same terminal treatment: the credential is gone for
+//                          good, not flaky, so retrying can never succeed.
 //
 // Pure: state rides in on stdin and out on the result; never touches files/DB.
 // Self-contained on purpose (no src/ imports): skill scripts must stay portable.
@@ -119,6 +121,23 @@ export function buildLookupFailureOutput(httpStatus: number, blandMessage?: stri
   };
 }
 
+// A missing BLAND_API_KEY is permanent, not transient: exiting non-zero would
+// make the skill-script handler retry every tick forever with the user never
+// hearing about it. Emit a TERMINAL context item + state { done: true }, so
+// the drafting turn reports it once and deletes the job.
+export function buildMissingCredentialOutput(): CallWatchOutput {
+  return {
+    kind: "context",
+    items: [
+      {
+        text: "Phone call status lookup failed permanently: the Bland AI credential (BLAND_API_KEY) is missing or disconnected. The call result cannot be retrieved.",
+        untrusted: true
+      }
+    ],
+    state: { done: true }
+  };
+}
+
 // Decide the tick's hook output from the prior state and (when fetched) the
 // Bland call payload. The done backstop takes no payload at all — main()
 // checks it BEFORE fetching, so a delivered watch never re-hits the API.
@@ -170,7 +189,7 @@ async function main(): Promise<void> {
   if (args.state?.done === true) emit(evaluateCallWatch(args.state));
 
   const apiKey = process.env.BLAND_API_KEY;
-  if (!apiKey) fail("Missing BLAND_API_KEY.");
+  if (!apiKey) emit(buildMissingCredentialOutput());
   if (typeof args.callId !== "string" || args.callId.length === 0) fail("callId is required.");
 
   const controller = new AbortController();
