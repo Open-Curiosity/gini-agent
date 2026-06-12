@@ -241,8 +241,14 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                     );
                   }
                   const channelSession = (allSessions.data ?? []).find((s) => s.id === job.chatSessionId);
+                  // A deliverTo:"chat" job binds to a normal conversation
+                  // rather than a dedicated channel: its row navigates
+                  // there, so the unread dot would light on ANY activity
+                  // in that conversation — suppress it and show where the
+                  // job delivers instead.
+                  const chatBound = channelSession !== undefined && channelSession.kind !== "channel";
                   const active = onChat && selectedSession === job.chatSessionId;
-                  const unread = !active && channelSession ? isUnread(channelSession) : false;
+                  const unread = !active && !chatBound && channelSession ? isUnread(channelSession) : false;
                   const onClick = () => {
                     if (job.chatSessionId) {
                       selectChannel(job.chatSessionId);
@@ -261,19 +267,30 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                           active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
                         )}
                       >
-                        <span
-                          aria-hidden
-                          className="w-3.5 shrink-0 text-center text-sm font-medium text-sidebar-foreground/55"
-                        >
-                          #
-                        </span>
-                        <span
-                          className={cn(
-                            "min-w-0 flex-1 truncate text-[13px]",
-                            active || unread ? "font-semibold text-sidebar-accent-foreground" : "font-medium text-sidebar-foreground"
-                          )}
-                        >
-                          {job.name}
+                        {chatBound ? (
+                          <MessagesSquare aria-hidden className="size-3.5 shrink-0 text-sidebar-foreground/55" />
+                        ) : (
+                          <span
+                            aria-hidden
+                            className="w-3.5 shrink-0 text-center text-sm font-medium text-sidebar-foreground/55"
+                          >
+                            #
+                          </span>
+                        )}
+                        <span className="flex min-w-0 flex-1 flex-col">
+                          <span
+                            className={cn(
+                              "truncate text-[13px]",
+                              active || unread ? "font-semibold text-sidebar-accent-foreground" : "font-medium text-sidebar-foreground"
+                            )}
+                          >
+                            {job.name}
+                          </span>
+                          {chatBound ? (
+                            <span className="truncate text-[11px] font-medium text-sidebar-foreground/55">
+                              → {channelSession.title?.trim() || "main chat"}
+                            </span>
+                          ) : null}
                         </span>
                         {unread ? (
                           <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-sidebar-primary" />

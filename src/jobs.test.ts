@@ -16,7 +16,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, rmSync } from "node:fs";
 import { createHandler } from "./http";
 import { runDueJobs, runJobNow } from "./jobs";
-import { advanceCronNextRunAt, updateJob } from "./jobs/index";
+import { advanceCronNextRunAt, createScheduledJob, updateJob } from "./jobs/index";
 import { createChatMessage, createTask, mutateState, readState, upsertTask } from "./state";
 import { dispatchToolCall } from "./execution/tool-dispatch";
 import { syncChatTaskResult } from "./execution/chat";
@@ -549,6 +549,38 @@ describe("cron lifecycle", () => {
       )
     ).rejects.toThrow(/deliverTo must be one of/);
     expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
+  test("createScheduledJob with requireChatSession rejects a vanished chat session and persists no job", async () => {
+    const config = testConfig("jobs-create-require-chat-session");
+    // The tool path resolves the originating session from a lock-free
+    // readState; requireChatSession makes the mutateState callback
+    // re-verify it. A session deleted between check and write must throw
+    // the recognizable error instead of persisting a job bound to a dead
+    // conversation.
+    await expect(
+      createScheduledJob(config, {
+        name: "dead-session",
+        intervalSeconds: 60,
+        prompt: "x",
+        chatSessionId: "session_deleted_in_race"
+      }, { requireChatSession: true })
+    ).rejects.toThrow(/chat session session_deleted_in_race no longer exists/);
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
+  test("createScheduledJob without requireChatSession keeps the permissive chatSessionId behavior", async () => {
+    const config = testConfig("jobs-create-permissive-chat-session");
+    // The raw POST /api/jobs path does not opt into the strict re-check:
+    // callers may pre-create or backfill sessions out of band.
+    const job = await createScheduledJob(config, {
+      name: "backfilled-session",
+      intervalSeconds: 60,
+      prompt: "x",
+      chatSessionId: "session_not_yet_created"
+    });
+    expect(job.chatSessionId).toBe("session_not_yet_created");
+    expect(readState(config.instance).jobs).toHaveLength(1);
   });
 
   test("create_job dispatch from an imperative task leaves chatSessionId undefined", async () => {

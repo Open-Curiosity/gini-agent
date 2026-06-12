@@ -54,6 +54,15 @@ export interface CreateScheduledJobOptions {
   // path never sets this — public clients must not be able to spoof
   // `agentId` through the request body.
   originatingAgentId?: string;
+  // Strict chat-session binding for the in-task `create_job` tool. The
+  // dispatcher resolves the originating conversation from a lock-free
+  // `readState`, so the session can be deleted between that check and the
+  // write below; setting this makes the `mutateState` callback re-verify
+  // the supplied `chatSessionId` still exists (same serialization
+  // rationale as the parent-task terminal re-check). The HTTP path never
+  // sets it — `POST /api/jobs` stays permissive about caller-supplied
+  // session ids.
+  requireChatSession?: boolean;
 }
 
 export async function createScheduledJob(
@@ -295,6 +304,15 @@ export async function createScheduledJob(
       // be "schedule a recurring follow-up job."
       if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
         throw new Error(`Cannot create scheduled job: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
+    // Re-resolve the caller-supplied chat session INSIDE the lock. The
+    // dispatcher's originating-session id came from a lock-free
+    // `readState`; without this, a session deleted between that check and
+    // this write would persist a job bound to a dead conversation.
+    if (options.requireChatSession && chatSessionId !== undefined) {
+      if (!state.chatSessions.some((candidate) => candidate.id === chatSessionId)) {
+        throw new Error(`Cannot create scheduled job: chat session ${chatSessionId} no longer exists.`);
       }
     }
     // Dedicated-session creation. Done INSIDE the mutateState callback so

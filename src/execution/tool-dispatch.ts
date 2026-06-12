@@ -1527,11 +1527,19 @@ async function createJobTool(
       // doesn't reattribute the job to whichever agent happens to be
       // active at fire time. Threaded through the trusted options bag
       // so a malicious HTTP client can't spoof it via the request body.
-      originatingAgentId: task?.agentId
+      originatingAgentId: task?.agentId,
+      // originatingSessionId came from a lock-free readState above; ask
+      // createScheduledJob to re-verify the session inside its mutateState
+      // callback so a deletion racing this call can't persist a job bound
+      // to a dead conversation.
+      requireChatSession: deliverTo === "chat"
     });
   } catch (err) {
     if (err instanceof Error && err.message.startsWith("Cannot create scheduled job: parent task ")) {
       return `Error: create_job skipped because parent task was cancelled between pre-check and job creation.`;
+    }
+    if (err instanceof Error && err.message.startsWith("Cannot create scheduled job: chat session ")) {
+      return `Error: create_job skipped because the originating chat session was deleted between pre-check and job creation.`;
     }
     throw err;
   }
