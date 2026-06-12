@@ -29,7 +29,7 @@ The runtime injects `BLAND_API_KEY` into the scripts — you never see or pass t
 2. **Confirm with the user before dialing.** State the exact number and what the agent will say/ask, and get an explicit go-ahead. Calls are outward-facing and irreversible.
 3. **Place the call** with `place-call`. It returns `{ ok, callId }`.
 4. **Wait for the result** with `check-call`, passing `waitSeconds: 240` — the script polls Bland every 10 seconds internally and returns as soon as the call completes (or when the budget runs out). If the result comes back with `completed: false`, call `check-call` again with the same args and repeat until `completed` is `true`.
-5. **Report back** the `summary` and the key points of the `transcript` (quote relevant exchanges, don't dump the whole thing unless asked).
+5. **Report back** the `summary` and the key points of the `transcript` (quote relevant exchanges, don't dump the whole thing unless asked). Optional: for structured answers about the call (did they confirm? what time?), run `analyze-call`.
 
 If the user wants to abort a call in progress, run `stop-call` with the `callId`.
 
@@ -67,6 +67,21 @@ skill_run({ skill: "phone-call", script: "stop-call", args: { callId: "..." } })
 ```
 
 Ends an in-progress call. Returns `{ ok, message }`.
+
+### analyze-call
+
+```
+skill_run({ skill: "phone-call", script: "analyze-call", args: {
+  callId: "...",                                      // required
+  goal: "Book a dinner reservation",                  // optional context
+  questions: [                                        // required, non-empty
+    ["Did they confirm the reservation?", "boolean"],
+    ["What time was booked?", "string"]
+  ]
+} })
+```
+
+Use after `check-call` reports `completed: true` when you need structured answers instead of reading the transcript — e.g. "Did they confirm the reservation?" → `true`. Each question is a `[question, answerType]` pair (`"string"`, `"boolean"`, `"number"`); a bare string question defaults to `"string"`. Returns `{ ok, answers }` with one answer per question, in order. Each analysis costs Bland credits, so prefer the transcript/summary for simple cases.
 
 ## Writing a good task prompt
 
