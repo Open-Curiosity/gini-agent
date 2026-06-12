@@ -43,12 +43,19 @@ export function DocSheet({
   onOpenChange: (open: boolean) => void;
   lead?: React.ReactNode;
 }) {
-  // The fetched doc is cached for the lifetime of this mount and keyed to the
-  // FIRST url — callers that swap docs must remount (a `key` on this element),
-  // which every current caller does (one DocReference per url; TunnelMenu
-  // keys its guide sheet by provider).
+  // The fetched doc is cached per url. A caller that swaps `url` in place
+  // (no key remount — e.g. AddConnectorDialog switching provider templates)
+  // must never see the previous url's doc, so a url change drops the cache
+  // during render and re-arms the open-edge fetch below.
   const ref = parseDocsUrl(url);
   const [state, setState] = useState<FetchState>({ loading: false });
+  const openedRef = useRef(false);
+  const [fetchedFor, setFetchedFor] = useState(url);
+  if (fetchedFor !== url) {
+    setFetchedFor(url);
+    setState({ loading: false });
+    openedRef.current = false;
+  }
 
   async function load() {
     if (state.data || state.loading) return;
@@ -65,7 +72,9 @@ export function DocSheet({
   // Fetch on the open EDGE (not via Radix's onOpenChange, which only fires on
   // user interaction — programmatic opens would never load). Once loaded, the
   // data guard makes later edges no-ops; after an error, the next open retries.
-  const openedRef = useRef(false);
+  // `fetchedFor` re-fires the effect when a caller swaps `url` in place: the
+  // render-time reset above re-armed the edge, so an already-open sheet
+  // fetches the new doc immediately.
   useEffect(() => {
     if (open && !openedRef.current) {
       openedRef.current = true;
@@ -73,7 +82,7 @@ export function DocSheet({
     }
     if (!open) openedRef.current = false;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, fetchedFor]);
 
   // Not a /docs/ URL we can render inline — nothing to show; callers with a
   // visible trigger (DocReference) degrade to a plain link before reaching us.

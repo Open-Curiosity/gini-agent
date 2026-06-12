@@ -155,14 +155,23 @@ export function parseCloudflareConfig(body: string | null): NamedCloudflareTunne
   if (!body) return null;
   const id = unquoteYamlScalar(/^tunnel:\s*(\S+)\s*$/m.exec(body)?.[1]);
   const credentialsFile = unquoteYamlScalar(/^credentials-file:\s*(.+?)\s*$/m.exec(body)?.[1]);
-  const hostname = unquoteYamlScalar(/^\s*-\s*hostname:\s*(\S+)\s*$/m.exec(body)?.[1]);
   // Shape checks AFTER unquoting: the id rides into cloudflared's argv and
   // the hostname into the published https URL + origin trust, so anything
   // that still carries quote/space residue must reject to the quick-tunnel
   // fallback rather than connect with a URL that can never serve.
   if (!id || !/^[A-Za-z0-9-]+$/.test(id)) return null;
-  if (!hostname || !/^[A-Za-z0-9*.-]+$/.test(hostname)) return null;
-  return { id, credentialsFile, hostname };
+  // The ingress list may lead with a wildcard rule (`- hostname:
+  // "*.example.com"` is Cloudflare's canonical wildcard setup), which can
+  // never serve as a published URL — its literal host would go into origin
+  // trust and match no real visitor. Pick the FIRST CONCRETE hostname; only
+  // a config with no concrete hostname falls back to a quick tunnel.
+  for (const match of body.matchAll(/^\s*-\s*hostname:\s*(\S+)\s*$/gm)) {
+    const hostname = unquoteYamlScalar(match[1]);
+    if (hostname && /^[A-Za-z0-9.-]+$/.test(hostname)) {
+      return { id, credentialsFile, hostname };
+    }
+  }
+  return null;
 }
 
 export interface RunResult {
@@ -955,7 +964,11 @@ export function getTunnel(config: RuntimeConfig): TunnelState {
 export async function selectProvider(config: RuntimeConfig, provider: string): Promise<TunnelState> {
   // A selection change supersedes any connect still in its prep awaits (see
   // cancel) - the user moved on; the older attempt must not resume and claim.
-  bumpConnectAttempt(config.instance);
+  // The stamp is re-checked after this function's OWN awaits too: a newer
+  // user action during the re-probe/teardown windows must win over this
+  // earlier-started selection.
+  const attempt = bumpConnectAttempt(config.instance);
+  const superseded = (): boolean => connectAttempts.get(config.instance) !== attempt;
   let entry = findProvider(provider);
   if (!entry) throw new Error(`Unknown tunnel provider: ${provider}`);
   if (!entry.enabled && isManualProviderId(entry.id)) {
@@ -970,6 +983,11 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
   if (!entry.enabled) {
     throw providerUnavailableError(entry.name, entry.requires);
   }
+  // A newer action landed while the re-probe was parked. Bail BEFORE the
+  // teardown below: resuming would capture the winner's supervisor as
+  // `torndown`, kill it, and pass the write guard — clobbering a live claim
+  // with this older selection.
+  if (superseded()) return getTunnel(config);
   // Re-selecting the provider you're already connected to (or connecting with)
   // is a no-op: don't tear a live tunnel down just because the user re-clicked
   // its row in the edit panel. Only an actual provider change drops to idle.
@@ -1013,6 +1031,12 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
     // this earlier-started selection write.
     const live = supervisors.get(config.instance);
     if (live && live !== torndown) return toState(state.tunnel ?? null);
+    // Supervisor-less newer actions (another select, a cancel/disconnect)
+    // leave no entry for the guard above to compare — the stamp is the only
+    // witness that the user moved on. Both guards stay: the boot-reconcile
+    // resume claims a supervisor WITHOUT bumping the stamp, so neither
+    // subsumes the other.
+    if (superseded()) return toState(state.tunnel ?? null);
     applyTunnel(state, {
       ...(state.tunnel ?? {}),
       selectedProvider: entry.id,

@@ -70,6 +70,47 @@ describe("DocSheet", () => {
     expect(fetchCalls.length).toBe(2);
   });
 
+  test("swapping the url in place drops the cached doc and fetches the new one", async () => {
+    // Callers may swap `url` without a key remount (AddConnectorDialog
+    // switches provider templates on one DocReference) — the sheet must
+    // never serve the previous url's doc under the new link.
+    fetchImpl = () =>
+      new Response(JSON.stringify({ path: "search/brave", title: "Brave", markdown: "Brave doc body" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    const { rerender } = render(
+      <DocSheet url="https://gini.lilaclabs.ai/docs/search/brave" open onOpenChange={() => {}} />
+    );
+    await waitFor(() => expect(screen.queryByText("Brave doc body")).not.toBeNull());
+    fetchImpl = () =>
+      new Response(JSON.stringify({ path: "search/exa", title: "Exa", markdown: "Exa doc body" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    // Swap while OPEN: the cached Brave doc drops and Exa fetches immediately.
+    rerender(<DocSheet url="https://gini.lilaclabs.ai/docs/search/exa" open onOpenChange={() => {}} />);
+    await waitFor(() => expect(screen.queryByText("Exa doc body")).not.toBeNull());
+    expect(screen.queryByText("Brave doc body")).toBeNull();
+    expect(fetchCalls).toEqual(["/api/runtime/docs/search/brave", "/api/runtime/docs/search/exa"]);
+    // Swap while CLOSED: no eager fetch; the next open edge fetches.
+    rerender(<DocSheet url="https://gini.lilaclabs.ai/docs/search/exa" open={false} onOpenChange={() => {}} />);
+    rerender(<DocSheet url="https://gini.lilaclabs.ai/docs/search/brave" open={false} onOpenChange={() => {}} />);
+    expect(fetchCalls.length).toBe(2);
+    fetchImpl = () =>
+      new Response(JSON.stringify({ path: "search/brave", title: "Brave", markdown: "Brave doc body" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    rerender(<DocSheet url="https://gini.lilaclabs.ai/docs/search/brave" open onOpenChange={() => {}} />);
+    await waitFor(() => expect(screen.queryByText("Brave doc body")).not.toBeNull());
+    expect(fetchCalls).toEqual([
+      "/api/runtime/docs/search/brave",
+      "/api/runtime/docs/search/exa",
+      "/api/runtime/docs/search/brave"
+    ]);
+  });
+
   test("closing via the sheet reports through onOpenChange", async () => {
     const user = userEvent.setup();
     let openState = true;

@@ -18,7 +18,7 @@ const PROVIDERS: TunnelProvider[] = [
   { id: "gini-relay", name: "Gini Relay", enabled: true },
   { id: "tailscale", name: "Tailscale", enabled: false, requires: "Tailscale network" },
   { id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account" },
-  { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "Cloudflare account" }
+  { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "cloudflared CLI" }
 ];
 
 function makeState(over: Partial<TunnelState> = {}): TunnelState {
@@ -75,7 +75,7 @@ describe("TunnelSelectionPanel", () => {
     renderPanel();
     expect(screen.queryByText(/Requires Tailscale network/)).not.toBeNull();
     expect(screen.queryByText(/Requires ngrok account/)).not.toBeNull();
-    expect(screen.queryByText(/Requires Cloudflare account/)).not.toBeNull();
+    expect(screen.queryByText(/Requires cloudflared CLI/)).not.toBeNull();
     const disabled = row("Tailscale");
     expect(disabled.getAttribute("aria-disabled")).toBe("true");
     expect(disabled.getAttribute("tabindex")).toBe("-1");

@@ -1549,6 +1549,25 @@ describe("manual tunnel drivers", () => {
     expect(isRuntimeTunnelHost("pub.ngrok-free.app")).toBe(false);
   });
 
+  test("a stale selection parked in its re-probe never reverts a newer selection", async () => {
+    // select(tailscale) parks in the forced availability re-probe (the cache
+    // starts disabled); select(gini-relay) completes meanwhile. The parked
+    // select resumes with no supervisor for the write guard to compare — the
+    // attempt stamp must make it bail instead of writing the OLDER provider
+    // over the user's last action.
+    const detectGate = Promise.withResolvers<{ enabled: boolean }>();
+    const tailscale = scriptedDriver({ detect: () => detectGate.promise });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    const stale = selectProvider(config, "tailscale"); // parks in refreshProviderDetection
+    for (let i = 0; tailscale.detects < 1 && i < 1000; i += 1) await Bun.sleep(1);
+    const newer = await selectProvider(config, "gini-relay");
+    expect(newer.selectedProvider).toBe("gini-relay");
+    detectGate.resolve({ enabled: true }); // the CLI IS available — staleness, not rejection, must stop the write
+    const resumed = await stale;
+    expect(resumed.selectedProvider).toBe("gini-relay");
+    expect(getTunnel(config).selectedProvider).toBe("gini-relay");
+  });
+
   test("disconnect swallows a live child's stop rejection during teardown", async () => {
     const exited = Promise.withResolvers<number>();
     const child: TunnelChild = {
@@ -2458,8 +2477,19 @@ describe("makeDefaultDrivers", () => {
     // (quick-tunnel fallback), never connect with a garbage URL.
     expect(parseCloudflareConfig('tunnel: "abc-123\'\ningress:\n  - hostname: a.example\n    service: x')).toBeNull();
     expect(parseCloudflareConfig("tunnel: abc-123\ningress:\n  - hostname: \"a.example'\n    service: x")).toBeNull();
-    // A wildcard ingress hostname stays valid.
-    expect(parseCloudflareConfig("tunnel: abc-123\ningress:\n  - hostname: '*.example.com'\n    service: x")?.hostname).toBe("*.example.com");
+  });
+
+  test("parseCloudflareConfig skips wildcard ingress hostnames for the first concrete one", () => {
+    // `- hostname: "*.example.com"` is Cloudflare's canonical wildcard setup;
+    // its literal host can never serve as a published URL (origin trust would
+    // match no real visitor). A later concrete hostname must win…
+    expect(
+      parseCloudflareConfig(
+        "tunnel: abc-123\ningress:\n  - hostname: '*.example.com'\n    service: x\n  - hostname: gini.example.com\n    service: x"
+      )?.hostname
+    ).toBe("gini.example.com");
+    // …and a config with ONLY wildcard hostnames falls back to a quick tunnel.
+    expect(parseCloudflareConfig("tunnel: abc-123\ningress:\n  - hostname: '*.example.com'\n    service: x")).toBeNull();
   });
 
   test("cloudflared: a config without credentials-file defaults to ~/.cloudflared/<id>.json", async () => {
