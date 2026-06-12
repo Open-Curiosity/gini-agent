@@ -10,6 +10,7 @@ metadata:
     platforms: [macos, linux]
     requires:
       credentials: [BLAND_API_KEY]
+      approval: [place-call]
 ---
 
 # Phone Call
@@ -26,7 +27,7 @@ The runtime injects `BLAND_API_KEY` into the scripts — you never see or pass t
 ## Workflow
 
 1. **Gather the full task.** Before anything else, collect: who to call (name + number), the goal, hard constraints (dates, times, party size, budget), fallbacks if the first ask isn't available, and the name to give if the callee asks who's calling. A vague task produces a bad call.
-2. **Confirm with the user before dialing — exactly once.** State the exact number and what the agent will say/ask, and get an explicit go-ahead. Calls are outward-facing and irreversible. Once the user approves this number and task, place the call immediately without re-confirming, even if intermediate steps happened in between (connector setup, clarifications). Only re-confirm if the number or the task changed since the approval.
+2. **Announce, then dial — the approval card is the confirmation.** In one short message, state who you're calling (the exact number) and what the agent will say or ask, then call `place-call` immediately. Do not ask "should I go ahead?" in chat: `place-call` always pauses on an Approve/Deny card, and approving that card is the user's go-ahead. If the user denies the card, do not re-submit the same call — ask what to change instead.
 3. **Place the call** with `place-call`. It returns `{ ok, callId }`.
 4. **Wait for the result** with `check-call`, passing `waitSeconds: 240` — the script polls Bland every 10 seconds internally and returns as soon as the call completes (or when the budget runs out). If the result comes back with `completed: false`, call `check-call` again with the same args and repeat until `completed` is `true`.
 5. **Report back** the `summary` and the key points of the `transcript` (quote relevant exchanges, don't dump the whole thing unless asked). Optional: for structured answers about the call (did they confirm? what time?), run `analyze-call`.
@@ -133,7 +134,7 @@ Use `firstSentence` when the opening line matters (e.g. "Hi, I'm calling on beha
 
 ## Rules
 
-1. **Always confirm the number and task with the user before placing a call — and treat one explicit go-ahead as final.** Calls reach real people and cannot be un-placed; never ask the user to confirm the same unchanged call twice.
+1. **Never ask for confirmation in chat — the Approve/Deny card on `place-call` is the confirmation.** State the number and task in your message, call `place-call`, and let the user decide on the card. Calls reach real people and cannot be un-placed. After a denial, ask what to change; never re-submit the same unchanged call.
 2. **Never call emergency numbers** (911, 112, 999, etc.) under any circumstances.
 3. Phone numbers must be E.164 format: `+15551234567`.
 4. Don't store third-party phone numbers in memory — only the user's own.
