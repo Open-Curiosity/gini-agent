@@ -370,12 +370,15 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // Serve the sha-keyed production bundle when one exists for the CURRENT
   // checkout (web/.next-prod-<sha12> with a BUILD_ID, <sha12> = `git
   // rev-parse --short=12 HEAD`); fall back to `next dev` otherwise. Only the
-  // update/install flows create these dirs, and the sha key makes a stale
-  // build impossible to serve — a bundle built for any other commit doesn't
-  // match the current HEAD, so a fresh clone, a worktree, or a checkout that
-  // moved past its last build all land on dev mode, which compiles on demand
-  // and always reflects the current source. The launchd web shim
-  // (src/cli/autostart.ts buildWebShim) applies the same rule in sh.
+  // update/install flows create these dirs, and the sha key pins a bundle to
+  // the commit it was built from — a fresh clone, a worktree, or a checkout
+  // that moved past its last build all miss the key and land on dev mode,
+  // which compiles on demand and always reflects the current source. The key
+  // sees HEAD, not the working tree: the installed runtime is `reset --hard`
+  // clean so its bundle always matches the source, but a repo checkout with
+  // uncommitted edits and a hand-built bundle for its HEAD serves that
+  // bundle anyway. The launchd web shim (src/cli/autostart.ts buildWebShim)
+  // applies the same rule in sh.
   // Bind the inner Next server to loopback (-H 127.0.0.1). Next defaults to
   // 0.0.0.0 (all interfaces) in BOTH modes, which would make the web port
   // LAN-reachable; the BFF trusts a loopback `Host` for its owner-bearer

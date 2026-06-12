@@ -77,6 +77,25 @@ quiet() {
   fi
 }
 
+# Like quiet, but a failure warns and continues instead of aborting the
+# install. For optional steps that have a working fallback.
+quiet_optional() {
+  local label="$1"
+  shift
+  local logfile
+  logfile="$(mktemp)"
+  if "$@" >"$logfile" 2>&1; then
+    step "$label"
+  else
+    local rc=$?
+    err "$label failed (exit $rc) — continuing"
+    printf '%s\n' "$C_DIM----- output -----$C_RESET" >&2
+    cat "$logfile" >&2
+    printf '%s\n' "$C_DIM------------------$C_RESET" >&2
+  fi
+  rm -f "$logfile"
+}
+
 verify_local_repo() {
   if [ ! -e "$LOCAL_REPO/.git" ] || [ ! -f "$LOCAL_REPO/package.json" ]; then
     err "$LOCAL_REPO does not look like a gini-agent checkout."
@@ -195,10 +214,12 @@ install_deps() {
     # web/.next-prod-<sha12> iff <sha12> matches `git rev-parse --short=12
     # HEAD` and the dir carries a BUILD_ID; the runtime's update flow
     # (src/runtime/update.ts) rebuilds + GCs these on every update. See ADR
-    # web-production-serving.md.
+    # web-production-serving.md. A build failure is tolerated: the serving
+    # paths fall back to `next dev` when no bundle matches, so the install
+    # continues with a working (dev-mode) web UI rather than aborting.
     local web_sha
     web_sha="$(git -C "$RUNTIME_DIR" rev-parse --short=12 HEAD)"
-    quiet "Web app built" bash -c "cd '$RUNTIME_DIR/web' && GINI_DIST_DIR='.next-prod-$web_sha' bun run build"
+    quiet_optional "Web app built" bash -c "cd '$RUNTIME_DIR/web' && GINI_DIST_DIR='.next-prod-$web_sha' bun run build"
   fi
 }
 

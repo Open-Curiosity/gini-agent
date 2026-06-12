@@ -560,9 +560,9 @@ describe("UpdateGate", () => {
     jest.useFakeTimers();
     // A POST that never settles, with status forever on the old sha. The
     // deadline is injected short so the release lands inside one sub-poll tick.
-    // Advancing the 120s production default in one synchronous step instead
-    // would fire each 1.5s poll interval 80 times (120000 / 1500) across the
-    // status and healthz queries — 160 refetch cycles — which wedges the worker
+    // Advancing the 240s production default in one synchronous step instead
+    // would fire each 1.5s poll interval 160 times (240000 / 1500) across the
+    // status and healthz queries — 320 refetch cycles — which wedges the worker
     // under `bun test --isolate`.
     updateResponse = () => new Promise<Response>(() => {});
     renderGate({ stallTimeoutMs: 1_000 });
@@ -603,7 +603,7 @@ describe("UpdateGate", () => {
     // would be cleared every 1.5s and never fire. The deadline is fixed when
     // the gate leaves idle, so once it passes the gate must release — no
     // reload, back to idle, persisted gate cleared. The deadline is injected
-    // short so this runs in a few laps: at the 120s default it would take 80
+    // short so this runs in a few laps: at the 240s default it would take 160
     // laps, and each lap's 1.5s advance fires the poll intervals, which wedges
     // the worker under `bun test --isolate`.
     healthzFailing = true;
