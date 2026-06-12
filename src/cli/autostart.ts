@@ -569,9 +569,11 @@ function buildWebShim(instance: Instance, bunPath: string): string {
     // The update/install flows build web/.next-prod-<sha12> (<sha12> =
     // `git rev-parse --short=12 HEAD`); we serve `next start` from it iff
     // it matches the CURRENT checkout and carries a BUILD_ID (next build's
-    // completion marker). Keying by sha makes a stale build impossible to
-    // serve — any non-matching checkout (worktree, fresh clone, moved HEAD)
-    // falls back to `next dev`, which always compiles the current source.
+    // completion marker). The sha key pins a bundle to its commit — any
+    // non-matching checkout (worktree, fresh clone, moved HEAD) falls back
+    // to `next dev`, which always compiles the current source. The key sees
+    // HEAD, not the working tree; the installed runtime is `reset --hard`
+    // clean, so only there is the bundle guaranteed in sync with the source.
     // Mirrors webLaunchPlan in src/cli/process.ts; both paths must agree.
     //
     // SECURITY: `-H 127.0.0.1` is mandatory on BOTH branches — `next

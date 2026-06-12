@@ -15,8 +15,11 @@ const MAX_INSTALL_FAILURE_OUTPUT = 4000;
 // launchd web shim in src/cli/autostart.ts and startWeb in
 // src/cli/process.ts) serves `next start` from that dir iff it exists with a
 // BUILD_ID for the CURRENT checkout, falling back to `next dev` otherwise.
-// Keying by sha makes a stale build impossible to serve: a bundle built for
-// any other commit simply doesn't match. See ADR web-production-serving.md.
+// The sha key pins a bundle to the commit it was built from — note it sees
+// HEAD, not the working tree, so only the installed runtime (kept clean by
+// `git reset --hard`) is stale-proof by construction; a repo checkout with
+// uncommitted edits and a hand-built bundle for its HEAD serves that bundle
+// anyway. See ADR web-production-serving.md.
 export const WEB_PROD_DIST_PREFIX = ".next-prod-";
 
 export interface GiniVersionInfo {
@@ -406,7 +409,12 @@ export async function buildWebProdBundle(
     }
   }
   for (const entry of readdirSync(webDir)) {
-    if (!entry.startsWith(WEB_PROD_DIST_PREFIX) || entry === distDir) continue;
+    // GC only dirs shaped like OUR sha-keyed bundles (<prefix> + a hex sha
+    // of >=12 chars, matching `git rev-parse --short=12`, which lengthens
+    // on ambiguity). A bare prefix match would also delete the `next dev`
+    // dist dir of an instance literally named e.g. `prod-foo`
+    // (`.next-prod-foo`).
+    if (entry === distDir || !PROD_DIST_GC_PATTERN.test(entry)) continue;
     try {
       rmSync(join(webDir, entry), { recursive: true, force: true });
     } catch {
@@ -416,6 +424,10 @@ export async function buildWebProdBundle(
   }
   return { distDir, built: !alreadyBuilt };
 }
+
+// Shape of a GC-able sha-keyed bundle dir name. Must agree with
+// WEB_PROD_DIST_PREFIX; the trailing hex run is the short sha.
+const PROD_DIST_GC_PATTERN = /^\.next-prod-[0-9a-f]{12,}$/;
 
 async function runBunInstall(cwd: string, label: string, stdio: "inherit" | "pipe", runStepImpl: RunStepImpl): Promise<void> {
   const result = await runStepImpl("bun", ["install"], { cwd, stdio });

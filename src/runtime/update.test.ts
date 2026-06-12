@@ -133,23 +133,27 @@ describe("web production bundle", () => {
   test("GCs other prod dist dirs on success, leaving the current bundle and dev dirs alone", async () => {
     const runtimeDir = makeRuntimeDir();
     markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}${SHA}`);
-    markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}0ldsha0000000`);
+    markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}0dd5a00000000`);
     // A dev dist dir must never be GC'd — it belongs to `next dev` fallback.
     mkdirSync(join(runtimeDir, "web", ".next-default"), { recursive: true });
+    // Nor may the dev dist dir of an instance whose NAME starts with
+    // "prod-": only sha-shaped (>=12 hex chars) suffixes are GC-able.
+    mkdirSync(join(runtimeDir, "web", ".next-prod-foo"), { recursive: true });
     const { runStepImpl } = makeBuildRecorder();
     await buildWebProdBundle(runtimeDir, SHA, "pipe", { runStepImpl });
     expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}${SHA}`))).toBe(true);
-    expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}0ldsha0000000`))).toBe(false);
+    expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}0dd5a00000000`))).toBe(false);
     expect(existsSync(join(runtimeDir, "web", ".next-default"))).toBe(true);
+    expect(existsSync(join(runtimeDir, "web", ".next-prod-foo"))).toBe(true);
   });
 
   test("a failed build throws (so updateRuntime aborts before scheduling a restart) and GCs nothing", async () => {
     const runtimeDir = makeRuntimeDir();
-    markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}0ldsha0000000`);
+    markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}0dd5a00000000`);
     const { runStepImpl } = makeBuildRecorder(1);
     await expect(buildWebProdBundle(runtimeDir, SHA, "pipe", { runStepImpl })).rejects.toThrow(/bun run build in web\/ failed/);
     // The old (still-servable-by-the-old-process) bundle survives a failure.
-    expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}0ldsha0000000`))).toBe(true);
+    expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}0dd5a00000000`))).toBe(true);
   });
 
   // resolveWebProdDistDir reads the real `git rev-parse --short=12 HEAD`, so
@@ -182,7 +186,7 @@ describe("web production bundle", () => {
   test("resolveWebProdDistDir returns null when only a STALE-sha bundle exists or outside a git repo", () => {
     const repo = scratch("resolve-stale");
     initRepoWithCommit(repo);
-    markBuilt(repo, `${WEB_PROD_DIST_PREFIX}0ldsha0000000`);
+    markBuilt(repo, `${WEB_PROD_DIST_PREFIX}0dd5a00000000`);
     expect(resolveWebProdDistDir(repo)).toBeNull();
     // No .git at all (fresh tarball-style dir) -> dev fallback.
     const plain = scratch("resolve-plain");

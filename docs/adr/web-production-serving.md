@@ -69,7 +69,12 @@ auto-update (2026-06-12) and produced ~30s of user-visible web outage:
 Sha-keying the build dir defuses the staleness hazard that justified
 dev-always: a bundle is only ever served when its dir name matches the
 *current* HEAD's short sha, so a checkout that moved (update, git pull,
-worktree switch) simply misses the key and falls back to dev. Developer
+worktree switch) simply misses the key and falls back to dev. The
+guarantee is scoped to the installed runtime: the sha key sees HEAD, not
+the working tree, and only `~/.gini/runtime` (kept clean by the update's
+`git reset --hard`) is in-sync with its HEAD by construction. A repo
+checkout with uncommitted edits and a hand-built prod dir for its HEAD
+serves that bundle even though the tree has drifted — but developer
 workflows never build prod dirs, so `gini run` from a worktree behaves
 exactly as before.
 
@@ -106,6 +111,14 @@ instead.
   start` is read-only on the dist dir, unlike `next dev`'s exclusive
   `<distDir>/lock` (which is why the dev fallback keeps the per-instance
   dirs).
+- Known limitation for multi-instance installs sharing the installed
+  runtime: an update triggered from one instance GCs every prior
+  `.next-prod-*` bundle and restarts only the triggering instance. Other
+  instances keep their already-running servers (which hold the deleted
+  bundle's assets in memory / open file handles and may 500 on
+  not-yet-loaded routes) until they are restarted themselves, at which
+  point they pick up the new bundle. Single-instance installs — the
+  installer default — never hit this.
 - The launchd web plist's `GINI_DIST_DIR` env stays the dev-fallback value;
   the shim exports the prod dir over it only on the prod branch. The shim
   change re-stamps existing installs automatically — the plist stamp hashes
@@ -122,7 +135,9 @@ instead.
   `-H 127.0.0.1` and `GINI_DIST_DIR=.next-prod-<sha12>` iff that dir
   matches the current HEAD and carries a `BUILD_ID`; otherwise they exec
   the unchanged `next dev` command.
-- `scripts/install.sh` builds the prod bundle after "Web app installed".
+- `scripts/install.sh` builds the prod bundle after "Web app installed"; a
+  build failure warns and continues (the install completes with the dev
+  fallback) instead of aborting.
 - A checkout with no prod dir (fresh clone, worktree) starts the dev
   server exactly as before.
 - `bun run typecheck`, `bun run test`, and `bun run gini smoke` pass.
