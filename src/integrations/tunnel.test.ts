@@ -20,17 +20,25 @@ import {
   connectTunnel,
   defaultLogout,
   defaultOpenBrowser,
+  defaultRunCommand,
+  defaultTunnelProcSpawn,
   disconnectTunnel,
   getTunnel,
   makeDefaultDeps,
+  makeDefaultDrivers,
   reconcileTunnelOnStartup,
+  refreshProviderDetection,
   selectProvider,
   setTunnelDeps,
+  spawnUrlChild,
   stopAllTunnels,
+  type ManualDriver,
+  type SpawnedTunnelProc,
   type TunnelChild,
   type TunnelDeps
 } from "./tunnel";
 import { mutateState, readState } from "../state";
+import { isRuntimeTunnelHost } from "../lib/origin-trust";
 import type { RuntimeConfig, TunnelProviderId } from "../types";
 import type { LoginHandle, RelayDefaults, Session, Store, TunnelOptions } from "gini-relay";
 
@@ -185,6 +193,23 @@ function deps(over: Partial<TunnelDeps> = {}): Partial<TunnelDeps> {
   return { ...depsNoPort(), resolveLocalPort: () => 4321, ...over };
 }
 
+// Inert manual drivers: detection reports the default-disabled availability
+// and connect/disconnect must never run. Every deps set includes these so no
+// test can fall through to the REAL drivers and shell out to a host-installed
+// tailscale/ngrok/cloudflared (whose presence would also flip catalog rows).
+function fakeDrivers(over: Partial<TunnelDeps["drivers"]> = {}): TunnelDeps["drivers"] {
+  const inert = (requires: string): ManualDriver => ({
+    detect: () => Promise.resolve({ enabled: false, requires }),
+    connect: () => Promise.reject(new Error("manual driver connect must not run in this test"))
+  });
+  return {
+    tailscale: inert("Tailscale network"),
+    ngrok: inert("ngrok account"),
+    cloudflare: inert("cloudflared CLI"),
+    ...over
+  };
+}
+
 // The same seams MINUS resolveLocalPort, so the module's default
 // (env override -> gateway port config.port) runs.
 function depsNoPort(over: Partial<TunnelDeps> = {}): Partial<TunnelDeps> {
@@ -199,6 +224,7 @@ function depsNoPort(over: Partial<TunnelDeps> = {}): Partial<TunnelDeps> {
     },
     probeLocalPort: () => Promise.resolve(true),
     logout: () => Promise.resolve(),
+    drivers: fakeDrivers(),
     ...over
   };
 }
@@ -249,7 +275,7 @@ describe("tunnel integration", () => {
     expect(byId["gini-relay"]).toEqual({ id: "gini-relay", name: "Gini Relay", enabled: true });
     expect(byId.tailscale).toEqual({ id: "tailscale", name: "Tailscale", enabled: false, requires: "Tailscale network" });
     expect(byId.ngrok).toEqual({ id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account" });
-    expect(byId.cloudflare).toEqual({ id: "cloudflare", name: "Cloudflare", enabled: false, requires: "Cloudflare account" });
+    expect(byId.cloudflare).toEqual({ id: "cloudflare", name: "Cloudflare", enabled: false, requires: "cloudflared CLI" });
   });
 
   // select saves the choice without connecting; status stays idle.
@@ -1151,5 +1177,558 @@ describe("tunnel integration", () => {
     logoutGate.resolve();
     await disconnecting;
     expect(getTunnel(config).status).toBe("connected");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manual drivers: detection-driven catalog, the manual connect/disconnect/
+// resume flows, and the runtime-tunnel origin trust they publish.
+// ---------------------------------------------------------------------------
+
+// A manual driver whose detect/connect are scriptable and counted.
+function scriptedDriver(over: Partial<ManualDriver> & { requires?: string } = {}): ManualDriver & {
+  detects: number;
+  connects: number;
+  disconnects: number;
+} {
+  const driver = {
+    detects: 0,
+    connects: 0,
+    disconnects: 0,
+    detect() {
+      driver.detects += 1;
+      return over.detect ? over.detect() : Promise.resolve({ enabled: true });
+    },
+    connect(port: number) {
+      driver.connects += 1;
+      return over.connect ? over.connect(port) : Promise.resolve({ url: "https://machine.tail-test.ts.net" });
+    },
+    disconnect() {
+      driver.disconnects += 1;
+      return over.disconnect ? over.disconnect() : Promise.resolve();
+    }
+  };
+  return driver;
+}
+
+describe("manual tunnel drivers", () => {
+  let config: RuntimeConfig;
+
+  // Seed a persisted "connected" record as if the runtime had this provider up
+  // before a restart (mirrors the relay reconcile tests' helper, which is
+  // scoped to their describe).
+  async function seedManualConnected(c: RuntimeConfig, provider: TunnelProviderId): Promise<void> {
+    await mutateState(c.instance, (s) => {
+      s.tunnel = {
+        instance: c.instance,
+        selectedProvider: provider,
+        status: "connected",
+        url: "https://stale.tail-test.ts.net",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      };
+    });
+  }
+
+  beforeEach(() => {
+    config = testConfig(`m-${Math.random().toString(36).slice(2)}`);
+    setTunnelDeps(deps());
+  });
+
+  afterEach(() => {
+    setTunnelDeps();
+    rmSync(`${ROOT}/instances/${config.instance}`, { recursive: true, force: true });
+  });
+
+  test("refreshProviderDetection flips detected rows enabled and drops their requires", async () => {
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale: scriptedDriver() }) }));
+    await refreshProviderDetection();
+    const byId = Object.fromEntries(getTunnel(config).providers.map((p) => [p.id, p]));
+    expect(byId.tailscale).toEqual({ id: "tailscale", name: "Tailscale", enabled: true });
+    expect(byId.ngrok).toEqual({ id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account" });
+  });
+
+  test("a throwing detect keeps the default-disabled entry", async () => {
+    setTunnelDeps(deps({
+      drivers: fakeDrivers({
+        cloudflare: scriptedDriver({ detect: () => Promise.reject(new Error("spawn ENOENT")) })
+      })
+    }));
+    await refreshProviderDetection();
+    const byId = Object.fromEntries(getTunnel(config).providers.map((p) => [p.id, p]));
+    expect(byId.cloudflare).toEqual({ id: "cloudflare", name: "Cloudflare", enabled: false, requires: "cloudflared CLI" });
+  });
+
+  test("detection results inside the TTL are reused; concurrent callers share one probe", async () => {
+    const tailscale = scriptedDriver();
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await Promise.all([refreshProviderDetection(), refreshProviderDetection()]);
+    expect(tailscale.detects).toBe(1);
+    await refreshProviderDetection(); // within TTL — no new probe
+    expect(tailscale.detects).toBe(1);
+  });
+
+  test("selecting a manual provider re-probes a stale disabled cache and then succeeds", async () => {
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale: scriptedDriver() }) }));
+    // No prior refresh: the cache still says disabled; select must re-detect.
+    const state = await selectProvider(config, "tailscale");
+    expect(state.selectedProvider).toBe("tailscale");
+    expect(state.status).toBe("idle");
+  });
+
+  test("manual connect (childless driver) flips to connected and publishes origin trust", async () => {
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale: scriptedDriver() }) }));
+    const connecting = await connectTunnel(config, "tailscale");
+    expect(connecting.status).toBe("connecting");
+    await awaitTunnelSettled(config.instance);
+    const state = getTunnel(config);
+    expect(state.status).toBe("connected");
+    expect(state.url).toBe("https://machine.tail-test.ts.net");
+    expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(true);
+
+    // Disconnect clears the record AND revokes the trusted front, and runs the
+    // driver's provider-side teardown instead of the relay logout.
+    let loggedOut = 0;
+    const tailscale = scriptedDriver();
+    setTunnelDeps(deps({
+      logout: () => {
+        loggedOut += 1;
+        return Promise.resolve();
+      },
+      drivers: fakeDrivers({ tailscale })
+    }));
+    const after = await disconnectTunnel(config);
+    expect(after.status).toBe("idle");
+    expect(after.selectedProvider).toBe("tailscale");
+    expect(tailscale.disconnects).toBe(1);
+    expect(loggedOut).toBe(0);
+    expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(false);
+  });
+
+  test("manual connect with a child supervises it: a crash flips connected -> error", async () => {
+    const child = crashableChild();
+    setTunnelDeps(deps({
+      drivers: fakeDrivers({
+        ngrok: scriptedDriver({ connect: () => Promise.resolve({ url: "https://abc.ngrok-free.app", child }) })
+      })
+    }));
+    await connectTunnel(config, "ngrok");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).url).toBe("https://abc.ngrok-free.app");
+    expect(isRuntimeTunnelHost("abc.ngrok-free.app")).toBe(true);
+
+    child.crash(7);
+    await waitForStatus(config, "error");
+    expect(getTunnel(config).message).toBe("Tunnel process exited (code 7).");
+    expect(isRuntimeTunnelHost("abc.ngrok-free.app")).toBe(false);
+  });
+
+  test("a failing manual driver folds its message into the error record", async () => {
+    setTunnelDeps(deps({
+      drivers: fakeDrivers({
+        cloudflare: scriptedDriver({ connect: () => Promise.reject(new Error("cloudflared exited (code 1) before reporting a public URL")) })
+      })
+    }));
+    await connectTunnel(config, "cloudflare");
+    await awaitTunnelSettled(config.instance);
+    const state = getTunnel(config);
+    expect(state.status).toBe("error");
+    expect(state.message).toContain("cloudflared exited");
+  });
+
+  test("manual connect refuses when the web UI is not reachable", async () => {
+    setTunnelDeps(deps({
+      probeLocalPort: () => Promise.resolve(false),
+      drivers: fakeDrivers({ tailscale: scriptedDriver() })
+    }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("error");
+    expect(getTunnel(config).message).toContain("isn't responding on port");
+  });
+
+  test("a superseded childless manual connect tears down its provider config instead of publishing", async () => {
+    const gate = Promise.withResolvers<void>();
+    // The teardown call's failure must be swallowed (best-effort) — reject it
+    // so the swallow path actually runs.
+    const tailscale = scriptedDriver({
+      connect: () => gate.promise.then(() => ({ url: "https://machine.tail-test.ts.net" })),
+      disconnect: () => Promise.reject(new Error("serve off failed"))
+    });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await connectTunnel(config, "tailscale");
+    // Capture the in-flight background connect BEFORE cancel tears the
+    // supervisor entry down (afterwards awaitTunnelSettled has nothing to wait
+    // on and would race the abort path).
+    const settled = awaitTunnelSettled(config.instance);
+    // Cancel while the driver is mid-connect; then release the driver.
+    await cancelTunnel(config);
+    gate.resolve();
+    await settled;
+    expect(getTunnel(config).status).toBe("idle");
+    expect(tailscale.disconnects).toBe(1);
+    expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(false);
+  });
+
+  test("a teardown during the web-ready probe aborts before the driver ever connects", async () => {
+    const probeGate = Promise.withResolvers<boolean>();
+    const tailscale = scriptedDriver();
+    setTunnelDeps(deps({
+      probeLocalPort: () => probeGate.promise,
+      drivers: fakeDrivers({ tailscale })
+    }));
+    await connectTunnel(config, "tailscale");
+    const settled = awaitTunnelSettled(config.instance);
+    await cancelTunnel(config);
+    probeGate.resolve(true);
+    await settled;
+    expect(getTunnel(config).status).toBe("idle");
+    expect(tailscale.connects).toBe(0);
+  });
+
+  test("a driver failure after a teardown logs an abort instead of clobbering the idle record", async () => {
+    const gate = Promise.withResolvers<never>();
+    setTunnelDeps(deps({
+      drivers: fakeDrivers({ ngrok: scriptedDriver({ connect: () => gate.promise }) })
+    }));
+    await connectTunnel(config, "ngrok");
+    const settled = awaitTunnelSettled(config.instance);
+    await cancelTunnel(config);
+    gate.reject(new Error("agent died"));
+    await settled;
+    // The superseded run must not write an error over cancel's idle record.
+    expect(getTunnel(config).status).toBe("idle");
+    expect(getTunnel(config).message).toBeUndefined();
+  });
+
+  test("a superseded child-backed manual connect stops the child it spawned (a stop failure is swallowed)", async () => {
+    const gate = Promise.withResolvers<void>();
+    const child = fakeChild();
+    let stops = 0;
+    // stop() rejecting must not surface — the abort path is best-effort.
+    const rejectingChild: TunnelChild = {
+      start: () => child.start(),
+      stop: () => {
+        stops += 1;
+        void child.stop();
+        return Promise.reject(new Error("kill failed"));
+      },
+      exited: child.exited
+    };
+    setTunnelDeps(deps({
+      drivers: fakeDrivers({
+        ngrok: scriptedDriver({ connect: () => gate.promise.then(() => ({ url: "https://abc.ngrok-free.app", child: rejectingChild })) })
+      })
+    }));
+    await connectTunnel(config, "ngrok");
+    const settled = awaitTunnelSettled(config.instance);
+    await cancelTunnel(config);
+    gate.resolve();
+    await settled;
+    expect(getTunnel(config).status).toBe("idle");
+    expect(stops).toBeGreaterThanOrEqual(1);
+  });
+
+  test("reconcile resumes a connected manual tunnel when its driver is still available", async () => {
+    const tailscale = scriptedDriver();
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await seedManualConnected(config, "tailscale");
+    const flipped = await reconcileTunnelOnStartup(config);
+    expect(flipped.status).toBe("connecting");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+    expect(getTunnel(config).url).toBe("https://machine.tail-test.ts.net");
+    expect(tailscale.connects).toBe(1);
+  });
+
+  test("reconcile resets a connected manual tunnel to idle when its prerequisite is gone", async () => {
+    setTunnelDeps(deps()); // all manual drivers detect disabled
+    await seedManualConnected(config, "tailscale");
+    const state = await reconcileTunnelOnStartup(config);
+    expect(state.status).toBe("idle");
+    expect(state.selectedProvider).toBe("tailscale");
+  });
+
+  test("manual resume settles to idle when the web never comes back", async () => {
+    process.env.GINI_TUNNEL_RESUME_WAIT_MS = "0";
+    process.env.GINI_TUNNEL_RESUME_POLL_MS = "1";
+    try {
+      setTunnelDeps(deps({
+        probeLocalPort: () => Promise.resolve(false),
+        drivers: fakeDrivers({ ngrok: scriptedDriver() })
+      }));
+      await seedManualConnected(config, "ngrok");
+      await reconcileTunnelOnStartup(config);
+      await awaitTunnelSettled(config.instance);
+      expect(getTunnel(config).status).toBe("idle");
+      expect(getTunnel(config).selectedProvider).toBe("ngrok");
+    } finally {
+      delete process.env.GINI_TUNNEL_RESUME_WAIT_MS;
+      delete process.env.GINI_TUNNEL_RESUME_POLL_MS;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// spawnUrlChild: the URL-scanning process wrapper the ngrok/cloudflared
+// drivers ride on.
+// ---------------------------------------------------------------------------
+
+// A scriptable SpawnedTunnelProc: push lines into stdout/stderr, resolve exit.
+function fakeProc(): SpawnedTunnelProc & {
+  emitOut: (line: string) => void;
+  emitErr: (line: string) => void;
+  exit: (code: number) => void;
+  killed: boolean;
+} {
+  const out = new TransformStream<Uint8Array, Uint8Array>();
+  const err = new TransformStream<Uint8Array, Uint8Array>();
+  const outWriter = out.writable.getWriter();
+  const errWriter = err.writable.getWriter();
+  const exited = Promise.withResolvers<number>();
+  const encoder = new TextEncoder();
+  const proc = {
+    stdout: out.readable,
+    stderr: err.readable,
+    exited: exited.promise,
+    killed: false,
+    kill() {
+      proc.killed = true;
+      exited.resolve(143);
+    },
+    emitOut(line: string) {
+      void outWriter.write(encoder.encode(`${line}\n`));
+    },
+    emitErr(line: string) {
+      void errWriter.write(encoder.encode(`${line}\n`));
+    },
+    exit(code: number) {
+      exited.resolve(code);
+    }
+  };
+  return proc;
+}
+
+describe("spawnUrlChild", () => {
+  test("resolves the first capture-group match and wraps the live process", async () => {
+    const proc = fakeProc();
+    const pending = spawnUrlChild(() => proc, ["ngrok"], /url=(https:\/\/[^\s"]+)/, 5_000);
+    proc.emitOut("t=1 lvl=info msg=starting");
+    proc.emitOut('t=2 lvl=info msg="started tunnel" url=https://ab-12.ngrok-free.app');
+    const result = await pending;
+    expect(result.url).toBe("https://ab-12.ngrok-free.app");
+    expect(result.child).toBeDefined();
+    await result.child!.start();
+    const stopped = result.child!.stop();
+    expect(proc.killed).toBe(true);
+    expect(await stopped).toBe(143);
+  });
+
+  test("matches on stderr too (cloudflared logs there) using the whole match", async () => {
+    const proc = fakeProc();
+    const pending = spawnUrlChild(
+      () => proc,
+      ["cloudflared"],
+      /(https:\/\/[a-z0-9-]+\.trycloudflare\.com)/,
+      5_000
+    );
+    proc.emitErr("INF +--------------------------------+");
+    proc.emitErr("INF |  https://some-words.trycloudflare.com  |");
+    const result = await pending;
+    expect(result.url).toBe("https://some-words.trycloudflare.com");
+  });
+
+  test("an exit before the URL rejects with the output tail and the agent name", async () => {
+    const proc = fakeProc();
+    const pending = spawnUrlChild(() => proc, ["ngrok"], /url=(\S+)/, 5_000);
+    proc.emitErr("ERROR: authentication failed: your authtoken is invalid");
+    await Bun.sleep(5); // let the line land in the tail before the exit races it
+    proc.exit(1);
+    await expect(pending).rejects.toThrow(/ngrok exited \(code 1\).*authtoken is invalid/);
+  });
+
+  test("a silent agent times out, is killed, and rejects", async () => {
+    const proc = fakeProc();
+    const pending = spawnUrlChild(() => proc, ["cloudflared"], /never-matches/, 10);
+    await expect(pending).rejects.toThrow(/did not report a public URL/);
+    expect(proc.killed).toBe(true);
+  });
+
+  test("a stream that errors mid-read is swallowed; the exit watcher still settles the result", async () => {
+    const out = new TransformStream<Uint8Array, Uint8Array>();
+    const writer = out.writable.getWriter();
+    const exited = Promise.withResolvers<number>();
+    const proc: SpawnedTunnelProc = {
+      stdout: out.readable,
+      stderr: null,
+      exited: exited.promise,
+      kill: () => exited.resolve(143)
+    };
+    const pending = spawnUrlChild(() => proc, ["agent"], /url=(\S+)/, 5_000);
+    void writer.write(new TextEncoder().encode("warming up\n"));
+    await Bun.sleep(5);
+    // The pipe tears down (e.g. the process was killed externally) — the read
+    // loop's catch must swallow it rather than surface an unhandled rejection.
+    void writer.abort(new Error("pipe torn down"));
+    await Bun.sleep(5);
+    exited.resolve(9);
+    await expect(pending).rejects.toThrow(/agent exited \(code 9\)/);
+  });
+
+  test("the default spawn wrapper drives a real process end to end", async () => {
+    const pending = spawnUrlChild(
+      defaultTunnelProcSpawn,
+      ["sh", "-c", 'echo "url=https://real.example.test"; sleep 30'],
+      /url=(\S+)/,
+      5_000
+    );
+    const result = await pending;
+    expect(result.url).toBe("https://real.example.test");
+    // stop() kills the real child and resolves with its exit code.
+    await result.child!.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// makeDefaultDrivers: the real CLI adapters, exercised through injected
+// run/spawn seams (no tailscale/ngrok/cloudflared binaries involved).
+// ---------------------------------------------------------------------------
+describe("makeDefaultDrivers", () => {
+  const TS_STATUS_RUNNING = JSON.stringify({ BackendState: "Running", Self: { DNSName: "mac.tail-test.ts.net." } });
+
+  function runScript(script: Record<string, { exitCode: number; stdout?: string; stderr?: string }>): {
+    run: (argv: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+    calls: string[];
+  } {
+    const calls: string[] = [];
+    return {
+      calls,
+      run: (argv: string[]) => {
+        const key = argv.join(" ");
+        calls.push(key);
+        const entry = script[key];
+        if (!entry) return Promise.reject(new Error(`unscripted command: ${key}`));
+        return Promise.resolve({ exitCode: entry.exitCode, stdout: entry.stdout ?? "", stderr: entry.stderr ?? "" });
+      }
+    };
+  }
+
+  test("tailscale: detect requires a Running backend with a MagicDNS name", async () => {
+    const running = runScript({ "tailscale status --json": { exitCode: 0, stdout: TS_STATUS_RUNNING } });
+    expect(await makeDefaultDrivers(running.run).tailscale.detect()).toEqual({ enabled: true });
+
+    const stopped = runScript({
+      "tailscale status --json": { exitCode: 0, stdout: JSON.stringify({ BackendState: "Stopped", Self: {} }) }
+    });
+    expect((await makeDefaultDrivers(stopped.run).tailscale.detect()).enabled).toBe(false);
+
+    const badJson = runScript({ "tailscale status --json": { exitCode: 0, stdout: "not json" } });
+    expect((await makeDefaultDrivers(badJson.run).tailscale.detect()).enabled).toBe(false);
+
+    const missing = runScript({});
+    expect((await makeDefaultDrivers(missing.run).tailscale.detect()).enabled).toBe(false);
+  });
+
+  test("tailscale: connect serves the gateway port and reports the ts.net URL; disconnect turns serve off", async () => {
+    const script = runScript({
+      "tailscale serve --bg http://127.0.0.1:7342": { exitCode: 0 },
+      "tailscale status --json": { exitCode: 0, stdout: TS_STATUS_RUNNING },
+      "tailscale serve --https=443 off": { exitCode: 0 }
+    });
+    const driver = makeDefaultDrivers(script.run).tailscale;
+    expect(await driver.connect(7342)).toEqual({ url: "https://mac.tail-test.ts.net" });
+    await driver.disconnect!();
+    expect(script.calls).toEqual([
+      "tailscale serve --bg http://127.0.0.1:7342",
+      "tailscale status --json",
+      "tailscale serve --https=443 off"
+    ]);
+  });
+
+  test("tailscale: connect surfaces serve failures, status failures, bad json, and a missing DNS name", async () => {
+    const serveFails = runScript({ "tailscale serve --bg http://127.0.0.1:1": { exitCode: 1, stderr: "serve: not allowed" } });
+    await expect(makeDefaultDrivers(serveFails.run).tailscale.connect(1)).rejects.toThrow("tailscale serve failed: serve: not allowed");
+
+    const statusFails = runScript({
+      "tailscale serve --bg http://127.0.0.1:1": { exitCode: 0 },
+      "tailscale status --json": { exitCode: 1, stderr: "down" }
+    });
+    await expect(makeDefaultDrivers(statusFails.run).tailscale.connect(1)).rejects.toThrow("tailscale status failed: down");
+
+    const badJson = runScript({
+      "tailscale serve --bg http://127.0.0.1:1": { exitCode: 0 },
+      "tailscale status --json": { exitCode: 0, stdout: "{" }
+    });
+    await expect(makeDefaultDrivers(badJson.run).tailscale.connect(1)).rejects.toThrow("unparseable JSON");
+
+    const noName = runScript({
+      "tailscale serve --bg http://127.0.0.1:1": { exitCode: 0 },
+      "tailscale status --json": { exitCode: 0, stdout: JSON.stringify({ Self: {} }) }
+    });
+    await expect(makeDefaultDrivers(noName.run).tailscale.connect(1)).rejects.toThrow("MagicDNS");
+  });
+
+  test("ngrok and cloudflared: detect maps the CLI checks; a missing binary disables", async () => {
+    const ok = runScript({
+      "ngrok config check": { exitCode: 0, stdout: "Valid configuration" },
+      "cloudflared --version": { exitCode: 0, stdout: "cloudflared version 2026.6.0" }
+    });
+    expect(await makeDefaultDrivers(ok.run).ngrok.detect()).toEqual({ enabled: true });
+    expect(await makeDefaultDrivers(ok.run).cloudflare.detect()).toEqual({ enabled: true });
+
+    const none = runScript({});
+    expect((await makeDefaultDrivers(none.run).ngrok.detect()).enabled).toBe(false);
+    expect((await makeDefaultDrivers(none.run).cloudflare.detect()).enabled).toBe(false);
+  });
+
+  test("ngrok and cloudflared: connect spawns the agent and scans for its URL", async () => {
+    process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS = "5000";
+    try {
+      const spawned: string[][] = [];
+      const procs: ReturnType<typeof fakeProc>[] = [];
+      const spawn = (argv: string[]): SpawnedTunnelProc => {
+        spawned.push(argv);
+        const proc = fakeProc();
+        procs.push(proc);
+        return proc;
+      };
+      const drivers = makeDefaultDrivers(runScript({}).run, spawn);
+
+      const ngrokPending = drivers.ngrok.connect(7342);
+      procs[0]!.emitOut('msg="started tunnel" url=https://xy-1.ngrok-free.app');
+      expect((await ngrokPending).url).toBe("https://xy-1.ngrok-free.app");
+      expect(spawned[0]).toEqual(["ngrok", "http", "7342", "--log", "stdout", "--log-format", "logfmt"]);
+
+      const cfPending = drivers.cloudflare.connect(7342);
+      procs[1]!.emitErr("INF |  https://ab-cd.trycloudflare.com  |");
+      expect((await cfPending).url).toBe("https://ab-cd.trycloudflare.com");
+      expect(spawned[1]).toEqual(["cloudflared", "--config", "/dev/null", "tunnel", "--url", "http://127.0.0.1:7342"]);
+    } finally {
+      delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
+    }
+  });
+
+  test("the manual-connect timeout env knob falls back on garbage and applies when set", async () => {
+    process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS = "10";
+    try {
+      const spawn = (): SpawnedTunnelProc => fakeProc();
+      await expect(makeDefaultDrivers(runScript({}).run, spawn).ngrok.connect(1)).rejects.toThrow(
+        /did not report a public URL/
+      );
+    } finally {
+      delete process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS;
+    }
+  });
+
+  test("defaultRunCommand runs a real command and captures exit code + both streams", async () => {
+    const result = await defaultRunCommand(["sh", "-c", "echo out; echo err 1>&2; exit 3"]);
+    expect(result.exitCode).toBe(3);
+    expect(result.stdout.trim()).toBe("out");
+    expect(result.stderr.trim()).toBe("err");
+  });
+
+  test("defaultRunCommand kills a command that outlives its timeout", async () => {
+    const result = await defaultRunCommand(["sleep", "30"], 25);
+    expect(result.exitCode).not.toBe(0);
   });
 });

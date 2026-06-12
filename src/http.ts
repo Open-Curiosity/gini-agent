@@ -101,7 +101,7 @@ import { resolveEffectiveContext } from "./execution/effective-context";
 import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
-import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, selectProvider } from "./integrations/tunnel";
+import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, refreshProviderDetection, selectProvider } from "./integrations/tunnel";
 import { isLoopbackHost, isRelayHost, webBoundRequestAllowed } from "./lib/origin-trust";
 import { cookieValue, serializeCookie } from "./lib/cookies";
 import { RateLimiter } from "./lib/rate-limit";
@@ -1840,7 +1840,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // UI. connect() flips to "connecting" and runs the gini-relay OAuth-loopback
     // login + frpc handshake in the background; the UI polls GET /api/tunnel
     // until status flips to "connected" (with url) or "error".
-    ["GET", /^\/api\/tunnel$/, () => json(getTunnel(config))],
+    // `?detect=1` (the panel-open / CLI-status path) re-probes the manual
+    // driver prerequisites first, so a freshly-installed CLI flips its catalog
+    // row without a runtime restart; plain polling GETs never spawn detection.
+    ["GET", /^\/api\/tunnel$/, async (request) => {
+      if (new URL(request.url).searchParams.get("detect") === "1") {
+        await refreshProviderDetection().catch(() => {});
+      }
+      return json(getTunnel(config));
+    }],
     ["POST", /^\/api\/tunnel\/select$/, async (request) => json(await selectProvider(config, String((await body(request)).provider ?? "")))],
     ["POST", /^\/api\/tunnel\/connect$/, async (request) => {
       const payload = await body(request);

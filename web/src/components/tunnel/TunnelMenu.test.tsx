@@ -92,6 +92,24 @@ describe("TunnelMenu", () => {
     expect(screen.queryByRole("button", { name: "Reveal QR" })).not.toBeNull();
   });
 
+  test("the trigger pill names the CONNECTED provider (any provider, not just the relay)", () => {
+    controller.state = makeState({ status: "connected", url: "https://m.ts.example", selectedProvider: "tailscale" });
+    render(<TunnelMenu />);
+    expect(screen.queryByText("Live")).not.toBeNull();
+    expect(screen.queryByText("tailscale")).not.toBeNull();
+  });
+
+  test("the trigger pill falls back to 'tunnel' when connected with no recorded selection, and 'no tunnel' when idle", () => {
+    controller.state = makeState({ status: "connected", url: "https://x.example", selectedProvider: null });
+    const first = render(<TunnelMenu />);
+    expect(screen.queryByText("tunnel")).not.toBeNull();
+    first.unmount();
+    controller.state = makeState({ status: "idle" });
+    render(<TunnelMenu />);
+    expect(screen.queryByText("Off")).not.toBeNull();
+    expect(screen.queryByText("no tunnel")).not.toBeNull();
+  });
+
   test("connected: Edit shows the selection panel with a Disconnect button, without disconnecting", async () => {
     const user = userEvent.setup();
     controller.state = makeState({ status: "connected", url: "https://g31.example" });

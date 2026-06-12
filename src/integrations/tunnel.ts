@@ -52,6 +52,7 @@ import { addAudit, createTunnelRecord, mutateState, readState } from "../state";
 import { appendLog } from "../state/trace";
 import { relayHome } from "../paths";
 import { isSupervisedWebChild } from "../runtime/health-probe";
+import { clearRuntimeTunnelTrust, setRuntimeTunnelTrust } from "../lib/origin-trust";
 
 // ---------------------------------------------------------------------------
 // Injectable gini-relay seams.
@@ -69,6 +70,253 @@ export interface TunnelChild {
   start(): Promise<unknown>;
   stop(): Promise<number>;
   exited: Promise<number>;
+}
+
+// ---------------------------------------------------------------------------
+// Manual tunnel drivers (tailscale serve / ngrok / cloudflared quick tunnel).
+//
+// Each driver knows how to (a) DETECT whether its prerequisite is met on this
+// machine — which is what flips the catalog row from disabled to enabled —
+// (b) CONNECT: bring the tunnel up for the gateway port and report the public
+// URL (plus a supervised child for process-backed tunnels), and (c) optionally
+// DISCONNECT provider-side state (tailscale's serve config persists outside
+// any child process). Defaults shell out to the real CLIs; tests inject fakes
+// through `setTunnelDeps({ drivers })`.
+// ---------------------------------------------------------------------------
+
+export const MANUAL_PROVIDER_IDS = ["tailscale", "ngrok", "cloudflare"] as const;
+export type ManualProviderId = (typeof MANUAL_PROVIDER_IDS)[number];
+
+export interface ProviderAvailability {
+  enabled: boolean;
+  requires?: string;
+}
+
+export interface ManualDriverResult {
+  url: string;
+  // Present for process-backed tunnels (ngrok, cloudflared); absent for
+  // tailscale serve, whose lifetime lives in tailscaled, not a child of ours.
+  child?: TunnelChild;
+}
+
+export interface ManualDriver {
+  detect(): Promise<ProviderAvailability>;
+  connect(port: number): Promise<ManualDriverResult>;
+  disconnect?(): Promise<void>;
+}
+
+const DEFAULT_REQUIRES: Record<ManualProviderId, string> = {
+  tailscale: "Tailscale network",
+  ngrok: "ngrok account",
+  cloudflare: "cloudflared CLI"
+};
+
+export interface RunResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+export type RunCommand = (argv: string[], timeoutMs?: number) => Promise<RunResult>;
+
+// Run a short-lived CLI command, capturing output. A missing binary rejects
+// (Bun.spawn throws ENOENT) — callers treat that as "prerequisite not met".
+export async function defaultRunCommand(argv: string[], timeoutMs = 15_000): Promise<RunResult> {
+  const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+  const timer = setTimeout(() => proc.kill(), timeoutMs);
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited
+  ]);
+  clearTimeout(timer);
+  return { exitCode, stdout, stderr };
+}
+
+// The slim process surface a long-running tunnel agent needs. Mirrors
+// Bun.spawn's shape so the default is a thin wrapper and tests can fake the
+// streams deterministically.
+export interface SpawnedTunnelProc {
+  stdout: ReadableStream<Uint8Array> | null;
+  stderr: ReadableStream<Uint8Array> | null;
+  exited: Promise<number>;
+  kill(): void;
+}
+export type TunnelProcSpawn = (argv: string[]) => SpawnedTunnelProc;
+
+export const defaultTunnelProcSpawn: TunnelProcSpawn = (argv) => {
+  const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+  return { stdout: proc.stdout, stderr: proc.stderr, exited: proc.exited, kill: () => proc.kill() };
+};
+
+// How long a spawned tunnel agent gets to print its public URL before the
+// connect is declared failed. Read at call time so tests can tighten it.
+function manualConnectTimeoutMs(): number {
+  const v = Number(process.env.GINI_TUNNEL_MANUAL_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : 45_000;
+}
+
+// Spawn a tunnel agent and scan its output for the public URL. Resolves with
+// the url + a TunnelChild wrapping the live process; rejects (and kills the
+// process) if the agent exits or stays silent past the deadline. The last few
+// output lines ride along in the error so the panel shows the real cause
+// (auth failure, port clash, …) instead of a bare timeout.
+export async function spawnUrlChild(
+  spawn: TunnelProcSpawn,
+  argv: string[],
+  urlPattern: RegExp,
+  timeoutMs: number
+): Promise<ManualDriverResult> {
+  const proc = spawn(argv);
+  const settled = Promise.withResolvers<string>();
+  const tail: string[] = [];
+  let buffered = "";
+
+  const scan = (chunk: string): void => {
+    buffered += chunk;
+    const lines = buffered.split("\n");
+    buffered = lines.pop() ?? "";
+    for (const line of lines) {
+      if (line.trim()) {
+        tail.push(line.trim());
+        if (tail.length > 20) tail.shift();
+      }
+      const match = urlPattern.exec(line);
+      if (match) settled.resolve(match[1] ?? match[0]);
+    }
+  };
+
+  const readAll = async (stream: ReadableStream<Uint8Array> | null): Promise<void> => {
+    if (!stream) return;
+    const decoder = new TextDecoder();
+    const reader = stream.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        scan(decoder.decode(value, { stream: true }));
+      }
+    } catch {
+      // The stream tears down when the process is killed; the race below
+      // already settled (or will settle via `exited`).
+    }
+  };
+  void readAll(proc.stdout);
+  void readAll(proc.stderr);
+
+  const timer = setTimeout(() => {
+    settled.reject(new Error(`${argv[0]} did not report a public URL within ${Math.round(timeoutMs / 1000)}s.`));
+  }, timeoutMs);
+  void proc.exited.then((code) => {
+    settled.reject(
+      new Error(`${argv[0]} exited (code ${code}) before reporting a public URL${tail.length ? `: ${tail.slice(-3).join(" | ")}` : "."}`)
+    );
+  });
+
+  try {
+    const url = await settled.promise;
+    return {
+      url,
+      child: {
+        start: () => Promise.resolve(0),
+        stop: () => {
+          proc.kill();
+          return proc.exited;
+        },
+        exited: proc.exited
+      }
+    };
+  } catch (error) {
+    proc.kill();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Build the real CLI-backed drivers. Exported with injectable run/spawn seams
+// so tests cover every fold without the tailscale/ngrok/cloudflared binaries.
+export function makeDefaultDrivers(
+  run: RunCommand = defaultRunCommand,
+  spawn: TunnelProcSpawn = defaultTunnelProcSpawn
+): Record<ManualProviderId, ManualDriver> {
+  const tailscaleDnsName = async (): Promise<string> => {
+    const status = await run(["tailscale", "status", "--json"]);
+    if (status.exitCode !== 0) {
+      throw new Error(`tailscale status failed: ${(status.stderr || status.stdout).trim()}`);
+    }
+    let name = "";
+    try {
+      const parsed = JSON.parse(status.stdout) as { Self?: { DNSName?: string } };
+      name = (parsed.Self?.DNSName ?? "").replace(/\.$/, "");
+    } catch {
+      throw new Error("tailscale status returned unparseable JSON.");
+    }
+    if (!name) throw new Error("tailscale did not report a MagicDNS name for this machine.");
+    return name;
+  };
+
+  return {
+    tailscale: {
+      detect: async () => {
+        const status = await run(["tailscale", "status", "--json"]).catch(() => null);
+        if (status && status.exitCode === 0) {
+          try {
+            const parsed = JSON.parse(status.stdout) as { BackendState?: string; Self?: { DNSName?: string } };
+            if (parsed.BackendState === "Running" && (parsed.Self?.DNSName ?? "").replace(/\.$/, "")) {
+              return { enabled: true };
+            }
+          } catch {
+            // fall through to disabled
+          }
+        }
+        return { enabled: false, requires: DEFAULT_REQUIRES.tailscale };
+      },
+      // `tailscale serve --bg` persists in tailscaled (no child to supervise)
+      // and is idempotent, which is also what makes the boot resume safe.
+      connect: async (port) => {
+        const serve = await run(["tailscale", "serve", "--bg", `http://127.0.0.1:${port}`]);
+        if (serve.exitCode !== 0) {
+          throw new Error(`tailscale serve failed: ${(serve.stderr || serve.stdout).trim()}`);
+        }
+        return { url: `https://${await tailscaleDnsName()}` };
+      },
+      disconnect: async () => {
+        await run(["tailscale", "serve", "--https=443", "off"]);
+      }
+    },
+    ngrok: {
+      detect: async () => {
+        const check = await run(["ngrok", "config", "check"]).catch(() => null);
+        return check && check.exitCode === 0
+          ? { enabled: true }
+          : { enabled: false, requires: DEFAULT_REQUIRES.ngrok };
+      },
+      connect: (port) =>
+        spawnUrlChild(
+          spawn,
+          ["ngrok", "http", String(port), "--log", "stdout", "--log-format", "logfmt"],
+          /url=(https:\/\/[^\s"]+)/,
+          manualConnectTimeoutMs()
+        )
+    },
+    cloudflare: {
+      detect: async () => {
+        const version = await run(["cloudflared", "--version"]).catch(() => null);
+        return version && version.exitCode === 0
+          ? { enabled: true }
+          : { enabled: false, requires: DEFAULT_REQUIRES.cloudflare };
+      },
+      // --config /dev/null: a named-tunnel ~/.cloudflared/config.yml otherwise
+      // silently breaks quick tunnels (they register but the edge 404s).
+      connect: (port) =>
+        spawnUrlChild(
+          spawn,
+          ["cloudflared", "--config", "/dev/null", "tunnel", "--url", `http://127.0.0.1:${port}`],
+          /(https:\/\/[a-z0-9-]+\.trycloudflare\.com)/,
+          manualConnectTimeoutMs()
+        )
+    }
+  };
 }
 
 export interface TunnelDeps {
@@ -100,6 +348,8 @@ export interface TunnelDeps {
   // server-side revoke — which keeps the same stable subdomain/URL on reconnect
   // while still rotating the token. Called by disconnect (= sever the connector).
   logout: (config: RuntimeConfig) => Promise<void>;
+  // The manual tunnel drivers (tailscale / ngrok / cloudflared).
+  drivers: Record<ManualProviderId, ManualDriver>;
 }
 
 // The default host-browser opener. The auth code comes back to THIS machine's
@@ -160,16 +410,23 @@ export function makeDefaultDeps(): TunnelDeps {
     openBrowser: defaultOpenBrowser,
     resolveLocalPort: defaultResolveLocalPort,
     probeLocalPort: (config: RuntimeConfig, port: number) => isSupervisedWebChild(config.instance, port),
-    logout: (config: RuntimeConfig) => defaultLogout(config.instance)
+    logout: (config: RuntimeConfig) => defaultLogout(config.instance),
+    drivers: makeDefaultDrivers()
   };
 }
 
 let deps: TunnelDeps = makeDefaultDeps();
 
-// Swap the gini-relay seams. Tests inject fakes; calling with no argument
-// restores the real implementations (so a test can clean up after itself).
+// Swap the gini-relay/driver seams. Tests inject fakes; calling with no
+// argument restores the real implementations (so a test can clean up after
+// itself). Either way the detection cache and runtime-tunnel trust registry
+// reset, so availability/trust never leaks between tests.
 export function setTunnelDeps(next?: Partial<TunnelDeps>): void {
   deps = next ? { ...makeDefaultDeps(), ...next } : makeDefaultDeps();
+  detection = defaultDetection();
+  detectionAt = 0;
+  detectionInFlight = null;
+  clearRuntimeTunnelTrust();
 }
 
 // ---------------------------------------------------------------------------
@@ -244,19 +501,71 @@ export async function stopAllTunnels(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Provider catalog.
+// Provider catalog + availability detection.
 // ---------------------------------------------------------------------------
 
-// The static provider catalog. gini-relay is the only enabled provider for
-// now; the rest are placeholders surfaced with a `requires` explanation of
-// the prerequisite that's missing. The order here is the order the panel
-// renders them. Rebuilt fresh on every read — never persisted.
+// Last-known driver availability. The catalog is rebuilt from this cache on
+// every read (never persisted); the cache itself refreshes via
+// `refreshProviderDetection` — at boot, on an explicit `GET /api/tunnel?detect=1`
+// (the panel-open / CLI-status path), and lazily when a select/connect targets
+// a provider the cache still marks disabled. Plain polling GETs never spawn
+// detection subprocesses.
+function defaultDetection(): Record<ManualProviderId, ProviderAvailability> {
+  return {
+    tailscale: { enabled: false, requires: DEFAULT_REQUIRES.tailscale },
+    ngrok: { enabled: false, requires: DEFAULT_REQUIRES.ngrok },
+    cloudflare: { enabled: false, requires: DEFAULT_REQUIRES.cloudflare }
+  };
+}
+let detection: Record<ManualProviderId, ProviderAvailability> = defaultDetection();
+let detectionAt = 0;
+let detectionInFlight: Promise<void> | null = null;
+const DETECTION_TTL_MS = 5_000;
+
+export function isManualProviderId(id: string): id is ManualProviderId {
+  return (MANUAL_PROVIDER_IDS as readonly string[]).includes(id);
+}
+
+// Probe every manual driver and update the availability cache. Concurrent
+// callers share one in-flight probe; results within the TTL are reused so a
+// panel-open burst doesn't stack subprocess spawns. A driver that throws stays
+// at its default-disabled entry.
+export function refreshProviderDetection(): Promise<void> {
+  if (Date.now() - detectionAt < DETECTION_TTL_MS) return Promise.resolve();
+  if (detectionInFlight) return detectionInFlight;
+  detectionInFlight = (async () => {
+    const next = defaultDetection();
+    await Promise.all(
+      MANUAL_PROVIDER_IDS.map(async (id) => {
+        try {
+          next[id] = await deps.drivers[id].detect();
+        } catch {
+          // keep the default-disabled entry
+        }
+      })
+    );
+    detection = next;
+    detectionAt = Date.now();
+  })().finally(() => {
+    detectionInFlight = null;
+  });
+  return detectionInFlight;
+}
+
+// The provider catalog: gini-relay is always available; the manual providers
+// reflect the last detection pass (disabled with a `requires` explanation
+// until their CLI prerequisite is found). The order here is the order the
+// panel renders them. Rebuilt fresh on every read — never persisted.
 function providerCatalog(): TunnelProvider[] {
+  const availability = (id: ManualProviderId): { enabled: boolean; requires?: string } => {
+    const entry = detection[id];
+    return entry.enabled ? { enabled: true } : { enabled: false, requires: entry.requires ?? DEFAULT_REQUIRES[id] };
+  };
   return [
     { id: "gini-relay", name: "Gini Relay", enabled: true },
-    { id: "tailscale", name: "Tailscale", enabled: false, requires: "Tailscale network" },
-    { id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account" },
-    { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "Cloudflare account" }
+    { id: "tailscale", name: "Tailscale", ...availability("tailscale") },
+    { id: "ngrok", name: "ngrok", ...availability("ngrok") },
+    { id: "cloudflare", name: "Cloudflare", ...availability("cloudflare") }
   ];
 }
 
@@ -265,6 +574,21 @@ function providerCatalog(): TunnelProvider[] {
 // unknown provider is rejected before any state mutation.
 function findProvider(id: string): TunnelProvider | undefined {
   return providerCatalog().find((provider) => provider.id === id);
+}
+
+// Write the tunnel record AND sync the runtime-tunnel origin trust to it: a
+// `connected` record's url front is admitted by the gateway's web-bound guard
+// (src/lib/origin-trust.ts) exactly while the record says connected — every
+// transition away from connected revokes the front atomically with the state
+// write, so a torn-down tunnel host can't keep riding the trust lane.
+function applyTunnel(
+  state: RuntimeState,
+  fields: Parameters<typeof createTunnelRecord>[1]
+): NonNullable<RuntimeState["tunnel"]> {
+  const record = createTunnelRecord(state, fields);
+  state.tunnel = record;
+  setRuntimeTunnelTrust(record.instance, record.status === "connected" && record.url ? record.url : null);
+  return record;
 }
 
 // Build the full TunnelState from the persisted singleton (which may be
@@ -295,8 +619,14 @@ export function getTunnel(config: RuntimeConfig): TunnelState {
 // "idle" — the user still has to click Connect. Clears any prior url/message
 // because the selection changed.
 export async function selectProvider(config: RuntimeConfig, provider: string): Promise<TunnelState> {
-  const entry = findProvider(provider);
+  let entry = findProvider(provider);
   if (!entry) throw new Error(`Unknown tunnel provider: ${provider}`);
+  if (!entry.enabled && isManualProviderId(entry.id)) {
+    // The availability cache may predate a freshly-installed CLI (or a fresh
+    // boot) — re-probe before rejecting so a valid selection never bounces.
+    await refreshProviderDetection();
+    entry = findProvider(provider) ?? entry;
+  }
   if (!entry.enabled) {
     throw new Error(`Tunnel provider ${entry.name} is not available${entry.requires ? ` (requires ${entry.requires})` : ""}.`);
   }
@@ -315,7 +645,7 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
   // idle (an orphaned child). No-op when nothing is live.
   teardown(config.instance);
   return mutateState(config.instance, (state) => {
-    const record = createTunnelRecord(state, {
+    applyTunnel(state, {
       ...(state.tunnel ?? {}),
       selectedProvider: entry.id,
       status: "idle",
@@ -323,7 +653,6 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
       subdomain: undefined,
       message: undefined
     });
-    state.tunnel = record;
     // Selection is an instance-level transport choice, like a relay.
     addAudit(
       state,
@@ -350,8 +679,12 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
 export async function connectTunnel(config: RuntimeConfig, provider?: string): Promise<TunnelState> {
   const requested = provider ?? readState(config.instance).tunnel?.selectedProvider ?? null;
   if (!requested) throw new Error("No tunnel provider selected.");
-  const entry = findProvider(requested);
+  let entry = findProvider(requested);
   if (!entry) throw new Error(`Unknown tunnel provider: ${requested}`);
+  if (!entry.enabled && isManualProviderId(entry.id)) {
+    await refreshProviderDetection();
+    entry = findProvider(requested) ?? entry;
+  }
   if (!entry.enabled) {
     throw new Error(`Tunnel provider ${entry.name} is not available${entry.requires ? ` (requires ${entry.requires})` : ""}.`);
   }
@@ -365,7 +698,7 @@ export async function connectTunnel(config: RuntimeConfig, provider?: string): P
 
   const id: TunnelProviderId = entry.id;
   const connecting = await mutateState(config.instance, (state) => {
-    state.tunnel = createTunnelRecord(state, {
+    applyTunnel(state, {
       ...(state.tunnel ?? {}),
       selectedProvider: id,
       status: "connecting",
@@ -390,7 +723,7 @@ export async function connectTunnel(config: RuntimeConfig, provider?: string): P
   // Fire the background handshake. We retain its promise on the (already
   // claimed) supervisor so tests can await the terminal transition; production
   // never awaits it (the UI polls). The flow catches its own errors into "error".
-  sup.settled = runConnect(config, id, sup);
+  sup.settled = isManualProviderId(id) ? runManualConnect(config, id, sup) : runConnect(config, id, sup);
   return connecting;
 }
 
@@ -430,7 +763,7 @@ async function waitForLocalPort(
 // reconnect manually. No audit row — the appendLog at the call site is the trace.
 async function settleResumeIdle(config: RuntimeConfig, provider: TunnelProviderId): Promise<void> {
   await mutateState(config.instance, (state) => {
-    state.tunnel = createTunnelRecord(state, {
+    applyTunnel(state, {
       ...(state.tunnel ?? {}),
       selectedProvider: provider,
       status: "idle",
@@ -439,6 +772,111 @@ async function settleResumeIdle(config: RuntimeConfig, provider: TunnelProviderI
       message: undefined
     });
   });
+}
+
+// The background connect flow for a MANUAL driver (tailscale / ngrok /
+// cloudflared). Mirrors runConnect's supervision contract — same web-readiness
+// probe, same isCurrent ownership rules, same error-into-state fold — without
+// the OAuth/session machinery (these drivers have no login).
+async function runManualConnect(
+  config: RuntimeConfig,
+  provider: ManualProviderId,
+  sup: Supervisor,
+  opts: { awaitWebReady?: boolean } = {}
+): Promise<void> {
+  const isCurrent = (): boolean => supervisors.get(config.instance) === sup;
+  try {
+    const port = deps.resolveLocalPort(config);
+    const ready = opts.awaitWebReady
+      ? await waitForLocalPort(config, port, isCurrent)
+      : await deps.probeLocalPort(config, port);
+    if (!ready) {
+      if (opts.awaitWebReady) {
+        // Boot resume: a restart where the web never came back up shouldn't
+        // error — settle idle so the user can reconnect (mirrors the relay
+        // resume; waitForLocalPort already returns false when superseded).
+        if (isCurrent()) await settleResumeIdle(config, provider);
+        appendLog(config.instance, "tunnel.resume.web_unavailable", { provider, port });
+        return;
+      }
+      throw new Error(`Gini's web UI isn't responding on port ${port} — start it, then reconnect.`);
+    }
+    if (!isCurrent()) {
+      appendLog(config.instance, "tunnel.connect.aborted", { provider });
+      return;
+    }
+
+    const result = await deps.drivers[provider].connect(port);
+    if (result.child) sup.child = result.child;
+
+    // A cancel/disconnect or a newer connect may have superseded us while the
+    // driver was bringing the tunnel up — tear down what we just started
+    // instead of publishing it. Childless drivers (tailscale serve) get their
+    // provider-side teardown so the loser doesn't keep serving.
+    if (!isCurrent()) {
+      if (result.child) {
+        void result.child.stop().catch(() => {});
+        sup.child = undefined;
+      } else {
+        void deps.drivers[provider].disconnect?.().catch(() => {});
+      }
+      appendLog(config.instance, "tunnel.connect.aborted", { provider });
+      return;
+    }
+
+    await mutateState(config.instance, (state) => {
+      applyTunnel(state, {
+        ...(state.tunnel ?? {}),
+        selectedProvider: provider,
+        status: "connected",
+        url: result.url,
+        subdomain: undefined,
+        message: undefined
+      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "tunnel.connected",
+          target: provider,
+          risk: "medium",
+          evidence: { provider, url: result.url, port }
+        },
+        { system: true }
+      );
+    });
+    appendLog(config.instance, "tunnel.connected", { provider, url: result.url, port });
+    if (result.child) watchChildExit(config, provider, sup, result.child);
+  } catch (error) {
+    sup.child = undefined;
+    const message = error instanceof Error ? error.message : String(error);
+    if (!isCurrent()) {
+      appendLog(config.instance, "tunnel.connect.aborted", { provider, message });
+      return;
+    }
+    await mutateState(config.instance, (state) => {
+      applyTunnel(state, {
+        ...(state.tunnel ?? {}),
+        selectedProvider: provider,
+        status: "error",
+        url: undefined,
+        subdomain: undefined,
+        message
+      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "tunnel.error",
+          target: provider,
+          risk: "medium",
+          evidence: { provider, message }
+        },
+        { system: true }
+      );
+    });
+    appendLog(config.instance, "tunnel.connect.error", { provider, message });
+  }
 }
 
 // The background login + tunnel handshake. Runs the full gini-relay flow:
@@ -563,7 +1001,7 @@ async function runConnect(
 
     const url = `https://${session.subdomain}.${relay.relayDomain}`;
     await mutateState(config.instance, (state) => {
-      state.tunnel = createTunnelRecord(state, {
+      applyTunnel(state, {
         ...(state.tunnel ?? {}),
         selectedProvider: provider,
         status: "connected",
@@ -610,7 +1048,7 @@ async function runConnect(
       return;
     }
     await mutateState(config.instance, (state) => {
-      state.tunnel = createTunnelRecord(state, {
+      applyTunnel(state, {
         ...(state.tunnel ?? {}),
         selectedProvider: provider,
         status: "error",
@@ -657,7 +1095,7 @@ function watchChildExit(
           return;
         }
         sup.child = undefined;
-        state.tunnel = createTunnelRecord(state, {
+        applyTunnel(state, {
           ...(state.tunnel ?? {}),
           selectedProvider: provider,
           status: "error",
@@ -693,7 +1131,7 @@ export async function cancelTunnel(config: RuntimeConfig): Promise<TunnelState> 
   teardown(config.instance);
   return mutateState(config.instance, (state) => {
     const selected = state.tunnel?.selectedProvider ?? null;
-    state.tunnel = createTunnelRecord(state, {
+    applyTunnel(state, {
       ...(state.tunnel ?? {}),
       selectedProvider: selected,
       status: "idle",
@@ -720,27 +1158,38 @@ export async function cancelTunnel(config: RuntimeConfig): Promise<TunnelState> 
 // user can reconnect to the same provider without re-selecting. Stops the
 // frpc child and clears the url/message.
 export async function disconnectTunnel(config: RuntimeConfig): Promise<TunnelState> {
-  // Capture the entry we're tearing down BEFORE the logout await: if a new
-  // connect claims the instance during that await, the idle write below must
-  // not clobber its live record.
+  // Capture the entry we're tearing down BEFORE the provider-teardown awaits:
+  // if a new connect claims the instance during those awaits, the idle write
+  // below must not clobber its live record.
   const torndown = supervisors.get(config.instance);
+  const selectedBefore = readState(config.instance).tunnel?.selectedProvider ?? null;
   teardown(config.instance);
-  // Local logout: disconnect severs the connector, so clear this instance's
-  // stored relay session (local-only — no server-side revoke; keeps a stable
-  // subdomain on reconnect). A later connect then requires a fresh login
-  // (best-effort — a logout failure must never block disconnect from settling).
-  try {
-    await deps.logout(config);
-  } catch {
-    // never block disconnect on a logout failure.
+  if (selectedBefore === "gini-relay") {
+    // Local logout: disconnect severs the connector, so clear this instance's
+    // stored relay session (local-only — no server-side revoke; keeps a stable
+    // subdomain on reconnect). A later connect then requires a fresh login
+    // (best-effort — a logout failure must never block disconnect from settling).
+    try {
+      await deps.logout(config);
+    } catch {
+      // never block disconnect on a logout failure.
+    }
+  } else if (selectedBefore && isManualProviderId(selectedBefore)) {
+    // Provider-side teardown for drivers whose tunnel outlives any child of
+    // ours (tailscale serve). Child-backed drivers were stopped by teardown.
+    try {
+      await deps.drivers[selectedBefore].disconnect?.();
+    } catch {
+      // never block disconnect on a provider-teardown failure.
+    }
   }
   return mutateState(config.instance, (state) => {
-    // A connect claimed the instance during the logout await — leave its live
-    // record intact instead of clobbering it back to idle.
+    // A connect claimed the instance during the teardown awaits — leave its
+    // live record intact instead of clobbering it back to idle.
     const current = supervisors.get(config.instance);
     if (current && current !== torndown) return toState(state.tunnel ?? null);
     const selected = state.tunnel?.selectedProvider ?? null;
-    state.tunnel = createTunnelRecord(state, {
+    applyTunnel(state, {
       ...(state.tunnel ?? {}),
       selectedProvider: selected,
       status: "idle",
@@ -784,6 +1233,12 @@ export async function reconcileTunnelOnStartup(config: RuntimeConfig): Promise<T
     return toState(record);
   }
   const selected = record.selectedProvider ?? null;
+  // A manual provider's availability cache is empty on a fresh boot — probe
+  // before deciding whether the record's provider can resume. (Never rejects:
+  // each driver probe catches into its default-disabled entry.)
+  if (selected && isManualProviderId(selected)) {
+    await refreshProviderDetection();
+  }
   const provider = selected ? findProvider(selected) : undefined;
   // Only a tunnel that was actually "connected" (with an enabled provider still
   // in the catalog) resumes; a stale "connecting" just resets to idle.
@@ -791,7 +1246,7 @@ export async function reconcileTunnelOnStartup(config: RuntimeConfig): Promise<T
 
   const next = await mutateState(config.instance, (state) => {
     const prior = state.tunnel?.status;
-    state.tunnel = createTunnelRecord(state, {
+    applyTunnel(state, {
       ...(state.tunnel ?? {}),
       selectedProvider: selected,
       status: willResume ? "connecting" : "idle",
@@ -814,13 +1269,17 @@ export async function reconcileTunnelOnStartup(config: RuntimeConfig): Promise<T
   });
 
   if (willResume && provider) {
-    // Background reconnect: reuse the stored session and wait for the web child to
-    // become reachable (the gateway binds, and the web child finishes compiling,
-    // just after this returns — so the resume probes with retry). Retained on the
-    // supervisor so tests can await the terminal transition.
+    // Background reconnect, waiting for the web child to become reachable (the
+    // gateway binds, and the web child finishes compiling, just after this
+    // returns — so the resume probes with retry). gini-relay reuses the stored
+    // session (no browser); manual drivers just reconnect — tailscale republishes
+    // the same stable ts.net URL, while ngrok/cloudflared mint a fresh one.
+    // Retained on the supervisor so tests can await the terminal transition.
     teardown(config.instance);
     const sup = supervisor(config.instance);
-    sup.settled = runConnect(config, provider.id, sup, { reuseOnly: true, awaitWebReady: true });
+    sup.settled = isManualProviderId(provider.id)
+      ? runManualConnect(config, provider.id, sup, { awaitWebReady: true })
+      : runConnect(config, provider.id, sup, { reuseOnly: true, awaitWebReady: true });
   }
   return next;
 }

@@ -61,7 +61,7 @@ export function TunnelMenu() {
       }}
     >
       <PopoverTrigger asChild>
-        <TunnelTrigger connected={connected} />
+        <TunnelTrigger connected={connected} provider={state.selectedProvider} />
       </PopoverTrigger>
       <PopoverContent
         side={isMobile ? "top" : "right"}

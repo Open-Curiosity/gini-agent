@@ -44,10 +44,16 @@ export function useTunnel(): TunnelController {
   // a newer state.
   const getSeq = useRef(0);
 
-  const get = useCallback(async () => {
+  // `detect` re-probes the manual driver prerequisites gateway-side; used by
+  // the panel-open refresh so a freshly-installed tailscale/ngrok/cloudflared
+  // flips its row enabled without a runtime restart. Mount + poll reads stay
+  // plain so they never spawn detection subprocesses.
+  const get = useCallback(async (detect = false) => {
     const seq = (getSeq.current += 1);
     try {
-      const next = await readState(await fetch(BASE, { headers: { accept: "application/json" } }));
+      const next = await readState(
+        await fetch(detect ? `${BASE}?detect=1` : BASE, { headers: { accept: "application/json" } })
+      );
       if (seq !== getSeq.current) return;
       setState(next);
       setError(null);
@@ -103,5 +109,5 @@ export function useTunnel(): TunnelController {
   const cancel = useCallback(() => void post("/cancel"), [post]);
   const disconnect = useCallback(() => void post("/disconnect"), [post]);
 
-  return { state, loading, error, refresh: () => void get(), select, connect, cancel, disconnect };
+  return { state, loading, error, refresh: () => void get(true), select, connect, cancel, disconnect };
 }

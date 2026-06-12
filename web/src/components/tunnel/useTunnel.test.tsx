@@ -205,17 +205,18 @@ describe("useTunnel", () => {
     expect(result.current.error).toBe("post-nope");
   });
 
-  test("refresh() triggers another get()", async () => {
+  test("refresh() triggers a detect=1 get (the panel-open path re-probes drivers); mount stays plain", async () => {
     const { result } = renderHook(() => useTunnel());
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenLastCalledWith(BASE, { headers: { accept: "application/json" } });
 
     await act(async () => {
       result.current.refresh();
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock).toHaveBeenLastCalledWith(BASE, { headers: { accept: "application/json" } });
+    expect(fetchMock).toHaveBeenLastCalledWith(`${BASE}?detect=1`, { headers: { accept: "application/json" } });
   });
 
   test("polling: a connecting state arms the interval, and connected clears it", async () => {

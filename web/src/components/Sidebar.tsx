@@ -5,6 +5,7 @@ import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
 import {
+  BookOpen,
   ChevronDown,
   Menu,
   MessagesSquare,
@@ -29,6 +30,7 @@ import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state"
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
 import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
+import { DocReference } from "@/components/DocReference";
 import { useUpdateGate } from "@/components/UpdateGate";
 import type { AgentRow, ChatSession } from "@/lib/view-types";
 import type { JobRecord, JobRoute } from "@runtime/types";
@@ -325,6 +327,18 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
 
       <div className="px-3 pb-2 pt-3">
         <TunnelMenu />
+        {/* The Remote Access guide rendered inline (DocReference sheet): how to
+            expose Gini through gini-relay or a manual Tailscale/ngrok/cloudflared
+            front, and how to confirm which tunnel mode is selected. */}
+        <DocReference url="https://gini.lilaclabs.ai/docs/remote-access">
+          <button
+            type="button"
+            className="mt-1.5 flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11px] text-sidebar-foreground/60 transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground"
+          >
+            <BookOpen className="size-3 shrink-0" aria-hidden />
+            <span className="truncate">Remote access guide — relay · Tailscale · ngrok · Cloudflare</span>
+          </button>
+        </DocReference>
       </div>
       <div className="h-px bg-sidebar-border" />
       <UpdateReminder />

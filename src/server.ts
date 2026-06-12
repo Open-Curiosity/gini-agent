@@ -20,7 +20,7 @@ import { closeAll as closeBrowserSessions, setBrowserInstance, setBrowserRecordi
 import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
 import { createApnsDispatcher } from "./integrations/apns/dispatcher";
-import { reconcileTunnelOnStartup, stopAllTunnels } from "./integrations/tunnel";
+import { reconcileTunnelOnStartup, refreshProviderDetection, stopAllTunnels } from "./integrations/tunnel";
 
 // Marks the moment this module finished loading (ms since process start), so
 // the runtime.started log can split total boot into module-load vs. the boot
@@ -102,6 +102,9 @@ setBrowserRecording(config.browserRecording === true);
 // port with retry, so it tolerates serve binding a moment later). The .catch
 // keeps the never-crash-boot guarantee. See ADR tunnel-connectivity.md.
 const tunnelReconcileStartedMs = performance.now();
+// Probe the manual tunnel drivers (tailscale/ngrok/cloudflared) once at boot so
+// the catalog's enabled flags are correct from the first GET /api/tunnel.
+await refreshProviderDetection().catch(() => {});
 await reconcileTunnelOnStartup(config).catch((error) => {
   appendLog(config.instance, "tunnel.reconcile.error", {
     error: error instanceof Error ? error.message : String(error)

@@ -39,6 +39,50 @@ export function isRelayHost(host: string): boolean {
   return hostnameOnly === domain || hostnameOnly.endsWith(`.${domain}`);
 }
 
+// Hosts of runtime-managed tunnels that are currently CONNECTED (set by
+// src/integrations/tunnel.ts whenever it writes a tunnel record, keyed by
+// instance). A Host equal to a connected tunnel's host is as trustworthy as a
+// relay subdomain: the runtime itself established that tunnel to this gateway,
+// and the provider (Tailscale's tailnet DNS, ngrok's *.ngrok-free.app,
+// Cloudflare's *.trycloudflare.com, the gini relay) owns the DNS for the name —
+// an attacker cannot rebind it to this machine. Without this lane, a tunnel the
+// runtime just published would fail closed (404/403) until the operator
+// hand-copied the random URL into GINI_TRUSTED_ORIGINS.
+const runtimeTunnelHosts = new Map<string, string>();
+
+// Record (url) or clear (null) the connected tunnel host for an instance.
+export function setRuntimeTunnelTrust(instance: string, url: string | null): void {
+  if (!url) {
+    runtimeTunnelHosts.delete(instance);
+    return;
+  }
+  try {
+    runtimeTunnelHosts.set(instance, stripDefaultPort(new URL(url).host));
+  } catch {
+    // An unparseable url must never install a trust entry.
+    runtimeTunnelHosts.delete(instance);
+  }
+}
+
+// Test seam: drop every runtime-tunnel trust entry.
+export function clearRuntimeTunnelTrust(): void {
+  runtimeTunnelHosts.clear();
+}
+
+function stripDefaultPort(host: string): string {
+  return host.toLowerCase().replace(/:(?:80|443)$/, "");
+}
+
+// A Host that equals a currently-connected runtime-managed tunnel's host.
+export function isRuntimeTunnelHost(host: string): boolean {
+  if (runtimeTunnelHosts.size === 0) return false;
+  const target = stripDefaultPort(host);
+  for (const tunnelHost of runtimeTunnelHosts.values()) {
+    if (tunnelHost === target) return true;
+  }
+  return false;
+}
+
 // Parse `GINI_TRUSTED_ORIGINS` into validated origin strings. Mirrors the BFF's
 // web/src/lib/trusted-origins.ts validation exactly (entries with a path,
 // query, hash, or userinfo are rejected as a likely paste error). Tri-state:
@@ -127,7 +171,12 @@ const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 function hostOriginTrusted(origin: string | null, isUnsafe: boolean, expectedHost: string): boolean {
   if (!origin) {
     if (isUnsafe) return false;
-    return isLoopbackHost(expectedHost) || isRelayHost(expectedHost) || hostInTrustedAllowlist(expectedHost);
+    return (
+      isLoopbackHost(expectedHost)
+      || isRelayHost(expectedHost)
+      || isRuntimeTunnelHost(expectedHost)
+      || hostInTrustedAllowlist(expectedHost)
+    );
   }
   let originUrl: URL;
   try {
@@ -142,6 +191,15 @@ function hostOriginTrusted(origin: string | null, isUnsafe: boolean, expectedHos
   // since all *.<relayDomain> share one registrable domain. Match the Origin==Host
   // discipline the loopback/allowlist lanes use.
   if (isRelayHost(originUrl.host) && isRelayHost(expectedHost) && originUrl.host === expectedHost) return true;
+  // A runtime-tunnel Origin follows the same Origin==Host discipline as the
+  // relay lane: only the page served from that same tunnel front is trusted.
+  if (
+    isRuntimeTunnelHost(originUrl.host)
+    && isRuntimeTunnelHost(expectedHost)
+    && originUrl.host === expectedHost
+  ) {
+    return true;
+  }
   if (isLoopbackHost(expectedHost) && isLoopbackHost(originUrl.host)) return true;
   const allowlist = trustedOrigins();
   if (allowlist) return allowlist.has(`${originUrl.protocol}//${originUrl.host}`);
