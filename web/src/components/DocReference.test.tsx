@@ -14,14 +14,18 @@ import { DocReference } from "./DocReference";
 
 const realFetch = globalThis.fetch;
 let fetchCalls: string[] = [];
-let fetchImpl: (url: string) => Response = () =>
+const successFetchImpl = () =>
   new Response(JSON.stringify({ path: "remote-access", title: "Remote Access", markdown: "Front the **gateway port**." }), {
     status: 200,
     headers: { "content-type": "application/json" }
   });
+let fetchImpl: (url: string) => Response = successFetchImpl;
 
 beforeEach(() => {
   fetchCalls = [];
+  // fetchImpl is per-test mutable state — restore the success default so a
+  // test that swaps in a failure response can't leak it into later tests.
+  fetchImpl = successFetchImpl;
   globalThis.fetch = ((input: RequestInfo | URL) => {
     const url = String(input);
     fetchCalls.push(url);

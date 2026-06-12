@@ -7,8 +7,8 @@
 // case — and both copy outcomes (success flips to "Copied" and back; an
 // unavailable clipboard silently no-ops).
 
-import { beforeEach, describe, expect, mock, test } from "bun:test";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, jest, mock, test } from "bun:test";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { EmailDraftCard } from "./EmailDraftCard";
 
 const writeText = mock((_: string) => Promise.resolve());
@@ -20,6 +20,12 @@ beforeEach(() => {
     value: { writeText },
     configurable: true
   });
+});
+
+// The copy test enables fake timers; always restore real timers so a failure
+// can't leak the fake clock into the next test.
+afterEach(() => {
+  jest.useRealTimers();
 });
 
 describe("EmailDraftCard", () => {
@@ -47,12 +53,19 @@ describe("EmailDraftCard", () => {
   // fireEvent (not userEvent) for the copy tests: userEvent.setup() installs
   // its own navigator.clipboard stub, which would shadow the mock under test.
   test("copy writes the trimmed raw draft and flips to Copied, then back", async () => {
+    jest.useFakeTimers();
     render(<EmailDraftCard raw={"To: a@b.c\n\nbody"} />);
     fireEvent.click(screen.getByRole("button", { name: "Copy draft" }));
-    await waitFor(() => expect(writeText).toHaveBeenCalledWith("To: a@b.c\n\nbody"));
-    await waitFor(() => expect(screen.queryByText("Copied")).not.toBeNull());
-    // The 1.5s timer restores the idle label.
-    await waitFor(() => expect(screen.queryByText("Copy")).not.toBeNull(), { timeout: 3000 });
+    // Flush onCopy's continuation (await writeText -> setCopied(true)).
+    await act(async () => {});
+    expect(writeText).toHaveBeenCalledWith("To: a@b.c\n\nbody");
+    expect(screen.queryByText("Copied")).not.toBeNull();
+    // Fire the setTimeout(1500) revert on the fake clock instead of burning
+    // real wall-clock.
+    await act(async () => {
+      jest.advanceTimersByTime(1500);
+    });
+    expect(screen.queryByText("Copy")).not.toBeNull();
   });
 
   test("an unavailable clipboard is a silent no-op", async () => {
