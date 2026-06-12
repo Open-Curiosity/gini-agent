@@ -1213,7 +1213,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "update_job",
-      description: "Patch an existing scheduled job in place. Use this — NOT delete+create — when the user wants to change a job's schedule, prompt, name, status, or auto-approve envelope; this preserves the job id, its dedicated chat thread, and run history. Supply only the fields you want to change. Schedule transitions follow the same mutual-exclusion rule as create_job: a single patch may not set BOTH a positive intervalSeconds AND a cronExpression. To switch a job between cron-driven and interval-driven, pass the new driver and set the other to null (e.g. `{cronExpression: '0 9 * * *', cronTimezone: 'America/Los_Angeles', intervalSeconds: null}`). Call list_jobs first if you don't already know the jobId.",
+      description: "Patch an existing scheduled job in place. Use this — NOT delete+create — when the user wants to change a job's schedule, prompt, name, status, skill attachments, or auto-approve envelope; this preserves the job id, its dedicated chat thread, and run history. Supply only the fields you want to change. Schedule transitions follow the same mutual-exclusion rule as create_job: a single patch may not set BOTH a positive intervalSeconds AND a cronExpression. To switch a job between cron-driven and interval-driven, pass the new driver and set the other to null (e.g. `{cronExpression: '0 9 * * *', cronTimezone: 'America/Los_Angeles', intervalSeconds: null}`). Call list_jobs first if you don't already know the jobId.",
       parameters: {
         type: "object",
         properties: {
@@ -1227,7 +1227,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           skillNames: {
             type: ["array", "null"],
             items: { type: "string" },
-            description: "Optional new skill attachments (FULL replacement — supply every skill the job should keep; pass [] (or null) to clear). Attached skills' full instructions are loaded into every run, so each fire follows the skill's recipe instead of rediscovering CLI usage. Call list_jobs first to see the job's current skillNames."
+            description: "Optional new skill attachments (FULL replacement — supply every skill the job should keep; pass [] (or null) to clear). Attached skills' full instructions are loaded into every run, so each fire follows the skill's recipe instead of rediscovering CLI usage. Pick by each skill's listed description, choosing the OPERATING recipes the fire will follow at run time. Never attach one-time setup/installation skills (anything described as 'setup', 'install', or 'sign in'); setup is already done by the time the job fires. Call list_jobs first to see the job's current skillNames."
           },
           status: { type: "string", enum: ["active", "paused"], description: "Optional pause/resume. 'paused' stops the scheduler from firing the job; 'active' resumes it." },
           autoApproveCommands: { type: "array", items: { type: "string" }, description: "Optional new list of auto-approve shell patterns for unattended fires." },
