@@ -17,6 +17,19 @@ gateway API:
   build aborts the update like a failed install: no restart is scheduled
   and the old servers keep running.
 
+The update's long steps (the `git fetch`, both `bun install`s, and the web
+build — 40-90s+ together) run as **awaited async spawns**, never
+`spawnSync`: the handler must not block the gateway's event loop, or the
+gateway stops answering `/api/status` for the whole window and the watchdog
+reads a healthy-but-updating gateway as dead. Updates are **single-flight**
+— a second `POST /api/update` while one is running gets a structured 409
+("gini update already in progress") instead of interleaving git/install
+steps. For the duration of `updateRuntime`, an **update-in-progress marker**
+(`~/.gini/update-in-progress`, machine-global because the installed runtime
+is shared) tells the watchdog to suppress revive actions; the marker is
+removed when the update settles and goes stale after 15 minutes (see
+[Always-Up Supervision](always-up-supervision.md)).
+
 The CLI `gini update` keeps the same installer-managed target
 (`~/.gini/runtime`) but no longer asks the operator to run
 `gini stop && gini start`. If the selected instance is running and the
@@ -116,6 +129,10 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   ppid) have both answered, and the blur survives the restart-triggered
   reload rather than briefly exposing the app.
 - `gini update` no longer prints a manual restart instruction.
+- The gateway answers `/api/status` while a `POST /api/update` is running;
+  a concurrent `POST /api/update` returns 409; the update-in-progress
+  marker exists exactly for the duration of `updateRuntime` (removed on
+  success and on failure).
 - After a non-upToDate update, `web/` contains exactly one `.next-prod-*`
   dir keyed to the new HEAD's short sha; a failed web build surfaces a
   structured error and schedules no restart.

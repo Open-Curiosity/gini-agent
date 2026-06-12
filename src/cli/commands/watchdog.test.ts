@@ -21,12 +21,12 @@
 // report queued) on the one and only tick.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { watchdog, WATCHDOG_TICK_INTERVAL_MS } from "./watchdog";
+import { watchdog, UPDATE_MARKER_STALE_MS, WATCHDOG_TICK_INTERVAL_MS } from "./watchdog";
 import type { CliContext } from "../context";
 import type { LaunchctlResult, PlistKind } from "../../integrations/launchd";
-import { runtimePortPath, webPortPath } from "../../paths";
+import { logDir, runtimePortPath, updateInProgressMarkerPath, webPortPath } from "../../paths";
 import { listPendingReports } from "../../runtime/crash-report";
 
 function tag(): string {
@@ -615,6 +615,60 @@ describe("watchdog", () => {
     // (suppressed), tick 4 clears the episode, tick 6 confirms a fresh outage
     // and reports again, tick 7 is suppressed.
     expect(listPendingReports().length).toBe(2);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("a fresh update-in-progress marker suppresses revives AND the web report despite sustained failures", async () => {
+    writePorts();
+    // updateRuntime writes this for the duration of the install/build window;
+    // probe misses there are expected and a kickstart -k would force-kill the
+    // mid-update service.
+    writeFileSync(updateInProgressMarkerPath(), "2026-06-12T00:00:00.000Z\n");
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => false,
+      probeWeb: async () => false,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      maxTicks: 3,
+      sleep: async () => {}
+    });
+    // Three failed ticks for both services, zero revive actions and zero
+    // queued reports — only suppression entries in the tick log.
+    expect(kicks.length).toBe(0);
+    expect(listPendingReports().length).toBe(0);
+    const tickLog = readFileSync(join(logDir(INSTANCE), "runtime.jsonl"), "utf8");
+    expect(tickLog).toContain("suppressed:update:gateway");
+    expect(tickLog).toContain("suppressed:update:web");
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("a STALE marker does not suppress: revives proceed as normal", async () => {
+    writePorts();
+    writeFileSync(updateInProgressMarkerPath(), "2026-06-12T00:00:00.000Z\n");
+    // The injected clock sits past the staleness cutoff relative to the
+    // marker's just-written mtime — a crashed update that never removed its
+    // marker must not disarm the watchdog forever.
+    const clock = () => new Date(Date.now() + UPDATE_MARKER_STALE_MS + 60_000);
+    const kicks: PlistKind[] = [];
+    await watchdog(ctxFor([]), {
+      probeRuntime: async () => false,
+      probeWeb: async () => true,
+      kickstartImpl: (_instance, kind) => {
+        kicks.push(kind);
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => true,
+      supervisorImpl: () => "launchd",
+      clock,
+      maxTicks: 2,
+      sleep: async () => {}
+    });
+    expect(kicks).toEqual(["gateway"]);
     expect(process.exitCode).toBe(0);
   });
 

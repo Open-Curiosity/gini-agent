@@ -9,8 +9,11 @@ import {
   formatInstallFailure,
   resolveWebProdDistDir,
   scheduleRuntimeRestart,
-  WEB_PROD_DIST_PREFIX
+  updateRuntime,
+  WEB_PROD_DIST_PREFIX,
+  type RunStepImpl
 } from "./update";
+import { updateInProgressMarkerPath } from "../paths";
 
 function scratch(tag: string): string {
   const dir = `/tmp/gini-runtime-update-tests/${tag}-${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -99,17 +102,17 @@ describe("web production bundle", () => {
   // Records build invocations; `status` controls the simulated exit code.
   function makeBuildRecorder(status = 0) {
     const calls: Array<{ cmd: string; args: string[]; cwd?: string; distDir?: string }> = [];
-    const spawnImpl = ((cmd: string, args: readonly string[], options: { cwd?: string; env?: Record<string, string> }) => {
+    const runStepImpl: RunStepImpl = async (cmd, args, options) => {
       calls.push({ cmd, args: [...args], cwd: options.cwd, distDir: options.env?.GINI_DIST_DIR });
       return { status, stdout: "", stderr: status === 0 ? "" : "next build exploded" };
-    }) as unknown as typeof spawnSync;
-    return { calls, spawnImpl };
+    };
+    return { calls, runStepImpl };
   }
 
-  test("builds into the sha-keyed dist dir via bun run build", () => {
+  test("builds into the sha-keyed dist dir via bun run build", async () => {
     const runtimeDir = makeRuntimeDir();
-    const { calls, spawnImpl } = makeBuildRecorder();
-    const result = buildWebProdBundle(runtimeDir, SHA, "pipe", { spawnImpl });
+    const { calls, runStepImpl } = makeBuildRecorder();
+    const result = await buildWebProdBundle(runtimeDir, SHA, "pipe", { runStepImpl });
     expect(result).toEqual({ distDir: `${WEB_PROD_DIST_PREFIX}${SHA}`, built: true });
     expect(calls.length).toBe(1);
     expect(calls[0]!.cmd).toBe("bun");
@@ -118,33 +121,33 @@ describe("web production bundle", () => {
     expect(calls[0]!.distDir).toBe(`${WEB_PROD_DIST_PREFIX}${SHA}`);
   });
 
-  test("skips the build when the sha dir already carries a BUILD_ID (idempotent re-update)", () => {
+  test("skips the build when the sha dir already carries a BUILD_ID (idempotent re-update)", async () => {
     const runtimeDir = makeRuntimeDir();
     markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}${SHA}`);
-    const { calls, spawnImpl } = makeBuildRecorder();
-    const result = buildWebProdBundle(runtimeDir, SHA, "pipe", { spawnImpl });
+    const { calls, runStepImpl } = makeBuildRecorder();
+    const result = await buildWebProdBundle(runtimeDir, SHA, "pipe", { runStepImpl });
     expect(result).toEqual({ distDir: `${WEB_PROD_DIST_PREFIX}${SHA}`, built: false });
     expect(calls.length).toBe(0);
   });
 
-  test("GCs other prod dist dirs on success, leaving the current bundle and dev dirs alone", () => {
+  test("GCs other prod dist dirs on success, leaving the current bundle and dev dirs alone", async () => {
     const runtimeDir = makeRuntimeDir();
     markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}${SHA}`);
     markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}0ldsha0000000`);
     // A dev dist dir must never be GC'd — it belongs to `next dev` fallback.
     mkdirSync(join(runtimeDir, "web", ".next-default"), { recursive: true });
-    const { spawnImpl } = makeBuildRecorder();
-    buildWebProdBundle(runtimeDir, SHA, "pipe", { spawnImpl });
+    const { runStepImpl } = makeBuildRecorder();
+    await buildWebProdBundle(runtimeDir, SHA, "pipe", { runStepImpl });
     expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}${SHA}`))).toBe(true);
     expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}0ldsha0000000`))).toBe(false);
     expect(existsSync(join(runtimeDir, "web", ".next-default"))).toBe(true);
   });
 
-  test("a failed build throws (so updateRuntime aborts before scheduling a restart) and GCs nothing", () => {
+  test("a failed build throws (so updateRuntime aborts before scheduling a restart) and GCs nothing", async () => {
     const runtimeDir = makeRuntimeDir();
     markBuilt(runtimeDir, `${WEB_PROD_DIST_PREFIX}0ldsha0000000`);
-    const { spawnImpl } = makeBuildRecorder(1);
-    expect(() => buildWebProdBundle(runtimeDir, SHA, "pipe", { spawnImpl })).toThrow(/bun run build in web\/ failed/);
+    const { runStepImpl } = makeBuildRecorder(1);
+    await expect(buildWebProdBundle(runtimeDir, SHA, "pipe", { runStepImpl })).rejects.toThrow(/bun run build in web\/ failed/);
     // The old (still-servable-by-the-old-process) bundle survives a failure.
     expect(existsSync(join(runtimeDir, "web", `${WEB_PROD_DIST_PREFIX}0ldsha0000000`))).toBe(true);
   });
@@ -184,6 +187,95 @@ describe("web production bundle", () => {
     // No .git at all (fresh tarball-style dir) -> dev fallback.
     const plain = scratch("resolve-plain");
     expect(resolveWebProdDistDir(plain)).toBeNull();
+  });
+});
+
+// updateRuntime end-to-end against a scratch git repo. The fast local git
+// calls (rev-parse, reset --hard) run real git; the long steps (fetch, the
+// installs, the build) go through the injected async runner so nothing slow
+// or networked runs. GINI_STATE_ROOT is pinned to a scratch dir so the
+// update-in-progress marker lands there.
+describe("updateRuntime", () => {
+  let stateRoot: string;
+  let prevStateRoot: string | undefined;
+
+  beforeEach(() => {
+    stateRoot = scratch("update-state");
+    prevStateRoot = process.env.GINI_STATE_ROOT;
+    process.env.GINI_STATE_ROOT = stateRoot;
+  });
+
+  afterEach(() => {
+    restoreEnv("GINI_STATE_ROOT", prevStateRoot);
+    rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  // A repo whose origin/HEAD resolves locally: the stubbed fetch never
+  // creates remote-tracking refs, so point origin/HEAD at the local HEAD —
+  // the sync `git reset --hard origin/HEAD` step then succeeds (up to date).
+  function makeUpdateRepo(): string {
+    const dir = scratch("update-repo");
+    initRepo(dir, "https://github.com/Lilac-Labs/gini-agent");
+    spawnSync("git", [
+      "-C", dir,
+      "-c", "user.email=test@example.invalid",
+      "-c", "user.name=test",
+      "commit", "--allow-empty", "-m", "init", "--quiet"
+    ]);
+    spawnSync("git", ["-C", dir, "update-ref", "refs/remotes/origin/main", "HEAD"]);
+    spawnSync("git", ["-C", dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+    return dir;
+  }
+
+  const okStep = { status: 0, stdout: "", stderr: "" };
+
+  test("runs the long steps through the awaited runner, with the marker present for the duration", async () => {
+    const runtimeDir = makeUpdateRepo();
+    const calls: string[] = [];
+    let markerSeenDuringSteps = true;
+    const runStepImpl: RunStepImpl = async (cmd, args) => {
+      calls.push([cmd, ...args].join(" "));
+      markerSeenDuringSteps &&= existsSync(updateInProgressMarkerPath());
+      return okStep;
+    };
+
+    const result = await updateRuntime(runtimeDir, { runStepImpl });
+
+    expect(result.upToDate).toBe(true);
+    expect(result.commitCount).toBe("0");
+    // git fetch + root bun install (no web/package.json in the scratch repo).
+    expect(calls).toEqual([`git -C ${runtimeDir} fetch origin`, "bun install"]);
+    // The marker covered every long step and is gone once the update settles.
+    expect(markerSeenDuringSteps).toBe(true);
+    expect(existsSync(updateInProgressMarkerPath())).toBe(false);
+  });
+
+  test("a failed step rejects AND removes the marker (no permanent watchdog suppression)", async () => {
+    const runtimeDir = makeUpdateRepo();
+    const runStepImpl: RunStepImpl = async (cmd) =>
+      cmd === "bun" ? { status: 1, stdout: "", stderr: "install exploded" } : okStep;
+
+    await expect(updateRuntime(runtimeDir, { runStepImpl })).rejects.toThrow(/bun install failed/);
+    expect(existsSync(updateInProgressMarkerPath())).toBe(false);
+  });
+
+  test("single-flight: a second update while one is in flight rejects, and the guard clears after settle", async () => {
+    const runtimeDir = makeUpdateRepo();
+    const gate = Promise.withResolvers<void>();
+    const first = updateRuntime(runtimeDir, {
+      runStepImpl: async () => {
+        await gate.promise;
+        return okStep;
+      }
+    });
+
+    await expect(updateRuntime(runtimeDir, { runStepImpl: async () => okStep })).rejects.toThrow(/already in progress/);
+
+    gate.resolve();
+    await first;
+    // The in-flight guard cleared: a fresh update runs to completion.
+    const again = await updateRuntime(runtimeDir, { runStepImpl: async () => okStep });
+    expect(again.upToDate).toBe(true);
   });
 });
 
