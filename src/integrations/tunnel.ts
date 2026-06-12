@@ -414,6 +414,23 @@ export function makeDefaultDrivers(
       // `tailscale serve --bg` persists in tailscaled (no child to supervise)
       // and is idempotent, which is also what makes the boot resume safe.
       connect: async (port) => {
+        // The serve config is a MACHINE-global singleton: a sibling Gini
+        // instance (or the operator's own serve) may already front 443 to a
+        // different local port. Refuse instead of silently stealing that
+        // front — our later disconnect would also tear THEIRS down. A proxy
+        // already pointing at OUR port is the boot-resume case and proceeds.
+        // Best-effort: if the status probe itself fails, connect proceeds.
+        const claimed = await run(["tailscale", "serve", "status", "--json"], DETECT_TIMEOUT_MS).catch(() => null);
+        if (claimed && claimed.exitCode === 0) {
+          const proxies = [...claimed.stdout.matchAll(/"Proxy":\s*"http:\/\/127\.0\.0\.1:(\d+)"/g)].map((m) => Number(m[1]));
+          const foreign = proxies.find((p) => p !== port);
+          if (foreign !== undefined) {
+            throw new Error(
+              `tailscale serve already fronts 127.0.0.1:${foreign} (another instance or a manually-run serve) — ` +
+              `disconnect that first, or use a different provider here.`
+            );
+          }
+        }
         const serve = await run(["tailscale", "serve", "--bg", `http://127.0.0.1:${port}`]);
         if (serve.exitCode !== 0) {
           throw new Error(`tailscale serve failed: ${(serve.stderr || serve.stdout).trim()}`);

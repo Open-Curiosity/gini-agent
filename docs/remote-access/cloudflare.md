@@ -7,6 +7,8 @@ Two modes, picked automatically when you tap **Connect**:
 
 Both modes terminate TLS at Cloudflare's edge, so Cloudflare can observe everything proxied — cookies, device tokens, and chat/task content.
 
+> **Named tunnels: one instance per machine.** `~/.cloudflared/config.yml` names one tunnel/hostname, and Cloudflare load-balances across every running connector — two Gini instances both running it would split the hostname's traffic between two different gateways (and two different device-pairing stores). Connect the named tunnel from at most one instance; quick tunnels mint distinct URLs and don't collide.
+
 ## Set it up
 
 1. Install cloudflared: `brew install cloudflared`.

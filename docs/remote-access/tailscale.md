@@ -2,6 +2,8 @@
 
 Private to your tailnet — no public exposure, TLS terminates on your own machine (Tailscale never sees plaintext), and the URL is stable forever. The recommended option when every device that needs Gini can join your tailnet.
 
+> **One instance per machine.** The serve config is machine-global (one `https://<machine>.ts.net` front), so only one Gini instance can be connected via Tailscale at a time. Connect refuses when the serve config already fronts a different local port — disconnect that instance (or your own manual serve) first.
+
 ## Set it up
 
 1. Install Tailscale: `brew install tailscale` (or the Mac App Store app).

@@ -2336,6 +2336,7 @@ describe("makeDefaultDrivers", () => {
 
   test("tailscale: connect serves the gateway port and reports the ts.net URL; disconnect turns serve off", async () => {
     const script = runScript({
+      "tailscale serve status --json": { exitCode: 0, stdout: "{}" },
       "tailscale serve --bg http://127.0.0.1:7342": { exitCode: 0 },
       "tailscale status --json": { exitCode: 0, stdout: TS_STATUS_RUNNING },
       "tailscale serve --https=443 off": { exitCode: 0 }
@@ -2344,10 +2345,37 @@ describe("makeDefaultDrivers", () => {
     expect(await driver.connect(7342)).toEqual({ url: "https://mac.tail-test.ts.net" });
     await driver.disconnect!();
     expect(script.calls).toEqual([
+      "tailscale serve status --json",
       "tailscale serve --bg http://127.0.0.1:7342",
       "tailscale status --json",
       "tailscale serve --https=443 off"
     ]);
+  });
+
+  test("tailscale: connect refuses when serve already fronts a DIFFERENT port", async () => {
+    // The serve config is machine-global: a sibling instance's front must
+    // not be silently stolen (and later torn down by our disconnect).
+    const foreign = runScript({
+      "tailscale serve status --json": {
+        exitCode: 0,
+        stdout: JSON.stringify({ Web: { "mac.tail-test.ts.net:443": { Handlers: { "/": { Proxy: "http://127.0.0.1:9999" } } } } })
+      }
+    });
+    await expect(makeDefaultDrivers(foreign.run).tailscale.connect(7342)).rejects.toThrow("already fronts 127.0.0.1:9999");
+    // The refusal happens BEFORE any serve --bg is issued.
+    expect(foreign.calls).toEqual(["tailscale serve status --json"]);
+  });
+
+  test("tailscale: connect proceeds when the existing serve proxy is OUR port (boot resume)", async () => {
+    const own = runScript({
+      "tailscale serve status --json": {
+        exitCode: 0,
+        stdout: JSON.stringify({ Web: { "mac.tail-test.ts.net:443": { Handlers: { "/": { Proxy: "http://127.0.0.1:7342" } } } } })
+      },
+      "tailscale serve --bg http://127.0.0.1:7342": { exitCode: 0 },
+      "tailscale status --json": { exitCode: 0, stdout: TS_STATUS_RUNNING }
+    });
+    expect(await makeDefaultDrivers(own.run).tailscale.connect(7342)).toEqual({ url: "https://mac.tail-test.ts.net" });
   });
 
   test("tailscale: disconnect throws when serve off exits non-zero (the front may still be live)", async () => {
