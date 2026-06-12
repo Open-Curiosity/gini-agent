@@ -14,9 +14,13 @@
 // authenticates with a raw `authorization: <key>` header — no Bearer.
 //
 // `waitSeconds` (default 0, capped at 240 to stay inside the 5-minute script
-// runner timeout) makes the script poll every 10s until the call completes or
-// the budget runs out; either way the latest mapped details are emitted with
-// ok:true, so the caller re-invokes with the same args until `completed`.
+// runner timeout; numeric strings like "240" are accepted) makes the script
+// poll every 10s until the call completes or the budget runs out; either way
+// the latest mapped details are emitted with ok:true, so the caller re-invokes
+// with the same args until `completed`. While budget remains, transient
+// failures (network errors, timeouts, HTTP 5xx) are retried on the same
+// cadence; 4xx responses — or any failure once the budget is gone, including
+// the single-shot waitSeconds=0 case — hard-fail with ok:false.
 // Self-contained on purpose (no src/ imports): skill scripts must stay portable.
 
 interface Args {
@@ -48,10 +52,11 @@ const POLL_INTERVAL_MS = 10_000;
 // ── Pure helpers (unit-tested) ───────────────────────────────────────────────
 
 // Normalize the optional waitSeconds arg: default 0, clamp to [0, 240].
-// Non-finite values fall back to 0 (single-shot).
+// Numeric strings are coerced; non-finite values fall back to 0 (single-shot).
 export function normalizeWaitSeconds(value: unknown): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
-  return Math.min(Math.max(value, 0), MAX_WAIT_SECONDS);
+  const parsed = typeof value === "string" ? Number(value) : value;
+  if (typeof parsed !== "number" || !Number.isFinite(parsed)) return 0;
+  return Math.min(Math.max(parsed, 0), MAX_WAIT_SECONDS);
 }
 
 // Map Bland's GET /v1/calls/<id> payload to the script result. Note: Bland's
@@ -103,7 +108,9 @@ async function main(): Promise<void> {
   while (true) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-    let result: Result;
+    let result: Result | undefined;
+    let failure: Result | undefined;
+    let transient = false;
     try {
       const response = await fetch(`${BLAND_CALLS_ENDPOINT}/${encodeURIComponent(args.callId)}`, {
         headers: {
@@ -115,19 +122,27 @@ async function main(): Promise<void> {
       const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
       if (!response.ok) {
         const message = typeof payload.message === "string" ? payload.message : undefined;
-        emit({ ok: false, error: message ?? `Bland API returned HTTP ${response.status}` }, 1);
+        failure = { ok: false, error: message ?? `Bland API returned HTTP ${response.status}` };
+        transient = response.status >= 500;
+      } else {
+        result = mapCallDetails(payload);
       }
-      result = mapCallDetails(payload);
     } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") {
-        emit({ ok: false, error: `Bland API request timed out after ${TIMEOUT_MS}ms` }, 1);
-      }
-      emit({ ok: false, error: error instanceof Error ? error.message : String(error) }, 1);
+      transient = true;
+      failure =
+        error instanceof Error && error.name === "AbortError"
+          ? { ok: false, error: `Bland API request timed out after ${TIMEOUT_MS}ms` }
+          : { ok: false, error: error instanceof Error ? error.message : String(error) };
     } finally {
       clearTimeout(timer);
     }
     const remainingMs = deadline - Date.now();
-    if (result.completed === true || remainingMs <= 0) emit(result);
+    if (failure) {
+      // Retry transient failures while budget remains; otherwise hard-fail.
+      if (!transient || remainingMs <= 0) emit(failure, 1);
+    } else if (result && (result.completed === true || remainingMs <= 0)) {
+      emit(result);
+    }
     await Bun.sleep(Math.min(POLL_INTERVAL_MS, remainingMs));
   }
 }
