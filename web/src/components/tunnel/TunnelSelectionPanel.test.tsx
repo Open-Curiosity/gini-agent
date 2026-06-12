@@ -220,11 +220,15 @@ describe("TunnelSelectionPanel", () => {
     expect(screen.queryByRole("button", { name: "Remote Access" })).not.toBeNull();
   });
 
-  test("a disabled row's info toggle reveals its setup steps (works despite the disabled row)", async () => {
+  test("a disabled row's info toggle reveals its setup steps (sibling of the row, so it stays interactive)", async () => {
     const user = userEvent.setup();
     renderPanel();
     expect(screen.queryByText("Set up Tailscale")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Tailscale setup instructions" }));
+    const toggle = screen.getByRole("button", { name: "Tailscale setup instructions" });
+    // The toggle must NOT live inside the aria-disabled row — AT and real
+    // pointer semantics treat descendants of a disabled widget as inert.
+    expect(toggle.closest('[aria-disabled="true"]')).toBeNull();
+    await user.click(toggle);
     expect(screen.queryByText("Set up Tailscale")).not.toBeNull();
     expect(screen.queryByText("Install Tailscale")).not.toBeNull();
     expect(screen.queryByText("tailscale up")).not.toBeNull();

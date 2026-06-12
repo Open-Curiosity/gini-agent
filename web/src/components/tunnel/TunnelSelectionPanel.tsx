@@ -89,6 +89,7 @@ export function TunnelSelectionPanel({
           const setupOpen = setupFor === p.id;
           return (
             <div key={p.id} className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-1.5">
             <div
               role="radio"
               aria-checked={isSelected}
@@ -144,29 +145,6 @@ export function TunnelSelectionPanel({
                       {connected ? "Connected" : "Selected"}
                     </span>
                   )}
-                  {p.setup && p.setup.length > 0 && (
-                    // Info toggle: how to set this provider up (the reason a
-                    // disabled row can't connect, and the exact steps to fix
-                    // it). Lives on enabled rows too so the steps stay
-                    // discoverable. tabIndex 0 even inside a disabled row —
-                    // the instructions are FOR the disabled state.
-                    <button
-                      type="button"
-                      aria-label={`${p.name} setup instructions`}
-                      aria-expanded={setupOpen}
-                      tabIndex={0}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setSetupFor(setupOpen ? null : p.id);
-                      }}
-                      className={cn(
-                        "shrink-0 rounded-full p-0.5 transition-colors hover:text-foreground",
-                        setupOpen ? "text-foreground" : "text-muted-foreground"
-                      )}
-                    >
-                      <Info className="size-3.5" />
-                    </button>
-                  )}
                 </div>
                 {!p.enabled && p.requires && (
                   <span className="text-[11px] text-muted-foreground">Requires {p.requires}</span>
@@ -219,6 +197,26 @@ export function TunnelSelectionPanel({
                   Connect
                 </Button>
               )}
+            </div>
+            {p.setup && p.setup.length > 0 && (
+              // Info toggle: how to set this provider up (the reason a
+              // disabled row can't connect, and the exact steps to fix it).
+              // A SIBLING of the row, not a child — Playwright/AT treat
+              // descendants of aria-disabled as non-interactive, and these
+              // instructions exist precisely FOR the disabled state.
+              <button
+                type="button"
+                aria-label={`${p.name} setup instructions`}
+                aria-expanded={setupOpen}
+                onClick={() => setSetupFor(setupOpen ? null : p.id)}
+                className={cn(
+                  "shrink-0 self-center rounded-full p-1 transition-colors hover:text-foreground",
+                  setupOpen ? "text-foreground" : "text-muted-foreground"
+                )}
+              >
+                <Info className="size-3.5" />
+              </button>
+            )}
             </div>
             {setupOpen && p.setup && (
               <div className="rounded-lg border border-border bg-muted/40 px-3 py-2.5">
