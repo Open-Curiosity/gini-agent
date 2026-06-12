@@ -572,13 +572,11 @@ describe("runtime api", () => {
       const plain = await call(handler, config, "/api/tunnel");
       const plainRow = plain.providers.find((p: { id: string }) => p.id === "tailscale");
       expect(plainRow.enabled).toBe(false);
-      // detect=1 probes the drivers and the row flips (setup steps ride along
-      // for the panel's info affordance).
+      // detect=1 probes the drivers and the row flips.
       const detected = await call(handler, config, "/api/tunnel?detect=1");
       const row = detected.providers.find((p: { id: string }) => p.id === "tailscale");
       expect(row.enabled).toBe(true);
       expect(row.requires).toBeUndefined();
-      expect(Array.isArray(row.setup)).toBe(true);
     } finally {
       setTunnelDeps();
     }
@@ -605,6 +603,9 @@ describe("runtime api", () => {
       expect(response.status).toBe(400);
       const value = await response.json();
       expect(value.error).toContain("not available");
+      // The machine-readable code rides along so clients can branch on the
+      // failure kind (the web UI opens the provider's guide on this code).
+      expect(value.code).toBe("provider_unavailable");
     } finally {
       setTunnelDeps();
     }

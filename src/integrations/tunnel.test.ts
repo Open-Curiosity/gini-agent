@@ -28,6 +28,7 @@ import {
   makeDefaultDeps,
   makeDefaultDrivers,
   parseCloudflareConfig,
+  PROVIDER_UNAVAILABLE,
   reconcileTunnelOnStartup,
   refreshProviderDetection,
   selectProvider,
@@ -272,7 +273,8 @@ describe("tunnel integration", () => {
 
   // The catalog values must match the agreed contract exactly: only
   // gini-relay enabled (until detection finds a manual CLI); the rest disabled
-  // with a `requires` reason and `setup` steps for the panel's info affordance.
+  // with a `requires` reason. Setup guidance lives in docs/remote-access/<id>.md,
+  // not in the catalog.
   test("provider catalog matches the agreed shape", () => {
     const byId = Object.fromEntries(getTunnel(config).providers.map((p) => [p.id, p]));
     expect(byId["gini-relay"]).toEqual({ id: "gini-relay", name: "Gini Relay", enabled: true });
@@ -280,23 +282,19 @@ describe("tunnel integration", () => {
       id: "tailscale",
       name: "Tailscale",
       enabled: false,
-      requires: "Tailscale network",
-      setup: byId.tailscale.setup
+      requires: "Tailscale network"
     });
-    expect(byId.tailscale.setup?.length).toBeGreaterThan(0);
     expect(byId.ngrok).toEqual({
       id: "ngrok",
       name: "ngrok",
       enabled: false,
-      requires: "ngrok account",
-      setup: byId.ngrok.setup
+      requires: "ngrok account"
     });
     expect(byId.cloudflare).toEqual({
       id: "cloudflare",
       name: "Cloudflare",
       enabled: false,
-      requires: "cloudflared CLI",
-      setup: byId.cloudflare.setup
+      requires: "cloudflared CLI"
     });
   });
 
@@ -1262,13 +1260,12 @@ describe("manual tunnel drivers", () => {
     rmSync(`${ROOT}/instances/${config.instance}`, { recursive: true, force: true });
   });
 
-  test("refreshProviderDetection flips detected rows enabled (keeping setup) and drops their requires", async () => {
+  test("refreshProviderDetection flips detected rows enabled and drops their requires", async () => {
     setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale: scriptedDriver() }) }));
     await refreshProviderDetection();
     const byId = Object.fromEntries(getTunnel(config).providers.map((p) => [p.id, p]));
     expect(byId.tailscale.enabled).toBe(true);
     expect(byId.tailscale.requires).toBeUndefined();
-    expect(byId.tailscale.setup?.length).toBeGreaterThan(0);
     expect(byId.ngrok.enabled).toBe(false);
     expect(byId.ngrok.requires).toBe("ngrok account");
   });
@@ -1283,7 +1280,6 @@ describe("manual tunnel drivers", () => {
     const byId = Object.fromEntries(getTunnel(config).providers.map((p) => [p.id, p]));
     expect(byId.cloudflare.enabled).toBe(false);
     expect(byId.cloudflare.requires).toBe("cloudflared CLI");
-    expect(byId.cloudflare.setup?.length).toBeGreaterThan(0);
   });
 
   test("detection results inside the TTL are reused; concurrent callers share one probe", async () => {
@@ -1620,17 +1616,19 @@ describe("manual tunnel drivers", () => {
     expect(state.selectedProvider).toBe("tailscale");
   });
 
-  test("the catalog carries setup steps for every manual provider, enabled or not", async () => {
-    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale: scriptedDriver() }) }));
-    await refreshProviderDetection();
-    const byId = Object.fromEntries(getTunnel(config).providers.map((p) => [p.id, p]));
-    expect(byId["gini-relay"].setup).toBeUndefined();
-    // Enabled and disabled rows both carry their host-side steps.
-    expect(byId.tailscale.enabled).toBe(true);
-    expect(byId.tailscale.setup?.[0]).toContain("Install Tailscale");
-    expect(byId.ngrok.enabled).toBe(false);
-    expect(byId.ngrok.setup?.some((s) => s.includes("authtoken"))).toBe(true);
-    expect(byId.cloudflare.setup?.[0]).toContain("Install cloudflared");
+  test("an unavailable connect rejects with the provider_unavailable code (clients branch on it)", async () => {
+    setTunnelDeps(deps({
+      drivers: fakeDrivers({
+        ngrok: scriptedDriver({ detect: () => Promise.resolve({ enabled: false, requires: "ngrok account" }) })
+      })
+    }));
+    expect.assertions(2);
+    try {
+      await connectTunnel(config, "ngrok");
+    } catch (error) {
+      expect((error as Error).message).toContain("requires ngrok account");
+      expect((error as Error & { code?: string }).code).toBe(PROVIDER_UNAVAILABLE);
+    }
   });
 
   test("switching providers away from a live childless manual tunnel tears down its provider state", async () => {

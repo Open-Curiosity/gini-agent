@@ -3,10 +3,13 @@
 import { useEffect, useState } from "react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useIsMobile } from "@/lib/use-is-mobile";
+import { DocSheet } from "@/components/DocSheet";
 import { TunnelTrigger } from "./TunnelTrigger";
 import { TunnelSelectionPanel } from "./TunnelSelectionPanel";
 import { TunnelConnectedPopover } from "./TunnelConnectedPopover";
+import { CONNECTOR_DOC_URLS } from "./connector-docs";
 import { useTunnel } from "./useTunnel";
+import type { TunnelProviderId } from "./types";
 
 /**
  * Anchors the tunnel popover to the trigger and renders the correct view from
@@ -20,6 +23,19 @@ export function TunnelMenu() {
   const { state, error, select, connect, cancel, disconnect, refresh } = useTunnel();
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(false);
+  // Which connector's setup guide is open. Connect is the single affordance:
+  // the gateway re-checks the prerequisite on every attempt (so a freshly
+  // installed CLI just works), and a `provider_unavailable` rejection opens
+  // that connector's guide (docs/remote-access/<id>.md) instead of leaving
+  // only the error banner.
+  const [guideFor, setGuideFor] = useState<TunnelProviderId | null>(null);
+  const handleConnect = (provider?: TunnelProviderId) => {
+    void connect(provider).then((result) => {
+      if (!result.ok && result.code === "provider_unavailable" && provider) {
+        setGuideFor(provider);
+      }
+    });
+  };
   // The trigger now lives in the sidebar footer. Open the popover to the right
   // (into the content area) on desktop; on mobile the sidebar is a full-width
   // Sheet, so a side placement would push the 24rem popover off-screen — open it
@@ -98,7 +114,7 @@ export function TunnelMenu() {
               <TunnelSelectionPanel
                 state={state}
                 onSelect={select}
-                onConnect={connect}
+                onConnect={handleConnect}
                 onCancel={cancel}
                 onDisconnect={disconnect}
                 onClose={dismissSelection}
@@ -106,6 +122,25 @@ export function TunnelMenu() {
             )}
           </div>
         </div>
+        {guideFor && (
+          <DocSheet
+            url={CONNECTOR_DOC_URLS[guideFor]}
+            open
+            onOpenChange={(next) => {
+              if (!next) setGuideFor(null);
+            }}
+            lead={
+              <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-foreground">
+                This provider isn&apos;t ready on this machine yet
+                {state.providers.find((p) => p.id === guideFor)?.requires
+                  ? ` — it requires ${state.providers.find((p) => p.id === guideFor)?.requires}`
+                  : ""}
+                . Follow the guide below, then tap Connect again — availability is re-checked on
+                every attempt.
+              </p>
+            }
+          />
+        )}
       </PopoverContent>
     </Popover>
   );

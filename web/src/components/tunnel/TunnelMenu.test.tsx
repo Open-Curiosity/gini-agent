@@ -35,7 +35,7 @@ function makeState(over: Partial<TunnelState> = {}): TunnelState {
 
 const actions = {
   select: mock(() => {}),
-  connect: mock(() => {}),
+  connect: mock(async (): Promise<{ ok: true } | { ok: false; message: string; code?: string }> => ({ ok: true })),
   cancel: mock(() => {}),
   disconnect: mock(() => {}),
   refresh: mock(() => {})
@@ -54,6 +54,7 @@ const { TunnelMenu } = await import("./TunnelMenu");
 
 beforeEach(() => {
   for (const fn of Object.values(actions)) fn.mockClear();
+  actions.connect.mockImplementation(async () => ({ ok: true }));
   controller = { state: makeState(), loading: false, error: null, ...actions };
   globalThis.fetch = mock(
     async () =>
@@ -207,5 +208,52 @@ describe("TunnelMenu", () => {
     const alert = screen.queryByRole("alert");
     expect(alert).not.toBeNull();
     expect(alert?.textContent).toContain("Tunnel connect failed");
+  });
+
+  test("Connect on an unavailable provider opens THAT connector's setup guide sheet", async () => {
+    const user = userEvent.setup();
+    // The doc fetch must resolve a DocSection; everything else (pair-request
+    // polling) keeps the empty default.
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/docs/")) {
+        return new Response(
+          JSON.stringify({ path: "remote-access/tailscale", title: "Tailscale", markdown: "Install **Tailscale** and join your tailnet." }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+      }
+      return new Response(JSON.stringify({ requests: [] }), { headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    actions.connect.mockImplementation(async () => ({
+      ok: false,
+      message: "Tunnel provider Tailscale is not available (requires Tailscale network).",
+      code: "provider_unavailable"
+    }));
+    render(<TunnelMenu />);
+    await open(user, "Open tunnel");
+    // The unavailable row's Connect is LIVE — tapping it attempts the connect
+    // (fresh server-side prerequisite check) and the rejection opens the guide.
+    await user.click(screen.getByRole("button", { name: "Connect Tailscale" }));
+    expect(actions.connect).toHaveBeenCalledWith("tailscale");
+    // The guide sheet carries the dynamic availability lead + the doc body.
+    await screen.findByText(/isn't ready on this machine yet/);
+    expect(screen.queryByText(/requires Tailscale network/)).not.toBeNull();
+    await screen.findByText(/join your tailnet/);
+    // Connector-scoped: the guide fetched is tailscale's page.
+    const fetched = (globalThis.fetch as unknown as ReturnType<typeof mock>).mock.calls.map((c) => String(c[0]));
+    expect(fetched.some((u) => u.endsWith("/docs/remote-access/tailscale"))).toBe(true);
+    // Dismissing the guide clears it; the popover (with the panel) remains.
+    await user.keyboard("{Escape}");
+    expect(screen.queryByText(/isn't ready on this machine yet/)).toBeNull();
+  });
+
+  test("Connect failing for any OTHER reason shows the banner without opening a guide", async () => {
+    const user = userEvent.setup();
+    actions.connect.mockImplementation(async () => ({ ok: false, message: "relay handshake failed" }));
+    render(<TunnelMenu />);
+    await open(user, "Open tunnel");
+    await user.click(screen.getByRole("button", { name: "Connect Gini Relay" }));
+    expect(actions.connect).toHaveBeenCalledWith("gini-relay");
+    expect(screen.queryByText(/isn't ready on this machine yet/)).toBeNull();
   });
 });

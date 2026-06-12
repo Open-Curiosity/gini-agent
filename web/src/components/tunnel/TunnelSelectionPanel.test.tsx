@@ -16,15 +16,9 @@ import { TunnelSelectionPanel } from "./TunnelSelectionPanel";
 
 const PROVIDERS: TunnelProvider[] = [
   { id: "gini-relay", name: "Gini Relay", enabled: true },
-  {
-    id: "tailscale",
-    name: "Tailscale",
-    enabled: false,
-    requires: "Tailscale network",
-    setup: ["Install Tailscale", "tailscale up"]
-  },
-  { id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account", setup: ["Install ngrok", "Add your authtoken"] },
-  { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "Cloudflare account", setup: ["Install cloudflared"] }
+  { id: "tailscale", name: "Tailscale", enabled: false, requires: "Tailscale network" },
+  { id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account" },
+  { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "Cloudflare account" }
 ];
 
 function makeState(over: Partial<TunnelState> = {}): TunnelState {
@@ -77,20 +71,32 @@ describe("TunnelSelectionPanel", () => {
     expect(within(row("Gini Relay")).queryByText("Selected")).not.toBeNull();
   });
 
-  test("disabled rows show their requirement and are aria-disabled and untabbable", () => {
+  test("unavailable rows show their requirement and an aria-disabled, untabbable radio", () => {
     renderPanel();
-    expect(screen.queryByText("Requires Tailscale network")).not.toBeNull();
-    expect(screen.queryByText("Requires ngrok account")).not.toBeNull();
-    expect(screen.queryByText("Requires Cloudflare account")).not.toBeNull();
+    expect(screen.queryByText(/Requires Tailscale network/)).not.toBeNull();
+    expect(screen.queryByText(/Requires ngrok account/)).not.toBeNull();
+    expect(screen.queryByText(/Requires Cloudflare account/)).not.toBeNull();
     const disabled = row("Tailscale");
     expect(disabled.getAttribute("aria-disabled")).toBe("true");
     expect(disabled.getAttribute("tabindex")).toBe("-1");
   });
 
-  test("non-selected rows render a disabled Connect button", () => {
+  test("EVERY row's Connect is live — an unavailable provider's Connect routes onConnect (the gateway re-checks and the owner opens the guide)", async () => {
+    const user = userEvent.setup();
     renderPanel();
     const tailscaleConnect = screen.getByRole("button", { name: "Connect Tailscale" });
-    expect((tailscaleConnect as HTMLButtonElement).disabled).toBe(true);
+    expect((tailscaleConnect as HTMLButtonElement).disabled).toBe(false);
+    await user.click(tailscaleConnect);
+    expect(handlers.onConnect).toHaveBeenCalledWith("tailscale");
+    // Connect must not also select the (unselectable) row.
+    expect(handlers.onSelect).not.toHaveBeenCalled();
+  });
+
+  test("a non-selected ENABLED row's Connect routes onConnect directly (connect implies select)", async () => {
+    const user = userEvent.setup();
+    renderPanel({ selectedProvider: null });
+    await user.click(screen.getByRole("button", { name: "Connect Gini Relay" }));
+    expect(handlers.onConnect).toHaveBeenCalledWith("gini-relay");
   });
 
   test("clicking an enabled, non-selected row selects it", async () => {
@@ -165,11 +171,13 @@ describe("TunnelSelectionPanel", () => {
     expect(handlers.onSelect).not.toHaveBeenCalled();
   });
 
-  test("connecting: non-selected rows and Save are disabled", () => {
+  test("connecting: non-selected rows, their Connects, and Save are disabled", () => {
     renderPanel({ status: "connecting" });
     const tailscale = row("Tailscale");
     expect(tailscale.getAttribute("aria-disabled")).toBe("true");
     expect(tailscale.getAttribute("tabindex")).toBe("-1");
+    // The one in-flight connect locks every other row's Connect too.
+    expect((screen.getByRole("button", { name: "Connect Tailscale" }) as HTMLButtonElement).disabled).toBe(true);
     const save = screen.getByRole("button", { name: "Save" });
     expect((save as HTMLButtonElement).disabled).toBe(true);
   });
@@ -210,76 +218,18 @@ describe("TunnelSelectionPanel", () => {
     expect(handlers.onClose).toHaveBeenCalledTimes(1);
   });
 
-  test("the footer hint links to the Remote Access doc", () => {
+  test("an unavailable row's Connect lives OUTSIDE the aria-disabled radio so it stays interactive", () => {
     renderPanel();
-    expect(screen.queryByText(/Unavailable providers show an/)).not.toBeNull();
-    // The DocReference trigger renders as a link-styled button; clicking it is
-    // covered by DocReference's own tests — here we pin that the panel wires it.
-    expect(screen.queryByRole("button", { name: "Remote Access" })).not.toBeNull();
+    const connect = screen.getByRole("button", { name: "Connect Tailscale" });
+    // AT and real pointer semantics treat descendants of a disabled widget as
+    // inert — the whole point of this Connect is to work on unavailable rows.
+    expect(connect.closest('[aria-disabled="true"]')).toBeNull();
   });
 
-  test("a disabled row's (i) opens that provider's details sheet (the trigger stays interactive)", async () => {
-    const user = userEvent.setup();
+  test("there is no info toggle and no aggregate-guide footer — Connect is the only affordance", () => {
     renderPanel();
-    expect(screen.queryByText("Set up Tailscale")).toBeNull();
-    const toggle = screen.getByRole("button", { name: "Tailscale setup instructions" });
-    // The trigger sits in the row's action cluster, NEXT TO Connect, but must
-    // NOT live inside the aria-disabled radio — AT and real pointer semantics
-    // treat descendants of a disabled widget as inert.
-    expect(toggle.closest('[aria-disabled="true"]')).toBeNull();
-    expect(toggle.getAttribute("aria-haspopup")).toBe("dialog");
-    await user.click(toggle);
-    // A full slide-over sheet, scoped to this one provider.
-    const dialog = screen.getByRole("dialog");
-    expect(within(dialog).queryByText("Set up Tailscale")).not.toBeNull();
-    expect(within(dialog).queryByText(/requires Tailscale network/)).not.toBeNull();
-    expect(within(dialog).queryByText("Install Tailscale")).not.toBeNull();
-    expect(within(dialog).queryByText("tailscale up")).not.toBeNull();
-    expect(within(dialog).queryByText(/availability is re-checked/)).not.toBeNull();
-    // Scoped: no other provider's steps leak into the sheet.
-    expect(within(dialog).queryByText("Install ngrok")).toBeNull();
-    // Opening details must not select the (disabled) row.
-    expect(handlers.onSelect).not.toHaveBeenCalled();
-  });
-
-  test("closing the sheet and opening another provider's swaps the details", async () => {
-    const user = userEvent.setup();
-    renderPanel();
-    await user.click(screen.getByRole("button", { name: "Tailscale setup instructions" }));
-    expect(screen.queryByText("Set up Tailscale")).not.toBeNull();
-    await user.keyboard("{Escape}");
-    expect(screen.queryByText("Set up Tailscale")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "ngrok setup instructions" }));
-    expect(screen.queryByText("Set up ngrok")).not.toBeNull();
-    expect(screen.queryByText("Set up Tailscale")).toBeNull();
-  });
-
-  test("an ENABLED provider's details sheet uses the 'how this works' heading and omits the re-check hint", async () => {
-    const user = userEvent.setup();
-    render(
-      <TunnelSelectionPanel
-        state={makeState({
-          providers: [
-            { id: "gini-relay", name: "Gini Relay", enabled: true },
-            { id: "tailscale", name: "Tailscale", enabled: true, setup: ["Install Tailscale", "tailscale up"] },
-            { id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account", setup: ["Install ngrok"] },
-            { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "Cloudflare account", setup: ["Install cloudflared"] }
-          ]
-        })}
-        onSelect={handlers.onSelect}
-        onConnect={handlers.onConnect}
-        onCancel={handlers.onCancel}
-        onDisconnect={handlers.onDisconnect}
-        onClose={handlers.onClose}
-      />
-    );
-    await user.click(screen.getByRole("button", { name: "Tailscale setup instructions" }));
-    expect(screen.queryByText("Tailscale — how this works")).not.toBeNull();
-    expect(screen.queryByText(/availability is re-checked/)).toBeNull();
-  });
-
-  test("a provider without setup steps renders no info toggle (gini-relay)", () => {
-    renderPanel();
-    expect(screen.queryByRole("button", { name: "Gini Relay setup instructions" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /setup instructions/ })).toBeNull();
+    expect(screen.queryByText(/Unavailable providers show an/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Remote Access" })).toBeNull();
   });
 });

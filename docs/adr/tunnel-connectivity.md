@@ -4,7 +4,7 @@
 
 Gini exposes a remote URL for an instance through a **tunnel provider**, selected and managed by the user through a uniform RPC contract. The gateway owns a small persisted singleton (the user's provider selection + connection status) and rebuilds the provider catalog from code on every read. Every tunnel route returns the **full `TunnelState`** so a single fetch drives the whole selection / connect / connected UI without follow-up requests.
 
-The catalog carries four drivable providers. `gini-relay` is always enabled; `tailscale`, `ngrok`, and `cloudflare` are **detection-gated**: a driver probe (tailscale backend running with a MagicDNS name, `ngrok config check`, `cloudflared --version`) flips each row enabled, and a missing prerequisite surfaces as `requires` plus `setup` — the host-side steps the panel renders behind an info toggle. Detection refreshes at boot, on `GET /api/tunnel?detect=1` (panel open / CLI status), and lazily before a select/connect of a cache-disabled provider; plain polling GETs never spawn probes. The gini-relay connect flow is wired through the [`gini-relay`](https://github.com/Lilac-Labs/gini-relay) client package: `connectTunnel` flips status to `connecting` and returns immediately, then a background handshake mints an OAuth-loopback consent URL (`loginUrl`), opens it in the host browser, awaits the session, builds + starts a native `frpc` tunnel (`buildTunnel`) that exposes the instance's gateway port (the single origin fronting UI + API; see *Exposed port*), and records the public `https://<subdomain>.<relayDomain>` url. The UI/CLI polls `GET /api/tunnel` until status flips to `connected` (with `url`) or `error` (with `message`).
+The catalog carries four drivable providers. `gini-relay` is always enabled; `tailscale`, `ngrok`, and `cloudflare` are **detection-gated**: a driver probe (tailscale backend running with a MagicDNS name, `ngrok config check`, `cloudflared --version`) flips each row enabled, and a missing prerequisite surfaces as `requires`. A select/connect of an unavailable provider is rejected with HTTP 400 carrying the machine-readable `code: "provider_unavailable"` — Connect is the single UI affordance, and on that code the web UI opens the connector's self-contained guide (`docs/remote-access/<id>.md`, served inline through the gateway's docs endpoint) instead of dead-ending on the error. Detection refreshes at boot, on `GET /api/tunnel?detect=1` (panel open / CLI status, bypassing the cache TTL), and lazily before rejecting a select/connect — a freshly-installed CLI connects on the next attempt without any restart; plain polling GETs never spawn probes. The gini-relay connect flow is wired through the [`gini-relay`](https://github.com/Lilac-Labs/gini-relay) client package: `connectTunnel` flips status to `connecting` and returns immediately, then a background handshake mints an OAuth-loopback consent URL (`loginUrl`), opens it in the host browser, awaits the session, builds + starts a native `frpc` tunnel (`buildTunnel`) that exposes the instance's gateway port (the single origin fronting UI + API; see *Exposed port*), and records the public `https://<subdomain>.<relayDomain>` url. The UI/CLI polls `GET /api/tunnel` until status flips to `connected` (with `url`) or `error` (with `message`).
 
 ## Context
 
@@ -28,8 +28,7 @@ type TunnelProvider = {
   id: "gini-relay" | "tailscale" | "ngrok" | "cloudflare";
   name: string;
   enabled: boolean;
-  requires?: string;   // why a disabled row can't connect
-  setup?: string[];    // host-side steps (manual providers, enabled or not)
+  requires?: string;   // why an unavailable row can't connect yet
 };
 
 type TunnelState = {
@@ -58,7 +57,7 @@ View derivation from state:
 | `ngrok` | ngrok | detected | `ngrok account` | `ngrok http <port>` supervised child; URL scanned from agent output |
 | `cloudflare` | Cloudflare | detected | `cloudflared CLI` | named tunnel from `~/.cloudflared/config.yml` (run with the gateway as origin, publishing the config's stable ingress hostname — SSE-capable) when one exists; quick-tunnel fallback otherwise. `--config /dev/null` in both modes (loaded ingress rules would override `--url`); supervised child |
 
-Every manual entry also carries `setup: string[]` — the host-side install/auth steps — whether enabled or not, so the panel's info toggle can show a disabled row how to become available and an enabled row what Connect will run.
+Host-side install/auth steps are deliberately NOT part of the catalog: each connector's setup guidance lives in its self-contained doc (`docs/remote-access/<id>.md`), which clients open on `provider_unavailable` and the sidebar links per connector.
 
 The manual connect flow mirrors the relay's supervision contract: `connecting` → background driver → `connected` (with the public url) or `error`; a supervised child's unexpected exit flips `connected → error`; cancel/disconnect/supersede tear down the child **or** the provider-side state (tailscale serve config) — including on a provider *switch*, where `selectProvider` tears down the live manual tunnel before flipping to idle. Reconcile resumes a `connected` manual record after a restart when its prerequisite still detects (tailscale re-publishes the same URL; ngrok/cloudflared mint a fresh one).
 

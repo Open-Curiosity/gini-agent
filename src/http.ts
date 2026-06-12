@@ -1928,7 +1928,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
             return withCors(request, await handler(request, Object.fromEntries(match.slice(1).map((value, index) => [String(index), value]))));
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            return withCors(request, json({ error: message }, statusFromErrorMessage(message)));
+            // A machine-readable `code` rides along when the thrower set one
+            // (e.g. tunnel `provider_unavailable`) so clients can branch on
+            // the failure kind instead of parsing the human message.
+            const code = error instanceof Error && typeof (error as Error & { code?: unknown }).code === "string"
+              ? (error as Error & { code: string }).code
+              : undefined;
+            return withCors(request, json(code ? { error: message, code } : { error: message }, statusFromErrorMessage(message)));
           }
         }
       }

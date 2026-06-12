@@ -1,0 +1,97 @@
+/// <reference lib="dom" />
+
+// DocSheet is the controlled doc slide-over: programmatic opens (no Radix
+// trigger interaction) must still fetch on the open edge, the optional `lead`
+// renders above the body, a failed fetch retries on the next open, and a
+// non-/docs/ URL renders nothing (callers with visible triggers degrade to a
+// plain link before reaching it).
+
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { DocSheet } from "./DocSheet";
+
+const realFetch = globalThis.fetch;
+let fetchCalls: string[] = [];
+let fetchImpl: () => Response;
+
+beforeEach(() => {
+  fetchCalls = [];
+  fetchImpl = () =>
+    new Response(
+      JSON.stringify({ path: "remote-access/ngrok", title: "ngrok", markdown: "Install **ngrok** and add your authtoken." }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  globalThis.fetch = ((input: RequestInfo | URL) => {
+    fetchCalls.push(String(input));
+    return Promise.resolve(fetchImpl());
+  }) as typeof fetch;
+});
+
+afterEach(() => {
+  globalThis.fetch = realFetch;
+});
+
+describe("DocSheet", () => {
+  test("a programmatic open fetches the doc and renders title, lead, and body", async () => {
+    render(
+      <DocSheet
+        url="https://gini.lilaclabs.ai/docs/remote-access/ngrok"
+        open
+        onOpenChange={() => {}}
+        lead={<p>This provider needs setup first.</p>}
+      />
+    );
+    await waitFor(() => expect(screen.queryByText(/add your authtoken/)).not.toBeNull());
+    expect(fetchCalls).toEqual(["/api/runtime/docs/remote-access/ngrok"]);
+    expect(screen.queryByText("This provider needs setup first.")).not.toBeNull();
+    expect(screen.queryByText("ngrok", { selector: "[data-slot=sheet-title], h2" })).not.toBeNull();
+    // The escape hatch keeps the original hosted URL.
+    const full = screen.getAllByText("Open full docs")[0].closest("a");
+    expect(full?.getAttribute("href")).toBe("https://gini.lilaclabs.ai/docs/remote-access/ngrok");
+  });
+
+  test("a failed fetch shows the error fold and the next open retries", async () => {
+    fetchImpl = () => new Response(JSON.stringify({ error: "nope" }), { status: 500 });
+    const { rerender } = render(
+      <DocSheet url="https://gini.lilaclabs.ai/docs/remote-access/ngrok" open onOpenChange={() => {}} />
+    );
+    await waitFor(() => expect(screen.queryByText("Could not load this doc.")).not.toBeNull());
+    expect(fetchCalls.length).toBe(1);
+    // Close, fix the backend, reopen: the open edge retries the fetch.
+    fetchImpl = () =>
+      new Response(JSON.stringify({ path: "remote-access/ngrok", title: "ngrok", markdown: "now it loads" }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    rerender(<DocSheet url="https://gini.lilaclabs.ai/docs/remote-access/ngrok" open={false} onOpenChange={() => {}} />);
+    rerender(<DocSheet url="https://gini.lilaclabs.ai/docs/remote-access/ngrok" open onOpenChange={() => {}} />);
+    await waitFor(() => expect(screen.queryByText("now it loads")).not.toBeNull());
+    expect(fetchCalls.length).toBe(2);
+  });
+
+  test("closing via the sheet reports through onOpenChange", async () => {
+    const user = userEvent.setup();
+    let openState = true;
+    render(
+      <DocSheet
+        url="https://gini.lilaclabs.ai/docs/remote-access/ngrok"
+        open
+        onOpenChange={(next) => {
+          openState = next;
+        }}
+      />
+    );
+    await waitFor(() => expect(screen.queryByText(/add your authtoken/)).not.toBeNull());
+    await user.keyboard("{Escape}");
+    expect(openState).toBe(false);
+  });
+
+  test("a non-/docs/ URL renders nothing", () => {
+    const { container } = render(
+      <DocSheet url="https://example.com/changelog" open onOpenChange={() => {}} />
+    );
+    expect(container.innerHTML).toBe("");
+    expect(fetchCalls.length).toBe(0);
+  });
+});

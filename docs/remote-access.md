@@ -2,9 +2,16 @@
 
 An instance's gateway binds to loopback. To reach Gini from a phone or another machine you front the **gateway port** with a tunnel — one public origin then serves both the web UI and the `/api/*` surface (see [Gateway And Control Plane](gateway.md)).
 
-All four catalog providers — **Gini Relay, Tailscale, ngrok, Cloudflare** — can be driven natively from `gini tunnel` / the web tunnel panel. The relay is always available; the other three enable themselves when their host prerequisite is detected (`tailscale` logged into a tailnet, an ngrok authtoken, the `cloudflared` binary). A provider whose prerequisite is missing shows as a disabled row with the reason and an info toggle carrying the exact setup steps; this page is the long-form version of those steps, plus the **manual fallback** (run the tool yourself and trust the origin via `GINI_TRUSTED_ORIGINS`) for setups the drivers don't cover — a reverse proxy, a named Cloudflare tunnel on your own domain, a remote tailnet node.
+All four tunnel providers are drivable from the web tunnel panel and `gini tunnel`, and each has its own self-contained guide — the same pages the app opens in a slide-over when a provider needs setting up (tap Connect on a provider that isn't ready and its guide opens; the sidebar's Remote access entries open them directly):
 
-When the runtime drives a tunnel itself, the connected URL's origin is trusted **automatically** for as long as the record is connected (and revoked the moment it isn't) — no `GINI_TRUSTED_ORIGINS` needed. The env var remains the knob for manually-run fronts.
+- [Gini Relay](remote-access/gini-relay.md) — managed, zero setup, stable subdomain.
+- [Tailscale](remote-access/tailscale.md) — tailnet-private, stable URL, TLS on your own machine.
+- [ngrok](remote-access/ngrok.md) — public URL, random per connect on the free tier.
+- [Cloudflare](remote-access/cloudflare.md) — your own domain via a named tunnel (SSE works), quick-tunnel fallback.
+
+The relay is always available; the other three enable when their host prerequisite is detected (`tailscale` logged into a tailnet, an ngrok authtoken, the `cloudflared` binary). Tapping **Connect** re-checks availability server-side and either connects or rejects with the reason — so a freshly-installed CLI works without restarting anything.
+
+When the runtime drives a tunnel itself, the connected URL's origin is trusted **automatically** for as long as the record is connected (and revoked the moment it isn't) — no `GINI_TRUSTED_ORIGINS` needed. The env var remains the knob for manually-run fronts (below).
 
 > Terminology: this page is about **tunnel providers**. The similarly-named `gini connectors` CLI and `/api/connectors` routes manage *service* connectors (Google, Linear, MCP-backed tools) and are unrelated to remote access.
 
@@ -28,7 +35,7 @@ Every command returns the full tunnel state, so any one call tells you whether a
 | --- | --- | --- |
 | CLI | `gini tunnel` | `selectedProvider: null` means **no mode is selected**; a provider id means that mode is selected. `status` + `url` tell you whether it is actually live. |
 | HTTP | `curl -H "Authorization: Bearer <token>" http://127.0.0.1:<port>/api/tunnel` | Same `TunnelState` JSON — the web UI polls this same state through the BFF (`/api/runtime/tunnel`, token injected server-side). |
-| Web UI | Sidebar tunnel pill | `Off / no tunnel` when nothing is connected; `Live / gini-relay` with a green dot when connected. Opening it shows the provider panel with the selected row marked `Selected` (or `Connected`). |
+| Web UI | Sidebar tunnel pill | `Off / no tunnel` when nothing is connected; `Live / <provider>` with a green dot when connected. Opening it shows the provider panel with the selected row marked `Selected` (or `Connected`). |
 | Disk | `state.json` → `tunnel` | The persisted `TunnelSelectionRecord` (`selectedProvider`, `status`, `url`, `createdAt`/`updatedAt`). Survives restarts. |
 | Audit | audit rows `tunnel.select`, `tunnel.connect`, `tunnel.connected`, `tunnel.error`, `tunnel.cancel`, `tunnel.disconnect`, `tunnel.reconcile` | Who changed the mode and when, with the provider id in `evidence`. |
 | Logs | `~/.gini/instances/<instance>/logs/runtime.jsonl` | `tunnel.connected`, `tunnel.connect.error`, `tunnel.exited`, `tunnel.resume.*` events from the background connect/resume flows. |
@@ -51,7 +58,7 @@ After `gini tunnel select gini-relay`:
 
 ### Selecting a provider that isn't available
 
-Only catalog-enabled providers can be selected. `gini-relay` is always enabled; the other three enable when detection finds their prerequisite (re-probed at boot, on `gini tunnel` / panel open, and before rejecting a select/connect). Selecting a provider whose prerequisite is genuinely missing is rejected **before any state changes** with HTTP 400 (CLI exit 1):
+Only catalog-enabled providers can be selected. Selecting or connecting a provider whose prerequisite is genuinely missing is rejected **before any state changes** with HTTP 400 (CLI exit 1) and the machine-readable code `provider_unavailable` — the web UI uses that code to open the provider's guide instead of failing silently:
 
 ```text
 $ gini tunnel select tailscale     # on a machine without a tailnet login
@@ -61,30 +68,13 @@ $ gini tunnel select wireguard
 Unknown tunnel provider: wireguard
 ```
 
-So: a disabled provider can never be the selected mode. If you front Gini with a tool the runtime isn't driving (the manual fallback below), `gini tunnel` intentionally keeps reporting its own selection — the runtime only reports tunnels *it* manages. Confirm a manual front at its own layer instead.
-
-## The managed provider: Gini Relay
-
-```bash
-gini tunnel select gini-relay
-gini tunnel connect
-```
-
-`connect` returns immediately with `status: "connecting"`, opens an OAuth consent page in the host browser (only when no relay session is stored — reconnects and restarts reuse the session, but `gini tunnel disconnect` logs the instance out, so the next connect prompts again), starts a supervised `frpc` child, and flips the state to `connected` with a stable public URL `https://<subdomain>.<relayDomain>`. Poll `gini tunnel` until you see `connected` + `url`, or `error` + `message`. Relay subdomains are trusted by the gateway automatically — no extra configuration. Full lifecycle, supervision, and restart-resume behavior: ADR [tunnel-connectivity.md](adr/tunnel-connectivity.md).
-
-## Native connects (Tailscale, ngrok, Cloudflare)
-
-Select the provider and connect — panel or CLI (`gini tunnel connect tailscale`). What each driver runs:
-
-- **Tailscale**: `tailscale serve` on the gateway port; URL `https://<machine>.<tailnet>.ts.net` (tailnet-private, stable, survives gateway restarts — the resume re-publishes the same URL). Disconnect turns the serve config off.
-- **ngrok**: `ngrok http <gateway-port>` as a supervised child; free-tier URLs are random per connect and show a one-time browser interstitial (`ngrok-skip-browser-warning` header suppresses it for non-browser clients). If the agent dies, the record flips to `error` and the front's trust is revoked.
-- **Cloudflare**: if `~/.cloudflared/config.yml` declares a named tunnel, Gini runs **that tunnel** pointed at the gateway (`cloudflared --config /dev/null tunnel --cred-file <config's credentials> run --url http://127.0.0.1:<port> <id>`) and publishes the config's stable ingress hostname — SSE works, the URL never changes. Without one it falls back to a quick tunnel (random `https://<words>.trycloudflare.com`, testing-grade: no SSE — live UI updates need a reload). Same supervision as ngrok either way. (`--config /dev/null` is deliberate in both modes: with ingress rules loaded, the `--url` origin override is ignored — the named run must bypass the config file to route the hostname at the gateway instead of the config's own service.)
+So: an unavailable provider can never be the selected mode. If you front Gini with a tool the runtime isn't driving (a manual front), `gini tunnel` intentionally keeps reporting its own selection — the runtime only reports tunnels *it* manages. Confirm a manual front at its own layer instead (each provider guide shows how).
 
 Switching the selection away from a live provider tears the old tunnel down first (including the persistent tailscale serve config), and a connected front's origin trust always tracks the record — connected = admitted, anything else = revoked.
 
 ## Manual fronts
 
-For anything the drivers don't cover (reverse proxies, a named Cloudflare tunnel on your own domain, a serve running on another tailnet node), the same recipe always works. The examples below use `<gateway-port>` for the instance's gateway port — find yours with `gini status`.
+For anything the drivers don't cover — a reverse proxy, or any front you run yourself (each provider guide has its provider-specific variant of this) — the same recipe always works. The examples below use `<gateway-port>` for the instance's gateway port — find yours with `gini status`.
 
 1. **Expose the gateway port** (not the web port) with your tunnel tool. One origin then serves UI + API. For a durable tunnel, pin the port first: non-default instances derive hash-based ports that **walk forward when busy** (see [Gateway And Control Plane](gateway.md)), so after a restart a long-lived tunnel can silently forward to whatever process now owns the old port. Launch with an explicit `--port`/`GINI_PORT` — pinned ports stay strict and fail instead of moving — and stop/recreate the tunnel whenever the port or instance changes.
 2. **Trust the external origin.** The gateway fail-closes web-bound requests from hostnames it doesn't know (page navigations 404, `/api/runtime/*` 403). Set `GINI_TRUSTED_ORIGINS` to the comma-separated **full origins** of your tunnels, in the gateway process environment at launch:
@@ -93,7 +83,7 @@ For anything the drivers don't cover (reverse proxies, a named Cloudflare tunnel
    GINI_TRUSTED_ORIGINS=https://my-mac.tailnet-name.ts.net,https://gini.example.com gini start
    ```
 
-   To make it durable, add the line `GINI_TRUSTED_ORIGINS=...` to `~/.gini/secrets.env` — the installed `gini` wrapper sources it on every launch, and `gini autostart enable` merges it into the launchd plist (re-run that after editing). If the variable is set but contains no parseable origin, the gateway refuses every web-bound request on a **non-loopback, non-relay** front until it's fixed (loopback and gini-relay subdomains keep working — behaviorally a garbage value equals an unset one): the typo bricks exactly the manual-tunnel front you were configuring, loudly rather than silently downgrading. See ADR [bff-trust-boundary.md](adr/bff-trust-boundary.md).
+   To make it durable, add the line `GINI_TRUSTED_ORIGINS=...` to `~/.gini/secrets.env` — the installed `gini` wrapper sources it on every launch, and `gini autostart enable` merges it into the launchd plist (re-run that after editing). If the variable is set but contains no parseable origin, the gateway refuses every web-bound request on a front not covered by the other trust lanes until it's fixed — the typo bricks exactly the manual front you were configuring, loudly rather than silently downgrading. See ADR [bff-trust-boundary.md](adr/bff-trust-boundary.md).
 3. **Pair the device.** A browser arriving on a trusted non-loopback origin is redirected to `/pair` and must be approved once — from the loopback UI, or from the "Pair requests" panel of any **already-paired** session; see ADR [device-pairing-auth.md](adr/device-pairing-auth.md). A paired session is owner-equivalent (it can approve future pairing requests and mint pairing codes), so pair only devices you fully trust. Non-browser clients are never redirected to `/pair` — the native `/api/*` surface is bearer-gated instead, and the origin gate applies only to web-bound paths. A remote non-browser client should still pair: the mobile app runs the pairing handshake natively, and any other client can claim a pairing code against the tunnel origin — mint the code on the host (`gini pairing`), then from the remote device:
 
    ```bash
@@ -104,45 +94,9 @@ For anything the drivers don't cover (reverse proxies, a named Cloudflare tunnel
 
    The endpoint is public and rate-limited (no bearer needed); the `201` response returns `{ device, token }`, and the device then sends that token as `Authorization: Bearer`. Tokens are individually revocable (`gini device revoke <device-id>`). (`gini pairing claim <code>` wraps the same endpoint but always posts to the local instance, so it is only useful on the gateway host itself.) Reserve the instance owner bearer (`config.json`) for local operator tooling — it is a singleton with no per-device revocation, so don't copy it onto remote devices.
 
-### Tailscale
+## Verifying any front
 
-Private to your tailnet (no public exposure), with TLS and stable DNS — the recommended manual option. TLS terminates on your own node, so Tailscale never sees plaintext.
-
-```bash
-tailscale serve --bg http://127.0.0.1:<gateway-port>   # serves https://<machine>.<tailnet>.ts.net
-tailscale serve status                                 # confirm the proxy is registered
-tailscale serve --https=443 off                        # tear it down
-```
-
-Add `https://<machine>.<tailnet>.ts.net` to `GINI_TRUSTED_ORIGINS` and restart the gateway. To expose the same serve config to the public internet instead, Tailscale offers `tailscale funnel` — the origin string stays the same.
-
-Confirm the mode at the Tailscale layer (`tailscale serve status`) and end-to-end: a page request to the `ts.net` URL should answer `302 → /pair` (untrusted it answers `404`). If the `ts.net` name doesn't resolve on a machine, MagicDNS is off for that resolver — `curl --resolve <name>:443:<tailscale-ip>` pins it without giving up certificate validation.
-
-### ngrok
-
-Public URL through ngrok's edge; requires an ngrok account (`ngrok config add-authtoken <token>` once). ngrok terminates TLS at its edge, so ngrok can observe everything proxied — cookies, device tokens, and chat/task content.
-
-```bash
-ngrok http <gateway-port>                              # random https://<id>.ngrok-free.app
-ngrok http <gateway-port> --url https://you.ngrok.app  # reserved domain (paid)
-```
-
-The agent prints the public URL; add exactly that origin to `GINI_TRUSTED_ORIGINS` and restart the gateway. With a random URL you must update the variable every time the agent restarts — a reserved domain avoids the churn. On the free tier, a browser's first visit hits a one-time ngrok interstitial ("You are about to visit …") before reaching Gini — click Visit Site; non-browser clients can suppress it by sending a `ngrok-skip-browser-warning` request header.
-
-Confirm at the ngrok layer (the agent's console shows the live URL and each request) and end-to-end with the same `404 → 302 /pair` probe as above.
-
-### Cloudflare
-
-Two distinct modes:
-
-- **Quick tunnel (testing only):** `cloudflared tunnel --url http://127.0.0.1:<gateway-port>` prints a random `https://<words>.trycloudflare.com` URL. No account needed. Two sharp edges: (1) if `~/.cloudflared/` contains a `config.yml` from a named-tunnel setup, quick tunnels **register but serve edge 404s** — pass `--config /dev/null` to override; (2) quick tunnels do **not** proxy Server-Sent Events, and the Gini web UI streams live updates over SSE (`/api/runtime/events/stream`), so the UI will load but won't update live. Fine for a smoke test, not for real use.
-- **Named tunnel (real use):** a Cloudflare account plus your own domain, configured per Cloudflare's docs, gives a stable hostname without the SSE limitation of the quick-tunnel edge.
-
-Either way: add the printed/configured origin to `GINI_TRUSTED_ORIGINS`, restart the gateway, and probe for `302 → /pair`. Both modes terminate TLS at Cloudflare's edge, so Cloudflare can observe everything proxied — cookies, device tokens, and chat/task content.
-
-## Verifying a manual tunnel
-
-The full decision table — identical across Tailscale, ngrok, and Cloudflare tunnels:
+The full decision table — identical across every tunnel:
 
 | Probe through the tunnel | Origin **not** trusted | Origin trusted |
 | --- | --- | --- |
@@ -150,17 +104,4 @@ The full decision table — identical across Tailscale, ngrok, and Cloudflare tu
 | `GET /api/runtime/__healthz` (web-bound) | `403` | `401` (until paired) |
 | `GET /api/tunnel` with bearer (native API) | `200` | `200` |
 
-The third row is the discriminator when something is wrong: the native bearer-gated API ignores the origin gate, so a `200` there means the tunnel and gateway are healthy and any `404` on pages is the origin gate (fix `GINI_TRUSTED_ORIGINS`). If even the bearer probe fails, the tunnel itself is broken — for example a Cloudflare quick tunnel answering edge 404s carries only `server: cloudflare` headers and no gateway response at all.
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| Page `404` through the tunnel, loopback works | Origin not in `GINI_TRUSTED_ORIGINS` (gateway fails closed) | Add the exact `https://` origin; restart the gateway |
-| Tunnel 404s persist after setting the var (loopback still fine) | `GINI_TRUSTED_ORIGINS` set but no entry parses (typo), or the gateway wasn't restarted with the new value | Fix the value — entries are full origins, comma-separated — and restart the gateway |
-| Page redirects to `/pair`, API calls `401` | Device not paired (expected on any non-loopback front) | Approve the request from the loopback UI or any already-paired session |
-| `Tunnel provider X is not available (requires …)` | Selecting a disabled catalog placeholder | Use `gini-relay`, or run the tool manually per this page |
-| `gini tunnel` says `selectedProvider: null` while your manual tunnel works | Expected: the runtime only tracks tunnels it manages | Confirm manual tunnels at their own layer (`tailscale serve status`, the ngrok/cloudflared console) |
-| Cloudflare quick tunnel: edge `404`, bearer probe also `404`, headers only `server: cloudflare` | `~/.cloudflared/config.yml` present (quick tunnels unsupported with it) | Run `cloudflared --config /dev/null tunnel --url …`, or use a named tunnel |
-| Web UI loads through Cloudflare quick tunnel but never updates | Quick tunnels don't proxy SSE | Use a named tunnel, Tailscale, or ngrok |
-| `ts.net` hostname doesn't resolve | MagicDNS off for that resolver | Enable MagicDNS, or `curl --resolve <name>:443:<tailscale-ip>` |
+The third row is the discriminator when something is wrong: the native bearer-gated API ignores the origin gate, so a `200` there means the tunnel and gateway are healthy and any `404` on pages is the origin gate (for a runtime-driven tunnel that means it is no longer `connected`; for a manual front, fix `GINI_TRUSTED_ORIGINS`). If even the bearer probe fails, the tunnel itself is broken. Provider-specific symptoms live in each provider's guide.

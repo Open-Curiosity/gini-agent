@@ -205,6 +205,37 @@ describe("useTunnel", () => {
     expect(result.current.error).toBe("post-nope");
   });
 
+  test("connect() resolves ok:true on success and carries the gateway's failure code on a 400", async () => {
+    const { result } = renderHook(() => useTunnel());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    fetchMock.mockResolvedValueOnce(res({ body: makeState({ status: "connecting" }) }));
+    let outcome: Awaited<ReturnType<typeof result.current.connect>> | undefined;
+    await act(async () => {
+      outcome = await result.current.connect("gini-relay");
+    });
+    expect(outcome).toEqual({ ok: true });
+
+    // The gateway rejects an unavailable provider with a machine-readable
+    // code; the result surfaces it so the menu can open the provider's guide.
+    fetchMock.mockResolvedValueOnce(
+      res({
+        ok: false,
+        status: 400,
+        body: { error: "Tunnel provider Tailscale is not available (requires Tailscale network).", code: "provider_unavailable" }
+      })
+    );
+    await act(async () => {
+      outcome = await result.current.connect("tailscale");
+    });
+    expect(outcome).toEqual({
+      ok: false,
+      message: "Tunnel provider Tailscale is not available (requires Tailscale network).",
+      code: "provider_unavailable"
+    });
+    expect(result.current.error).toContain("not available");
+  });
+
   test("refresh() triggers a detect=1 get (the panel-open path re-probes drivers); mount stays plain", async () => {
     const { result } = renderHook(() => useTunnel());
     await waitFor(() => expect(result.current.loading).toBe(false));

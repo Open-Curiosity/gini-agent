@@ -111,28 +111,19 @@ const DEFAULT_REQUIRES: Record<ManualProviderId, string> = {
   cloudflare: "cloudflared CLI"
 };
 
-// Host-side setup steps per manual provider, surfaced by the panel's info
-// affordance so an unavailable row tells the user exactly how to make it
-// available (and an available row how it was satisfied). Code, not state —
-// like the catalog itself.
-const PROVIDER_SETUP: Record<ManualProviderId, string[]> = {
-  tailscale: [
-    "Install Tailscale: brew install tailscale (or the Mac App Store app)",
-    "Sign in and join your tailnet: tailscale up",
-    "That's it — Gini runs `tailscale serve` for you and publishes https://<machine>.<tailnet>.ts.net (private to your tailnet)"
-  ],
-  ngrok: [
-    "Install ngrok: brew install ngrok",
-    "Create a free account at https://dashboard.ngrok.com and copy your authtoken",
-    "Authenticate the agent: ngrok config add-authtoken <token>",
-    "Gini then runs `ngrok http <gateway-port>` for you — free-tier URLs are random per connect and show a one-time browser interstitial"
-  ],
-  cloudflare: [
-    "Install cloudflared: brew install cloudflared",
-    "Best: set up a named tunnel on your own domain (cloudflared tunnel login / create / route dns — see the Remote Access guide). With a ~/.cloudflared/config.yml present, Gini runs YOUR tunnel pointed at the gateway and publishes your stable hostname — SSE (live updates) works",
-    "No named tunnel? No account needed — Gini falls back to a quick tunnel with a random https://<words>.trycloudflare.com URL. Testing-grade: no SSE (live updates need a reload) and the URL changes per connect"
-  ]
-};
+// An unavailable select/connect rejects with this machine-readable code on
+// the error (surfaced in the HTTP error body) so clients can branch — the web
+// UI opens the provider's setup guide (docs/remote-access/<id>.md) instead of
+// parsing the human message.
+export const PROVIDER_UNAVAILABLE = "provider_unavailable";
+
+function providerUnavailableError(name: string, requires?: string): Error {
+  const error = new Error(
+    `Tunnel provider ${name} is not available${requires ? ` (requires ${requires})` : ""}.`
+  ) as Error & { code: string };
+  error.code = PROVIDER_UNAVAILABLE;
+  return error;
+}
 
 // A named Cloudflare tunnel parsed from ~/.cloudflared/config.yml: the tunnel
 // id, its credentials file, and the first ingress hostname (the operator's
@@ -667,11 +658,11 @@ export function refreshProviderDetection(force = false): Promise<void> {
 // until their CLI prerequisite is found). The order here is the order the
 // panel renders them. Rebuilt fresh on every read — never persisted.
 function providerCatalog(): TunnelProvider[] {
-  const availability = (id: ManualProviderId): { enabled: boolean; requires?: string; setup: string[] } => {
+  const availability = (id: ManualProviderId): { enabled: boolean; requires?: string } => {
     const entry = detection[id];
     return entry.enabled
-      ? { enabled: true, setup: PROVIDER_SETUP[id] }
-      : { enabled: false, requires: entry.requires ?? DEFAULT_REQUIRES[id], setup: PROVIDER_SETUP[id] };
+      ? { enabled: true }
+      : { enabled: false, requires: entry.requires ?? DEFAULT_REQUIRES[id] };
   };
   return [
     { id: "gini-relay", name: "Gini Relay", enabled: true },
@@ -740,7 +731,7 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
     entry = findProvider(provider) ?? entry;
   }
   if (!entry.enabled) {
-    throw new Error(`Tunnel provider ${entry.name} is not available${entry.requires ? ` (requires ${entry.requires})` : ""}.`);
+    throw providerUnavailableError(entry.name, entry.requires);
   }
   // Re-selecting the provider you're already connected to (or connecting with)
   // is a no-op: don't tear a live tunnel down just because the user re-clicked
@@ -826,7 +817,7 @@ export async function connectTunnel(config: RuntimeConfig, provider?: string): P
     entry = findProvider(requested) ?? entry;
   }
   if (!entry.enabled) {
-    throw new Error(`Tunnel provider ${entry.name} is not available${entry.requires ? ` (requires ${entry.requires})` : ""}.`);
+    throw providerUnavailableError(entry.name, entry.requires);
   }
 
   // Connecting DIRECTLY to a different provider (the explicit-provider path —

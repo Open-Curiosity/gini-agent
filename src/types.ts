@@ -90,20 +90,18 @@ export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 // exposes a remote URL for this instance through one of several providers.
 // "gini-relay" is always enabled; tailscale/ngrok/cloudflare are
 // detection-gated native drivers (a disabled row carries a `requires`
-// reason plus `setup` steps for the panel's info affordance).
+// reason).
 export type TunnelProviderId = "gini-relay" | "tailscale" | "ngrok" | "cloudflare";
 
 // One row in the provider catalog. Drives the selection panel: disabled
-// rows render their `requires` string as the reason they can't be picked,
-// and `setup` (always present on manual providers, enabled or not) carries
-// the host-side steps to make/keep the prerequisite available — the panel
-// surfaces it behind an info affordance on the row.
+// rows render their `requires` string as the reason they can't connect yet.
+// The long-form setup guidance lives in docs/remote-access/<id>.md — the web
+// UI opens it when a connect is rejected with `provider_unavailable`.
 export interface TunnelProvider {
   id: TunnelProviderId;
   name: string;
   enabled: boolean;
   requires?: string;
-  setup?: string[];
 }
 
 // The connection lifecycle status surfaced to clients.
