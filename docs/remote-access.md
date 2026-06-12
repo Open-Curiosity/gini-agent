@@ -71,7 +71,7 @@ gini tunnel select gini-relay
 gini tunnel connect
 ```
 
-`connect` returns immediately with `status: "connecting"`, opens a one-time OAuth consent page in the host browser (first connect only — the session is reused afterwards), starts a supervised `frpc` child, and flips the state to `connected` with a stable public URL `https://<subdomain>.<relayDomain>`. Poll `gini tunnel` until you see `connected` + `url`, or `error` + `message`. Relay subdomains are trusted by the gateway automatically — no extra configuration. Full lifecycle, supervision, and restart-resume behavior: ADR [tunnel-connectivity.md](adr/tunnel-connectivity.md).
+`connect` returns immediately with `status: "connecting"`, opens an OAuth consent page in the host browser (only when no relay session is stored — reconnects and restarts reuse the session, but `gini tunnel disconnect` logs the instance out, so the next connect prompts again), starts a supervised `frpc` child, and flips the state to `connected` with a stable public URL `https://<subdomain>.<relayDomain>`. Poll `gini tunnel` until you see `connected` + `url`, or `error` + `message`. Relay subdomains are trusted by the gateway automatically — no extra configuration. Full lifecycle, supervision, and restart-resume behavior: ADR [tunnel-connectivity.md](adr/tunnel-connectivity.md).
 
 ## Manual connectors
 
@@ -84,8 +84,8 @@ All three manual connectors follow the same recipe. The examples below were veri
    GINI_TRUSTED_ORIGINS=https://my-mac.tailnet-name.ts.net,https://gini.example.com gini start
    ```
 
-   To make it durable, add the line `GINI_TRUSTED_ORIGINS=...` to `~/.gini/secrets.env` — the installed `gini` wrapper sources it on every launch, and `gini autostart enable` merges it into the launchd plist (re-run that after editing). If the variable is set but contains no parseable origin, the gateway refuses **every** web-bound request until it's fixed — a typo bricks loudly rather than silently downgrading. See ADR [bff-trust-boundary.md](adr/bff-trust-boundary.md).
-3. **Pair the device.** A browser arriving on a trusted non-loopback origin is redirected to `/pair` and must be approved from the loopback UI once; see ADR [device-pairing-auth.md](adr/device-pairing-auth.md). Non-browser clients skip pairing entirely and call the native `/api/*` surface with the instance bearer token — the origin gate applies only to web-bound paths.
+   To make it durable, add the line `GINI_TRUSTED_ORIGINS=...` to `~/.gini/secrets.env` — the installed `gini` wrapper sources it on every launch, and `gini autostart enable` merges it into the launchd plist (re-run that after editing). If the variable is set but contains no parseable origin, the gateway refuses every web-bound request on a **non-loopback, non-relay** front until it's fixed (loopback and gini-relay subdomains keep working — behaviorally a garbage value equals an unset one): the typo bricks exactly the manual-connector front you were configuring, loudly rather than silently downgrading. See ADR [bff-trust-boundary.md](adr/bff-trust-boundary.md).
+3. **Pair the device.** A browser arriving on a trusted non-loopback origin is redirected to `/pair` and must be approved from the loopback UI once; see ADR [device-pairing-auth.md](adr/device-pairing-auth.md). Non-browser clients are never redirected to `/pair` — the native `/api/*` surface is bearer-gated instead, and the origin gate applies only to web-bound paths. A remote non-browser client should still pair: the mobile app runs the pairing handshake natively, and any other client can claim a pairing code (`gini pairing claim <code>`); either way the device gets its own **revocable** token to send as `Authorization: Bearer`. Reserve the instance owner bearer (`config.json`) for local operator tooling — it is a singleton with no per-device revocation, so don't copy it onto remote devices.
 
 ### Tailscale
 
@@ -140,7 +140,7 @@ The third row is the discriminator when something is wrong: the native bearer-ga
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Page `404` through the tunnel, loopback works | Origin not in `GINI_TRUSTED_ORIGINS` (gateway fails closed) | Add the exact `https://` origin; restart the gateway |
-| Every web request refused, even loopback ones work but tunnel 404s persist after setting the var | `GINI_TRUSTED_ORIGINS` set but no entry parses (typo) | Fix the value — entries are full origins, comma-separated |
+| Tunnel 404s persist after setting the var (loopback still fine) | `GINI_TRUSTED_ORIGINS` set but no entry parses (typo), or the gateway wasn't restarted with the new value | Fix the value — entries are full origins, comma-separated — and restart the gateway |
 | Page redirects to `/pair`, API calls `401` | Device not paired (expected on any non-loopback front) | Approve the pairing code from the loopback UI |
 | `Tunnel provider X is not available (requires …)` | Selecting a disabled catalog placeholder | Use `gini-relay`, or run the tool manually per this page |
 | `gini tunnel` says `selectedProvider: null` while your manual tunnel works | Expected: the runtime only tracks tunnels it manages | Confirm manual connectors at their own layer (`tailscale serve status`, the ngrok/cloudflared console) |
