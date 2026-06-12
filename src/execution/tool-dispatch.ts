@@ -1851,24 +1851,48 @@ async function updateJobTool(
   // (job.delivery.rebound, chat.session.archived); the clause below feeds
   // the result text so the model can describe the new binding.
   let deliveryClause: string | undefined;
+  let deliverToApplied = false;
   if (deliverTo !== undefined) {
-    let rebind;
+    let rebind: Awaited<ReturnType<typeof rebindJobDelivery>> | undefined;
     try {
       rebind = await rebindJobDelivery(config, jobId, deliverTo, { originatingSessionId, parentTaskId: taskId });
     } catch (err) {
-      if (err instanceof Error && err.message.startsWith("Cannot rebind job delivery: chat session ")) {
-        return `Error: update_job skipped the delivery rebind because the originating chat session was deleted mid-call.`;
+      // The rebind can race a session deletion or a parent-task
+      // cancellation landing between the lock-free pre-checks above and
+      // rebindJobDelivery's serialized re-checks. By this point the
+      // sibling patches (name/schedule/oneShot/status) have already
+      // committed, so returning a bare `Error:` would tell the model the
+      // whole call failed while most of it persisted: when other fields
+      // were applied, fall through to the normal success return with a
+      // skip clause and leave `deliverTo` out of appliedFields. Only a
+      // deliverTo-only call (nothing applied) keeps the error surface.
+      const sessionVanished =
+        err instanceof Error && err.message.startsWith("Cannot rebind job delivery: chat session ");
+      const parentTerminal =
+        err instanceof Error && err.message.startsWith("Cannot rebind job delivery: parent task ");
+      if (!sessionVanished && !parentTerminal) throw err;
+      const otherFieldsApplied = hasFieldPatch || statusPatch !== undefined;
+      if (!otherFieldsApplied) {
+        if (sessionVanished) {
+          return `Error: update_job skipped the delivery rebind because the originating chat session was deleted mid-call.`;
+        }
+        throw err;
       }
-      throw err;
+      deliveryClause = sessionVanished
+        ? "Delivery rebind skipped: the originating chat session was deleted mid-call."
+        : "Delivery rebind skipped: the parent task went terminal mid-call.";
     }
-    if (rebind.outcome === "noop") {
-      deliveryClause = deliverTo === "chat"
-        ? "Delivery already bound to this conversation — no change."
-        : "Delivery already bound to a dedicated channel — no change.";
-    } else if (deliverTo === "channel") {
-      deliveryClause = `Delivery rebound to a new dedicated channel ${rebind.job.chatSessionId}.`;
-    } else {
-      deliveryClause = `Delivery rebound to this conversation (${originatingSessionId})${rebind.archivedSessionId ? `; the previous channel ${rebind.archivedSessionId} was archived (history preserved, removed from lists)` : ""}.`;
+    if (rebind) {
+      deliverToApplied = true;
+      if (rebind.outcome === "noop") {
+        deliveryClause = deliverTo === "chat"
+          ? "Delivery already bound to this conversation — no change."
+          : "Delivery already bound to a dedicated channel — no change.";
+      } else if (deliverTo === "channel") {
+        deliveryClause = `Delivery rebound to a new dedicated channel ${rebind.job.chatSessionId}.`;
+      } else {
+        deliveryClause = `Delivery rebound to this conversation (${originatingSessionId})${rebind.archivedSessionId ? `; the previous channel ${rebind.archivedSessionId} was archived (history preserved, removed from lists)` : ""}.`;
+      }
     }
   }
 
@@ -1877,13 +1901,15 @@ async function updateJobTool(
 
   // Compose evidence describing exactly which fields were touched. We
   // record only the patch keys the caller supplied (plus `status`,
-  // `oneShot`, and `deliverTo` if present) so the audit row mirrors the
-  // agent's intent.
+  // `oneShot`, and `deliverTo` if it actually applied — a rebind skipped
+  // by a mid-call race is excluded so appliedFields reflects persisted
+  // state; the supplied value still appears in the `patch` evidence as
+  // intent).
   const appliedFields = [
     ...Object.keys(patch),
     ...(oneShotPatch !== undefined ? ["oneShot"] : []),
     ...(statusPatch !== undefined ? ["status"] : []),
-    ...(deliverTo !== undefined ? ["deliverTo"] : [])
+    ...(deliverToApplied ? ["deliverTo"] : [])
   ];
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
