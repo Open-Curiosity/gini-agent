@@ -2,10 +2,9 @@
 
 An instance's gateway binds to loopback. To reach Gini from a phone or another machine you front the **gateway port** with a tunnel — one public origin then serves both the web UI and the `/api/*` surface (see [Gateway And Control Plane](gateway.md)).
 
-There are two ways to get that tunnel:
+All four catalog providers — **Gini Relay, Tailscale, ngrok, Cloudflare** — can be driven natively from `gini tunnel` / the web tunnel panel. The relay is always available; the other three enable themselves when their host prerequisite is detected (`tailscale` logged into a tailnet, an ngrok authtoken, the `cloudflared` binary). A provider whose prerequisite is missing shows as a disabled row with the reason and an info toggle carrying the exact setup steps; this page is the long-form version of those steps, plus the **manual fallback** (run the tool yourself and trust the origin via `GINI_TRUSTED_ORIGINS`) for setups the drivers don't cover — a reverse proxy, a named Cloudflare tunnel on your own domain, a remote tailnet node.
 
-- **The managed provider — Gini Relay.** Built in, selected and supervised through `gini tunnel` / the web tunnel panel. This is the only provider the runtime can drive today.
-- **Manual tunnels — Tailscale, ngrok, Cloudflare.** They appear in the tunnel panel as disabled catalog entries (native integration is planned; see [Roadmap](../ROADMAP.md)), but you can use each of them **today** by running the tool yourself against the gateway port and telling the gateway to trust the external origin. This page documents exactly how, and how to confirm what you've got.
+When the runtime drives a tunnel itself, the connected URL's origin is trusted **automatically** for as long as the record is connected (and revoked the moment it isn't) — no `GINI_TRUSTED_ORIGINS` needed. The env var remains the knob for manually-run fronts.
 
 > Terminology: this page is about **tunnel providers**. The similarly-named `gini connectors` CLI and `/api/connectors` routes manage *service* connectors (Google, Linear, MCP-backed tools) and are unrelated to remote access.
 
@@ -52,17 +51,17 @@ After `gini tunnel select gini-relay`:
 
 ### Selecting a provider that isn't available
 
-Only catalog-enabled providers can be selected. Today that is `gini-relay` alone; the others are placeholders, and selecting one is rejected **before any state changes** with HTTP 400 (CLI exit 1):
+Only catalog-enabled providers can be selected. `gini-relay` is always enabled; the other three enable when detection finds their prerequisite (re-probed at boot, on `gini tunnel` / panel open, and before rejecting a select/connect). Selecting a provider whose prerequisite is genuinely missing is rejected **before any state changes** with HTTP 400 (CLI exit 1):
 
 ```text
-$ gini tunnel select tailscale
+$ gini tunnel select tailscale     # on a machine without a tailnet login
 Tunnel provider Tailscale is not available (requires Tailscale network).
 
 $ gini tunnel select wireguard
 Unknown tunnel provider: wireguard
 ```
 
-So: a disabled provider can never be the selected mode. If you front Gini with Tailscale, ngrok, or Cloudflare manually (below), `gini tunnel` intentionally keeps reporting `selectedProvider: null` (or your relay selection) — the runtime only reports tunnels *it* manages. Confirm a manual tunnel at its own layer instead, per its section below.
+So: a disabled provider can never be the selected mode. If you front Gini with a tool the runtime isn't driving (the manual fallback below), `gini tunnel` intentionally keeps reporting its own selection — the runtime only reports tunnels *it* manages. Confirm a manual front at its own layer instead.
 
 ## The managed provider: Gini Relay
 
@@ -73,9 +72,19 @@ gini tunnel connect
 
 `connect` returns immediately with `status: "connecting"`, opens an OAuth consent page in the host browser (only when no relay session is stored — reconnects and restarts reuse the session, but `gini tunnel disconnect` logs the instance out, so the next connect prompts again), starts a supervised `frpc` child, and flips the state to `connected` with a stable public URL `https://<subdomain>.<relayDomain>`. Poll `gini tunnel` until you see `connected` + `url`, or `error` + `message`. Relay subdomains are trusted by the gateway automatically — no extra configuration. Full lifecycle, supervision, and restart-resume behavior: ADR [tunnel-connectivity.md](adr/tunnel-connectivity.md).
 
-## Manual tunnels
+## Native connects (Tailscale, ngrok, Cloudflare)
 
-All three manual tunnels follow the same recipe. The examples below use `<gateway-port>` for the instance's gateway port — find yours with `gini status`.
+Select the provider and connect — panel or CLI (`gini tunnel connect tailscale`). What each driver runs:
+
+- **Tailscale**: `tailscale serve` on the gateway port; URL `https://<machine>.<tailnet>.ts.net` (tailnet-private, stable, survives gateway restarts — the resume re-publishes the same URL). Disconnect turns the serve config off.
+- **ngrok**: `ngrok http <gateway-port>` as a supervised child; free-tier URLs are random per connect and show a one-time browser interstitial (`ngrok-skip-browser-warning` header suppresses it for non-browser clients). If the agent dies, the record flips to `error` and the front's trust is revoked.
+- **Cloudflare**: a quick tunnel (`cloudflared --config /dev/null tunnel --url …`, the `--config` override built in so a named-tunnel `config.yml` can't break it); random `https://<words>.trycloudflare.com` URL, testing-grade (no SSE — live UI updates need a reload). Same supervision as ngrok.
+
+Switching the selection away from a live provider tears the old tunnel down first (including the persistent tailscale serve config), and a connected front's origin trust always tracks the record — connected = admitted, anything else = revoked.
+
+## Manual fronts
+
+For anything the drivers don't cover (reverse proxies, a named Cloudflare tunnel on your own domain, a serve running on another tailnet node), the same recipe always works. The examples below use `<gateway-port>` for the instance's gateway port — find yours with `gini status`.
 
 1. **Expose the gateway port** (not the web port) with your tunnel tool. One origin then serves UI + API. For a durable tunnel, pin the port first: non-default instances derive hash-based ports that **walk forward when busy** (see [Gateway And Control Plane](gateway.md)), so after a restart a long-lived tunnel can silently forward to whatever process now owns the old port. Launch with an explicit `--port`/`GINI_PORT` — pinned ports stay strict and fail instead of moving — and stop/recreate the tunnel whenever the port or instance changes.
 2. **Trust the external origin.** The gateway fail-closes web-bound requests from hostnames it doesn't know (page navigations 404, `/api/runtime/*` 403). Set `GINI_TRUSTED_ORIGINS` to the comma-separated **full origins** of your tunnels, in the gateway process environment at launch:

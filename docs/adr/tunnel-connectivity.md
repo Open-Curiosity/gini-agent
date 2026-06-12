@@ -4,7 +4,7 @@
 
 Gini exposes a remote URL for an instance through a **tunnel provider**, selected and managed by the user through a uniform RPC contract. The gateway owns a small persisted singleton (the user's provider selection + connection status) and rebuilds the provider catalog from code on every read. Every tunnel route returns the **full `TunnelState`** so a single fetch drives the whole selection / connect / connected UI without follow-up requests.
 
-The provider catalog is fixed for now: `gini-relay` is the only enabled provider; `tailscale`, `ngrok`, and `cloudflare` are catalog placeholders surfaced to the UI with a `requires` string explaining the missing prerequisite. The gini-relay connect flow is wired through the [`gini-relay`](https://github.com/Lilac-Labs/gini-relay) client package: `connectTunnel` flips status to `connecting` and returns immediately, then a background handshake mints an OAuth-loopback consent URL (`loginUrl`), opens it in the host browser, awaits the session, builds + starts a native `frpc` tunnel (`buildTunnel`) that exposes the instance's gateway port (the single origin fronting UI + API; see *Exposed port*), and records the public `https://<subdomain>.<relayDomain>` url. The UI/CLI polls `GET /api/tunnel` until status flips to `connected` (with `url`) or `error` (with `message`).
+The catalog carries four drivable providers. `gini-relay` is always enabled; `tailscale`, `ngrok`, and `cloudflare` are **detection-gated**: a driver probe (tailscale backend running with a MagicDNS name, `ngrok config check`, `cloudflared --version`) flips each row enabled, and a missing prerequisite surfaces as `requires` plus `setup` — the host-side steps the panel renders behind an info toggle. Detection refreshes at boot, on `GET /api/tunnel?detect=1` (panel open / CLI status), and lazily before a select/connect of a cache-disabled provider; plain polling GETs never spawn probes. The gini-relay connect flow is wired through the [`gini-relay`](https://github.com/Lilac-Labs/gini-relay) client package: `connectTunnel` flips status to `connecting` and returns immediately, then a background handshake mints an OAuth-loopback consent URL (`loginUrl`), opens it in the host browser, awaits the session, builds + starts a native `frpc` tunnel (`buildTunnel`) that exposes the instance's gateway port (the single origin fronting UI + API; see *Exposed port*), and records the public `https://<subdomain>.<relayDomain>` url. The UI/CLI polls `GET /api/tunnel` until status flips to `connected` (with `url`) or `error` (with `message`).
 
 ## Context
 
@@ -28,7 +28,8 @@ type TunnelProvider = {
   id: "gini-relay" | "tailscale" | "ngrok" | "cloudflare";
   name: string;
   enabled: boolean;
-  requires?: string;
+  requires?: string;   // why a disabled row can't connect
+  setup?: string[];    // host-side steps (manual providers, enabled or not)
 };
 
 type TunnelState = {
@@ -50,14 +51,20 @@ View derivation from state:
 
 ## Provider catalog
 
-| id | name | enabled | requires |
-|----|------|---------|----------|
-| `gini-relay` | Gini Relay | `true` | — |
-| `tailscale` | Tailscale | `false` | `Tailscale network` |
-| `ngrok` | ngrok | `false` | `ngrok account` |
-| `cloudflare` | Cloudflare | `false` | `Cloudflare account` |
+| id | name | enabled | requires (when disabled) | driver |
+|----|------|---------|--------------------------|--------|
+| `gini-relay` | Gini Relay | always | — | gini-relay client (OAuth + frpc) |
+| `tailscale` | Tailscale | detected | `Tailscale network` | `tailscale serve` (childless; persists in tailscaled; same stable ts.net URL across restarts) |
+| `ngrok` | ngrok | detected | `ngrok account` | `ngrok http <port>` supervised child; URL scanned from agent output |
+| `cloudflare` | Cloudflare | detected | `cloudflared CLI` | quick tunnel (`--config /dev/null` built in) supervised child |
 
-A disabled catalog entry only means the **runtime** can't drive that provider; an operator can still front the gateway with the tool manually (their own Tailscale/ngrok/Cloudflare tunnel + a `GINI_TRUSTED_ORIGINS` entry for the external origin). Such tunnels are intentionally invisible to `state.tunnel` — the record describes only runtime-managed tunnels. The user-facing per-provider instructions and the verification matrix live in [Remote Access](../remote-access.md).
+Every manual entry also carries `setup: string[]` — the host-side install/auth steps — whether enabled or not, so the panel's info toggle can show a disabled row how to become available and an enabled row what Connect will run.
+
+The manual connect flow mirrors the relay's supervision contract: `connecting` → background driver → `connected` (with the public url) or `error`; a supervised child's unexpected exit flips `connected → error`; cancel/disconnect/supersede tear down the child **or** the provider-side state (tailscale serve config) — including on a provider *switch*, where `selectProvider` tears down the live manual tunnel before flipping to idle. Reconcile resumes a `connected` manual record after a restart when its prerequisite still detects (tailscale re-publishes the same URL; ngrok/cloudflared mint a fresh one).
+
+**Runtime-tunnel origin trust.** Every tunnel-record write syncs a per-instance entry in `src/lib/origin-trust.ts` (`setRuntimeTunnelTrust`): while a record is `connected`, its url's host is admitted by the gateway's web-bound guard exactly like a relay subdomain (the runtime established the front; the provider owns the DNS), and any transition away from connected revokes it atomically with the state write. Unsafe methods still require Origin==Host on the tunnel front, and device pairing still gates every non-loopback front.
+
+A *manually*-run front (a tool the runtime isn't driving — reverse proxy, named Cloudflare tunnel, remote tailnet node) is still supported via a `GINI_TRUSTED_ORIGINS` entry, and is intentionally invisible to `state.tunnel` — the record describes only runtime-managed tunnels. The user-facing per-provider instructions and the verification matrix live in [Remote Access](../remote-access.md).
 
 ## Endpoints
 
