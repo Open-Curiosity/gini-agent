@@ -8,6 +8,7 @@ import type {
   ChatBlock,
   ConnectorRecord,
   EmailWatcherRecord,
+  GoogleAccountStatus,
   ImprovementProposal,
   JobRecord,
   JobRunRecord,
@@ -252,6 +253,12 @@ export interface ProviderDescriptor {
   // page match a service skill's required-credential connector to its setup
   // skill so the service pill defers to the setup card's sign-in status.
   setupSkill?: string;
+  // Live result of the provider's credentialExternallySatisfied hook (e.g.
+  // registered machine-global Google accounts). deriveActivation mirrors the
+  // runtime gate with it: the fallthrough applies only when NO connector
+  // record with the credential name exists — an existing record of any
+  // status (including disabled) keeps the record-based gate.
+  externallySatisfied?: boolean;
   probeIntervalMs?: number;
   // Defaults the Add Connector dialog prefills when this provider is picked
   // as a credential template. Present only for providers whose module
@@ -270,9 +277,24 @@ export function useProviders() {
   return useQuery<ProviderDescriptor[]>({
     queryKey: ["connector-providers"],
     queryFn: () => api<ProviderDescriptor[]>("/connectors/providers"),
-    // The registry is built at runtime startup; it doesn't change between
-    // reloads, so a long stale time avoids unnecessary refetches.
-    staleTime: 5 * 60_000
+    // The registry itself is built at runtime startup, but the payload also
+    // carries the live `externallySatisfied` bit (machine-global account
+    // registry), so cap staleness at the same 60s cadence the connectors
+    // query idles at.
+    staleTime: 60_000
+  });
+}
+
+// Machine-global tagged Google accounts (GET /api/google/accounts), each
+// joined with live `gws auth status`. Exists independently of any
+// google-oauth-desktop connector record, so the Skills page can render the
+// accounts card on a registry-only machine. The GoogleAccountsCard
+// mutations invalidate the "google-accounts" key.
+export function useGoogleAccounts() {
+  return useQuery<GoogleAccountStatus[]>({
+    queryKey: ["google-accounts"],
+    queryFn: () => api<GoogleAccountStatus[]>("/google/accounts"),
+    refetchInterval: 60_000
   });
 }
 
