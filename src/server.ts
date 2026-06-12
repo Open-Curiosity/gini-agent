@@ -103,8 +103,16 @@ setBrowserRecording(config.browserRecording === true);
 // keeps the never-crash-boot guarantee. See ADR tunnel-connectivity.md.
 const tunnelReconcileStartedMs = performance.now();
 // Probe the manual tunnel drivers (tailscale/ngrok/cloudflared) once at boot so
-// the catalog's enabled flags are correct from the first GET /api/tunnel.
-await refreshProviderDetection().catch(() => {});
+// the catalog's enabled flags fill in shortly after bind. Fire-and-forget: a
+// wedged provider CLI takes up to 4500ms to settle (2000ms DETECT_TIMEOUT_MS
+// SIGTERM + 2000ms SIGKILL escalation + 500ms bail), and `gini start` SIGKILLs
+// a boot that isn't healthy within its 5000ms window — detection must never
+// eat that budget. Until the probe lands the catalog is merely
+// default-disabled, and every user path (panel-open `?detect=1`,
+// select/connect of a disabled provider) forces its own probe. The reconcile
+// below still awaits detection internally when a manual record needs it —
+// that's the one case worth blocking for.
+void refreshProviderDetection().catch(() => {});
 await reconcileTunnelOnStartup(config).catch((error) => {
   appendLog(config.instance, "tunnel.reconcile.error", {
     error: error instanceof Error ? error.message : String(error)
@@ -465,8 +473,12 @@ async function shutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
   //
   // Bound the wait at SCHEDULER_DRAIN_TIMEOUT_MS: a hung tick (e.g. a
   // script job that spawned a child blocking on stdio) shouldn't block
-  // shutdown forever. After the timeout we proceed even if the tick
-  // hasn't unwound — the OS will reap the child process tree on exit.
+  // shutdown forever. After the timeout we proceed even if the tick hasn't
+  // unwound. NOTE: children that survive are NOT reliably reaped on exit —
+  // in daemon mode (`gini start` spawns the runtime detached, its own
+  // process group) an orphan is reparented and keeps running, which is why
+  // stopAllTunnels kills in-flight tunnel agents explicitly before this
+  // deadline can fire.
   const SCHEDULER_DRAIN_TIMED_OUT = Symbol("scheduler-drain-timed-out");
   const drained = Promise.race([
     Promise.all([

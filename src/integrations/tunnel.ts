@@ -101,7 +101,11 @@ export interface ManualDriverResult {
 
 export interface ManualDriver {
   detect(): Promise<ProviderAvailability>;
-  connect(port: number): Promise<ManualDriverResult>;
+  // `onSpawn` hands the caller a kill handle THE MOMENT an agent process
+  // spawns (before URL discovery resolves), so cancel/shutdown can terminate
+  // an in-flight connect instead of orphaning the agent — a process spawned
+  // mid-discovery is otherwise invisible until connect() settles.
+  connect(port: number, onSpawn?: (kill: () => void) => void): Promise<ManualDriverResult>;
   disconnect?(): Promise<void>;
 }
 
@@ -218,9 +222,11 @@ export async function spawnUrlChild(
   spawn: TunnelProcSpawn,
   argv: string[],
   urlPattern: RegExp,
-  timeoutMs: number
+  timeoutMs: number,
+  onSpawn?: (kill: () => void) => void
 ): Promise<ManualDriverResult> {
   const proc = spawn(argv);
+  onSpawn?.(() => proc.kill());
   const settled = Promise.withResolvers<string>();
   const tail: string[] = [];
   let buffered = "";
@@ -365,6 +371,11 @@ export function makeDefaultDrivers(
           throw error;
         }
       },
+      // `--https=443 off` over `serve reset`: both clear Gini's handler (each
+      // verified exit 0 + "No serve config" on tailscale 1.96.4), but reset
+      // wipes the operator's ENTIRE serve config — including handlers Gini
+      // never created — while this form removes only the one 443 proxy that
+      // connect() set up.
       disconnect: async () => {
         await run(["tailscale", "serve", "--https=443", "off"]);
       }
@@ -384,12 +395,13 @@ export function makeDefaultDrivers(
           ? { enabled: true }
           : { enabled: false, requires: DEFAULT_REQUIRES.ngrok };
       },
-      connect: (port) =>
+      connect: (port, onSpawn) =>
         spawnUrlChild(
           spawn,
           ["ngrok", "http", String(port), "--log", "stdout", "--log-format", "logfmt"],
           /url=(https:\/\/[^\s"]+)/,
-          manualConnectTimeoutMs()
+          manualConnectTimeoutMs(),
+          onSpawn
         )
     },
     cloudflare: {
@@ -408,7 +420,7 @@ export function makeDefaultDrivers(
       // instead of the gateway. Credentials are passed explicitly (the
       // config's credentials-file, defaulting to ~/.cloudflared/<id>.json).
       // Without a named tunnel, fall back to an ephemeral quick tunnel.
-      connect: async (port) => {
+      connect: async (port, onSpawn) => {
         const named = parseCloudflareConfig(await readCloudflareConfig());
         if (named) {
           const credFile = named.credentialsFile ?? `${process.env.HOME}/.cloudflared/${named.id}.json`;
@@ -423,7 +435,8 @@ export function makeDefaultDrivers(
               "run", "--url", `http://127.0.0.1:${port}`, named.id
             ],
             /(Registered tunnel connection|Connection [a-f0-9-]+ registered)/,
-            manualConnectTimeoutMs()
+            manualConnectTimeoutMs(),
+            onSpawn
           );
           return { url: `https://${named.hostname}`, child: result.child };
         }
@@ -431,7 +444,8 @@ export function makeDefaultDrivers(
           spawn,
           ["cloudflared", "--config", "/dev/null", "tunnel", "--url", `http://127.0.0.1:${port}`],
           /(https:\/\/[a-z0-9-]+\.trycloudflare\.com)/,
-          manualConnectTimeoutMs()
+          manualConnectTimeoutMs(),
+          onSpawn
         );
       }
     }
@@ -566,6 +580,11 @@ interface Supervisor {
   // The in-flight background connect promise — awaited by tests to observe
   // the terminal (connected/error) transition deterministically.
   settled?: Promise<void>;
+  // Kill handle for an agent process spawned by an IN-FLIGHT manual connect
+  // (set the moment the process spawns, cleared when connect() settles).
+  // Without it, cancel/shutdown during URL discovery would orphan the agent —
+  // sup.child only exists after discovery resolves.
+  pendingKill?: () => void;
 }
 
 const supervisors = new Map<Instance, Supervisor>();
@@ -605,11 +624,16 @@ function serializeProviderOp<T>(instance: Instance, provider: ManualProviderId, 
 
 // Queue-aware driver call helpers: childless drivers go through the
 // per-(instance,provider) queue; child-backed drivers call straight through.
-function driverConnect(instance: Instance, provider: ManualProviderId, port: number): Promise<ManualDriverResult> {
+function driverConnect(
+  instance: Instance,
+  provider: ManualProviderId,
+  port: number,
+  onSpawn?: (kill: () => void) => void
+): Promise<ManualDriverResult> {
   const driver = deps.drivers[provider];
   return driver.disconnect
-    ? serializeProviderOp(instance, provider, () => driver.connect(port))
-    : driver.connect(port);
+    ? serializeProviderOp(instance, provider, () => driver.connect(port, onSpawn))
+    : driver.connect(port, onSpawn);
 }
 
 function driverDisconnect(instance: Instance, provider: ManualProviderId): Promise<void> {
@@ -654,6 +678,13 @@ function teardown(instance: Instance): void {
   } catch {
     // A cancel after the login already settled is a no-op upstream; swallow.
   }
+  try {
+    // Kill an agent still in URL discovery so the in-flight connect rejects
+    // promptly (its abort path sees it is no longer current and stays quiet).
+    entry.pendingKill?.();
+  } catch {
+    // The process may already be gone.
+  }
   if (entry.child) {
     void entry.child.stop().catch(() => {
       // The child may already be gone; the OS reaps it on exit regardless.
@@ -685,6 +716,21 @@ export async function stopAllTunnels(): Promise<void> {
         // login already settled — nothing to cancel.
       }
       const stops: Promise<unknown>[] = [];
+      try {
+        // An agent still in URL discovery: kill it now — the event loop dies
+        // with this drain, so neither the discovery timeout nor the connect's
+        // abort path would ever run for an orphan (and in daemon mode the
+        // reparented agent would keep fronting a dead gateway's port).
+        entry.pendingKill?.();
+      } catch {
+        // The process may already be gone.
+      }
+      if (entry.settled) {
+        // Give the killed connect a beat to run its abort path (log + no
+        // state write) before exit; bounded so a wedged settle can't stall
+        // the drain.
+        stops.push(Promise.race([entry.settled, Bun.sleep(2_000)]));
+      }
       if (entry.child) stops.push(entry.child.stop().catch(() => undefined));
       // A connected CHILDLESS tunnel (tailscale serve) would keep fronting the
       // gateway PORT after this process exits — and whatever binds that port
@@ -1095,7 +1141,14 @@ async function runManualConnect(
       return;
     }
 
-    const result = await driverConnect(config.instance, provider, port);
+    let result: ManualDriverResult;
+    try {
+      result = await driverConnect(config.instance, provider, port, (kill) => {
+        sup.pendingKill = kill;
+      });
+    } finally {
+      sup.pendingKill = undefined;
+    }
     if (result.child) sup.child = result.child;
 
     // A cancel/disconnect or a newer connect may have superseded us while the

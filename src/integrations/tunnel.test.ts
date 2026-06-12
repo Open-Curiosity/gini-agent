@@ -1220,9 +1220,9 @@ function scriptedDriver(over: Partial<ManualDriver> & { requires?: string } = {}
       driver.detects += 1;
       return over.detect ? over.detect() : Promise.resolve({ enabled: true });
     },
-    connect(port: number) {
+    connect(port: number, onSpawn?: (kill: () => void) => void) {
       driver.connects += 1;
-      return over.connect ? over.connect(port) : Promise.resolve({ url: "https://machine.tail-test.ts.net" });
+      return over.connect ? over.connect(port, onSpawn) : Promise.resolve({ url: "https://machine.tail-test.ts.net" });
     },
     disconnect() {
       driver.disconnects += 1;
@@ -1592,9 +1592,13 @@ describe("manual tunnel drivers", () => {
     // entering alone supersedes A. When A's prep await releases, A must bail
     // instead of claiming/overwriting; B then proceeds and wins.
     const a = connectTunnel(config, "ngrok");
-    await Bun.sleep(1); // A reaches its disconnect await (gate 0)
-    const b = connectTunnel(config, "cloudflare"); // its teardown queues behind A's
-    await Bun.sleep(1);
+    // Poll the driver's call counter: disconnect is invoked exactly when A's
+    // prep reaches its (parked) teardown await — no blind sleeps.
+    for (let i = 0; disconnectCalls < 1 && i < 1000; i += 1) await Bun.sleep(1);
+    expect(disconnectCalls).toBe(1);
+    // B supersedes A synchronously at entry (the attempt stamp bumps before
+    // B's first await); B's own teardown then queues behind A's parked one.
+    const b = connectTunnel(config, "cloudflare");
     disconnectGates[0]!.resolve(); // A's prep completes — superseded, bails
     const aState = await a;
     expect(ngrok.connects).toBe(0);
@@ -1621,13 +1625,82 @@ describe("manual tunnel drivers", () => {
     await awaitTunnelSettled(config.instance);
 
     const a = connectTunnel(config, "ngrok"); // prep parks on tailscale's teardown
-    await Bun.sleep(1);
+    for (let i = 0; disconnects < 1 && i < 1000; i += 1) await Bun.sleep(1);
+    expect(disconnects).toBe(1);
     const d = disconnectTunnel(config); // the user's LAST action
     prepGate.resolve(); // a's prep completes — superseded by the disconnect, bails
     await a;
     await d;
     expect(getTunnel(config).status).toBe("idle");
     expect(ngrok.connects).toBe(0);
+  });
+
+  test("a driver with no provider-side disconnect connects outside the serialization queue", async () => {
+    // Child-backed drivers (no singleton provider-side state) bypass the
+    // per-(instance,provider) op queue — their teardown is the child stop.
+    const ngrok: ManualDriver = {
+      detect: () => Promise.resolve({ enabled: true }),
+      connect: (_port, onSpawn) => {
+        onSpawn?.(() => {});
+        return Promise.resolve({ url: "https://q.ngrok-free.app", child: fakeChild() });
+      }
+    };
+    setTunnelDeps(deps({ drivers: fakeDrivers({ ngrok }) }));
+    await connectTunnel(config, "ngrok");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+  });
+
+  test("cancel during URL discovery kills the in-flight agent promptly (no orphan, no error write)", async () => {
+    // The driver invokes onSpawn the moment its agent spawns (mirroring
+    // spawnUrlChild); the kill handle rejects the parked discovery.
+    let killed = 0;
+    const discovery = Promise.withResolvers<never>();
+    const ngrok = scriptedDriver({
+      connect: (_port: number, onSpawn?: (kill: () => void) => void) => {
+        onSpawn?.(() => {
+          killed += 1;
+          discovery.reject(new Error("ngrok killed (exit 143)"));
+        });
+        return discovery.promise;
+      }
+    });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ ngrok }) }));
+    await connectTunnel(config, "ngrok");
+    // Wait until the background flow actually reaches the driver (the agent
+    // has spawned and is hunting for its URL) before cancelling.
+    for (let i = 0; ngrok.connects < 1 && i < 1000; i += 1) await Bun.sleep(1);
+    expect(ngrok.connects).toBe(1);
+    const settled = awaitTunnelSettled(config.instance);
+    // Cancel lands while the agent is still hunting for its URL: teardown's
+    // pendingKill must terminate it NOW, not after the discovery timeout.
+    const state = await cancelTunnel(config);
+    expect(state.status).toBe("idle");
+    expect(killed).toBe(1);
+    await settled; // the killed connect aborts quietly (no clobbering error)
+    expect(getTunnel(config).status).toBe("idle");
+  });
+
+  test("stopAllTunnels kills an agent still in URL discovery (a shutdown can't orphan it)", async () => {
+    let killed = 0;
+    const discovery = Promise.withResolvers<never>();
+    const ngrok = scriptedDriver({
+      connect: (_port: number, onSpawn?: (kill: () => void) => void) => {
+        onSpawn?.(() => {
+          killed += 1;
+          discovery.reject(new Error("ngrok killed (exit 143)"));
+        });
+        return discovery.promise;
+      }
+    });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ ngrok }) }));
+    await connectTunnel(config, "ngrok");
+    for (let i = 0; ngrok.connects < 1 && i < 1000; i += 1) await Bun.sleep(1);
+    expect(ngrok.connects).toBe(1);
+    // Shutdown mid-discovery: sup.child doesn't exist yet, so only the
+    // pendingKill seam can stop the spawned agent before process exit.
+    await stopAllTunnels();
+    expect(killed).toBe(1);
   });
 
   test("stopAllTunnels turns childless provider-side state off; the record stays connected for the boot resume", async () => {
@@ -1829,6 +1902,20 @@ describe("spawnUrlChild", () => {
     expect(await stopped).toBe(143);
   });
 
+  test("onSpawn hands out a kill handle the moment the process spawns", async () => {
+    const proc = fakeProc();
+    let kill: (() => void) | undefined;
+    const pending = spawnUrlChild(() => proc, ["ngrok"], /url=(\S+)/, 5_000, (k) => {
+      kill = k;
+    });
+    // The handle exists BEFORE any output/resolution — that's the point: an
+    // in-flight discovery must be killable by cancel/shutdown.
+    expect(kill).toBeDefined();
+    kill!();
+    expect(proc.killed).toBe(true);
+    await expect(pending).rejects.toThrow(/ngrok exited/);
+  });
+
   test("matches on stderr too (cloudflared logs there) using the whole match", async () => {
     const proc = fakeProc();
     const pending = spawnUrlChild(
@@ -1994,6 +2081,8 @@ describe("makeDefaultDrivers", () => {
       const withToken = makeDefaultDrivers(ok.run, undefined, undefined, async (path) =>
         path === "/home/u/ngrok.yml" ? "version: 3\nagent:\n  authtoken: tok_x\n" : null
       );
+      // The v3 nested layout, read from the exact path the check reported.
+      expect(await withToken.ngrok.detect()).toEqual({ enabled: true });
       // The simple `authtoken:` line form is the common v2 layout.
       const v2 = makeDefaultDrivers(ok.run, undefined, undefined, async () => "authtoken: tok_x\n");
       expect(await v2.ngrok.detect()).toEqual({ enabled: true });
