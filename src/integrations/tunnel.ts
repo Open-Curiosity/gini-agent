@@ -229,31 +229,34 @@ export async function spawnUrlChild(
   onSpawn?.(() => proc.kill());
   const settled = Promise.withResolvers<string>();
   const tail: string[] = [];
-  let buffered = "";
 
-  const scan = (chunk: string): void => {
-    buffered += chunk;
-    const lines = buffered.split("\n");
-    buffered = lines.pop() ?? "";
-    for (const line of lines) {
-      if (line.trim()) {
-        tail.push(line.trim());
-        if (tail.length > 20) tail.shift();
-      }
-      const match = urlPattern.exec(line);
-      if (match) settled.resolve(match[1] ?? match[0]);
+  const processLine = (line: string): void => {
+    if (line.trim()) {
+      tail.push(line.trim());
+      if (tail.length > 20) tail.shift();
     }
+    const match = urlPattern.exec(line);
+    if (match) settled.resolve(match[1] ?? match[0]);
   };
 
+  // Each reader owns its OWN line buffer: stdout and stderr are read
+  // concurrently, and a shared accumulator would splice a chunk from one
+  // stream into the middle of the other's partial line — corrupting the very
+  // line the URL pattern matches. Cross-stream ordering doesn't matter to
+  // either consumer (tail context, URL match); line integrity does.
   const readAll = async (stream: ReadableStream<Uint8Array> | null): Promise<void> => {
     if (!stream) return;
     const decoder = new TextDecoder();
     const reader = stream.getReader();
+    let buffered = "";
     try {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        scan(decoder.decode(value, { stream: true }));
+        buffered += decoder.decode(value, { stream: true });
+        const lines = buffered.split("\n");
+        buffered = lines.pop() ?? "";
+        for (const line of lines) processLine(line);
       }
     } catch {
       // The stream tears down when the process is killed; the race below
@@ -740,11 +743,25 @@ export async function stopAllTunnels(): Promise<void> {
       const record = readState(instance).tunnel;
       if (
         !entry.child &&
-        record?.status === "connected" &&
+        (record?.status === "connected" || record?.status === "connecting") &&
         record.selectedProvider &&
         isManualProviderId(record.selectedProvider)
       ) {
-        stops.push(driverDisconnect(instance, record.selectedProvider).catch(() => undefined));
+        // "connecting" counts: tailscale's serve --bg runs BEFORE the
+        // connected write, so a shutdown in that window must still turn the
+        // front off (the off serializes behind the in-flight serve op; for
+        // child-backed providers this is a no-op and pendingKill covers the
+        // agent). The next boot resets a stale connecting record to idle, so
+        // nothing would ever clean it up otherwise. Bounded: the off queues
+        // behind the in-flight serve op, and a WEDGED op must not stall the
+        // drain — the boot-time reconcile of a stale connecting record is
+        // the backstop for that residual.
+        stops.push(
+          Promise.race([
+            driverDisconnect(instance, record.selectedProvider).catch(() => undefined),
+            Bun.sleep(2_000)
+          ])
+        );
       }
       return Promise.all(stops);
     })
@@ -1619,10 +1636,18 @@ export async function reconcileTunnelOnStartup(config: RuntimeConfig): Promise<T
   }
   const selected = record.selectedProvider ?? null;
   // A manual provider's availability cache is empty on a fresh boot — probe
-  // before deciding whether the record's provider can resume. (Never rejects:
-  // each driver probe catches into its default-disabled entry.)
-  if (selected && isManualProviderId(selected)) {
+  // before deciding whether the record's provider can resume. Only worth
+  // blocking boot for a record that CAN resume: a stale "connecting" resets
+  // to idle regardless of detection. (Never rejects: each driver probe
+  // catches into its default-disabled entry.)
+  if (record.status === "connected" && selected && isManualProviderId(selected)) {
     await refreshProviderDetection();
+  }
+  // A stale manual "connecting" record can have provider-side state live with
+  // nothing left to clean it (a crash mid-connect after tailscale's serve
+  // --bg) — turn it off best-effort before resetting to idle.
+  if (record.status === "connecting" && selected && isManualProviderId(selected)) {
+    await driverDisconnect(config.instance, selected).catch(() => {});
   }
   const provider = selected ? findProvider(selected) : undefined;
   // Only a tunnel that was actually "connected" (with an enabled provider still

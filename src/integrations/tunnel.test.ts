@@ -1703,6 +1703,44 @@ describe("manual tunnel drivers", () => {
     expect(killed).toBe(1);
   });
 
+  test("stopAllTunnels turns serve off for a record still CONNECTING (serve --bg precedes the connected write)", async () => {
+    // Park the connect between serve --bg and the DNS lookup: provider-side
+    // state is live while the record reads "connecting".
+    const dnsGate = Promise.withResolvers<never>();
+    const tailscale = scriptedDriver({ connect: () => dnsGate.promise });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await connectTunnel(config, "tailscale");
+    for (let i = 0; tailscale.connects < 1 && i < 1000; i += 1) await Bun.sleep(1);
+    expect(getTunnel(config).status).toBe("connecting");
+    await stopAllTunnels();
+    // The off is queued behind the parked connect op, so it lands once the
+    // in-flight serve op settles — but it MUST have been issued.
+    dnsGate.reject(new Error("shutdown"));
+    for (let i = 0; tailscale.disconnects < 1 && i < 1000; i += 1) await Bun.sleep(1);
+    expect(tailscale.disconnects).toBe(1);
+  });
+
+  test("reconcile tears provider-side state down when resetting a stale manual CONNECTING record", async () => {
+    // A crash mid-connect (after serve --bg, before the connected write)
+    // persists "connecting" with serve live; the reset must clean it up.
+    const tailscale = scriptedDriver();
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await mutateState(config.instance, (state) => {
+      state.tunnel = {
+        instance: config.instance,
+        selectedProvider: "tailscale",
+        status: "connecting",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      };
+    });
+    const state = await reconcileTunnelOnStartup(config);
+    expect(state.status).toBe("idle");
+    expect(tailscale.disconnects).toBe(1);
+    // And no detection probe was awaited for a record that can't resume.
+    expect(tailscale.detects).toBe(0);
+  });
+
   test("stopAllTunnels turns childless provider-side state off; the record stays connected for the boot resume", async () => {
     const tailscale = scriptedDriver();
     setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
@@ -1853,6 +1891,7 @@ describe("manual tunnel drivers", () => {
 function fakeProc(): SpawnedTunnelProc & {
   emitOut: (line: string) => Promise<void>;
   emitErr: (line: string) => Promise<void>;
+  writeErr: (text: string) => Promise<void>;
   exit: (code: number) => void;
   killed: boolean;
 } {
@@ -1880,6 +1919,10 @@ function fakeProc(): SpawnedTunnelProc & {
     emitErr(line: string) {
       return errWriter.write(encoder.encode(`${line}\n`));
     },
+    // Raw write WITHOUT a newline — for interleaving partial lines.
+    writeErr(text: string) {
+      return errWriter.write(encoder.encode(text));
+    },
     exit(code: number) {
       exited.resolve(code);
     }
@@ -1900,6 +1943,19 @@ describe("spawnUrlChild", () => {
     const stopped = result.child!.stop();
     expect(proc.killed).toBe(true);
     expect(await stopped).toBe(143);
+  });
+
+  test("interleaved partial chunks across stdout and stderr never corrupt a line", async () => {
+    const proc = fakeProc();
+    const pending = spawnUrlChild(() => proc, ["ngrok"], /url=(https:\/\/\S+)/, 5_000);
+    // stderr emits HALF a line, stdout interleaves a full line, stderr
+    // finishes its line. With a shared buffer the stdout chunk would splice
+    // into stderr's partial line and corrupt the URL.
+    await proc.writeErr("t=1 url=https://real");
+    await proc.emitOut("t=2 lvl=info msg=heartbeat");
+    await proc.writeErr("-tunnel.example\n");
+    const result = await pending;
+    expect(result.url).toBe("https://real-tunnel.example");
   });
 
   test("onSpawn hands out a kill handle the moment the process spawns", async () => {
