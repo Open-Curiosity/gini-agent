@@ -227,12 +227,17 @@ from a Telegram/Discord conversation) mirrors the reply back to that
 bridge, and `JobRecord.deliveryTargets` names additional bridges to
 deliver to — the surface for "send my morning briefing to telegram"
 when the job was created from web/CLI. The `create_job`/`update_job`
-tools accept `deliveryTargets` (bridge names, validated against the
-configured bridges; `[]` clears). Entries resolve by bridge id, then
-case-insensitive name, then kind; a bridge the origin mirror already
-covered is skipped, and both paths honor the exact-`[SILENT]`
-suppression contract. Fire-time resolution failures or send errors are
-logged (`job.delivery.target.error`) without failing the run.
+tools accept `deliveryTargets` entries that must resolve to exactly
+one dispatchable (Telegram/Discord) bridge — by id, case-insensitive
+name, or kind; unknown and ambiguous entries are rejected — and
+persist the resolved bridge id (`[]` clears). Delivery runs on every
+terminal finalize: a job with no chat session (created via `POST
+/api/jobs` or from a non-chat task) or whose session vanished delivers
+the task summary instead of the synced chat reply, and both paths
+honor the exact-`[SILENT]` suppression contract. A bridge the origin
+mirror already delivered to is skipped. Fire-time resolution failures
+and send failures are logged (`job.delivery.target.error`) and audited
+(`job.delivery.failed`) without failing the run.
 
 ## Agent-Decided Routing
 

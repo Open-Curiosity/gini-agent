@@ -1265,12 +1265,18 @@ async function spawnSubagentTool(
 }
 
 // Validate a create_job / update_job `deliveryTargets` payload against
-// the configured messaging bridges. Entries resolve by bridge id, then
-// case-insensitive name, then kind — the same resolution the job
-// finalizer applies at fire time (src/jobs/finalize.ts), so a payload
-// that passes here is deliverable as long as the bridge still exists
-// when the job fires. Unknown entries are rejected with the configured
-// bridge names so the agent can relay a fixable error to the user.
+// the dispatchable messaging bridges — telegram / discord, the only
+// kinds the job finalizer (src/jobs/finalize.ts) can send to. A demo
+// (or other non-dispatchable) bridge would validate and then fail on
+// every fire, so it is rejected here. Entries resolve by bridge id,
+// then case-insensitive name, then kind; an entry whose winning tier
+// matches more than one bridge is rejected as ambiguous (bridge names
+// and kinds are not unique, and bridge ordering shifts as records are
+// added — first-match would silently re-route). The resolved entry is
+// persisted as the bridge id, which is stable across renames and
+// reordering (the same way ChatSessionRecord.outboundMirror pins
+// bridgeId). Unknown entries are rejected with the dispatchable bridge
+// names so the agent can relay a fixable error to the user.
 // Returns undefined when the field was omitted; an empty array is the
 // documented "clear" signal for update_job and passes through.
 function parseDeliveryTargets(config: RuntimeConfig, raw: unknown): string[] | undefined {
@@ -1278,27 +1284,34 @@ function parseDeliveryTargets(config: RuntimeConfig, raw: unknown): string[] | u
   if (!Array.isArray(raw)) {
     throw new Error("Invalid input: deliveryTargets must be an array of strings.");
   }
-  const bridges = readState(config.instance).messagingBridges;
-  const cleaned: string[] = [];
+  const dispatchable = readState(config.instance).messagingBridges.filter(
+    (bridge) => bridge.kind === "telegram" || bridge.kind === "discord"
+  );
+  const resolved: string[] = [];
   for (const entry of raw) {
     if (typeof entry !== "string" || entry.trim().length === 0) {
       throw new Error("Invalid input: deliveryTargets entries must be non-empty strings.");
     }
     const value = entry.trim();
     const lower = value.toLowerCase();
-    const match =
-      bridges.find((bridge) => bridge.id === value) ??
-      bridges.find((bridge) => bridge.name.toLowerCase() === lower) ??
-      bridges.find((bridge) => bridge.kind.toLowerCase() === lower);
-    if (!match) {
-      const configured = bridges.map((bridge) => bridge.name).join(", ");
+    let matches = dispatchable.filter((bridge) => bridge.id === value);
+    if (matches.length === 0) matches = dispatchable.filter((bridge) => bridge.name.toLowerCase() === lower);
+    if (matches.length === 0) matches = dispatchable.filter((bridge) => bridge.kind.toLowerCase() === lower);
+    if (matches.length === 0) {
+      const names = dispatchable.map((bridge) => bridge.name).join(", ");
       throw new Error(
-        `Invalid input: no messaging bridge matches '${value}'. Configured bridges: ${configured.length > 0 ? configured : "<none>"}.`
+        `Invalid input: no dispatchable messaging bridge matches '${value}'. Dispatchable bridges: ${names.length > 0 ? names : "<none>"}.`
       );
     }
-    cleaned.push(value);
+    if (matches.length > 1) {
+      const candidates = matches.map((bridge) => `${bridge.name} (${bridge.id})`).join(", ");
+      throw new Error(
+        `Invalid input: deliveryTargets entry '${value}' is ambiguous — matches ${candidates}. Use the bridge name or id.`
+      );
+    }
+    resolved.push(matches[0]!.id);
   }
-  return cleaned;
+  return resolved;
 }
 
 // Schedule a real job (cron-style) and link it to the originating chat
@@ -1692,9 +1705,10 @@ async function updateJobTool(
   for (const key of passthrough) {
     if (key in args) patch[key] = args[key];
   }
-  // `deliveryTargets` is validated against configured bridges instead of
-  // passed through raw — an unknown entry must fail here with the
-  // configured bridge names so the agent can relay a fixable error.
+  // `deliveryTargets` is validated against dispatchable bridges and
+  // normalized to bridge ids instead of passed through raw — an unknown
+  // or ambiguous entry must fail here with the dispatchable bridge
+  // names so the agent can relay a fixable error.
   // `[]` is the documented "clear" signal and passes through.
   const deliveryTargetsPatch = parseDeliveryTargets(config, args.deliveryTargets);
   if (deliveryTargetsPatch !== undefined) patch.deliveryTargets = deliveryTargetsPatch;
