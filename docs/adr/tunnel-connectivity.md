@@ -57,6 +57,8 @@ View derivation from state:
 | `ngrok` | ngrok | `false` | `ngrok account` |
 | `cloudflare` | Cloudflare | `false` | `Cloudflare account` |
 
+A disabled catalog entry only means the **runtime** can't drive that provider; an operator can still front the gateway with the tool manually (their own Tailscale/ngrok/Cloudflare tunnel + a `GINI_TRUSTED_ORIGINS` entry for the external origin). Such tunnels are intentionally invisible to `state.tunnel` — the record describes only runtime-managed tunnels. The user-facing per-provider instructions and the verification matrix live in [Remote Access](../remote-access.md).
+
 ## Endpoints
 
 RPC action style, matching `/api/browser/*` and `/api/relays/*`. Every route returns the full `TunnelState`.
