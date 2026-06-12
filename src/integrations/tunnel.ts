@@ -111,6 +111,29 @@ const DEFAULT_REQUIRES: Record<ManualProviderId, string> = {
   cloudflare: "cloudflared CLI"
 };
 
+// Host-side setup steps per manual provider, surfaced by the panel's info
+// affordance so an unavailable row tells the user exactly how to make it
+// available (and an available row how it was satisfied). Code, not state —
+// like the catalog itself.
+const PROVIDER_SETUP: Record<ManualProviderId, string[]> = {
+  tailscale: [
+    "Install Tailscale: brew install tailscale (or the Mac App Store app)",
+    "Sign in and join your tailnet: tailscale up",
+    "That's it — Gini runs `tailscale serve` for you and publishes https://<machine>.<tailnet>.ts.net (private to your tailnet)"
+  ],
+  ngrok: [
+    "Install ngrok: brew install ngrok",
+    "Create a free account at https://dashboard.ngrok.com and copy your authtoken",
+    "Authenticate the agent: ngrok config add-authtoken <token>",
+    "Gini then runs `ngrok http <gateway-port>` for you — free-tier URLs are random per connect and show a one-time browser interstitial"
+  ],
+  cloudflare: [
+    "Install cloudflared: brew install cloudflared",
+    "No account needed — Gini runs a quick tunnel (`cloudflared tunnel --url …`) and publishes a random https://<words>.trycloudflare.com URL",
+    "Quick tunnels are for testing: no SSE (live updates need a reload) and the URL changes per connect. For a stable hostname, set up a named tunnel on your own domain — see the Remote Access guide"
+  ]
+};
+
 export interface RunResult {
   exitCode: number;
   stdout: string;
@@ -557,9 +580,11 @@ export function refreshProviderDetection(): Promise<void> {
 // until their CLI prerequisite is found). The order here is the order the
 // panel renders them. Rebuilt fresh on every read — never persisted.
 function providerCatalog(): TunnelProvider[] {
-  const availability = (id: ManualProviderId): { enabled: boolean; requires?: string } => {
+  const availability = (id: ManualProviderId): { enabled: boolean; requires?: string; setup: string[] } => {
     const entry = detection[id];
-    return entry.enabled ? { enabled: true } : { enabled: false, requires: entry.requires ?? DEFAULT_REQUIRES[id] };
+    return entry.enabled
+      ? { enabled: true, setup: PROVIDER_SETUP[id] }
+      : { enabled: false, requires: entry.requires ?? DEFAULT_REQUIRES[id], setup: PROVIDER_SETUP[id] };
   };
   return [
     { id: "gini-relay", name: "Gini Relay", enabled: true },
@@ -644,6 +669,23 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
   // first — otherwise the old tunnel would keep running while the record reads
   // idle (an orphaned child). No-op when nothing is live.
   teardown(config.instance);
+  // A live MANUAL tunnel may have provider-side state that outlives any child
+  // of ours (tailscale serve persists in tailscaled) — tear that down too, or
+  // the old front would keep serving while the record reads idle. Best-effort
+  // and idempotent (the superseded connect's abort path may also call it).
+  if (
+    current &&
+    current.selectedProvider &&
+    current.selectedProvider !== entry.id &&
+    (current.status === "connected" || current.status === "connecting") &&
+    isManualProviderId(current.selectedProvider)
+  ) {
+    try {
+      await deps.drivers[current.selectedProvider].disconnect?.();
+    } catch {
+      // never block a provider switch on the old provider's teardown.
+    }
+  }
   return mutateState(config.instance, (state) => {
     applyTunnel(state, {
       ...(state.tunnel ?? {}),

@@ -4,7 +4,7 @@
 // and routes every interaction (select by click/keyboard, connect, cancel,
 // close) straight back through its callbacks. These tests render it directly
 // with crafted TunnelState objects so each render branch and handler is
-// exercised — idle selection, the connecting pending-login fold, the disabled
+// exercised — idle selection, the connecting fold, the disabled
 // non-selected rows, the error message, and the header/footer controls.
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
@@ -16,9 +16,15 @@ import { TunnelSelectionPanel } from "./TunnelSelectionPanel";
 
 const PROVIDERS: TunnelProvider[] = [
   { id: "gini-relay", name: "Gini Relay", enabled: true },
-  { id: "tailscale", name: "Tailscale", enabled: false, requires: "Tailscale network" },
-  { id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account" },
-  { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "Cloudflare account" }
+  {
+    id: "tailscale",
+    name: "Tailscale",
+    enabled: false,
+    requires: "Tailscale network",
+    setup: ["Install Tailscale", "tailscale up"]
+  },
+  { id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account", setup: ["Install ngrok", "Add your authtoken"] },
+  { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "Cloudflare account", setup: ["Install cloudflared"] }
 ];
 
 function makeState(over: Partial<TunnelState> = {}): TunnelState {
@@ -148,10 +154,10 @@ describe("TunnelSelectionPanel", () => {
     expect(handlers.onSelect).not.toHaveBeenCalled();
   });
 
-  test("connecting: the selected row shows Pending Login and a Cancel button", async () => {
+  test("connecting: the selected row shows Connecting and a Cancel button", async () => {
     const user = userEvent.setup();
     renderPanel({ status: "connecting" });
-    expect(screen.queryByText("Pending Login...")).not.toBeNull();
+    expect(screen.queryByText("Connecting...")).not.toBeNull();
     const cancel = within(row("Gini Relay")).getByRole("button", { name: "Cancel" });
     await user.click(cancel);
     expect(handlers.onCancel).toHaveBeenCalledTimes(1);
@@ -206,11 +212,65 @@ describe("TunnelSelectionPanel", () => {
     expect(handlers.onClose).toHaveBeenCalledTimes(1);
   });
 
-  test("the manual-tunnels hint links to the Remote Access doc", () => {
+  test("the footer hint links to the Remote Access doc", () => {
     renderPanel();
-    expect(screen.queryByText(/front\s+Gini manually/)).not.toBeNull();
+    expect(screen.queryByText(/Unavailable providers show an/)).not.toBeNull();
     // The DocReference trigger renders as a link-styled button; clicking it is
     // covered by DocReference's own tests — here we pin that the panel wires it.
     expect(screen.queryByRole("button", { name: "Remote Access" })).not.toBeNull();
+  });
+
+  test("a disabled row's info toggle reveals its setup steps (works despite the disabled row)", async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    expect(screen.queryByText("Set up Tailscale")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Tailscale setup instructions" }));
+    expect(screen.queryByText("Set up Tailscale")).not.toBeNull();
+    expect(screen.queryByText("Install Tailscale")).not.toBeNull();
+    expect(screen.queryByText("tailscale up")).not.toBeNull();
+    expect(screen.queryByText(/availability is re-checked/)).not.toBeNull();
+    // The toggle must not select the (disabled) row.
+    expect(handlers.onSelect).not.toHaveBeenCalled();
+  });
+
+  test("only one provider's setup fold is open at a time; toggling again closes it", async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    await user.click(screen.getByRole("button", { name: "Tailscale setup instructions" }));
+    expect(screen.queryByText("Set up Tailscale")).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "ngrok setup instructions" }));
+    expect(screen.queryByText("Set up Tailscale")).toBeNull();
+    expect(screen.queryByText("Set up ngrok")).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "ngrok setup instructions" }));
+    expect(screen.queryByText("Set up ngrok")).toBeNull();
+  });
+
+  test("an ENABLED provider's setup fold uses the 'how this works' heading and omits the re-check hint", async () => {
+    const user = userEvent.setup();
+    render(
+      <TunnelSelectionPanel
+        state={makeState({
+          providers: [
+            { id: "gini-relay", name: "Gini Relay", enabled: true },
+            { id: "tailscale", name: "Tailscale", enabled: true, setup: ["Install Tailscale", "tailscale up"] },
+            { id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account", setup: ["Install ngrok"] },
+            { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "Cloudflare account", setup: ["Install cloudflared"] }
+          ]
+        })}
+        onSelect={handlers.onSelect}
+        onConnect={handlers.onConnect}
+        onCancel={handlers.onCancel}
+        onDisconnect={handlers.onDisconnect}
+        onClose={handlers.onClose}
+      />
+    );
+    await user.click(screen.getByRole("button", { name: "Tailscale setup instructions" }));
+    expect(screen.queryByText("Tailscale — how this works")).not.toBeNull();
+    expect(screen.queryByText(/availability is re-checked/)).toBeNull();
+  });
+
+  test("a provider without setup steps renders no info toggle (gini-relay)", () => {
+    renderPanel();
+    expect(screen.queryByRole("button", { name: "Gini Relay setup instructions" })).toBeNull();
   });
 });

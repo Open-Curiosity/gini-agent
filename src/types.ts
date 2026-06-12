@@ -93,12 +93,16 @@ export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 export type TunnelProviderId = "gini-relay" | "tailscale" | "ngrok" | "cloudflare";
 
 // One row in the provider catalog. Drives the selection panel: disabled
-// rows render their `requires` string as the reason they can't be picked.
+// rows render their `requires` string as the reason they can't be picked,
+// and `setup` (always present on manual providers, enabled or not) carries
+// the host-side steps to make/keep the prerequisite available — the panel
+// surfaces it behind an info affordance on the row.
 export interface TunnelProvider {
   id: TunnelProviderId;
   name: string;
   enabled: boolean;
   requires?: string;
+  setup?: string[];
 }
 
 // The connection lifecycle status surfaced to clients.

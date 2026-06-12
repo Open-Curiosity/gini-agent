@@ -269,13 +269,33 @@ describe("tunnel integration", () => {
   });
 
   // The catalog values must match the agreed contract exactly: only
-  // gini-relay enabled; the rest disabled with a `requires` reason.
+  // gini-relay enabled (until detection finds a manual CLI); the rest disabled
+  // with a `requires` reason and `setup` steps for the panel's info affordance.
   test("provider catalog matches the agreed shape", () => {
     const byId = Object.fromEntries(getTunnel(config).providers.map((p) => [p.id, p]));
     expect(byId["gini-relay"]).toEqual({ id: "gini-relay", name: "Gini Relay", enabled: true });
-    expect(byId.tailscale).toEqual({ id: "tailscale", name: "Tailscale", enabled: false, requires: "Tailscale network" });
-    expect(byId.ngrok).toEqual({ id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account" });
-    expect(byId.cloudflare).toEqual({ id: "cloudflare", name: "Cloudflare", enabled: false, requires: "cloudflared CLI" });
+    expect(byId.tailscale).toEqual({
+      id: "tailscale",
+      name: "Tailscale",
+      enabled: false,
+      requires: "Tailscale network",
+      setup: byId.tailscale.setup
+    });
+    expect(byId.tailscale.setup?.length).toBeGreaterThan(0);
+    expect(byId.ngrok).toEqual({
+      id: "ngrok",
+      name: "ngrok",
+      enabled: false,
+      requires: "ngrok account",
+      setup: byId.ngrok.setup
+    });
+    expect(byId.cloudflare).toEqual({
+      id: "cloudflare",
+      name: "Cloudflare",
+      enabled: false,
+      requires: "cloudflared CLI",
+      setup: byId.cloudflare.setup
+    });
   });
 
   // select saves the choice without connecting; status stays idle.
@@ -1240,12 +1260,15 @@ describe("manual tunnel drivers", () => {
     rmSync(`${ROOT}/instances/${config.instance}`, { recursive: true, force: true });
   });
 
-  test("refreshProviderDetection flips detected rows enabled and drops their requires", async () => {
+  test("refreshProviderDetection flips detected rows enabled (keeping setup) and drops their requires", async () => {
     setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale: scriptedDriver() }) }));
     await refreshProviderDetection();
     const byId = Object.fromEntries(getTunnel(config).providers.map((p) => [p.id, p]));
-    expect(byId.tailscale).toEqual({ id: "tailscale", name: "Tailscale", enabled: true });
-    expect(byId.ngrok).toEqual({ id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account" });
+    expect(byId.tailscale.enabled).toBe(true);
+    expect(byId.tailscale.requires).toBeUndefined();
+    expect(byId.tailscale.setup?.length).toBeGreaterThan(0);
+    expect(byId.ngrok.enabled).toBe(false);
+    expect(byId.ngrok.requires).toBe("ngrok account");
   });
 
   test("a throwing detect keeps the default-disabled entry", async () => {
@@ -1256,7 +1279,9 @@ describe("manual tunnel drivers", () => {
     }));
     await refreshProviderDetection();
     const byId = Object.fromEntries(getTunnel(config).providers.map((p) => [p.id, p]));
-    expect(byId.cloudflare).toEqual({ id: "cloudflare", name: "Cloudflare", enabled: false, requires: "cloudflared CLI" });
+    expect(byId.cloudflare.enabled).toBe(false);
+    expect(byId.cloudflare.requires).toBe("cloudflared CLI");
+    expect(byId.cloudflare.setup?.length).toBeGreaterThan(0);
   });
 
   test("detection results inside the TTL are reused; concurrent callers share one probe", async () => {
@@ -1447,6 +1472,50 @@ describe("manual tunnel drivers", () => {
     const state = await reconcileTunnelOnStartup(config);
     expect(state.status).toBe("idle");
     expect(state.selectedProvider).toBe("tailscale");
+  });
+
+  test("the catalog carries setup steps for every manual provider, enabled or not", async () => {
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale: scriptedDriver() }) }));
+    await refreshProviderDetection();
+    const byId = Object.fromEntries(getTunnel(config).providers.map((p) => [p.id, p]));
+    expect(byId["gini-relay"].setup).toBeUndefined();
+    // Enabled and disabled rows both carry their host-side steps.
+    expect(byId.tailscale.enabled).toBe(true);
+    expect(byId.tailscale.setup?.[0]).toContain("Install Tailscale");
+    expect(byId.ngrok.enabled).toBe(false);
+    expect(byId.ngrok.setup?.some((s) => s.includes("authtoken"))).toBe(true);
+    expect(byId.cloudflare.setup?.[0]).toContain("Install cloudflared");
+  });
+
+  test("switching providers away from a live childless manual tunnel tears down its provider state", async () => {
+    const tailscale = scriptedDriver();
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale, ngrok: scriptedDriver() }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+
+    // Selecting a DIFFERENT provider while tailscale serve is live must turn
+    // the serve config off — otherwise the old front keeps serving while the
+    // record reads idle.
+    const switched = await selectProvider(config, "ngrok");
+    expect(switched.selectedProvider).toBe("ngrok");
+    expect(switched.status).toBe("idle");
+    expect(tailscale.disconnects).toBe(1);
+    expect(isRuntimeTunnelHost("machine.tail-test.ts.net")).toBe(false);
+
+    // Re-selecting the already-idle provider does NOT re-run the teardown.
+    await selectProvider(config, "tailscale");
+    expect(tailscale.disconnects).toBe(1);
+  });
+
+  test("a failing provider-side teardown never blocks the provider switch", async () => {
+    const tailscale = scriptedDriver({ disconnect: () => Promise.reject(new Error("serve off failed")) });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale, ngrok: scriptedDriver() }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+    const switched = await selectProvider(config, "ngrok");
+    expect(switched.selectedProvider).toBe("ngrok");
+    expect(switched.status).toBe("idle");
   });
 
   test("manual resume settles to idle when the web never comes back", async () => {

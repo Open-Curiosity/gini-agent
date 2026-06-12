@@ -572,10 +572,13 @@ describe("runtime api", () => {
       const plain = await call(handler, config, "/api/tunnel");
       const plainRow = plain.providers.find((p: { id: string }) => p.id === "tailscale");
       expect(plainRow.enabled).toBe(false);
-      // detect=1 probes the drivers and the row flips.
+      // detect=1 probes the drivers and the row flips (setup steps ride along
+      // for the panel's info affordance).
       const detected = await call(handler, config, "/api/tunnel?detect=1");
       const row = detected.providers.find((p: { id: string }) => p.id === "tailscale");
-      expect(row).toEqual({ id: "tailscale", name: "Tailscale", enabled: true });
+      expect(row.enabled).toBe(true);
+      expect(row.requires).toBeUndefined();
+      expect(Array.isArray(row.setup)).toBe(true);
     } finally {
       setTunnelDeps();
     }

@@ -1,6 +1,7 @@
 "use client";
 
-import { Globe, Plug, Lock, Loader2, X } from "lucide-react";
+import { useState } from "react";
+import { Globe, Plug, Lock, Loader2, Info, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -22,10 +23,11 @@ const PROVIDER_ICON: Record<TunnelProviderId, LucideIcon> = {
 
 /**
  * Provider picker (selection design Variant02). The selected provider's
- * trailing button reflects status: "Connect" when idle/error, a "Pending
- * Login..." + destructive Cancel while "connecting", and a destructive
- * "Disconnect" when "connected" (so the live tunnel can be torn down from the
- * edit view too). No URL is ever shown here.
+ * trailing button reflects status: "Connect" when idle/error, a
+ * "Connecting..." + destructive Cancel while "connecting" (gini-relay may be
+ * waiting on its OAuth consent tab; manual drivers on their agent's URL), and
+ * a destructive "Disconnect" when "connected" (so the live tunnel can be torn
+ * down from the edit view too). No URL is ever shown here.
  *
  * Rows are real radios (role="radio" + aria-checked) so keyboard users can
  * select with Enter/Space; disabled rows are aria-disabled and removed from the
@@ -51,6 +53,9 @@ export function TunnelSelectionPanel({
 }) {
   const connecting = state.status === "connecting";
   const connected = state.status === "connected";
+  // Which provider's setup instructions are expanded (the row's info toggle).
+  // One at a time keeps the panel compact; null = all collapsed.
+  const [setupFor, setSetupFor] = useState<TunnelProviderId | null>(null);
 
   return (
     <div
@@ -81,9 +86,10 @@ export function TunnelSelectionPanel({
           const rowConnecting = connecting && isSelected;
           // While connecting, lock every row except the one mid-connect.
           const rowDisabled = !p.enabled || (connecting && !isSelected);
+          const setupOpen = setupFor === p.id;
           return (
+            <div key={p.id} className="flex flex-col gap-1.5">
             <div
-              key={p.id}
               role="radio"
               aria-checked={isSelected}
               aria-disabled={rowDisabled || undefined}
@@ -138,6 +144,29 @@ export function TunnelSelectionPanel({
                       {connected ? "Connected" : "Selected"}
                     </span>
                   )}
+                  {p.setup && p.setup.length > 0 && (
+                    // Info toggle: how to set this provider up (the reason a
+                    // disabled row can't connect, and the exact steps to fix
+                    // it). Lives on enabled rows too so the steps stay
+                    // discoverable. tabIndex 0 even inside a disabled row —
+                    // the instructions are FOR the disabled state.
+                    <button
+                      type="button"
+                      aria-label={`${p.name} setup instructions`}
+                      aria-expanded={setupOpen}
+                      tabIndex={0}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSetupFor(setupOpen ? null : p.id);
+                      }}
+                      className={cn(
+                        "shrink-0 rounded-full p-0.5 transition-colors hover:text-foreground",
+                        setupOpen ? "text-foreground" : "text-muted-foreground"
+                      )}
+                    >
+                      <Info className="size-3.5" />
+                    </button>
+                  )}
                 </div>
                 {!p.enabled && p.requires && (
                   <span className="text-[11px] text-muted-foreground">Requires {p.requires}</span>
@@ -148,7 +177,7 @@ export function TunnelSelectionPanel({
                   <div className="flex items-center gap-2">
                     <span className="flex items-center gap-1.5 font-mono text-xs text-amber-500">
                       <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" />
-                      Pending Login...
+                      Connecting...
                     </span>
                     <Button
                       variant="destructive"
@@ -191,13 +220,31 @@ export function TunnelSelectionPanel({
                 </Button>
               )}
             </div>
+            {setupOpen && p.setup && (
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-2.5">
+                <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {p.enabled ? `${p.name} — how this works` : `Set up ${p.name}`}
+                </p>
+                <ol className="list-decimal space-y-1 pl-4 text-[12px] leading-relaxed text-foreground">
+                  {p.setup.map((step) => (
+                    <li key={step}>{step}</li>
+                  ))}
+                </ol>
+                {!p.enabled && (
+                  <p className="mt-1.5 text-[11px] text-muted-foreground">
+                    Done? Close and reopen this panel — availability is re-checked each time it opens.
+                  </p>
+                )}
+              </div>
+            )}
+            </div>
           );
         })}
       </div>
 
       <p className="px-4 pb-1 text-[11px] leading-relaxed text-muted-foreground">
-        Greyed-out providers can&apos;t be driven from here yet, but each can still front
-        Gini manually — see{" "}
+        Unavailable providers show an <Info aria-hidden className="inline size-3 align-[-2px]" /> with
+        setup steps; the full guide is{" "}
         <DocReference url={REMOTE_ACCESS_DOCS_URL}>
           <button
             type="button"
