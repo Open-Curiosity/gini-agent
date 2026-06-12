@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RuntimeConfig } from "./types";
 import { createHandler, isPairingBootstrapPath, resetPairingLimiters } from "./http";
+import { clearRuntimeTunnelTrust, setRuntimeTunnelTrust } from "./lib/origin-trust";
 import { createPairingRequest, mutateState } from "./state";
 
 // The pairing rate limiters are module-level singletons shared across this
@@ -171,6 +172,28 @@ describe("pairing routes — device create + poll", () => {
     expect(cookie).toContain("HttpOnly");
     expect(cookie).toContain("Secure");
     expect(cookie).toContain("Path=/api/pairing");
+  });
+
+  test("create on a runtime-managed tunnel front sets Secure (the runtime only publishes https fronts)", async () => {
+    // A runtime-driven tunnel terminates TLS upstream, so the gateway hop is
+    // plain http with no X-Forwarded-Proto guarantee — the host being a
+    // connected runtime tunnel is itself the proof of an https front.
+    setRuntimeTunnelTrust("pair-tunnel-secure", "https://machine.tail-test.ts.net");
+    try {
+      const { handler } = makeHandler("pair-tunnel-secure");
+      const res = await pair(handler, "/api/pairing/request", {
+        method: "POST",
+        host: "machine.tail-test.ts.net",
+        origin: "https://machine.tail-test.ts.net",
+        secFetchSite: "same-origin",
+        body: {}
+      });
+      expect(res.status).toBe(201);
+      const cookie = res.headers.getSetCookie().find((c) => c.startsWith("gini_pair="));
+      expect(cookie).toContain("Secure");
+    } finally {
+      clearRuntimeTunnelTrust();
+    }
   });
 
   test("create over a plain-http trusted front omits Secure on the binding cookie", async () => {

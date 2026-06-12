@@ -43,6 +43,10 @@ export function DocSheet({
   onOpenChange: (open: boolean) => void;
   lead?: React.ReactNode;
 }) {
+  // The fetched doc is cached for the lifetime of this mount and keyed to the
+  // FIRST url — callers that swap docs must remount (a `key` on this element),
+  // which every current caller does (one DocReference per url; TunnelMenu
+  // keys its guide sheet by provider).
   const ref = parseDocsUrl(url);
   const [state, setState] = useState<FetchState>({ loading: false });
 

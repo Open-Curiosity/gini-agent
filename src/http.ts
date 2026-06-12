@@ -101,8 +101,12 @@ import { resolveEffectiveContext } from "./execution/effective-context";
 import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
-import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, refreshProviderDetection, selectProvider } from "./integrations/tunnel";
-import { isLoopbackHost, isRelayHost, webBoundRequestAllowed } from "./lib/origin-trust";
+import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, PROVIDER_UNAVAILABLE, refreshProviderDetection, selectProvider } from "./integrations/tunnel";
+
+// Error codes deliberately published in error bodies (see the route-table
+// catch). Everything else stays message-only.
+const PUBLIC_ERROR_CODES = new Set<string>([PROVIDER_UNAVAILABLE]);
+import { isLoopbackHost, isRelayHost, isRuntimeTunnelHost, webBoundRequestAllowed } from "./lib/origin-trust";
 import { cookieValue, serializeCookie } from "./lib/cookies";
 import { RateLimiter } from "./lib/rate-limit";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
@@ -1928,12 +1932,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
             return withCors(request, await handler(request, Object.fromEntries(match.slice(1).map((value, index) => [String(index), value]))));
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            // A machine-readable `code` rides along when the thrower set one
-            // (e.g. tunnel `provider_unavailable`) so clients can branch on
-            // the failure kind instead of parsing the human message.
-            const code = error instanceof Error && typeof (error as Error & { code?: unknown }).code === "string"
-              ? (error as Error & { code: string }).code
-              : undefined;
+            // A machine-readable `code` rides along ONLY for the codes we
+            // deliberately publish (clients branch on the failure kind
+            // instead of parsing the human message). Allowlisted so a stray
+            // Node errno (`ENOENT`…) on a thrown fs error can't silently
+            // widen the public API shape.
+            const raw = error instanceof Error ? (error as Error & { code?: unknown }).code : undefined;
+            const code = typeof raw === "string" && PUBLIC_ERROR_CODES.has(raw) ? raw : undefined;
             return withCors(request, json(code ? { error: message, code } : { error: message }, statusFromErrorMessage(message)));
           }
         }
@@ -2658,13 +2663,15 @@ function randomBindSecret(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Whether to set Secure on pairing cookies. The relay front is always HTTPS and
-// loopback is a secure context, so both get Secure. A plain-http
+// Whether to set Secure on pairing cookies. The relay front is always HTTPS,
+// loopback is a secure context, and a runtime-managed tunnel front (tailscale
+// serve / ngrok / cloudflared) only ever publishes https URLs — all three get
+// Secure regardless of what the proxied hop looks like. A plain-http
 // GINI_TRUSTED_ORIGINS front would otherwise have its Secure cookie silently
 // dropped by the browser; honor X-Forwarded-Proto / the request scheme so such
 // a front can still pair.
 function pairingCookieSecure(request: Request, host: string): boolean {
-  if (isRelayHost(host) || isLoopbackHost(host)) return true;
+  if (isRelayHost(host) || isLoopbackHost(host) || isRuntimeTunnelHost(host)) return true;
   if ((request.headers.get("x-forwarded-proto") ?? "").toLowerCase() === "https") return true;
   return new URL(request.url).protocol === "https:";
 }

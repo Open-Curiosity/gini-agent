@@ -31,6 +31,8 @@ Both modes terminate TLS at Cloudflare's edge, so Cloudflare can observe everyth
 
 3. Tap **Connect**. With the config present, Gini publishes `https://gini.your-domain.com`; without it, a quick tunnel.
 
+> Use a tunnel dedicated to Gini: while connected, Gini serves as the tunnel's only origin, so **every** hostname whose DNS routes to that tunnel id reaches Gini — not just the first ingress hostname. If the tunnel carries other hostnames for other apps, give Gini its own `cloudflared tunnel create` + `route dns` instead.
+
 ## What Connect runs
 
 Named mode:

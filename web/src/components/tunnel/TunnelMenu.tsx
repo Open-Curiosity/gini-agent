@@ -124,6 +124,7 @@ export function TunnelMenu() {
         </div>
         {guideFor && (
           <DocSheet
+            key={guideFor}
             url={CONNECTOR_DOC_URLS[guideFor]}
             open
             onOpenChange={(next) => {

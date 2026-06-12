@@ -16,15 +16,15 @@
 // so adding a provider never needs a state migration. Only the user's
 // selection + connection status live in `state.tunnel`.
 //
-// gini-relay (the enabled provider) is wired through its client library:
-// `loginUrl(deps)` mints the OAuth-loopback consent URL, which we open in
-// the HOST browser; `waitForSession()` resolves with the session token +
-// assigned subdomain; `buildTunnel(opts)` builds a supervised native frpc
-// child that exposes the instance's gateway port. The public URL is
-// `https://<subdomain>.<relayDomain>`. Every gini-relay seam (login
-// primitive, tunnel builder, credential store, browser opener, port
-// resolver) is injectable so unit tests never hit the network, OAuth, or
-// the host browser. See `setTunnelDeps`.
+// gini-relay is wired through its client library: `loginUrl(deps)` mints the
+// OAuth-loopback consent URL, which we open in the HOST browser;
+// `waitForSession()` resolves with the session token + assigned subdomain;
+// `buildTunnel(opts)` builds a supervised native frpc child that exposes the
+// instance's gateway port. The public URL is `https://<subdomain>.<relayDomain>`.
+// tailscale/ngrok/cloudflare connect through native ManualDrivers (below) with
+// no login machinery. Every seam (login primitive, tunnel builder, credential
+// store, browser opener, port resolver, drivers) is injectable so unit tests
+// never hit the network, OAuth, or the host browser. See `setTunnelDeps`.
 
 import { unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -153,15 +153,36 @@ export type RunCommand = (argv: string[], timeoutMs?: number) => Promise<RunResu
 
 // Run a short-lived CLI command, capturing output. A missing binary rejects
 // (Bun.spawn throws ENOENT) — callers treat that as "prerequisite not met".
+// The timeout escalates SIGTERM -> SIGKILL -> bail: a wedged CLI that ignores
+// TERM would otherwise hold the awaits open indefinitely, and even after a
+// KILL a grandchild that inherited the pipes can keep the stream reads from
+// settling — so shortly after the KILL we stop waiting entirely and report a
+// timeout result. Boot awaits a detection pass; a hang here would block the
+// port bind.
 export async function defaultRunCommand(argv: string[], timeoutMs = 15_000): Promise<RunResult> {
   const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
-  const timer = setTimeout(() => proc.kill(), timeoutMs);
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let bailTimer: ReturnType<typeof setTimeout> | undefined;
+  const bail = Promise.withResolvers<null>();
+  const timer = setTimeout(() => {
+    proc.kill();
+    killTimer = setTimeout(() => {
+      proc.kill(9);
+      bailTimer = setTimeout(() => bail.resolve(null), 500);
+    }, 2_000);
+  }, timeoutMs);
+  const settled = await Promise.race([
+    Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]),
+    bail.promise
   ]);
   clearTimeout(timer);
+  clearTimeout(killTimer);
+  clearTimeout(bailTimer);
+  if (settled === null) {
+    // 137 = killed by SIGKILL; output is unrecoverable without risking a hang.
+    return { exitCode: 137, stdout: "", stderr: `${argv[0]} timed out after ${timeoutMs}ms` };
+  }
+  const [stdout, stderr, exitCode] = settled;
   return { exitCode, stdout, stderr };
 }
 
@@ -328,7 +349,15 @@ export function makeDefaultDrivers(
         if (serve.exitCode !== 0) {
           throw new Error(`tailscale serve failed: ${(serve.stderr || serve.stdout).trim()}`);
         }
-        return { url: `https://${await tailscaleDnsName()}` };
+        try {
+          return { url: `https://${await tailscaleDnsName()}` };
+        } catch (error) {
+          // serve is already live but we can't publish a URL for it — turn it
+          // back off (best-effort) so a failed connect doesn't leave an
+          // orphaned front serving behind an `error` record.
+          await run(["tailscale", "serve", "--https=443", "off"]).catch(() => {});
+          throw error;
+        }
       },
       disconnect: async () => {
         await run(["tailscale", "serve", "--https=443", "off"]);
@@ -526,6 +555,12 @@ interface Supervisor {
 }
 
 const supervisors = new Map<Instance, Supervisor>();
+
+// Monotonic per-instance connect-attempt stamp. connectTunnel awaits
+// (detection, old-provider teardown) BEFORE claiming the supervisor; an
+// attempt that resumes from those awaits after a newer attempt started must
+// bail instead of claiming — last user action wins.
+const connectAttempts = new Map<Instance, number>();
 
 // Monotonic per-instance epoch for CHILDLESS provider-side state (tailscale
 // serve lives in tailscaled, not in a child we can stop). Every action that
@@ -725,9 +760,12 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
   let entry = findProvider(provider);
   if (!entry) throw new Error(`Unknown tunnel provider: ${provider}`);
   if (!entry.enabled && isManualProviderId(entry.id)) {
-    // The availability cache may predate a freshly-installed CLI (or a fresh
-    // boot) — re-probe before rejecting so a valid selection never bounces.
-    await refreshProviderDetection();
+    // The availability cache may predate a freshly-installed CLI — re-probe
+    // before rejecting so a valid selection never bounces. Forced past the
+    // TTL: this is an explicit user action, and the promise is that every
+    // attempt re-checks (a panel-open probe seconds ago must not mask a CLI
+    // installed since).
+    await refreshProviderDetection(true);
     entry = findProvider(provider) ?? entry;
   }
   if (!entry.enabled) {
@@ -808,25 +846,35 @@ export async function selectProvider(config: RuntimeConfig, provider: string): P
 // flow flips status to "connected" (with the public url) or "error" (with a
 // message). The OAuth consent URL is opened in the host browser.
 export async function connectTunnel(config: RuntimeConfig, provider?: string): Promise<TunnelState> {
+  // Stamp this attempt BEFORE any await: the detection/teardown awaits below
+  // open windows where a NEWER connect can run to completion. When that
+  // happens this older attempt must bail before the claim — otherwise it
+  // would resume, tear down the newer winner's supervisor, and overwrite its
+  // record (the user's LAST action must win).
+  const attempt = (connectAttempts.get(config.instance) ?? 0) + 1;
+  connectAttempts.set(config.instance, attempt);
+  const superseded = (): boolean => connectAttempts.get(config.instance) !== attempt;
+
   const requested = provider ?? readState(config.instance).tunnel?.selectedProvider ?? null;
   if (!requested) throw new Error("No tunnel provider selected.");
   let entry = findProvider(requested);
   if (!entry) throw new Error(`Unknown tunnel provider: ${requested}`);
   if (!entry.enabled && isManualProviderId(entry.id)) {
-    await refreshProviderDetection();
+    // Forced past the TTL: every attempt re-checks availability, so a CLI
+    // installed seconds after a panel-open probe still connects.
+    await refreshProviderDetection(true);
     entry = findProvider(requested) ?? entry;
   }
   if (!entry.enabled) {
     throw providerUnavailableError(entry.name, entry.requires);
   }
+  if (superseded()) return getTunnel(config);
 
   // Connecting DIRECTLY to a different provider (the explicit-provider path —
   // no selectProvider step ran, so its switch teardown didn't either): a live
   // OLD childless manual front must be torn down, or tailscale serve would
   // keep serving while the record describes the new provider. `error` counts
-  // as live — a partial connect can leave provider-side state up. Best-effort,
-  // and awaited BEFORE the supervisor claim below so this connect stays the
-  // newest claim (last connect wins) when others interleave with the await.
+  // as live — a partial connect can leave provider-side state up. Best-effort.
   const previous = readState(config.instance).tunnel;
   if (
     previous &&
@@ -842,6 +890,7 @@ export async function connectTunnel(config: RuntimeConfig, provider?: string): P
       // never block the new connect on the old provider's teardown.
     }
   }
+  if (superseded()) return getTunnel(config);
 
   // Tear down any previous in-flight login / live child, then claim a fresh
   // supervisor entry SYNCHRONOUSLY (no await between teardown and the claim) so

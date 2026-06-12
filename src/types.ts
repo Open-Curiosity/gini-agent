@@ -106,7 +106,8 @@ export interface TunnelProvider {
 
 // The connection lifecycle status surfaced to clients.
 //   idle       — no active tunnel; selection may or may not be set.
-//   connecting — a login/connect is pending; the panel shows "Pending Login…".
+//   connecting — a connect is pending (the relay's OAuth consent, or a manual
+//                driver bringing its tunnel up); the panel shows "Connecting…".
 //   connected  — the tunnel is live; `url` is present.
 //   error      — the last connect failed; `message` carries the reason.
 export type TunnelStatus = "idle" | "connecting" | "connected" | "error";

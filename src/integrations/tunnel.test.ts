@@ -1553,10 +1553,55 @@ describe("manual tunnel drivers", () => {
     await refreshProviderDetection();
     expect(tailscale.detects).toBe(1);
     // Within the TTL a plain refresh is a cache hit, but the explicit
-    // panel-open/CLI path re-probes — the (i) fold promises availability is
-    // re-checked each time the panel opens.
+    // panel-open/CLI path re-probes — availability is re-checked on every
+    // user-initiated look.
     await refreshProviderDetection(true);
     expect(tailscale.detects).toBe(2);
+  });
+
+  test("a connect within the detection TTL still re-probes — installing a CLI right before tapping Connect works", async () => {
+    let enabled = false;
+    const tailscale = scriptedDriver({
+      detect: () => Promise.resolve(enabled ? { enabled: true } : { enabled: false, requires: "Tailscale network" })
+    });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale }) }));
+    await refreshProviderDetection(); // fresh cache: disabled
+    enabled = true; // the user installs/logs in seconds later...
+    await connectTunnel(config, "tailscale"); // ...and taps Connect within the TTL
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config).status).toBe("connected");
+  });
+
+  test("a connect that resumes from its prep awaits after a NEWER connect ran bails instead of clobbering the winner", async () => {
+    // Old provider live so the next connect's prep awaits its teardown.
+    const disconnectGates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    let disconnectCalls = 0;
+    const tailscale = scriptedDriver({
+      disconnect: () => disconnectGates[Math.min(disconnectCalls++, 1)]!.promise
+    });
+    const ngrok = scriptedDriver({ connect: () => Promise.resolve({ url: "https://a.ngrok-free.app", child: fakeChild() }) });
+    const cloudflare = scriptedDriver({ connect: () => Promise.resolve({ url: "https://b.example.com", child: fakeChild() }) });
+    setTunnelDeps(deps({ drivers: fakeDrivers({ tailscale, ngrok, cloudflare }) }));
+    await connectTunnel(config, "tailscale");
+    await awaitTunnelSettled(config.instance);
+
+    // A (ngrok) parks on tailscale's teardown; B (cloudflare) starts after,
+    // parks on its own teardown await; release both with B finishing FIRST.
+    const a = connectTunnel(config, "ngrok");
+    await Bun.sleep(1); // A reaches its disconnect await (gate 0)
+    const b = connectTunnel(config, "cloudflare");
+    await Bun.sleep(1); // B reaches its disconnect await (gate 1)
+    disconnectGates[1]!.resolve();
+    await b;
+    await awaitTunnelSettled(config.instance);
+    expect(getTunnel(config)).toMatchObject({ selectedProvider: "cloudflare", status: "connected" });
+
+    // A resumes from its await AFTER B won — it must bail, not claim/overwrite.
+    disconnectGates[0]!.resolve();
+    const aState = await a;
+    expect(aState.selectedProvider).toBe("cloudflare");
+    expect(getTunnel(config)).toMatchObject({ selectedProvider: "cloudflare", status: "connected" });
+    expect(ngrok.connects).toBe(0);
   });
 
   test("disconnect while idle never runs provider-side teardown (protects a pre-existing serve config)", async () => {
@@ -1872,9 +1917,13 @@ describe("makeDefaultDrivers", () => {
 
     const statusFails = runScript({
       "tailscale serve --bg http://127.0.0.1:1": { exitCode: 0 },
-      "tailscale status --json": { exitCode: 1, stderr: "down" }
+      "tailscale status --json": { exitCode: 1, stderr: "down" },
+      "tailscale serve --https=443 off": { exitCode: 0 }
     });
     await expect(makeDefaultDrivers(statusFails.run).tailscale.connect(1)).rejects.toThrow("tailscale status failed: down");
+    // serve came up before the URL lookup failed — connect must turn it back
+    // off rather than leave an orphaned front behind the error record.
+    expect(statusFails.calls).toContain("tailscale serve --https=443 off");
 
     const badJson = runScript({
       "tailscale serve --bg http://127.0.0.1:1": { exitCode: 0 },
@@ -2054,6 +2103,15 @@ describe("makeDefaultDrivers", () => {
 
   test("defaultRunCommand kills a command that outlives its timeout", async () => {
     const result = await defaultRunCommand(["sleep", "30"], 25);
+    expect(result.exitCode).not.toBe(0);
+  });
+
+  test("defaultRunCommand escalates to SIGKILL when the command ignores SIGTERM", async () => {
+    // A wedged CLI trapping TERM would hold the stream/exit awaits open
+    // forever without the escalation (boot awaits a detection pass, so a
+    // hang here would block the port bind). The 2s escalation delay plus
+    // margin keeps this test bounded well under the per-test cap.
+    const result = await defaultRunCommand(["sh", "-c", 'trap "" TERM; sleep 30'], 25);
     expect(result.exitCode).not.toBe(0);
   });
 });

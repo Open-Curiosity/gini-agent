@@ -44,7 +44,7 @@ View derivation from state:
 
 - `selectedProvider === null` & status `idle` → Selection panel.
 - status `idle` with a selection → Selection panel (Connect available on the selected provider).
-- status `connecting` → Selection panel with the selected provider's button showing "Pending Login…" + Cancel (the OAuth consent tab is open in the host browser; the gateway is awaiting the session + frpc readiness).
+- status `connecting` → Selection panel with the selected provider's row showing "Connecting…" + Cancel (the relay's OAuth consent tab is open in the host browser, or a manual driver is bringing its tunnel up).
 - status `connected` → Connected popover (QR + url + disconnect + edit).
 - status `error` → error shown in the panel (`message`).
 
