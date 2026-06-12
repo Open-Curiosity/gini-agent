@@ -1,6 +1,9 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createEmptyState, mutateState, readState } from "../../state";
+import { writeGoogleAccounts } from "../../state/google-accounts";
 import { writeSecret } from "../../state/secrets";
 import type { ConnectorRecord, RuntimeConfig, SkillRecord } from "../../types";
 import { bindingsForCredentials, checkConnector, createConnector, isSkillActive, resolveSkillEnv } from "./index";
@@ -456,6 +459,65 @@ describe("isSkillActive by credential name", () => {
   test("unsatisfied when the named connector is disabled (stale healthy probe)", () => {
     const state = createEmptyState("dev");
     state.connectors = [newConnector({ name: "LINEAR_API_KEY", type: "api-key", provider: "linear", status: "disabled", health: "healthy" })];
+    const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
+});
+
+describe("isSkillActive with an externally satisfied credential", () => {
+  // google-oauth-desktop's `credentialExternallySatisfied` hook reads the
+  // machine-global account registry (~/.gini/google-accounts/accounts.json).
+  // HOME is pointed at a scratch dir per test — the registry resolves HOME via
+  // process.env.HOME first (see the src/state/google-accounts.ts header) — so
+  // the host machine's real registry never leaks into these assertions.
+  let scratchHome: string;
+  let prevHome: string | undefined;
+
+  beforeEach(() => {
+    scratchHome = mkdtempSync(join(tmpdir(), "gini-connectors-ext-"));
+    prevHome = process.env.HOME;
+    process.env.HOME = scratchHome;
+  });
+
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    rmSync(scratchHome, { recursive: true, force: true });
+  });
+
+  function registryAccount() {
+    return {
+      id: "gacct_test0001",
+      tag: "personal",
+      email: "me@example.com",
+      configDir: join(scratchHome, ".gini", "google-accounts", "gacct_test0001"),
+      addedAt: "2026-01-01T00:00:00.000Z"
+    };
+  }
+
+  test("a registered Google account activates a workspace skill with zero connectors", () => {
+    writeGoogleAccounts([registryAccount()]);
+    const state = createEmptyState("dev");
+    state.connectors = [];
+    const skill = newSkill({ requiredCredentials: ["google-workspace-oauth"] });
+    expect(isSkillActive(state, skill)).toBe(true);
+  });
+
+  test("an empty or missing registry leaves the workspace skill inactive", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [];
+    const skill = newSkill({ requiredCredentials: ["google-workspace-oauth"] });
+    // Missing registry file.
+    expect(isSkillActive(state, skill)).toBe(false);
+    // Present but empty registry.
+    writeGoogleAccounts([]);
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
+
+  test("an unrelated credential is unaffected by registered Google accounts", () => {
+    writeGoogleAccounts([registryAccount()]);
+    const state = createEmptyState("dev");
+    state.connectors = [];
     const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
     expect(isSkillActive(state, skill)).toBe(false);
   });

@@ -87,6 +87,14 @@ export interface ProviderModule {
   // `canonicalCredentialName` (connectors/registry.ts), the single source the
   // migration and skill loader both consult.
   credentialName?: string;
+  // Optional. Returns true when this provider's canonical credential is
+  // satisfied by an external (machine-global) source even though no usable
+  // connector record exists in the instance. `isSkillActive` consults this
+  // before declaring a required credential unmet — e.g. google-oauth-desktop
+  // reports the machine-global Google account registry, where each registered
+  // config dir is self-contained. Must be cheap and synchronous: the
+  // activation gate sits on the hot system-prompt path.
+  credentialExternallySatisfied?: () => boolean;
   // Probe is optional per ADR connector-provider-spec-compliance.md. Providers with no remote system to
   // query (apple-notes via TCC, generic by definition) omit it; the
   // connector record's health falls back to a status-only check.

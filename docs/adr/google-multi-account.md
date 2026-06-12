@@ -19,6 +19,16 @@ skills (`google-gmail`, `google-calendar`, `google-drive`, `google-docs`,
   credential resolution still keys on the single name `google-workspace-oauth`,
   so the seven Workspace skills keep activating exactly as before.
 
+- **A registered account satisfies the credential for skill activity.** With
+  ≥1 account in the registry, the Workspace skills are active even when no
+  per-instance `google-workspace-oauth` connector exists: `isSkillActive`
+  (`src/integrations/connectors/index.ts`) consults the owning provider's
+  `credentialExternallySatisfied` hook (`google-oauth-desktop.ts`, backed by
+  `readGoogleAccounts()`) before declaring a required credential unmet. Each
+  account's config dir is self-contained (its own OAuth client + tokens), so
+  no client env bindings are needed on this path. The check is presence-only;
+  sign-in expiry is handled by the skill recipes at run time.
+
 - **Accounts are tagged.** Each account carries a user label (`personal`,
   `work`, `school`, …). Tags are unique case-insensitively across accounts.
 
