@@ -1171,6 +1171,16 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           timeoutSeconds: {
             type: "number",
             description: "Wall-clock seconds before the spawned task is killed. Default 600 (10 min) — enough for typical git/gh + multi-file scan jobs. Drop lower (e.g. 60-120) for trivial reminders; raise (e.g. 1800-3600) when the prompt invokes external CLIs like codex or claude-code that can run several minutes. The model will be terminated mid-thought if this is too low."
+          },
+          preRunHook: {
+            type: "object",
+            description: "Optional pre-fire hook: a registered trusted handler runs in-process before each fire and either shortCircuits the run (no model turn; also auto-pauses oneShot jobs, so watch jobs need oneShot=false) or injects context items into the prompt turn. The built-in \"skill-script\" handler runs config.skill/config.script headless, passing the remaining config keys to the script as args.",
+            properties: {
+              handlerId: { type: "string", description: "Registered handler id (built-in: \"skill-script\")." },
+              config: { type: "object", description: "For \"skill-script\": { skill, script, ...args }." },
+              timeoutMs: { type: "number", description: "Timeout in ms (default 30000)." }
+            },
+            required: ["handlerId", "config"]
           }
         },
         required: ["name", "prompt"]

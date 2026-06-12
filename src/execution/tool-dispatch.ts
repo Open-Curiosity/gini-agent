@@ -1386,6 +1386,13 @@ async function createJobTool(
     }
     timeoutSeconds = args.timeoutSeconds;
   }
+  // `preRunHook` passes through UNVALIDATED on purpose: the authoritative
+  // shape + known-handler (isKnownHook) validation lives in
+  // `createScheduledJob` — the same seam the HTTP /api/jobs route uses — and
+  // its typed `Invalid input: …` relays back as the tool-result error.
+  // Duplicating the registry check here would just drift from that one
+  // source of truth.
+  const preRunHook = args.preRunHook;
 
   // Walk task -> run -> conversation to determine whether the agent is
   // invoking us from inside a chat task. If so, we want each scheduled
@@ -1447,7 +1454,8 @@ async function createJobTool(
       approvalMode,
       autoApproveCommands,
       dangerousTerminalPatterns,
-      timeoutSeconds
+      timeoutSeconds,
+      preRunHook
     }, {
       // Inherit the originating task's owning agent so a scheduler tick
       // doesn't reattribute the job to whichever agent happens to be
@@ -1488,7 +1496,10 @@ async function createJobTool(
           approvalMode,
           autoApproveCommands,
           dangerousTerminalPatterns,
-          timeoutSeconds
+          timeoutSeconds,
+          // Handler id only — the hook's declarative config can carry bulky
+          // per-script data the audit row doesn't need.
+          preRunHookHandlerId: job.preRunHook?.handlerId
         }
       },
       { taskId: item.id }
@@ -1506,6 +1517,7 @@ async function createJobTool(
       cronTimezone,
       oneShot,
       chatSessionId,
+      preRunHookHandlerId: job.preRunHook?.handlerId,
       dangerouslyAutoApprove,
       approvalMode,
       autoApproveCommands,
