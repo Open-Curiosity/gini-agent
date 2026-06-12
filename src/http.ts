@@ -198,10 +198,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/version$/, () => json(currentVersionInfo())],
-    ["POST", /^\/api\/update\/check$/, () => json(refreshVersionInfo())],
-    ["POST", /^\/api\/update$/, () => {
+    ["POST", /^\/api\/update\/check$/, async () => json(await refreshVersionInfo())],
+    ["POST", /^\/api\/update$/, async () => {
       assertCurrentRuntimeUpdateSupported();
-      const result = updateRuntime(projectRoot());
+      // updateRuntime runs its long steps (git fetch, installs, web build)
+      // as awaited async spawns, so the gateway keeps answering /api/status
+      // for the whole window. A concurrent POST while one update is in
+      // flight rejects with "gini update already in progress." → 409.
+      const result = await updateRuntime(projectRoot());
       const restartRequested = result.upToDate ? false : scheduleRuntimeRestart(config.instance);
       return json({ ...result, restart: { requested: restartRequested } });
     }],
@@ -3073,6 +3077,9 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Could not reach CDP endpoint")) return 400;
   if (message.startsWith("Could not locate")) return 400;
   if (message.startsWith("Web update is only available")) return 400;
+  // updateRuntime's single-flight guard: a second POST /api/update while one
+  // is running is a conflict, not a server error.
+  if (message.startsWith("gini update already in progress")) return 409;
   // Messaging-bridge surface throws plain Error strings rather than the
   // "Invalid input:" prefix the rest of the codebase uses. Map the
   // expected user-error shapes to 400 / 404 so the HTTP layer doesn't

@@ -63,7 +63,15 @@ The model rests on four pieces:
   healthy service on a CPU-pegged host (observed live during a post-update
   rebuild), and a revive is a `kickstart -k` — a force-kill with no drain —
   so acting on the first miss kills the very service the watchdog protects.
-  The revive itself: a service launchd
+  While a runtime update is rewriting `~/.gini/runtime` (a fresh
+  `~/.gini/update-in-progress` marker, written by `updateRuntime` for the
+  duration of its git reset + installs + web build — see
+  [Runtime Update Surface](runtime-update-surface.md)), revive actions are
+  suppressed entirely: probe misses are expected while `node_modules` are
+  swapped under the live web server and the build pegs the CPU. The tick
+  still probes and logs `suppressed:update:<kind>`; a marker older than 15
+  minutes is stale (a crashed update never removed it) and stops
+  suppressing. The revive itself: a service launchd
   still has registered is `launchctl kickstart -k`ed, while a *core*
   service launchd has **deregistered** is re-bootstrapped via `autostart
   enable` (kickstart is a no-op on a label launchd no longer knows, and
@@ -233,7 +241,10 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   gateway; with web down for two consecutive ticks it `kickstart -k`s web
   (and queues a web crash report for consent-gated filing — see the crash
   ADR). A single failed tick takes no action, and a healthy probe resets
-  the service's failure streak. The loop paces itself at
+  the service's failure streak. With a fresh update-in-progress marker on
+  disk it takes no revive action regardless of streaks (logging
+  `suppressed:update:<kind>` instead); a stale marker (>15 min) does not
+  suppress. The loop paces itself at
   `WATCHDOG_TICK_INTERVAL_MS` between ticks and never exits on its own;
   `gini watchdog --once` runs exactly one tick and revives on it.
 - Every generated plist's `EnvironmentVariables` carries a `GINI_PLIST_STAMP`.
