@@ -67,12 +67,17 @@ describe("mapCallDetails", () => {
 });
 
 describe("normalizeWaitSeconds", () => {
-  test("defaults to 0 when omitted or not a finite number", () => {
+  test("defaults to 0 when omitted or not coercible to a finite number", () => {
     expect(normalizeWaitSeconds(undefined)).toBe(0);
     expect(normalizeWaitSeconds(null)).toBe(0);
-    expect(normalizeWaitSeconds("60")).toBe(0);
+    expect(normalizeWaitSeconds("abc")).toBe(0);
     expect(normalizeWaitSeconds(Number.NaN)).toBe(0);
     expect(normalizeWaitSeconds(Number.POSITIVE_INFINITY)).toBe(0);
+  });
+
+  test("coerces numeric strings", () => {
+    expect(normalizeWaitSeconds("240")).toBe(240);
+    expect(normalizeWaitSeconds("  60 ")).toBe(60);
   });
 
   test("clamps to the [0, 240] budget", () => {
