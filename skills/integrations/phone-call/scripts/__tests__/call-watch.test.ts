@@ -5,7 +5,13 @@
 // No network.
 
 import { describe, expect, test } from "bun:test";
-import { buildCallResultItem, buildLookupFailureOutput, evaluateCallWatch, isCallFinished } from "../call-watch";
+import {
+  buildCallResultItem,
+  buildLookupFailureOutput,
+  buildMissingCredentialOutput,
+  evaluateCallWatch,
+  isCallFinished
+} from "../call-watch";
 
 describe("evaluateCallWatch", () => {
   test("done state short-circuits silently with no payload (post-delivery backstop)", () => {
@@ -89,6 +95,18 @@ describe("buildLookupFailureOutput", () => {
     expect(output.kind).toBe("context");
     expect(output.state).toEqual({ done: true });
     expect(output.items?.[0]?.text).toContain("Bland API returned HTTP 401");
+  });
+});
+
+describe("buildMissingCredentialOutput", () => {
+  test("missing BLAND_API_KEY is terminal: untrusted context item, done state (never a transient retry)", () => {
+    const output = buildMissingCredentialOutput();
+    expect(output.kind).toBe("context");
+    expect(output.state).toEqual({ done: true });
+    expect(output.items).toHaveLength(1);
+    expect(output.items?.[0]?.untrusted).toBe(true);
+    expect(output.items?.[0]?.text).toContain("BLAND_API_KEY");
+    expect(output.items?.[0]?.text).toContain("cannot be retrieved");
   });
 });
 
