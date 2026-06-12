@@ -13,7 +13,7 @@
 // - intervalSeconds validation surfaces 400
 
 import { describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { createHandler } from "./http";
 import { runDueJobs, runJobNow } from "./jobs";
 import { advanceCronNextRunAt, updateJob } from "./jobs/index";
@@ -1320,6 +1320,120 @@ describe("cron lifecycle", () => {
     ).rejects.toThrow(/status must be 'active' or 'paused'/);
   });
 
+  test("create_job dispatch persists deliveryTargets that match a configured bridge", async () => {
+    const config = testConfig("jobs-create-tool-delivery");
+    const { addMessagingBridge } = await import("./integrations/messaging");
+    await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await dispatchToolCall(
+      config,
+      taskId,
+      "create_job",
+      "call_delivery",
+      JSON.stringify({ name: "briefing", intervalSeconds: 60, prompt: "x", deliveryTargets: ["disc"] })
+    );
+
+    const jobs = readState(config.instance).jobs;
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.deliveryTargets).toEqual(["disc"]);
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.created" && event.target === jobs[0]!.id
+    );
+    expect(audit?.evidence?.deliveryTargets).toEqual(["disc"]);
+  });
+
+  test("create_job dispatch rejects an unknown deliveryTargets entry, listing configured bridge names", async () => {
+    const config = testConfig("jobs-create-tool-delivery-bad");
+    const { addMessagingBridge } = await import("./integrations/messaging");
+    await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    // The error names the configured bridges so the agent can relay a
+    // fixable message ("did you mean 'disc'?") instead of a dead end.
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "create_job",
+        "call_delivery_bad",
+        JSON.stringify({ name: "briefing", intervalSeconds: 60, prompt: "x", deliveryTargets: ["whatsapp"] })
+      )
+    ).rejects.toThrow(/no messaging bridge matches 'whatsapp'. Configured bridges: disc/);
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
+  test("update_job dispatch sets deliveryTargets and clears them with []", async () => {
+    const config = testConfig("jobs-update-tool-delivery");
+    const handler = createHandler(config);
+    const { addMessagingBridge } = await import("./integrations/messaging");
+    await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "to-route", script: "true", intervalSeconds: 60 })
+    });
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await dispatchToolCall(
+      config,
+      taskId,
+      "update_job",
+      "call_set_delivery",
+      JSON.stringify({ jobId: job.id, deliveryTargets: ["disc"] })
+    );
+    expect(readState(config.instance).jobs.find((j) => j.id === job.id)?.deliveryTargets).toEqual(["disc"]);
+
+    // An unknown entry is rejected with the configured names and the
+    // previously-set targets stay untouched.
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "update_job",
+        "call_bad_delivery",
+        JSON.stringify({ jobId: job.id, deliveryTargets: ["slackk"] })
+      )
+    ).rejects.toThrow(/no messaging bridge matches 'slackk'. Configured bridges: disc/);
+    expect(readState(config.instance).jobs.find((j) => j.id === job.id)?.deliveryTargets).toEqual(["disc"]);
+
+    // Empty array is the documented "clear" signal.
+    await dispatchToolCall(
+      config,
+      taskId,
+      "update_job",
+      "call_clear_delivery",
+      JSON.stringify({ jobId: job.id, deliveryTargets: [] })
+    );
+    expect(readState(config.instance).jobs.find((j) => j.id === job.id)?.deliveryTargets).toEqual([]);
+  });
+
   test("delete_job dispatch removes the job and writes job.deleted audit", async () => {
     const config = testConfig("jobs-delete-tool");
     const handler = createHandler(config);
@@ -2119,6 +2233,269 @@ describe("cron lifecycle", () => {
       const taskObj = readState(config.instance).tasks.find((t) => t.id === taskId)!;
       await finalizeJobRunFromTask(config, taskObj);
       expect(sendCalls.length).toBe(0);
+    } finally {
+      resetMessagingDeps();
+    }
+  });
+});
+
+// Delivery of a finished prompt-job's output to the bridges named on
+// job.deliveryTargets (src/jobs/finalize.ts dispatchJobReplyToDeliveryTargets).
+// This is the path for jobs created from web/CLI chats — sessions with no
+// originating bridge to mirror back to. Stubs the Discord client via
+// setMessagingDeps so no test touches the network.
+describe("job deliveryTargets delivery", () => {
+  // Stub client factory shared by every test below; each test resets
+  // sendCalls and messaging deps around its body.
+  function discordStub(sendCalls: Array<{ channelId: string; content: string }>) {
+    return () => ({
+      async getMe() {
+        return { id: "100", username: "Gini", discriminator: "0000", bot: true };
+      },
+      async sendMessage(channelId: string, content: string) {
+        sendCalls.push({ channelId, content });
+        return { id: "reply", channel_id: channelId, content, timestamp: "", author: { id: "100", username: "Gini", bot: true } };
+      },
+      async triggerTypingIndicator() {
+        return true as const;
+      },
+      async fetchChannelMessages() {
+        return [];
+      }
+    });
+  }
+
+  // Seed a plain chat session (no bridge source), an active job pointing
+  // at it with the given deliveryTargets, a running run, and a terminal
+  // task carrying the summary. Returns the Task object ready for
+  // finalizeJobRunFromTask.
+  async function seedJobRun(
+    config: RuntimeConfig,
+    options: { deliveryTargets: string[]; summary: string; sessionId?: string; status?: "completed" | "failed" }
+  ) {
+    const taskId = await mutateState(config.instance, (state) => {
+      let sessionId = options.sessionId;
+      if (!sessionId) {
+        sessionId = "session_delivery";
+        state.chatSessions.unshift({
+          id: sessionId,
+          instance: state.instance,
+          title: "Delivery",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          messageIds: [],
+          taskIds: [],
+          runIds: []
+        });
+      }
+      const t = createTask(state.instance, "scheduled", undefined, undefined, undefined, undefined);
+      t.status = options.status ?? "completed";
+      t.summary = options.summary;
+      if (t.status === "failed") t.error = options.summary;
+      t.jobId = "job_delivery";
+      upsertTask(state, t);
+      const session = state.chatSessions.find((s) => s.id === sessionId)!;
+      session.taskIds.push(t.id);
+      state.jobs.push({
+        id: "job_delivery",
+        instance: state.instance,
+        name: "briefing",
+        status: "active",
+        prompt: "p",
+        deliveryTargets: options.deliveryTargets,
+        context: [],
+        retryLimit: 0,
+        timeoutSeconds: 600,
+        chatSessionId: sessionId,
+        runIds: [],
+        taskIds: [],
+        runCount: 0,
+        missedRuns: 0,
+        nextRunAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+      state.jobRuns.push({
+        id: "run_delivery",
+        instance: state.instance,
+        jobId: "job_delivery",
+        status: "running",
+        taskId: t.id,
+        attempt: 1,
+        trigger: "schedule",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+      return t.id;
+    });
+    return readState(config.instance).tasks.find((t) => t.id === taskId)!;
+  }
+
+  test("delivers the final output to the named bridge when the session has no origin bridge", async () => {
+    const config = testConfig("jobs-delivery-happy");
+    const { addMessagingBridge, setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ channelId: string; content: string }> = [];
+    setMessagingDeps({ discordClientFactory: discordStub(sendCalls) });
+    try {
+      await addMessagingBridge(config, {
+        name: "disc",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "TOK"
+      });
+      const task = await seedJobRun(config, { deliveryTargets: ["disc"], summary: "Morning briefing: all clear." });
+      await finalizeJobRunFromTask(config, task);
+      expect(sendCalls).toHaveLength(1);
+      expect(sendCalls[0]?.channelId).toBe("chan-1");
+      expect(sendCalls[0]?.content).toContain("Morning briefing");
+      // The run itself finalized normally.
+      const run = readState(config.instance).jobRuns.find((r) => r.id === "run_delivery");
+      expect(run?.status).toBe("completed");
+    } finally {
+      resetMessagingDeps();
+    }
+  });
+
+  test("delivers the failure summary on failed runs — parity with the origin mirror, which surfaces failures rather than going silent", async () => {
+    const config = testConfig("jobs-delivery-failed");
+    const { addMessagingBridge, setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ channelId: string; content: string }> = [];
+    setMessagingDeps({ discordClientFactory: discordStub(sendCalls) });
+    try {
+      await addMessagingBridge(config, {
+        name: "disc",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "TOK"
+      });
+      const task = await seedJobRun(config, {
+        deliveryTargets: ["disc"],
+        summary: "Briefing failed: calendar fetch errored.",
+        status: "failed"
+      });
+      await finalizeJobRunFromTask(config, task);
+      expect(sendCalls).toHaveLength(1);
+      expect(sendCalls[0]?.content).toContain("calendar fetch errored");
+    } finally {
+      resetMessagingDeps();
+    }
+  });
+
+  test("exact '[SILENT]' suppresses deliveryTargets delivery", async () => {
+    const config = testConfig("jobs-delivery-silent");
+    const { addMessagingBridge, setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ channelId: string; content: string }> = [];
+    setMessagingDeps({ discordClientFactory: discordStub(sendCalls) });
+    try {
+      await addMessagingBridge(config, {
+        name: "disc",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "TOK"
+      });
+      const task = await seedJobRun(config, { deliveryTargets: ["disc"], summary: "[SILENT]" });
+      await finalizeJobRunFromTask(config, task);
+      expect(sendCalls).toHaveLength(0);
+    } finally {
+      resetMessagingDeps();
+    }
+  });
+
+  test("resolves by case-insensitive name, id, and kind, deduping to one send per bridge", async () => {
+    const config = testConfig("jobs-delivery-dedupe");
+    const { addMessagingBridge, setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ channelId: string; content: string }> = [];
+    setMessagingDeps({ discordClientFactory: discordStub(sendCalls) });
+    try {
+      const first = await addMessagingBridge(config, {
+        name: "disc-one",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "TOK"
+      });
+      await addMessagingBridge(config, {
+        name: "disc-two",
+        kind: "discord",
+        deliveryTargets: ["chan-2"],
+        botToken: "TOK"
+      });
+      // "DISC-ONE" (case-insensitive name), the raw record id, and
+      // "discord" (kind → first matching bridge) all resolve to the same
+      // bridge; only one send may land on it. "disc-two" is distinct.
+      const task = await seedJobRun(config, {
+        deliveryTargets: ["DISC-ONE", first.id, "discord", "disc-two"],
+        summary: "Multi-target briefing."
+      });
+      await finalizeJobRunFromTask(config, task);
+      expect(sendCalls).toHaveLength(2);
+      expect(sendCalls.map((c) => c.channelId).sort()).toEqual(["chan-1", "chan-2"]);
+    } finally {
+      resetMessagingDeps();
+    }
+  });
+
+  test("skips a target the origin mirror already dispatched to", async () => {
+    const config = testConfig("jobs-delivery-origin-dedupe");
+    const { addMessagingBridge, setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { findOrCreateDiscordChatSession } = await import("./state");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ channelId: string; content: string }> = [];
+    setMessagingDeps({ discordClientFactory: discordStub(sendCalls) });
+    try {
+      const origin = await addMessagingBridge(config, {
+        name: "disc-origin",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "TOK"
+      });
+      await addMessagingBridge(config, {
+        name: "disc-extra",
+        kind: "discord",
+        deliveryTargets: ["chan-2"],
+        botToken: "TOK"
+      });
+      // The job's session originates from disc-origin, so the mirror
+      // (dispatchJobReplyToBridge) already sends there. Naming the same
+      // bridge in deliveryTargets must NOT double-send; the extra bridge
+      // still gets its copy.
+      const sessionId = await mutateState(config.instance, (state) => {
+        const session = findOrCreateDiscordChatSession(state, origin.id, "chan-1");
+        return session.id;
+      });
+      const task = await seedJobRun(config, {
+        deliveryTargets: ["disc-origin", "disc-extra"],
+        summary: "Origin-dedupe briefing.",
+        sessionId
+      });
+      await finalizeJobRunFromTask(config, task);
+      expect(sendCalls).toHaveLength(2);
+      expect(sendCalls.map((c) => c.channelId).sort()).toEqual(["chan-1", "chan-2"]);
+    } finally {
+      resetMessagingDeps();
+    }
+  });
+
+  test("an unresolvable target at fire time logs job.delivery.target.error and the run still completes", async () => {
+    const config = testConfig("jobs-delivery-missing-bridge");
+    const { setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ channelId: string; content: string }> = [];
+    setMessagingDeps({ discordClientFactory: discordStub(sendCalls) });
+    try {
+      // No bridge named "ghost" exists (it was removed after the job was
+      // saved). Delivery must skip it without failing the finalize.
+      const task = await seedJobRun(config, { deliveryTargets: ["ghost"], summary: "Briefing for nobody." });
+      await finalizeJobRunFromTask(config, task);
+      expect(sendCalls).toHaveLength(0);
+      const run = readState(config.instance).jobRuns.find((r) => r.id === "run_delivery");
+      expect(run?.status).toBe("completed");
+      const log = readFileSync(`${config.logRoot}/runtime.jsonl`, "utf8");
+      expect(log).toContain("job.delivery.target.error");
+      expect(log).toContain("ghost");
     } finally {
       resetMessagingDeps();
     }

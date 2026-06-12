@@ -1171,6 +1171,11 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           timeoutSeconds: {
             type: "number",
             description: "Wall-clock seconds before the spawned task is killed. Default 600 (10 min) — enough for typical git/gh + multi-file scan jobs. Drop lower (e.g. 60-120) for trivial reminders; raise (e.g. 1800-3600) when the prompt invokes external CLIs like codex or claude-code that can run several minutes. The model will be terminated mid-thought if this is too low."
+          },
+          deliveryTargets: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional messaging-bridge names to deliver the job's final output to (in addition to its chat thread), e.g. [\"telegram\"]. Use when the user asks for the job's output to reach a messaging app. Each entry must match a configured bridge by name (or id/kind, case-insensitive); unknown entries are rejected with the configured bridge names so you can relay the fix."
           }
         },
         required: ["name", "prompt"]
@@ -1222,7 +1227,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           status: { type: "string", enum: ["active", "paused"], description: "Optional pause/resume. 'paused' stops the scheduler from firing the job; 'active' resumes it." },
           autoApproveCommands: { type: "array", items: { type: "string" }, description: "Optional new list of auto-approve shell patterns for unattended fires." },
           dangerouslyAutoApprove: { type: "boolean", description: "Optional. If true the scheduled task bypasses ALL approval gates at fire-time." },
-          timeoutSeconds: { type: "number", description: "Optional. Wall-clock seconds before the spawned task is killed." }
+          timeoutSeconds: { type: "number", description: "Optional. Wall-clock seconds before the spawned task is killed." },
+          deliveryTargets: { type: "array", items: { type: "string" }, description: "Optional new list of messaging-bridge names that receive the job's final output in addition to its chat thread, e.g. [\"telegram\"]. Pass [] to clear. Each entry must match a configured bridge by name (or id/kind, case-insensitive)." }
         },
         required: ["jobId"]
       }

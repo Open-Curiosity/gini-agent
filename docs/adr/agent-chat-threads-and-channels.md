@@ -220,6 +220,20 @@ an agent chat; the difference is purely the `kind`/`origin` tags that
 drive the rail grouping and the unread-until-opened behavior job
 sessions already had.
 
+Beyond the channel itself, a finished job run's reply can reach
+messaging bridges two ways (`src/jobs/finalize.ts`): the session's
+origin mirror (`outboundMirror`/`source`, set when the job was created
+from a Telegram/Discord conversation) mirrors the reply back to that
+bridge, and `JobRecord.deliveryTargets` names additional bridges to
+deliver to — the surface for "send my morning briefing to telegram"
+when the job was created from web/CLI. The `create_job`/`update_job`
+tools accept `deliveryTargets` (bridge names, validated against the
+configured bridges; `[]` clears). Entries resolve by bridge id, then
+case-insensitive name, then kind; a bridge the origin mirror already
+covered is skipped, and both paths honor the exact-`[SILENT]`
+suppression contract. Fire-time resolution failures or send errors are
+logged (`job.delivery.target.error`) without failing the run.
+
 ## Agent-Decided Routing
 
 Routing is resolved per turn, before the user sees any text, by three
@@ -415,6 +429,11 @@ Con:
 - `bun test src/state/chat-blocks.test.ts` covers thread tagging on
   insert, `listThreadBlocks` / `listMainChatBlocks`, and the
   `summarizeThreads` / `summarizeThreadsForInstance` aggregates.
+- `bun test src/jobs.test.ts` covers job-output bridge delivery: the
+  origin-mirror `[SILENT]` contract, and the `deliveryTargets` path
+  (resolution by name/id/kind, dedupe against the origin mirror,
+  fire-time resolution failure logged without failing the run, and
+  `create_job`/`update_job` validation against configured bridges).
 - `bun test src/http.test.ts` smoke-tests the new routes — the
   agent-chat resolver, the three per-session thread routes (including
   create-or-append from a new thread id + `parentBlockId`, the

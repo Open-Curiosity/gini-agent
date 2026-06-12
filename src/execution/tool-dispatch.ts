@@ -1264,6 +1264,43 @@ async function spawnSubagentTool(
   return JSON.stringify(payload);
 }
 
+// Validate a create_job / update_job `deliveryTargets` payload against
+// the configured messaging bridges. Entries resolve by bridge id, then
+// case-insensitive name, then kind — the same resolution the job
+// finalizer applies at fire time (src/jobs/finalize.ts), so a payload
+// that passes here is deliverable as long as the bridge still exists
+// when the job fires. Unknown entries are rejected with the configured
+// bridge names so the agent can relay a fixable error to the user.
+// Returns undefined when the field was omitted; an empty array is the
+// documented "clear" signal for update_job and passes through.
+function parseDeliveryTargets(config: RuntimeConfig, raw: unknown): string[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) {
+    throw new Error("Invalid input: deliveryTargets must be an array of strings.");
+  }
+  const bridges = readState(config.instance).messagingBridges;
+  const cleaned: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string" || entry.trim().length === 0) {
+      throw new Error("Invalid input: deliveryTargets entries must be non-empty strings.");
+    }
+    const value = entry.trim();
+    const lower = value.toLowerCase();
+    const match =
+      bridges.find((bridge) => bridge.id === value) ??
+      bridges.find((bridge) => bridge.name.toLowerCase() === lower) ??
+      bridges.find((bridge) => bridge.kind.toLowerCase() === lower);
+    if (!match) {
+      const configured = bridges.map((bridge) => bridge.name).join(", ");
+      throw new Error(
+        `Invalid input: no messaging bridge matches '${value}'. Configured bridges: ${configured.length > 0 ? configured : "<none>"}.`
+      );
+    }
+    cleaned.push(value);
+  }
+  return cleaned;
+}
+
 // Schedule a real job (cron-style) and link it to the originating chat
 // session so the job's output is delivered back as an assistant message
 // when it fires. Low-risk: no approval gate, since reminders should not
@@ -1386,6 +1423,7 @@ async function createJobTool(
     }
     timeoutSeconds = args.timeoutSeconds;
   }
+  const deliveryTargets = parseDeliveryTargets(config, args.deliveryTargets);
 
   // Walk task -> run -> conversation to determine whether the agent is
   // invoking us from inside a chat task. If so, we want each scheduled
@@ -1447,7 +1485,8 @@ async function createJobTool(
       approvalMode,
       autoApproveCommands,
       dangerousTerminalPatterns,
-      timeoutSeconds
+      timeoutSeconds,
+      deliveryTargets
     }, {
       // Inherit the originating task's owning agent so a scheduler tick
       // doesn't reattribute the job to whichever agent happens to be
@@ -1488,7 +1527,8 @@ async function createJobTool(
           approvalMode,
           autoApproveCommands,
           dangerousTerminalPatterns,
-          timeoutSeconds
+          timeoutSeconds,
+          deliveryTargets
         }
       },
       { taskId: item.id }
@@ -1510,7 +1550,8 @@ async function createJobTool(
       approvalMode,
       autoApproveCommands,
       dangerousTerminalPatterns,
-      timeoutSeconds
+      timeoutSeconds,
+      deliveryTargets
     }
   });
 
@@ -1651,6 +1692,12 @@ async function updateJobTool(
   for (const key of passthrough) {
     if (key in args) patch[key] = args[key];
   }
+  // `deliveryTargets` is validated against configured bridges instead of
+  // passed through raw — an unknown entry must fail here with the
+  // configured bridge names so the agent can relay a fixable error.
+  // `[]` is the documented "clear" signal and passes through.
+  const deliveryTargetsPatch = parseDeliveryTargets(config, args.deliveryTargets);
+  if (deliveryTargetsPatch !== undefined) patch.deliveryTargets = deliveryTargetsPatch;
   // oneShot lives on the JobRecord but isn't part of `updateJob`'s patch
   // contract — apply it directly inside the same mutateState so the audit
   // row reflects every field the agent touched. We forward it via

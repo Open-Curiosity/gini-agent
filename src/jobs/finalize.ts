@@ -11,18 +11,18 @@
 //
 // Idempotent: if the run is already terminal, this is a no-op.
 
-import type { RuntimeConfig, Task } from "../types";
+import type { RuntimeConfig, RuntimeState, Task } from "../types";
 import { addAudit, appendEvent, appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { syncChatTaskResult } from "../execution/chat";
-// `sendMessagingOutput` is imported lazily inside dispatchJobReplyToBridge
-// to avoid closing a static import cycle. The runtime graph would be:
+// `sendMessagingOutput` is imported lazily inside the bridge-dispatch
+// helpers to avoid closing a static import cycle. The runtime graph would be:
 //   agent.ts -> jobs/finalize.ts -> integrations/messaging.ts -> agent.ts
 // (messaging.ts imports submitTask from agent.ts). A static cycle here
 // would defeat the deliberate split between agent.ts and jobs/finalize.ts —
 // see the leaf-module comment at src/agent.ts:51-55 — so we defer the
 // messaging import until call time. Module-init cost is unchanged; the
 // dynamic import resolves to the already-loaded module the first time
-// dispatchJobReplyToBridge runs.
+// a dispatch helper runs.
 
 export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task): Promise<void> {
   if (!task.jobId) return;
@@ -143,7 +143,41 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
     // case where the synced assistant message is genuinely empty
     // (failed task with no error summary) still mirrors nothing.
     await dispatchJobReplyToBridge(config, chatSessionIdToSync, task);
+    // Independently of the origin mirror, deliver the same reply to any
+    // bridges the job names on its own deliveryTargets — the "send my
+    // morning briefing to telegram" surface for jobs created from
+    // web/CLI chats that have no originating bridge to mirror back to.
+    await dispatchJobReplyToDeliveryTargets(config, chatSessionIdToSync, task);
   }
+}
+
+// Resolve the assistant reply text the bridge dispatchers should mirror,
+// or undefined when nothing should be sent. The synced assistant message
+// is the most recent one on the session keyed to this task; pick it up
+// from chatMessages so we never accidentally re-dispatch an older turn.
+// `[SILENT]` summaries explicitly suppress the bridge mirror. The
+// canonical match is EXACT (trimmed), not prefix — matching the
+// suppression contract in src/execution/chat.ts and the system-
+// prompt instruction at src/jobs/index.ts that tells the LLM to
+// "respond with exactly [SILENT] and nothing else". A prefix match
+// here would silently drop a legitimate reply like
+// `"[SILENT] but here's an update"`, which is the exact failure
+// mode the chat-side test pins against.
+function resolveJobReplyText(state: RuntimeState, chatSessionId: string, task: Task): string | undefined {
+  const assistantMessage = state.chatMessages
+    .filter(
+      (m) =>
+        m.sessionId === chatSessionId &&
+        m.taskId === task.id &&
+        m.role === "assistant" &&
+        m.kind !== "tool_transcript" &&
+        m.kind !== "approval_reason"
+    )
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+  const replyText = assistantMessage?.content?.trim();
+  if (!replyText || replyText.length === 0) return undefined;
+  if (replyText === "[SILENT]") return undefined;
+  return replyText;
 }
 
 async function dispatchJobReplyToBridge(
@@ -165,30 +199,8 @@ async function dispatchJobReplyToBridge(
   // (it's just a migration breadcrumb), so a job that landed on a
   // migrated chat has nowhere to mirror its assistant reply.
   if (dispatchTo.kind !== "telegram" && dispatchTo.kind !== "discord") return;
-  // The synced assistant message is the most recent one on the
-  // session keyed to this task; pick it up from chatMessages so we
-  // never accidentally re-dispatch an older turn.
-  const assistantMessage = state.chatMessages
-    .filter(
-      (m) =>
-        m.sessionId === chatSessionId &&
-        m.taskId === task.id &&
-        m.role === "assistant" &&
-        m.kind !== "tool_transcript" &&
-        m.kind !== "approval_reason"
-    )
-    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
-  const replyText = assistantMessage?.content?.trim();
-  // `[SILENT]` summaries explicitly suppress the bridge mirror. The
-  // canonical match is EXACT (trimmed), not prefix — matching the
-  // suppression contract in src/execution/chat.ts and the system-
-  // prompt instruction at src/jobs/index.ts that tells the LLM to
-  // "respond with exactly [SILENT] and nothing else". A prefix match
-  // here would silently drop a legitimate reply like
-  // `"[SILENT] but here's an update"`, which is the exact failure
-  // mode the chat-side test pins against.
-  if (!replyText || replyText.length === 0) return;
-  if (replyText === "[SILENT]") return;
+  const replyText = resolveJobReplyText(state, chatSessionId, task);
+  if (replyText === undefined) return;
   try {
     const replyToMessageId = dispatchTo.lastInboundMessageId;
     const { sendMessagingOutput } = await import("../integrations/messaging");
@@ -206,5 +218,71 @@ async function dispatchJobReplyToBridge(
       kind: dispatchTo.kind,
       error: error instanceof Error ? error.message : String(error)
     });
+  }
+}
+
+// Deliver the job's final reply to each bridge named on the job's own
+// `deliveryTargets`. Entries resolve against configured bridges by
+// record id, then case-insensitive name, then kind — the same
+// resolution create_job/update_job validate against, so a fire-time
+// miss means the bridge was removed/renamed after the job was saved.
+// Only telegram / discord bridges are dispatchable today;
+// sendMessagingOutput picks the bridge's default target
+// (bridge.deliveryTargets[0]). A bridge the origin mirror
+// (dispatchJobReplyToBridge) already covered is skipped, as are
+// duplicate entries resolving to the same bridge. Resolution failures
+// and send errors are logged and skipped — delivery problems must
+// never fail the run.
+async function dispatchJobReplyToDeliveryTargets(
+  config: RuntimeConfig,
+  chatSessionId: string,
+  task: Task
+): Promise<void> {
+  const state = readState(config.instance);
+  const job = state.jobs.find((candidate) => candidate.id === task.jobId);
+  if (!job || job.deliveryTargets.length === 0) return;
+  const replyText = resolveJobReplyText(state, chatSessionId, task);
+  if (replyText === undefined) return;
+  // The origin mirror dispatches whenever the session's
+  // outboundMirror/source is a telegram/discord bridge and the reply is
+  // non-suppressed — the same reply-text condition we just checked, so
+  // seeding the dedupe set with that bridge id is exact.
+  const session = state.chatSessions.find((candidate) => candidate.id === chatSessionId);
+  const origin = session?.outboundMirror ?? session?.source;
+  const dispatchedBridgeIds = new Set<string>();
+  if (origin && (origin.kind === "telegram" || origin.kind === "discord")) {
+    dispatchedBridgeIds.add(origin.bridgeId);
+  }
+  for (const entry of job.deliveryTargets) {
+    const lower = entry.toLowerCase();
+    const bridge =
+      state.messagingBridges.find((candidate) => candidate.id === entry) ??
+      state.messagingBridges.find((candidate) => candidate.name.toLowerCase() === lower) ??
+      state.messagingBridges.find((candidate) => candidate.kind.toLowerCase() === lower);
+    if (!bridge || (bridge.kind !== "telegram" && bridge.kind !== "discord")) {
+      appendLog(config.instance, "job.delivery.target.error", {
+        jobId: job.id,
+        taskId: task.id,
+        target: entry,
+        error: bridge
+          ? `bridge kind '${bridge.kind}' is not dispatchable`
+          : "no matching messaging bridge"
+      });
+      continue;
+    }
+    if (dispatchedBridgeIds.has(bridge.id)) continue;
+    dispatchedBridgeIds.add(bridge.id);
+    try {
+      const { sendMessagingOutput } = await import("../integrations/messaging");
+      await sendMessagingOutput(config, bridge.id, { text: replyText });
+    } catch (error) {
+      appendLog(config.instance, "job.delivery.target.error", {
+        jobId: job.id,
+        taskId: task.id,
+        target: entry,
+        bridgeId: bridge.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 }
