@@ -296,6 +296,26 @@ describe("buildToolCatalog", () => {
     expect(tool?.function.parameters.required).toEqual(["jobId"]);
   });
 
+  test("create_job and update_job offer skillNames with the attach-the-recipe steering", () => {
+    // The skillNames descriptions carry the in-prompt steering that makes
+    // the agent attach integration skills when scheduling (ADR
+    // job-skill-attachments.md). Pin the key clauses so a rewrite that
+    // drops them surfaces as a test failure.
+    const state = stateWithToolsets([]);
+    const catalog = buildToolCatalog(state);
+    const createTool = catalog.find((t) => t.function.name === "create_job");
+    const createProps = createTool?.function.parameters.properties as Record<string, { description?: string }>;
+    expect(createProps.skillNames).toBeDefined();
+    expect(createProps.skillNames?.description).toContain("loaded into every run");
+    expect(createProps.skillNames?.description).toContain("google-calendar + google-gmail");
+    const updateTool = catalog.find((t) => t.function.name === "update_job");
+    const updateProps = updateTool?.function.parameters.properties as Record<string, { description?: string }>;
+    expect(updateProps.skillNames).toBeDefined();
+    // update is full-replacement; [] clears.
+    expect(updateProps.skillNames?.description).toContain("FULL replacement");
+    expect(updateProps.skillNames?.description).toContain("[] to clear");
+  });
+
   test("set_provider's model-facing schema offers bedrock + awsRegion + azure routing; baseUrl is documented as ignored for anthropic/bedrock", () => {
     // This is the schema the MODEL actually sees (the SELF_OPERATIONS schema is
     // documentation-only). It offers bedrock + awsRegion and azure transport

@@ -1149,6 +1149,11 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           },
           prompt: { type: "string", description: "The instruction the agent will receive when the job fires. Phrase it from the user's perspective (e.g. 'Remind me to take the cake out of the oven.')." },
           oneShot: { type: "boolean", description: "If true, the job is paused after its first successful run. Defaults to false (recurring)." },
+          skillNames: {
+            type: "array",
+            items: { type: "string" },
+            description: "Names from the Available skills list to attach to this job. Their full instructions are loaded into every run, so each fire follows the skill's recipe instead of rediscovering CLI usage. Attach the skills covering any integration the prompt touches (e.g. google-calendar + google-gmail for a morning briefing). Max 8; every name must match an enabled skill."
+          },
           autoApproveCommands: {
             type: "array",
             items: { type: "string" },
@@ -1187,7 +1192,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "list_jobs",
-      description: "List scheduled jobs visible to this instance. Cheap, side-effect-free; call this first when the user refers to 'this job', 'my reminder', or any existing scheduled job so you can target the right job id with update_job / delete_job (instead of creating a duplicate). Returns a compact JSON array with each job's id, name, status, schedule shape (cronExpression+cronTimezone OR intervalSeconds), oneShot flag, nextRunAt/lastRunAt timestamps, chatSessionId, and a truncated prompt. Pass `fullPrompt: true` when you intend to edit a prompt (e.g. 'append to this reminder' or 'change wording X to Y') so you get the verbatim prompt without truncation — otherwise prompts are truncated to 200 chars to keep the result compact.",
+      description: "List scheduled jobs visible to this instance. Cheap, side-effect-free; call this first when the user refers to 'this job', 'my reminder', or any existing scheduled job so you can target the right job id with update_job / delete_job (instead of creating a duplicate). Returns a compact JSON array with each job's id, name, status, schedule shape (cronExpression+cronTimezone OR intervalSeconds), oneShot flag, nextRunAt/lastRunAt timestamps, chatSessionId, attached skillNames, and a truncated prompt. Pass `fullPrompt: true` when you intend to edit a prompt (e.g. 'append to this reminder' or 'change wording X to Y') so you get the verbatim prompt without truncation — otherwise prompts are truncated to 200 chars to keep the result compact.",
       parameters: {
         type: "object",
         properties: {
@@ -1219,6 +1224,11 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           cronExpression: { type: ["string", "null"], description: "Optional new 5-field Unix cron expression. Pass a string to make the job cron-driven; pass null to clear it when switching to intervalSeconds." },
           cronTimezone: { type: ["string", "null"], description: "Optional new IANA timezone identifier (only valid with cronExpression). Pass null to clear (only legal when also clearing cronExpression)." },
           oneShot: { type: "boolean", description: "Optional. If true the job is auto-paused after its first run." },
+          skillNames: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional new skill attachments (FULL replacement — supply every skill the job should keep; pass [] to clear). Attached skills' full instructions are loaded into every run, so each fire follows the skill's recipe instead of rediscovering CLI usage. Call list_jobs first to see the job's current skillNames."
+          },
           status: { type: "string", enum: ["active", "paused"], description: "Optional pause/resume. 'paused' stops the scheduler from firing the job; 'active' resumes it." },
           autoApproveCommands: { type: "array", items: { type: "string" }, description: "Optional new list of auto-approve shell patterns for unattended fires." },
           dangerouslyAutoApprove: { type: "boolean", description: "Optional. If true the scheduled task bypasses ALL approval gates at fire-time." },
