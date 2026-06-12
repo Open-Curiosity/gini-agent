@@ -4,7 +4,14 @@ import { Globe, Plug, Lock, Loader2, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { DocReference } from "@/components/DocReference";
 import type { TunnelProvider, TunnelProviderId, TunnelState } from "./types";
+
+// Hosted docs URL for the Remote Access guide's manual-tunnels section —
+// rendered inline via DocReference, same pattern as connector docsUrl links.
+// Disabled catalog rows are a dead end without this: the runtime can't drive
+// those providers, but the guide shows how to front Gini with them manually.
+const REMOTE_ACCESS_DOCS_URL = "https://gini.lilaclabs.ai/docs/remote-access#manual-tunnels";
 
 const PROVIDER_ICON: Record<TunnelProviderId, LucideIcon> = {
   "gini-relay": Globe,
@@ -187,6 +194,20 @@ export function TunnelSelectionPanel({
           );
         })}
       </div>
+
+      <p className="px-4 pb-1 text-[11px] leading-relaxed text-muted-foreground">
+        Greyed-out providers can&apos;t be driven from here yet, but each can still front
+        Gini manually — see{" "}
+        <DocReference url={REMOTE_ACCESS_DOCS_URL}>
+          <button
+            type="button"
+            className="underline underline-offset-2 hover:text-foreground"
+          >
+            Remote Access
+          </button>
+        </DocReference>
+        .
+      </p>
 
       {state.status === "error" && state.message && (
         <div className="px-4 pb-2">

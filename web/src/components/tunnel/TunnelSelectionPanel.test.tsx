@@ -205,4 +205,12 @@ describe("TunnelSelectionPanel", () => {
     await user.click(screen.getByRole("button", { name: "Save" }));
     expect(handlers.onClose).toHaveBeenCalledTimes(1);
   });
+
+  test("the manual-tunnels hint links to the Remote Access doc", () => {
+    renderPanel();
+    expect(screen.queryByText(/front\s+Gini manually/)).not.toBeNull();
+    // The DocReference trigger renders as a link-styled button; clicking it is
+    // covered by DocReference's own tests — here we pin that the panel wires it.
+    expect(screen.queryByRole("button", { name: "Remote Access" })).not.toBeNull();
+  });
 });
