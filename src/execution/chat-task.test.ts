@@ -4345,17 +4345,19 @@ describe("chat-task loop", () => {
     });
 
     // Geometry: the projection crosses the high-water mark (27,200 tokens
-    // under the echo provider's 32k window) by a hair, with a small middle
-    // span — so the compaction reclaims under 10% of the projection (the
-    // savings-bail threshold) but enough to dip back under the mark.
-    // Exchange 0 is the protected head, exchanges 1–2 the summarizable
-    // middle, exchanges 3–4 the protected tail.
+    // under the echo provider's 32k window) with a small middle span — so
+    // the compaction reclaims under 10% of the projection (the savings-bail
+    // threshold) but enough to dip back under the mark. Exchange 0 is the
+    // protected head, exchanges 1–2 the summarizable middle, exchanges 3–4
+    // the protected tail. The tail sizes leave a few hundred tokens of
+    // post-compaction headroom under the mark; the always-on tool schemas
+    // count toward the projection, so growing them erodes this headroom.
     const bodies = [
       `BODY-0 ${"x".repeat(9_600)}`,
       `BODY-1 ${"x".repeat(4_000)}`,
       `BODY-2 ${"x".repeat(4_000)}`,
       `BODY-3 ${"x".repeat(19_000)}`,
-      `BODY-4 ${"x".repeat(19_000)}`
+      `BODY-4 ${"x".repeat(16_000)}`
     ];
     for (let i = 0; i < bodies.length; i++) {
       await seedBulkSkill(config, `bulk-skill-${i}`, bodies[i]!);
