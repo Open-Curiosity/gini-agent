@@ -19,7 +19,7 @@ import {
   setEchoToolCallingResponse
 } from "../provider";
 import { createScheduledJob, runJobNow, updateJob } from "./index";
-import { mutateState, readState, readTrace } from "../state";
+import { closeAllMemoryDbs, mutateState, readState, readTrace } from "../state";
 import { __registerHookForTest, __resetHooksForTest } from "../hooks";
 import "../hooks/builtins";
 import type { RuntimeConfig, RuntimeState, SkillRecord } from "../types";
@@ -97,6 +97,7 @@ describe("job skill attachments", () => {
   });
 
   afterEach(() => {
+    closeAllMemoryDbs();
     __resetHooksForTest();
     if (prevState === undefined) delete process.env.GINI_STATE_ROOT;
     else process.env.GINI_STATE_ROOT = prevState;
