@@ -97,8 +97,10 @@ export function TunnelMenu() {
         {/* One stable container so the connecting->connected view swap animates
             height/opacity instead of an abrupt resize. Honors reduced motion.
             grid-cols-1 pins the swap track to the popover width so neither view
-            can size the shared cell to max-content and overflow the 384px box. */}
-        <div className="grid w-96 grid-cols-1 transition-all duration-200 ease-out motion-reduce:transition-none">
+            can size the shared cell to max-content and overflow it. w-full (not
+            a fixed w-96): the popover itself is viewport-bounded, and a fixed
+            inner width clips the panel's buttons on narrow screens. */}
+        <div className="grid w-full grid-cols-1 transition-all duration-200 ease-out motion-reduce:transition-none">
           <div
             key={showConnected ? "connected" : "selection"}
             className="col-start-1 row-start-1 min-w-0 duration-150 data-open:animate-in data-open:fade-in-0 motion-reduce:animate-none"
