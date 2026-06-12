@@ -412,11 +412,16 @@ const discordDone: Promise<void> = (async function discordReconcileLoop(): Promi
 // confuses launchd.
 let shutdownStarted = false;
 
-process.on("SIGTERM", async () => {
+// SIGTERM (daemon stop / launchd / self-signal) and SIGINT (Ctrl-C on a
+// foreground `gini run`) share the same drain. Without the SIGINT hook the
+// default handler killed the process with NO drain at all — frpc/agent
+// children were orphaned and a live tailscale serve config kept fronting the
+// gateway port after exit.
+async function shutdown(signal: "SIGTERM" | "SIGINT"): Promise<void> {
   if (shutdownStarted) return;
   shutdownStarted = true;
   const shutdownStartedMs = performance.now();
-  appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
+  appendLog(config.instance, "runtime.stopped", { signal });
   schedulerStopped = true;
   reprobeStopped = true;
   telegramStopped = true;
@@ -522,11 +527,14 @@ process.on("SIGTERM", async () => {
         error: error instanceof Error ? error.message : String(error)
       });
     }
-    process.stdout.write(`Gini runtime shutting down (SIGTERM) instance=${config.instance}\n`, () => {
+    process.stdout.write(`Gini runtime shutting down (${signal}) instance=${config.instance}\n`, () => {
       appendLog(config.instance, "runtime.stop.drained", {
         drainMs: Math.round(performance.now() - shutdownStartedMs)
       });
       process.exit(0);
     });
   });
-});
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
