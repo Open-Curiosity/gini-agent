@@ -63,16 +63,22 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const allSessions = useAllChatSessions();
 
   // A job is recurring when it isn't a one-shot reminder and carries an active
-  // schedule (cron or interval). Stable-sorted by createdAt (then name) so the
-  // list doesn't reorder as jobs fire.
+  // schedule (cron or interval). Only channel-bound jobs get a sidebar row: a
+  // deliverTo:"chat" job delivers into — and is managed from — its bound
+  // conversation (Jobs tab), so a rail row would just be a confusing alias for
+  // that chat. A missing/unresolved bound session is treated as not-channel
+  // and hidden. Stable-sorted by createdAt (then name) so the list doesn't
+  // reorder as jobs fire.
   const recurringJobs = useMemo<JobRecord[]>(() => {
+    const sessionsById = new Map((allSessions.data ?? []).map((s) => [s.id, s]));
     return (allJobs.data ?? [])
       .filter((j) => !j.oneShot && (j.cronExpression != null || (j.intervalSeconds ?? 0) > 0))
+      .filter((j) => j.chatSessionId != null && sessionsById.get(j.chatSessionId)?.kind === "channel")
       .sort(
         (a, b) =>
           (a.createdAt ?? "").localeCompare(b.createdAt ?? "") || a.name.localeCompare(b.name)
       );
-  }, [allJobs.data]);
+  }, [allJobs.data, allSessions.data]);
 
   const { isUnread } = useChatReadState(allSessions.data);
 
@@ -241,14 +247,8 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                     );
                   }
                   const channelSession = (allSessions.data ?? []).find((s) => s.id === job.chatSessionId);
-                  // A deliverTo:"chat" job binds to a normal conversation
-                  // rather than a dedicated channel: its row navigates
-                  // there, so the unread dot would light on ANY activity
-                  // in that conversation — suppress it and show where the
-                  // job delivers instead.
-                  const chatBound = channelSession !== undefined && channelSession.kind !== "channel";
                   const active = onChat && selectedSession === job.chatSessionId;
-                  const unread = !active && !chatBound && channelSession ? isUnread(channelSession) : false;
+                  const unread = !active && channelSession ? isUnread(channelSession) : false;
                   const onClick = () => {
                     if (job.chatSessionId) {
                       selectChannel(job.chatSessionId);
@@ -267,30 +267,19 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                           active ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
                         )}
                       >
-                        {chatBound ? (
-                          <MessagesSquare aria-hidden className="size-3.5 shrink-0 text-sidebar-foreground/55" />
-                        ) : (
-                          <span
-                            aria-hidden
-                            className="w-3.5 shrink-0 text-center text-sm font-medium text-sidebar-foreground/55"
-                          >
-                            #
-                          </span>
-                        )}
-                        <span className="flex min-w-0 flex-1 flex-col">
-                          <span
-                            className={cn(
-                              "truncate text-[13px]",
-                              active || unread ? "font-semibold text-sidebar-accent-foreground" : "font-medium text-sidebar-foreground"
-                            )}
-                          >
-                            {job.name}
-                          </span>
-                          {chatBound ? (
-                            <span className="truncate text-[11px] font-medium text-sidebar-foreground/55">
-                              → {channelSession.title?.trim() || "main chat"}
-                            </span>
-                          ) : null}
+                        <span
+                          aria-hidden
+                          className="w-3.5 shrink-0 text-center text-sm font-medium text-sidebar-foreground/55"
+                        >
+                          #
+                        </span>
+                        <span
+                          className={cn(
+                            "min-w-0 flex-1 truncate text-[13px]",
+                            active || unread ? "font-semibold text-sidebar-accent-foreground" : "font-medium text-sidebar-foreground"
+                          )}
+                        >
+                          {job.name}
                         </span>
                         {unread ? (
                           <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-sidebar-primary" />

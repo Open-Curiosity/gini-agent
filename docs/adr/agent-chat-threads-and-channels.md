@@ -231,12 +231,13 @@ tool description instructs the agent to put the choice to the user via
 the `ask_user` choices card for recurring jobs (channel recommended,
 this-chat, plus one option per dispatchable bridge when configured),
 and to default one-shot reminders to `"chat"` without asking. A
-chat-bound recurring job still appears under the Recurring jobs rail,
-but its row navigates to — and each fire delivers into — the bound
-conversation rather than a channel. Its fires also run with that
-conversation's prior-turn context (token-budgeted, like any chat turn)
-— intended, the job benefits from its conversational setting — whereas
-a channel-bound job's fires only see prior fires.
+chat-bound job gets no Recurring jobs rail row — the rail lists only
+channel-bound jobs; each fire delivers into the bound conversation,
+and the job is managed from that conversation's Jobs tab. Its fires
+also run with that conversation's prior-turn context (token-budgeted,
+like any chat turn) — intended, the job benefits from its
+conversational setting — whereas a channel-bound job's fires only see
+prior fires.
 
 Beyond the channel itself, a finished job run's reply can reach
 messaging bridges two ways (`src/jobs/finalize.ts`): the session's
