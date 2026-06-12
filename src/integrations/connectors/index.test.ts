@@ -521,6 +521,23 @@ describe("isSkillActive with an externally satisfied credential", () => {
     const skill = newSkill({ requiredCredentials: ["LINEAR_API_KEY"] });
     expect(isSkillActive(state, skill)).toBe(false);
   });
+
+  test("a disabled workspace connector keeps the skill inactive despite registered accounts", () => {
+    // Explicit operator off stays off: once a connector record with the
+    // required name exists, the hook never overrides its status — only a
+    // fully absent record falls through to the external-satisfaction check.
+    writeGoogleAccounts([registryAccount()]);
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({
+      name: "google-workspace-oauth",
+      type: "oauth2",
+      provider: "google-oauth-desktop",
+      status: "disabled",
+      health: "healthy"
+    })];
+    const skill = newSkill({ requiredCredentials: ["google-workspace-oauth"] });
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
 });
 
 describe("bindingsForCredentials", () => {

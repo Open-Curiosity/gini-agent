@@ -60,12 +60,15 @@ export const googleOauthDesktopProvider: ProviderModule = {
   // in connectors/registry.ts).
   credentialName: "google-workspace-oauth",
   // A registered machine-global Google account (ADR google-multi-account.md)
-  // satisfies the workspace credential without any connector record: each
-  // account's config dir carries its own OAuth client + tokens, so the gws
-  // CLI needs no client env vars on that path — which is why
-  // `bindingsForCredentials` is untouched (there is nothing to bind).
-  // Presence-only by design: sign-in expiry is handled by the skill recipes
-  // at run time (`gws auth status` / re-login guidance), not by this gate.
+  // satisfies the workspace credential without any connector record. For the
+  // read/operate Workspace skills each account's config dir carries its own
+  // OAuth client + tokens, so the gws CLI needs no client env vars on that
+  // path — which is why `bindingsForCredentials` is untouched. The exception
+  // is google-account-login's fresh-login flow, which mints a NEW config dir
+  // and still needs this connector's GOOGLE_WORKSPACE_CLI_CLIENT_ID/_SECRET
+  // bindings. Presence-only by design: sign-in expiry is handled by the
+  // skill recipes at run time (`gws auth status` / re-login guidance), not
+  // by this gate.
   credentialExternallySatisfied: () => readGoogleAccounts().length > 0,
   // The setup flow is non-trivial — install gws, install gcloud, gcloud
   // auth login, project provisioning, APIs enable, THEN capture the

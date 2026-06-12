@@ -24,10 +24,17 @@ skills (`google-gmail`, `google-calendar`, `google-drive`, `google-docs`,
   per-instance `google-workspace-oauth` connector exists: `isSkillActive`
   (`src/integrations/connectors/index.ts`) consults the owning provider's
   `credentialExternallySatisfied` hook (`google-oauth-desktop.ts`, backed by
-  `readGoogleAccounts()`) before declaring a required credential unmet. Each
-  account's config dir is self-contained (its own OAuth client + tokens), so
-  no client env bindings are needed on this path. The check is presence-only;
-  sign-in expiry is handled by the skill recipes at run time.
+  `readGoogleAccounts()`) before declaring a required credential unmet. The
+  hook applies only when no connector record with that name exists at all —
+  an existing record of any status keeps the usability-only gate, so a
+  `disabled` connector (explicit operator off) leaves the skills inactive
+  regardless of registered accounts. For the read/operate Workspace skills,
+  each account's config dir is self-contained (its own OAuth client + tokens),
+  so no client env bindings are needed on that path; the exception is
+  `google-account-login`'s fresh-login flow, which mints a new config dir and
+  still needs the connector's `GOOGLE_WORKSPACE_CLI_CLIENT_ID`/`_SECRET`
+  bindings. The check is presence-only; sign-in expiry is handled by the
+  skill recipes at run time.
 
 - **Accounts are tagged.** Each account carries a user label (`personal`,
   `work`, `school`, …). Tags are unique case-insensitively across accounts.
