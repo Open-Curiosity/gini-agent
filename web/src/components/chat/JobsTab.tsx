@@ -14,8 +14,9 @@ import { scheduleLabel } from "@/app/jobs/_components/schedule-label";
 import { CalendarView } from "@/app/jobs/_components/calendar/calendar-view";
 import { adaptJob, adaptRun } from "@/app/jobs/_components/calendar/types";
 import { api } from "@/lib/api";
-import { useInvalidate, useJobRuns, useJobs } from "@/lib/queries";
+import { useAllChatSessions, useInvalidate, useJobRuns, useJobs } from "@/lib/queries";
 import { JobFanout } from "@/components/chat/JobFanout";
+import type { ChatSession } from "@/lib/view-types";
 import type { JobRecord, JobRunRecord, JobStatus } from "@runtime/types";
 
 type View = "list" | "calendar";
@@ -35,6 +36,10 @@ const STATUS_FILTER_LABELS: Record<StatusFilter, string> = {
 export function JobsTab() {
   const jobs = useJobs();
   const runs = useJobRuns();
+  // Unscoped session list (shared cache with the sidebar) — used to resolve
+  // each job's delivery binding (channel title vs the agent's chat) for the
+  // read-only "Delivers to" line on the card.
+  const sessions = useAllChatSessions();
   const invalidate = useInvalidate();
   const [view, setView] = useState<View>("list");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
@@ -73,6 +78,10 @@ export function JobsTab() {
   });
 
   const allJobs = jobs.data ?? [];
+  const sessionsById = useMemo(
+    () => new Map((sessions.data ?? []).map((s) => [s.id, s])),
+    [sessions.data]
+  );
   const selectedJob = useMemo(
     () => (selectedId ? (allJobs.find((j) => j.id === selectedId) ?? null) : null),
     [allJobs, selectedId]
@@ -152,6 +161,7 @@ export function JobsTab() {
                   <JobCard
                     key={job.id}
                     job={job}
+                    deliveryLabel={deliveryLabel(job, sessionsById)}
                     actionPending={action.isPending}
                     onAction={(op) => action.mutate({ id: job.id, op })}
                     onSelect={() => setSelectedId(job.id)}
@@ -274,17 +284,29 @@ function ViewToggle({ view, onChange }: { view: View; onChange: (v: View) => voi
   );
 }
 
+// Read-only delivery-binding label for a job card: the dedicated channel's
+// title when channel-bound, the agent's chat when bound to any other session,
+// null (no line) when the job is session-less or the session can't resolve.
+function deliveryLabel(job: JobRecord, sessionsById: Map<string, ChatSession>): string | null {
+  if (!job.chatSessionId) return null;
+  const session = sessionsById.get(job.chatSessionId);
+  if (!session) return null;
+  return session.kind === "channel" ? `# ${session.title}` : "this agent's chat";
+}
+
 // Job card — design `y6aU9` (Job List Item). The header is a click target that
 // opens the job detail (fan-out) view; the action buttons stop propagation so
 // Run/Pause/Resume don't also select.
 function JobCard({
   job,
+  deliveryLabel,
   actionPending,
   onAction,
   onSelect,
   onRequestDelete
 }: {
   job: JobRecord;
+  deliveryLabel: string | null;
   actionPending: boolean;
   onAction: (op: "run" | "pause" | "resume") => void;
   onSelect: () => void;
@@ -311,6 +333,7 @@ function JobCard({
         <span className="font-medium text-muted-foreground">
           {job.runCount} runs · {job.missedRuns} missed
         </span>
+        {deliveryLabel ? <span className="truncate">Delivers to: {deliveryLabel}</span> : null}
       </div>
       <div className="flex gap-2.5">
         <button

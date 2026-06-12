@@ -239,6 +239,24 @@ like any chat turn) — intended, the job benefits from its
 conversational setting — whereas a channel-bound job's fires only see
 prior fires.
 
+The binding stays modifiable after creation: `update_job` accepts the
+same `deliverTo` enum (`rebindJobDelivery` in `src/jobs/index.ts`, one
+`mutateState` write, audited as `job.delivery.rebound`). Switching to
+`"channel"` always mints a **new** dedicated channel (an earlier
+archived channel is never unarchived) and leaves the previously bound
+conversation untouched — it's the user's chat. Switching to `"chat"`
+binds future fires to the conversation the `update_job` call came from
+(tool error when the invocation isn't chat-bound) and, when the job's
+current session is a dedicated channel, stamps the channel's
+`archivedAt` (audited as `chat.session.archived`). An archived session
+keeps its full history and stays directly addressable by id/URL; it is
+only excluded from session/channel lists (web sidebar rail, mobile
+channels). Rebinding when already bound the requested way is a no-op.
+Watcher jobs (a `preRunHook` or fan-out `routes`) reject `deliverTo` —
+their sessions carry routing state a rebind would orphan. The raw
+`PATCH /api/jobs` path stays permissive and has no `deliverTo`
+semantics.
+
 Beyond the channel itself, a finished job run's reply can reach
 messaging bridges two ways (`src/jobs/finalize.ts`): the session's
 origin mirror (`outboundMirror`/`source`, set when the job was created

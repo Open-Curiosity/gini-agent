@@ -984,6 +984,13 @@ export interface ChatSessionRecord {
   // sessions may leave this undefined; the new UI treats undefined as
   // hidden.
   kind?: "agent" | "channel";
+  // Archived marker. Absent = active. An archived session keeps its full
+  // history and stays directly addressable (GET /api/chat/<id>, deep links),
+  // but is excluded from session/channel lists. Set when a job's delivery
+  // is rebound away from its dedicated channel (update_job deliverTo
+  // "chat") so the orphaned channel stops cluttering the rails. Optional,
+  // so legacy sessions just lack it — no normalizeState backfill.
+  archivedAt?: string;
   // Stable marker identifying a channel as belonging to the email-watch
   // feature, used for PRECISE identity-based cleanup of orphan email-watch
   // channels — NOT title-based matching (which could catch an unrelated

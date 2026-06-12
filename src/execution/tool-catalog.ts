@@ -1219,7 +1219,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "update_job",
-      description: "Patch an existing scheduled job in place. Use this — NOT delete+create — when the user wants to change a job's schedule, prompt, name, status, or auto-approve envelope; this preserves the job id, its bound chat session, and run history. Supply only the fields you want to change. Schedule transitions follow the same mutual-exclusion rule as create_job: a single patch may not set BOTH a positive intervalSeconds AND a cronExpression. To switch a job between cron-driven and interval-driven, pass the new driver and set the other to null (e.g. `{cronExpression: '0 9 * * *', cronTimezone: 'America/Los_Angeles', intervalSeconds: null}`). Call list_jobs first if you don't already know the jobId.",
+      description: "Patch an existing scheduled job in place. Use this — NOT delete+create — when the user wants to change a job's schedule, prompt, name, status, auto-approve envelope, or delivery binding (`deliverTo`); this preserves the job id, its bound chat session, and run history. Supply only the fields you want to change. Schedule transitions follow the same mutual-exclusion rule as create_job: a single patch may not set BOTH a positive intervalSeconds AND a cronExpression. To switch a job between cron-driven and interval-driven, pass the new driver and set the other to null (e.g. `{cronExpression: '0 9 * * *', cronTimezone: 'America/Los_Angeles', intervalSeconds: null}`). Call list_jobs first if you don't already know the jobId.",
       parameters: {
         type: "object",
         properties: {
@@ -1234,7 +1234,12 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           autoApproveCommands: { type: "array", items: { type: "string" }, description: "Optional new list of auto-approve shell patterns for unattended fires." },
           dangerouslyAutoApprove: { type: "boolean", description: "Optional. If true the scheduled task bypasses ALL approval gates at fire-time." },
           timeoutSeconds: { type: "number", description: "Optional. Wall-clock seconds before the spawned task is killed." },
-          deliveryTargets: { type: "array", items: { type: "string" }, description: "Optional new list of messaging-bridge names that receive the job's final output in addition to its chat thread, e.g. [\"telegram\"]. Pass [] to clear. Each entry must match exactly one configured Telegram or Discord bridge by exact id, or by name or kind (case-insensitive), and is stored as the bridge id; unknown or ambiguous entries are rejected." }
+          deliveryTargets: { type: "array", items: { type: "string" }, description: "Optional new list of messaging-bridge names that receive the job's final output in addition to its chat thread, e.g. [\"telegram\"]. Pass [] to clear. Each entry must match exactly one configured Telegram or Discord bridge by exact id, or by name or kind (case-insensitive), and is stored as the bridge id; unknown or ambiguous entries are rejected." },
+          deliverTo: {
+            type: "string",
+            enum: ["channel", "chat"],
+            description: "Optional rebind of where future fires deliver. \"channel\": creates a NEW dedicated job channel and delivers future fires there (a previously archived channel is never unarchived); no-op when the job already delivers to a channel. \"chat\": delivers future fires into THIS conversation (only valid when invoked from a chat conversation) and ARCHIVES the job's previous dedicated channel — its history is preserved and the channel stays directly addressable, but it disappears from session lists; no-op when the job is already bound to this conversation. Not available for watcher jobs (preRunHook or fan-out routes) — their sessions carry routing state."
+          }
         },
         required: ["jobId"]
       }
