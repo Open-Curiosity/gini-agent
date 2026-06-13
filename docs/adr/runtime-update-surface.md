@@ -93,7 +93,10 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   update guard), the blurred client polls it every ~5s, and each `true`
   answer pushes the deadline out to at least now + 90s — so a genuinely
   long update keeps the blur up for as long as the gateway proves it is
-  still working, capped by an absolute 30-minute ceiling from gate start.
+  still working, capped by an absolute 30-minute ceiling anchored at the
+  moment the gate first engaged. The gate-start timestamp is persisted
+  with the in-flight state, so a restart-triggered reload resumes the
+  original ceiling (and base deadline) instead of re-arming them.
   `false`, errors, and silence extend nothing, so a hung or dead gateway
   still releases on the base deadline. Because the restart only fires
   after the response flushes (above), a dropped `POST /api/update`

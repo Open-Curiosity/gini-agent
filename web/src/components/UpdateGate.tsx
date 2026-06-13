@@ -74,6 +74,12 @@ interface PersistedGate {
   // complete WITHOUT this marker resumes into "restarting" and re-proves the
   // stack is up instead of reloading blind.
   verified?: boolean;
+  // When the gate first left idle (epoch ms). A resumed gate anchors its base
+  // stall deadline and the absolute hard cap to THIS instant, not the reload:
+  // re-arming the 30-minute ceiling on every restart-triggered reload would
+  // let a wedged-but-alive update hold the blur indefinitely, one reload at a
+  // time.
+  startedAt?: number;
 }
 
 function readPersistedGate(): PersistedGate | null {
@@ -94,7 +100,8 @@ function readPersistedGate(): PersistedGate | null {
       beforePid: typeof parsed.beforePid === "number" ? parsed.beforePid : undefined,
       beforeWebPpid: typeof parsed.beforeWebPpid === "number" ? parsed.beforeWebPpid : undefined,
       restartExpected: typeof parsed.restartExpected === "boolean" ? parsed.restartExpected : undefined,
-      verified: parsed.verified === true ? true : undefined
+      verified: parsed.verified === true ? true : undefined,
+      startedAt: typeof parsed.startedAt === "number" ? parsed.startedAt : undefined
     };
   } catch {
     return null;
@@ -205,6 +212,10 @@ export function UpdateGateProvider({
   // Absolute ceiling for progress extensions, fixed when the gate leaves
   // "idle": no amount of gateway progress holds the blur past this.
   const hardCapRef = useRef<number | null>(null);
+  // When the gate first left idle. Persisted with the gate and restored on
+  // resume so the deadline and hard cap above stay anchored to the ORIGINAL
+  // start across mid-update reloads (see PersistedGate.startedAt).
+  const startedAtRef = useRef<number | null>(null);
   // Bumped whenever the progress poll moves the deadline so the stall effect
   // below re-runs and re-arms its timer against the new deadline (a ref
   // change alone re-schedules nothing).
@@ -288,6 +299,7 @@ export function UpdateGateProvider({
     // restart (upToDate, a structured pre-flight error, a stall release).
     if (ownerRef.current) channelRef.current?.postMessage({ type: "done" });
     ownerRef.current = false;
+    startedAtRef.current = null;
     setPhase("idle");
     setTargetSha(null);
     setBeforeSha(null);
@@ -320,7 +332,8 @@ export function UpdateGateProvider({
         beforeSha: beforeSha ?? undefined,
         beforePid: beforePid ?? undefined,
         beforeWebPpid: beforeWebPpid ?? undefined,
-        restartExpected: expectRestart
+        restartExpected: expectRestart,
+        startedAt: startedAtRef.current ?? undefined
       });
     },
     onError: (error: Error) => {
@@ -336,6 +349,17 @@ export function UpdateGateProvider({
       // and release the gate in exactly the window it exists to cover.
       const { status, unreachable } = error as ApiError;
       if (typeof status === "number" && !unreachable) {
+        // One structured error must NOT release: the gateway's single-flight
+        // guard answers 409 when another tab's POST won the race inside the
+        // broadcast latency. An update IS running — just not this tab's — so
+        // a reset() here would broadcast {type:"done"} and unblur every
+        // follower while the winner's update is mid-flight. Demote this tab
+        // to follower instead: keep the blur (and its engage-time baselines)
+        // and finish through the follower completion detection.
+        if (status === 409) {
+          ownerRef.current = false;
+          return;
+        }
         reset();
         toast.error(error.message);
       }
@@ -353,13 +377,15 @@ export function UpdateGateProvider({
   const engage = useCallback((owner: boolean) => {
     if (phase !== "idle") return;
     ownerRef.current = owner;
+    startedAtRef.current = Date.now();
     setBeforeSha(statusSha);
     setBeforePid(statusPid);
     setPhase("updating");
     writePersistedGate({
       phase: "updating",
       beforeSha: statusSha ?? undefined,
-      beforePid: statusPid ?? undefined
+      beforePid: statusPid ?? undefined,
+      startedAt: startedAtRef.current
     });
     // Capture the web server's tree identity (ppid) once, in parallel with
     // the POST. The POST takes seconds (git + install), so this settles long
@@ -419,6 +445,11 @@ export function UpdateGateProvider({
   useEffect(() => {
     const persisted = readPersistedGate();
     if (!persisted) return;
+    // Restore the original gate start FIRST (every resumed shape needs it):
+    // the stall effect anchors the deadline and hard cap on it, so a resume
+    // must not re-arm them from "now". A legacy gate without it falls back
+    // to anchoring at the resume.
+    startedAtRef.current = persisted.startedAt ?? null;
     if (persisted.phase === "complete" && persisted.verified) {
       setPhase("complete");
       return;
@@ -451,13 +482,14 @@ export function UpdateGateProvider({
       writePersistedGate({
         phase: "restarting",
         beforePid: beforePid ?? undefined,
-        beforeWebPpid: beforeWebPpid ?? undefined
+        beforeWebPpid: beforeWebPpid ?? undefined,
+        startedAt: startedAtRef.current ?? undefined
       });
     } else {
       // No restart scheduled → the servers never go down, so this complete
       // is verified by construction.
       setPhase("complete");
-      writePersistedGate({ phase: "complete", verified: true });
+      writePersistedGate({ phase: "complete", verified: true, startedAt: startedAtRef.current ?? undefined });
     }
   }, [phase, targetSha, beforeSha, statusSha, isPending, restartExpected, beforePid, beforeWebPpid]);
 
@@ -491,21 +523,32 @@ export function UpdateGateProvider({
   // down the polls just reject; react-query keeps refetching on the interval.
   const statusUpdatedAt = status.dataUpdatedAt;
   const healthzUpdatedAt = healthz.dataUpdatedAt;
+  // While the gateway's LATEST progress answer reports the update still
+  // running, the time-based fallback legs must not latch: the restart
+  // hasn't happened, so any poll that succeeds now succeeded against the
+  // still-old stack. The exposure is a gate with BOTH baselines unknown —
+  // a follower engages without a pending POST, so it can sit in
+  // "restarting" minutes before the real restart, and the first successful
+  // polls would otherwise complete it onto stale assets. The identity legs
+  // stay as-is (a flipped pid/ppid is restart proof regardless). A `false`
+  // answer or a poll failure newer than the last success (errorUpdatedAt
+  // past dataUpdatedAt) drops the hold and the plain fallback resumes.
+  const progressHoldsFallback = progressInFlight && progress.errorUpdatedAt <= progress.dataUpdatedAt;
   useEffect(() => {
     if (phase !== "restarting") return;
     const gatewayRestarted =
       beforePid != null
         ? statusPid != null && statusPid !== beforePid
-        : restartingSince != null && statusUpdatedAt > restartingSince;
+        : !progressHoldsFallback && restartingSince != null && statusUpdatedAt > restartingSince;
     const webRestarted =
       beforeWebPpid != null
         ? healthzPpid != null && healthzPpid !== beforeWebPpid
-        : restartingSince != null && healthzUpdatedAt > restartingSince;
+        : !progressHoldsFallback && restartingSince != null && healthzUpdatedAt > restartingSince;
     if (gatewayRestarted && webRestarted) {
       setPhase("complete");
-      writePersistedGate({ phase: "complete", verified: true });
+      writePersistedGate({ phase: "complete", verified: true, startedAt: startedAtRef.current ?? undefined });
     }
-  }, [phase, beforePid, statusPid, beforeWebPpid, healthzPpid, restartingSince, statusUpdatedAt, healthzUpdatedAt]);
+  }, [phase, beforePid, statusPid, beforeWebPpid, healthzPpid, restartingSince, statusUpdatedAt, healthzUpdatedAt, progressHoldsFallback]);
 
   // Once complete, reload onto the fresh assets — after one last __healthz
   // probe. The identity proofs above are point-in-time: the web server can
@@ -538,7 +581,8 @@ export function UpdateGateProvider({
           writePersistedGate({
             phase: "restarting",
             beforePid: beforePid ?? undefined,
-            beforeWebPpid: beforeWebPpid ?? undefined
+            beforeWebPpid: beforeWebPpid ?? undefined,
+            startedAt: startedAtRef.current ?? undefined
           });
         });
     }, COMPLETE_RELOAD_DELAY_MS);
@@ -567,8 +611,11 @@ export function UpdateGateProvider({
       hardCapRef.current = null;
       return;
     }
-    stallDeadlineRef.current ??= Date.now() + stallTimeoutMs;
-    hardCapRef.current ??= Date.now() + gateHardCapMs;
+    // Anchor both on the gate's first start — the persisted one for a
+    // resumed gate — so a mid-update reload cannot re-arm the deadline or
+    // the hard cap from "now".
+    stallDeadlineRef.current ??= (startedAtRef.current ?? Date.now()) + stallTimeoutMs;
+    hardCapRef.current ??= (startedAtRef.current ?? Date.now()) + gateHardCapMs;
     const timer = setTimeout(() => {
       reset();
       toast.error("Update is taking longer than expected. Reload to check on it.");
