@@ -445,7 +445,7 @@ async function dispatchToolCallInner(
           result: JSON.stringify({
             ok: false,
             error:
-              "You've already surfaced a Connect card for this site twice in this task and the sign-in wall hasn't cleared. Do NOT call browser_connect again for this site. If you can finish without signing in, continue; otherwise stop and tell the user you're blocked on signing in to this site."
+              "You've already surfaced a Connect card for this site twice in this task and the step it was for (sign-in or a user handoff) hasn't been completed. Do NOT call browser_connect again for this site. If you can finish without the user acting in the browser, continue; otherwise stop and tell the user you're blocked waiting on them to complete that step on this site."
           })
         };
       }

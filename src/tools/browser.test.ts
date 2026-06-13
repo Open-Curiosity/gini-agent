@@ -6019,8 +6019,28 @@ describe("dispatchToolCall(browser_connect)", () => {
     if (third.kind !== "sync") throw new Error("unreachable");
     const parsed = JSON.parse(third.result) as { ok: boolean; error: string };
     expect(parsed.ok).toBe(false);
-    expect(parsed.error).toMatch(/twice in this task|blocked on signing in/i);
+    expect(parsed.error).toMatch(/twice in this task/i);
+    // The card serves two uses (sign-in unblock and user handoff); the
+    // refusal must not claim the model is blocked on signing in when the
+    // pending step may be a handoff.
+    expect(parsed.error).toMatch(/sign-in or a user handoff/i);
     // Still exactly two cards — the loop did not spam a third approval.
+    expect(connectCards()).toBe(2);
+
+    // A handoff-mode call shares the same per-host bucket and gets the same
+    // mode-neutral refusal.
+    const fourth = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_loop_4",
+      JSON.stringify({ reason: "Enter payment details", mode: "handoff" })
+    );
+    expect(fourth.kind).toBe("sync");
+    if (fourth.kind !== "sync") throw new Error("unreachable");
+    const parsedFourth = JSON.parse(fourth.result) as { ok: boolean; error: string };
+    expect(parsedFourth.ok).toBe(false);
+    expect(parsedFourth.error).toMatch(/sign-in or a user handoff/i);
     expect(connectCards()).toBe(2);
 
     rmSync(ROOT, { recursive: true, force: true });
