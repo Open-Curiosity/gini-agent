@@ -467,6 +467,62 @@ describe("UpdateGate", () => {
     expect(phase()).toBe("complete");
   });
 
+  test("a fresh updateInProgress:true holds the time-fallback legs until a false answer", async () => {
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    setSystemTime(t0);
+    statusPid = null;
+    // Both baselines unknown — the follower shape: it never has a pending
+    // POST, so it can sit in "restarting" minutes before the real restart.
+    // While the gateway's progress answers say the update is still running,
+    // post-entry poll successes are answers from the still-OLD stack and
+    // must not latch the fallback legs.
+    window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ phase: "restarting" }));
+    updateInProgressFlag = true;
+    const { client } = renderGate();
+    await flush();
+    expect(phase()).toBe("restarting");
+    await pollProgress(client);
+
+    setSystemTime(new Date(t0.getTime() + 5_000));
+    await pollStatus(client);
+    await pollHealthz(client);
+    expect(phase()).toBe("restarting");
+    expect(reloadSpy).not.toHaveBeenCalled();
+
+    // The single-flight guard released → the update is over; the plain
+    // fallback resumes and the already-landed post-entry answers complete
+    // the gate.
+    updateInProgressFlag = false;
+    setSystemTime(new Date(t0.getTime() + 10_000));
+    await pollProgress(client);
+    expect(phase()).toBe("complete");
+  });
+
+  test("a progress poll failure after the last true answer resumes the time fallback", async () => {
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    setSystemTime(t0);
+    statusPid = null;
+    window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ phase: "restarting" }));
+    updateInProgressFlag = true;
+    const { client } = renderGate();
+    await flush();
+    expect(phase()).toBe("restarting");
+    await pollProgress(client);
+
+    setSystemTime(new Date(t0.getTime() + 5_000));
+    await pollStatus(client);
+    await pollHealthz(client);
+    expect(phase()).toBe("restarting");
+
+    // The gateway goes quiet mid-restart: the failure is NEWER than the
+    // retained true answer, so the hold drops and the fallback behaves
+    // exactly as before the progress poll existed.
+    versionFailing = true;
+    setSystemTime(new Date(t0.getTime() + 10_000));
+    await pollProgress(client);
+    expect(phase()).toBe("complete");
+  });
+
   test("a verified persisted complete gate resumes, passes the pre-reload probe, and reloads", async () => {
     jest.useFakeTimers();
     window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ phase: "complete", verified: true }));
@@ -547,7 +603,14 @@ describe("UpdateGate", () => {
     // legs wait for a fresh post-entry poll instead.
     window.sessionStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({ phase: "restarting", beforePid: "111", beforeWebPpid: "444", targetSha: 7, restartExpected: "yes" })
+      JSON.stringify({
+        phase: "restarting",
+        beforePid: "111",
+        beforeWebPpid: "444",
+        targetSha: 7,
+        restartExpected: "yes",
+        startedAt: "earlier"
+      })
     );
     const { client } = renderGate();
     await flush();
@@ -750,6 +813,51 @@ describe("UpdateGate", () => {
     expect(reloadSpy).not.toHaveBeenCalled();
   });
 
+  test("a resumed gate anchors the hard cap at the persisted gate start, not the reload", async () => {
+    jest.useFakeTimers();
+    const t0 = new Date("2026-01-01T00:00:00.000Z");
+    setSystemTime(t0);
+    // The gate engaged 1s before the reload that resumed it. With the cap
+    // re-armed from the resume instead, a wedged-but-alive update could hold
+    // the blur indefinitely — 30 fresh minutes per reload — so the deadline
+    // (start + 2s) and the cap (start + 3s) must both anchor at the
+    // PERSISTED start: t0 + 1s and t0 + 2s here.
+    updateInProgressFlag = true;
+    window.sessionStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ phase: "updating", startedAt: t0.getTime() - 1_000 })
+    );
+    const { client } = renderGate({
+      stallTimeoutMs: 2_000,
+      gateHardCapMs: 3_000,
+      progressExtendMs: 10_000,
+      progressPollIntervalMs: 600_000
+    });
+    await flush();
+    expect(phase()).toBe("updating");
+    // "Still working" extends the deadline — but only to the resumed cap.
+    await pollProgress(client);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1_500);
+      setSystemTime(new Date(t0.getTime() + 1_500));
+    });
+    await flush();
+    expect(phase()).toBe("updating");
+    // A fresh answer still cannot move the deadline past the original cap.
+    await pollProgress(client);
+
+    // t0 + 2.5s is past the resumed cap (start + 3s = t0 + 2s); a cap
+    // re-armed at the resume (t0 + 3s) would still be holding here.
+    await act(async () => {
+      jest.advanceTimersByTime(1_000);
+      setSystemTime(new Date(t0.getTime() + 2_500));
+    });
+    await flush();
+    expect(phase()).toBe("idle");
+    expect(reloadSpy).not.toHaveBeenCalled();
+  });
+
   test("the complete↔restarting probe-failure cycle cannot outlive the stall deadline", async () => {
     jest.useFakeTimers();
     const t0 = new Date("2026-01-01T00:00:00.000Z");
@@ -935,6 +1043,42 @@ describe("UpdateGate cross-tab", () => {
     expect(phase()).toBe("restarting");
     act(() => channel.emit({ type: "done" }));
     expect(phase()).toBe("restarting");
+  });
+
+  test("a single-flight 409 demotes the losing owner to a follower instead of unblurring everyone", async () => {
+    jest.useFakeTimers();
+    // Two tabs clicked inside the broadcast latency; this tab's POST lost
+    // the gateway's single-flight guard. The structured 409 must NOT
+    // reset-and-broadcast-done — that would release every follower while
+    // the winner's update runs. The loser keeps the blur as a follower.
+    updateResponse = async () => jsonResponse({ error: "gini update already in progress." }, 409);
+    const channel = makeFakeChannel();
+    const { client } = renderGate({ createGateChannel: () => channel });
+    await flush();
+
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    expect(channel.posted).toEqual([{ type: "start" }]);
+    await flush();
+    expect(phase()).toBe("updating");
+    expect(channel.posted).toEqual([{ type: "start" }]);
+    expect(window.sessionStorage.getItem(STORAGE_KEY)).not.toBeNull();
+
+    // It finishes through follower detection — and the reload broadcasts
+    // nothing, because the tab no longer owns the update.
+    statusSha = "sha-new";
+    await pollStatus(client);
+    expect(phase()).toBe("restarting");
+    statusPid = 222;
+    webPpid = 555;
+    await pollStatus(client);
+    await pollHealthz(client);
+    expect(phase()).toBe("complete");
+    await act(async () => {
+      jest.advanceTimersByTime(1_500);
+    });
+    await flush();
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    expect(channel.posted).toEqual([{ type: "start" }]);
   });
 
   test("a platform without BroadcastChannel degrades to a single-tab gate", async () => {
