@@ -3815,7 +3815,7 @@ describe("chat-task loop", () => {
     // reports usage; the resulting calibration gap forces the pre-call trim
     // ahead of the 13th call.
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(450));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(420));
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -4634,7 +4634,7 @@ describe("chat-task loop", () => {
     });
 
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(450));
+      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(420));
       setEchoToolCallingResponse({
         provider,
         text: "",
