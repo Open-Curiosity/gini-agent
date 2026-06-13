@@ -165,8 +165,11 @@ remote previews, screen readers) would need the same translation code.
       destination" badge so the human reviewer can spot a target
       mismatch. See ADR [browser-fill-secret.md](browser-fill-secret.md).
     - `browser.connect` — Connect button posts to
-      `/api/setup-requests/<id>/open-browser`; the follow-up "I've
-      signed in" posts to `/api/setup-requests/<id>/complete`.
+      `/api/setup-requests/<id>/open-browser`; the follow-up
+      completion button ("I've signed in", or "I'm done" when the
+      payload carries `mode: "handoff"` — see
+      [browser-connect-handoff.md](browser-connect-handoff.md))
+      posts to `/api/setup-requests/<id>/complete`.
     - `messaging.add_bridge` — render an inline form with a name
       input (pre-seeded from `setupRequest.payload.suggestedName`)
       and a password-masked bot-token input. Submit posts
