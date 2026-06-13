@@ -192,6 +192,35 @@ describe("TunnelSelectionPanel", () => {
     expect(handlers.onSelect).not.toHaveBeenCalled();
   });
 
+  test("connected ⇒ available: a LIVE provider flagged !enabled by detection still shows Disconnect, no 'Requires', and a selectable radio", () => {
+    // The detection probe lagged/flaked and reports cloudflare unavailable,
+    // but it is the live tunnel. The connection is the source of truth: the
+    // row must read available, not "unavailable + Connect".
+    const stale: TunnelProvider[] = [
+      { id: "gini-relay", name: "Gini Relay", enabled: true },
+      { id: "tailscale", name: "Tailscale", enabled: false, requires: "Tailscale network" },
+      { id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account" },
+      { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "cloudflared CLI" }
+    ];
+    renderPanel({
+      providers: stale,
+      selectedProvider: "cloudflare",
+      status: "connected",
+      url: "https://app.example"
+    });
+    // Disconnect, not a stale unavailable Connect.
+    expect(screen.queryByRole("button", { name: "Disconnect Cloudflare" })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Connect Cloudflare" })).toBeNull();
+    // No "Requires …" caption on the live provider, despite enabled:false.
+    expect(screen.queryByText(/Requires cloudflared CLI/)).toBeNull();
+    // Its radio is selectable (not aria-disabled) — connected proves available.
+    const cloudflare = row("Cloudflare");
+    expect(cloudflare.getAttribute("aria-disabled")).toBeNull();
+    expect(cloudflare.getAttribute("tabindex")).toBe("0");
+    // A genuinely-unavailable OTHER provider still shows its requirement.
+    expect(screen.queryByText(/Requires Tailscale network/)).not.toBeNull();
+  });
+
   test("error: the message renders", () => {
     renderPanel({ status: "error", message: "Tunnel handshake failed" });
     expect(screen.queryByText("Tunnel handshake failed")).not.toBeNull();

@@ -26,6 +26,10 @@ const PROVIDER_ICON: Record<TunnelProviderId, React.ComponentType<{ className?: 
  *
  * The selected provider's action reflects status: "Connecting..." + a
  * destructive Cancel while pending, a destructive Disconnect when connected.
+ * A LIVE connection is proof the provider is available, so the connected row
+ * is always treated as available regardless of the (best-effort, lag-prone)
+ * detection flag — no "Requires …", a selectable radio, and Disconnect — and
+ * can never fall through to a stale "unavailable" Connect.
  * Radio semantics live on the icon+label area of each row so the action
  * cluster stays interactive even when the radio is aria-disabled (an
  * unavailable provider can't be SELECTED — the gateway rejects it — but its
@@ -79,9 +83,17 @@ export function TunnelSelectionPanel({
           const Icon = PROVIDER_ICON[p.id];
           const isSelected = p.id === state.selectedProvider;
           const rowConnecting = connecting && isSelected;
+          // A live tunnel is proof the provider is AVAILABLE on this machine —
+          // the detection probe is a best-effort hint that can lag or flake
+          // (a transient CLI miss), so it must never override a real
+          // connection. The connected provider is therefore always treated as
+          // available: no "Requires …" caption, a selectable (not disabled)
+          // radio, and a Disconnect action — never a stale "unavailable" Connect.
+          const isLive = connected && isSelected;
+          const available = p.enabled || isLive;
           // An unavailable provider can't be SELECTED (the gateway rejects
           // it), and while connecting every other row is locked.
-          const radioDisabled = !p.enabled || (connecting && !isSelected);
+          const radioDisabled = !available || (connecting && !isSelected);
           return (
             <div
               key={p.id}
@@ -144,7 +156,7 @@ export function TunnelSelectionPanel({
                       </span>
                     )}
                   </div>
-                  {!p.enabled && p.requires && (
+                  {!available && p.requires && (
                     <span className="text-[11px] text-muted-foreground">
                       Requires {p.requires} — Connect shows how
                     </span>
@@ -167,7 +179,10 @@ export function TunnelSelectionPanel({
                       Cancel
                     </Button>
                   </div>
-                ) : connected && isSelected ? (
+                ) : isLive ? (
+                  // The live provider always offers Disconnect — connected is
+                  // proof it's available, so it can never fall through to a
+                  // stale "unavailable" Connect.
                   <Button
                     variant="destructive"
                     size="sm"
