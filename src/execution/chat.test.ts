@@ -36,6 +36,7 @@ import {
   getChatSession,
   listChatSessions,
   submitChatMessage,
+  submitThreadReply,
   syncChatTaskResult,
   createChat,
   deleteChat
@@ -1163,6 +1164,26 @@ describe("chat message client surface", () => {
     const session = await createChat(config, { title: "surface-absent" });
     const submitted = await submitChatMessage(config, session.id, { content: "hi" });
     expect(taskSurface(config, submitted.taskId)).toBeUndefined();
+  });
+
+  test("stamps the client surface on a thread reply's spawned task", async () => {
+    const config = buildConfig(workspaceRoot, "chat-surface-thread");
+    stubTurn(config);
+    const session = await createChat(config, { title: "surface-thread" });
+    // Root the new thread on a main-chat block — the message being
+    // branched from.
+    const parent = insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId: session.id,
+      text: "original message",
+      agentId: null
+    });
+    const submitted = await submitThreadReply(config, session.id, "thread_surface", {
+      content: "reply from my phone",
+      client: "mobile",
+      parentBlockId: parent.id
+    });
+    expect(taskSurface(config, submitted.taskId)).toBe("mobile");
   });
 
   test("derives the surface from a bridge session source without a client field", async () => {
