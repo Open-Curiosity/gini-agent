@@ -105,6 +105,15 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   tagged shape like a transport failure and holds the blur. The
   in-flight state is persisted to `sessionStorage` so the restart-triggered
   reload resumes the blur instead of briefly exposing a half-updated app.
+  The gate is **cross-tab**: the owner tab broadcasts `{type:"start"}` /
+  `{type:"done"}` on `BroadcastChannel("gini-update-gate")`, and every other
+  open tab engages the same blur in follower mode — no POST of its own, but
+  the same baselines (captured at engage time), completion detection,
+  deadline rules, and probe-then-reload, persisted to its own
+  `sessionStorage` the same way. `done` releases a follower whose update
+  ended without a restart; a follower already waiting on the restart
+  finishes through its own detection. Platforms without `BroadcastChannel`
+  degrade to the single-tab gate.
   The gate's base stall deadline is 240s — the POST now contains a full
   `next build` of the web app on top of git + the installs — and the
   restart's downtime window itself is short (~1-2s gateway drain +
