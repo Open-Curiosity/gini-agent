@@ -3596,12 +3596,13 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  // No double-write for a normal turn. A normal web/chat turn gets its summary
-  // chatMessage from syncChatTaskResult — the finalize persistence must not add
-  // a second assistant row. Here we model the normal path: a run-bound chat task
-  // (run.conversationId === session) with NO subagentId. Finalize must NOT
-  // create a summary row (it's gated to the subagent path), so calling
-  // syncChatTaskResult once yields exactly one assistant summary message.
+  // No double-write for a normal turn. Finalize persists the durable assistant
+  // summary row for every completed chat task; syncChatTaskResult (mobile /sync,
+  // messaging pollers) must short-circuit to that existing row instead of
+  // adding a second one. Here we model the normal path: a run-bound chat task
+  // (run.conversationId === session) with NO subagentId. Finalize writes the
+  // row, then syncChatTaskResult returns it, yielding exactly one assistant
+  // summary message.
   test("normal chat turn persists exactly one assistant summary (no double-write)", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-no-double-write");
@@ -3629,11 +3630,12 @@ describe("chat-task loop", () => {
     const finished = await waitForTerminal(config, task.id);
     expect(finished.status).toBe("completed");
 
-    // Finalize did NOT write a summary row for a non-subagent turn.
+    // Finalize wrote the summary row for the normal turn.
     const beforeSync = readState(config.instance).chatMessages.filter(
       (m) => m.sessionId === sessionId.sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
     );
-    expect(beforeSync.length).toBe(0);
+    expect(beforeSync.length).toBe(1);
+    expect(beforeSync[0]!.content).toBe("Here is your answer.");
 
     const { syncChatTaskResult } = await import("./chat");
     const synced = await syncChatTaskResult(config, sessionId.sessionId, task.id);
@@ -3643,6 +3645,63 @@ describe("chat-task loop", () => {
       (m) => m.sessionId === sessionId.sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
     );
     expect(afterSync.length).toBe(1);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Normal chat-turn answer durability. A plain chat turn (no subagentId, no
+  // jobId) must land its final answer in durable chatMessages at completion —
+  // no client /sync callback required — so the next turn in the same session
+  // replays the answer via priorChatMessages instead of seeing the prior
+  // question unanswered.
+  test("normal chat turn persists its final answer and the next turn replays it", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-normal-answer-history");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "General chat");
+      return session.id;
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Section 413 has better sightlines than Cat2.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "is 413 better than Cat2?", { mode: "chat", chatSessionId: sessionId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    // Exactly one durable assistant answer row (not a transcript/approval row).
+    const answerRows = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === sessionId && m.role === "assistant" && m.kind !== "tool_transcript" && m.kind !== "approval_reason"
+    );
+    expect(answerRows.length).toBe(1);
+    expect(answerRows[0]!.content).toBe("Section 413 has better sightlines than Cat2.");
+    expect(answerRows[0]!.taskId).toBe(task.id);
+    expect(answerRows[0]!.kind).toBeUndefined();
+
+    clearEchoToolCallingResponses();
+    setEchoToolCallingResponse({
+      provider,
+      text: "Noted.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    // Turn 2 in the same session: the provider messages must replay the
+    // prior turn's answer via priorChatMessages.
+    const followUp = await submitTask(config, "ok thanks", { mode: "chat", chatSessionId: sessionId });
+    const finishedFollowUp = await waitForTerminal(config, followUp.id);
+    expect(finishedFollowUp.status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    const lastTurn = calls[calls.length - 1]!;
+    const replayed = lastTurn.map((m) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    expect(replayed).toContain("Section 413 has better sightlines than Cat2.");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

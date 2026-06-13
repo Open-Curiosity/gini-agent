@@ -2494,18 +2494,18 @@ async function runLoop(
       await updateRunFromTask(config, finished);
       await syncSubagentFromTask(config, finished);
       // Persist the FINAL turn-ending text as a durable assistant chatMessage
-      // for the session-bound-subagent path (a fan-out watch worker spawned
-      // into a concern channel). A normal chat turn gets this row from
-      // syncChatTaskResult (web /sync, messaging pollers, finalizeJobRunFromTask
-      // for jobId-bearing tasks); the fan-out worker is spawned via
-      // spawnSubagent and none of those fire, so its draft never becomes a
-      // chatMessage and the next turn in the channel replays empty history. We
-      // mirror syncChatTaskResult's own short-circuit (an existing non-transcript
-      // assistant row) so this never double-writes, and suppress the [SILENT]
-      // sentinel exactly like the block/legacy paths above.
+      // for every completed chat task. Without this row, priorChatMessages
+      // replays the session to the model with the user's questions and tool
+      // transcripts but no answers, so the next turn re-answers the previous
+      // question. syncChatTaskResult stays for clients/pollers that need the
+      // message record returned (mobile /sync, messaging pollers) and is
+      // idempotent against this write via its existing short-circuit, which we
+      // mirror here (an existing non-transcript assistant row) so neither path
+      // double-writes. jobId-bearing tasks are excluded: finalizeJobRunFromTask
+      // below owns their row plus delivery semantics. The [SILENT] sentinel is
+      // suppressed exactly like the block/legacy paths above.
       if (
         finished.status === "completed" &&
-        finished.subagentId &&
         !finished.jobId &&
         transcriptSessionId &&
         finalText.trim().length > 0 &&
