@@ -403,6 +403,51 @@ describe("buildToolCatalog", () => {
     });
   });
 
+  describe("sensitive-boundary tool descriptions", () => {
+    // browser_connect and browser_fill_secrets carry the steering for the
+    // payment / PII boundary: the agent drives a sensitive flow as far as
+    // it can, then escalates to the user instead of refusing. Pin the key
+    // clauses so a rewrite that drops a sanctioned use surfaces as a test
+    // failure. browser_fill_secrets is always-on; browser_connect rides the
+    // browser toolset, so enable it.
+    const state = stateWithToolsets([ts("browser")]);
+    const catalog = buildToolCatalog(state);
+
+    test("browser_connect description sanctions both sign-in unblock and sensitive-step handoff", () => {
+      const tool = catalog.find((t) => t.function.name === "browser_connect");
+      expect(tool).toBeDefined();
+      const desc = tool?.function.description ?? "";
+      // Use (1): the sign-in unblock keeps its strong steers.
+      expect(desc).toContain("Sign-in unblock");
+      expect(desc).toContain("NEVER a first step");
+      expect(desc).toContain("I've signed in");
+      // Use (2): the handoff for a user-must-act step.
+      expect(desc).toContain("Sensitive-step handoff");
+      expect(desc).toContain("payment");
+      expect(desc).toContain("I'm done");
+      // Handoff is only useful when the user is at the gateway machine.
+      expect(desc).toContain("gateway machine");
+      // The mode parameter selects the completion-card wording.
+      const props = tool!.function.parameters.properties as Record<string, { enum?: string[]; default?: string }>;
+      expect(props.mode?.enum).toEqual(["sign-in", "handoff"]);
+      expect(props.mode?.default).toBe("sign-in");
+    });
+
+    test("browser_fill_secrets description names payment and checkout PII alongside credentials", () => {
+      const tool = catalog.find((t) => t.function.name === "browser_fill_secrets");
+      expect(tool).toBeDefined();
+      const desc = tool?.function.description ?? "";
+      // Credentials remain first-class.
+      expect(desc).toContain("passwords, OTPs");
+      // Payment / sensitive personal info at checkout is now first-class too.
+      expect(desc).toContain("payment-card");
+      expect(desc).toContain("checkout");
+      // Existing constraints survive the broadening.
+      expect(desc).toContain("NEVER for ordinary text");
+      expect(desc).toContain("you never see the values");
+    });
+  });
+
   describe("cross-toolset routing hints", () => {
     // browser_navigate's description steers content discovery to
     // web_search, and the search/fetch descriptions steer page
