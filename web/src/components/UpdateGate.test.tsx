@@ -143,12 +143,40 @@ function Probe() {
   );
 }
 
+// In-memory stand-in for the cross-tab BroadcastChannel: records what the
+// provider posts and lets tests deliver messages as if a sibling tab sent
+// them (a real channel never echoes to its own sender, so posted messages
+// are NOT looped back).
+interface FakeGateChannel {
+  posted: unknown[];
+  postMessage: (message: unknown) => void;
+  close: () => void;
+  onmessage: ((event: MessageEvent) => void) | null;
+  emit: (data: unknown) => void;
+}
+
+function makeFakeChannel(): FakeGateChannel {
+  const channel: FakeGateChannel = {
+    posted: [],
+    postMessage(message) {
+      channel.posted.push(message);
+    },
+    close() {},
+    onmessage: null,
+    emit(data) {
+      channel.onmessage?.({ data } as MessageEvent);
+    }
+  };
+  return channel;
+}
+
 function renderGate(
   props: {
     stallTimeoutMs?: number;
     progressPollIntervalMs?: number;
     progressExtendMs?: number;
     gateHardCapMs?: number;
+    createGateChannel?: () => FakeGateChannel | null;
   } = {}
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -802,5 +830,127 @@ describe("UpdateGate resume without a recorded target", () => {
     setSystemTime(new Date(t0.getTime() + 5_000));
     await pollHealthz(client);
     expect(phase()).toBe("complete");
+  });
+});
+
+// The cross-tab gate: an update started in one tab must blur every open tab
+// — an unblurred sibling keeps hitting the stack mid-restart and can
+// hard-navigate onto a dead port. The owner broadcasts {type:"start"} /
+// {type:"done"} on BroadcastChannel("gini-update-gate"); a follower engages
+// the same gate without owning the POST and exits through its own
+// detection, or through the owner's "done" when the update ended without a
+// restart.
+describe("UpdateGate cross-tab", () => {
+  test("the owner broadcasts start on engage and done on a restart-free release", async () => {
+    updateResponse = async () => jsonResponse(updateResult({ upToDate: true }));
+    const channel = makeFakeChannel();
+    renderGate({ createGateChannel: () => channel });
+    await flush();
+
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    // The start goes out the moment the gate engages, before the POST
+    // settles — followers must blur for the whole window.
+    expect(channel.posted).toEqual([{ type: "start" }]);
+    await flush();
+    // upToDate released this gate; followers are told to release too.
+    expect(phase()).toBe("idle");
+    expect(channel.posted).toEqual([{ type: "start" }, { type: "done" }]);
+  });
+
+  test("a start broadcast engages a follower that never POSTs, persists like an owner, and reloads via its own detection", async () => {
+    jest.useFakeTimers();
+    let updatePosts = 0;
+    updateResponse = async () => {
+      updatePosts += 1;
+      return jsonResponse(updateResult());
+    };
+    const channel = makeFakeChannel();
+    const { client } = renderGate({ createGateChannel: () => channel });
+    await flush();
+    expect(phase()).toBe("idle");
+
+    act(() => channel.emit({ type: "start" }));
+    expect(phase()).toBe("updating");
+    await flush();
+    // The follower owns no POST and re-broadcasts nothing...
+    expect(updatePosts).toBe(0);
+    expect(channel.posted).toEqual([]);
+    // ...but persists the same resumable gate as an owner, so a mid-update
+    // reload re-blurs (the resume machinery is pinned by the resume tests).
+    expect(JSON.parse(window.sessionStorage.getItem(STORAGE_KEY)!).phase).toBe("updating");
+
+    // It walks the same completion detection as an owner whose POST was
+    // interrupted: HEAD moves off the engage-time sha → restarting; both
+    // identity legs flip → complete → probe-then-reload.
+    statusSha = "sha-new";
+    await pollStatus(client);
+    expect(phase()).toBe("restarting");
+    statusPid = 222;
+    webPpid = 555;
+    await pollStatus(client);
+    await pollHealthz(client);
+    expect(phase()).toBe("complete");
+    await act(async () => {
+      jest.advanceTimersByTime(1_500);
+    });
+    await flush();
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    // The reload broadcasts nothing — "done" belongs to the owner.
+    expect(channel.posted).toEqual([]);
+  });
+
+  test("a follower persisted mid-update resumes the blur on the reloaded page without a fresh broadcast", async () => {
+    const channel = makeFakeChannel();
+    const first = renderGate({ createGateChannel: () => channel });
+    await flush();
+    act(() => channel.emit({ type: "start" }));
+    expect(phase()).toBe("updating");
+    first.view.unmount();
+
+    // Same tab, same sessionStorage: the reloaded page re-blurs on mount.
+    renderGate({ createGateChannel: () => makeFakeChannel() });
+    await flush();
+    expect(phase()).toBe("updating");
+  });
+
+  test("done releases a follower whose sha never moved; one already restarting finishes on its own", async () => {
+    const channel = makeFakeChannel();
+    const { client } = renderGate({ createGateChannel: () => channel });
+    await flush();
+    act(() => channel.emit({ type: "start" }));
+    expect(phase()).toBe("updating");
+    // The owner's update ended without the sha ever moving here (upToDate or
+    // a pre-flight failure): release rather than blur until the deadline.
+    act(() => channel.emit({ type: "done" }));
+    expect(phase()).toBe("idle");
+    expect(window.sessionStorage.getItem(STORAGE_KEY)).toBeNull();
+
+    // Re-engage and reach "restarting": now "done" must NOT release — a
+    // release here would strand the tab on stale assets; its own detection
+    // finishes with the reload instead.
+    act(() => channel.emit({ type: "start" }));
+    await flush();
+    statusSha = "sha-new";
+    await pollStatus(client);
+    expect(phase()).toBe("restarting");
+    act(() => channel.emit({ type: "done" }));
+    expect(phase()).toBe("restarting");
+  });
+
+  test("a platform without BroadcastChannel degrades to a single-tab gate", async () => {
+    const scope = globalThis as { BroadcastChannel?: typeof BroadcastChannel };
+    const original = scope.BroadcastChannel;
+    delete scope.BroadcastChannel;
+    try {
+      // No injected channel: the default factory finds no BroadcastChannel
+      // and the provider runs without one — the gate still blurs locally.
+      renderGate();
+      await flush();
+      fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+      expect(phase()).toBe("updating");
+      await flush();
+    } finally {
+      if (original !== undefined) scope.BroadcastChannel = original;
+    }
   });
 });

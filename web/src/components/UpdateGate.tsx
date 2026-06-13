@@ -111,6 +111,29 @@ function writePersistedGate(value: PersistedGate | null): void {
   }
 }
 
+// Cross-tab gate channel. One update should blur EVERY open tab, not just
+// the one that clicked: an unblurred sibling tab keeps hitting the stack
+// mid-restart and can hard-navigate onto a dead port. The owner tab
+// broadcasts {type:"start"} the moment its gate engages and {type:"done"}
+// when its update ends (release or completion); every other provider
+// follows — same blur, same completion detection, same deadline rules.
+const GATE_CHANNEL_NAME = "gini-update-gate";
+
+// The slice of BroadcastChannel the gate uses, injectable for tests (the
+// test DOM may not implement it) and null when the platform lacks it.
+export interface GateChannel {
+  postMessage: (message: unknown) => void;
+  close: () => void;
+  onmessage: ((event: MessageEvent) => void) | null;
+}
+
+function defaultGateChannel(): GateChannel | null {
+  // No BroadcastChannel (an old WebView, a non-browser DOM): the gate
+  // degrades to single-tab behavior rather than failing.
+  if (typeof BroadcastChannel === "undefined") return null;
+  return new BroadcastChannel(GATE_CHANNEL_NAME);
+}
+
 // Hold the "complete" confirmation on screen this long before the final
 // pre-reload probe and the reload onto the freshly built assets.
 const COMPLETE_RELOAD_DELAY_MS = 1_500;
@@ -154,13 +177,16 @@ export function UpdateGateProvider({
   stallTimeoutMs = STALL_TIMEOUT_MS,
   progressPollIntervalMs = PROGRESS_POLL_INTERVAL_MS,
   progressExtendMs = PROGRESS_EXTEND_MS,
-  gateHardCapMs = GATE_HARD_CAP_MS
+  gateHardCapMs = GATE_HARD_CAP_MS,
+  // The cross-tab channel factory, injectable for tests.
+  createGateChannel = defaultGateChannel
 }: {
   children: ReactNode;
   stallTimeoutMs?: number;
   progressPollIntervalMs?: number;
   progressExtendMs?: number;
   gateHardCapMs?: number;
+  createGateChannel?: () => GateChannel | null;
 }) {
   const qc = useQueryClient();
   const [phase, setPhase] = useState<UpdatePhase>("idle");
@@ -183,6 +209,11 @@ export function UpdateGateProvider({
   // below re-runs and re-arms its timer against the new deadline (a ref
   // change alone re-schedules nothing).
   const [deadlineExtensions, setDeadlineExtensions] = useState(0);
+  // The live cross-tab channel (null when unsupported) and whether THIS tab
+  // owns the in-flight POST. Only the owner broadcasts; a follower blurs,
+  // detects completion, and reloads entirely on its own.
+  const channelRef = useRef<GateChannel | null>(null);
+  const ownerRef = useRef(false);
 
   // Poll status fast while updating/restarting so the new revision — and then
   // the restarted gateway — are picked up promptly.
@@ -252,6 +283,11 @@ export function UpdateGateProvider({
   const updateAvailable = version?.git.updateAvailable === true;
 
   const reset = useCallback(() => {
+    // The owner's exit is broadcast so follower tabs don't sit blurred
+    // behind their own deadlines after an update that ends without a
+    // restart (upToDate, a structured pre-flight error, a stall release).
+    if (ownerRef.current) channelRef.current?.postMessage({ type: "done" });
+    ownerRef.current = false;
     setPhase("idle");
     setTargetSha(null);
     setBeforeSha(null);
@@ -307,10 +343,16 @@ export function UpdateGateProvider({
   });
   const { mutate, isPending } = update;
 
-  const start = useCallback(() => {
+  // Engage the gate in this tab. The owner (the tab whose update control was
+  // clicked) additionally broadcasts the start to sibling tabs and fires the
+  // POST; a follower (engaged by that broadcast) runs everything else — the
+  // same baseline capture, persistence, completion detection, and deadline
+  // rules — and probe-then-reloads itself on completion. Either way the blur
+  // goes up immediately: the POST itself (git + bun install + build) is the
+  // slow part, so the gate must not wait for it.
+  const engage = useCallback((owner: boolean) => {
     if (phase !== "idle") return;
-    // Blur immediately on click — the POST itself (git + bun install) is the
-    // slow part, so the gate must go up before awaiting it.
+    ownerRef.current = owner;
     setBeforeSha(statusSha);
     setBeforePid(statusPid);
     setPhase("updating");
@@ -327,8 +369,46 @@ export function UpdateGateProvider({
     api<{ ppid?: number }>("/__healthz")
       .then((h) => setBeforeWebPpid(typeof h.ppid === "number" ? h.ppid : null))
       .catch(() => {});
-    mutate();
+    if (owner) {
+      channelRef.current?.postMessage({ type: "start" });
+      mutate();
+    }
   }, [phase, statusSha, statusPid, mutate]);
+
+  const start = useCallback(() => engage(true), [engage]);
+
+  // Cross-tab messages, dispatched through a render-refreshed ref so the
+  // mount effect below subscribes once without re-opening the channel every
+  // time phase or engage identity changes. (Null only before first render's
+  // assignment below, which precedes every effect and message.)
+  const onGateMessageRef = useRef<((data: unknown) => void) | null>(null);
+  onGateMessageRef.current = (data: unknown) => {
+    const type = (data as { type?: unknown } | null)?.type;
+    // A sibling tab started an update: blur here too, in follower mode.
+    if (type === "start") engage(false);
+    // The owner's update ended. A follower still in "updating" — the sha
+    // never moved, so the update released without a restart (upToDate, a
+    // pre-flight failure, a stall) — releases with it; one already in
+    // "restarting"/"complete" ignores the message and finishes through its
+    // own detection + probe-then-reload, which is what lands it on the
+    // freshly built assets.
+    if (type === "done" && !ownerRef.current && phase === "updating") reset();
+  };
+
+  // Open the cross-tab channel once per mount. The factory is read through a
+  // ref so an inline prop value can't churn the subscription.
+  const createGateChannelRef = useRef(createGateChannel);
+  createGateChannelRef.current = createGateChannel;
+  useEffect(() => {
+    const channel = createGateChannelRef.current();
+    if (!channel) return;
+    channelRef.current = channel;
+    channel.onmessage = (event) => onGateMessageRef.current?.(event.data);
+    return () => {
+      channelRef.current = null;
+      channel.close();
+    };
+  }, []);
 
   // Resume an in-flight gate after a restart-triggered reload. Only a
   // verified complete (written after reachability was proven) may resume into
@@ -446,6 +526,9 @@ export function UpdateGateProvider({
       api("/__healthz", { signal: AbortSignal.timeout(5_000) })
         .then(() => {
           if (cancelled) return;
+          // Completion side of the cross-tab contract (see GATE_CHANNEL_NAME):
+          // the owner announces the update is over right before reloading.
+          if (ownerRef.current) channelRef.current?.postMessage({ type: "done" });
           writePersistedGate(null);
           window.location.reload();
         })
