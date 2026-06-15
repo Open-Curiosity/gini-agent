@@ -928,6 +928,71 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
   }
 }
 
+// Cap on how many times one task may be re-dispatched after a gateway
+// restart. A poison task that crashes the process on every resume would
+// otherwise brick the gateway in a restart loop; over the cap we fail it
+// instead of resuming. See ADR task-resume-on-restart.md.
+const MAX_BOOT_RESUMES = 3;
+
+// Reconcile tasks left in-flight by a previous process when the gateway
+// boots. An "orphan" is a task whose status is `running` or `queued` and
+// whose `updatedAt` predates this process's boot time (`cutoffIso`) — the
+// cutoff race-guard excludes anything created/updated by THIS process, so a
+// client POSTing a new message in the window between the HTTP bind and this
+// pass is never claimed. `waiting_approval` and terminal statuses are never
+// touched. Top-level chat orphans are RESUMED by re-running the interrupted
+// turn from durable chat state (runChatTask rebuilds context from the user
+// message); everything else orphaned — subagent children, imperative tasks,
+// and chat tasks over the crash-loop cap — is FAILED so nothing hangs and the
+// UI spinner clears. See ADR task-resume-on-restart.md.
+export async function reconcileInFlightTasks(
+  config: RuntimeConfig,
+  opts: {
+    cutoffIso: string;
+    dispatch?: (config: RuntimeConfig, taskId: string) => Promise<unknown>;
+  }
+): Promise<{ resumed: string[]; failed: string[] }> {
+  const { resumeIds, failIds } = await mutateState(config.instance, (state) => {
+    const resumeIds: string[] = [];
+    const failIds: string[] = [];
+    for (const task of state.tasks) {
+      const orphaned =
+        (task.status === "running" || task.status === "queued") && task.updatedAt < opts.cutoffIso;
+      if (!orphaned) continue;
+      const resumable =
+        task.mode === "chat" &&
+        !task.parentTaskId &&
+        (task.bootResumeCount ?? 0) + 1 <= MAX_BOOT_RESUMES;
+      if (resumable) {
+        task.bootResumeCount = (task.bootResumeCount ?? 0) + 1;
+        // appendTaskPartial APPENDS, so a stale partial from the interrupted
+        // turn would concatenate onto the resumed turn's streamed text.
+        task.partialSummary = "";
+        task.currentStep = "Thinking";
+        task.updatedAt = now();
+        resumeIds.push(task.id);
+      } else {
+        // Don't flip status here; failTask does it outside the lock.
+        failIds.push(task.id);
+      }
+    }
+    return { resumeIds, failIds };
+  });
+  for (const id of failIds) {
+    await failTask(
+      config,
+      id,
+      new Error("Interrupted by a gateway restart before it could finish; not resumed automatically.")
+    );
+  }
+  for (const id of resumeIds) {
+    appendTrace(config.instance, id, { type: "task", message: "Task resumed after gateway restart", data: {} });
+    (opts.dispatch ?? runTask)(config, id).catch((err) => failTask(config, id, err));
+  }
+  appendLog(config.instance, "tasks.reconciled", { resumed: resumeIds.length, failed: failIds.length });
+  return { resumed: resumeIds, failed: failIds };
+}
+
 // Shared between agent and tool modules. Tools that complete immediately
 // (file.read, file.list, file.search, web.fetch) call this to record the
 // audit, set the task summary, and mark it completed in one shot.
