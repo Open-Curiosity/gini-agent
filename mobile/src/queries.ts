@@ -167,7 +167,9 @@ export function useChannels() {
     refetchInterval: 30_000,
     select: (sessions) =>
       sessions
-        .filter((s) => s.kind === "channel" || s.origin === "job")
+        // Archived channels (job delivery rebound away) keep their history
+        // and stay addressable by deep link, but leave the list.
+        .filter((s) => (s.kind === "channel" || s.origin === "job") && !s.archivedAt)
         .sort((a, b) =>
           (b.updatedAt ?? b.createdAt).localeCompare(a.updatedAt ?? a.createdAt)
         )

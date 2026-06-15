@@ -63,16 +63,27 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const allSessions = useAllChatSessions();
 
   // A job is recurring when it isn't a one-shot reminder and carries an active
-  // schedule (cron or interval). Stable-sorted by createdAt (then name) so the
-  // list doesn't reorder as jobs fire.
+  // schedule (cron or interval). Only channel-bound jobs get a sidebar row: a
+  // deliverTo:"chat" job delivers into — and is managed from — its bound
+  // conversation (Jobs tab), so a rail row would just be a confusing alias for
+  // that chat. A missing/unresolved bound session is treated as not-channel
+  // and hidden, as is an archived channel (archived sessions keep history and
+  // stay addressable by URL but leave the lists). Stable-sorted by createdAt
+  // (then name) so the list doesn't reorder as jobs fire.
   const recurringJobs = useMemo<JobRecord[]>(() => {
+    const sessionsById = new Map((allSessions.data ?? []).map((s) => [s.id, s]));
     return (allJobs.data ?? [])
       .filter((j) => !j.oneShot && (j.cronExpression != null || (j.intervalSeconds ?? 0) > 0))
+      .filter((j) => {
+        if (j.chatSessionId == null) return false;
+        const session = sessionsById.get(j.chatSessionId);
+        return session?.kind === "channel" && !session.archivedAt;
+      })
       .sort(
         (a, b) =>
           (a.createdAt ?? "").localeCompare(b.createdAt ?? "") || a.name.localeCompare(b.name)
       );
-  }, [allJobs.data]);
+  }, [allJobs.data, allSessions.data]);
 
   const { isUnread } = useChatReadState(allSessions.data);
 

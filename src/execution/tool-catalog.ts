@@ -1123,9 +1123,10 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
-    // Schedule a real cron/job. The job's output is delivered as an
-    // assistant message back into the originating chat session when it
-    // fires. Low-risk: no approval gate — the user can pause/delete the
+    // Schedule a real cron/job. The job's output is delivered into a
+    // dedicated job channel by default, or into the originating chat
+    // session with deliverTo "chat" (see the dispatcher for the binding
+    // logic). Low-risk: no approval gate — the user can pause/delete the
     // job at any time, and gating reminders behind an approval dialog
     // would defeat the UX (`remind me in 2 minutes` should not pop a
     // modal). Always exposed (like read_skill / spawn_subagent) so a
@@ -1135,7 +1136,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "create_job",
-      description: "Schedule a recurring or one-shot job that runs a prompt. The job's response is delivered as an assistant message back to this chat session when it fires. ALWAYS set `skillNames` when the prompt touches an integration covered by an Available skill (e.g. google-calendar + google-gmail for a daily briefing, linear for an issue digest): attached skills' instructions are inlined into every fire, so the job follows the recipe instead of rediscovering CLI usage each run — omitting them makes every fire slower, costlier, and less reliable. Provide EITHER `intervalSeconds` OR `cronExpression` (with `cronTimezone`), never both. Use `intervalSeconds` for 'in N minutes' or 'every N hours' (from-now timing). Use `cronExpression` + `cronTimezone` for wall-clock or weekday patterns ('daily at 9am', 'weekdays at 8:30'). Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `approvalMode: \"yolo\"` for tasks that need broad action, or use `autoApproveCommands` for narrow shell-pattern opt-ins — otherwise the job may stall at a gated approval forever (the instance default is \"auto\", which auto-approves file writes and safe shell commands but still gates dangerous patterns like rm -rf, sudo, pipe-to-sh, chmod 777, and destructive git operations). `dangerouslyAutoApprove: true` is a deprecated alias for `approvalMode: \"yolo\"` kept for back-compat. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
+      description: "Schedule a recurring or one-shot job that runs a prompt. ALWAYS set `skillNames` when the prompt touches an integration covered by an Available skill (e.g. google-calendar + google-gmail for a daily briefing, linear for an issue digest): attached skills' instructions are inlined into every fire, so the job follows the recipe instead of rediscovering CLI usage each run — omitting them makes every fire slower, costlier, and less reliable. By default each fire's output is delivered into a dedicated job channel — a fresh chat thread listed under Recurring jobs — keeping this conversation uncluttered; pass `deliverTo: \"chat\"` to deliver each fire into THIS conversation instead. Choosing the destination: for a RECURRING job created from chat where the user has NOT already said where the output should go, FIRST call `ask_user` with options \"Job channel\" (recommended — keeps this conversation uncluttered; appears under Recurring jobs) and \"This chat\" (each fire posts into this conversation); when you have reason to think a dispatchable messaging bridge is configured, check `list_messaging_bridges` and include up to 4 bridge options (\"Send to <name>\") — `ask_user` allows at most 6 options total — each mapping to `deliveryTargets`. A bridge pick is IN ADDITION to the chat-vs-channel binding, not instead of it: pair the bridge selection with whichever binding the user prefers, defaulting to the job channel. For ONE-SHOT reminders skip the question and pass `deliverTo: \"chat\"` (a reminder belongs in the conversation that set it) unless the user said otherwise. When the user already specified a destination, don't ask. Provide EITHER `intervalSeconds` OR `cronExpression` (with `cronTimezone`), never both. Use `intervalSeconds` for 'in N minutes' or 'every N hours' (from-now timing). Use `cronExpression` + `cronTimezone` for wall-clock or weekday patterns ('daily at 9am', 'weekdays at 8:30'). Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `approvalMode: \"yolo\"` for tasks that need broad action, or use `autoApproveCommands` for narrow shell-pattern opt-ins — otherwise the job may stall at a gated approval forever (the instance default is \"auto\", which auto-approves file writes and safe shell commands but still gates dangerous patterns like rm -rf, sudo, pipe-to-sh, chmod 777, and destructive git operations). `dangerouslyAutoApprove: true` is a deprecated alias for `approvalMode: \"yolo\"` kept for back-compat. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
       parameters: {
         type: "object",
         properties: {
@@ -1178,6 +1179,16 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           timeoutSeconds: {
             type: "number",
             description: "Wall-clock seconds before the spawned task is killed. Default 600 (10 min) — enough for typical git/gh + multi-file scan jobs. Drop lower (e.g. 60-120) for trivial reminders; raise (e.g. 1800-3600) when the prompt invokes external CLIs like codex or claude-code that can run several minutes. The model will be terminated mid-thought if this is too low."
+          },
+          deliverTo: {
+            type: "string",
+            enum: ["channel", "chat"],
+            description: "Where each fire's output is delivered. \"channel\" (default when invoked from chat): a dedicated job channel — a fresh chat thread listed under Recurring jobs; an imperative/CLI invocation gets a session-less job instead. \"chat\": the conversation this tool call was made from (only valid when invoked from a chat conversation). Pass \"chat\" for one-shot reminders; for recurring jobs ask the user first when they haven't said (see tool description)."
+          },
+          deliveryTargets: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional messaging-bridge names to deliver the job's final output to (in addition to its chat thread, if it has one), e.g. [\"telegram\"]. Use when the user asks for the job's output to reach a messaging app. Each entry must match exactly one configured Telegram or Discord bridge by exact id, or by name or kind (case-insensitive), and is stored as the bridge id; unknown or ambiguous entries are rejected with the dispatchable bridge names so you can relay the fix."
           },
           preRunHook: {
             type: "object",
@@ -1225,7 +1236,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "update_job",
-      description: "Patch an existing scheduled job in place. Use this — NOT delete+create — when the user wants to change a job's schedule, prompt, name, status, skill attachments, or auto-approve envelope; this preserves the job id, its dedicated chat thread, and run history. Supply only the fields you want to change. Schedule transitions follow the same mutual-exclusion rule as create_job: a single patch may not set BOTH a positive intervalSeconds AND a cronExpression. To switch a job between cron-driven and interval-driven, pass the new driver and set the other to null (e.g. `{cronExpression: '0 9 * * *', cronTimezone: 'America/Los_Angeles', intervalSeconds: null}`). Call list_jobs first if you don't already know the jobId.",
+      description: "Patch an existing scheduled job in place. Use this — NOT delete+create — when the user wants to change a job's schedule, prompt, name, status, skill attachments, auto-approve envelope, or delivery binding (`deliverTo`); this preserves the job id, its bound chat session, and run history. Supply only the fields you want to change. Schedule transitions follow the same mutual-exclusion rule as create_job: a single patch may not set BOTH a positive intervalSeconds AND a cronExpression. To switch a job between cron-driven and interval-driven, pass the new driver and set the other to null (e.g. `{cronExpression: '0 9 * * *', cronTimezone: 'America/Los_Angeles', intervalSeconds: null}`). Call list_jobs first if you don't already know the jobId.",
       parameters: {
         type: "object",
         properties: {
@@ -1244,7 +1255,13 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           status: { type: "string", enum: ["active", "paused"], description: "Optional pause/resume. 'paused' stops the scheduler from firing the job; 'active' resumes it." },
           autoApproveCommands: { type: "array", items: { type: "string" }, description: "Optional new list of auto-approve shell patterns for unattended fires." },
           dangerouslyAutoApprove: { type: "boolean", description: "Optional. If true the scheduled task bypasses ALL approval gates at fire-time." },
-          timeoutSeconds: { type: "number", description: "Optional. Wall-clock seconds before the spawned task is killed." }
+          timeoutSeconds: { type: "number", description: "Optional. Wall-clock seconds before the spawned task is killed." },
+          deliveryTargets: { type: "array", items: { type: "string" }, description: "Optional new list of messaging-bridge names that receive the job's final output in addition to its chat thread, e.g. [\"telegram\"]. Pass [] to clear. Each entry must match exactly one configured Telegram or Discord bridge by exact id, or by name or kind (case-insensitive), and is stored as the bridge id; unknown or ambiguous entries are rejected." },
+          deliverTo: {
+            type: "string",
+            enum: ["channel", "chat"],
+            description: "Optional rebind of where future fires deliver. \"channel\": creates a NEW dedicated job channel and delivers future fires there (a previously archived channel is never unarchived); no-op when the job already delivers to a channel. \"chat\": delivers future fires into THIS conversation (only valid when invoked from a chat conversation) and ARCHIVES the job's previous dedicated channel — its history is preserved and the channel stays directly addressable, but it disappears from session lists; no-op when the job is already bound to this conversation. Not available for watcher jobs (preRunHook or fan-out routes) — their sessions carry routing state."
+          }
         },
         required: ["jobId"]
       }

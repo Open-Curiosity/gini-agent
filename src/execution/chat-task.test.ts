@@ -4275,18 +4275,26 @@ describe("chat-task loop", () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-overflow-retry");
     const provider = normalizeProvider(config.provider);
+    await mutateState(config.instance, (state) => {
+      for (const toolset of state.toolsets) toolset.status = "disabled";
+    });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
-    // Seven mid-size tool results (distinct files so no loop-breaker trips)
+    // Seven mid-size tool results (distinct skills so no loop-breaker trips)
     // give the overflow compaction passes something to shrink, while the
-    // estimated total stays under every proactive threshold — the overflow
-    // is driven purely by the stubbed provider failures.
+    // estimated total stays under the proactive high-water mark (27,200
+    // tokens against the pinned 12,278-token floor) — the proactive
+    // compaction path never fires, so the overflow is driven purely by the
+    // stubbed provider failures.
     for (let i = 0; i < 7; i++) {
-      writeFileSync(join(workspaceRoot, `bulk${i}.md`), `bulk-${i} ${"x".repeat(4_800)}`);
+      await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(4_800)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
         toolCalls: [
-          { id: `call_o${i}`, type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: `bulk${i}.md` }) } }
+          { id: `call_o${i}`, type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: `bulk-skill-${i}` }) } }
         ],
         finishReason: "tool_calls"
       });
@@ -5050,14 +5058,22 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the no-trim geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
+    // Twelve modest reads (~950 tokens each). With echo reporting no usage the
+    // calibration gap stays 0, so the only trim trigger is the chars/4 live
+    // budget — and the accumulated transcript stays well under it (the budget
+    // is 32,000 − 1,600 reserve − 12,278 pinned floor = 18,122 tokens), so no
+    // elision and no proactive compaction ever engages.
     for (let i = 0; i < 12; i++) {
-      writeFileSync(join(workspaceRoot, `chunk${i}.md`), `chunk-${i} `.repeat(420));
+      await seedBulkSkill(config, `chunk-skill-${i}`, `chunk-${i} ${"x".repeat(3_700)}`);
       setEchoToolCallingResponse({
         provider,
         text: "",
         toolCalls: [
-          { id: `call_n${i}`, type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: `chunk${i}.md` }) } }
+          { id: `call_n${i}`, type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: `chunk-skill-${i}` }) } }
         ],
         finishReason: "tool_calls"
       });
