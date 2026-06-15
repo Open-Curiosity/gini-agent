@@ -369,6 +369,35 @@ describe("UpdateGate", () => {
     expect(phase()).toBe("complete");
   });
 
+  test("a malformed (too-short) buildSha does not complete the web leg; it falls back to ppid", async () => {
+    // buildSha is contractually >=12 hex; a degenerate short value (here a
+    // truncated prefix of the target) must NOT prefix-match the target and
+    // release the gate. The web leg falls back to the ppid signal.
+    const targetSha = "0123456789abcdef0123456789abcdef01234567";
+    updateResponse = async () => jsonResponse(updateResult({ afterSha: targetSha, version: versionInfo(targetSha) }));
+    const { client } = renderGate();
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    statusSha = targetSha;
+    await pollStatus(client);
+    expect(phase()).toBe("restarting");
+
+    // Gateway restarts (pid flips) and __healthz answers, but with a 4-char
+    // buildSha and an unchanged ppid: neither web signal is satisfied, so hold.
+    statusPid = 222;
+    webBuildSha = targetSha.slice(0, 4);
+    await pollStatus(client);
+    await pollHealthz(client);
+    expect(phase()).toBe("restarting");
+    expect(reloadSpy).not.toHaveBeenCalled();
+
+    // A full >=12 buildSha now matches → the web leg latches → complete.
+    webBuildSha = targetSha.slice(0, 12);
+    await pollHealthz(client);
+    expect(phase()).toBe("complete");
+  });
+
   test("a worker respawn — new worker pid, same tree ppid — does not satisfy the web leg", async () => {
     const { client } = renderGate();
     await flush();
@@ -816,6 +845,30 @@ describe("UpdateGate", () => {
     // Under production serving the verify additionally requires the served
     // build to match the target; here it does.
     webBuildSha = targetSha.slice(0, 12);
+    await pollStatus(client);
+    expect(phase()).toBe("restarting");
+
+    await act(async () => {
+      jest.advanceTimersByTime(5_000);
+    });
+    await flush();
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    expect(toastErrorSpy).not.toHaveBeenCalled();
+  });
+
+  test("the deadline verify treats a malformed buildSha as absent and passes the web leg on reachability", async () => {
+    jest.useFakeTimers();
+    // A too-short buildSha can't stand in for the target, so the web leg falls
+    // back to reachability (as in dev) rather than letting a degenerate prefix
+    // match. HEAD is on target and __healthz answers, so the verify reloads.
+    const targetSha = "0123456789abcdef0123456789abcdef01234567";
+    updateResponse = async () => jsonResponse(updateResult({ afterSha: targetSha, version: versionInfo(targetSha) }));
+    const { client } = renderGate({ stallTimeoutMs: 5_000 });
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "start-update" }));
+    await flush();
+    statusSha = targetSha;
+    webBuildSha = targetSha.slice(0, 4);
     await pollStatus(client);
     expect(phase()).toBe("restarting");
 
