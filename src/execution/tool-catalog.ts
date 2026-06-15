@@ -721,17 +721,18 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "browser",
-    displayLabel: "Connect browser to sign in",
+    displayLabel: "Hand browser to user",
     type: "function",
     function: {
       name: "browser_connect",
-      description: "Surface a Connect button in chat so the user can sign in to a third-party service in a visible Chrome window. ONLY call this when a navigation you ALREADY made hit a sign-in roadblock — a login screen, OAuth / identity-provider redirect, 401/403, or \"please sign in\" interstitial that actually blocks the page you need. It is NEVER a first step and must NOT be called proactively or before navigating: always navigate with browser_navigate first, and reach for this only if that page genuinely requires sign-in. For ordinary browsing that does not hit a sign-in wall, keep using browser_navigate (headless) — no connection or approval is needed, so do not ask the user to connect. When you DO hit a sign-in wall, don't report it as a blocker — call this tool. The user clicks Connect, signs in once, clicks \"I've signed in\", then the browser switches to headless and the agent continues with the persisted session. Pass `url` = the page you ALREADY navigated to and were blocked at by the sign-in wall, so the visible Chrome reopens that exact page for sign-in and the agent retries it afterward. This tool does NOT reach a page you haven't navigated to — use browser_navigate for that.",
+      description: "Surface a Connect button in chat that hands the user a visible Chrome window on the agent's own browser profile, for a step only the user can perform; when they finish, the browser returns to headless and the agent continues with the persisted session. Two sanctioned uses — it is NEVER a first step and must NOT be called before navigating: always navigate with browser_navigate first. (1) Sign-in unblock (default, mode \"sign-in\"): ONLY when a navigation you ALREADY made hit a sign-in roadblock — a login screen, OAuth / identity-provider redirect, 401/403, or \"please sign in\" interstitial that actually blocks the page you need. Never call it proactively for sign-in; for ordinary browsing that does not hit a sign-in wall, keep using browser_navigate (headless) — no connection or approval is needed, so do not ask the user to connect. When you DO hit a sign-in wall, don't report it as a blocker — call this tool. The user clicks Connect, signs in once, clicks \"I've signed in\", then the agent continues. (2) Sensitive-step handoff (mode \"handoff\"): the task has reached a step the USER must perform themselves in the visible window — entering payment details, a final purchase confirmation — or the user chose via ask_user to finish manually. Only at such a genuine user-must-act step or on the user's explicit choice, never as a shortcut for steps you can drive yourself, and only when the user is at the gateway machine (the per-turn surface note tells you). The user clicks Connect, completes the step in the visible window, clicks \"I'm done\", then the agent continues — re-snapshot the page, confirm the outcome from it, and report. In both uses pass `url` = the page you ALREADY navigated to (the sign-in wall, or the page the user must act on), so the visible Chrome reopens that exact page and the agent retries it afterward. This tool does NOT reach a page you haven't navigated to — use browser_navigate for that.",
       parameters: {
         type: "object",
         properties: {
-          reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Amazon to manage your Audible subscription')." },
-          url: { type: "string", description: "Absolute http(s) URL of the page you already navigated to and were blocked at by a sign-in wall. The visible Chrome reopens this exact page for sign-in, and the agent retries it afterward. Not a way to open a page you haven't navigated to — use browser_navigate for that." },
-          headless: { type: "boolean", description: "Reserved for the legacy auto-approve path. Leave unset in normal use — the two-stage Connect / \"I've signed in\" flow handles the headed→headless transition automatically.", default: false }
+          reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Amazon to manage your Audible subscription', 'Enter your payment details to finish the booking')." },
+          url: { type: "string", description: "Absolute http(s) URL of the page you already navigated to — the sign-in wall, or the page the user must act on. The visible Chrome reopens this exact page, and the agent retries it afterward. Not a way to open a page you haven't navigated to — use browser_navigate for that." },
+          mode: { type: "string", enum: ["sign-in", "handoff"], default: "sign-in", description: "Which sanctioned use this is. \"sign-in\" (default): clear a sign-in wall — the completion card reads \"I've signed in\". \"handoff\": the user performs a sensitive step themselves (payment entry, final confirmation) — the completion card reads \"I'm done\"." },
+          headless: { type: "boolean", description: "Reserved for the legacy auto-approve path. Leave unset in normal use — the two-stage Connect / completion flow handles the headed→headless transition automatically.", default: false }
         },
         required: ["reason"]
       }
@@ -823,20 +824,21 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     // Browser-fill-secrets affordance. When the agent's browser tool
-    // reaches a login or other input form whose values must come from
-    // the user (passwords, OTPs, account ids, MFA codes), the agent
-    // calls this tool. The user sees a card in chat with one input
+    // reaches a login, checkout, or other input form whose values must
+    // come from the user (passwords, OTPs, MFA codes, payment-card
+    // fields, sensitive personal info), the agent calls this tool. The
+    // user sees a card in chat with one input
     // field per slot, types the value(s), and the gateway pipes them
     // straight into page.locator(...).fill(...) via the same /connect
     // endpoint connector.request uses. Submitted values are never
     // persisted, never enter the LLM context, never reach the
     // transcript or audit payload — see ADR browser-fill-secret.md.
     toolset: "browser",
-    displayLabel: "Ask user for credentials",
+    displayLabel: "Ask user for sensitive values",
     type: "function",
     function: {
       name: "browser_fill_secrets",
-      description: "Ask the user to fill one or more input fields on the active browser page. ONLY for credentials and other secret values the user must supply (passwords, OTPs, account ids, MFA codes) — NEVER for ordinary text like search queries or form content you already know; type that yourself with browser_type. Every call here interrupts the user with an approval card, and conversely NEVER attempt to fill credential fields yourself with browser_type. The user sees a single card in chat with one input per slot; once they submit, the gateway fills each locator on the page with the user's value via playwright. Requires an active browser session — call browser_navigate first if needed. Your tool result is a plain-text summary naming which slots filled (by slot.name, never values), which errored, and any abort condition (cancel, origin drift); you never see the values themselves. Re-snapshot the page after this returns to see the post-fill state. If more fields need filling (e.g. an MFA code on the next page), call this tool again.",
+      description: "Ask the user to fill one or more input fields on the active browser page. ONLY for values the user must supply themselves: credentials and other secrets (passwords, OTPs, account ids, MFA codes) AND payment-card or sensitive personal-info fields on a checkout, booking, or registration page (card number, expiry, CVC, SSN, and the like). NEVER for ordinary text like search queries or form content you already know; type that yourself with browser_type. Every call here interrupts the user with an approval card, and conversely NEVER attempt to fill credential fields yourself with browser_type. The user sees a single card in chat with one input per slot; once they submit, the gateway fills each locator on the page with the user's value via playwright. Requires an active browser session — call browser_navigate first if needed. Your tool result is a plain-text summary naming which slots filled (by slot.name, never values), which errored, and any abort condition (cancel, origin drift); you never see the values themselves. Re-snapshot the page after this returns to see the post-fill state. If more fields need filling (e.g. an MFA code on the next page), call this tool again.",
       parameters: {
         type: "object",
         properties: {

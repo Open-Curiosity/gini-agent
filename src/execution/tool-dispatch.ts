@@ -384,17 +384,20 @@ async function dispatchToolCallInner(
       return await dispatchSelfOp(config, taskId, toolCallId, toolName, args);
     case "browser_connect": {
       // browser.connect is a SetupRequest (user-actor): the user opens the
-      // visible browser, signs in, then clicks Connect. There is no
+      // visible browser, performs their step (sign-in, or a handoff step
+      // like payment entry), then signals done. There is no
       // "auto-approve" path — the user has to perform the action — so
       // bypass pendingOrAuto and always return the pending approval id.
       //
       // Navigate-first precondition (same contract as browser_fill_secrets):
-      // browser_connect's only job is to clear a sign-in / auth wall the agent
-      // ALREADY hit by navigating. Calling it cold — before any browser_navigate
+      // both sanctioned uses act on a page the agent ALREADY reached by
+      // navigating — a sign-in / auth wall to clear, or a sensitive step the
+      // user must perform themselves (ADR browser-connect-handoff.md).
+      // Calling it cold — before any browser_navigate
       // — is a misuse that would pop a spurious "Connect" card at the user for
       // what is really an ordinary browse-the-web request. Refuse the cold call
       // and steer the agent to browse headless first; it then only escalates to
-      // a Connect prompt when a navigation genuinely lands on a sign-in wall.
+      // a Connect prompt when a navigation genuinely reaches such a step.
       // Validate the reason first so a missing reason fails identically
       // regardless of browser state.
       requireString(args, "reason");
@@ -414,7 +417,7 @@ async function dispatchToolCallInner(
           result: JSON.stringify({
             ok: false,
             error:
-              "browser_connect only clears a sign-in or auth wall you have already hit. No browser page is open yet — call browser_navigate (headless) to open the page first, and call browser_connect only if that navigation lands on a login, OAuth, or 401/403 wall."
+              "browser_connect only acts on a page you have already reached — a sign-in wall to clear, or a step the user must perform themselves. No browser page is open yet — call browser_navigate (headless) to open the page first, and call browser_connect only when that page genuinely needs the user (a login, OAuth, or 401/403 wall, or a handoff step like payment entry)."
           })
         };
       }
@@ -442,7 +445,7 @@ async function dispatchToolCallInner(
           result: JSON.stringify({
             ok: false,
             error:
-              "You've already surfaced a Connect card for this site twice in this task and the sign-in wall hasn't cleared. Do NOT call browser_connect again for this site. If you can finish without signing in, continue; otherwise stop and tell the user you're blocked on signing in to this site."
+              "You've already surfaced a Connect card for this site twice in this task and the step it was for (sign-in or a user handoff) hasn't been completed. Do NOT call browser_connect again for this site. If you can finish without the user acting in the browser, continue; otherwise stop and tell the user you're blocked waiting on them to complete that step on this site."
           })
         };
       }
@@ -3324,6 +3327,11 @@ async function requestBrowserConnect(
   // Validated minimally; safetyCheck runs server-side in the open-browser
   // endpoint before navigation.
   const url = resolveConnectUrl(args, taskId);
+  // Handoff mode is opt-in: only an explicit mode:"handoff" rides the payload
+  // (it flips the web card's completion button from "I've signed in" to
+  // "I'm done" — ADR browser-connect-handoff.md). Anything else, including
+  // the unset default, keeps the payload byte-identical to the sign-in flow.
+  const handoff = args.mode === "handoff";
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -3337,14 +3345,14 @@ async function requestBrowserConnect(
       // the body when rendering a browser.connect card.
       target: reason,
       reason: reasonOverride ?? "Opening a managed browser window requires explicit approval.",
-      payload: { reason, toolCallId, headless, url }
+      payload: { reason, toolCallId, headless, url, ...(handoff ? { mode: "handoff" } : {}) }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for browser connect (chat-task)",
-      data: { approvalId: approval.id, reason, toolCallId, headless, url }
+      data: { approvalId: approval.id, reason, toolCallId, headless, url, ...(handoff ? { mode: "handoff" } : {}) }
     });
     return approval.id;
   });
