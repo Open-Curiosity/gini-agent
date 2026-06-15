@@ -52,6 +52,7 @@ import { resolveDefaultPriorContextTokenBudget } from "../provider-capabilities"
 import type { AgentIdentity, GoogleAccount, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
 import {
+  __setBaseToolCatalogForTests,
   buildAgentIdentity,
   buildConnectedAccountsBlock,
   buildEnabledSkillsBlock,
@@ -66,6 +67,7 @@ import {
   promptTokensFromUsage,
   renderMessagesForCompaction
 } from "./chat-task";
+import type { ToolCatalogTool } from "./tool-catalog";
 import type { EffectiveContext } from "./effective-context";
 
 let scratchHome: string;
@@ -123,6 +125,51 @@ async function seedBulkSkill(config: RuntimeConfig, name: string, body: string):
   await setSkillStatus(config, skill.id, "enabled");
 }
 
+// Fixed, test-owned tool catalog for the in-turn-compaction geometry tests.
+// Those tests size skill bodies against the always-on `toolSchemaTokens`
+// floor; growing any always-on tool description (as create_job's did) would
+// otherwise shift that floor and move the compaction crossing point opaquely.
+// Installing this constant via __setBaseToolCatalogForTests pins the floor so
+// no live-catalog change can perturb the geometry.
+//
+// Shape: `read_skill` (the only tool the compaction scripts dispatch — the
+// loop must run to completion with it) plus uniform filler tools whose count
+// is chosen so the serialized provider catalog tokenizes to a known floor.
+// Measured floor: toolSchemaTokens = ceil(JSON.stringify(toProviderTools)/4)
+// = 12,207 tokens (read_skill ≈ 90 tokens + 47 filler tools ≈ 258 tokens
+// each). The high-water mark is floor(32,000 × 0.85) = 27,200 under the echo
+// provider (no usage → promptTokenEstimateGap 0), so the message budget
+// before the mark is 27,200 − 12,207 ≈ 14,993 tokens. Each in-turn exchange
+// is one ~8,600-char read_skill result (≈ 2,150 tokens) plus its assistant
+// tool_call row; with the protected head + system prompt, six accumulated
+// results cross the mark before the 7th call. The filler count is the ONE
+// knob that sets the floor; bodies below are derived from it.
+const FIXED_COMPACTION_CATALOG_FILLER = 47;
+const FIXED_COMPACTION_CATALOG: ToolCatalogTool[] = [
+  {
+    toolset: "skills",
+    type: "function",
+    function: {
+      name: "read_skill",
+      description: "Return the full body of an enabled skill by name.",
+      parameters: {
+        type: "object",
+        properties: { name: { type: "string", description: "Skill name." } },
+        required: ["name"]
+      }
+    }
+  },
+  ...Array.from({ length: FIXED_COMPACTION_CATALOG_FILLER }, (_unused, i) => ({
+    toolset: "core",
+    type: "function" as const,
+    function: {
+      name: `fixed_floor_tool_${i}`,
+      description: "X".repeat(900),
+      parameters: { type: "object", properties: {}, required: [] as string[] }
+    }
+  }))
+];
+
 async function waitForTerminal(config: RuntimeConfig, taskId: string, timeoutMs = 5000): Promise<Task> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -156,6 +203,9 @@ describe("chat-task loop", () => {
     else process.env.GINI_STATE_ROOT = prevState;
     if (prevLog === undefined) delete process.env.GINI_LOG_ROOT;
     else process.env.GINI_LOG_ROOT = prevLog;
+    // Clear any fixed-catalog override a compaction test installed so the
+    // rest of the suite sees the live buildToolCatalog.
+    __setBaseToolCatalogForTests(null);
     rmSync(root, { recursive: true, force: true });
     clearEchoToolCallingResponses();
     clearEchoAuxTextResponses();
@@ -4248,6 +4298,9 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     for (let i = 0; i < 7; i++) {
       await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_600)}`);
@@ -4332,6 +4385,9 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     // Exchange sizes: big, tiny, big, big. The middle span (everything
     // between the protected first exchange and the protected last two) is
@@ -4375,6 +4431,9 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     // Geometry: the projection crosses the high-water mark (27,200 tokens
     // under the echo provider's 32k window) by a hair, with a small middle
@@ -4430,6 +4489,9 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     // Same geometry as the happy path (compaction fires before call 7) plus
     // a 7th huge read that immediately refills the reclaimed space.
@@ -4471,6 +4533,9 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     const queueRead = (i: number): void => {
       setEchoToolCallingResponse({
@@ -4529,6 +4594,9 @@ describe("chat-task loop", () => {
     await mutateState(config.instance, (state) => {
       for (const toolset of state.toolsets) toolset.status = "disabled";
     });
+    // Pin the tool-catalog floor so the crossing geometry is decoupled from
+    // live always-on catalog size (cleared in afterEach).
+    __setBaseToolCatalogForTests(FIXED_COMPACTION_CATALOG);
 
     for (let i = 0; i < 7; i++) {
       await seedBulkSkill(config, `bulk-skill-${i}`, `BODY-${i} ${"x".repeat(8_600)}`);
