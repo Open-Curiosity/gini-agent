@@ -115,6 +115,7 @@ import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subage
 import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
+import { peekRefLabel } from "../tools/browser";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider, providerForCredentialName } from "../integrations/connectors/registry";
 import { resolveEffectiveContext } from "./effective-context";
@@ -2778,7 +2779,8 @@ async function runLoop(
       emitToolCallRunning(emitCtx, {
         toolName: call.function.name,
         callId: call.id,
-        args: parsedArgs
+        args: parsedArgs,
+        resolveRefLabel: (ref) => peekRefLabel(taskId, ref)
       });
       // load_tools is handled INLINE (not via dispatchToolCall): it mutates
       // the loaded set, recomputes providerTools so the NEXT iteration ships
