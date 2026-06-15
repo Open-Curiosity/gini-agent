@@ -1,0 +1,25 @@
+# Model providers
+
+Gini reaches chat models through pluggable providers. Each page below covers how
+to obtain credentials, install any prerequisite tooling, and configure the
+provider in Gini (both the CLI and the web Add Provider form).
+
+| Provider | Auth | How credentials are supplied | Setup guide |
+|---|---|---|---|
+| OpenAI | API key | `OPENAI_API_KEY` | [openai.md](openai.md) |
+| Anthropic (first-party Claude) | API key | `ANTHROPIC_API_KEY` | [anthropic.md](anthropic.md) |
+| Amazon Bedrock | AWS SigV4 | `~/.aws` or `AWS_*` env (no key) | [bedrock.md](bedrock.md) |
+| Azure OpenAI | API key / Entra | `AZURE_OPENAI_API_KEY` | [azure.md](azure.md) |
+| OpenRouter | API key | `OPENROUTER_API_KEY` | [openrouter.md](openrouter.md) |
+| DeepSeek | API key | `DEEPSEEK_API_KEY` | [deepseek.md](deepseek.md) |
+| Codex (OpenAI OAuth) | OAuth / CLI | `~/.codex/auth.json` (no key) | [codex.md](codex.md) |
+| Local (OpenAI-compatible) | none / optional key | `GINI_LOCAL_API_KEY` (optional) | [local.md](local.md) |
+
+`gini setup`'s interactive picker covers **OpenAI** and **Codex**. For every
+other provider, use `gini provider set …` (each page has the exact command) or
+the web **Settings → Add provider** form.
+
+When a credential fails mid-chat, Gini surfaces a provider-named note: API-key
+providers link to the Settings key form, Bedrock points at AWS-credential
+guidance, and Codex opens its re-authentication steps. See ADR
+[provider-reauth-guidance.md](../adr/provider-reauth-guidance.md).

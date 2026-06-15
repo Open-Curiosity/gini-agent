@@ -12,6 +12,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [Conversation And Runs](docs/conversation-runs.md): chat, runs, tasks, plan steps, traces, and audit handoff
 - [Memory](docs/memory.md): retain, recall, embeddings, reranking, review, and storage
 - [Runtime Capabilities](docs/runtime-capabilities.md): current CLI/API capability map and verification commands
+- [Model Providers](docs/providers/README.md): per-provider setup guides (credentials, prerequisites, CLI/web config) for OpenAI, Anthropic, Bedrock, Azure, OpenRouter, DeepSeek, Codex, and Local
 - [Operations](docs/operations.md): install, start, stop, smoke, diagnostics, and cleanup
 - [Remote Access](docs/remote-access.md): tunnel modes and confirmation, plus a self-contained guide per tunnel provider — [Gini Relay](docs/remote-access/gini-relay.md), [Tailscale](docs/remote-access/tailscale.md), [ngrok](docs/remote-access/ngrok.md), [Cloudflare](docs/remote-access/cloudflare.md) — the same pages the app opens inline
 - [Releases](docs/releases.md): versioning, CHANGELOG conventions, and the release process
@@ -122,7 +123,11 @@ gini provider set azure gpt-4o \
   --deployment <deployment> --api-version 2024-10-21 --auth-scheme api-key  # uses $AZURE_OPENAI_API_KEY
 ```
 
+For step-by-step setup of each provider — getting credentials, installing any prerequisite tooling (AWS CLI, Ollama, …), and configuring it in the CLI or web — see the per-provider guides: [OpenAI](docs/providers/openai.md), [Anthropic](docs/providers/anthropic.md), [Amazon Bedrock](docs/providers/bedrock.md), [Azure OpenAI](docs/providers/azure.md), [OpenRouter](docs/providers/openrouter.md), [DeepSeek](docs/providers/deepseek.md), [Codex](docs/providers/codex.md), and [Local](docs/providers/local.md). The [providers index](docs/providers/README.md) lists them all with their auth model at a glance.
+
 The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). The `azure` provider targets an Azure OpenAI resource: set `--base-url` to `https://<resource>.openai.azure.com` and pick a deployment; `--api-version` defaults to a GA value and `--auth-scheme` defaults to `api-key` (a resource key), with `bearer` available for an Entra token. API keys are read from environment variables, and Codex OAuth is read from `~/.codex/auth.json` (or `CODEX_AUTH_JSON`) — nothing is written to Gini config. Run `gini --help` for the full flag set, or see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract and [Azure OpenAI As A First-Class Provider](docs/adr/azure-provider.md) for the Azure routing contract. When a credential fails mid-chat, see [Codex re-authentication](docs/providers/codex.md#re-authentication) and [Provider Re-Authentication Guidance](docs/adr/provider-reauth-guidance.md).
+
+> **Note:** `gini setup`'s interactive picker currently covers only OpenAI and Codex. For Bedrock, Azure, Anthropic, OpenRouter, DeepSeek, or Local, use `gini provider set …` (above) or the web **Settings → Add provider** form.
 
 ## Parallel Instances
 
