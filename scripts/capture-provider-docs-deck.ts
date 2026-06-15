@@ -84,11 +84,14 @@ async function main() {
 
   // Open a provider's guide, size the viewport to the doc's full height, return
   // the dialog locator + its scrollHeight so the caller can shoot + record.
-  async function openGuideFull(label: string): Promise<{ dialog: Locator; scrollHeight: number; hitCap: boolean }> {
+  // `title` is the doc's expected H1 (the sheet title) — asserting it confirms
+  // the link opened the RIGHT provider's guide, not just some dialog.
+  async function openGuideFull(label: string, title: string): Promise<{ dialog: Locator; scrollHeight: number; hitCap: boolean }> {
     const link = new RegExp(`Read the ${escapeRegExp(label)} setup guide`);
     await page.getByRole("button", { name: link }).first().click();
     const dialog = page.getByRole("dialog");
     await dialog.waitFor({ state: "visible", timeout: 30000 });
+    await dialog.getByRole("heading", { name: title, exact: true }).waitFor({ state: "visible", timeout: 30000 });
     // Body loaded (skeletons replaced by rendered markdown).
     await dialog.locator(".doc-panel").waitFor({ state: "visible", timeout: 30000 });
     await page.waitForTimeout(300);
@@ -144,7 +147,7 @@ async function main() {
     );
 
     // Full-guide slide: the whole doc, captured at full scroll height.
-    const { dialog, scrollHeight, hitCap } = await openGuideFull(p.label);
+    const { dialog, scrollHeight, hitCap } = await openGuideFull(p.label, p.title);
     const guideFile = `shots/${n}b-${p.name}-guide.png`;
     await dialog.screenshot({ path: join(OUT, guideFile) });
     slides.push({
