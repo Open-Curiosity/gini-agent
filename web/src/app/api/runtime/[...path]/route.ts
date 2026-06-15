@@ -12,8 +12,19 @@ export const dynamic = "force-dynamic";
 // uses `.next-<instance>`, which has no sha and yields undefined. Reported as
 // `buildSha` on __healthz so the update gate can latch web completion on the
 // actual code being served rather than the indirect ppid proxy.
+//
+// Gate on production serving, not the dir name alone: a dev server (`next
+// dev`) for an instance literally named `prod-<sha12>` gets the same
+// `.next-prod-<sha12>` dist dir (it's `.next-<instance>`) yet serves
+// on-demand-compiled source, not that bundle — reporting a buildSha would be a
+// lie. `next start` runs under NODE_ENV=production and `next dev` under
+// development (Next assigns these per command when NODE_ENV is unset, which it
+// is — see src/cli/process.ts startWeb's spawn env), so requiring production
+// here reports a buildSha only when the server is genuinely serving a built
+// bundle.
 const PROD_DIST_SHA = /^\.next-prod-([0-9a-f]{12,})$/;
 function servedBuildSha(): string | undefined {
+  if (process.env.NODE_ENV !== "production") return undefined;
   return PROD_DIST_SHA.exec(process.env.GINI_DIST_DIR ?? "")?.[1];
 }
 
@@ -31,8 +42,9 @@ async function forward(request: NextRequest, params: Promise<{ path: string[] }>
   // web-completion signal under production serving: it is the sha of the code
   // THIS server is serving, so the OLD server reports the OLD build and only
   // the restarted server reports the target — an un-raceable identity, unlike
-  // the indirect signals below. It is undefined under dev serving (no
-  // sha-keyed dist dir), where the gate falls back to `ppid`. `pid` (the
+  // the indirect signals below. It is reported only under production serving
+  // (see servedBuildSha) and is undefined under dev serving, where the gate
+  // falls back to `ppid`. `pid` (the
   // worker serving this request) is diagnostic only: it is NOT a restart
   // proof, because the next CLI respawns the worker — new pid, same server
   // tree — on any next.config.* change, which an update's checkout can trigger

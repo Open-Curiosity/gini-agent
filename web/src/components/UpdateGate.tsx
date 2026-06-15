@@ -259,7 +259,12 @@ export function UpdateGateProvider({
     retry: false
   });
   const healthzPpid = typeof healthz.data?.ppid === "number" ? healthz.data.ppid : null;
-  const healthzBuildSha = typeof healthz.data?.buildSha === "string" ? healthz.data.buildSha : null;
+  // buildSha is contractually the `--short=12` HEAD sha (>=12 hex). Reject an
+  // empty/too-short value so a degenerate string can't false-match the target
+  // via startsWith ("" or a 1-char prefix would spuriously complete the gate);
+  // a malformed signal falls back to the ppid leg below.
+  const healthzBuildSha =
+    typeof healthz.data?.buildSha === "string" && healthz.data.buildSha.length >= 12 ? healthz.data.buildSha : null;
 
   // Progress poll: while waiting, ask the gateway whether its single-flight
   // update is still running. Only an affirmative answer feeds the deadline
@@ -635,8 +640,13 @@ export function UpdateGateProvider({
       if (ver.updateInProgress === true) return false;
       const headOnTarget = targetSha != null ? ver.git.sha === targetSha : ver.git.updateAvailable === false;
       if (!headOnTarget) return false;
+      // Same >=12 guard as healthzBuildSha: an empty/too-short buildSha can't
+      // stand in for the target, so treat it as absent (web leg falls back to
+      // reachability) rather than letting a degenerate prefix match.
       const webOnTarget =
-        typeof health.buildSha === "string" && targetSha != null ? targetSha.startsWith(health.buildSha) : true;
+        typeof health.buildSha === "string" && health.buildSha.length >= 12 && targetSha != null
+          ? targetSha.startsWith(health.buildSha)
+          : true;
       return webOnTarget;
     } catch {
       return false;
