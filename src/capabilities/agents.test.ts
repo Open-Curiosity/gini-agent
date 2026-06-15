@@ -419,6 +419,60 @@ describe("createAgent", () => {
     expect(audit).toBeDefined();
   });
 
+  test("archiveAgent is a no-op when the agent is already archived", async () => {
+    // A second archive must return the same archivedAt and NOT bump updatedAt
+    // or append a second agent.archived audit row, mirroring renameAgent's and
+    // setAgentProvider's no-op hygiene.
+    const config = buildConfig(workspaceRoot, "archive-agent-noop", root);
+    await install(config);
+    const created = await createAgent(config, { name: "scratch" });
+    const archived = await archiveAgent(config, created.id);
+    // Stamp a fixed, distinctly-old updatedAt so a regression that rewrites it
+    // with now() is caught — capturing the archive-time value could be masked
+    // by a same-millisecond write.
+    const sentinel = "2000-01-01T00:00:00.000Z";
+    await mutateState(config.instance, (state) => {
+      const agent = state.agents.find((a) => a.id === created.id)!;
+      agent.updatedAt = sentinel;
+      return agent;
+    });
+    const again = await archiveAgent(config, created.id);
+    expect(again.id).toBe(created.id);
+    expect(again.archivedAt).toBe(archived.archivedAt);
+    const after = readState(config.instance);
+    expect(after.agents.find((agent) => agent.id === created.id)?.updatedAt).toBe(sentinel);
+    expect(
+      after.audit.filter(
+        (event) => event.action === "agent.archived" && event.target === created.id
+      ).length
+    ).toBe(1);
+  });
+
+  test("unarchiveAgent is a no-op when the agent is not archived", async () => {
+    // Restoring a non-archived agent must make no change and append no
+    // agent.unarchived audit row.
+    const config = buildConfig(workspaceRoot, "unarchive-agent-noop", root);
+    await install(config);
+    const created = await createAgent(config, { name: "scratch" });
+    expect(created.archivedAt).toBeUndefined();
+    const sentinel = "2000-01-01T00:00:00.000Z";
+    await mutateState(config.instance, (state) => {
+      const agent = state.agents.find((a) => a.id === created.id)!;
+      agent.updatedAt = sentinel;
+      return agent;
+    });
+    const restored = await unarchiveAgent(config, created.id);
+    expect(restored.id).toBe(created.id);
+    expect(restored.archivedAt).toBeUndefined();
+    const after = readState(config.instance);
+    expect(after.agents.find((agent) => agent.id === created.id)?.updatedAt).toBe(sentinel);
+    expect(
+      after.audit.some(
+        (event) => event.action === "agent.unarchived" && event.target === created.id
+      )
+    ).toBe(false);
+  });
+
   test("archiveAgent refuses to archive the default agent", async () => {
     const config = buildConfig(workspaceRoot, "archive-agent-default", root);
     await install(config);
