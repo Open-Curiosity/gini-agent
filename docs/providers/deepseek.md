@@ -1,7 +1,7 @@
 # DeepSeek
 
 DeepSeek is an OpenAI-compatible API-key provider. Gini talks to
-`https://api.deepseek.com` and authenticates with a Bearer key.
+`https://api.deepseek.com/v1` and authenticates with a Bearer key.
 
 ## Step 1 — Get an API key
 
@@ -37,7 +37,7 @@ gini provider set deepseek deepseek-v4-flash
 Available models include `deepseek-v4-flash` and `deepseek-v4-pro`. (The older
 `deepseek-chat` and `deepseek-reasoner` names are scheduled for deprecation by
 DeepSeek — prefer the `v4` ids.) The base URL defaults to
-`https://api.deepseek.com`; override it only for a proxy with `--base-url`.
+`https://api.deepseek.com/v1`; override it only for a proxy with `--base-url`.
 
 ### Web
 

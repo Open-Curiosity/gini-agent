@@ -14,10 +14,13 @@ Gini resolves AWS credentials in this order on each chat turn:
 
 1. The `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment variables (plus
    `AWS_SESSION_TOKEN` when you are using a temporary session).
-2. The `[default]` profile in your `~/.aws/credentials` file.
+2. A profile in your `~/.aws/credentials` file — the one named by `AWS_PROFILE`,
+   or `[default]` when `AWS_PROFILE` is unset. Set `AWS_SHARED_CREDENTIALS_FILE`
+   to read a credentials file at a non-default path.
 
 That is the whole list. Gini uses **static credentials only**. It does **not**
-read IAM Identity Center (SSO) session caches, `~/.aws/config` role chains,
+read IAM Identity Center (SSO) session caches, `~/.aws/config` role chains
+(including the `role_arn` / `source_profile` settings there),
 `credential_process` entries, or EC2/container instance roles. This is the most
 common source of "I logged in but Gini still says no credentials" — see
 [I signed in but Gini sees no credentials](#i-signed-in-but-gini-sees-no-credentials)
