@@ -874,6 +874,9 @@ export interface Task {
   // main-chat tasks.
   threadId?: string;
   parentBlockId?: string;
+  // Times this task has been re-dispatched after a gateway restart; capped to
+  // break crash loops — see ADR task-resume-on-restart.md.
+  bootResumeCount?: number;
 }
 
 export interface RuntimeEvent {
