@@ -19,7 +19,14 @@ const server = Bun.serve({
   port: PORT,
   async fetch(req) {
     const url = new URL(req.url);
-    const rel = decodeURIComponent(url.pathname === "/" ? "/index.html" : url.pathname);
+    // Malformed percent-encoding (e.g. "/%") makes decodeURIComponent throw a
+    // URIError; return a clean 400 instead of letting the handler 500.
+    let rel: string;
+    try {
+      rel = decodeURIComponent(url.pathname === "/" ? "/index.html" : url.pathname);
+    } catch {
+      return new Response("Bad Request", { status: 400 });
+    }
     // Resolve under ROOT and reject anything that escapes it. The boundary must
     // be ROOT itself OR a path under ROOT + separator — a bare startsWith(ROOT)
     // would also admit a sibling whose name merely begins with "deck"
