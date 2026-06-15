@@ -7,6 +7,7 @@ import {
   ActivityIndicator,
   Alert,
   Image,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -171,6 +172,20 @@ export default function ThreadViewScreen() {
     }, 50);
     return () => clearTimeout(id);
   }, [list.length, lastUpdatedAt]);
+
+  // When the keyboard opens, the composer rises above it and the reply
+  // viewport shrinks from the bottom, covering the latest replies. Follow the
+  // user down only if they were already reading at the bottom; if they'd
+  // scrolled up, leave their position so they stay on what they're looking at.
+  // keyboardDidShow (not willShow) fires after KeyboardAvoidingView's padding
+  // animation settles, so scrollToEnd lands on the true, shrunk-viewport bottom.
+  useEffect(() => {
+    const sub = Keyboard.addListener("keyboardDidShow", () => {
+      if (!pinnedToBottomRef.current) return;
+      scrollRef.current?.scrollToEnd({ animated: true });
+    });
+    return () => sub.remove();
+  }, []);
 
   const trimmed = text.trim();
   const readyImages = useMemo(
