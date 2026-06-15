@@ -2469,6 +2469,28 @@ function previewValue(value: unknown): string {
   }
 }
 
+// Render a browser ref as a human-readable element label when a resolver
+// can name it, falling back to the bare ref otherwise. The resolver is
+// supplied by the caller (chat-task wires it to the live browser session)
+// so tool-catalog stays free of browser internals.
+function formatRefPreview(
+  ref: unknown,
+  resolve?: (ref: string) => { role: string; name: string } | undefined
+): string {
+  const refStr = previewValue(ref);
+  if (!refStr) return "";
+  const label = resolve?.(refStr);
+  if (label?.name) {
+    // Synthetic "clickable" role (cursor-detected, not a real ARIA role) reads
+    // poorly as a label — show the name alone in that one case.
+    return label.role && label.role !== "clickable"
+      ? `${label.role} "${label.name}"`
+      : `"${label.name}"`;
+  }
+  // No accessible name (icon button) or no live session → bare ref.
+  return refStr;
+}
+
 // Per-tool argsPreview override — returns the most useful 1-line
 // representation of the call's headline argument. Falls back to a
 // generic "key=value, ..." dump of all top-level args when no specific
@@ -2479,7 +2501,8 @@ function previewValue(value: unknown): string {
 // inline preview without each one rebuilding the per-tool mapping.
 export function chatBlockArgsPreviewFor(
   toolName: string,
-  args: Record<string, unknown> | null | undefined
+  args: Record<string, unknown> | null | undefined,
+  resolveRefLabel?: (ref: string) => { role: string; name: string } | undefined
 ): string {
   const safe = args ?? {};
   // Headline-arg mapping per tool. Order matters within an entry only
@@ -2518,7 +2541,7 @@ export function chatBlockArgsPreviewFor(
     case "browser_select_option":
     case "browser_upload_file":
     case "browser_download":
-      return truncatePreview(previewValue(safe.ref));
+      return truncatePreview(formatRefPreview(safe.ref, resolveRefLabel));
     case "browser_press":
       return truncatePreview(previewValue(safe.key));
     case "browser_resize":
@@ -2526,14 +2549,14 @@ export function chatBlockArgsPreviewFor(
     case "browser_scroll":
       return truncatePreview(previewValue(safe.direction));
     case "browser_wait_for":
-      return truncatePreview(previewValue(safe.ref) || previewValue(safe.text));
+      return truncatePreview(formatRefPreview(safe.ref, resolveRefLabel) || previewValue(safe.text));
     case "browser_fill_form":
       // Preview the refs only — field text is page content the card
       // doesn't need, and the ref list tells the user what's touched.
       return truncatePreview(
         Array.isArray(safe.fields)
           ? safe.fields
-              .map((f) => (f !== null && typeof f === "object" ? previewValue((f as Record<string, unknown>).ref) : ""))
+              .map((f) => (f !== null && typeof f === "object" ? formatRefPreview((f as Record<string, unknown>).ref, resolveRefLabel) : ""))
               .filter(Boolean)
               .join(", ")
           : ""
@@ -2545,7 +2568,7 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.question));
     case "browser_drag":
       return truncatePreview(
-        `${previewValue(safe.fromRef)} → ${previewValue(safe.toRef)}`
+        `${formatRefPreview(safe.fromRef, resolveRefLabel)} → ${formatRefPreview(safe.toRef, resolveRefLabel)}`
       );
     case "browser_requests":
       return truncatePreview(previewValue(safe.filter));
