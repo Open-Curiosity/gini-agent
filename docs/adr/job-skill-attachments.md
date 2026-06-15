@@ -78,11 +78,20 @@ degradation signal. Skips surface on four layers:
   (keyed `{sessionId, taskId, runId, threadId, parentBlockId}` so it lands
   in-thread after the answer) naming the skipped recipe(s) + the remedy
   ("re-enable the skill or re-attach via `update_job`"). This is the
-  guaranteed (not model-reliant) web surface. Idempotent: finalize
-  early-returns once the run is terminal, so the note is written once.
+  guaranteed (not model-reliant) web surface. The gate is `skillSkips`
+  present AND `task.status === "completed"`. On a `[SILENT]` completed run the
+  chat-task loop retracts its answer block, so there is **no** answer block and
+  the system_note appears alone — intended: degradation outranks silence,
+  because the silence can itself be a consequence of the missing recipe (e.g.
+  the calendar recipe was skipped, the model saw no events, and reported
+  nothing), which is exactly when the user most needs the signal. Idempotent:
+  finalize early-returns once the run is terminal, so the note is written once.
 - **Bridge note.** `dispatchJobReplyToBridge` appends the same one-line note to
   the telegram/discord text when the run had skips and the reply is non-empty
-  and not `[SILENT]`, so bridge/CLI users see it too.
+  and not `[SILENT]`, so bridge/CLI users see it too. On a `[SILENT]` run the
+  bridge stays silent (no reply, no note): web and bridge intentionally diverge
+  for `[SILENT]`+skips — the web surface carries the lone degradation note, the
+  bridge carries nothing.
 
 **Fan-out limitation.** Fan-out workers deliver individually (each via the
 chat path, not through `finalizeJobRunFromTask`), so the deterministic chat

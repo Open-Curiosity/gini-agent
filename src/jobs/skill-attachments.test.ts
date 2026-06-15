@@ -12,7 +12,9 @@
 //   - surfacing skips: a skip persists on the JobRunRecord, the dispatched
 //     prompt carries an informational skip directive (all-skipped =>
 //     directive-only block), finalize emits one system_note naming the
-//     skipped skill into the job session, and a clean run emits none.
+//     skipped skill into the job session (including on a [SILENT] completed
+//     run, where the note lands alone with no answer block), and a clean run
+//     emits none.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -526,6 +528,47 @@ describe("job skill attachments", () => {
       );
       expect(notes.length).toBe(1);
       expect(notes[0]!.kind === "system_note" && notes[0]!.text).toContain("update_job");
+    });
+
+    test("a [SILENT] completed run with a skip still emits the lone degradation system_note", async () => {
+      // A completed run whose final text is exactly "[SILENT]" retracts its
+      // answer block (the chat-task loop suppresses the assistant_text), so the
+      // system_note lands alone — no preceding answer. This is intended:
+      // degradation outranks silence (the silence can itself be a consequence of
+      // the skipped recipe), so the gate stays `skillSkips present AND
+      // task.status === "completed"`, independent of whether an answer remains.
+      const config = buildConfig(workspaceRoot, "attach-skip-silent");
+      const provider = normalizeProvider(config.provider);
+      setEchoToolCallingResponse({ provider, text: "[SILENT]", toolCalls: [], finishReason: "stop" });
+      const session = "session_skip_silent";
+      await createSession(config, session);
+      await mutateState(config.instance, (state) => {
+        pushSkill(state, { name: "fleeting", body: "ephemeral recipe" });
+      });
+      const job = await createScheduledJob(config, {
+        name: "resilient",
+        prompt: "carry on",
+        intervalSeconds: 60,
+        chatSessionId: session,
+        skillNames: ["fleeting"]
+      });
+      await mutateState(config.instance, (state) => {
+        const skill = state.skills.find((s) => s.name === "fleeting");
+        if (skill) skill.status = "disabled";
+      });
+
+      await runJobNow(config, job.id, "manual");
+      await waitForJobRunTerminal(config, job.id);
+
+      // The run completed silently (summary exactly "[SILENT]").
+      const run = readState(config.instance).jobRuns.find((r) => r.jobId === job.id);
+      expect(run!.status).toBe("completed");
+      expect(run!.summary).toBe("[SILENT]");
+      // The degradation note still fires — exactly one, naming the skipped skill.
+      const notes = listChatBlocks(config.instance, session).filter(
+        (b) => b.kind === "system_note" && b.text.includes("fleeting")
+      );
+      expect(notes.length).toBe(1);
     });
 
     test("a clean run (no skips) emits no skip system_note", async () => {
