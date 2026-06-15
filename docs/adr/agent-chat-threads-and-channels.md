@@ -227,23 +227,18 @@ the dedicated channel session above; `"chat"` binds
 each fire posts into the chat that created the job (the session stays a
 normal agent chat — no kind/title mutation). `"chat"` is only valid for
 chat-bound invocations; an imperative/CLI task gets a tool error. The
-tool description instructs the agent to put the choice to the user via
-the `ask_user` choices card for recurring jobs (channel recommended,
-this-chat, plus one option per dispatchable bridge when configured),
-and to default one-shot reminders to `"chat"` without asking. A
+default is `"channel"`; one-shot reminders default to `"chat"`. A
 chat-bound job gets no Recurring jobs rail row — the rail lists only
 channel-bound jobs; each fire delivers into the bound conversation,
 and the job is managed from that conversation's Jobs tab. Its fires
 also run with that conversation's prior-turn context (token-budgeted,
-like any chat turn) — intended, the job benefits from its
-conversational setting — whereas a channel-bound job's fires only see
+like any chat turn), whereas a channel-bound job's fires see only
 prior fires.
 
 The binding stays modifiable after creation: `update_job` accepts the
-same `deliverTo` enum (`rebindJobDelivery` in `src/jobs/index.ts`, one
-`mutateState` write, audited as `job.delivery.rebound`). Switching to
-`"channel"` always mints a **new** dedicated channel (an earlier
-archived channel is never unarchived) and leaves the previously bound
+same `deliverTo` enum (`rebindJobDelivery` in `src/jobs/index.ts`,
+audited as `job.delivery.rebound`). Switching to `"channel"` always
+mints a **new** dedicated channel and leaves the previously bound
 conversation untouched — it's the user's chat. Switching to `"chat"`
 binds future fires to the conversation the `update_job` call came from
 (tool error when the invocation isn't chat-bound) and, when the job's
